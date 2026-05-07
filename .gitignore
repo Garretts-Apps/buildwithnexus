@@ -1,6 +1,5 @@
 node_modules/
-dist/*
-!dist/nexus-release.tar.gz
+dist/
 *.tsbuildinfo
 .DS_Store
 .env.local
