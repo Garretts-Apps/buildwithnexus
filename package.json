@@ -1,6 +1,6 @@
 {
   "name": "buildwithnexus",
-  "version": "0.8.7",
+  "version": "0.8.8",
   "description": "Interactive AI agent orchestrator with intent-based planning, execution, and brainstorming modes",
   "type": "module",
   "bin": {
