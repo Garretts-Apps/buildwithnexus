@@ -11,6 +11,27 @@ import { buildRunPayload, checkServerHealth } from '../core/api.js';
 
 const appVersion = resolvedVersion;
 
+// When the backend stops sending SSE events for this long, surface a hint to the
+// user so a silent stall doesn't look like a frozen terminal. The 120s
+// AbortSignal.timeout still bounds the total wait — this just prints a
+// breadcrumb sooner.
+const SSE_STALL_WARNING_MS = 8000;
+
+async function reportBackendError(label: string, response: Response): Promise<void> {
+  let bodySnippet = '';
+  try {
+    const text = await response.text();
+    bodySnippet = text.slice(0, 300);
+  } catch {
+    bodySnippet = '(could not read response body)';
+  }
+  console.error(chalk.red(`${label}: HTTP ${response.status} ${response.statusText}`));
+  if (bodySnippet) {
+    console.error(chalk.gray(`  body: ${bodySnippet}`));
+  }
+  console.error(chalk.gray('  Tip: stream backend logs with `buildwithnexus logs -f`'));
+}
+
 export async function interactiveMode() {
   const backendUrl = process.env.BACKEND_URL || 'http://localhost:4200';
 
@@ -256,7 +277,7 @@ async function planModeLoop(
     });
 
     if (!response.ok) {
-      console.error(chalk.red('Backend error — cannot fetch plan.'));
+      await reportBackendError('Backend error fetching plan', response);
       return 'cancel';
     }
 
@@ -282,7 +303,7 @@ async function planModeLoop(
 
     const streamResponse = await fetch(`${backendUrl}/api/stream/${run_id}`, { signal: AbortSignal.timeout(120000) });
     if (!streamResponse.ok) {
-      console.error(chalk.red(`Stream endpoint returned ${streamResponse.status}`));
+      await reportBackendError('Stream endpoint error', streamResponse);
       return 'cancel';
     }
     const reader = streamResponse.body?.getReader();
@@ -290,23 +311,32 @@ async function planModeLoop(
     if (!reader) throw new Error('No response body');
 
     let planReceived = false;
+    const stallTimer = setTimeout(() => {
+      console.log(chalk.gray(`(no events from backend after ${SSE_STALL_WARNING_MS / 1000}s — backend may be stalled; check \`buildwithnexus logs -f\`)`));
+    }, SSE_STALL_WARNING_MS);
 
-    for await (const parsed of parseSSEStream(reader)) {
-      if (parsed.type === 'plan') {
-        steps = (parsed.data['steps'] as string[]) || [];
-        planReceived = true;
-        reader.cancel();
-        break;
-      } else if (parsed.type === 'error') {
-        const errorMsg = (parsed.data['error'] as string) || (parsed.data['content'] as string) || 'Unknown error';
-        tui.displayError(errorMsg);
-        reader.cancel();
-        return 'cancel';
+    try {
+      for await (const parsed of parseSSEStream(reader)) {
+        if (parsed.type === 'plan') {
+          steps = (parsed.data['steps'] as string[]) || [];
+          planReceived = true;
+          reader.cancel();
+          break;
+        } else if (parsed.type === 'error') {
+          const errorMsg = (parsed.data['error'] as string) || (parsed.data['content'] as string) || 'Unknown error';
+          tui.displayError(errorMsg);
+          reader.cancel();
+          return 'cancel';
+        }
       }
+    } finally {
+      clearTimeout(stallTimer);
     }
 
     if (!planReceived || steps.length === 0) {
       console.log(chalk.yellow('No plan received from backend.'));
+      console.log(chalk.gray('  This usually means the backend exited without emitting a plan event.'));
+      console.log(chalk.gray('  Check `buildwithnexus logs -f` for the underlying error.'));
       steps = ['(no steps returned — execute anyway?)'];
     }
   } catch (err: unknown) {
@@ -326,7 +356,7 @@ async function planModeLoop(
     if (answer === '' || answer === 'y') {
       return 'BUILD';
     }
-    if (answer === 'n' || answer === '\u001b') {
+    if (answer === 'n' || answer === '') {
       console.log(chalk.yellow('\nExecution cancelled.\n'));
       return 'cancel';
     }
@@ -391,7 +421,7 @@ async function buildModeLoop(
     });
 
     if (!response.ok) {
-      console.error(chalk.red('Backend error'));
+      await reportBackendError('Backend error starting run', response);
       return 'done';
     }
 
@@ -420,33 +450,50 @@ async function buildModeLoop(
 
     const streamResponse = await fetch(`${backendUrl}/api/stream/${run_id}`, { signal: AbortSignal.timeout(120000) });
     if (!streamResponse.ok) {
-      console.error(chalk.red(`Stream endpoint returned ${streamResponse.status}`));
+      await reportBackendError('Stream endpoint error', streamResponse);
       return 'done';
     }
     const reader = streamResponse.body?.getReader();
 
     if (!reader) throw new Error('No response body');
 
-    for await (const parsed of parseSSEStream(reader)) {
-      const type = parsed.type;
+    let sawTerminal = false;
+    const stallTimer = setTimeout(() => {
+      console.log(chalk.gray(`(no events from backend after ${SSE_STALL_WARNING_MS / 1000}s — backend may be stalled; check \`buildwithnexus logs -f\`)`));
+    }, SSE_STALL_WARNING_MS);
 
-      if (type === 'execution_complete') {
-        const summary = (parsed.data['summary'] as string) || '';
-        const count = (parsed.data['todos_completed'] as number) || 0;
-        tui.displayResults(summary, count);
-        tui.displayComplete(tui.getElapsedTime());
-        break;
-      } else if (type === 'done') {
-        tui.displayEvent(type, { content: 'Task completed successfully' });
-        tui.displayComplete(tui.getElapsedTime());
-        break;
-      } else if (type === 'error') {
-        const errorMsg = (parsed.data['error'] as string) || (parsed.data['content'] as string) || 'Unknown error';
-        tui.displayError(errorMsg);
-        break;
-      } else if (type !== 'plan') {
-        tui.displayEvent(type, parsed.data);
+    try {
+      for await (const parsed of parseSSEStream(reader)) {
+        const type = parsed.type;
+
+        if (type === 'execution_complete') {
+          const summary = (parsed.data['summary'] as string) || '';
+          const count = (parsed.data['todos_completed'] as number) || 0;
+          tui.displayResults(summary, count);
+          tui.displayComplete(tui.getElapsedTime());
+          sawTerminal = true;
+          break;
+        } else if (type === 'done') {
+          tui.displayEvent(type, { content: 'Task completed successfully' });
+          tui.displayComplete(tui.getElapsedTime());
+          sawTerminal = true;
+          break;
+        } else if (type === 'error') {
+          const errorMsg = (parsed.data['error'] as string) || (parsed.data['content'] as string) || 'Unknown error';
+          tui.displayError(errorMsg);
+          sawTerminal = true;
+          break;
+        } else if (type !== 'plan') {
+          tui.displayEvent(type, parsed.data);
+        }
       }
+    } finally {
+      clearTimeout(stallTimer);
+    }
+
+    if (!sawTerminal) {
+      console.log(chalk.yellow('Stream ended without a terminal event (no execution_complete / done / error).'));
+      console.log(chalk.gray('  The backend likely crashed mid-run. Check `buildwithnexus logs -f`.'));
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -492,7 +539,9 @@ async function brainstormModeLoop(
         signal: AbortSignal.timeout(120000),
       });
 
-      if (response.ok) {
+      if (!response.ok) {
+        await reportBackendError('Backend error in brainstorm', response);
+      } else {
         const brainstormText = await response.text();
         let brainstormParsed: unknown;
         try {
@@ -513,7 +562,7 @@ async function brainstormModeLoop(
         const run_id = brainstormRunId;
         const streamResponse = await fetch(`${backendUrl}/api/stream/${run_id}`, { signal: AbortSignal.timeout(120000) });
         if (!streamResponse.ok) {
-          console.error(chalk.red(`Stream endpoint returned ${streamResponse.status}`));
+          await reportBackendError('Stream endpoint error', streamResponse);
           continue;
         }
         const reader = streamResponse.body?.getReader();
@@ -525,58 +574,63 @@ async function brainstormModeLoop(
 
         let responseText = '';
         let firstEvent = true;
+        const stallTimer = setTimeout(() => {
+          console.log(chalk.gray(`(no events from backend after ${SSE_STALL_WARNING_MS / 1000}s — backend may be stalled; check \`buildwithnexus logs -f\`)`));
+        }, SSE_STALL_WARNING_MS);
 
-        for await (const parsed of parseSSEStream(reader)) {
-          const type = parsed.type;
-          const data = parsed.data;
+        try {
+          for await (const parsed of parseSSEStream(reader)) {
+            const type = parsed.type;
+            const data = parsed.data;
 
-          // Show thinking indicator on first event
-          if (firstEvent && type !== 'done' && type !== 'error') {
-            console.log(chalk.bold.blue('💭 Thinking...\n'));
-            firstEvent = false;
-          }
-
-          if (type === 'done' || type === 'execution_complete' || type === 'final_result') {
-            const summary = (data['summary'] as string) || (data['result'] as string) || '';
-            if (summary) responseText = summary;
-            break;
-          } else if (type === 'error') {
-            const errorMsg = (data['error'] as string) || (data['content'] as string) || 'Unknown error';
-            responseText += errorMsg + '\n';
-            break;
-          } else if (type === 'thought' || type === 'observation') {
-            const content = (data['content'] as string) || '';
-            if (content) {
-              console.log(chalk.gray('→ ' + content));
-              responseText += content + '\n';
+            // Show thinking indicator on first event
+            if (firstEvent && type !== 'done' && type !== 'error') {
+              console.log(chalk.bold.blue('💭 Thinking...\n'));
+              firstEvent = false;
             }
-          } else if (type === 'agent_response' || type === 'agent_result') {
-            // Handle agent response events
-            const content = (data['content'] as string) || (data['result'] as string) || '';
-            if (content) responseText += content + '\n';
-          } else if (type === 'action') {
-            const content = (data['content'] as string) || '';
-            if (content) {
-              console.log(chalk.cyan('⚙️  ' + content));
-              responseText += content + '\n';
+
+            if (type === 'done' || type === 'execution_complete' || type === 'final_result') {
+              const summary = (data['summary'] as string) || (data['result'] as string) || '';
+              if (summary) responseText = summary;
+              break;
+            } else if (type === 'error') {
+              const errorMsg = (data['error'] as string) || (data['content'] as string) || 'Unknown error';
+              responseText += errorMsg + '\n';
+              break;
+            } else if (type === 'thought' || type === 'observation') {
+              const content = (data['content'] as string) || '';
+              if (content) {
+                console.log(chalk.gray('→ ' + content));
+                responseText += content + '\n';
+              }
+            } else if (type === 'agent_response' || type === 'agent_result') {
+              // Handle agent response events
+              const content = (data['content'] as string) || (data['result'] as string) || '';
+              if (content) responseText += content + '\n';
+            } else if (type === 'action') {
+              const content = (data['content'] as string) || '';
+              if (content) {
+                console.log(chalk.cyan('⚙️  ' + content));
+                responseText += content + '\n';
+              }
+            } else if (type === 'agent_working' || type === 'started') {
+              // Skip intermediate agent_working and started events in brainstorm mode
+            } else if (type !== 'plan') {
+              // Catch-all for any other event types
+              const content = (data['content'] as string) || (data['response'] as string) || '';
+              if (content) responseText += content + '\n';
             }
-          } else if (type === 'agent_working' || type === 'started') {
-            // Skip intermediate agent_working and started events in brainstorm mode
-          } else if (type !== 'plan') {
-            // Catch-all for any other event types
-            const content = (data['content'] as string) || (data['response'] as string) || '';
-            if (content) responseText += content + '\n';
           }
+        } finally {
+          clearTimeout(stallTimer);
         }
         console.log('');
 
         if (responseText.trim()) {
           tui.displayBrainstormResponse(responseText.trim());
         } else {
-          console.log(chalk.gray('(No response received from agent)'));
+          console.log(chalk.gray('(No response received from agent — check `buildwithnexus logs -f`)'));
         }
-      } else {
-        console.log(chalk.red('Could not reach backend for brainstorm response.'));
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
