@@ -51,7 +51,7 @@ async function runCommand(task: string, options: { agent: string; goal?: string;
 
         switch (data.type) {
           case 'plan_created':
-            repl.displayPlan(data.data as Parameters<PlanningREPL['displayPlan']>[0]);
+            repl.displayPlan(data.data as unknown as Parameters<PlanningREPL['displayPlan']>[0]);
             break;
           case 'thought':
             repl.displayReAct(data.data['content'] as string, 'thought');
@@ -66,7 +66,7 @@ async function runCommand(task: string, options: { agent: string; goal?: string;
             console.log(`  Checkpoint saved: ${JSON.stringify(data.data)}`);
             break;
           case 'metrics_update':
-            repl.displayMetrics(data.data as Parameters<PlanningREPL['displayMetrics']>[0]);
+            repl.displayMetrics(data.data as unknown as Parameters<PlanningREPL['displayMetrics']>[0]);
             break;
           case 'done':
             console.log('\nWorkflow complete!\n');
