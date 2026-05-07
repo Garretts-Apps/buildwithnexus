@@ -39,7 +39,7 @@ jobs:
         with:
           repository: Garretts-Apps/nexus
           ref: ${{ github.event.inputs.nexus_ref || 'main' }}
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.GARRETT_PAT }}
           path: nexus
 
       - uses: actions/setup-node@v4
