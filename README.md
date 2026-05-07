@@ -109,7 +109,7 @@ Built-in DLP (Data Loss Prevention) layer protects every data path — zero depe
 
 - **npm:** [npmjs.com/package/buildwithnexus](https://www.npmjs.com/package/buildwithnexus)
 - **Docs:** [buildwithnexus.dev](https://buildwithnexus.dev)
-- **GitHub:** [github.com/Garrett-s-Apps/buildwithnexus](https://github.com/Garrett-s-Apps/buildwithnexus)
+- **GitHub:** [github.com/Garretts-Apps/buildwithnexus](https://github.com/Garretts-Apps/buildwithnexus)
 
 ## License
 
