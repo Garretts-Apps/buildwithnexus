@@ -43,7 +43,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Garrett-s-Apps/buildwithnexus.git"
+    "url": "git+https://github.com/Garretts-Apps/buildwithnexus.git"
   },
   "homepage": "https://buildwithnexus.dev",
   "dependencies": {
