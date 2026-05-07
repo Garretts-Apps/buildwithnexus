@@ -4,24 +4,104 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Version bump (patch/minor/major) — 'none' to publish current version"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+      nexus_ref:
+        description: "Branch/tag/sha of Garretts-Apps/nexus to bundle (default: main)"
+        required: false
+        default: "main"
+        type: string
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # needed for the version-bump commit/tag push
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout buildwithnexus
+        uses: actions/checkout@v4
+        with:
+          path: buildwithnexus
+          fetch-depth: 0
+
+      - name: Checkout nexus (sibling, for bundle step)
+        uses: actions/checkout@v4
+        with:
+          repository: Garretts-Apps/nexus
+          ref: ${{ github.event.inputs.nexus_ref || 'main' }}
+          token: ${{ secrets.NEXUS_REPO_TOKEN }}
+          path: nexus
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - run: npm ci
+      - name: Configure git (for version bump)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none'
+        working-directory: buildwithnexus
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - run: npm test
+      - name: Bump version (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none'
+        working-directory: buildwithnexus
+        run: |
+          NEW_VERSION=$(npm version ${{ github.event.inputs.version_bump }} --no-git-tag-version)
+          echo "New version: $NEW_VERSION"
+          git add package.json package-lock.json
+          git commit -m "chore(release): $NEW_VERSION"
+          git tag "$NEW_VERSION"
+          git push origin HEAD:main --follow-tags
 
-      - run: npm publish --access public
+      - name: Install dependencies
+        working-directory: buildwithnexus
+        run: npm ci
+
+      - name: Run tests
+        working-directory: buildwithnexus
+        run: npm test
+
+      - name: Verify nexus checkout has fixed model IDs
+        working-directory: nexus
+        run: |
+          set -e
+          echo "Verifying retired/deprecated model IDs are NOT present in the source we're about to bundle..."
+          if grep -rn 'claude-3-5-haiku-20241022' src/ ; then
+            echo "::error::Retired model claude-3-5-haiku-20241022 found in nexus source. Refusing to publish."
+            exit 1
+          fi
+          if grep -rn 'claude-sonnet-4-20250514\|claude-opus-4-20250514' src/ ; then
+            echo "::error::Deprecated dated alias found in nexus source. Refusing to publish."
+            exit 1
+          fi
+          echo "✓ No retired/deprecated model IDs in the bundled Python source."
+
+      - name: Publish to npm
+        working-directory: buildwithnexus
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NEXUS_SRC: ${{ github.workspace }}/nexus
+        run: npm publish --access public
+
+      - name: Summarize
+        if: always()
+        working-directory: buildwithnexus
+        run: |
+          echo "### Publish summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Package: \`$(node -p \"require('./package.json').name\")\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: \`$(node -p \"require('./package.json').version\")\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Nexus ref bundled: \`${{ github.event.inputs.nexus_ref || 'main' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Tarball: \`dist/nexus-release.tar.gz\`" >> $GITHUB_STEP_SUMMARY
