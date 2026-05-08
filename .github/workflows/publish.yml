@@ -45,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout buildwithnexus
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: buildwithnexus
           fetch-depth: 0
@@ -54,7 +54,7 @@ jobs:
           submodules: false
 
       - name: Checkout nexus (for bundle)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Garretts-Apps/nexus
           ref: ${{ github.event.inputs.nexus_ref || 'main' }}
@@ -72,7 +72,7 @@ jobs:
           echo "nexus_sha=$NEXUS_SHA" >> "$GITHUB_OUTPUT"
           echo "nexus_epoch=$NEXUS_EPOCH" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
