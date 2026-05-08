@@ -50,10 +50,11 @@ jobs:
         with:
           path: buildwithnexus
           fetch-depth: 0
-          # Use GARRETT_PAT instead of GITHUB_TOKEN so the version-bump step
-          # can push back to main even if branch protection blocks GHA pushes.
-          # The PAT-as-user is allowed past the rule.
-          token: ${{ secrets.GARRETT_PAT }}
+          # NPM_REPO is a fine-grained PAT scoped to Garretts-Apps/buildwithnexus
+          # AND Garretts-Apps/nexus, contents:read+write. Used here so the
+          # version-bump push can bypass branch protection on main, and reused
+          # below for the nexus checkout (cross-org-repo access).
+          token: ${{ secrets.NPM_REPO }}
           persist-credentials: true
 
       - name: Checkout nexus (sibling, for bundle step)
@@ -61,7 +62,7 @@ jobs:
         with:
           repository: Garretts-Apps/nexus
           ref: ${{ github.event.inputs.nexus_ref || 'main' }}
-          token: ${{ secrets.GARRETT_PAT }}
+          token: ${{ secrets.NPM_REPO }}
           path: nexus
           persist-credentials: false
 
