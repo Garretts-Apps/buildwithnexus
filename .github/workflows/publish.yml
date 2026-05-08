@@ -22,27 +22,59 @@ on:
         default: "main"
         type: string
 
+# Deny-by-default at the workflow level. Each job opts into the minimum it needs.
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
-      contents: write   # needed for the version-bump commit/tag push
+      contents: write   # version-bump commit/tag push, GitHub Release upload
+      id-token: write   # npm provenance via OIDC (SLSA-style attestation)
+      attestations: write  # GitHub artifact attestations
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/buildwithnexus
+
     steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2.10.4
+        with:
+          egress-policy: audit
+          disable-sudo: true
+
       - name: Checkout buildwithnexus
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           path: buildwithnexus
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Checkout nexus (sibling, for bundle step)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           repository: Garretts-Apps/nexus
           ref: ${{ github.event.inputs.nexus_ref || 'main' }}
           token: ${{ secrets.GARRETT_PAT }}
           path: nexus
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Record nexus source SHA + commit time
+        id: nexus-sha
+        working-directory: nexus
+        run: |
+          NEXUS_SHA=$(git rev-parse HEAD)
+          NEXUS_EPOCH=$(git log -1 --pretty=%ct)
+          echo "nexus_sha=$NEXUS_SHA" >> "$GITHUB_OUTPUT"
+          echo "nexus_epoch=$NEXUS_EPOCH" >> "$GITHUB_OUTPUT"
+          echo "Nexus pinned at: $NEXUS_SHA (commit time: $NEXUS_EPOCH)"
+
+      - uses: actions/setup-node@v4.1.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -65,9 +97,13 @@ jobs:
           git tag "$NEW_VERSION"
           git push origin HEAD:main --follow-tags
 
-      - name: Install dependencies
+      - name: Install dependencies (no lifecycle scripts)
         working-directory: buildwithnexus
-        run: npm ci
+        run: npm ci --ignore-scripts
+
+      - name: Audit production dependencies
+        working-directory: buildwithnexus
+        run: npm audit --audit-level=high --omit=dev
 
       - name: Run tests
         working-directory: buildwithnexus
@@ -78,7 +114,6 @@ jobs:
         run: |
           set -e
           echo "Verifying retired/deprecated model IDs are NOT present in non-comment source lines..."
-          # grep exit 0 = found match; we pipe through grep -v to strip comment-only lines
           if grep -rn 'claude-3-5-haiku-20241022' src/ | grep -v ':[[:space:]]*#'; then
             echo "::error::Retired model claude-3-5-haiku-20241022 found in nexus source code. Refusing to publish."
             exit 1
@@ -89,12 +124,57 @@ jobs:
           fi
           echo "✓ No retired/deprecated model IDs in the bundled Python source."
 
-      - name: Publish to npm
+      - name: Build + bundle
+        working-directory: buildwithnexus
+        env:
+          NEXUS_SRC: ${{ github.workspace }}/nexus
+          # Reproducible tarball: pin mtime to the nexus source commit timestamp
+          SOURCE_DATE_EPOCH: ${{ steps.nexus-sha.outputs.nexus_epoch }}
+        run: |
+          npm run build
+          npm run bundle
+
+      - name: Generate SBOM (CycloneDX)
+        working-directory: buildwithnexus
+        run: |
+          npx --yes @cyclonedx/cyclonedx-npm@^2.0.0 \
+            --output-format JSON \
+            --output-file dist/sbom.cdx.json \
+            --omit dev \
+            --spec-version 1.5
+          echo "SBOM size: $(wc -c < dist/sbom.cdx.json) bytes"
+
+      - name: Generate SHA256SUMS
+        working-directory: buildwithnexus
+        run: |
+          cd dist
+          sha256sum nexus-release.tar.gz sbom.cdx.json > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish to npm (with provenance)
         working-directory: buildwithnexus
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NEXUS_SRC: ${{ github.workspace }}/nexus
-        run: npm publish --access public
+        run: npm publish --access public --provenance
+
+      - name: Attest tarball + SBOM
+        uses: actions/attest-build-provenance@v1.4.4
+        with:
+          subject-path: |
+            buildwithnexus/dist/nexus-release.tar.gz
+            buildwithnexus/dist/sbom.cdx.json
+
+      - name: Upload artifacts to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2.0.8
+        with:
+          files: |
+            buildwithnexus/dist/nexus-release.tar.gz
+            buildwithnexus/dist/sbom.cdx.json
+            buildwithnexus/dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
 
       - name: Summarize
         if: always()
@@ -102,9 +182,21 @@ jobs:
         run: |
           pkg_name=$(node -e 'console.log(require("./package.json").name)')
           pkg_version=$(node -e 'console.log(require("./package.json").version)')
-          echo "### Publish summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Package: \`$pkg_name\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Version: \`$pkg_version\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Nexus ref bundled: \`${{ github.event.inputs.nexus_ref || 'main' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Tarball: \`dist/nexus-release.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Publish summary"
+            echo ""
+            echo "- Package: \`$pkg_name\`"
+            echo "- Version: \`$pkg_version\`"
+            echo "- Nexus ref: \`${{ github.event.inputs.nexus_ref || 'main' }}\`"
+            echo "- Nexus SHA: \`${{ steps.nexus-sha.outputs.nexus_sha }}\`"
+            echo "- Tarball: \`dist/nexus-release.tar.gz\`"
+            echo "- SBOM: \`dist/sbom.cdx.json\`"
+            echo "- Provenance: signed via GitHub OIDC"
+            echo ""
+            if [ -f dist/SHA256SUMS.txt ]; then
+              echo "#### Checksums"
+              echo '```'
+              cat dist/SHA256SUMS.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

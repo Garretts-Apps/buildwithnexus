@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    name: Lint + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2.10.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4.1.0
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies (no lifecycle scripts)
+        run: npm ci --ignore-scripts
+
+      - name: Type-check
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4.1.0
+        with:
+          node-version: "22"
+
+      - name: Audit production dependencies
+        run: npm audit --audit-level=high --omit=dev
+
+  actionlint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2.0.1
+        with:
+          flags: -shellcheck=
+
+  zizmor:
+    name: Static analysis (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3.2.4
+
+      - name: Run zizmor
+        run: |
+          uvx zizmor --format sarif . > zizmor.sarif || true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3.27.0
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
