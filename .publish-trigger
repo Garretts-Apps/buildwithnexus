@@ -1,5 +1,5 @@
 bump=patch
 nexus_ref=main
-# bumped at 2026-05-08T19:21:00Z (retry with NPM_PERMISSIONED_TOKEN PAT)
+# bumped at 2026-05-08T19:27:00Z (retry after nexus PR #42 stub .gitmodules merged)
 # this file's only job is to fire .github/workflows/trigger-publish.yml
 # which in turn fires .github/workflows/publish.yml as workflow_dispatch.
