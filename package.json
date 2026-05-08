@@ -76,7 +76,7 @@
     "@types/node": "^22.13.4",
     "@vitest/coverage-v8": "^4.0.18",
     "tsup": "^8.3.6",
-    "typescript": "^5.7.3",
+    "typescript": "^6.0.3",
     "vitest": "^4.0.18"
   }
 }
