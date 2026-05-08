@@ -1,5 +1,4 @@
 bump=patch
 nexus_ref=main
-# bumped at 2026-05-08T19:27:00Z (retry after nexus PR #42 stub .gitmodules merged)
-# this file's only job is to fire .github/workflows/trigger-publish.yml
-# which in turn fires .github/workflows/publish.yml as workflow_dispatch.
+# bumped at 2026-05-08T19:50:00Z (simplified publish.yml — direct trigger, no bridge)
+# this file's job is to fire .github/workflows/publish.yml directly via push.
