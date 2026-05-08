@@ -1,4 +1,4 @@
 bump=patch
 nexus_ref=main
-# bumped at 2026-05-08T20:00:00Z (retry — assuming NPM_TOKEN updated to bypass-2FA granular)
+# bumped at 2026-05-08T22:32:00Z (retry — CI fixes pushed, publish.yml unchanged)
 # this file's job is to fire .github/workflows/publish.yml directly via push.
