@@ -3,7 +3,7 @@ name: Publish to npm
 # Triggers (any of these fires the publish):
 #   - push of a v* tag
 #   - workflow_dispatch (UI "Run workflow")
-#   - push to main that touches `.publish-trigger` (claude-from-MCP path)
+#   - push to main that touches `.publish-trigger`
 on:
   push:
     branches: [main]
@@ -41,7 +41,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
-      id-token: write
+      id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
 
     steps:
       - name: Checkout buildwithnexus
@@ -75,11 +75,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+          # Note: registry-url *intentionally omitted* — when a Trusted Publisher
+          # is configured for this package on npmjs.com, npm publish auto-detects
+          # the OIDC context from GitHub Actions and uses it for auth. Setting
+          # registry-url + .npmrc with NODE_AUTH_TOKEN fights that flow.
 
       - name: Bump version + tag
-        # Bump on workflow_dispatch (with bump != none) OR on push to .publish-trigger.
-        # Tag-push events (refs/tags/v*) skip the bump — already at the right version.
         if: |
           (github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none') ||
           (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
@@ -98,8 +99,6 @@ jobs:
           git add package.json package-lock.json
           git commit -m "chore(release): $NEW_VERSION [skip ci]"
           git tag "$NEW_VERSION"
-          # Best-effort push of bump+tag back to main. If branch protection blocks,
-          # we still publish to npm with the bumped version in this checkout.
           if ! git push origin HEAD:main --follow-tags; then
             echo "::warning::Could not push bump+tag to main. Publishing to npm anyway."
           fi
@@ -151,10 +150,27 @@ jobs:
           sha256sum nexus-release.tar.gz $([ -f sbom.cdx.json ] && echo sbom.cdx.json) > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Publish to npm (with provenance)
+      # === AUTH ===
+      # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
+      #   1. Trusted Publisher configured on npmjs.com for the
+      #      buildwithnexus package, scoped to:
+      #        - Org: Garretts-Apps
+      #        - Repo: buildwithnexus
+      #        - Workflow: publish.yml
+      #        - Environment: (blank)
+      #   2. id-token: write permission on this job (set above).
+      #
+      # No NPM_TOKEN is read. Token-based auth (and its 2FA gate) is bypassed.
+      #
+      # Configure here:
+      #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
+      #
+      # If the trusted publisher isn't configured yet, this step fails with a
+      # message about authentication — exactly what you'd want to see, since
+      # the alternative was the silent EOTP rejection.
+      - name: Publish to npm (OIDC Trusted Publisher + provenance)
         working-directory: buildwithnexus
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NEXUS_SRC: ${{ github.workspace }}/nexus
         run: npm publish --access public --provenance
 
@@ -168,5 +184,6 @@ jobs:
             echo ""
             echo "- Version: \`$PKG_VERSION\`"
             echo "- Nexus SHA: \`${{ steps.nexus-sha.outputs.nexus_sha }}\`"
-            echo "- Provenance: via OIDC"
+            echo "- Auth: OIDC Trusted Publisher"
+            echo "- Provenance: signed via OIDC"
           } >> "$GITHUB_STEP_SUMMARY"
