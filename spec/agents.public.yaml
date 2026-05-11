@@ -1,0 +1,613 @@
+# NEXUS Agent Roster — Public Specification (Metadata)
+#
+# This file is published as a public, auditable proof that the 56-agent
+# organization claimed in the buildwithnexus README is real, not marketing.
+#
+# What's here:
+#   - name + title (the role's "person" — first name + job title)
+#   - model: which Claude / OpenAI tier the role uses (opus/sonnet/haiku/o3)
+#   - layer: executive | management | senior | implementation | quality | consultant
+#   - org: engineering | salesforce | product | security | analytics | etc.
+#   - specialty (when set): frontend / backend / salesforce_<area> / etc.
+#   - description: what the role owns (one paragraph)
+#   - tools: which tools the role can invoke
+#   - spawns_sdk: whether the role runs in an isolated Claude Agent SDK session
+#
+# What's intentionally NOT here:
+#   - system_prompt: the role's full behavioral prompt is intellectual property
+#     of the NEXUS engine and stays in the private source. The metadata above
+#     is the architectural truth; the prompts are the implementation.
+#
+# Counts (verified against the canonical config/agents.yaml in nexus):
+#   - Layer:   10 executive, 10 management, 12 senior, 15 implementation,
+#              6 quality, 3 consultant = 56
+#   - Model:   15 opus, 37 sonnet, 3 haiku, 1 o3 = 56
+#   - Org:     25 engineering, 10 salesforce, 5 product, 4 security,
+#              3 ai_team, 3 analytics, 2 documentation, 2 executive,
+#              1 finance, 1 revenue = 56
+#
+# Tools doctrine: executive + management agents are typically read-only
+# (Read/Grep/Glob) so they cannot directly modify code — they review, decide,
+# and delegate. Implementation + tester agents have read+write+execute access.
+# spawns_sdk=true means the agent runs in an isolated Claude Code subprocess;
+# spawns_sdk=false means it operates inside the LangGraph orchestration loop.
+#
+# Source of truth: Garretts-Apps/nexus (private repo).
+# License: MIT, published as part of buildwithnexus for transparency.
+
+agents:
+  ceo:
+    name: Garrett
+    title: Chief Executive Officer
+    model: opus
+    layer: executive
+    org: executive
+    description: Owns overall strategy, business value, and final go/no-go decisions. Delegates execution to VPs. Makes critical calls.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  cpo:
+    name: Sarah
+    title: Chief Product Officer
+    model: opus
+    layer: executive
+    org: product
+    description: Defines requirements, acceptance criteria, and product vision. Ensures what we build solves real user problems.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  cfo:
+    name: Michael
+    title: Chief Financial Officer
+    model: sonnet
+    layer: executive
+    org: finance
+    description: Manages token budget, tracks spending, flags when approaching limits. Recommends cost-saving approaches.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  cro:
+    name: Lisa
+    title: Chief Revenue Officer
+    model: sonnet
+    layer: executive
+    org: revenue
+    description: Estimates timelines, identifies bottlenecks, optimizes for speed and parallelization. Ensures timely delivery.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  vp_product:
+    name: Marcus
+    title: VP of Product
+    model: opus
+    layer: executive
+    org: product
+    description: Owns the product org. Defines product strategy, prioritizes the roadmap, ensures alignment between engineering delivery and business goals. Reviews PRDs from PMs.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  pm_1:
+    name: Riley
+    title: Senior Product Manager
+    model: sonnet
+    layer: senior
+    org: product
+    description: Writes PRDs, defines requirements and acceptance criteria, manages backlog, works with engineering to scope and prioritize stories. Does not code.
+    spawns_sdk: false
+
+  pm_2:
+    name: Avery
+    title: Product Manager
+    model: sonnet
+    layer: management
+    org: product
+    description: Writes PRDs, defines requirements and acceptance criteria, manages backlog. Handles secondary projects and assists Senior PM. Does not code.
+    spawns_sdk: false
+
+  vp_engineering:
+    name: Adrian
+    title: VP of Engineering
+    model: opus
+    layer: executive
+    org: engineering
+    description: Owns the engineering org. Makes high-level architecture decisions with the Chief Architect. Manages engineering leads. Ensures code quality, velocity, and technical excellence.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  chief_architect:
+    name: Sebastian
+    title: Chief Architect
+    model: o3
+    layer: senior
+    org: engineering
+    description: Defines system architecture, tech stack decisions, API contracts, data models, and infrastructure patterns. Reviews all major technical designs. Uses deep reasoning to evaluate tradeoffs. Does NOT write production code.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  tech_lead:
+    name: Jordan
+    title: Technical Lead
+    model: opus
+    layer: senior
+    org: engineering
+    description: Guards architecture, evaluates long-term maintainability, identifies technical debt. Pragmatic balance between perfect and good enough.
+    tools: [Read, Grep, Glob, Bash]
+    spawns_sdk: true
+
+  eng_lead:
+    name: Nathan
+    title: Engineering Lead
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Manages the engineering team day-to-day. Runs scrum ceremonies, unblocks engineers, reviews technical approaches, breaks architecture into implementable stories.
+    tools: [Read, Grep, Glob, Bash]
+    spawns_sdk: true
+
+  em_frontend:
+    name: Alex
+    title: Frontend Engineering Manager
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Manages frontend engineering team. Breaks down frontend work into tasks.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  em_backend:
+    name: Taylor
+    title: Backend Engineering Manager
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Manages backend engineering team. Breaks down backend work into tasks.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  em_platform:
+    name: Morgan
+    title: Platform Engineering Manager
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Manages platform/DevOps team. Breaks down infrastructure work into tasks.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  fe_engineer_1:
+    name: Derek
+    title: Senior Frontend Engineer
+    model: sonnet
+    layer: implementation
+    org: engineering
+    specialty: frontend
+    description: Writes production frontend code. Specializes in React, TypeScript, Next.js, Tailwind, component architecture, state management, responsive design, accessibility.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  fe_engineer_2:
+    name: Landon
+    title: Senior Frontend Engineer
+    model: sonnet
+    layer: implementation
+    org: engineering
+    specialty: frontend
+    description: Writes production frontend code. Specializes in React, TypeScript, Vue, CSS/SCSS, animations, UI/UX implementation, browser APIs.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  be_engineer_1:
+    name: Caleb
+    title: Senior Backend Engineer
+    model: sonnet
+    layer: implementation
+    org: engineering
+    specialty: backend
+    description: Writes production backend code. Specializes in Python, FastAPI, Node.js, PostgreSQL, SQLite, REST APIs, authentication, data processing, server architecture.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  be_engineer_2:
+    name: Weston
+    title: Senior Backend Engineer
+    model: sonnet
+    layer: implementation
+    org: engineering
+    specialty: backend
+    description: Writes production backend code. Specializes in Python, Django, Express, MongoDB, Redis, WebSockets, background jobs, integrations.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  code_review_lead:
+    name: Victor
+    title: Code Review Lead
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Manages the code review process. Ensures all code meets quality standards before merge. Assigns reviews, resolves disputes. Does NOT write code.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  fe_reviewer:
+    name: Pierce
+    title: Frontend Code Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    specialty: frontend
+    description: Reviews all frontend code for quality, accessibility, performance, component design, and best practices. Does NOT write code.
+    tools: [Read, Grep, Glob, Bash]
+    spawns_sdk: true
+
+  be_reviewer:
+    name: Graham
+    title: Backend Code Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    specialty: backend
+    description: Reviews all backend code for quality, security, performance, API design, and best practices. Does NOT write code.
+    tools: [Read, Grep, Glob, Bash]
+    spawns_sdk: true
+
+  qa_lead:
+    name: Roman
+    title: QA Lead
+    model: sonnet
+    layer: management
+    org: engineering
+    description: Owns the QA process. Defines test strategy, manages QA engineers, ensures comprehensive coverage. Reviews test plans and results. Signs off on releases.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  fe_tester:
+    name: Ellis
+    title: Frontend Tester
+    model: haiku
+    layer: quality
+    org: engineering
+    specialty: frontend
+    description: Runs frontend tests — Playwright, Puppeteer, browser testing, visual regression, accessibility audits. Tests against actual running applications.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  be_tester:
+    name: Milo
+    title: Backend Tester
+    model: haiku
+    layer: quality
+    org: engineering
+    specialty: backend
+    description: Runs backend tests — API testing, integration tests, load testing, database validation. Tests against actual running services.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  unit_test_engineer:
+    name: Jasper
+    title: Unit Test Engineer
+    model: sonnet
+    layer: quality
+    org: engineering
+    description: Writes comprehensive unit tests. Cleans up code comments to be meaningful — comments explain WHY, not WHAT. Refactors test code for clarity.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  linting_agent:
+    name: Linter
+    title: Linting Agent
+    model: haiku
+    layer: quality
+    org: engineering
+    description: Runs linters and static analysis. Zero tolerance for warnings.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  test_frontend:
+    name: FE Test Runner
+    title: Frontend Test Agent
+    model: sonnet
+    layer: quality
+    org: engineering
+    description: Writes and runs frontend tests. Tests real user scenarios.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  test_backend:
+    name: BE Test Runner
+    title: Backend Test Agent
+    model: sonnet
+    layer: quality
+    org: engineering
+    description: Writes and runs backend tests. Tests edge cases and failure modes.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sr_frontend:
+    name: Senior FE Reviewer
+    title: Senior Frontend Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    description: Reviews frontend code for quality, accessibility, performance.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sr_backend:
+    name: Senior BE Reviewer
+    title: Senior Backend Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    description: Reviews backend code for security, performance, API design.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sr_fullstack:
+    name: Senior Fullstack Reviewer
+    title: Senior Fullstack Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    description: Reviews full-stack code for overall architecture and integration.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sr_devops:
+    name: Senior DevOps Reviewer
+    title: Senior DevOps Reviewer
+    model: sonnet
+    layer: senior
+    org: engineering
+    description: Reviews infrastructure and deployment code.
+    tools: [Read, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  ux_consultant:
+    name: UX Consultant
+    title: UX/UI Consultant
+    model: sonnet
+    layer: consultant
+    org: product
+    description: Reviews UI/UX for visual quality, accessibility, and usability.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  ciso:
+    name: Dominic
+    title: CISO
+    model: opus
+    layer: executive
+    org: security
+    description: Owns security, networking, DevOps, and infrastructure. Sets security policy, reviews threat models, approves deployments. Reports security posture to CEO.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  security_consultant:
+    name: Sterling
+    title: Security Consultant
+    model: opus
+    layer: consultant
+    org: security
+    description: Performs comprehensive security audits, vulnerability scanning, OWASP Top 10 checks. Zero tolerance for security issues.
+    tools: [Read, Grep, Glob, Bash]
+    spawns_sdk: true
+
+  security_engineer:
+    name: Reece
+    title: Security Engineer
+    model: sonnet
+    layer: implementation
+    org: security
+    description: Performs vulnerability scanning, SAST/DAST, secret detection, dependency audits, auth flow reviews, penetration testing concepts. Implements security controls.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  devops_engineer:
+    name: Cole
+    title: DevOps Engineer
+    model: sonnet
+    layer: implementation
+    org: security
+    description: Manages deployment, CI/CD, Docker, server management, port management, process management, health checks, log management. Manages git operations.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  head_of_docs:
+    name: Grant
+    title: Head of Documentation
+    model: opus
+    layer: executive
+    org: documentation
+    description: Owns all documentation output. Ensures quality, consistency, and completeness of all written deliverables. Reviews technical writer output.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  tech_writer:
+    name: Reid
+    title: Senior Technical Writer
+    model: sonnet
+    layer: implementation
+    org: documentation
+    description: Writes technical documentation, API docs, README files, user guides, code review reports (as .docx), architecture documentation.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  consultant:
+    name: Casey
+    title: Executive Consultant
+    model: opus
+    layer: consultant
+    org: executive
+    description: Creates powerful PPTX pitch decks, executive-level Word documents, board presentations, investor materials, one-pagers, and strategic briefs.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  ml_engineer:
+    name: ML Engineer (AI Team)
+    title: Machine Learning Engineer
+    model: opus
+    layer: implementation
+    org: ai_team
+    specialty: ml
+    description: Requires dual approval from VP Engineering and Chief Architect before invocation. Specializes in model training, feature engineering, and ML pipeline development.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  ai_engineer:
+    name: AI Engineer (AI Team)
+    title: AI Engineer
+    model: opus
+    layer: implementation
+    org: ai_team
+    specialty: ai
+    description: Requires dual approval from VP Engineering and Chief Architect before invocation. Specializes in neural networks, deep learning, and AI system architecture.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  data_engineer:
+    name: Data Engineer (AI Team)
+    title: Data Engineer
+    model: sonnet
+    layer: implementation
+    org: ai_team
+    specialty: data
+    description: Requires dual approval from VP Engineering and Chief Architect before invocation. Specializes in data pipelines, ETL, and data infrastructure for ML/AI systems.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  director_analytics:
+    name: Brennan
+    title: Director of Analytics
+    model: opus
+    layer: executive
+    org: analytics
+    description: Owns the analytics org. Defines analytics strategy, reviews data models, ensures data quality and insight accuracy.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  sr_data_analyst:
+    name: Hayes
+    title: Senior Data Analyst
+    model: sonnet
+    layer: implementation
+    org: analytics
+    specialty: data
+    description: Advanced data analysis using Python — pandas, NumPy, Matplotlib, Seaborn, Plotly, Altair. Creates visualizations, statistical analyses, predictive models. Builds executive dashboards.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  data_analyst:
+    name: Tate
+    title: Data Analyst
+    model: sonnet
+    layer: implementation
+    org: analytics
+    specialty: data
+    description: Data analysis using Python — pandas, NumPy, Matplotlib, Seaborn, Plotly, Altair. Creates charts, cleans data, builds reports. Supports senior analyst on larger projects.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  vp_salesforce:
+    name: Cameron
+    title: VP of Salesforce
+    model: opus
+    layer: executive
+    org: salesforce
+    description: Owns the Salesforce practice. Defines Salesforce strategy, architecture decisions, and oversees all Salesforce implementations. Expert in Financial Services Cloud, Service Cloud, Agent Force.
+    tools: [Read, Grep, Glob]
+    spawns_sdk: false
+
+  sf_product_lead:
+    name: Parker
+    title: Salesforce Product Lead
+    model: opus
+    layer: management
+    org: salesforce
+    description: Leads Salesforce product strategy and requirements. Writes PRDs, user stories, and specs for Salesforce implementations. Expert in FSC, Service Cloud, and Agent Force.
+    tools: [Read, Write, Edit, Grep, Glob]
+    spawns_sdk: true
+
+  sf_pm_senior:
+    name: Finn
+    title: Senior Salesforce Product Manager
+    model: sonnet
+    layer: senior
+    org: salesforce
+    description: Writes detailed PRDs, user stories, and specs for FSC implementations. Deep expertise in FSC data model, household accounts, financial accounts, goals, insurance policies.
+    tools: [Read, Write, Edit, Grep, Glob]
+    spawns_sdk: true
+
+  sf_pm:
+    name: Wyatt
+    title: Salesforce Product Manager
+    model: sonnet
+    layer: management
+    org: salesforce
+    description: Writes PRDs for Service Cloud and Agent Force. Expertise in omni-channel routing, case management, Service Cloud Voice, contact center integrations (Vonage), Agent Force setup.
+    tools: [Read, Write, Edit, Grep, Glob]
+    spawns_sdk: true
+
+  sf_eng_lead:
+    name: Quinn
+    title: Salesforce Engineering Lead
+    model: opus
+    layer: management
+    org: salesforce
+    description: Leads Salesforce engineering team. Expert in Salesforce architecture, Apex, LWC, Visualforce, integrations, data migrations.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sf_fsc_data_expert:
+    name: Dawson
+    title: Financial Services Cloud Data Model Expert
+    model: sonnet
+    layer: senior
+    org: salesforce
+    specialty: salesforce_fsc
+    description: Expert in FSC data model. Deep knowledge of FSC objects, relationships, household accounts, financial accounts, assets, liabilities, goals, insurance policies.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sf_service_cloud_architect:
+    name: Rowan
+    title: Service Cloud Architect
+    model: sonnet
+    layer: senior
+    org: salesforce
+    specialty: salesforce_service
+    description: Expert in Service Cloud architecture. Deep knowledge of omni-channel routing, queues, case management, Service Cloud Voice, contact center integrations (Vonage), Einstein bots.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sf_developer:
+    name: Blake
+    title: Senior Salesforce Developer
+    model: sonnet
+    layer: implementation
+    org: salesforce
+    specialty: salesforce_dev
+    description: Writes Apex, LWC, Aura components, Visualforce, triggers, batch classes, scheduled jobs. Implements Salesforce features across FSC and Service Cloud.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sf_integration_engineer:
+    name: Rhys
+    title: Salesforce Integration Engineer
+    model: sonnet
+    layer: implementation
+    org: salesforce
+    specialty: salesforce_integration
+    description: Builds REST/SOAP APIs, integration with external systems, middleware, webhooks, platform events, streaming APIs. Specializes in Vonage Contact Center integration.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
+
+  sf_agent_force_specialist:
+    name: Knox
+    title: Agent Force Specialist
+    model: sonnet
+    layer: implementation
+    org: salesforce
+    specialty: salesforce_agentforce
+    description: Expert in Salesforce Agent Force setup, configuration, and implementation. Builds autonomous agents, defines agent topics, configures agent actions.
+    tools: [Read, Write, Edit, Bash, Grep, Glob]
+    spawns_sdk: true
