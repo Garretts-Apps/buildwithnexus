@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 
@@ -85,6 +85,26 @@ pub fn write_stream(chunk: &str) {
 
 pub fn flush() {
     let _ = io::stdout().flush();
+}
+
+// Non-blocking: drain pending key events and report whether Ctrl-C was pressed
+// during a running turn (raw mode only). Lets the agent loop bail between steps.
+pub fn interrupted() -> bool {
+    if !is_raw() {
+        return false;
+    }
+    let mut hit = false;
+    while poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(k)) = read() {
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                hit = true;
+            }
+        }
+    }
+    hit
 }
 
 // Read one line after printing `prompt`. Raw mode uses a key-driven editor;

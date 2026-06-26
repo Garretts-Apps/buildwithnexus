@@ -61,7 +61,18 @@ fn provider_or_onboard() -> Result<(Provider, Permission), String> {
 
 fn build_provider(s: &Settings) -> Result<Provider, String> {
     let preset = config::preset(&s.provider).ok_or_else(|| format!("unknown provider '{}'; run `buildwithnexus init`", s.provider))?;
-    let base_url = s.base_url.clone().unwrap_or_else(|| preset.base_url.to_string());
+    // Never ship an API key to a non-HTTPS endpoint. Keyed presets may only be
+    // overridden to another https:// host; keyless (local) presets are exempt.
+    let base_url = match &s.base_url {
+        Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
+            return Err(format!(
+                "refusing to send the {} API key to a non-HTTPS endpoint ({u}); use https:// or a local provider",
+                preset.env_key
+            ));
+        }
+        Some(u) => u.clone(),
+        None => preset.base_url.to_string(),
+    };
     let model = if s.model.is_empty() { preset.default_model.to_string() } else { s.model.clone() };
     let api_key = if preset.env_key.is_empty() { None } else { config::load_key(preset.env_key) };
     if !preset.env_key.is_empty() && api_key.is_none() {
@@ -77,6 +88,7 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    hooks::init(&cwd, false); // headless: never run untrusted project hooks
     hooks::notify("SessionStart", &cwd);
     let r = f(&provider, perm, cwd.clone());
     hooks::notify("SessionEnd", &cwd);
@@ -100,6 +112,7 @@ fn interactive() {
 
     // Raw mode only when we own a real terminal; piped/headless stays cooked.
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    hooks::init(&cwd, raw); // may prompt to trust project hooks (cooked, pre-alt-screen)
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
     let result = repl(&provider, perm, &cwd, raw);

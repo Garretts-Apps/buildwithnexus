@@ -2,6 +2,7 @@
 // three modes. PLAN decomposes + gates, BUILD is a ReAct tool loop, BRAINSTORM
 // is streaming-free chat. Roles are a small data table, not an agent framework.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,22 +43,64 @@ pub fn role(id: &str) -> Role {
     Role { system }
 }
 
-// Returns Some(reason) when a call is blocked, None when allowed.
-fn gate(perm: Permission, name: &str, input: &serde_json::Value) -> Option<String> {
-    if !tools::is_mutating(name) {
-        return None;
+fn confirm(label: &str) -> Option<String> {
+    // Never block waiting for input when no human can answer (JSON/automation or
+    // a non-terminal stdin) — deny by default instead of hanging.
+    if report::is_json() || !std::io::stdin().is_terminal() {
+        return Some(format!("blocked (no interactive terminal to confirm: {label})"));
     }
+    let q = format!("  {} {}? {} ", tui::yellow("➤"), tui::bold(label), tui::dim("[y/N]"));
+    let ans = tui::ask(&q).unwrap_or_default();
+    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+        None
+    } else {
+        Some("denied by user".into())
+    }
+}
+
+// Returns Some(reason) when a call is blocked, None when allowed. Layers:
+// sensitive paths and catastrophic commands always require an explicit yes
+// (in auto/headless an un-answerable prompt safely resolves to denial); then
+// the chosen permission mode governs mutations and out-of-cwd reads.
+fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+    let path = tools::touched_path(name, input, cwd);
+
+    if let Some(p) = &path {
+        if tools::is_sensitive(p) {
+            return confirm(&format!("access sensitive path {}", p.display()));
+        }
+    }
+    if name == "run_command" {
+        if let Some(c) = input["command"].as_str() {
+            if tools::catastrophic(c) {
+                return confirm(&format!("run dangerous command `{c}`"));
+            }
+        }
+    }
+
     match perm {
         Permission::Auto => None,
-        Permission::ReadOnly => Some("read-only mode: mutation skipped".into()),
-        Permission::Ask => {
-            let q = format!("  {} {}? {} ", tui::yellow("➤"), tui::bold(&tools::preview(name, input)), tui::dim("[y/N]"));
-            let ans = tui::ask(&q).unwrap_or_default();
-            if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
-                None
-            } else {
-                Some("denied by user".into())
+        Permission::ReadOnly => {
+            if tools::is_mutating(name) {
+                return Some("read-only mode: mutation skipped".into());
             }
+            if let Some(p) = &path {
+                if tools::escapes_cwd(p, cwd) {
+                    return Some(format!("read-only: refusing to read outside the working directory ({})", p.display()));
+                }
+            }
+            None
+        }
+        Permission::Ask => {
+            if tools::is_mutating(name) {
+                return confirm(&tools::preview(name, input));
+            }
+            if let Some(p) = &path {
+                if tools::escapes_cwd(p, cwd) {
+                    return confirm(&format!("read outside working directory: {}", p.display()));
+                }
+            }
+            None
         }
     }
 }
@@ -85,6 +128,10 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
     let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
 
     for _ in 0..MAX_ITERS {
+        if tui::interrupted() {
+            report::notice("interrupted");
+            return Ok(String::new());
+        }
         // JSON mode buffers (one clean event); human mode streams tokens live.
         let reply: Reply = if report::is_json() {
             let r = complete(p, &msgs, &defs)?;
@@ -102,17 +149,28 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             r
         };
         if reply.calls.is_empty() {
+            if reply.text.trim().is_empty() {
+                report::notice("model returned no output");
+            }
             return Ok(reply.text); // model answered in prose
         }
 
         let mut results = Vec::new();
         let mut summary: Option<String> = None;
         for call in &reply.calls {
+            // Reject calls whose JSON arguments didn't parse, with a message the
+            // model can act on (common failure mode for small local models).
+            if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                let msg = format!("tool arguments were not valid JSON: {}", raw.chars().take(200).collect::<String>());
+                report::tool_denied(&msg);
+                results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
+                continue;
+            }
             // PreToolUse hook can allow (skip the gate), deny, or defer to it.
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
-                PreDecision::Continue => gate(perm, &call.name, &call.input),
+                PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
             };
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
@@ -144,8 +202,7 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             return Ok(s);
         }
     }
-    report::notice(&format!("Reached the {MAX_ITERS}-step limit without finishing."));
-    Ok(String::new())
+    Err(format!("reached the {MAX_ITERS}-step limit without finishing"))
 }
 
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);

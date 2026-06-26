@@ -1,25 +1,81 @@
-// Claude Code-compatible lifecycle hooks. Users register shell commands in
-// settings.json at the same events Claude Code exposes; each hook receives the
-// event as JSON on stdin and can block via exit code 2 or a permissionDecision.
-// No regex crate: matchers are "*", an exact tool name, or a |-separated list.
+// Claude Code-compatible lifecycle hooks, hardened against the clone-and-own
+// attack: a project's .buildwithnexus/settings.json can register shell commands,
+// so project hooks run ONLY after the user explicitly trusts that folder, and a
+// project hook can never *grant* a permission (only deny). Home settings are
+// trusted implicitly. Everything is parsed once per session, not per tool call.
 
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
 use crate::config;
+use crate::tui;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Source {
+    Home,
+    Project,
+}
+
+struct Hook {
+    event: String,
+    matcher: String,
+    command: String,
+    source: Source,
+}
+
+struct Hooks {
+    list: Vec<Hook>,
+}
+
+static HOOKS: OnceLock<Hooks> = OnceLock::new();
 
 pub enum PreDecision {
-    Continue, // defer to the normal permission gate
-    Allow,    // hook explicitly approved — skip the gate
+    Continue,
+    Allow,
     Deny(String),
 }
 
-// User settings first, then project (.buildwithnexus/settings.json); both apply.
-fn settings_files(cwd: &Path) -> Vec<std::path::PathBuf> {
-    vec![config::home().join("settings.json"), cwd.join(".buildwithnexus/settings.json")]
+// Load + parse settings once. Home is implicitly trusted; project hooks load
+// only if the folder is trusted (prompting once when interactive). Must be
+// called before the agent runs.
+pub fn init(cwd: &Path, interactive: bool) {
+    let mut list = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(config::home().join("settings.json")) {
+        parse_into(&text, Source::Home, &mut list);
+    }
+    let proj = cwd.join(".buildwithnexus/settings.json");
+    if let Ok(text) = std::fs::read_to_string(&proj) {
+        if project_trusted(cwd, &text, interactive) {
+            parse_into(&text, Source::Project, &mut list);
+        } else if interactive {
+            tui::line(&tui::dim("  (project hooks present but not trusted — skipped)"));
+        }
+    }
+    let _ = HOOKS.set(Hooks { list });
+}
+
+fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return };
+    let Some(events) = v["hooks"].as_object() else { return };
+    for (event, groups) in events {
+        let Some(groups) = groups.as_array() else { continue };
+        for g in groups {
+            let matcher = g["matcher"].as_str().unwrap_or("*").to_string();
+            if let Some(hs) = g["hooks"].as_array() {
+                for h in hs {
+                    if h["type"].as_str() == Some("command") {
+                        if let Some(cmd) = h["command"].as_str() {
+                            out.push(Hook { event: event.clone(), matcher: matcher.clone(), command: cmd.to_string(), source });
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn matches(matcher: &str, tool: &str) -> bool {
@@ -27,32 +83,66 @@ fn matches(matcher: &str, tool: &str) -> bool {
     m.is_empty() || m == "*" || m.split('|').any(|p| p.trim() == tool)
 }
 
-fn commands_for(event: &str, tool: Option<&str>, cwd: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    for f in settings_files(cwd) {
-        let Ok(text) = std::fs::read_to_string(&f) else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-        let Some(groups) = v["hooks"][event].as_array() else { continue };
-        for g in groups {
-            if let Some(t) = tool {
-                if !matches(g["matcher"].as_str().unwrap_or("*"), t) {
-                    continue;
-                }
-            }
-            if let Some(hs) = g["hooks"].as_array() {
-                for h in hs {
-                    if h["type"].as_str() == Some("command") {
-                        if let Some(cmd) = h["command"].as_str() {
-                            out.push(cmd.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
+// (command, source) pairs for an event, optionally filtered by tool name.
+fn commands_for(event: &str, tool: Option<&str>) -> Vec<(&'static str, Source)> {
+    let Some(h) = HOOKS.get() else { return Vec::new() };
+    h.list.iter()
+        .filter(|hk| hk.event == event)
+        .filter(|hk| tool.map_or(true, |t| matches(&hk.matcher, t)))
+        .map(|hk| (hk.command.as_str(), hk.source))
+        .collect()
 }
 
+// ── per-folder trust ────────────────────────────────────────────────────────
+fn trust_path() -> std::path::PathBuf {
+    config::home().join("trusted.json")
+}
+
+// Non-cryptographic content hash (djb2) — only used to detect that a trusted
+// settings file changed since consent, so a no-dep hash is sufficient.
+fn digest(s: &str) -> String {
+    let mut h: u64 = 5381;
+    for b in s.bytes() {
+        h = (h << 5).wrapping_add(h).wrapping_add(b as u64);
+    }
+    format!("{h:016x}")
+}
+
+fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
+    let key = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()).to_string_lossy().into_owned();
+    let want = digest(text);
+    let mut store: Value = std::fs::read_to_string(trust_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({}));
+
+    if store[&key].as_str() == Some(want.as_str()) {
+        return true;
+    }
+    if !interactive {
+        return false; // never run untrusted project hooks unattended
+    }
+
+    let changed = store.get(&key).is_some();
+    tui::line("");
+    tui::line(&tui::yellow(&format!("  ⚠ {}/.buildwithnexus/settings.json defines hooks that run shell commands.", cwd.display())));
+    if changed {
+        tui::line(&tui::dim("    (the file changed since you last trusted it)"));
+    }
+    let ans = tui::ask(&format!("  Trust this folder's hooks? {} ", tui::dim("[y/N]"))).unwrap_or_default();
+    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+        store[key] = json!(want);
+        if let Ok(t) = serde_json::to_string_pretty(&store) {
+            config::ensure_home();
+            let _ = std::fs::write(trust_path(), t);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+// ── execution ────────────────────────────────────────────────────────────────
 fn run_one(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
     let mut c = if cfg!(windows) {
         let mut x = Command::new("cmd");
@@ -90,8 +180,8 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
         "hook_event_name": "PreToolUse", "session_id": std::process::id(),
         "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
     });
-    for cmd in commands_for("PreToolUse", Some(tool), cwd) {
-        let (code, stdout, stderr) = run_one(&cmd, &payload, cwd);
+    for (cmd, source) in commands_for("PreToolUse", Some(tool)) {
+        let (code, stdout, stderr) = run_one(cmd, &payload, cwd);
         if code == 2 {
             let r = stderr.trim();
             return PreDecision::Deny(if r.is_empty() { "blocked by PreToolUse hook".into() } else { r.to_string() });
@@ -103,7 +193,9 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
                         .or_else(|| j["reason"].as_str()).unwrap_or("denied by hook");
                     return PreDecision::Deny(reason.to_string());
                 }
-                Some("allow") => return PreDecision::Allow,
+                // A project hook may only deny, never grant — otherwise a hostile
+                // repo could disarm the permission gate.
+                Some("allow") if source == Source::Home => return PreDecision::Allow,
                 _ => {}
             }
         }
@@ -112,7 +204,7 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
 }
 
 pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, cwd: &Path) {
-    let cmds = commands_for("PostToolUse", Some(tool), cwd);
+    let cmds = commands_for("PostToolUse", Some(tool));
     if cmds.is_empty() {
         return;
     }
@@ -122,20 +214,19 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
         "tool_response": {"content": response, "is_error": is_error},
         "cwd": cwd.to_string_lossy()
     });
-    for cmd in cmds {
-        let _ = run_one(&cmd, &payload, cwd);
+    for (cmd, _) in cmds {
+        let _ = run_one(cmd, &payload, cwd);
     }
 }
 
-// Returns extra context to inject (hook stdout), or Err(reason) if blocked.
 pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
     let payload = json!({
         "hook_event_name": "UserPromptSubmit", "session_id": std::process::id(),
         "prompt": prompt, "cwd": cwd.to_string_lossy()
     });
     let mut ctx = String::new();
-    for cmd in commands_for("UserPromptSubmit", None, cwd) {
-        let (code, stdout, stderr) = run_one(&cmd, &payload, cwd);
+    for (cmd, _) in commands_for("UserPromptSubmit", None) {
+        let (code, stdout, stderr) = run_one(cmd, &payload, cwd);
         if code == 2 {
             let r = stderr.trim();
             return Err(if r.is_empty() { "blocked by UserPromptSubmit hook".into() } else { r.to_string() });
@@ -148,14 +239,13 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
     Ok(ctx)
 }
 
-// SessionStart / Stop / SessionEnd — fire-and-forget notifications.
 pub fn notify(event: &str, cwd: &Path) {
-    let cmds = commands_for(event, None, cwd);
+    let cmds = commands_for(event, None);
     if cmds.is_empty() {
         return;
     }
     let payload = json!({"hook_event_name": event, "session_id": std::process::id(), "cwd": cwd.to_string_lossy()});
-    for cmd in cmds {
-        let _ = run_one(&cmd, &payload, cwd);
+    for (cmd, _) in cmds {
+        let _ = run_one(cmd, &payload, cwd);
     }
 }

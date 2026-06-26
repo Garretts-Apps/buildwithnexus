@@ -76,6 +76,73 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
 }
 
+// Marker placed on a tool call whose JSON arguments failed to parse, so the
+// agent can feed the model a clear error instead of running with empty fields.
+pub const INVALID_ARGS: &str = "__bwn_invalid_args__";
+
+// The filesystem path a call touches (for confinement checks), resolved against
+// cwd. None for non-path tools.
+pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
+    match name {
+        "read_file" | "list_dir" | "write_file" | "edit_file" => {
+            Some(resolve(cwd, input["path"].as_str().unwrap_or("")))
+        }
+        _ => None,
+    }
+}
+
+// Lexically fold `.`/`..` without touching the filesystem (works for paths that
+// don't exist yet, e.g. write targets).
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => { out.pop(); }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+// True if the path resolves outside the working directory.
+pub fn escapes_cwd(p: &Path, cwd: &Path) -> bool {
+    let base = cwd.canonicalize().unwrap_or_else(|_| normalize(cwd));
+    !normalize(p).starts_with(&base)
+}
+
+// Paths that should never be read/written without explicit confirmation, even in
+// auto mode — credential stores and key material are the prime exfil targets.
+pub fn is_sensitive(p: &Path) -> bool {
+    let s = normalize(p).to_string_lossy().to_lowercase();
+    let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    s.contains("/.ssh/")
+        || s.contains("/.buildwithnexus/")
+        || s.contains("/.aws/")
+        || s.contains("/.gnupg/")
+        || name == ".env.keys"
+        || name == ".env"
+        || name.starts_with(".env.")
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.ends_with(".pem")
+}
+
+// Commands so destructive they require confirmation in every mode.
+pub fn catastrophic(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    let nospace: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    nospace.contains("rm-rf/")          // rm -rf of an absolute path
+        || nospace.contains("rm-fr/")
+        || nospace.contains(":(){:|:&};:") // fork bomb
+        || nospace.contains("mkfs")
+        || nospace.contains("of=/dev/")    // dd onto a device
+        || nospace.contains(">/dev/sd")
+        || nospace.contains(">/dev/nvme")
+        || nospace.contains("chmod-r777/")
+}
+
 fn truncate(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;

@@ -52,7 +52,7 @@ fn agent() -> &'static ureq::Agent {
     A.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_secs(180))
             .build()
     })
 }
@@ -106,10 +106,34 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
         Ok(resp) => Ok(resp),
         Err(ureq::Error::Status(code, resp)) => {
             let detail = resp.into_string().unwrap_or_default();
-            Err(format!("HTTP {code}: {}", detail.chars().take(400).collect::<String>()))
+            Err(format!("HTTP {code}: {}", redact(&detail).chars().take(400).collect::<String>()))
         }
-        Err(e) => Err(format!("connection failed: {e}")),
+        Err(e) => Err(format!("connection failed: {}", redact(&e.to_string()))),
     }
+}
+
+// Defense-in-depth: blank out anything that looks like an API key/token before
+// surfacing an upstream error body to the user or logs.
+fn redact(s: &str) -> String {
+    s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
+        .map(|tok| {
+            let core = tok.trim_end_matches(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c));
+            let secretish = core.len() >= 12
+                && (core.starts_with("sk-") || core.starts_with("AIza") || core.starts_with("hf_")
+                    || core.starts_with("Bearer")
+                    || (core.len() > 32 && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')));
+            if secretish { tok.replacen(core, "[redacted]", 1) } else { tok.to_string() }
+        })
+        .collect()
+}
+
+// OpenAI tool-call arguments arrive as a JSON *string*; mark unparseable ones so
+// the agent can tell the model instead of silently running with empty fields.
+fn parse_args(args: &str) -> Value {
+    if args.trim().is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(args).unwrap_or_else(|_| json!({ crate::tools::INVALID_ARGS: args }))
 }
 
 // Iterate `data:` payloads of an SSE stream, handing each JSON value to `f`.
@@ -290,7 +314,7 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
             calls.push(ToolCall {
                 id: tc["id"].as_str().unwrap_or_default().to_string(),
                 name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
-                input: serde_json::from_str(args).unwrap_or_else(|_| json!({})),
+                input: parse_args(args),
             });
         }
     }
@@ -332,7 +356,7 @@ fn openai_stream(resp: ureq::Response, on_text: &mut dyn FnMut(&str)) -> Result<
         false
     });
     let calls = pending.into_iter().filter(|e| !e.1.is_empty()).map(|(id, name, args)| ToolCall {
-        id, name, input: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
+        id, name, input: parse_args(&args),
     }).collect();
     Ok(Reply { text, calls })
 }
