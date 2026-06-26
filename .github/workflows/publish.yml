@@ -37,12 +37,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Gate: a successful `release` run on a v* tag, or a manual dispatch.
-    # Without this, a failed or non-tag release run would still publish.
+    # Gate: a successful `release` run — whether it came from a v* tag push or a
+    # manual run (whose head_branch is the branch, not a tag) — or a direct
+    # manual dispatch of this workflow. A failed release never publishes.
     if: >-
       ${{ github.event_name == 'workflow_dispatch' ||
           (github.event.workflow_run.conclusion == 'success' &&
-           startsWith(github.event.workflow_run.head_branch, 'v')) }}
+           (startsWith(github.event.workflow_run.head_branch, 'v') ||
+            github.event.workflow_run.event == 'workflow_dispatch')) }}
     permissions:
       contents: write
       id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
