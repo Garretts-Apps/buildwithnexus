@@ -4,3 +4,11 @@ dist/
 .DS_Store
 .env.local
 .omc/
+
+# Rust build output, vendored deps, and the native binary (built by postinstall)
+harness/target/
+harness/vendor/
+harness/.cargo/
+/bin/buildwithnexus
+/bin/buildwithnexus.exe
+*.tar.gz

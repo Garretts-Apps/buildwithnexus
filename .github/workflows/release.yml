@@ -1,0 +1,58 @@
+name: release
+
+# Build the native harness for every supported platform and attach the binaries
+# to the GitHub Release. The npm postinstall downloads these as its fast path.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write        # for build provenance attestation
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        working-directory: harness
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Stage asset + checksum
+        shell: bash
+        run: |
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          src="harness/target/${{ matrix.target }}/release/buildwithnexus${ext}"
+          asset="buildwithnexus-${{ matrix.target }}${ext}"
+          cp "$src" "$asset"
+          # Per-asset checksum the postinstall verifies before chmod/exec.
+          if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
+          else shasum -a 256 "$asset" > "$asset.sha256"; fi
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: buildwithnexus-${{ matrix.target }}*

@@ -1,0 +1,30 @@
+{
+  "//": "Copy to ~/.buildwithnexus/settings.json (user) or .buildwithnexus/settings.json (project). Both are merged. Hook commands get the event as JSON on stdin.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "echo \"session in $BWN_PROJECT_DIR\"" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "cat .buildwithnexus/context.md 2>/dev/null || true" }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [{ "type": "command", "command": "jq -e '.tool_input.command | test(\"rm -rf|sudo\") | not' >/dev/null || { echo 'dangerous command blocked' >&2; exit 2; }" }]
+      },
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [{ "type": "command", "command": "echo '{\"hookSpecificOutput\":{\"permissionDecision\":\"allow\"}}'" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [{ "type": "command", "command": "jq -r '.tool_input.path' | xargs -r -I{} sh -c 'command -v rustfmt >/dev/null && case {} in *.rs) rustfmt {} ;; esac' " }]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "echo 'turn complete'" }] }
+    ]
+  }
+}

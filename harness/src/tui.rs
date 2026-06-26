@@ -1,0 +1,274 @@
+// Terminal layer: alternate screen, optional raw mode, ANSI colors, line input,
+// and a spinner. Raw mode gives consistent key-driven input across platforms; in
+// raw mode the kernel's line discipline is off, so every newline we emit must be
+// "\r\n" and we echo keystrokes ourselves. Falls back to cooked line input when
+// stdout isn't a TTY, so piped/headless use is unaffected.
+
+use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use crossterm::cursor::MoveTo;
+use crossterm::event::{
+    poll, read, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
+
+static RAW: AtomicBool = AtomicBool::new(false);
+pub fn is_raw() -> bool {
+    RAW.load(Ordering::Relaxed)
+}
+
+// ANSI SGR — hand-rolled so we don't pull a color crate. Honors NO_COLOR.
+fn color(code: &str, s: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return s.to_string();
+    }
+    format!("\x1b[{code}m{s}\x1b[0m")
+}
+pub fn bold(s: &str) -> String { color("1", s) }
+pub fn dim(s: &str) -> String { color("2", s) }
+pub fn red(s: &str) -> String { color("31", s) }
+pub fn green(s: &str) -> String { color("32", s) }
+pub fn yellow(s: &str) -> String { color("33", s) }
+pub fn blue(s: &str) -> String { color("34", s) }
+pub fn cyan(s: &str) -> String { color("36", s) }
+pub fn accent(s: &str) -> String { color("38;5;141", s) } // brand violet
+
+pub fn enter_alt(raw: bool) {
+    let _ = execute!(io::stdout(), EnterAlternateScreen);
+    if raw && enable_raw_mode().is_ok() {
+        RAW.store(true, Ordering::Relaxed);
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
+    }
+    // Always restore the terminal, even on panic — never leave the user in a raw
+    // alt buffer with no echo.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        prev(info);
+    }));
+    clear();
+}
+
+pub fn leave_alt() {
+    if RAW.swap(false, Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+pub fn clear() {
+    print!("\x1b[2J\x1b[H");
+    flush();
+}
+
+// Print a line, honoring raw mode's need for carriage returns.
+pub fn line(s: &str) {
+    if is_raw() {
+        print!("{}\r\n", s.replace('\n', "\r\n"));
+        flush();
+    } else {
+        println!("{s}");
+    }
+}
+
+// Stream a chunk of text (no trailing newline), translating newlines in raw mode.
+pub fn write_stream(chunk: &str) {
+    // Only allocate the \r\n translation when the chunk actually has a newline;
+    // the vast majority of token deltas don't.
+    if is_raw() && chunk.contains('\n') {
+        print!("{}", chunk.replace('\n', "\r\n"));
+    } else {
+        print!("{chunk}");
+    }
+    flush();
+}
+
+pub fn flush() {
+    let _ = io::stdout().flush();
+}
+
+// Non-blocking: drain pending key events and report whether Ctrl-C was pressed
+// during a running turn (raw mode only). Lets the agent loop bail between steps.
+pub fn interrupted() -> bool {
+    if !is_raw() {
+        return false;
+    }
+    let mut hit = false;
+    while poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(k)) = read() {
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                hit = true;
+            }
+        }
+    }
+    hit
+}
+
+// Read one line after printing `prompt`. Raw mode uses a key-driven editor;
+// otherwise cooked stdin. Returns None on EOF / Ctrl-C / Ctrl-D.
+pub fn ask(prompt: &str) -> Option<String> {
+    if is_raw() {
+        read_line_raw(prompt)
+    } else {
+        print!("{prompt}");
+        flush();
+        let mut buf = String::new();
+        let n = io::stdin().lock().read_line(&mut buf).unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        Some(buf.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
+fn history() -> &'static std::sync::Mutex<Vec<String>> {
+    static H: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+// Repaint the editable buffer from a fixed start column, then position the
+// cursor. Treats one char as one column (CJK width is approximate).
+fn redraw(start: (u16, u16), buf: &[char], cursor: usize) {
+    let mut out = io::stdout();
+    let s: String = buf.iter().collect();
+    let _ = queue!(out, MoveTo(start.0, start.1), Clear(ClearType::UntilNewLine));
+    let _ = write!(out, "{s}");
+    let _ = queue!(out, MoveTo(start.0.saturating_add(cursor as u16), start.1));
+    let _ = out.flush();
+}
+
+// Full raw-mode line editor: cursor movement, word/line kill, history, paste.
+fn read_line_raw(prompt: &str) -> Option<String> {
+    print!("{prompt}");
+    flush();
+    let start = crossterm::cursor::position().unwrap_or((0, 0));
+    let mut buf: Vec<char> = Vec::new();
+    let mut cursor = 0usize;
+    let mut hist_idx: Option<usize> = None;
+
+    loop {
+        let ev = match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
+            Ok(Event::Paste(s)) => {
+                for c in s.chars().filter(|c| *c != '\n' && *c != '\r') {
+                    buf.insert(cursor, c);
+                    cursor += 1;
+                }
+                redraw(start, &buf, cursor);
+                continue;
+            }
+            Ok(_) => continue,
+            Err(_) => return None,
+        };
+        let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+        match ev.code {
+            KeyCode::Char('c') if ctrl => {
+                print!("\r\n");
+                flush();
+                return None;
+            }
+            KeyCode::Char('d') if ctrl => {
+                if buf.is_empty() {
+                    print!("\r\n");
+                    flush();
+                    return None;
+                }
+            }
+            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor); }
+            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor); }
+            KeyCode::Char('u') if ctrl => { buf.clear(); cursor = 0; redraw(start, &buf, cursor); }
+            KeyCode::Char('w') if ctrl => {
+                let mut i = cursor;
+                while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
+                while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
+                buf.drain(i..cursor);
+                cursor = i;
+                redraw(start, &buf, cursor);
+            }
+            KeyCode::Char(c) if !ctrl => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor); }
+            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(start, &buf, cursor); } }
+            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(start, &buf, cursor); } }
+            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(start, &buf, cursor); }
+            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(start, &buf, cursor); } }
+            KeyCode::Home => { cursor = 0; redraw(start, &buf, cursor); }
+            KeyCode::End => { cursor = buf.len(); redraw(start, &buf, cursor); }
+            KeyCode::Up => {
+                if let Ok(h) = history().lock() {
+                    if !h.is_empty() {
+                        let idx = match hist_idx { None => h.len() - 1, Some(0) => 0, Some(i) => i - 1 };
+                        hist_idx = Some(idx);
+                        buf = h[idx].chars().collect();
+                        cursor = buf.len();
+                    }
+                }
+                redraw(start, &buf, cursor);
+            }
+            KeyCode::Down => {
+                if let Ok(h) = history().lock() {
+                    match hist_idx {
+                        Some(i) if i + 1 < h.len() => { hist_idx = Some(i + 1); buf = h[i + 1].chars().collect(); cursor = buf.len(); }
+                        _ => { hist_idx = None; buf.clear(); cursor = 0; }
+                    }
+                }
+                redraw(start, &buf, cursor);
+            }
+            KeyCode::Enter => {
+                print!("\r\n");
+                flush();
+                let s: String = buf.iter().collect();
+                if !s.trim().is_empty() {
+                    if let Ok(mut h) = history().lock() {
+                        if h.last().map(String::as_str) != Some(s.as_str()) {
+                            h.push(s.clone());
+                        }
+                    }
+                }
+                return Some(s);
+            }
+            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor); }
+            _ => {}
+        }
+    }
+}
+
+// Run `work` while a spinner animates, so a blocking model call never looks
+// frozen. Spinner is erased before returning.
+pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
+    let running = Arc::new(AtomicBool::new(true));
+    let r2 = running.clone();
+    let label = label.to_string();
+    let spinner = thread::spawn(move || {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let mut i = 0usize;
+        while r2.load(Ordering::Relaxed) {
+            print!("\r{} {}", cyan(&frames[i % frames.len()].to_string()), dim(&label));
+            flush();
+            i += 1;
+            // Sleep in small slices so we notice completion within ~10ms instead
+            // of parking the full frame interval past the work finishing.
+            for _ in 0..8 {
+                if !r2.load(Ordering::Relaxed) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let result = work();
+    running.store(false, Ordering::Relaxed);
+    let _ = spinner.join();
+    print!("\r\x1b[2K"); // erase spinner line
+    flush();
+    result
+}
