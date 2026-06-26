@@ -1,0 +1,27 @@
+[package]
+name = "buildwithnexus"
+version = "0.1.0"
+edition = "2021"
+description = "A hilariously fast agentic AI CLI harness — remote or local models, alternate-screen TUI"
+license = "MIT"
+repository = "https://github.com/garretts-apps/buildwithnexus"
+default-run = "buildwithnexus"
+
+[[bin]]
+name = "buildwithnexus"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
+crossterm = "0.28"
+# Blocking HTTP with rustls — no async runtime, fast cold start, one TLS stack.
+ureq = { version = "2.10", features = ["json", "tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
