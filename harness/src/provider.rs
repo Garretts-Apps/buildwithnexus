@@ -139,12 +139,20 @@ fn parse_args(args: &str) -> Value {
 // Iterate `data:` payloads of an SSE stream, handing each JSON value to `f`.
 // `f` returns true to stop early (e.g. on [DONE]).
 fn for_each_sse(resp: ureq::Response, mut f: impl FnMut(&str) -> bool) {
-    let reader = BufReader::new(resp.into_reader());
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let Some(payload) = line.strip_prefix("data:") else { continue };
-        if f(payload.trim()) {
-            break;
+    // Reuse one buffer across lines instead of allocating a String per line.
+    let mut reader = BufReader::with_capacity(32 * 1024, resp.into_reader());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if let Some(payload) = line.strip_prefix("data:") {
+                    if f(payload.trim()) {
+                        break;
+                    }
+                }
+            }
         }
     }
 }

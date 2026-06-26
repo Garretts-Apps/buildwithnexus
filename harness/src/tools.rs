@@ -201,12 +201,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
-            let count = body.matches(old).count();
-            if old.is_empty() || count == 0 {
+            if old.is_empty() {
                 return err("`old` text not found in file");
             }
-            if count > 1 {
-                return err(format!("`old` text is not unique ({count} matches) — add context"));
+            // One pass to locate, a partial pass to confirm uniqueness — instead
+            // of matches().count() (materializes all) plus a separate replace.
+            let Some(first) = body.find(old) else {
+                return err("`old` text not found in file");
+            };
+            if body[first + old.len()..].contains(old) {
+                return err("`old` text is not unique — add surrounding context");
             }
             match fs::write(&p, body.replacen(old, new, 1)) {
                 Ok(_) => ok(format!("edited {}", p.display())),
