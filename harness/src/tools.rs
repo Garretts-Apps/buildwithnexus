@@ -76,12 +76,20 @@ fn resolve(cwd: &Path, p: &str) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
 }
 
-fn truncate(mut s: String, max: usize) -> String {
-    if s.len() > max {
-        s.truncate(max);
-        s.push_str("\n…[truncated]");
+fn truncate(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
     }
-    s
+    // Back off to a UTF-8 char boundary — String::truncate / slicing panics if
+    // `max` lands inside a multibyte glyph, which arbitrary file/command output
+    // can easily produce.
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = s[..end].to_string();
+    out.push_str("\n…[truncated]");
+    out
 }
 
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
