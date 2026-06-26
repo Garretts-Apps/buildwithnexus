@@ -1,10 +1,11 @@
 'use strict';
 // Get a working native binary on `npm install`, then walk the user into setup.
-// Order: already present → download prebuilt release → build from source.
-// Never hard-fails the install (a thrown postinstall aborts `npm i`).
+// Order: already present -> download a checksum-verified prebuilt -> build from
+// source. Never hard-fails the install (a thrown postinstall aborts `npm i`).
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const { ROOT, ext, target, installedBinary, existing } = require('./resolve-binary.js');
 
@@ -14,25 +15,53 @@ function log(m) {
   process.stdout.write(m + '\n');
 }
 
-function download(url, dest, redirects = 0) {
+// Only ever fetch from GitHub's own hosts, including on redirects.
+function allowedHost(u) {
+  const h = new URL(u).host;
+  return h === 'github.com' || h === 'objects.githubusercontent.com' || h.endsWith('.githubusercontent.com');
+}
+
+function get(url, redirects, onResponse) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
+    if (!allowedHost(url)) return reject(new Error(`refusing non-GitHub host ${new URL(url).host}`));
     https.get(url, { headers: { 'user-agent': 'buildwithnexus-installer' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        return resolve(download(res.headers.location, dest, redirects + 1));
+        const next = new URL(res.headers.location, url).toString();
+        return resolve(get(next, redirects + 1, onResponse));
       }
       if (res.statusCode !== 200) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      const file = fs.createWriteStream(dest);
-      res.pipe(file);
-      file.on('finish', () => file.close(() => resolve()));
-      file.on('error', reject);
+      onResponse(res, resolve, reject);
     }).on('error', reject);
   });
+}
+
+function fetchText(url) {
+  return get(url, 0, (res, resolve, reject) => {
+    let s = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => (s += c));
+    res.on('end', () => resolve(s));
+    res.on('error', reject);
+  });
+}
+
+function download(url, dest) {
+  return get(url, 0, (res, resolve, reject) => {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const file = fs.createWriteStream(dest);
+    res.pipe(file);
+    file.on('finish', () => file.close(() => resolve()));
+    file.on('error', reject);
+  });
+}
+
+function sha256(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
 function hasCargo() {
@@ -61,14 +90,25 @@ async function obtain() {
   const t = target();
   if (t) {
     const asset = `buildwithnexus-${t}${ext()}`;
-    const url = `https://github.com/Garretts-Apps/buildwithnexus/releases/download/v${pkg.version}/${asset}`;
+    const base = `https://github.com/Garretts-Apps/buildwithnexus/releases/download/v${pkg.version}`;
+    const tmp = installedBinary() + '.download';
     try {
-      await download(url, installedBinary());
+      log('buildwithnexus: downloading prebuilt binary…');
+      // Fetch the expected hash first; refuse to install anything that doesn't match.
+      const expected = (await fetchText(`${base}/${asset}.sha256`)).trim().split(/\s+/)[0];
+      if (!/^[0-9a-f]{64}$/i.test(expected || '')) throw new Error('missing/invalid checksum');
+      await download(`${base}/${asset}`, tmp);
+      const got = sha256(tmp);
+      if (got.toLowerCase() !== expected.toLowerCase()) {
+        throw new Error('checksum mismatch — refusing to install');
+      }
+      fs.renameSync(tmp, installedBinary());
       try { fs.chmodSync(installedBinary(), 0o755); } catch {}
-      log('buildwithnexus: installed prebuilt binary.');
+      log('buildwithnexus: installed prebuilt binary (sha256 verified).');
       return true;
-    } catch {
-      // no release asset yet — fall through to a source build
+    } catch (e) {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
+      log(`buildwithnexus: prebuilt unavailable (${e.message}); falling back to source build…`);
     }
   }
 
