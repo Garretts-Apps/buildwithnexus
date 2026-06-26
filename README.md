@@ -71,9 +71,11 @@ Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
 
 Run your own commands at the same lifecycle points as Claude Code, configured in
 `~/.buildwithnexus/settings.json` (user) and/or `.buildwithnexus/settings.json`
-(project) — both apply. Events: `SessionStart`, `UserPromptSubmit`,
-`PreToolUse`, `PostToolUse`, `Stop`, `SessionEnd`. Each hook command receives the
-event as JSON on stdin.
+(project). User hooks are always active; **project hooks run only after you trust
+that folder** (you're prompted once, and a project hook may *deny* a tool but
+never *grant* one — so cloning a hostile repo can't run or unlock anything).
+Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`,
+`SessionEnd`. Each hook command receives the event as JSON on stdin.
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
 `permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
@@ -99,8 +101,21 @@ bash scripts/vendor.sh                                      # vendor deps for of
 ```
 
 The npm package is a thin wrapper: `postinstall` downloads the prebuilt binary
-for your platform from the GitHub Release, falling back to a `cargo` build (using
-vendored deps when present).
+for your platform from the GitHub Release and **verifies its SHA-256** before
+use, falling back to a `cargo` build (using vendored deps when present). Releases
+also carry build-provenance attestations (`gh attestation verify`).
+
+## Safety
+
+- Default permission is **ask** — every file write, edit, and command is
+  confirmed. `auto` ("yolo") and `readonly` are opt-in.
+- File tools are confined to the working directory; reads outside it, and of
+  sensitive paths (the key store, `~/.ssh`, `.env`, `*.pem`), require
+  confirmation even in `auto`. Catastrophic commands (`rm -rf /`, `mkfs`, …) too.
+- API keys are never sent to a non-HTTPS endpoint, and key-like tokens are
+  redacted from surfaced errors.
+- In non-interactive / `--json` runs, anything that would prompt is denied
+  rather than blocking.
 
 ## License
 
