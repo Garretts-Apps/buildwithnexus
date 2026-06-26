@@ -1,21 +1,19 @@
 name: Publish to npm
 
-# Triggers (any of these fires the publish):
-#   - push of a v* tag
-#   - workflow_dispatch (UI "Run workflow")
-#   - push to main that touches `.publish-trigger`
-#
 # The published package is a thin, zero-dependency wrapper: `postinstall`
 # fetches the SHA-256-verified prebuilt binary for the user's platform from the
-# GitHub Release (built by release.yml on the same tag), falling back to a cargo
-# build. So publishing is just `npm publish` of the wrapper — no bundle step.
+# GitHub Release, falling back to a cargo build. So publishing is just
+# `npm publish` of the wrapper — no bundle step.
+#
+# Sequencing: publishing is chained off the `release` workflow's COMPLETION, not
+# the raw `v*` tag. release.yml builds and attaches the per-platform binaries on
+# the tag; only once that whole workflow succeeds do we publish to npm — so a
+# user never installs a version whose binaries aren't up yet (the postinstall
+# fast path). workflow_dispatch stays for manual/emergency publishes.
 on:
-  push:
-    branches: [main]
-    paths:
-      - .publish-trigger
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version_bump:
@@ -39,6 +37,12 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Gate: a successful `release` run on a v* tag, or a manual dispatch.
+    # Without this, a failed or non-tag release run would still publish.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           startsWith(github.event.workflow_run.head_branch, 'v')) }}
     permissions:
       contents: write
       id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
@@ -48,6 +52,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # On the release-triggered path, publish exactly the tagged commit the
+          # binaries were built from; on manual dispatch, the current branch.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
           token: ${{ secrets.NPM_PERMISSIONED_TOKEN }}
           persist-credentials: true
           submodules: false
@@ -61,9 +68,9 @@ jobs:
           # registry-url + .npmrc with NODE_AUTH_TOKEN fights that flow.
 
       - name: Bump version + tag
-        if: |
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none') ||
-          (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+        # Only the manual path bumps; the release-triggered path publishes the
+        # already-tagged version as-is.
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none' }}
         run: |
           set -e
           BUMP="${{ github.event.inputs.version_bump || 'patch' }}"
