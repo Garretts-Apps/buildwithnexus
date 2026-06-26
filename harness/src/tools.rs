@@ -26,6 +26,14 @@ fn err(s: impl Into<String>) -> Outcome { Outcome { content: s.into(), is_error:
 const MAX_READ: usize = 100 * 1024;
 const MAX_OUT: usize = 16 * 1024;
 
+// Exposed only for the criterion perf suite (see provider::bench).
+#[doc(hidden)]
+pub mod bench {
+    use std::path::{Path, PathBuf};
+    pub fn normalize(p: &Path) -> PathBuf { super::normalize(p) }
+    pub fn truncate(s: String, max: usize) -> String { super::truncate(s, max) }
+}
+
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
         ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents.",
@@ -246,5 +254,291 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             finished: true,
         },
         other => err(format!("unknown tool: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ── truncate ────────────────────────────────────────────────────────────
+    #[test]
+    fn truncate_shorter_than_max_unchanged() {
+        assert_eq!(truncate("hello".into(), 100), "hello");
+    }
+
+    #[test]
+    fn truncate_appends_marker() {
+        let out = truncate("abcdefghij".into(), 5);
+        assert!(out.starts_with("abcde"));
+        assert!(out.contains("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_backs_off_to_char_boundary() {
+        // "é" is two bytes; cutting at an odd byte must not panic and must yield
+        // valid UTF-8.
+        let s = "a".to_string() + &"é".repeat(50); // 1 + 100 bytes
+        let out = truncate(s, 4); // 4 lands mid-glyph
+        assert!(out.is_char_boundary(out.find('\n').unwrap_or(out.len())));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_emoji_boundary() {
+        let s = "🎉".repeat(10); // 4 bytes each
+        let out = truncate(s, 5); // mid-emoji
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_exactly_max_unchanged() {
+        assert_eq!(truncate("abcde".into(), 5), "abcde");
+    }
+
+    // ── is_sensitive ────────────────────────────────────────────────────────
+    #[test]
+    fn sensitive_paths() {
+        for p in [
+            "/home/u/.ssh/id_rsa",
+            "/home/u/.aws/credentials",
+            "/home/u/.gnupg/secring.gpg",
+            "/home/u/.buildwithnexus/.env.keys",
+            "/proj/.env",
+            "/proj/.env.local",
+            "/proj/server.pem",
+            "/home/u/id_ed25519",
+        ] {
+            assert!(is_sensitive(Path::new(p)), "{p} should be sensitive");
+        }
+    }
+
+    #[test]
+    fn non_sensitive_paths() {
+        for p in ["/proj/src/main.rs", "/proj/README.md", "/proj/environment.txt"] {
+            assert!(!is_sensitive(Path::new(p)), "{p} should not be sensitive");
+        }
+    }
+
+    #[test]
+    fn sensitive_is_case_insensitive() {
+        assert!(is_sensitive(Path::new("/home/U/.SSH/known_hosts")));
+    }
+
+    // ── escapes_cwd ─────────────────────────────────────────────────────────
+    #[test]
+    fn escapes_cwd_detects_parent_traversal() {
+        let cwd = PathBuf::from("/proj/work");
+        assert!(escapes_cwd(Path::new("/proj/work/../../etc/passwd"), &cwd));
+        assert!(escapes_cwd(Path::new("/etc/passwd"), &cwd));
+    }
+
+    #[test]
+    fn escapes_cwd_allows_inside() {
+        let cwd = PathBuf::from("/proj/work");
+        // Use a non-existent dir so canonicalize falls back to lexical normalize.
+        assert!(!escapes_cwd(Path::new("/proj/work/src/a.rs"), &cwd));
+        assert!(!escapes_cwd(Path::new("/proj/work/a/../b.rs"), &cwd));
+    }
+
+    // ── catastrophic ────────────────────────────────────────────────────────
+    #[test]
+    fn catastrophic_commands() {
+        for c in [
+            "rm -rf /",
+            "rm   -rf   /",
+            "rm -fr /home",
+            ":(){ :|:& };:",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "echo x > /dev/sda",
+            "chmod -R 777 /",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+    }
+
+    #[test]
+    fn non_catastrophic_commands() {
+        for c in ["ls -la", "rm -rf ./build", "cargo test", "git status", "rm file.txt"] {
+            assert!(!catastrophic(c), "{c} should be allowed");
+        }
+    }
+
+    // ── normalize ───────────────────────────────────────────────────────────
+    #[test]
+    fn normalize_folds_dot_segments() {
+        assert_eq!(normalize(Path::new("a/./b/../c")), PathBuf::from("a/c"));
+        assert_eq!(normalize(Path::new("./x")), PathBuf::from("x"));
+    }
+
+    // ── is_mutating / touched_path / preview ────────────────────────────────
+    #[test]
+    fn mutating_classification() {
+        assert!(is_mutating("write_file"));
+        assert!(is_mutating("edit_file"));
+        assert!(is_mutating("run_command"));
+        assert!(!is_mutating("read_file"));
+        assert!(!is_mutating("list_dir"));
+        assert!(!is_mutating("finish"));
+    }
+
+    #[test]
+    fn touched_path_only_for_file_tools() {
+        let cwd = Path::new("/proj");
+        assert!(touched_path("read_file", &json!({"path": "a.rs"}), cwd).is_some());
+        assert!(touched_path("run_command", &json!({"command": "ls"}), cwd).is_none());
+        assert!(touched_path("finish", &json!({}), cwd).is_none());
+    }
+
+    #[test]
+    fn touched_path_resolves_relative_to_cwd() {
+        let cwd = Path::new("/proj");
+        assert_eq!(
+            touched_path("read_file", &json!({"path": "src/a.rs"}), cwd),
+            Some(PathBuf::from("/proj/src/a.rs"))
+        );
+    }
+
+    #[test]
+    fn preview_strings() {
+        assert_eq!(preview("write_file", &json!({"path": "a"})), "write a");
+        assert_eq!(preview("run_command", &json!({"command": "ls"})), "run: ls");
+        assert_eq!(preview("read_file", &json!({})), "read_file");
+    }
+
+    #[test]
+    fn defs_includes_subagent_only_when_requested() {
+        assert!(!defs(false).iter().any(|d| d.name == "spawn_subagent"));
+        assert!(defs(true).iter().any(|d| d.name == "spawn_subagent"));
+    }
+
+    // ── run: filesystem tools against a tempdir ─────────────────────────────
+    fn tempdir() -> PathBuf {
+        // Unique-enough path without external deps or Date/random (which the
+        // harness forbids): use the test thread name + an atomic counter.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let tn = std::thread::current().name().unwrap_or("t").replace("::", "_");
+        let dir = std::env::temp_dir().join(format!("bwn-test-{tn}-{id}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn run_write_then_read_roundtrip() {
+        let d = tempdir();
+        let w = run("write_file", &json!({"path": "f.txt", "content": "hi"}), &d);
+        assert!(!w.is_error);
+        let r = run("read_file", &json!({"path": "f.txt"}), &d);
+        assert_eq!(r.content, "hi");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_write_creates_parent_dirs() {
+        let d = tempdir();
+        let w = run("write_file", &json!({"path": "a/b/c.txt", "content": "x"}), &d);
+        assert!(!w.is_error);
+        assert!(d.join("a/b/c.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_read_missing_file_errors() {
+        let d = tempdir();
+        let r = run("read_file", &json!({"path": "nope.txt"}), &d);
+        assert!(r.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_unique_match() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "f.txt", "content": "alpha beta gamma"}), &d);
+        let e = run("edit_file", &json!({"path": "f.txt", "old": "beta", "new": "BETA"}), &d);
+        assert!(!e.is_error);
+        let r = run("read_file", &json!({"path": "f.txt"}), &d);
+        assert_eq!(r.content, "alpha BETA gamma");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_non_unique_match_errors() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "f.txt", "content": "x x"}), &d);
+        let e = run("edit_file", &json!({"path": "f.txt", "old": "x", "new": "y"}), &d);
+        assert!(e.is_error);
+        assert!(e.content.contains("not unique"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_not_found_errors() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "f.txt", "content": "abc"}), &d);
+        let e = run("edit_file", &json!({"path": "f.txt", "old": "zzz", "new": "y"}), &d);
+        assert!(e.is_error);
+        assert!(e.content.contains("not found"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_empty_old_errors() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "f.txt", "content": "abc"}), &d);
+        let e = run("edit_file", &json!({"path": "f.txt", "old": "", "new": "y"}), &d);
+        assert!(e.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_list_dir_sorted() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "b.txt", "content": ""}), &d);
+        run("write_file", &json!({"path": "a.txt", "content": ""}), &d);
+        let r = run("list_dir", &json!({"path": "."}), &d);
+        let lines: Vec<&str> = r.content.lines().collect();
+        assert_eq!(lines, vec!["a.txt", "b.txt"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_command_captures_output_and_exit() {
+        let d = tempdir();
+        let r = run("run_command", &json!({"command": "echo hello"}), &d);
+        assert!(!r.is_error);
+        assert!(r.content.contains("hello"));
+        assert!(r.content.contains("[exit 0]"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_command_nonzero_is_error() {
+        let d = tempdir();
+        let r = run("run_command", &json!({"command": "exit 3"}), &d);
+        assert!(r.is_error);
+        assert!(r.content.contains("[exit 3]"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_finish_sets_finished_flag() {
+        let d = tempdir();
+        let r = run("finish", &json!({"summary": "all done"}), &d);
+        assert!(r.finished);
+        assert_eq!(r.content, "all done");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_unknown_tool_errors() {
+        let d = tempdir();
+        let r = run("bogus", &json!({}), &d);
+        assert!(r.is_error);
+        let _ = fs::remove_dir_all(&d);
     }
 }

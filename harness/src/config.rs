@@ -170,3 +170,169 @@ fn restrict(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Tests here mutate process-global env (NEXUS_HOME and key vars); serialize
+    // them so parallel runs don't clobber each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_home() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("bwn-cfg-{id}"))
+    }
+
+    // ── mask ────────────────────────────────────────────────────────────────
+    #[test]
+    fn mask_short_keys_fully_hidden() {
+        assert_eq!(mask("short"), "***");
+        assert_eq!(mask("12345678"), "***");
+        assert_eq!(mask(""), "***");
+    }
+
+    #[test]
+    fn mask_reveals_head_and_tail() {
+        let m = mask("sk-abcdefghijklmnopqrstuvwxyz");
+        assert!(m.contains('…'));
+        assert!(m.starts_with("sk"));
+        assert!(m.ends_with("yz"));
+    }
+
+    #[test]
+    fn mask_never_leaks_more_than_clamp() {
+        // Even a very long key reveals at most 4 chars each side.
+        let key = "A".repeat(200);
+        let m = mask(&key);
+        let head = m.split('…').next().unwrap();
+        assert!(head.len() <= 4);
+    }
+
+    // ── preset ──────────────────────────────────────────────────────────────
+    #[test]
+    fn preset_lookup() {
+        assert!(preset("anthropic").unwrap().protocol == Protocol::Anthropic);
+        assert!(preset("ollama").unwrap().protocol == Protocol::OpenAi);
+        assert!(preset("ollama").unwrap().local);
+        assert!(preset("nonexistent").is_none());
+    }
+
+    #[test]
+    fn all_presets_have_distinct_ids() {
+        for (i, a) in PRESETS.iter().enumerate() {
+            for b in &PRESETS[i + 1..] {
+                assert_ne!(a.id, b.id);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_presets_use_https() {
+        for p in PRESETS.iter().filter(|p| !p.local) {
+            assert!(p.base_url.starts_with("https://"), "{} not https", p.id);
+            assert!(!p.env_key.is_empty(), "{} missing env_key", p.id);
+        }
+    }
+
+    // ── settings default ────────────────────────────────────────────────────
+    #[test]
+    fn settings_default_is_ask() {
+        let s = Settings::default();
+        assert_eq!(s.permission, "ask");
+        assert_eq!(s.provider, "anthropic");
+        assert!(s.base_url.is_none());
+    }
+
+    #[test]
+    fn settings_roundtrip_json() {
+        let s = Settings { provider: "ollama".into(), model: "llama3.2".into(),
+            permission: "auto".into(), base_url: Some("http://x".into()) };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.provider, "ollama");
+        assert_eq!(back.base_url.as_deref(), Some("http://x"));
+    }
+
+    #[test]
+    fn settings_tolerates_missing_base_url() {
+        let s: Settings = serde_json::from_str(
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#).unwrap();
+        assert!(s.base_url.is_none());
+    }
+
+    // ── keys file parsing + precedence ──────────────────────────────────────
+    #[test]
+    fn keys_file_parsing_and_env_precedence() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        std::env::remove_var("TESTKEY_A");
+        std::env::remove_var("TESTKEY_B");
+
+        // Lines with no '=' and a leading '=' are ignored; valid pairs kept.
+        fs::write(h.join(".env.keys"),
+            "TESTKEY_A=from_file\nb=garbage_no_eq_handled\n=leadingeq\nTESTKEY_B=second\n").unwrap();
+
+        let map = read_keys_file();
+        assert_eq!(map.get("TESTKEY_A").map(String::as_str), Some("from_file"));
+        assert_eq!(map.get("TESTKEY_B").map(String::as_str), Some("second"));
+        assert!(!map.contains_key(""));
+
+        // File value when env unset.
+        assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_file"));
+        // Env overrides file.
+        std::env::set_var("TESTKEY_A", "from_env");
+        assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_env"));
+        // Blank env is ignored, file used.
+        std::env::set_var("TESTKEY_A", "   ");
+        assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_file"));
+        // Empty name → None.
+        assert!(load_key("").is_none());
+
+        std::env::remove_var("TESTKEY_A");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn save_and_load_key_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        std::env::set_var("NEXUS_HOME", &h);
+        std::env::remove_var("RTKEY");
+
+        save_key("RTKEY", "secret-value");
+        assert_eq!(load_key("RTKEY").as_deref(), Some("secret-value"));
+        // Overwrite preserves other keys.
+        save_key("OTHER", "x");
+        save_key("RTKEY", "updated");
+        assert_eq!(load_key("RTKEY").as_deref(), Some("updated"));
+        assert_eq!(load_key("OTHER").as_deref(), Some("x"));
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn load_settings_none_when_absent() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        assert!(load_settings().is_none());
+        let s = Settings { provider: "groq".into(), model: String::new(),
+            permission: "ask".into(), base_url: None };
+        save_settings(&s);
+        assert_eq!(load_settings().unwrap().provider, "groq");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+}

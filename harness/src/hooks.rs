@@ -249,3 +249,125 @@ pub fn notify(event: &str, cwd: &Path) {
         let _ = run_one(cmd, &payload, cwd);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── matches ─────────────────────────────────────────────────────────────
+    #[test]
+    fn matches_wildcard_and_empty() {
+        assert!(matches("*", "anything"));
+        assert!(matches("", "anything"));
+        assert!(matches("  ", "anything"));
+    }
+
+    #[test]
+    fn matches_exact() {
+        assert!(matches("run_command", "run_command"));
+        assert!(!matches("run_command", "write_file"));
+    }
+
+    #[test]
+    fn matches_pipe_list_with_spaces() {
+        assert!(matches("write_file | edit_file", "edit_file"));
+        assert!(matches("a|b|c", "b"));
+        assert!(!matches("a|b|c", "d"));
+    }
+
+    // ── digest ──────────────────────────────────────────────────────────────
+    #[test]
+    fn digest_is_stable_and_sensitive() {
+        assert_eq!(digest("hello"), digest("hello"));
+        assert_ne!(digest("hello"), digest("hello!"));
+        assert_eq!(digest("hello").len(), 16);
+    }
+
+    #[test]
+    fn digest_empty() {
+        assert_eq!(digest("").len(), 16);
+    }
+
+    // ── decision_field ──────────────────────────────────────────────────────
+    #[test]
+    fn decision_field_reads_all_shapes() {
+        assert_eq!(decision_field(&json!({"hookSpecificOutput": {"permissionDecision": "deny"}})), Some("deny"));
+        assert_eq!(decision_field(&json!({"permissionDecision": "allow"})), Some("allow"));
+        assert_eq!(decision_field(&json!({"decision": "block"})), Some("block"));
+        assert_eq!(decision_field(&json!({"unrelated": 1})), None);
+    }
+
+    #[test]
+    fn decision_field_prefers_specific_output() {
+        let v = json!({
+            "hookSpecificOutput": {"permissionDecision": "allow"},
+            "permissionDecision": "deny"
+        });
+        assert_eq!(decision_field(&v), Some("allow"));
+    }
+
+    // ── parse_into ──────────────────────────────────────────────────────────
+    #[test]
+    fn parse_into_extracts_command_hooks() {
+        let text = r#"{
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "run_command",
+                      "hooks": [{ "type": "command", "command": "echo hi" }] }
+                ]
+            }
+        }"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Home, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event, "PreToolUse");
+        assert_eq!(out[0].matcher, "run_command");
+        assert_eq!(out[0].command, "echo hi");
+    }
+
+    #[test]
+    fn parse_into_defaults_matcher_to_star() {
+        let text = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"x"}]}]}}"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Project, &mut out);
+        assert_eq!(out[0].matcher, "*");
+    }
+
+    #[test]
+    fn parse_into_skips_non_command_hooks() {
+        let text = r#"{"hooks":{"Stop":[{"hooks":[{"type":"webhook","url":"x"}]}]}}"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Home, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_into_ignores_malformed_json() {
+        let mut out = Vec::new();
+        parse_into("not json at all", Source::Home, &mut out);
+        parse_into("{}", Source::Home, &mut out);
+        parse_into(r#"{"hooks": "wrong type"}"#, Source::Home, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_into_handles_multiple_events_and_hooks() {
+        let text = r#"{
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "a", "hooks": [
+                        {"type":"command","command":"c1"},
+                        {"type":"command","command":"c2"}
+                    ]}
+                ],
+                "PostToolUse": [
+                    { "matcher": "*", "hooks": [{"type":"command","command":"c3"}] }
+                ]
+            }
+        }"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Home, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.iter().filter(|h| h.event == "PreToolUse").count(), 2);
+    }
+}

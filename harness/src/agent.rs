@@ -330,3 +330,96 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── permission ──────────────────────────────────────────────────────────
+    #[test]
+    fn permission_parsing() {
+        assert!(matches!(permission("auto"), Permission::Auto));
+        assert!(matches!(permission("readonly"), Permission::ReadOnly));
+        assert!(matches!(permission("ask"), Permission::Ask));
+        assert!(matches!(permission("anything-else"), Permission::Ask));
+        assert!(matches!(permission(""), Permission::Ask));
+    }
+
+    // ── role ────────────────────────────────────────────────────────────────
+    #[test]
+    fn role_selection() {
+        assert!(role("researcher").system.contains("research"));
+        assert!(role("engineer").system.contains("software engineer"));
+        // Unknown roles fall back to the engineer prompt.
+        assert!(role("ceo").system.contains("software engineer"));
+    }
+
+    // ── gate ────────────────────────────────────────────────────────────────
+    // These run with a non-terminal stdin, so any path that would prompt resolves
+    // to a denial (Some(reason)) rather than blocking.
+    #[test]
+    fn gate_auto_allows_ordinary_mutation() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Auto, "write_file", &json!({"path": "a.txt", "content": "x"}), cwd);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn gate_auto_still_confirms_sensitive_path() {
+        let cwd = Path::new("/proj");
+        // Sensitive even under auto → would prompt → denied in non-terminal tests.
+        let r = gate(Permission::Auto, "read_file", &json!({"path": "/proj/.env"}), cwd);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn gate_auto_confirms_catastrophic_command() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Auto, "run_command", &json!({"command": "rm -rf /"}), cwd);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn gate_auto_allows_safe_command() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Auto, "run_command", &json!({"command": "ls"}), cwd);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn gate_readonly_blocks_mutation() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::ReadOnly, "write_file", &json!({"path": "a", "content": "x"}), cwd);
+        assert!(r.unwrap().contains("read-only"));
+    }
+
+    #[test]
+    fn gate_readonly_blocks_out_of_cwd_read() {
+        let cwd = Path::new("/proj/work");
+        let r = gate(Permission::ReadOnly, "read_file", &json!({"path": "/etc/passwd"}), cwd);
+        assert!(r.unwrap().contains("outside"));
+    }
+
+    #[test]
+    fn gate_readonly_allows_in_cwd_read() {
+        let cwd = Path::new("/proj/work");
+        let r = gate(Permission::ReadOnly, "read_file", &json!({"path": "/proj/work/a.rs"}), cwd);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn gate_ask_prompts_for_mutation() {
+        let cwd = Path::new("/proj");
+        // Would prompt → denied in non-terminal test env.
+        let r = gate(Permission::Ask, "write_file", &json!({"path": "a", "content": "x"}), cwd);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn gate_ask_allows_in_cwd_read() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Ask, "read_file", &json!({"path": "/proj/a.rs"}), cwd);
+        assert!(r.is_none());
+    }
+}

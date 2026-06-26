@@ -6,7 +6,7 @@
 // `complete()` and the streaming `stream()` so there's exactly one place that
 // knows each vendor's JSON shape.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -81,6 +81,25 @@ pub fn prewarm(p: &Provider) {
     });
 }
 
+// Thin wrappers exposing the internal pure helpers to the criterion perf suite
+// without widening the real API (the originals stay private). Not semver-stable.
+#[doc(hidden)]
+pub mod bench {
+    use super::*;
+    pub fn redact(s: &str) -> String { super::redact(s) }
+    pub fn parse_args(s: &str) -> Value { super::parse_args(s) }
+    pub fn cache_last_message(m: &mut [Value]) { super::cache_last_message(m) }
+    pub fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
+        super::anthropic_body(model, msgs, tools)
+    }
+    pub fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
+        super::openai_body(model, msgs, tools)
+    }
+    pub fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+        super::openai_stream(reader, on_text)
+    }
+}
+
 // ── public entry points ────────────────────────────────────────────────────
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
@@ -99,7 +118,7 @@ fn request(p: &Provider, msgs: &[Msg], tools: &[ToolDef], streaming: bool, on_te
             let (req, mut body) = anthropic_request(p, msgs, tools)?;
             if streaming {
                 body["stream"] = json!(true);
-                anthropic_stream(send_raw(req, body)?, on_text)
+                anthropic_stream(send_raw(req, body)?.into_reader(), on_text)
             } else {
                 anthropic_parse(send(req, body)?)
             }
@@ -108,7 +127,7 @@ fn request(p: &Provider, msgs: &[Msg], tools: &[ToolDef], streaming: bool, on_te
             let (req, mut body) = openai_request(p, msgs, tools);
             if streaming {
                 body["stream"] = json!(true);
-                openai_stream(send_raw(req, body)?, on_text)
+                openai_stream(send_raw(req, body)?.into_reader(), on_text)
             } else {
                 openai_parse(send(req, body)?)
             }
@@ -157,10 +176,11 @@ fn parse_args(args: &str) -> Value {
 }
 
 // Iterate `data:` payloads of an SSE stream, handing each JSON value to `f`.
-// `f` returns true to stop early (e.g. on [DONE]).
-fn for_each_sse(resp: ureq::Response, mut f: impl FnMut(&str) -> bool) {
+// `f` returns true to stop early (e.g. on [DONE]). Takes any reader so the
+// streaming parsers are unit-testable against an in-memory byte slice.
+fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
     // Reuse one buffer across lines instead of allocating a String per line.
-    let mut reader = BufReader::with_capacity(32 * 1024, resp.into_reader());
+    let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
     loop {
         line.clear();
@@ -178,7 +198,10 @@ fn for_each_sse(resp: ureq::Response, mut f: impl FnMut(&str) -> bool) {
 }
 
 // ── Anthropic Messages ──────────────────────────────────────────────────────
-fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(ureq::Request, Value), String> {
+// Pure request-body builder, split out from the HTTP wiring so the JSON shape
+// (system caching, tool schema mapping, tool_use/tool_result, the last-message
+// cache breakpoint) is unit-testable without constructing a `ureq::Request`.
+fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
     let mut system = String::new();
     let mut messages: Vec<Value> = Vec::new();
     for m in msgs {
@@ -216,7 +239,7 @@ fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(u
     // prior turns from cache — much lower time-to-first-token on multi-step tasks.
     cache_last_message(&mut messages);
 
-    let mut body = json!({"model": p.model, "max_tokens": 4096, "messages": messages});
+    let mut body = json!({"model": model, "max_tokens": 4096, "messages": messages});
     if !system.is_empty() {
         body["system"] = json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
     }
@@ -225,7 +248,11 @@ fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(u
             "name": t.name, "description": t.description, "input_schema": t.schema
         })).collect::<Vec<_>>());
     }
+    body
+}
 
+fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(ureq::Request, Value), String> {
+    let body = anthropic_body(&p.model, msgs, tools);
     let key = p.api_key.as_deref().ok_or("Anthropic requires an API key")?;
     let req = agent().post(&url(p, "/v1/messages"))
         .set("x-api-key", key)
@@ -268,11 +295,11 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
     Ok(Reply { text, calls })
 }
 
-fn anthropic_stream(resp: ureq::Response, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+fn anthropic_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
     let mut text = String::new();
     // index → (id, name, accumulated input JSON)
     let mut pending: Vec<(usize, String, String, String)> = Vec::new();
-    for_each_sse(resp, |data| {
+    for_each_sse(reader, |data| {
         let Ok(v) = serde_json::from_str::<Value>(data) else { return false };
         match v["type"].as_str() {
             Some("content_block_start") => {
@@ -314,7 +341,8 @@ fn anthropic_stream(resp: ureq::Response, on_text: &mut dyn FnMut(&str)) -> Resu
 }
 
 // ── OpenAI-compatible /chat/completions ─────────────────────────────────────
-fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
+// Pure body builder (see `anthropic_body` for the rationale).
+fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     for m in msgs {
         match m {
@@ -338,14 +366,18 @@ fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Reque
         }
     }
 
-    let mut body = json!({"model": p.model, "messages": messages});
+    let mut body = json!({"model": model, "messages": messages});
     if !tools.is_empty() {
         body["tools"] = json!(tools.iter().map(|t| json!({
             "type": "function",
             "function": {"name": t.name, "description": t.description, "parameters": t.schema}
         })).collect::<Vec<_>>());
     }
+    body
+}
 
+fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
+    let body = openai_body(&p.model, msgs, tools);
     let mut req = agent().post(&url(p, "/chat/completions")).set("content-type", "application/json");
     if let Some(key) = &p.api_key {
         req = req.set("authorization", &format!("Bearer {key}"));
@@ -370,11 +402,11 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
     Ok(Reply { text, calls })
 }
 
-fn openai_stream(resp: ureq::Response, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
     let mut text = String::new();
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
-    for_each_sse(resp, |data| {
+    for_each_sse(reader, |data| {
         if data == "[DONE]" {
             return true;
         }
@@ -408,4 +440,379 @@ fn openai_stream(resp: ureq::Response, on_text: &mut dyn FnMut(&str)) -> Result<
         id, name, input: parse_args(&args),
     }).collect();
     Ok(Reply { text, calls })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn tc(id: &str, name: &str, input: Value) -> ToolCall {
+        ToolCall { id: id.into(), name: name.into(), input }
+    }
+
+    // ── redact ──────────────────────────────────────────────────────────────
+    #[test]
+    fn redact_blanks_known_key_prefixes() {
+        // Prefix tokens must clear the 12-char length floor to be flagged.
+        assert!(redact("error: sk-ABCDEFGHIJKLMNOP failed").contains("[redacted]"));
+        assert!(redact("token AIzaSyABCDEFGHIJKL bad").contains("[redacted]"));
+        assert!(redact("hf_ABCDEFGHIJKLMNOP nope").contains("[redacted]"));
+    }
+
+    #[test]
+    fn redact_blanks_long_opaque_tokens() {
+        // A whitespace-delimited token of >32 alnum chars is treated as secretish.
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"; // 42 alnum
+        assert!(redact(&format!("token {long} end")).contains("[redacted]"));
+        // The surrounding words survive.
+        let out = redact(&format!("token {long} end"));
+        assert!(out.starts_with("token ") && out.ends_with(" end"));
+    }
+
+    #[test]
+    fn redact_leaves_ordinary_text_untouched() {
+        let msg = "the quick brown fox jumps over the lazy dog";
+        assert_eq!(redact(msg), msg);
+        // Short sk- prefixed words are below the length floor and survive.
+        assert_eq!(redact("sk-short"), "sk-short");
+    }
+
+    #[test]
+    fn redact_preserves_punctuation_around_secret() {
+        let out = redact("(\"sk-ABCDEFGHIJKLMNOP\")");
+        assert!(out.contains("[redacted]"));
+        assert!(out.starts_with("(\"") && out.ends_with("\")"));
+    }
+
+    #[test]
+    fn redact_empty_string() {
+        assert_eq!(redact(""), "");
+    }
+
+    // ── parse_args ──────────────────────────────────────────────────────────
+    #[test]
+    fn parse_args_empty_is_object() {
+        assert_eq!(parse_args(""), json!({}));
+        assert_eq!(parse_args("   "), json!({}));
+    }
+
+    #[test]
+    fn parse_args_valid_json() {
+        assert_eq!(parse_args(r#"{"a":1}"#), json!({"a": 1}));
+    }
+
+    #[test]
+    fn parse_args_invalid_is_flagged() {
+        let v = parse_args("not json");
+        assert_eq!(v[crate::tools::INVALID_ARGS], json!("not json"));
+    }
+
+    #[test]
+    fn parse_args_partial_json_is_flagged() {
+        let v = parse_args(r#"{"a":"#);
+        assert_eq!(v[crate::tools::INVALID_ARGS], json!(r#"{"a":"#));
+    }
+
+    // ── cache_last_message ──────────────────────────────────────────────────
+    #[test]
+    fn cache_last_message_empty_is_noop() {
+        let mut m: Vec<Value> = vec![];
+        cache_last_message(&mut m);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn cache_last_message_string_body_becomes_text_block() {
+        let mut m = vec![json!({"role": "user", "content": "hi"})];
+        cache_last_message(&mut m);
+        let block = &m[0]["content"][0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "hi");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_last_message_array_body_marks_last_block() {
+        let mut m = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "a"},
+            {"type": "text", "text": "b"}
+        ]})];
+        cache_last_message(&mut m);
+        assert!(m[0]["content"][0].get("cache_control").is_none());
+        assert_eq!(m[0]["content"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_last_message_only_touches_last() {
+        let mut m = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "user", "content": "second"}),
+        ];
+        cache_last_message(&mut m);
+        assert!(m[0]["content"].is_string());
+        assert_eq!(m[1]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    // ── anthropic_body ──────────────────────────────────────────────────────
+    #[test]
+    fn anthropic_body_merges_system_blocks() {
+        let msgs = vec![
+            Msg::System("one".into()),
+            Msg::System("two".into()),
+            Msg::User("hello".into()),
+        ];
+        let b = anthropic_body("m", &msgs, &[]);
+        assert_eq!(b["system"][0]["text"], "one\n\ntwo");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(b["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn anthropic_body_no_system_no_tools_keys() {
+        let b = anthropic_body("m", &[Msg::User("hi".into())], &[]);
+        assert!(b.get("system").is_none());
+        assert!(b.get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_assistant_text_and_calls() {
+        let msgs = vec![Msg::Assistant {
+            text: "thinking".into(),
+            calls: vec![tc("t1", "read_file", json!({"path": "a"}))],
+        }];
+        let b = anthropic_body("m", &msgs, &[]);
+        let content = &b["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["id"], "t1");
+        assert_eq!(content[1]["name"], "read_file");
+    }
+
+    #[test]
+    fn anthropic_body_empty_assistant_text_omits_text_block() {
+        let msgs = vec![Msg::Assistant {
+            text: String::new(),
+            calls: vec![tc("t1", "x", json!({}))],
+        }];
+        let b = anthropic_body("m", &msgs, &[]);
+        assert_eq!(b["messages"][0]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_body_tool_results() {
+        let msgs = vec![Msg::Tool(vec![ToolResult {
+            id: "t1".into(), content: "ok".into(), is_error: false,
+        }])];
+        let b = anthropic_body("m", &msgs, &[]);
+        let block = &b["messages"][0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "t1");
+        assert_eq!(block["is_error"], false);
+    }
+
+    #[test]
+    fn anthropic_body_maps_tool_schemas() {
+        let tools = crate::tools::defs(false);
+        let b = anthropic_body("m", &[Msg::User("hi".into())], &tools);
+        assert!(b["tools"].as_array().unwrap().len() == tools.len());
+        assert!(b["tools"][0].get("input_schema").is_some());
+    }
+
+    // ── openai_body ─────────────────────────────────────────────────────────
+    #[test]
+    fn openai_body_roles() {
+        let msgs = vec![
+            Msg::System("sys".into()),
+            Msg::User("u".into()),
+        ];
+        let b = openai_body("m", &msgs, &[]);
+        assert_eq!(b["messages"][0]["role"], "system");
+        assert_eq!(b["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn openai_body_assistant_serializes_tool_calls_as_string_args() {
+        let msgs = vec![Msg::Assistant {
+            text: "x".into(),
+            calls: vec![tc("c1", "run_command", json!({"cmd": "ls"}))],
+        }];
+        let b = openai_body("m", &msgs, &[]);
+        let call = &b["messages"][0]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "run_command");
+        // arguments must be a JSON *string*, per the OpenAI shape.
+        assert!(call["function"]["arguments"].is_string());
+        assert_eq!(call["function"]["arguments"], json!({"cmd": "ls"}).to_string());
+    }
+
+    #[test]
+    fn openai_body_tool_results_each_become_a_message() {
+        let msgs = vec![Msg::Tool(vec![
+            ToolResult { id: "a".into(), content: "1".into(), is_error: false },
+            ToolResult { id: "b".into(), content: "2".into(), is_error: true },
+        ])];
+        let b = openai_body("m", &msgs, &[]);
+        assert_eq!(b["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(b["messages"][0]["role"], "tool");
+        assert_eq!(b["messages"][1]["tool_call_id"], "b");
+    }
+
+    #[test]
+    fn openai_body_tool_schema_wraps_function() {
+        let tools = crate::tools::defs(false);
+        let b = openai_body("m", &[Msg::User("hi".into())], &tools);
+        assert_eq!(b["tools"][0]["type"], "function");
+        assert!(b["tools"][0]["function"].get("parameters").is_some());
+    }
+
+    // ── openai_stream ───────────────────────────────────────────────────────
+    fn drain_openai(sse: &str) -> Reply {
+        let mut out = String::new();
+        openai_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t)).unwrap()
+    }
+
+    #[test]
+    fn openai_stream_accumulates_text_and_stops_on_done() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\
+                   data: [DONE]\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"AFTER\"}}]}\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.text, "Hello");
+    }
+
+    #[test]
+    fn openai_stream_assembles_fragmented_tool_call() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"edit_file\",\"arguments\":\"{\\\"pa\"}}]}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a\\\"}\"}}]}}]}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "c1");
+        assert_eq!(r.calls[0].name, "edit_file");
+        assert_eq!(r.calls[0].input, json!({"path": "a"}));
+    }
+
+    #[test]
+    fn openai_stream_multiple_tool_calls_by_index() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"f0\",\"arguments\":\"{}\"}}]}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"f1\",\"arguments\":\"{}\"}}]}}]}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.calls.len(), 2);
+        assert_eq!(r.calls[0].name, "f0");
+        assert_eq!(r.calls[1].name, "f1");
+    }
+
+    #[test]
+    fn openai_stream_ignores_blank_and_malformed_lines() {
+        let sse = "\n\
+                   data: not-json\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
+                   : comment\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.text, "ok");
+    }
+
+    #[test]
+    fn openai_stream_invalid_args_flagged() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"f\",\"arguments\":\"{bad\"}}]}}]}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.calls[0].input[crate::tools::INVALID_ARGS], json!("{bad"));
+    }
+
+    #[test]
+    fn openai_stream_empty_stream_is_empty_reply() {
+        let r = drain_openai("");
+        assert!(r.text.is_empty());
+        assert!(r.calls.is_empty());
+    }
+
+    // ── anthropic_stream ────────────────────────────────────────────────────
+    fn drain_anthropic(sse: &str) -> Reply {
+        let mut out = String::new();
+        anthropic_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t)).unwrap()
+    }
+
+    #[test]
+    fn anthropic_stream_text_deltas() {
+        let sse = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(r.text, "Hi there");
+    }
+
+    #[test]
+    fn anthropic_stream_assembles_input_json_delta() {
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read_file\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\"\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\":\\\"x\\\"}\"}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "t1");
+        assert_eq!(r.calls[0].name, "read_file");
+        assert_eq!(r.calls[0].input, json!({"path": "x"}));
+    }
+
+    #[test]
+    fn anthropic_stream_bad_input_json_falls_back_to_empty_object() {
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"x\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not\"}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(r.calls[0].input, json!({}));
+    }
+
+    #[test]
+    fn anthropic_stream_interleaved_text_and_tool() {
+        let sse = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"go\"}}\n\
+                   data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(r.text, "go");
+        assert_eq!(r.calls.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_stream_ignores_unknown_events() {
+        let sse = "data: {\"type\":\"ping\"}\n\
+                   data: {\"type\":\"message_start\",\"message\":{}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert!(r.text.is_empty());
+        assert!(r.calls.is_empty());
+    }
+
+    #[test]
+    fn anthropic_parse_extracts_text_and_calls() {
+        let v = json!({"content": [
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a"}}
+        ]});
+        let r = anthropic_parse(v).unwrap();
+        assert_eq!(r.text, "hello");
+        assert_eq!(r.calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn openai_parse_handles_missing_tool_calls() {
+        let v = json!({"choices": [{"message": {"content": "hi"}}]});
+        let r = openai_parse(v).unwrap();
+        assert_eq!(r.text, "hi");
+        assert!(r.calls.is_empty());
+    }
+
+    #[test]
+    fn openai_parse_defaults_missing_args_to_empty_object() {
+        let v = json!({"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "f"}}
+        ]}}]});
+        let r = openai_parse(v).unwrap();
+        assert_eq!(r.calls[0].input, json!({}));
+    }
 }
