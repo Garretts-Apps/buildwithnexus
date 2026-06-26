@@ -26,8 +26,8 @@ fn err(s: impl Into<String>) -> Outcome { Outcome { content: s.into(), is_error:
 const MAX_READ: usize = 100 * 1024;
 const MAX_OUT: usize = 16 * 1024;
 
-pub fn defs() -> Vec<ToolDef> {
-    vec![
+pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
+    let mut v = vec![
         ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
         ToolDef { name: "list_dir", description: "List entries in a directory.",
@@ -40,7 +40,19 @@ pub fn defs() -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}) },
         ToolDef { name: "finish", description: "Signal the task is complete with a short summary for the user.",
             schema: json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}) },
-    ]
+    ];
+    if include_subagent {
+        v.push(ToolDef {
+            name: "spawn_subagent",
+            description: "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.",
+            schema: json!({"type":"object","properties":{
+                "task":{"type":"string"},
+                "role":{"type":"string","enum":["engineer","researcher"]},
+                "isolate":{"type":"boolean"}
+            },"required":["task"]}),
+        });
+    }
+    v
 }
 
 // Mutating tools pass through the permission gate; reads never do.
@@ -54,6 +66,7 @@ pub fn preview(name: &str, input: &Value) -> String {
         "write_file" => format!("write {}", input["path"].as_str().unwrap_or("?")),
         "edit_file" => format!("edit {}", input["path"].as_str().unwrap_or("?")),
         "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
+        "spawn_subagent" => format!("subagent: {}", input["task"].as_str().unwrap_or("?")),
         _ => name.to_string(),
     }
 }

@@ -2,14 +2,18 @@
 // three modes. PLAN decomposes + gates, BUILD is a ReAct tool loop, BRAINSTORM
 // is streaming-free chat. Roles are a small data table, not an agent framework.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::hooks::{self, PreDecision};
 use crate::provider::{complete, Msg, Provider, Reply, ToolResult};
+use crate::report;
 use crate::tools;
 use crate::tui;
 
 const MAX_ITERS: usize = 30;
+const MAX_DEPTH: usize = 3;
 
 #[derive(Clone, Copy)]
 pub enum Permission {
@@ -61,35 +65,39 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value) -> Option<Strin
 // One ReAct turn-and-tools loop. Shared by BUILD and the execution half of PLAN.
 // The Stop hook always fires once the turn ends, however it ended.
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
-    let r = build_inner(p, perm, role_id, task, cwd);
+    let r = build_inner(p, perm, role_id, task, cwd, 0).map(|_| ());
     hooks::notify("Stop", cwd);
     r
 }
 
-fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
+// Returns the final assistant text / finish summary, so a parent can read a
+// spawned subagent's result. `depth` bounds recursion via spawn_subagent.
+fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
-            tui::line(&tui::red(&format!("  blocked by hook: {reason}")));
-            return Ok(());
+            report::error(&format!("blocked by hook: {reason}"));
+            return Ok(String::new());
         }
         Ok(ctx) if !ctx.is_empty() => format!("{task}\n\n[hook context]\n{ctx}"),
         Ok(_) => task.to_string(),
     };
-    let defs = tools::defs();
+    let defs = tools::defs(depth < MAX_DEPTH);
     let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
 
     for _ in 0..MAX_ITERS {
-        let reply: Reply = tui::with_spinner("thinking…", || complete(p, &msgs, &defs))?;
-
-        if !reply.text.trim().is_empty() {
-            tui::line(&reply.text);
-        }
+        // The spinner writes to stdout — suppress it in JSON mode so events stay clean.
+        let reply: Reply = if report::is_json() {
+            complete(p, &msgs, &defs)?
+        } else {
+            tui::with_spinner("thinking…", || complete(p, &msgs, &defs))?
+        };
+        report::assistant(&reply.text);
         if reply.calls.is_empty() {
-            return Ok(()); // model answered in prose — nothing left to execute
+            return Ok(reply.text); // model answered in prose
         }
 
         let mut results = Vec::new();
-        let mut finished = false;
+        let mut summary: Option<String> = None;
         for call in &reply.calls {
             // PreToolUse hook can allow (skip the gate), deny, or defer to it.
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
@@ -98,29 +106,83 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 PreDecision::Continue => gate(perm, &call.name, &call.input),
             };
             if let Some(reason) = reason {
-                tui::line(&tui::dim(&format!("  ✗ {}", reason)));
+                report::tool_denied(&reason);
                 results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
                 continue;
             }
-            tui::line(&tui::dim(&format!("  • {}", tools::preview(&call.name, &call.input))));
+            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+
+            if call.name == "spawn_subagent" {
+                let out = spawn_subagent(p, perm, &call.input, cwd, depth);
+                report::tool_result(&call.name, &out, false);
+                results.push(ToolResult { id: call.id.clone(), content: out, is_error: false });
+                continue;
+            }
+
             let out = tools::run(&call.name, &call.input, cwd);
             hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
+            report::tool_result(&call.name, &out.content, out.is_error);
             if out.finished {
-                tui::line("");
-                tui::line(&tui::green(&format!("✨ {}", out.content)));
-                finished = true;
+                report::finish(&out.content);
+                summary = Some(out.content.clone());
             }
             results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
         }
 
         msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
         msgs.push(Msg::Tool(results));
-        if finished {
-            return Ok(());
+        if let Some(s) = summary {
+            return Ok(s);
         }
     }
-    tui::line(&tui::yellow(&format!("Reached the {MAX_ITERS}-step limit without finishing.")));
-    Ok(())
+    report::notice(&format!("Reached the {MAX_ITERS}-step limit without finishing."));
+    Ok(String::new())
+}
+
+static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+// Delegate a self-contained sub-task to a fresh agent (own context window).
+// `isolate` runs it in a new git worktree so parallel edits never collide.
+fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd: &Path, depth: usize) -> String {
+    if depth + 1 >= MAX_DEPTH {
+        return "subagent depth limit reached".into();
+    }
+    let task = input["task"].as_str().unwrap_or("").trim();
+    if task.is_empty() {
+        return "spawn_subagent requires a task".into();
+    }
+    let role = input["role"].as_str().unwrap_or("engineer");
+    let isolate = input["isolate"].as_bool().unwrap_or(false);
+
+    let (run_cwd, note) = if isolate {
+        match make_worktree(cwd) {
+            Some(wt) => {
+                let n = format!("[isolated worktree: {}]\n", wt.display());
+                (wt, n)
+            }
+            None => (cwd.to_path_buf(), "[worktree unavailable — ran in place]\n".into()),
+        }
+    } else {
+        (cwd.to_path_buf(), String::new())
+    };
+
+    report::notice(&format!("  ↳ subagent: {task}"));
+    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1)
+        .unwrap_or_else(|e| format!("subagent error: {e}"));
+    format!("{note}{result}")
+}
+
+fn make_worktree(cwd: &Path) -> Option<PathBuf> {
+    let id = SUB_SEQ.fetch_add(1, Ordering::Relaxed);
+    let wt = cwd.join(format!(".bwn/worktrees/sub-{}-{id}", std::process::id()));
+    let branch = format!("bwn-sub-{}-{id}", std::process::id());
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&wt)
+        .output()
+        .ok()?;
+    out.status.success().then_some(wt)
 }
 
 // PLAN: ask for a numbered breakdown, let the user approve/edit, then execute.

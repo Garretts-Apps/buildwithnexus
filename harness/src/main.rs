@@ -3,6 +3,7 @@ mod config;
 mod hooks;
 mod onboarding;
 mod provider;
+mod report;
 mod tools;
 mod tui;
 
@@ -15,7 +16,12 @@ use provider::Provider;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--json` switches headless commands to structured, one-event-per-line output.
+    if args.iter().any(|a| a == "--json") {
+        args.retain(|a| a != "--json");
+        report::set(report::Mode::Json);
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
 
