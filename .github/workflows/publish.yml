@@ -4,6 +4,11 @@ name: Publish to npm
 #   - push of a v* tag
 #   - workflow_dispatch (UI "Run workflow")
 #   - push to main that touches `.publish-trigger`
+#
+# The published package is a thin, zero-dependency wrapper: `postinstall`
+# fetches the SHA-256-verified prebuilt binary for the user's platform from the
+# GitHub Release (built by release.yml on the same tag), falling back to a cargo
+# build. So publishing is just `npm publish` of the wrapper — no bundle step.
 on:
   push:
     branches: [main]
@@ -23,11 +28,6 @@ on:
           - minor
           - major
           - none
-      nexus_ref:
-        description: "Branch/tag/sha of Garretts-Apps/nexus to bundle (default: main)"
-        required: false
-        default: "main"
-        type: string
 
 permissions: {}
 
@@ -38,41 +38,21 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
 
     steps:
-      - name: Checkout buildwithnexus
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
-          path: buildwithnexus
           fetch-depth: 0
           token: ${{ secrets.NPM_PERMISSIONED_TOKEN }}
           persist-credentials: true
           submodules: false
 
-      - name: Checkout nexus (for bundle)
-        uses: actions/checkout@v4
-        with:
-          repository: Garretts-Apps/nexus
-          ref: ${{ github.event.inputs.nexus_ref || 'main' }}
-          token: ${{ secrets.NPM_PERMISSIONED_TOKEN }}
-          path: nexus
-          persist-credentials: false
-          submodules: false
-
-      - name: Record nexus source SHA + commit time
-        id: nexus-sha
-        working-directory: nexus
-        run: |
-          NEXUS_SHA=$(git rev-parse HEAD)
-          NEXUS_EPOCH=$(git log -1 --pretty=%ct)
-          echo "nexus_sha=$NEXUS_SHA" >> "$GITHUB_OUTPUT"
-          echo "nexus_epoch=$NEXUS_EPOCH" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           # Note: registry-url *intentionally omitted* — when a Trusted Publisher
@@ -84,7 +64,6 @@ jobs:
         if: |
           (github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none') ||
           (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
-        working-directory: buildwithnexus
         run: |
           set -e
           BUMP="${{ github.event.inputs.version_bump || 'patch' }}"
@@ -94,61 +73,25 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # No package-lock.json in the wrapper — only package.json changes.
           NEW_VERSION=$(npm version "$BUMP" --no-git-tag-version)
           echo "New version: $NEW_VERSION"
-          git add package.json package-lock.json
+          git add package.json
           git commit -m "chore(release): $NEW_VERSION [skip ci]"
           git tag "$NEW_VERSION"
           if ! git push origin HEAD:main --follow-tags; then
             echo "::warning::Could not push bump+tag to main. Publishing to npm anyway."
           fi
 
-      - name: Install dependencies (no lifecycle scripts)
-        working-directory: buildwithnexus
-        run: npm ci --ignore-scripts
+      # Guard the install path: a syntax error in the wrapper or postinstall
+      # would break `npm install` for every user. Cheap to check, expensive to miss.
+      - name: Syntax-check wrapper scripts
+        run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
-      - name: Run tests
-        working-directory: buildwithnexus
-        run: npm test
-
-      - name: Verify nexus has fixed model IDs
-        working-directory: nexus
-        run: |
-          set -e
-          if grep -rn 'claude-3-5-haiku-20241022' src/ | grep -v ':[[:space:]]*#'; then
-            echo "::error::Retired model claude-3-5-haiku-20241022 found"
-            exit 1
-          fi
-          if grep -rn 'claude-sonnet-4-20250514\|claude-opus-4-20250514' src/ | grep -v ':[[:space:]]*#'; then
-            echo "::error::Deprecated dated alias found"
-            exit 1
-          fi
-
-      - name: Build + bundle
-        working-directory: buildwithnexus
-        env:
-          NEXUS_SRC: ${{ github.workspace }}/nexus
-          SOURCE_DATE_EPOCH: ${{ steps.nexus-sha.outputs.nexus_epoch }}
-        run: |
-          npm run build
-          npm run bundle
-
-      - name: Generate SBOM (CycloneDX)
-        working-directory: buildwithnexus
-        continue-on-error: true
-        run: |
-          npx --yes @cyclonedx/cyclonedx-npm@^2.0.0 \
-            --output-format JSON \
-            --output-file dist/sbom.cdx.json \
-            --omit dev \
-            --spec-version 1.5
-
-      - name: Generate SHA256SUMS
-        working-directory: buildwithnexus
-        run: |
-          cd dist
-          sha256sum nexus-release.tar.gz $([ -f sbom.cdx.json ] && echo sbom.cdx.json) > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+      # Confirm the published file set resolves (bin/, scripts, harness sources)
+      # without actually publishing.
+      - name: Verify package contents
+        run: npm pack --dry-run
 
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
@@ -164,26 +107,17 @@ jobs:
       #
       # Configure here:
       #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
-      #
-      # If the trusted publisher isn't configured yet, this step fails with a
-      # message about authentication — exactly what you'd want to see, since
-      # the alternative was the silent EOTP rejection.
       - name: Publish to npm (OIDC Trusted Publisher + provenance)
-        working-directory: buildwithnexus
-        env:
-          NEXUS_SRC: ${{ github.workspace }}/nexus
         run: npm publish --access public --provenance
 
       - name: Summary
         if: always()
-        working-directory: buildwithnexus
         run: |
           PKG_VERSION=$(node -e 'console.log(require("./package.json").version)')
           {
             echo "### Publish"
             echo ""
             echo "- Version: \`$PKG_VERSION\`"
-            echo "- Nexus SHA: \`${{ steps.nexus-sha.outputs.nexus_sha }}\`"
             echo "- Auth: OIDC Trusted Publisher"
             echo "- Provenance: signed via OIDC"
           } >> "$GITHUB_STEP_SUMMARY"

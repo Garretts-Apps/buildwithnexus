@@ -13,51 +13,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-test:
-    name: Lint + test
+  rust:
+    name: Rust lint + test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: harness
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: "22"
-          cache: npm
+          components: clippy
 
-      - name: Install dependencies (no lifecycle scripts)
-        run: npm ci --ignore-scripts
-
-      - name: Type-check
-        run: npm run lint
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: npm test
+        run: cargo test --locked
 
-  audit:
-    name: npm audit
+      - name: Build release
+        run: cargo build --release --locked
+
+      # The perf suite shouldn't rot — make sure it still compiles.
+      - name: Compile benchmarks
+        run: cargo bench --no-run --locked
+
+  wrapper:
+    name: npm wrapper syntax
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
 
-      - name: Audit production dependencies
-        run: npm audit --audit-level=high --omit=dev
-        continue-on-error: true
+      # Zero runtime deps — just syntax-check the wrapper and install scripts so
+      # a typo can't ship to npm and break `npm install` for everyone.
+      - name: Check wrapper scripts
+        run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
   actionlint:
     name: Lint workflows
@@ -67,7 +75,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
