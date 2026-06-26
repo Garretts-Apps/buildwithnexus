@@ -38,10 +38,14 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage asset + checksum
         shell: bash
+        # Pass the matrix value through env so shellcheck sees a real shell
+        # variable (a literal ${{ … }} in the script trips SC2193).
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
-          src="harness/target/${{ matrix.target }}/release/buildwithnexus${ext}"
-          asset="buildwithnexus-${{ matrix.target }}${ext}"
+          ext=""; [[ "$TARGET" == *windows* ]] && ext=".exe"
+          src="harness/target/$TARGET/release/buildwithnexus${ext}"
+          asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
           # Per-asset checksum the postinstall verifies before chmod/exec.
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
