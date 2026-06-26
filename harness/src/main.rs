@@ -7,6 +7,7 @@ mod report;
 mod tools;
 mod tui;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use agent::Permission;
@@ -97,9 +98,11 @@ fn interactive() {
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    // Raw mode only when we own a real terminal; piped/headless stays cooked.
+    let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     hooks::notify("SessionStart", &cwd);
-    tui::enter_alt();
-    let result = repl(&provider, perm, &cwd);
+    tui::enter_alt(raw);
+    let result = repl(&provider, perm, &cwd, raw);
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -107,7 +110,7 @@ fn interactive() {
     }
 }
 
-fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path) -> Result<(), String> {
+fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
     loop {
         tui::clear();
@@ -131,7 +134,7 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path) -> Result<
         if t == "/init" {
             tui::leave_alt();
             onboarding::run();
-            tui::enter_alt();
+            tui::enter_alt(raw);
             continue;
         }
 
