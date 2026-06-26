@@ -40,6 +40,19 @@ pub fn assistant(text: &str) {
     }
 }
 
+// Live token stream (human mode only). assistant_end() closes the line.
+pub fn assistant_delta(chunk: &str) {
+    if mode() == Mode::Human && !chunk.is_empty() {
+        print!("{chunk}");
+        tui::flush();
+    }
+}
+pub fn assistant_end() {
+    if mode() == Mode::Human {
+        tui::line("");
+    }
+}
+
 pub fn tool_call(name: &str, preview: &str, input: &Value) {
     match mode() {
         Mode::Human => tui::line(&tui::dim(&format!("  • {preview}"))),

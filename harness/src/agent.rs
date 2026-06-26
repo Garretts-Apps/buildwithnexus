@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::hooks::{self, PreDecision};
-use crate::provider::{complete, Msg, Provider, Reply, ToolResult};
+use crate::provider::{self, complete, Msg, Provider, Reply, ToolResult};
 use crate::report;
 use crate::tools;
 use crate::tui;
@@ -85,13 +85,22 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
     let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
 
     for _ in 0..MAX_ITERS {
-        // The spinner writes to stdout — suppress it in JSON mode so events stay clean.
+        // JSON mode buffers (one clean event); human mode streams tokens live.
         let reply: Reply = if report::is_json() {
-            complete(p, &msgs, &defs)?
+            let r = complete(p, &msgs, &defs)?;
+            report::assistant(&r.text);
+            r
         } else {
-            tui::with_spinner("thinking…", || complete(p, &msgs, &defs))?
+            let mut streamed = false;
+            let r = provider::stream(p, &msgs, &defs, &mut |c| {
+                report::assistant_delta(c);
+                streamed = true;
+            })?;
+            if streamed {
+                report::assistant_end();
+            }
+            r
         };
-        report::assistant(&reply.text);
         if reply.calls.is_empty() {
             return Ok(reply.text); // model answered in prose
         }
@@ -240,9 +249,15 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
     let mut question = first.to_string();
     loop {
         msgs.push(Msg::User(question.clone()));
-        let reply = tui::with_spinner("thinking…", || complete(p, &msgs, &[]))?;
         tui::line("");
-        tui::line(&reply.text);
+        let mut streamed = false;
+        let reply = provider::stream(p, &msgs, &[], &mut |c| {
+            report::assistant_delta(c);
+            streamed = true;
+        })?;
+        if streamed {
+            report::assistant_end();
+        }
         tui::line("");
         msgs.push(Msg::Assistant { text: reply.text, calls: vec![] });
 
