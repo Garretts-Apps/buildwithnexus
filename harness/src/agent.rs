@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use crate::hooks::{self, PreDecision};
 use crate::provider::{complete, Msg, Provider, Reply, ToolResult};
 use crate::tools;
 use crate::tui;
@@ -58,9 +59,24 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value) -> Option<Strin
 }
 
 // One ReAct turn-and-tools loop. Shared by BUILD and the execution half of PLAN.
+// The Stop hook always fires once the turn ends, however it ended.
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
+    let r = build_inner(p, perm, role_id, task, cwd);
+    hooks::notify("Stop", cwd);
+    r
+}
+
+fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
+    let task = match hooks::user_prompt_submit(task, cwd) {
+        Err(reason) => {
+            tui::line(&tui::red(&format!("  blocked by hook: {reason}")));
+            return Ok(());
+        }
+        Ok(ctx) if !ctx.is_empty() => format!("{task}\n\n[hook context]\n{ctx}"),
+        Ok(_) => task.to_string(),
+    };
     let defs = tools::defs();
-    let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task.into())];
+    let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
 
     for _ in 0..MAX_ITERS {
         let reply: Reply = tui::with_spinner("thinking…", || complete(p, &msgs, &defs))?;
@@ -75,13 +91,20 @@ pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd:
         let mut results = Vec::new();
         let mut finished = false;
         for call in &reply.calls {
-            if let Some(reason) = gate(perm, &call.name, &call.input) {
+            // PreToolUse hook can allow (skip the gate), deny, or defer to it.
+            let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+                PreDecision::Deny(r) => Some(r),
+                PreDecision::Allow => None,
+                PreDecision::Continue => gate(perm, &call.name, &call.input),
+            };
+            if let Some(reason) = reason {
                 tui::line(&tui::dim(&format!("  ✗ {}", reason)));
                 results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
                 continue;
             }
             tui::line(&tui::dim(&format!("  • {}", tools::preview(&call.name, &call.input))));
             let out = tools::run(&call.name, &call.input, cwd);
+            hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
             if out.finished {
                 tui::line("");
                 tui::line(&tui::green(&format!("✨ {}", out.content)));

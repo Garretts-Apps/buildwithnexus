@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod hooks;
 mod onboarding;
 mod provider;
 mod tools;
@@ -69,7 +70,10 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if let Err(e) = f(&provider, perm, cwd) {
+    hooks::notify("SessionStart", &cwd);
+    let r = f(&provider, perm, cwd.clone());
+    hooks::notify("SessionEnd", &cwd);
+    if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
         std::process::exit(1);
     }
@@ -87,9 +91,11 @@ fn interactive() {
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    hooks::notify("SessionStart", &cwd);
     tui::enter_alt();
     let result = repl(&provider, perm, &cwd);
     tui::leave_alt();
+    hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
         eprintln!("{}", tui::red(&e));
     }
