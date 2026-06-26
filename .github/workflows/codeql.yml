@@ -30,22 +30,22 @@ jobs:
 
     steps:
       - name: Harden runner
-        uses: step-security/harden-runner@v2.10.4
+        uses: step-security/harden-runner@v2.19.1
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3.27.0
+        uses: github/codeql-action/init@v4.35.4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-extended,security-and-quality
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3.27.0
+        uses: github/codeql-action/analyze@v4.35.4
         with:
           category: "/language:${{ matrix.language }}"

@@ -88,7 +88,7 @@ fn commands_for(event: &str, tool: Option<&str>) -> Vec<(&'static str, Source)> 
     let Some(h) = HOOKS.get() else { return Vec::new() };
     h.list.iter()
         .filter(|hk| hk.event == event)
-        .filter(|hk| tool.map_or(true, |t| matches(&hk.matcher, t)))
+        .filter(|hk| tool.is_none_or(|t| matches(&hk.matcher, t)))
         .map(|hk| (hk.command.as_str(), hk.source))
         .collect()
 }
