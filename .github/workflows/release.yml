@@ -50,13 +50,33 @@ jobs:
           # Per-asset checksum the postinstall verifies before chmod/exec.
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
+      # The release tag. On a tag push it's the pushed tag; on a manual run it's
+      # derived from package.json so it always matches the version npm publishes
+      # (postinstall fetches assets from releases/download/v<version>).
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            v=$(node -p "require('./package.json').version")
+            echo "tag=v${v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+      # Creates the tag + release on a manual run (the GITHUB_TOKEN can do this);
+      # on a tag push it just attaches assets to the existing tag's release.
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: buildwithnexus-${{ matrix.target }}*
