@@ -1,47 +1,42 @@
 {
   "name": "buildwithnexus",
-  "version": "0.8.11",
-  "description": "Interactive AI agent orchestrator with intent-based planning, execution, and brainstorming modes",
-  "type": "module",
+  "version": "0.9.0",
+  "description": "A hilariously fast, agentic AI CLI harness in Rust — remote (API key) or local models, alternate-screen TUI",
   "bin": {
-    "buildwithnexus": "dist/bin.js",
-    "deep-agents": "dist/bin.js"
+    "buildwithnexus": "bin/buildwithnexus.js",
+    "bwn": "bin/buildwithnexus.js"
   },
   "files": [
-    "dist/",
+    "bin/",
+    "scripts/resolve-binary.js",
+    "scripts/postinstall.js",
+    "harness/Cargo.toml",
+    "harness/Cargo.lock",
+    "harness/src/",
     "README.md",
     "LICENSE",
     "SECURITY.md"
   ],
   "scripts": {
-    "build": "tsup",
-    "bundle": "bash scripts/bundle-release.sh",
-    "dev": "tsup --watch",
-    "cli": "node dist/bin.js",
-    "init": "node dist/bin.js da-init",
-    "dashboard": "node dist/bin.js dashboard",
-    "lint": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
-    "audit:ci": "npm audit --audit-level=high --omit=dev",
-    "sbom": "bash scripts/generate-sbom.sh",
-    "verify-package": "bash scripts/verify-package.sh",
-    "prepublishOnly": "test -n \"$NEXUS_SRC\" -a -d \"$NEXUS_SRC/src\" || (echo 'ERROR: NEXUS_SRC must be set to a valid nexus checkout. Refusing to publish without an explicit source-of-truth.' && exit 1) && npm run build && npm run bundle && test -f dist/nexus-release.tar.gz || (echo 'ERROR: dist/nexus-release.tar.gz missing after bundle.' && exit 1)"
+    "postinstall": "node scripts/postinstall.js",
+    "build": "cargo build --release --manifest-path harness/Cargo.toml",
+    "vendor": "bash scripts/vendor.sh",
+    "start": "node bin/buildwithnexus.js"
   },
   "engines": {
-    "node": ">=20",
-    "npm": ">=10"
+    "node": ">=18"
   },
   "keywords": [
-    "nexus",
     "ai",
-    "agents",
-    "orchestration",
-    "vm",
-    "qemu",
-    "isolation",
-    "autonomous"
+    "agent",
+    "cli",
+    "coding-agent",
+    "rust",
+    "tui",
+    "anthropic",
+    "openai",
+    "ollama",
+    "local-llm"
   ],
   "author": "Garrett Eaglin",
   "license": "MIT",
@@ -57,26 +52,5 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/",
     "provenance": true
-  },
-  "dependencies": {
-    "@inquirer/prompts": "^8.2.1",
-    "chalk": "^5.3.0",
-    "commander": "^12.1.0",
-    "dotenv": "^17.3.1",
-    "ejs": "^3.1.10",
-    "execa": "^9.5.2",
-    "inquirer": "^12.3.2",
-    "node-ssh": "^13.2.1",
-    "ora": "^8.1.1",
-    "string-width": "^8.2.0",
-    "yaml": "^2.8.4"
-  },
-  "devDependencies": {
-    "@types/ejs": "^3.1.5",
-    "@types/node": "^22.13.4",
-    "@vitest/coverage-v8": "^4.0.18",
-    "tsup": "^8.3.6",
-    "typescript": "^5.7.3",
-    "vitest": "^4.0.18"
   }
 }
