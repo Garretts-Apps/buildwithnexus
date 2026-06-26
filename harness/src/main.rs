@@ -87,6 +87,7 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
+    provider::prewarm(&provider); // warm the TLS connection while we set up
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false); // headless: never run untrusted project hooks
     hooks::notify("SessionStart", &cwd);
@@ -108,6 +109,7 @@ fn interactive() {
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
+    provider::prewarm(&provider); // warm the TLS connection while the user reads/types
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Raw mode only when we own a real terminal; piped/headless stays cooked.

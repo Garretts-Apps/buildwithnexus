@@ -61,6 +61,26 @@ fn url(p: &Provider, path: &str) -> String {
     format!("{}{}", p.base_url.trim_end_matches('/'), path)
 }
 
+// Warm the pooled TLS connection in the background so the first real request
+// skips the TCP+TLS+DNS handshake — shaves latency off the first token.
+pub fn prewarm(p: &Provider) {
+    let url = match p.protocol {
+        Protocol::Anthropic => url(p, "/v1/models"),
+        Protocol::OpenAi => url(p, "/models"),
+    };
+    let key = p.api_key.clone();
+    let proto = p.protocol;
+    std::thread::spawn(move || {
+        let mut req = agent().get(&url).timeout(Duration::from_secs(5));
+        req = match (proto, &key) {
+            (Protocol::Anthropic, Some(k)) => req.set("x-api-key", k).set("anthropic-version", "2023-06-01"),
+            (Protocol::OpenAi, Some(k)) => req.set("authorization", &format!("Bearer {k}")),
+            _ => req,
+        };
+        let _ = req.call(); // result ignored — we only want the connection warmed
+    });
+}
+
 // ── public entry points ────────────────────────────────────────────────────
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
@@ -190,9 +210,15 @@ fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(u
         }
     }
 
+    // Prompt caching: render order is tools → system → messages, so a breakpoint
+    // on the system block caches the stable tools+system prefix, and one on the
+    // last message caches the growing conversation. Each ReAct step then reads the
+    // prior turns from cache — much lower time-to-first-token on multi-step tasks.
+    cache_last_message(&mut messages);
+
     let mut body = json!({"model": p.model, "max_tokens": 4096, "messages": messages});
     if !system.is_empty() {
-        body["system"] = json!(system);
+        body["system"] = json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools.iter().map(|t| json!({
@@ -206,6 +232,21 @@ fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(u
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json");
     Ok((req, body))
+}
+
+// Put an ephemeral cache breakpoint on the last content block of the last
+// message, normalizing a string body into a single text block if needed.
+fn cache_last_message(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else { return };
+    let content = &mut last["content"];
+    if let Some(text) = content.as_str() {
+        let text = text.to_string();
+        *content = json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
+    } else if let Some(arr) = content.as_array_mut() {
+        if let Some(block) = arr.last_mut() {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
+    }
 }
 
 fn anthropic_parse(v: Value) -> Result<Reply, String> {
