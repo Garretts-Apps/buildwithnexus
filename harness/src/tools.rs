@@ -52,6 +52,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"note":{"type":"string","description":"Short fact or preference to remember (one line)"}},"required":["note"]}) },
         ToolDef { name: "fetch_url", description: "Fetch the content of a URL via HTTP GET. Returns the response body as text. Use for reading documentation, API responses, changelogs, or any web content.",
             schema: json!({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"}},"required":["url"]}) },
+        ToolDef { name: "web_search", description: "Search the web via DuckDuckGo and return relevant excerpts. Use for current events, documentation lookup, or any question that benefits from live web results.",
+            schema: json!({"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}) },
     ];
     if include_subagent {
         v.push(ToolDef {
@@ -204,6 +206,99 @@ pub fn command_touches_wsl_mount(cmd: &str) -> bool {
     })
 }
 
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => { out.push('%'); out.push_str(&format!("{:02X}", b)); }
+        }
+    }
+    out
+}
+
+// Strip HTML for search result display. Removes script/style blocks,
+// HTML tags, and collapses whitespace. Keeps meaningful text content.
+fn strip_html(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len / 3);
+    let mut i = 0;
+    let mut in_tag = false;
+    // Tracks whether we're inside a script or style block (suppresses content).
+    let mut skip_depth = 0u8;
+
+    while i < len {
+        // Check for <script or <style open tags — enter suppression mode.
+        if !in_tag && skip_depth == 0 && bytes[i] == b'<' {
+            let rest = &bytes[i..];
+            let is_skip = |tag: &[u8]| {
+                rest.len() > tag.len()
+                    && rest[..tag.len()].eq_ignore_ascii_case(tag)
+                    && (rest.get(tag.len()).is_none_or(|b| !b.is_ascii_alphanumeric()))
+            };
+            if is_skip(b"<script") || is_skip(b"<style") {
+                skip_depth = 1;
+                in_tag = true;
+                i += 1;
+                continue;
+            }
+        }
+        if bytes[i] == b'<' {
+            if skip_depth > 0 {
+                // Inside suppressed block: look for </script> or </style>.
+                let rest = &bytes[i..];
+                let ends = |t: &[u8]| rest.len() >= t.len() && rest[..t.len()].eq_ignore_ascii_case(t);
+                if ends(b"</script>") || ends(b"</style>") {
+                    skip_depth = 0;
+                    // Skip past the closing tag.
+                    while i < len && bytes[i] != b'>' { i += 1; }
+                    i += 1;
+                    continue;
+                }
+            }
+            in_tag = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'>' {
+            in_tag = false;
+            if skip_depth == 0 { out.push(' '); }
+            i += 1;
+            continue;
+        }
+        if !in_tag && skip_depth == 0 {
+            out.push(bytes[i] as char);
+        }
+        i += 1;
+    }
+
+    // Collapse whitespace and decode common HTML entities.
+    let decoded = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&nbsp;", " ")
+        .replace("&#39;", "'");
+
+    let mut result = String::new();
+    let mut prev_ws = true;
+    for c in decoded.chars() {
+        if c.is_whitespace() {
+            if !prev_ws { result.push(' '); }
+            prev_ws = true;
+        } else {
+            result.push(c);
+            prev_ws = false;
+        }
+    }
+    result.trim().to_string()
+}
+
 // Commands so destructive they require confirmation in every mode.
 pub fn catastrophic(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
@@ -328,6 +423,24 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     }
                 }
                 Err(e) => err(format!("fetch failed: {e}")),
+            }
+        }
+        "web_search" => {
+            let query = input["query"].as_str().unwrap_or("").trim();
+            if query.is_empty() {
+                return err("query is required");
+            }
+            let encoded = url_encode(query);
+            let search_url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+            match ureq::get(&search_url)
+                .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)")
+                .call()
+            {
+                Ok(resp) => match resp.into_string() {
+                    Ok(html) => ok(truncate(strip_html(&html), MAX_OUT)),
+                    Err(e) => err(format!("search response error: {e}")),
+                },
+                Err(e) => err(format!("web search failed: {e}")),
             }
         }
         "finish" => Outcome {

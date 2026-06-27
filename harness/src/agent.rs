@@ -204,6 +204,7 @@ fn tool_manifest() -> String {
 • write_file / edit_file — create or surgically modify files\n\
 • run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
 • fetch_url              — HTTP GET (no curl/wget needed)\n\
+• web_search             — DuckDuckGo web search (no API key, live results)\n\
 • save_memory            — persist a note across sessions\n\
 • spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
 • finish                 — mark the task complete with a summary"
@@ -318,6 +319,19 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
             None // reads anywhere are allowed in readonly mode
         }
         Permission::Ask => {
+            // run_command calls whose binary appears in allowed_commands skip the
+            // confirmation prompt — git, cargo, npm, etc. should just work.
+            if name == "run_command" {
+                if let Some(c) = input["command"].as_str() {
+                    let first = c.split_whitespace().next().unwrap_or("");
+                    // Accept both bare names and full paths (/usr/bin/git → git).
+                    let bin = std::path::Path::new(first)
+                        .file_name().and_then(|n| n.to_str()).unwrap_or(first);
+                    if config::load_allowed_commands().iter().any(|a| a == bin) {
+                        return None;
+                    }
+                }
+            }
             if tools::is_mutating(name) {
                 return confirm(&tools::preview(name, input));
             }
@@ -326,6 +340,11 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
             None
         }
     }
+}
+
+// Public compact helper for the /compact REPL command.
+pub fn compact_msgs(p: &Provider, msgs: Vec<Msg>) -> Vec<Msg> {
+    compact_with(msgs, |middle| model_summary(p, middle))
 }
 
 // ── BUILD mode ────────────────────────────────────────────────────────────────
@@ -509,6 +528,7 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
         msgs.push(Msg::Tool(results));
         if !report::is_json() {
             tui::context_meter(estimate_tokens(msgs), p.context_tokens);
+            tui::poll_typeahead();
         }
         if let Some(s) = summary {
             return Ok(s);
@@ -742,6 +762,7 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
             msgs.push(Msg::Tool(results));
             if !report::is_json() {
                 tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                tui::poll_typeahead();
             }
         };
 
@@ -868,6 +889,23 @@ mod tests {
         let cwd = Path::new("/proj");
         let r = gate(Permission::Ask, "write_file", &json!({"path": "a", "content": "x"}), cwd);
         assert!(r.is_some()); // non-terminal → denied
+    }
+
+    #[test]
+    fn gate_ask_allows_default_allowed_commands() {
+        let cwd = Path::new("/proj");
+        // git, cargo, npm are in the default allowed_commands list
+        for cmd in &["git status", "cargo test", "npm install", "git commit -m 'x'"] {
+            let r = gate(Permission::Ask, "run_command", &json!({"command": cmd}), cwd);
+            assert!(r.is_none(), "expected {cmd} to be auto-allowed in Ask mode");
+        }
+    }
+
+    #[test]
+    fn gate_ask_still_prompts_for_unknown_command() {
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Ask, "run_command", &json!({"command": "mycustombinary --flag"}), cwd);
+        assert!(r.is_some()); // not in allowed list → denied (non-terminal)
     }
 
     #[test]
