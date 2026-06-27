@@ -106,6 +106,25 @@ pub mod bench {
     }
 }
 
+// Installed models reported by a running Ollama (GET /api/tags). Empty on any
+// failure (not running, wrong host, …). `base_url` is the OpenAI-style base
+// (…/v1); Ollama's native API lives at the host root, so /v1 is trimmed.
+pub fn ollama_models(base_url: &str) -> Vec<String> {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let resp = match agent().get(&format!("{root}/api/tags")).timeout(Duration::from_secs(2)).call() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let v: Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v["models"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 // ── public entry points ────────────────────────────────────────────────────
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
