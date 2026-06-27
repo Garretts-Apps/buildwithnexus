@@ -695,7 +695,10 @@ fn edit_in_editor(current: &str) -> Option<String> {
 // Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
 const SLASH_COMMANDS_BASE: &[&str] = &[
     "/help", "/clear", "/new", "/resume", "/init",
-    "/mode", "/permissions", "/config", "/memory", "/skills", "/exit", "/quit",
+    "/mode", "/model", "/permissions", "/compact",
+    "/review", "/commit", "/pr",
+    "/schedule", "/loop", "/workflows", "/btw",
+    "/config", "/memory", "/skills", "/exit", "/quit",
 ];
 
 fn load_slash_commands() -> Vec<String> {

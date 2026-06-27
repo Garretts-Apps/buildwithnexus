@@ -204,6 +204,7 @@ fn tool_manifest() -> String {
 • write_file / edit_file — create or surgically modify files\n\
 • run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
 • fetch_url              — HTTP GET (no curl/wget needed)\n\
+• web_search             — DuckDuckGo web search (no API key, live results)\n\
 • save_memory            — persist a note across sessions\n\
 • spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
 • finish                 — mark the task complete with a summary"
@@ -339,6 +340,11 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
             None
         }
     }
+}
+
+// Public compact helper for the /compact REPL command.
+pub fn compact_msgs(p: &Provider, msgs: Vec<Msg>) -> Vec<Msg> {
+    compact_with(msgs, |middle| model_summary(p, middle))
 }
 
 // ── BUILD mode ────────────────────────────────────────────────────────────────

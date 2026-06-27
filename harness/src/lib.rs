@@ -11,6 +11,7 @@ pub mod report;
 pub mod session;
 pub mod tools;
 pub mod tui;
+pub mod workflow;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -67,6 +68,7 @@ pub fn run() {
         }
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
+        "doctor" => run_doctor(),
         other => {
             eprintln!("unknown command: {other}\n");
             usage();
@@ -144,7 +146,7 @@ fn interactive() {
     hooks::init(&cwd, raw);
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
-    let result = repl(&provider, perm, &cwd, raw);
+    let result = repl(provider, perm, &cwd, raw);
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -153,7 +155,7 @@ fn interactive() {
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
-fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
+fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
 
     // Show the full-screen header banner.
@@ -170,8 +172,23 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
     let mut sid = session::new_id();
     let mut mode = Mode::Build;
     let mut last_suggested_mode: Option<&'static str> = None;
+    // /btw: extra context injected into the next task without interrupting.
+    let mut btw_ctx: Option<String> = None;
 
     loop {
+        // Tick background workflows and surface any completion notifications.
+        if let Some(note) = workflow::tick() {
+            tui::line(&tui::green(&note));
+        }
+        // Prune old done/cancelled workflows, keep last 20.
+        workflow::prune(20);
+
+        // Show workflow activity badge if any are pending/running.
+        let active = workflow::active_count();
+        if active > 0 {
+            tui::line(&tui::dim(&format!("  ⟳ {} workflow{} in queue — /workflows to manage", active, if active == 1 { "" } else { "s" })));
+        }
+
         tui::line("");
         let prompt = format!("{} {} ", tui::mode_badge(mode_label(&mode)), tui::accent("›"));
         let task = match tui::ask_task(&prompt) {
@@ -223,6 +240,66 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
             continue;
         }
 
+        // /model with an inline argument — hot-swap the model mid-session.
+        if let Some(model_arg) = t.strip_prefix("/model ") {
+            let new_model = model_arg.trim();
+            if !new_model.is_empty() {
+                provider.model = new_model.to_string();
+                if let Some(mut s) = config::load_settings() {
+                    s.model = new_model.to_string();
+                    config::save_settings(&s);
+                }
+                tui::line(&tui::green(&format!("  ✓ model → {new_model}")));
+            }
+            continue;
+        }
+
+        // /schedule <delay> <task>  e.g. `/schedule 5m git pull && cargo test`
+        if let Some(rest) = t.strip_prefix("/schedule ") {
+            let rest = rest.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let delay_str = parts.next().unwrap_or("").trim();
+            let task = parts.next().unwrap_or("").trim();
+            if task.is_empty() {
+                tui::line(&tui::red("  usage: /schedule <delay> <task>  e.g. /schedule 5m cargo test"));
+            } else if let Some(fire_at) = workflow::parse_delay(delay_str) {
+                let id = workflow::enqueue(task, workflow::WorkflowKind::Scheduled { fire_at_ms: fire_at });
+                tui::line(&tui::green(&format!("  ✓ scheduled workflow #{id}: {task}")));
+            } else {
+                tui::line(&tui::red(&format!("  invalid delay '{delay_str}' — try: 30s, 5m, 1h")));
+            }
+            continue;
+        }
+
+        // /loop <interval> <task>  e.g. `/loop 10m cargo test`
+        if let Some(rest) = t.strip_prefix("/loop ") {
+            let rest = rest.trim();
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let interval_str = parts.next().unwrap_or("").trim();
+            let task = parts.next().unwrap_or("").trim();
+            if task.is_empty() {
+                tui::line(&tui::red("  usage: /loop <interval> <task>  e.g. /loop 30m cargo test"));
+            } else if let Some(secs) = workflow::parse_interval_secs(interval_str) {
+                let id = workflow::enqueue(task, workflow::WorkflowKind::Loop { interval_secs: secs });
+                tui::line(&tui::green(&format!("  ✓ loop workflow #{id} every {secs}s: {task}")));
+            } else {
+                tui::line(&tui::red(&format!("  invalid interval '{interval_str}' — try: 30s, 5m, 1h")));
+            }
+            continue;
+        }
+
+        // /btw <context> — inject context into the next agent turn without stopping current work.
+        if let Some(ctx) = t.strip_prefix("/btw ") {
+            let ctx = ctx.trim();
+            if ctx.is_empty() {
+                tui::line(&tui::red("  usage: /btw <context>  e.g. /btw also update the tests"));
+            } else {
+                btw_ctx = Some(ctx.to_string());
+                tui::line(&tui::dim(&format!("  ⚑ context queued for next turn: {ctx}")));
+            }
+            continue;
+        }
+
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => { tui::clear(); continue; }
@@ -244,6 +321,54 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
                 tui::leave_alt();
                 onboarding::run();
                 tui::enter_alt(raw);
+                continue;
+            }
+            "/model" => {
+                handle_model(&mut provider);
+                continue;
+            }
+            "/compact" => {
+                handle_compact(&provider, &mut transcript);
+                continue;
+            }
+            "/review" => {
+                tui::line(&tui::accent("  /review — AI code review"));
+                tui::line(&tui::dim("  Reviews staged changes (or the last diff). Press Enter to review, or type a focus area."));
+                let focus = tui::ask("  focus (optional): ").unwrap_or_default();
+                let task = if focus.trim().is_empty() {
+                    "Review the current git diff (git diff HEAD and git diff --staged). Summarize what changed, identify bugs, style issues, and potential improvements. Be concise.".to_string()
+                } else {
+                    format!("Review the current git diff focusing on: {}. Run `git diff HEAD` and `git diff --staged` to see the changes.", focus.trim())
+                };
+                tui::line("");
+                if let Err(e) = agent::run_build_session(&provider, perm, "researcher", &task, cwd, &mut transcript, &sid) {
+                    tui::line(&tui::red(&format!("  {e}")));
+                }
+                tui::bell();
+                continue;
+            }
+            "/commit" => {
+                let task = "Generate a conventional git commit message for the staged changes. Run `git diff --staged` to see what's staged. Then run `git commit -m \"<message>\"` with the generated message. If nothing is staged, remind the user to `git add` files first.";
+                tui::line("");
+                if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task, cwd, &mut transcript, &sid) {
+                    tui::line(&tui::red(&format!("  {e}")));
+                }
+                tui::bell();
+                continue;
+            }
+            "/pr" => {
+                tui::line(&tui::accent("  /pr — AI pull request"));
+                tui::line(&tui::dim("  Generates a PR title and description from your branch diff."));
+                let task = "Generate a pull request title and description for the current branch. Run `git log main..HEAD --oneline` and `git diff main...HEAD` (or use origin/main if main isn't local) to understand the changes. Then use `gh pr create` (if gh is available) or just print the title and description so the user can paste it.";
+                tui::line("");
+                if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task, cwd, &mut transcript, &sid) {
+                    tui::line(&tui::red(&format!("  {e}")));
+                }
+                tui::bell();
+                continue;
+            }
+            "/workflows" => {
+                handle_workflows();
                 continue;
             }
             "/mode" => {
@@ -268,11 +393,11 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
                 continue;
             }
             "/config" => {
-                handle_config(provider, perm, cwd);
+                handle_config(&provider, perm, cwd);
                 continue;
             }
             "/memory" => {
-                handle_memory(provider, perm, cwd, &mut transcript, &sid);
+                handle_memory(&provider, perm, cwd, &mut transcript, &sid);
                 continue;
             }
             "/skills" => {
@@ -318,7 +443,7 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
                     let user_input = if cmd_args.is_empty() { t.to_string() } else { format!("{t} {cmd_args}") };
                     let task_with_context = format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
                     tui::line("");
-                    if let Err(e) = agent::run_build_session(provider, perm, "engineer", &task_with_context, cwd, &mut transcript, &sid) {
+                    if let Err(e) = agent::run_build_session(&provider, perm, "engineer", &task_with_context, cwd, &mut transcript, &sid) {
                         tui::line(&tui::red(&format!("  {e}")));
                     }
                 }
@@ -355,14 +480,21 @@ fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: b
             transcript.push(Msg::UserImages { text: clean_task.clone(), images: image_data });
             tui::line(&tui::dim(&format!("  attached {n_images} image(s)")));
         }
-        let t = clean_task.as_str();
+
+        // Merge any /btw context queued since the last turn.
+        let effective_task = if let Some(ctx) = btw_ctx.take() {
+            format!("{}\n\n[btw: {}]", clean_task, ctx)
+        } else {
+            clean_task.clone()
+        };
+        let t = effective_task.as_str();
 
         tui::line("");
         let r = match &mode {
-            Mode::Plan => agent::run_plan(provider, perm, t, cwd),
-            Mode::Build => agent::run_build_session(provider, perm, "engineer", t, cwd, &mut transcript, &sid),
+            Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
+            Mode::Build => agent::run_build_session(&provider, perm, "engineer", t, cwd, &mut transcript, &sid),
             Mode::Brainstorm => {
-                match agent::run_brainstorm(provider, perm, cwd, t) {
+                match agent::run_brainstorm(&provider, perm, cwd, t) {
                     Err(e) => Err(e),
                     Ok(None) => Ok(()),
                     Ok(Some(agent::ModeHint::Build)) => {
@@ -547,6 +679,85 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
     config::load_custom_commands().into_iter().find(|c| c.name == name)
 }
 
+fn handle_model(provider: &mut Provider) {
+    tui::line(&tui::accent("  /model — model hot-swap"));
+    tui::line(&format!("  Current: {}", tui::bold(&provider.model)));
+    tui::line(&tui::dim("  Tip: /model <name>  e.g. /model claude-opus-4-5"));
+    tui::line("");
+    let pick = tui::ask("  new model (Enter to keep): ").unwrap_or_default();
+    let pick = pick.trim();
+    if !pick.is_empty() {
+        provider.model = pick.to_string();
+        if let Some(mut s) = config::load_settings() {
+            s.model = pick.to_string();
+            config::save_settings(&s);
+        }
+        tui::line(&tui::green(&format!("  ✓ model → {pick}")));
+    }
+}
+
+fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
+    if transcript.is_empty() {
+        tui::line(&tui::dim("  nothing to compact (empty transcript)"));
+        return;
+    }
+    let before = transcript.len();
+    let taken = std::mem::take(transcript);
+    *transcript = agent::compact_msgs(provider, taken);
+    let after = transcript.len();
+    tui::line(&tui::green(&format!("  ✓ compacted: {before} → {after} messages")));
+}
+
+fn handle_workflows() {
+    let snaps = workflow::snapshots();
+    if snaps.is_empty() {
+        tui::line(&tui::dim("  no workflows yet — /schedule or /loop to create one"));
+        return;
+    }
+    tui::line(&tui::accent("  /workflows — background task manager"));
+    tui::line(&tui::dim("  ──────────────────────────────────────────────────────────────"));
+    for s in &snaps {
+        let status_color = match s.status_str.as_str() {
+            "running" => tui::blue(&s.status_str),
+            "done"    => tui::green(&s.status_str),
+            "failed"  => tui::red(&s.status_str),
+            _         => tui::dim(&s.status_str),
+        };
+        let elapsed = s.elapsed_secs.map(|e| format!(" [{e}s]")).unwrap_or_default();
+        let iter_label = if s.iteration > 1 { format!(" ×{}", s.iteration) } else { String::new() };
+        tui::line(&format!("  #{:<3}  {}{}  [{}]  {}{}",
+            s.id, status_color, elapsed, s.kind_str, tui::dim(&s.task), iter_label));
+    }
+    tui::line(&tui::dim("  ──────────────────────────────────────────────────────────────"));
+    tui::line(&tui::dim("  c<id> cancel  ·  i<id> inspect output  ·  Enter dismiss"));
+    let action = tui::ask("  action: ").unwrap_or_default();
+    let action = action.trim();
+    if let Some(rest) = action.strip_prefix('c') {
+        if let Ok(id) = rest.trim().parse::<usize>() {
+            if workflow::cancel(id) {
+                tui::line(&tui::yellow(&format!("  cancelled workflow #{id}")));
+            } else {
+                tui::line(&tui::dim(&format!("  workflow #{id} not found or already finished")));
+            }
+        }
+    } else if let Some(rest) = action.strip_prefix('i') {
+        if let Ok(id) = rest.trim().parse::<usize>() {
+            let lines = workflow::output(id);
+            if lines.is_empty() {
+                tui::line(&tui::dim(&format!("  no output captured for workflow #{id}")));
+            } else {
+                tui::line(&tui::accent(&format!("  workflow #{id} output:")));
+                for l in lines.iter().take(100) {
+                    tui::line(&format!("    {}", tui::dim(l)));
+                }
+                if lines.len() > 100 {
+                    tui::line(&tui::dim(&format!("  … ({} more lines)", lines.len() - 100)));
+                }
+            }
+        }
+    }
+}
+
 // Detect intent to switch agent mode from natural language input.
 // Only catches unambiguous switch phrases — not ordinary task verbs like "plan this".
 fn detect_mode_switch(t: &str) -> Option<Mode> {
@@ -668,6 +879,15 @@ fn print_help() {
     tui::line(&format!("  {}         show/switch mode  {}", tui::bold("/mode"), tui::dim("[plan|build|brainstorm]")));
     tui::line(&format!("  {}   show/switch tool permissions  {}", tui::bold("/permissions"), tui::dim("[ask|auto|readonly]")));
     tui::line(&tui::dim("               or just say: \"switch to build mode\" / \"use readonly\""));
+    tui::line(&format!("  {}        hot-swap the AI model mid-session", tui::bold("/model")));
+    tui::line(&format!("  {}      compact context  {}", tui::bold("/compact"), tui::dim("(free up token budget)")));
+    tui::line(&format!("  {}       AI code review of staged git diff", tui::bold("/review")));
+    tui::line(&format!("  {}       AI-drafted conventional commit message", tui::bold("/commit")));
+    tui::line(&format!("  {}           AI-drafted PR title + description", tui::bold("/pr")));
+    tui::line(&format!("  {}    schedule a one-shot workflow  {}", tui::bold("/schedule"), tui::dim("<delay> <task>")));
+    tui::line(&format!("  {}         start a repeating workflow  {}", tui::bold("/loop"), tui::dim("<interval> <task>")));
+    tui::line(&format!("  {}   list and manage background workflows", tui::bold("/workflows")));
+    tui::line(&format!("  {}          inject context into next agent turn  {}", tui::bold("/btw"), tui::dim("<context>")));
     tui::line(&format!("  {}       configure hooks, memory, commands via AI", tui::bold("/config")));
     tui::line(&format!("  {}       view/edit session memory", tui::bold("/memory")));
     tui::line(&format!("  {}       list available skills and custom commands", tui::bold("/skills")));
@@ -787,12 +1007,22 @@ fn usage() {
          \x20 buildwithnexus sessions        list saved sessions\n\
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
+         \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
          \x20 buildwithnexus version | help\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
+         \x20 /model [name]                    hot-swap the AI model\n\
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
+         \x20 /compact               compress context to free up token budget\n\
+         \x20 /review                AI code review of staged git diff\n\
+         \x20 /commit                AI-drafted conventional commit message\n\
+         \x20 /pr                    AI-drafted pull request title + description\n\
+         \x20 /schedule <delay> <t>  one-shot workflow  (e.g. /schedule 5m cargo test)\n\
+         \x20 /loop <interval> <t>   repeating workflow (e.g. /loop 30m cargo test)\n\
+         \x20 /workflows             list and manage background workflows\n\
+         \x20 /btw <context>         inject context into next agent turn\n\
          \x20 /config                configure hooks, memory, commands via AI\n\
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                list available skills and custom commands\n\
@@ -801,6 +1031,74 @@ fn usage() {
          \x20 @<path>                Tab-complete a file path\n\
          \x20 Tab                    autocomplete /commands and sub-args\n"
     );
+}
+
+fn run_doctor() {
+    println!("buildwithnexus {VERSION} — doctor");
+    println!();
+
+    // Settings
+    match config::load_settings() {
+        None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
+        Some(s) => {
+            println!("  ✓ settings       provider={} model={} permission={}",
+                s.provider, if s.model.is_empty() { "(default)" } else { &s.model }, s.permission);
+        }
+    }
+
+    // API key
+    for preset in config::PRESETS.iter().filter(|p| !p.env_key.is_empty() && !p.local) {
+        match config::load_key(preset.env_key) {
+            Some(_) => println!("  ✓ {}  set", preset.env_key),
+            None    => println!("  ✗ {}  not set (needed for {})", preset.env_key, preset.label),
+        }
+    }
+
+    // Memory
+    match config::load_memory() {
+        None    => println!("  ·  memory.md     (empty)"),
+        Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
+    }
+
+    // External tools
+    let tools_to_check = [
+        ("git",    "version control"),
+        ("cargo",  "Rust build tool"),
+        ("node",   "Node.js runtime"),
+        ("npm",    "Node package manager"),
+        ("python3","Python runtime"),
+        ("gh",     "GitHub CLI (optional)"),
+        ("docker", "Docker (optional)"),
+        ("rg",     "ripgrep (fast search, optional)"),
+    ];
+    for (bin, label) in &tools_to_check {
+        let found = std::process::Command::new("which")
+            .arg(bin)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let glyph = if found { "✓" } else { "·" };
+        println!("  {glyph} {bin:<12} {label}");
+    }
+
+    // Connectivity (quick HEAD to detect outbound network)
+    println!();
+    println!("  checking connectivity...");
+    let reachable = std::process::Command::new("curl")
+        .args(["-sS", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://api.anthropic.com"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|code| code.trim() != "000")
+        .unwrap_or(false);
+    if reachable {
+        println!("  ✓ api.anthropic.com reachable");
+    } else {
+        println!("  ✗ api.anthropic.com unreachable — check firewall / proxy");
+    }
+
+    println!();
+    println!("  Run `buildwithnexus init` to fix any missing configuration.");
 }
 
 #[cfg(test)]
