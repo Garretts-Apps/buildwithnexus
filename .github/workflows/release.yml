@@ -2,19 +2,15 @@ name: release
 
 # Build the native harness for every supported platform and attach the binaries
 # to the GitHub Release. The npm postinstall downloads these as its fast path.
+# publish.yml chains off this workflow's completion to push to npm.
 on:
   push:
     tags: ["v*"]
-    # One-shot: cut the v0.10.1 release whose binaries were never built. This
-    # branch trigger lets the release be produced without a tag push (which is
-    # gated in this environment). The tag is pinned to main's commit below, so
-    # the resulting release/tag is clean. Safe to remove this branch + line after.
-    branches: ["claude/cut-v0101-release"]
   workflow_dispatch:
 
 permissions:
   contents: write
-  id-token: write        # for build provenance attestation
+  id-token: write      # for build provenance attestation
   attestations: write
 
 jobs:
@@ -23,26 +19,41 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # One-shot recovery: the v0.10.1 release already has linux, windows, and
-          # intel-mac. Only the Apple Silicon binary lost the create-race and is
-          # missing. Build just that one and upload it to the existing release —
-          # a single job, so no create-race this time.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Cross-compilation toolchain for Linux aarch64 (runs on x86_64 runner).
+      - name: Install aarch64-linux cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Build
         working-directory: harness
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
+
       - name: Stage asset + checksum
         shell: bash
-        # Pass the matrix value through env so shellcheck sees a real shell
-        # variable (a literal ${{ … }} in the script trips SC2193).
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -50,12 +61,11 @@ jobs:
           src="harness/target/$TARGET/release/buildwithnexus${ext}"
           asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
-          # Per-asset checksum the postinstall verifies before chmod/exec.
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
-      # The release tag. On a tag push it's the pushed tag; otherwise it's derived
-      # from package.json so it always matches the version npm publishes
-      # (postinstall fetches assets from releases/download/v<version>).
+
+      # The release tag is the pushed v* tag; on workflow_dispatch it is derived
+      # from package.json so it always matches the version npm will publish.
       - name: Resolve release tag
         id: meta
         shell: bash
@@ -69,25 +79,16 @@ jobs:
             v=$(node -p "require('./package.json').version")
             echo "tag=v${v}" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/claude/cut-v0101-release'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
-      # Creates the tag + release on a manual run (the GITHUB_TOKEN can do this);
-      # on a tag push it just attaches assets to the existing tag's release.
+
+      # Creates the tag + release on workflow_dispatch; on a tag push it just
+      # attaches assets to the existing release.
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/claude/cut-v0101-release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          # Pin the created tag to main's commit so the release is clean even
-          # though the build ran from the throwaway branch.
-          target_commitish: 4b15c71bc9a96b99467bee558630ffd4982d41dd
-          body: |
-            Prebuilt binaries for buildwithnexus 0.10.1.
-
-            Same code as v0.10.0 — this release supplies the per-platform v0.10.1
-            binaries the npm postinstall fast path expects, so
-            `npm install -g buildwithnexus` works with no Rust toolchain.
           files: buildwithnexus-${{ matrix.target }}*
