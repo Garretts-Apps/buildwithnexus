@@ -166,7 +166,12 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
     tui::line(&tui::accent("  buildwithnexus"));
     tui::line(&tui::dim(&format!("  {} · {} · {} · {}",
         settings.provider, provider.model, settings.permission, cwd.display())));
-    tui::line(&tui::dim("  describe a task, or /help"));
+    tui::line(&tui::dim("  describe a task · /help for commands · !<cmd> to run a shell command"));
+
+    // One continuous, persisted session across BUILD tasks (resumable via
+    // /resume). Compaction in the agent loop keeps it within the model window.
+    let mut transcript: Vec<provider::Msg> = Vec::new();
+    let mut sid = session::new_id();
 
     loop {
         tui::line("");
@@ -178,12 +183,53 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         if t.is_empty() {
             continue;
         }
+
+        // Shell mode: `!cmd` runs directly in the working dir, no model.
+        if let Some(cmd) = t.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                let out = tools::run("run_command", &serde_json::json!({ "command": cmd }), cwd);
+                for l in out.content.lines() {
+                    tui::line(&tui::dim(&format!("  {l}")));
+                }
+            }
+            continue;
+        }
+
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => { tui::clear(); continue; }
+            "/new" => {
+                transcript.clear();
+                sid = session::new_id();
+                tui::line(&tui::dim("  started a fresh session"));
+                continue;
+            }
+            "/resume" => {
+                let mut sessions = session::list();
+                if sessions.is_empty() {
+                    tui::line(&tui::dim("  no saved sessions yet"));
+                    continue;
+                }
+                tui::line(&tui::dim("  recent sessions:"));
+                for (i, s) in sessions.iter().take(15).enumerate() {
+                    tui::line(&format!("  {}  {}", tui::bold(&(i + 1).to_string()), s.title));
+                }
+                let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
+                    .as_deref().map(str::trim).and_then(|x| x.parse::<usize>().ok());
+                if let Some(n) = pick {
+                    if n >= 1 && n <= sessions.len().min(15) {
+                        let s = sessions.swap_remove(n - 1);
+                        tui::line(&tui::green(&format!("  ✓ resumed: {}", s.title)));
+                        transcript = s.msgs;
+                        sid = s.id;
+                    }
+                }
+                continue;
+            }
             "/help" => {
-                tui::line(&tui::dim("  /help   show this   ·   /clear  clear screen   ·   /init  reconfigure   ·   /exit  quit"));
-                tui::line(&tui::dim("  edit: ←→ move · ^A/^E ends · ^W word · ^U/^K kill · ↑↓ history · paste multi-line ok"));
+                tui::line(&tui::dim("  /help  /clear  /new  /resume  /init  /exit   ·   !<cmd> shell"));
+                tui::line(&tui::dim("  edit: ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · ↑↓ history · ^G $EDITOR · paste ok"));
                 continue;
             }
             "/init" => {
@@ -199,12 +245,13 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         tui::line("");
         let r = match mode {
             Mode::Plan => agent::run_plan(provider, perm, t, cwd),
-            Mode::Build => agent::run_build(provider, perm, "engineer", t, cwd),
+            Mode::Build => agent::run_build_session(provider, perm, "engineer", t, cwd, &mut transcript, &sid),
             Mode::Brainstorm => agent::run_brainstorm(provider, t),
         };
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {e}")));
         }
+        tui::bell(); // soft "turn finished" nudge for long tasks
     }
 }
 

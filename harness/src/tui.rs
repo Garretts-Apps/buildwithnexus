@@ -4,7 +4,7 @@
 // "\r\n" and we echo keystrokes ourselves. Falls back to cooked line input when
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -204,6 +204,15 @@ pub fn write_stream(chunk: &str) {
 
 pub fn flush() {
     let _ = io::stdout().flush();
+}
+
+// Terminal bell — a soft "turn finished" nudge (the OS/terminal decides whether
+// to flash, beep, or badge). No-op when output isn't a TTY.
+pub fn bell() {
+    if std::io::stdout().is_terminal() {
+        print!("\x07");
+        flush();
+    }
 }
 
 // Non-blocking: drain pending key events and report whether Ctrl-C was pressed

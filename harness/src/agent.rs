@@ -225,16 +225,18 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> 
 // The Stop hook always fires once the turn ends, however it ended.
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
     let mut transcript: Vec<Msg> = Vec::new();
-    run_build_into(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
+    run_build_session(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
 }
 
 // Continue a restored session: `seed` is the prior transcript, persisted under
 // the same `sid` so resume updates the session rather than forking it.
 pub fn run_build_resumed(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, mut seed: Vec<Msg>, sid: &str) -> Result<(), String> {
-    run_build_into(p, perm, role_id, task, cwd, &mut seed, sid)
+    run_build_session(p, perm, role_id, task, cwd, &mut seed, sid)
 }
 
-fn run_build_into(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
+// Run a BUILD task into a caller-owned transcript, persisting the session. The
+// REPL uses this to keep one continuous, resumable conversation across tasks.
+pub fn run_build_session(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
     let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
