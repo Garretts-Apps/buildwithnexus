@@ -417,6 +417,15 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     out
 }
 
+// The `skip`-th newest history entry containing `query` (for Ctrl-R reverse
+// search). None when the query is empty or there's no further match.
+fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    hist.iter().rev().filter(|e| e.contains(query)).nth(skip).cloned()
+}
+
 // Candidates for the token under the cursor: slash-commands at line start, or
 // `@`-prefixed file paths anywhere.
 fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
@@ -529,6 +538,58 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                 if let Some(edited) = edit_in_editor(&cur) {
                     buf = edited.replace('\n', " ").chars().collect();
                     cursor = buf.len();
+                }
+                reline!();
+            }
+            // Ctrl-R: incremental reverse search over history. Ctrl-R again cycles
+            // older matches; Enter runs it, Esc/Tab edits it, Ctrl-C/G cancels.
+            KeyCode::Char('r') if ctrl => {
+                let snapshot = (buf.clone(), cursor);
+                let mut query = String::new();
+                let mut skip = 0usize;
+                loop {
+                    let m = {
+                        let h = history().lock();
+                        h.ok().and_then(|h| history_search(&h, &query, skip))
+                    };
+                    {
+                        let mut out = io::stdout();
+                        let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
+                        let _ = write!(out, "{}{}",
+                            dim(&format!("(reverse-i-search)`{query}`: ")),
+                            m.clone().unwrap_or_default());
+                        let _ = out.flush();
+                    }
+                    let ev = match read() {
+                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
+                        Ok(_) => continue,
+                        Err(_) => { buf = snapshot.0; cursor = snapshot.1; break; }
+                    };
+                    let c = ev.modifiers.contains(KeyModifiers::CONTROL);
+                    match ev.code {
+                        KeyCode::Char('r') if c => { if m.is_some() { skip += 1; } }
+                        KeyCode::Char('c') | KeyCode::Char('g') if c => { buf = snapshot.0; cursor = snapshot.1; break; }
+                        KeyCode::Char(ch) if !c => { query.push(ch); skip = 0; }
+                        KeyCode::Backspace => { query.pop(); skip = 0; }
+                        KeyCode::Enter => {
+                            if let Some(e) = m {
+                                print!("\r\n");
+                                flush();
+                                return Some((e, false));
+                            }
+                            buf = snapshot.0;
+                            cursor = snapshot.1;
+                            break;
+                        }
+                        KeyCode::Esc | KeyCode::Tab => {
+                            match m {
+                                Some(e) => { buf = e.chars().collect(); cursor = buf.len(); }
+                                None => { buf = snapshot.0; cursor = snapshot.1; }
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
                 reline!();
             }
@@ -766,6 +827,16 @@ mod tests {
         let (s, col) = viewport(5, 0, 3); // avail clamped to >=1
         assert!(col < 1 || s <= 5);
         let _ = (s, col);
+    }
+
+    #[test]
+    fn history_search_finds_newest_first() {
+        let h = vec!["git status".to_string(), "cargo test".to_string(), "git push".to_string()];
+        assert_eq!(history_search(&h, "git", 0).as_deref(), Some("git push"));
+        assert_eq!(history_search(&h, "git", 1).as_deref(), Some("git status"));
+        assert_eq!(history_search(&h, "git", 2), None);
+        assert_eq!(history_search(&h, "", 0), None);
+        assert_eq!(history_search(&h, "cargo", 0).as_deref(), Some("cargo test"));
     }
 
     #[test]
