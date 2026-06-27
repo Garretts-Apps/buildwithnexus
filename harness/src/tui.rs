@@ -452,7 +452,7 @@ fn edit_in_editor(current: &str) -> Option<String> {
 // Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
 const SLASH_COMMANDS_BASE: &[&str] = &[
     "/help", "/clear", "/new", "/resume", "/init",
-    "/mode", "/config", "/memory", "/skills", "/exit", "/quit",
+    "/mode", "/permissions", "/config", "/memory", "/skills", "/exit", "/quit",
 ];
 
 fn load_slash_commands() -> Vec<String> {
@@ -527,6 +527,25 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
     if at_line_start && token.starts_with('/') {
         let cmds = load_slash_commands();
         return cmds.into_iter().filter(|c| c.starts_with(token)).collect();
+    }
+    // Sub-argument completion: look at the command that precedes the current token.
+    let prefix: String = buf[..start].iter().collect();
+    match prefix.trim() {
+        "/mode" => {
+            return ["plan", "build", "brainstorm"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/permissions" => {
+            return ["ask", "auto", "readonly"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        _ => {}
     }
     if let Some(partial) = token.strip_prefix('@') {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

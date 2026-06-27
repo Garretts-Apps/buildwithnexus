@@ -153,7 +153,7 @@ fn interactive() {
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
-fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
+fn repl(provider: &Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
 
     // Show the full-screen header banner.
@@ -201,13 +201,24 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
             continue;
         }
 
-        // MODE-03: /mode with an inline argument, e.g. `/mode build`, `/mode 1`.
+        // /mode with an inline argument, e.g. `/mode build`, `/mode 1`.
         if let Some(mode_arg) = t.strip_prefix("/mode ") {
             match mode_arg.trim() {
                 "1" | "plan"       => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
                 "2" | "build"      => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
                 "3" | "brainstorm" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
                 other => tui::line(&tui::red(&format!("  unknown mode '{other}' — try: plan, build, brainstorm"))),
+            }
+            continue;
+        }
+
+        // /permissions with an inline argument, e.g. `/permissions auto`.
+        if let Some(perm_arg) = t.strip_prefix("/permissions ") {
+            match perm_arg.trim() {
+                "ask" | "1"      => apply_permission(&mut perm, "ask"),
+                "auto" | "2"     => apply_permission(&mut perm, "auto"),
+                "readonly" | "3" => apply_permission(&mut perm, "readonly"),
+                other => tui::line(&tui::red(&format!("  unknown permission '{other}' — try: ask, auto, readonly"))),
             }
             continue;
         }
@@ -237,14 +248,23 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
             }
             "/mode" => {
                 tui::line(&format!("  Current mode: {}", tui::mode_badge(mode_label(&mode))));
-                tui::line(&tui::dim("  Shift+Tab to cycle · 1=PLAN  2=BUILD  3=BRAINSTORM"));
-                let pick = tui::ask(&tui::dim("  switch to [1/2/3, Enter to keep]: ")).unwrap_or_default();
+                tui::line(&tui::dim("  Tab-complete: /mode plan|build|brainstorm  ·  Shift+Tab to cycle"));
+                tui::line("");
+                tui::line(&format!("    {}  {}", tui::bold("1"), "plan"));
+                tui::line(&format!("    {}  {}", tui::bold("2"), "build"));
+                tui::line(&format!("    {}  {}", tui::bold("3"), "brainstorm"));
+                tui::line("");
+                let pick = tui::ask("  switch to [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
                 match pick.trim() {
-                    "1" => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
-                    "2" => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
-                    "3" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
+                    "1" | "plan"       => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
+                    "2" | "build"      => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
+                    "3" | "brainstorm" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
                     _ => {}
                 }
+                continue;
+            }
+            "/permissions" => {
+                handle_permissions(&mut perm);
                 continue;
             }
             "/config" => {
@@ -310,6 +330,18 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
                 tui::line(&tui::red(&format!("  unknown command /{cmd_name} — /help for all commands")));
                 continue;
             }
+        }
+
+        // Natural-language mode/permission switch: "switch to build mode", "use readonly", etc.
+        if let Some(new_mode) = detect_mode_switch(t) {
+            mode = new_mode;
+            last_suggested_mode = None;
+            tui::show_mode_change(mode_label(&mode));
+            continue;
+        }
+        if let Some(new_perm) = detect_permission_switch(t) {
+            apply_permission(&mut perm, new_perm);
+            continue;
         }
 
         // Mode suggestion: hint once per unique suggestion (don't repeat if user stays in mode).
@@ -517,22 +549,139 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
     config::load_custom_commands().into_iter().find(|c| c.name == name)
 }
 
+// Detect intent to switch agent mode from natural language input.
+// Only catches unambiguous switch phrases — not ordinary task verbs like "plan this".
+fn detect_mode_switch(t: &str) -> Option<Mode> {
+    let l = t.trim().to_lowercase();
+    let l = l.trim_end_matches(['!', '.', '?']).trim();
+
+    let verb_prefixes: &[&str] = &[
+        "switch to ", "switch mode to ", "change to ", "change mode to ",
+        "go to ", "set mode to ", "set mode ",
+    ];
+    for prefix in verb_prefixes {
+        if let Some(rest) = l.strip_prefix(prefix) {
+            let rest = rest.trim().trim_end_matches("mode").trim();
+            match rest {
+                "plan" | "planning" => return Some(Mode::Plan),
+                "build" | "building" | "code" => return Some(Mode::Build),
+                "brainstorm" | "brainstorming" => return Some(Mode::Brainstorm),
+                _ => {}
+            }
+        }
+    }
+    // "use X mode" — the word "mode" makes the intent unambiguous.
+    if let Some(rest) = l.strip_prefix("use ") {
+        if let Some(name) = rest.trim().strip_suffix(" mode") {
+            match name.trim() {
+                "plan" | "planning" => return Some(Mode::Plan),
+                "build" | "building" | "code" => return Some(Mode::Build),
+                "brainstorm" | "brainstorming" => return Some(Mode::Brainstorm),
+                _ => {}
+            }
+        }
+    }
+    // Bare "X mode" when that's the entire input (2 words or fewer).
+    if t.split_whitespace().count() <= 2 {
+        let bare = l.trim_end_matches("mode").trim();
+        match bare {
+            "plan" | "planning" => return Some(Mode::Plan),
+            "build" | "building" => return Some(Mode::Build),
+            "brainstorm" | "brainstorming" => return Some(Mode::Brainstorm),
+            _ => {}
+        }
+    }
+    None
+}
+
+// Detect intent to switch permission mode from natural language input.
+fn detect_permission_switch(t: &str) -> Option<&'static str> {
+    let l = t.trim().to_lowercase();
+    let l = l.trim_end_matches(['!', '.', '?']).trim();
+
+    let verb_prefixes: &[&str] = &[
+        "switch to ", "change to ", "change permission to ", "set permission to ",
+        "set permission ", "use ",
+    ];
+    for prefix in verb_prefixes {
+        if let Some(rest) = l.strip_prefix(prefix) {
+            let rest = rest.trim().trim_end_matches("mode").trim()
+                           .trim_end_matches("permission").trim();
+            match rest {
+                "ask" | "confirm" => return Some("ask"),
+                "auto" | "yolo" | "approve all" => return Some("auto"),
+                "readonly" | "read only" | "read-only" | "safe" => return Some("readonly"),
+                _ => {}
+            }
+        }
+    }
+    // Bare "use readonly", "use ask" — short and unambiguous.
+    if t.split_whitespace().count() <= 3 {
+        match l.trim() {
+            "readonly" | "read-only" | "read only" => return Some("readonly"),
+            "auto permission" | "auto mode" => return Some("auto"),
+            "ask permission" | "ask mode" => return Some("ask"),
+            _ => {}
+        }
+    }
+    None
+}
+
+// Apply a permission string, update the in-session value, and persist to settings.json.
+fn apply_permission(perm: &mut Permission, ps: &str) {
+    *perm = agent::permission(ps);
+    if let Some(mut settings) = config::load_settings() {
+        settings.permission = ps.to_string();
+        config::save_settings(&settings);
+    }
+    tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
+}
+
+fn handle_permissions(perm: &mut Permission) {
+    let current = match perm {
+        Permission::Ask      => "ask",
+        Permission::Auto     => "auto",
+        Permission::ReadOnly => "readonly",
+    };
+    tui::line(&tui::accent("  /permissions — tool permission mode"));
+    tui::line(&format!("  Current: {}", tui::bold(current)));
+    tui::line(&tui::dim("  Tab-complete: /permissions ask|auto|readonly"));
+    tui::line("");
+    tui::line(&format!("    {}  {} — confirm before each file write or command  {}",
+        tui::bold("1"), tui::bold("ask"), tui::dim("(recommended)")));
+    tui::line(&format!("    {}  {} — auto-approve all actions                   {}",
+        tui::bold("2"), tui::bold("auto"), tui::dim("(yolo)")));
+    tui::line(&format!("    {}  {} — never write files or run commands",
+        tui::bold("3"), tui::bold("readonly")));
+    tui::line("");
+    let pick = tui::ask("  choice [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
+    match pick.trim() {
+        "1" | "ask"      => apply_permission(perm, "ask"),
+        "2" | "auto"     => apply_permission(perm, "auto"),
+        "3" | "readonly" => apply_permission(perm, "readonly"),
+        _ => {}
+    }
+}
+
 fn print_help() {
     tui::line(&tui::accent("  buildwithnexus commands"));
-    tui::line(&tui::dim("  ─────────────────────────────────────────────"));
-    tui::line(&format!("  {}  cycle modes (PLAN→BUILD→BRAINSTORM)", tui::bold("Shift+Tab")));
-    tui::line(&format!("  {}      show/switch mode", tui::bold("/mode")));
-    tui::line(&format!("  {}    configure hooks, memory, commands via AI", tui::bold("/config")));
-    tui::line(&format!("  {}    view/edit session memory", tui::bold("/memory")));
-    tui::line(&format!("  {}    list available skills and custom commands", tui::bold("/skills")));
-    tui::line(&format!("  {}    start a fresh session", tui::bold("/new")));
-    tui::line(&format!("  {}  pick a saved session to resume", tui::bold("/resume")));
-    tui::line(&format!("  {}      run setup (keys, providers, local models)", tui::bold("/init")));
-    tui::line(&format!("  {}     clear the screen", tui::bold("/clear")));
-    tui::line(&format!("  {}      exit", tui::bold("/exit")));
-    tui::line(&tui::dim("  ─────────────────────────────────────────────"));
+    tui::line(&tui::dim("  ─────────────────────────────────────────────────────────────"));
+    tui::line(&format!("  {}  cycle modes (PLAN → BUILD → BRAINSTORM)", tui::bold("Shift+Tab")));
+    tui::line(&format!("  {}         show/switch mode  {}", tui::bold("/mode"), tui::dim("[plan|build|brainstorm]")));
+    tui::line(&format!("  {}   show/switch tool permissions  {}", tui::bold("/permissions"), tui::dim("[ask|auto|readonly]")));
+    tui::line(&tui::dim("               or just say: \"switch to build mode\" / \"use readonly\""));
+    tui::line(&format!("  {}       configure hooks, memory, commands via AI", tui::bold("/config")));
+    tui::line(&format!("  {}       view/edit session memory", tui::bold("/memory")));
+    tui::line(&format!("  {}       list available skills and custom commands", tui::bold("/skills")));
+    tui::line(&format!("  {}          start a fresh session", tui::bold("/new")));
+    tui::line(&format!("  {}      pick a saved session to resume", tui::bold("/resume")));
+    tui::line(&format!("  {}         run setup (keys, providers, local models)", tui::bold("/init")));
+    tui::line(&format!("  {}        clear the screen", tui::bold("/clear")));
+    tui::line(&format!("  {}         exit", tui::bold("/exit")));
+    tui::line(&tui::dim("  ─────────────────────────────────────────────────────────────"));
     tui::line(&tui::dim("  !<cmd>   run a shell command directly"));
-    tui::line(&tui::dim("  @<path>  Tab-complete a file path"));
+    tui::line(&tui::dim("  @<path>  Tab-complete a file path into your message"));
+    tui::line(&tui::dim("  Tab      autocomplete /commands and their sub-args"));
     tui::line(&tui::dim("  ←→ ^A ^E  move · ^W ^U ^K kill · ^Y yank · ↑↓ history"));
     tui::line(&tui::dim("  ^G open in $EDITOR · ^R reverse search · \\ + Enter = newline"));
     tui::line(&tui::dim("  Tools active in all modes: read_file, run_command, grep, etc."));
@@ -643,13 +792,16 @@ fn usage() {
          \x20 buildwithnexus version | help\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
-         \x20 /mode                  show or switch mode\n\
+         \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
+         \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /config                configure hooks, memory, commands via AI\n\
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                list available skills and custom commands\n\
          \x20 /help /clear /new /resume /init /exit\n\
          \x20 !<cmd>                 run shell command directly\n\
-         \x20 @<path>                Tab-complete a file path\n"
+         \x20 @<path>                Tab-complete a file path\n\
+         \x20 Tab                    autocomplete /commands and sub-args\n"
     );
 }
 
@@ -701,6 +853,40 @@ mod tests {
         assert!(matches!(Mode::Plan.next(), Mode::Build));
         assert!(matches!(Mode::Build.next(), Mode::Brainstorm));
         assert!(matches!(Mode::Brainstorm.next(), Mode::Plan));
+    }
+
+    #[test]
+    fn detect_mode_switch_verb_prefixes() {
+        assert!(matches!(detect_mode_switch("switch to plan mode"), Some(Mode::Plan)));
+        assert!(matches!(detect_mode_switch("change to build"), Some(Mode::Build)));
+        assert!(matches!(detect_mode_switch("go to brainstorm"), Some(Mode::Brainstorm)));
+        assert!(matches!(detect_mode_switch("set mode to planning"), Some(Mode::Plan)));
+        assert!(matches!(detect_mode_switch("use build mode"), Some(Mode::Build)));
+        assert!(matches!(detect_mode_switch("use brainstorm mode"), Some(Mode::Brainstorm)));
+    }
+
+    #[test]
+    fn detect_mode_switch_bare_short_form() {
+        assert!(matches!(detect_mode_switch("plan mode"), Some(Mode::Plan)));
+        assert!(matches!(detect_mode_switch("build mode"), Some(Mode::Build)));
+        assert!(matches!(detect_mode_switch("brainstorm mode"), Some(Mode::Brainstorm)));
+        assert!(matches!(detect_mode_switch("planning"), Some(Mode::Plan)));
+    }
+
+    #[test]
+    fn detect_mode_switch_no_false_positives() {
+        assert!(detect_mode_switch("build me a todo app").is_none());
+        assert!(detect_mode_switch("plan the migration carefully").is_none());
+        assert!(detect_mode_switch("let's brainstorm some ideas").is_none());
+        assert!(detect_mode_switch("use this library instead").is_none());
+    }
+
+    #[test]
+    fn detect_permission_switch_verb_prefixes() {
+        assert_eq!(detect_permission_switch("switch to readonly"), Some("readonly"));
+        assert_eq!(detect_permission_switch("change to auto"), Some("auto"));
+        assert_eq!(detect_permission_switch("set permission to ask"), Some("ask"));
+        assert_eq!(detect_permission_switch("use readonly mode"), Some("readonly"));
     }
 
     #[test]
