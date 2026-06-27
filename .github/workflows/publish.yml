@@ -17,15 +17,19 @@ on:
   workflow_dispatch:
     inputs:
       version_bump:
-        description: "Version bump (patch/minor/major) — 'none' to publish current version"
+        # Default 'none': publish the version already on main, whose release
+        # binaries exist. A bump here can't push a tag (OIDC-only, no PAT), so
+        # release.yml never builds binaries for the bumped version — leaving
+        # postinstall with a 404 fast path. Bump via a PR to main instead.
+        description: "Version bump — keep 'none' to publish the current version (recommended)"
         required: true
-        default: "patch"
+        default: "none"
         type: choice
         options:
+          - none
           - patch
           - minor
           - major
-          - none
 
 permissions: {}
 
@@ -71,6 +75,14 @@ jobs:
           # is configured for this package on npmjs.com, npm publish auto-detects
           # the OIDC context from GitHub Actions and uses it for auth. Setting
           # registry-url + .npmrc with NODE_AUTH_TOKEN fights that flow.
+
+      # Node 22 ships npm 10.x, which has no OIDC Trusted Publishing support, so
+      # `npm publish` falls back to token auth, finds none, and fails ENEEDAUTH.
+      # OIDC trusted publishing requires npm >= 11.5.1 — install it explicitly.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: Bump version + tag
         # Only the manual path bumps; the release-triggered path publishes the
