@@ -84,7 +84,14 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     if !preset.env_key.is_empty() && api_key.is_none() {
         return Err(format!("{} not set; run `buildwithnexus init`", preset.env_key));
     }
-    Ok(Provider { protocol: preset.protocol, base_url, api_key, model })
+    // Context window drives auto-compaction. Local models are small (compact
+    // early — exactly where it matters for SLM swarms); hosted models are large.
+    let context_tokens = match preset.id {
+        "anthropic" => 200_000,
+        _ if preset.local => 8_192,
+        _ => 128_000,
+    };
+    Ok(Provider { protocol: preset.protocol, base_url, api_key, model, context_tokens })
 }
 
 // Headless one-shot commands: no alt screen, pipe-friendly.

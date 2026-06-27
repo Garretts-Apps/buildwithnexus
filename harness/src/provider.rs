@@ -19,6 +19,7 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    pub context_tokens: usize, // model context window, for compaction thresholds
 }
 
 // Neutral conversation. The provider translates this into each vendor's shape;
