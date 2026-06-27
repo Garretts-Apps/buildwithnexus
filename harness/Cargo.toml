@@ -1,8 +1,8 @@
 [package]
 name = "buildwithnexus"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
-description = "A hilariously fast agentic AI CLI harness — remote or local models, alternate-screen TUI"
+description = "A hilariously fast agentic AI CLI harness — remote or local models, full TUI with modes, memory, skills, hooks, and image input"
 license = "MIT"
 repository = "https://github.com/garretts-apps/buildwithnexus"
 default-run = "buildwithnexus"

@@ -36,18 +36,20 @@ pub mod bench {
 
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
-        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents.",
+        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Works anywhere on the filesystem.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
-        ToolDef { name: "list_dir", description: "List entries in a directory.",
+        ToolDef { name: "list_dir", description: "List entries in a directory. Works anywhere on the filesystem.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
         ToolDef { name: "write_file", description: "Create or overwrite a file with the given contents.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}) },
         ToolDef { name: "edit_file", description: "Replace the unique occurrence of `old` with `new` in a file.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}) },
-        ToolDef { name: "run_command", description: "Run a shell command in the working directory and return its output.",
+        ToolDef { name: "run_command", description: "Run a shell command (grep, find, git, cargo, etc.) and return its output. Use this for searching, building, or any shell operation.",
             schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}) },
         ToolDef { name: "finish", description: "Signal the task is complete with a short summary for the user.",
             schema: json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}) },
+        ToolDef { name: "save_memory", description: "Save a short note to persistent memory so it's available in future sessions. Use for preferences, recurring facts, or things the user says to remember.",
+            schema: json!({"type":"object","properties":{"note":{"type":"string","description":"Short fact or preference to remember (one line)"}},"required":["note"]}) },
     ];
     if include_subagent {
         v.push(ToolDef {

@@ -1,6 +1,5 @@
-// Provider presets, persisted settings, and the API-key store.
-// Everything here is flat data + direct file IO — no abstraction the call sites
-// don't actually need (compression-oriented).
+// Provider presets, persisted settings, API-key store, memory, and skills.
+// Everything here is flat data + direct file IO.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,14 +13,12 @@ pub enum Protocol {
     OpenAi,
 }
 
-// A model endpoint the harness knows how to talk to out of the box. Two wire
-// protocols cover every one of these — the rest is just base_url/key/model data.
 pub struct Preset {
     pub id: &'static str,
     pub label: &'static str,
     pub protocol: Protocol,
     pub base_url: &'static str,
-    pub env_key: &'static str, // key name in env / .env.keys; "" = local, no key
+    pub env_key: &'static str,
     pub default_model: &'static str,
     pub local: bool,
 }
@@ -59,11 +56,11 @@ pub fn preset(id: &str) -> Option<&'static Preset> {
 
 #[derive(Serialize, Deserialize)]
 pub struct Settings {
-    pub provider: String, // preset id
+    pub provider: String,
     pub model: String,
-    pub permission: String, // "ask" | "auto" | "readonly"
+    pub permission: String,
     #[serde(default)]
-    pub base_url: Option<String>, // override for self-hosted endpoints
+    pub base_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -81,19 +78,14 @@ pub fn home() -> PathBuf {
     PathBuf::from(base).join(".buildwithnexus")
 }
 
-fn settings_path() -> PathBuf {
-    home().join("config.json")
-}
-
-fn keys_path() -> PathBuf {
-    home().join(".env.keys")
-}
-
-// Input history, persisted across sessions (newest last). Bounded so it can't
-// grow without limit.
-pub fn history_path() -> PathBuf {
-    home().join("history")
-}
+fn settings_path() -> PathBuf { home().join("config.json") }
+fn keys_path() -> PathBuf { home().join(".env.keys") }
+pub fn history_path() -> PathBuf { home().join("history") }
+pub fn memory_path() -> PathBuf { home().join("memory.md") }
+fn agents_path() -> PathBuf { home().join("Agents.md") }
+fn skills_dir() -> PathBuf { home().join("skills") }
+fn commands_dir() -> PathBuf { home().join("commands") }
+fn hooks_dir() -> PathBuf { home().join("hooks") }
 
 pub fn load_history() -> Vec<String> {
     fs::read_to_string(history_path())
@@ -105,13 +97,126 @@ pub fn save_history(entries: &[String]) {
     const MAX: usize = 1000;
     ensure_home();
     let tail = if entries.len() > MAX { &entries[entries.len() - MAX..] } else { entries };
-    // One entry per line; entries with embedded newlines are flattened so the
-    // file stays line-delimited.
     let body: String = tail.iter().map(|e| format!("{}\n", e.replace('\n', " "))).collect();
     let p = history_path();
     if fs::write(&p, body).is_ok() {
         restrict(&p);
     }
+}
+
+// ── memory ────────────────────────────────────────────────────────────────────
+// memory.md persists facts the model saves across sessions. On startup it's
+// injected into the system context so the model "remembers" previous sessions.
+
+pub fn load_memory() -> Option<String> {
+    let text = fs::read_to_string(memory_path()).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+pub fn save_memory(content: &str) {
+    ensure_home();
+    let p = memory_path();
+    let _ = fs::write(&p, content);
+}
+
+pub fn append_memory(entry: &str) {
+    ensure_home();
+    let existing = load_memory().unwrap_or_default();
+    let new = if existing.is_empty() {
+        format!("- {entry}\n")
+    } else {
+        format!("{existing}\n- {entry}\n")
+    };
+    save_memory(&new);
+}
+
+// ── agents + skills ───────────────────────────────────────────────────────────
+// Agents.md defines roles/capabilities the model can invoke. Skills are
+// individual markdown files that describe custom behaviors.
+
+pub fn load_agents() -> Option<String> {
+    // Project-local Agents.md takes precedence over the home one.
+    let cwd = std::env::current_dir().ok()?;
+    let proj = cwd.join(".buildwithnexus").join("Agents.md");
+    if let Ok(t) = fs::read_to_string(&proj) {
+        if !t.trim().is_empty() { return Some(t.trim().to_string()); }
+    }
+    let global = agents_path();
+    fs::read_to_string(&global).ok().filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string())
+}
+
+// Returns (name, content) pairs for all skill files.
+pub fn load_skills() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for dir in [skills_dir(), std::env::current_dir().ok().map(|d| d.join(".buildwithnexus/skills")).unwrap_or_default()] {
+        if let Ok(rd) = fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.extension().is_some_and(|x| x == "md") {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if !name.is_empty() && !content.trim().is_empty() {
+                            out.push((name, content.trim().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── custom slash commands ─────────────────────────────────────────────────────
+pub struct CustomCommand {
+    pub name: String,     // without leading /
+    pub content: String,  // markdown instructions injected as context
+    pub script: Option<PathBuf>, // optional shell/py script to run
+}
+
+pub fn load_custom_commands() -> Vec<CustomCommand> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(commands_dir()) {
+        for e in rd.flatten() {
+            let path = e.path();
+            let ext = path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let stem = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if stem.is_empty() || stem.starts_with('.') { continue; }
+            match ext.as_str() {
+                "md" => {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        out.push(CustomCommand { name: stem, content: content.trim().to_string(), script: None });
+                    }
+                }
+                "sh" | "py" | "bash" => {
+                    out.push(CustomCommand { name: stem, content: String::new(), script: Some(path) });
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+// ── hooks directory ───────────────────────────────────────────────────────────
+// Auto-discovers scripts in ~/.buildwithnexus/hooks/<Event>/ so users can drop
+// a .sh or .py file there without editing settings.json.
+pub fn discover_hook_scripts(event: &str) -> Vec<PathBuf> {
+    let dir = hooks_dir().join(event);
+    let mut scripts = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if let Some(ext) = p.extension().map(|x| x.to_string_lossy().to_lowercase()) {
+                if matches!(ext.as_str(), "sh" | "bash" | "py" | "python") {
+                    scripts.push(p);
+                }
+            }
+        }
+    }
+    scripts
 }
 
 pub fn ensure_home() {
@@ -134,8 +239,6 @@ pub fn save_settings(s: &Settings) {
     }
 }
 
-// Keys live one-per-line as NAME=VALUE, 0600. Env vars win over the file so CI
-// and one-off overrides Just Work.
 fn read_keys_file() -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     if let Ok(text) = fs::read_to_string(keys_path()) {
@@ -196,16 +299,12 @@ fn restrict(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path) {}
 
-// Shared across every test that mutates the process-global NEXUS_HOME (config
-// and session tests both do), so they serialize against ONE lock and never
-// clobber each other's home directory mid-test.
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use super::TEST_ENV_LOCK as ENV_LOCK;
 
     fn unique_home() -> PathBuf {
@@ -215,7 +314,6 @@ mod tests {
         std::env::temp_dir().join(format!("bwn-cfg-{id}"))
     }
 
-    // ── mask ────────────────────────────────────────────────────────────────
     #[test]
     fn mask_short_keys_fully_hidden() {
         assert_eq!(mask("short"), "***");
@@ -233,14 +331,12 @@ mod tests {
 
     #[test]
     fn mask_never_leaks_more_than_clamp() {
-        // Even a very long key reveals at most 4 chars each side.
         let key = "A".repeat(200);
         let m = mask(&key);
         let head = m.split('…').next().unwrap();
         assert!(head.len() <= 4);
     }
 
-    // ── preset ──────────────────────────────────────────────────────────────
     #[test]
     fn preset_lookup() {
         assert!(preset("anthropic").unwrap().protocol == Protocol::Anthropic);
@@ -266,7 +362,6 @@ mod tests {
         }
     }
 
-    // ── settings default ────────────────────────────────────────────────────
     #[test]
     fn settings_default_is_ask() {
         let s = Settings::default();
@@ -292,7 +387,6 @@ mod tests {
         assert!(s.base_url.is_none());
     }
 
-    // ── keys file parsing + precedence ──────────────────────────────────────
     #[test]
     fn keys_file_parsing_and_env_precedence() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -303,7 +397,6 @@ mod tests {
         std::env::remove_var("TESTKEY_A");
         std::env::remove_var("TESTKEY_B");
 
-        // Lines with no '=' and a leading '=' are ignored; valid pairs kept.
         fs::write(h.join(".env.keys"),
             "TESTKEY_A=from_file\nb=garbage_no_eq_handled\n=leadingeq\nTESTKEY_B=second\n").unwrap();
 
@@ -312,15 +405,11 @@ mod tests {
         assert_eq!(map.get("TESTKEY_B").map(String::as_str), Some("second"));
         assert!(!map.contains_key(""));
 
-        // File value when env unset.
         assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_file"));
-        // Env overrides file.
         std::env::set_var("TESTKEY_A", "from_env");
         assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_env"));
-        // Blank env is ignored, file used.
         std::env::set_var("TESTKEY_A", "   ");
         assert_eq!(load_key("TESTKEY_A").as_deref(), Some("from_file"));
-        // Empty name → None.
         assert!(load_key("").is_none());
 
         std::env::remove_var("TESTKEY_A");
@@ -338,7 +427,6 @@ mod tests {
 
         save_key("RTKEY", "secret-value");
         assert_eq!(load_key("RTKEY").as_deref(), Some("secret-value"));
-        // Overwrite preserves other keys.
         save_key("OTHER", "x");
         save_key("RTKEY", "updated");
         assert_eq!(load_key("RTKEY").as_deref(), Some("updated"));
@@ -360,6 +448,25 @@ mod tests {
             permission: "ask".into(), base_url: None };
         save_settings(&s);
         assert_eq!(load_settings().unwrap().provider, "groq");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn memory_roundtrip() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        std::env::set_var("NEXUS_HOME", &h);
+
+        assert!(load_memory().is_none());
+        save_memory("- prefers Rust\n- dislikes Java");
+        let m = load_memory().unwrap();
+        assert!(m.contains("prefers Rust"));
+        append_memory("uses dark theme");
+        let m2 = load_memory().unwrap();
+        assert!(m2.contains("dark theme"));
+
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }

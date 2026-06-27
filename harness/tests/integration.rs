@@ -199,7 +199,8 @@ fn invalid_tool_args_are_fed_back_not_executed() {
 }
 
 #[test]
-fn readonly_blocks_out_of_cwd_read() {
+fn readonly_allows_out_of_cwd_read() {
+    // Since 0.10.2, read-only mode allows reads anywhere on the filesystem.
     let home = tmp("home");
     let cwd = tmp("proj");
     let port = serve(vec![
@@ -209,8 +210,7 @@ fn readonly_blocks_out_of_cwd_read() {
     write_config(&home, "ollama", "readonly", port);
 
     let r = run(&home, &cwd, "read a system file");
-    assert!(r.has_event("tool_denied"));
-    assert!(r.text_of("tool_denied").contains("outside"));
+    assert!(!r.has_event("tool_denied"), "reads outside cwd should be allowed in readonly mode");
 }
 
 #[test]

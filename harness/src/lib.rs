@@ -1,8 +1,5 @@
-// Library root. The binary (`main.rs`) is a thin shim over `run()`; everything
-// lives here so the integration and performance suites can reach the internals
-// (the crate is otherwise a single binary). Module visibility is unchanged —
-// each module exposes a small `#[doc(hidden)] pub mod bench` re-export used only
-// by the criterion suite, never part of the real API.
+// Library root. The binary is a thin shim; everything lives here so integration
+// suites can reach the internals directly.
 
 pub mod agent;
 pub mod config;
@@ -20,13 +17,13 @@ use std::path::PathBuf;
 
 use agent::Permission;
 use config::Settings;
+use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn run() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    // `--json` switches headless commands to structured, one-event-per-line output.
     if args.iter().any(|a| a == "--json") {
         args.retain(|a| a != "--json");
         report::set(report::Mode::Json);
@@ -47,19 +44,19 @@ pub fn run() {
         }
         "run" | "build" => headless(|p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
         "plan" => headless(|p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
-        "brainstorm" => headless(|p, _perm, _cwd| agent::run_brainstorm(p, &rest())),
+        "brainstorm" => headless(|p, perm, cwd| {
+            agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
+        }),
         "sessions" => {
             for s in session::list() {
                 let title: String = s.title.chars().take(48).collect();
                 println!("  {}  {:<48}  {}", s.id, title, s.cwd);
             }
         }
-        // Continue the most recent session with a new task.
         "continue" => headless(|p, perm, cwd| match session::latest() {
             Some(s) => agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id),
             None => Err("no sessions to continue".into()),
         }),
-        // Resume a specific session by id: `resume <id> <task…>`.
         "resume" => {
             let id = args.get(1).cloned().unwrap_or_default();
             let task = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
@@ -78,7 +75,6 @@ pub fn run() {
     }
 }
 
-// Resolve a runnable provider from saved settings, running onboarding if needed.
 fn provider_or_onboard() -> Result<(Provider, Permission), String> {
     let settings = match config::load_settings() {
         Some(s) => s,
@@ -89,8 +85,6 @@ fn provider_or_onboard() -> Result<(Provider, Permission), String> {
 
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     let preset = config::preset(&s.provider).ok_or_else(|| format!("unknown provider '{}'; run `buildwithnexus init`", s.provider))?;
-    // Never ship an API key to a non-HTTPS endpoint. Keyed presets may only be
-    // overridden to another https:// host; keyless (local) presets are exempt.
     let base_url = match &s.base_url {
         Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
             return Err(format!(
@@ -106,8 +100,6 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     if !preset.env_key.is_empty() && api_key.is_none() {
         return Err(format!("{} not set; run `buildwithnexus init`", preset.env_key));
     }
-    // Context window drives auto-compaction. Local models are small (compact
-    // early — exactly where it matters for SLM swarms); hosted models are large.
     let context_tokens = match preset.id {
         "anthropic" => 200_000,
         _ if preset.local => 8_192,
@@ -116,15 +108,14 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     Ok(Provider { protocol: preset.protocol, base_url, api_key, model, context_tokens })
 }
 
-// Headless one-shot commands: no alt screen, pipe-friendly.
 fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>) {
     let (provider, perm) = match provider_or_onboard() {
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
-    provider::prewarm(&provider); // warm the TLS connection while we set up
+    provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    hooks::init(&cwd, false); // headless: never run untrusted project hooks
+    hooks::init(&cwd, false);
     hooks::notify("SessionStart", &cwd);
     let r = f(&provider, perm, cwd.clone());
     hooks::notify("SessionEnd", &cwd);
@@ -134,7 +125,6 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
     }
 }
 
-// Full-screen interactive session.
 fn interactive() {
     let onboarded = config::load_settings().is_some();
     if !onboarded && onboarding::run().is_none() {
@@ -144,12 +134,11 @@ fn interactive() {
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
-    provider::prewarm(&provider); // warm the TLS connection while the user reads/types
+    provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    // Raw mode only when we own a real terminal; piped/headless stays cooked.
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    hooks::init(&cwd, raw); // may prompt to trust project hooks (cooked, pre-alt-screen)
+    hooks::init(&cwd, raw);
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
     let result = repl(&provider, perm, &cwd, raw);
@@ -160,32 +149,44 @@ fn interactive() {
     }
 }
 
+// ── REPL ──────────────────────────────────────────────────────────────────────
 fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
-    // Banner once. We render inline on the normal screen (no alt buffer), so the
-    // transcript stays in the terminal's scrollback — never cleared per task.
-    tui::line(&tui::accent("  buildwithnexus"));
-    tui::line(&tui::dim(&format!("  {} · {} · {} · {}",
-        settings.provider, provider.model, settings.permission, cwd.display())));
-    tui::line(&tui::dim("  describe a task · /help for commands · !<cmd> to run a shell command"));
 
-    // One continuous, persisted session across BUILD tasks (resumable via
-    // /resume). Compaction in the agent loop keeps it within the model window.
+    // Show the full-screen header banner.
+    let mode_name = "BUILD"; // default starting mode
+    tui::show_banner(
+        &settings.provider,
+        &provider.model,
+        mode_name,
+        &cwd.display().to_string(),
+    );
+    tui::line(&tui::dim("  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode"));
+
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();
+    let mut mode = Mode::Build;
+    let mut last_suggested_mode: Option<&'static str> = None;
 
     loop {
         tui::line("");
-        let task = match tui::ask_task(&format!("{} ", tui::accent("›"))) {
+        let prompt = format!("{} {} ", tui::mode_badge(mode_label(&mode)), tui::accent("›"));
+        let task = match tui::ask_task(&prompt) {
             None => return Ok(()),
-            Some(t) => t,
+            Some(tui::InputEvent::CycleMode) => {
+                mode = mode.next();
+                last_suggested_mode = None;
+                tui::show_mode_change(mode_label(&mode));
+                continue;
+            }
+            Some(tui::InputEvent::Text(t)) => t,
         };
         let t = task.trim();
         if t.is_empty() {
             continue;
         }
 
-        // Shell mode: `!cmd` runs directly in the working dir, no model.
+        // Shell passthrough: `!cmd` runs in the shell directly.
         if let Some(cmd) = t.strip_prefix('!') {
             let cmd = cmd.trim();
             if !cmd.is_empty() {
@@ -207,30 +208,11 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
                 continue;
             }
             "/resume" => {
-                let mut sessions = session::list();
-                if sessions.is_empty() {
-                    tui::line(&tui::dim("  no saved sessions yet"));
-                    continue;
-                }
-                tui::line(&tui::dim("  recent sessions:"));
-                for (i, s) in sessions.iter().take(15).enumerate() {
-                    tui::line(&format!("  {}  {}", tui::bold(&(i + 1).to_string()), s.title));
-                }
-                let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
-                    .as_deref().map(str::trim).and_then(|x| x.parse::<usize>().ok());
-                if let Some(n) = pick {
-                    if n >= 1 && n <= sessions.len().min(15) {
-                        let s = sessions.swap_remove(n - 1);
-                        tui::line(&tui::green(&format!("  ✓ resumed: {}", s.title)));
-                        transcript = s.msgs;
-                        sid = s.id;
-                    }
-                }
+                handle_resume(&mut transcript, &mut sid);
                 continue;
             }
             "/help" => {
-                tui::line(&tui::dim("  /help  /clear  /new  /resume  /init  /exit   ·   !<cmd> shell   ·   Tab completes / and @"));
-                tui::line(&tui::dim("  edit: ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · ↑↓ history · ^G $EDITOR · \\+Enter newline"));
+                print_help();
                 continue;
             }
             "/init" => {
@@ -239,47 +221,361 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
                 tui::enter_alt(raw);
                 continue;
             }
+            "/mode" => {
+                tui::line(&format!("  Current mode: {}", tui::mode_badge(mode_label(&mode))));
+                tui::line(&tui::dim("  Shift+Tab to cycle · 1=PLAN  2=BUILD  3=BRAINSTORM"));
+                let pick = tui::ask(&tui::dim("  switch to [1/2/3, Enter to keep]: ")).unwrap_or_default();
+                match pick.trim() {
+                    "1" => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
+                    "2" => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
+                    "3" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
+                    _ => {}
+                }
+                continue;
+            }
+            "/config" => {
+                handle_config(provider, perm, cwd);
+                continue;
+            }
+            "/memory" => {
+                handle_memory(provider, perm, cwd, &mut transcript, &sid);
+                continue;
+            }
+            "/skills" => {
+                handle_skills();
+                continue;
+            }
             _ => {}
         }
 
-        let mode = choose_mode(t);
+        // Check for custom user-defined slash commands.
+        if t.starts_with('/') {
+            let cmd_name = t.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            if let Some(custom) = find_custom_command(cmd_name) {
+                if let Some(script) = custom.script {
+                    // Run the script and show output.
+                    let cmd = script.to_string_lossy();
+                    let out = tools::run("run_command", &serde_json::json!({"command": cmd.as_ref()}), cwd);
+                    for l in out.content.lines() {
+                        tui::line(&format!("  {l}"));
+                    }
+                } else {
+                    // Inject the skill content as context and run in BUILD mode.
+                    let task_with_context = format!("{}\n\n[Skill: {cmd_name}]\n{}", t, custom.content);
+                    tui::line("");
+                    if let Err(e) = agent::run_build_session(provider, perm, "engineer", &task_with_context, cwd, &mut transcript, &sid) {
+                        tui::line(&tui::red(&format!("  {e}")));
+                    }
+                }
+                tui::bell();
+                continue;
+            }
+        }
+
+        // Mode suggestion: hint once per unique suggestion (don't repeat if user stays in mode).
+        suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
+
+        // Extract @image.png tokens → push a UserImages message so build_inner skips
+        // its own Msg::User push and uses this multimodal turn instead.
+        let (clean_task, image_data) = extract_images(t, cwd);
+        let n_images = image_data.len();
+        if n_images > 0 {
+            transcript.push(Msg::UserImages { text: clean_task.clone(), images: image_data });
+            tui::line(&tui::dim(&format!("  attached {n_images} image(s)")));
+        }
+        let t = clean_task.as_str();
+
         tui::line("");
-        let r = match mode {
+        let r = match &mode {
             Mode::Plan => agent::run_plan(provider, perm, t, cwd),
             Mode::Build => agent::run_build_session(provider, perm, "engineer", t, cwd, &mut transcript, &sid),
-            Mode::Brainstorm => agent::run_brainstorm(provider, t),
+            Mode::Brainstorm => {
+                match agent::run_brainstorm(provider, perm, cwd, t) {
+                    Err(e) => Err(e),
+                    Ok(None) => Ok(()),
+                    Ok(Some(agent::ModeHint::Build)) => {
+                        mode = Mode::Build;
+                        tui::show_mode_change("BUILD");
+                        Ok(())
+                    }
+                    Ok(Some(agent::ModeHint::Plan)) => {
+                        mode = Mode::Plan;
+                        tui::show_mode_change("PLAN");
+                        Ok(())
+                    }
+                    Ok(Some(agent::ModeHint::CycleMode)) => {
+                        mode = mode.next();
+                        tui::show_mode_change(mode_label(&mode));
+                        Ok(())
+                    }
+                }
+            }
         };
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {e}")));
         }
-        tui::bell(); // soft "turn finished" nudge for long tasks
+        tui::bell();
     }
 }
 
+fn mode_label(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Plan => "PLAN",
+        Mode::Build => "BUILD",
+        Mode::Brainstorm => "BRAINSTORM",
+    }
+}
+
+// Suggest switching modes when the task phrasing strongly implies a different mode.
+// Suppresses the tip if it was already shown for this mode combo in the current session.
+fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
+    let suggested = classify(task);
+    let mismatch = match (&suggested, current) {
+        (Mode::Build, Mode::Brainstorm) |
+        (Mode::Plan, Mode::Brainstorm) |
+        (Mode::Build, Mode::Plan) => true,
+        _ => false,
+    };
+    if mismatch {
+        let sug_label = mode_label(&suggested);
+        if *last_suggested != Some(sug_label) {
+            tui::line(&tui::dim(&format!("  tip: this looks like a {} task — Shift+Tab or /mode to switch", sug_label)));
+            *last_suggested = Some(sug_label);
+        }
+    } else {
+        *last_suggested = None;
+    }
+}
+
+fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
+    let mut sessions = session::list();
+    if sessions.is_empty() {
+        tui::line(&tui::dim("  no saved sessions yet"));
+        return;
+    }
+    tui::line(&tui::dim("  recent sessions:"));
+    for (i, s) in sessions.iter().take(15).enumerate() {
+        tui::line(&format!("  {}  {}", tui::bold(&(i + 1).to_string()), s.title));
+    }
+    let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
+        .as_deref().map(str::trim).and_then(|x| x.parse::<usize>().ok());
+    if let Some(n) = pick {
+        if n >= 1 && n <= sessions.len().min(15) {
+            let s = sessions.swap_remove(n - 1);
+            tui::line(&tui::green(&format!("  ✓ resumed: {}", s.title)));
+            *transcript = s.msgs;
+            *sid = s.id;
+        }
+    }
+}
+
+fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
+    tui::line(&tui::accent("  /config — AI-assisted configuration"));
+    tui::line(&tui::dim("  Tell me what to configure (hooks, memory, custom commands, settings…)"));
+    tui::line(&tui::dim("  Examples: 'add a hook to log every command run'"));
+    tui::line(&tui::dim("            'remember I prefer TypeScript over JavaScript'"));
+    tui::line(&tui::dim("            'create a /deploy slash command'"));
+    tui::line("");
+
+    let input = match tui::ask(&format!("  {} ", tui::accent("›"))) {
+        None => return,
+        Some(s) => s,
+    };
+    let t = input.trim();
+    if t.is_empty() { return; }
+
+    // Show current config context to the model.
+    let home_dir = config::home();
+    let settings_json = std::fs::read_to_string(home_dir.join("settings.json")).unwrap_or_default();
+    let memory_md = config::load_memory().unwrap_or_default();
+
+    let context = format!(
+        "The user wants to configure buildwithnexus. Their current settings.json:\n```json\n{settings_json}\n```\n\
+        Their current memory.md:\n```markdown\n{memory_md}\n```\n\
+        Home directory: {home}\n\
+        User request: {t}",
+        home = home_dir.display()
+    );
+
+    let full_task = format!(
+        "Help configure buildwithnexus based on this request. You can:\n\
+        - Write to ~/.buildwithnexus/settings.json to add/edit hooks\n\
+        - Write to ~/.buildwithnexus/memory.md to add memory\n\
+        - Create files in ~/.buildwithnexus/commands/ for custom slash commands\n\
+        - Create files in ~/.buildwithnexus/skills/ for skills\n\
+        - Create files in ~/.buildwithnexus/hooks/<Event>/ for auto-discovered hook scripts\n\n\
+        {context}"
+    );
+
+    tui::line("");
+    if let Err(e) = agent::run_build(provider, perm, "engineer", &full_task, cwd) {
+        tui::line(&tui::red(&format!("  {e}")));
+    }
+}
+
+fn handle_memory(provider: &Provider, perm: Permission, cwd: &std::path::Path, transcript: &mut Vec<provider::Msg>, sid: &str) {
+    tui::line(&tui::accent("  /memory — session memory"));
+    match config::load_memory() {
+        None => tui::line(&tui::dim("  (no memory saved yet)")),
+        Some(mem) => {
+            tui::line(&tui::dim("  Current memory:"));
+            for l in mem.lines() {
+                tui::line(&format!("    {l}"));
+            }
+        }
+    }
+    tui::line("");
+    tui::line(&tui::dim("  [a] add entry  [c] clear  [e] edit via AI  [Enter] dismiss"));
+    let pick = tui::ask(&tui::dim("  action › ")).unwrap_or_default();
+    match pick.trim() {
+        "a" => {
+            if let Some(entry) = tui::ask("  note to save: ") {
+                if !entry.trim().is_empty() {
+                    config::append_memory(entry.trim());
+                    tui::line(&tui::green("  ✓ saved"));
+                }
+            }
+        }
+        "c" => {
+            config::save_memory("");
+            tui::line(&tui::yellow("  memory cleared"));
+        }
+        "e" => {
+            let task = "Review and clean up the memory.md file at ~/.buildwithnexus/memory.md. \
+                Remove duplicates, organize by topic, and keep it concise.";
+            if let Err(e) = agent::run_build_session(provider, perm, "engineer", task, cwd, transcript, sid) {
+                tui::line(&tui::red(&format!("  {e}")));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_skills() {
+    tui::line(&tui::accent("  /skills — available skills"));
+    let skills = config::load_skills();
+    if skills.is_empty() {
+        tui::line(&tui::dim("  No skills found."));
+        tui::line(&tui::dim(&format!("  Add .md files to {}/skills/", config::home().display())));
+    } else {
+        for (name, content) in &skills {
+            let preview: String = content.lines().next().unwrap_or("").chars().take(60).collect();
+            tui::line(&format!("  {}  {}", tui::bold(&format!("/{name}")), tui::dim(&preview)));
+        }
+    }
+    // Also show custom commands.
+    let cmds = config::load_custom_commands();
+    if !cmds.is_empty() {
+        tui::line(&tui::dim("  Custom commands:"));
+        for cmd in &cmds {
+            tui::line(&format!("  {}  {}", tui::bold(&format!("/{}", cmd.name)), tui::dim(if cmd.script.is_some() { "[script]" } else { "[context]" })));
+        }
+    }
+}
+
+fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
+    config::load_custom_commands().into_iter().find(|c| c.name == name)
+}
+
+fn print_help() {
+    tui::line(&tui::accent("  buildwithnexus commands"));
+    tui::line(&tui::dim("  ─────────────────────────────────────────────"));
+    tui::line(&format!("  {}  cycle modes (PLAN→BUILD→BRAINSTORM)", tui::bold("Shift+Tab")));
+    tui::line(&format!("  {}      show/switch mode", tui::bold("/mode")));
+    tui::line(&format!("  {}    configure hooks, memory, commands via AI", tui::bold("/config")));
+    tui::line(&format!("  {}    view/edit session memory", tui::bold("/memory")));
+    tui::line(&format!("  {}    list available skills and custom commands", tui::bold("/skills")));
+    tui::line(&format!("  {}    start a fresh session", tui::bold("/new")));
+    tui::line(&format!("  {}  pick a saved session to resume", tui::bold("/resume")));
+    tui::line(&format!("  {}      run setup (keys, providers, local models)", tui::bold("/init")));
+    tui::line(&format!("  {}     clear the screen", tui::bold("/clear")));
+    tui::line(&format!("  {}      exit", tui::bold("/exit")));
+    tui::line(&tui::dim("  ─────────────────────────────────────────────"));
+    tui::line(&tui::dim("  !<cmd>   run a shell command directly"));
+    tui::line(&tui::dim("  @<path>  Tab-complete a file path"));
+    tui::line(&tui::dim("  ←→ ^A ^E  move · ^W ^U ^K kill · ^Y yank · ↑↓ history"));
+    tui::line(&tui::dim("  ^G open in $EDITOR · ^R reverse search · \\ + Enter = newline"));
+    tui::line(&tui::dim("  Tools active in all modes: read_file, run_command, grep, etc."));
+}
+
+// ── Mode ──────────────────────────────────────────────────────────────────────
 pub enum Mode {
     Plan,
     Build,
     Brainstorm,
 }
 
-// Suggest a mode from the phrasing, then let the user confirm or override.
-fn choose_mode(task: &str) -> Mode {
-    let suggested = classify(task);
-    let name = match suggested { Mode::Plan => "PLAN", Mode::Build => "BUILD", Mode::Brainstorm => "BRAINSTORM" };
-    tui::line(&format!("  {} {}  ·  {} plan  {} build  {} brainstorm",
-        tui::dim("suggested:"), tui::bold(name), tui::bold("1"), tui::bold("2"), tui::bold("3")));
-    match tui::ask(&format!("  {} ", tui::dim("mode [Enter to accept]:"))).as_deref().map(str::trim) {
-        Some("1") => Mode::Plan,
-        Some("2") => Mode::Build,
-        Some("3") => Mode::Brainstorm,
-        _ => suggested,
+impl Mode {
+    // Shift+Tab cycles PLAN → BUILD → BRAINSTORM → PLAN.
+    pub fn next(&self) -> Mode {
+        match self {
+            Mode::Plan => Mode::Build,
+            Mode::Build => Mode::Brainstorm,
+            Mode::Brainstorm => Mode::Plan,
+        }
     }
 }
 
+// Parse `@path` image tokens from a task string. Returns the cleaned text and
+// a list of `(media_type, base64_data)` pairs for any recognized image paths.
+// Unreadable or non-image @-tokens are left in the text unchanged.
+fn extract_images(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
+    use std::io::Read;
+    let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
+    let mut images: Vec<(String, String)> = Vec::new();
+    let mut clean = String::new();
+    for word in task.split_whitespace() {
+        if let Some(raw_path) = word.strip_prefix('@') {
+            let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
+            if image_exts.contains(&ext.as_str()) {
+                let p = if raw_path.starts_with('/') || raw_path.starts_with('~') {
+                    PathBuf::from(raw_path)
+                } else {
+                    cwd.join(raw_path)
+                };
+                if let Ok(mut f) = std::fs::File::open(&p) {
+                    let mut buf = Vec::new();
+                    if f.read_to_end(&mut buf).is_ok() {
+                        let media_type = match ext.as_str() {
+                            "jpg" | "jpeg" => "image/jpeg",
+                            "gif"          => "image/gif",
+                            "webp"         => "image/webp",
+                            _              => "image/png",
+                        };
+                        images.push((media_type.to_string(), base64_encode(&buf)));
+                        if !clean.is_empty() { clean.push(' '); }
+                        clean.push_str(&format!("[image: {}]", p.file_name().unwrap_or_default().to_string_lossy()));
+                        continue;
+                    }
+                }
+            }
+        }
+        if !clean.is_empty() { clean.push(' '); }
+        clean.push_str(word);
+    }
+    (clean, images)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        out.push(ALPHA[b0 >> 2] as char);
+        out.push(ALPHA[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(if chunk.len() > 1 { ALPHA[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHA[b2 & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
+// Suggest a mode from the task phrasing (used for the "tip" hint, not a gate).
 pub fn classify(task: &str) -> Mode {
     let l = task.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| l.contains(*w));
-    if has(&["what", "should", "idea", "think", "why", "how about", "options", "advice", "suggest"]) {
+    if has(&["what should", "what if", "ideas for", "what do you think", "why would", "why is", "why does", "how about", "what are the options", "advice on", "suggest", "tradeoffs"]) {
         return Mode::Brainstorm;
     }
     if has(&["plan", "design", "architect", "break down", "roadmap", "scope"]) {
@@ -295,16 +591,25 @@ fn usage() {
     println!(
         "buildwithnexus {VERSION} — agentic AI CLI harness\n\n\
          USAGE:\n\
-         \x20 buildwithnexus                 full-screen interactive session\n\
-         \x20 buildwithnexus run <task>      execute a task (agentic, headless)\n\
+         \x20 buildwithnexus                 interactive session (all modes, full TUI)\n\
+         \x20 buildwithnexus run <task>      execute a task (agentic BUILD loop)\n\
          \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
-         \x20 buildwithnexus brainstorm <q>  free-form chat, no tools\n\
+         \x20 buildwithnexus brainstorm <q>  chat with tools (grep, fetch, read, etc.)\n\
          \x20 buildwithnexus continue <task> continue the most recent session\n\
          \x20 buildwithnexus resume <id> <t> resume a specific session\n\
          \x20 buildwithnexus sessions        list saved sessions\n\
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
-         \x20 buildwithnexus version | help\n"
+         \x20 buildwithnexus version | help\n\n\
+         INTERACTIVE:\n\
+         \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
+         \x20 /mode                  show or switch mode\n\
+         \x20 /config                configure hooks, memory, commands via AI\n\
+         \x20 /memory                view and edit session memory\n\
+         \x20 /skills                list available skills and custom commands\n\
+         \x20 /help /clear /new /resume /init /exit\n\
+         \x20 !<cmd>                 run shell command directly\n\
+         \x20 @<path>                Tab-complete a file path\n"
     );
 }
 
@@ -312,7 +617,6 @@ fn usage() {
 mod tests {
     use super::*;
 
-    // ── classify ────────────────────────────────────────────────────────────
     #[test]
     fn classify_brainstorm_phrases() {
         assert!(matches!(classify("what should I name this?"), Mode::Brainstorm));
@@ -352,9 +656,13 @@ mod tests {
         assert!(matches!(classify("DESIGN the system"), Mode::Plan));
     }
 
-    // ── build_provider ──────────────────────────────────────────────────────
-    // Provider deliberately has no Debug impl (it holds the API key), so match
-    // on the Result rather than using unwrap/unwrap_err.
+    #[test]
+    fn mode_cycles_correctly() {
+        assert!(matches!(Mode::Plan.next(), Mode::Build));
+        assert!(matches!(Mode::Build.next(), Mode::Brainstorm));
+        assert!(matches!(Mode::Brainstorm.next(), Mode::Plan));
+    }
+
     #[test]
     fn build_provider_rejects_http_for_keyed_preset() {
         let s = Settings { provider: "openai".into(), model: String::new(),
@@ -377,7 +685,6 @@ mod tests {
 
     #[test]
     fn build_provider_local_preset_allows_http() {
-        // Ollama is keyless/local → http base_url is fine, and no key is required.
         let s = Settings { provider: "ollama".into(), model: String::new(),
             permission: "ask".into(), base_url: Some("http://localhost:11434/v1".into()) };
         match build_provider(&s) {
