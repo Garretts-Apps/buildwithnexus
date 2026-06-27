@@ -329,8 +329,72 @@ fn edit_in_editor(current: &str) -> Option<String> {
     content.map(|c| c.trim_end_matches(['\n', '\r']).to_string())
 }
 
+// ── Tab completion ───────────────────────────────────────────────────────────
+const SLASH_COMMANDS: &[&str] = &["/help", "/clear", "/new", "/resume", "/init", "/exit", "/quit"];
+
+// The whitespace-delimited token ending at `cursor`, and where it starts.
+fn token_at(buf: &[char], cursor: usize) -> (usize, String) {
+    let mut start = cursor;
+    while start > 0 && !buf[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    (start, buf[start..cursor].iter().collect())
+}
+
+// Longest common prefix across candidates (char-wise).
+fn common_prefix(items: &[String]) -> String {
+    let mut iter = items.iter();
+    let mut prefix: Vec<char> = match iter.next() {
+        Some(s) => s.chars().collect(),
+        None => return String::new(),
+    };
+    for s in iter {
+        let sc: Vec<char> = s.chars().collect();
+        let n = prefix.iter().zip(sc.iter()).take_while(|(a, b)| a == b).count();
+        prefix.truncate(n);
+    }
+    prefix.into_iter().collect()
+}
+
+// File/dir names under `cwd` matching an `@partial` path (dir-aware, skips dotfiles).
+fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
+    let (base, dir, prefix) = match partial.rfind('/') {
+        Some(i) => (&partial[..=i], cwd.join(&partial[..=i]), &partial[i + 1..]),
+        None => ("", cwd.to_path_buf(), partial),
+    };
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) && !name.starts_with('.') {
+                let mut full = format!("{base}{name}");
+                if e.path().is_dir() {
+                    full.push('/');
+                }
+                out.push(full);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+// Candidates for the token under the cursor: slash-commands at line start, or
+// `@`-prefixed file paths anywhere.
+fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
+    let at_line_start = buf[..start].iter().all(|c| c.is_whitespace());
+    if at_line_start && token.starts_with('/') {
+        return SLASH_COMMANDS.iter().filter(|c| c.starts_with(token)).map(|c| c.to_string()).collect();
+    }
+    if let Some(partial) = token.strip_prefix('@') {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        return path_candidates(partial, &cwd).into_iter().map(|p| format!("@{p}")).collect();
+    }
+    Vec::new()
+}
+
 // Full raw-mode line editor: cursor + word motion, kill-ring, history, paste,
-// open-in-$EDITOR. (Single visual line; multi-line composing lands separately.)
+// Tab completion, open-in-$EDITOR. (Single visual line; multi-line lands next.)
 fn read_line_raw(prompt: &str) -> Option<String> {
     print!("{prompt}");
     flush();
@@ -471,6 +535,37 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                     }
                 }
                 return Some(s);
+            }
+            KeyCode::Tab => {
+                let (tok_start, token) = token_at(&buf, cursor);
+                let cands = completions(&buf, tok_start, &token);
+                if cands.len() == 1 {
+                    let cand = &cands[0];
+                    let new: Vec<char> = cand.chars().collect();
+                    buf.splice(tok_start..cursor, new.iter().copied());
+                    cursor = tok_start + new.len();
+                    if !cand.ends_with('/') {
+                        buf.insert(cursor, ' ');
+                        cursor += 1;
+                    }
+                    redraw(start, &buf, cursor, &mut scroll);
+                } else if cands.len() > 1 {
+                    let common = common_prefix(&cands);
+                    if common.chars().count() > token.chars().count() {
+                        let new: Vec<char> = common.chars().collect();
+                        buf.splice(tok_start..cursor, new.iter().copied());
+                        cursor = tok_start + new.len();
+                        redraw(start, &buf, cursor, &mut scroll);
+                    } else {
+                        // Ambiguous — list the candidates, then reprint the line.
+                        print!("\r\n");
+                        for c in &cands {
+                            print!("  {}\r\n", dim(c));
+                        }
+                        flush();
+                        reline!();
+                    }
+                }
             }
             KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
             _ => {}
@@ -633,6 +728,46 @@ mod tests {
         let (s, col) = viewport(5, 0, 3); // avail clamped to >=1
         assert!(col < 1 || s <= 5);
         let _ = (s, col);
+    }
+
+    #[test]
+    fn token_at_grabs_trailing_token() {
+        let b: Vec<char> = "go @src/ma".chars().collect();
+        let (start, tok) = token_at(&b, b.len());
+        assert_eq!((start, tok.as_str()), (3, "@src/ma"));
+    }
+
+    #[test]
+    fn common_prefix_works() {
+        assert_eq!(common_prefix(&["/resume".into(), "/run".into()]), "/r");
+        assert_eq!(common_prefix(&["abc".into()]), "abc");
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn completions_slash_only_at_line_start() {
+        let b: Vec<char> = "/re".chars().collect();
+        assert!(completions(&b, 0, "/re").contains(&"/resume".to_string()));
+        // Same token mid-line is not a command completion.
+        let b2: Vec<char> = "do /re".chars().collect();
+        assert!(completions(&b2, 3, "/re").is_empty());
+    }
+
+    #[test]
+    fn path_candidates_matches_prefix_and_marks_dirs() {
+        use std::fs;
+        let d = std::env::temp_dir().join(format!("bwn-comp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("alpha.txt"), "").unwrap();
+        fs::write(d.join("apple.txt"), "").unwrap();
+        fs::create_dir_all(d.join("assets")).unwrap();
+        fs::write(d.join("beta.txt"), "").unwrap();
+        assert_eq!(
+            path_candidates("a", &d),
+            vec!["alpha.txt".to_string(), "apple.txt".to_string(), "assets/".to_string()]
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
