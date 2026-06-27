@@ -215,6 +215,25 @@ pub fn show_mode_change(mode: &str) {
     line(&format!("  {} mode → {}", dim("switching"), mode_badge(mode)));
 }
 
+// Live context-window meter — call after each API round-trip.
+// Color shifts green → yellow → red as the window fills up.
+pub fn context_meter(used: usize, total: usize) {
+    if total == 0 {
+        return;
+    }
+    let pct = (used * 100 / total).min(100);
+    let bar_width = 20usize;
+    let filled = (pct * bar_width / 100).min(bar_width);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+    let colored = if pct >= 80 { red(&bar) } else if pct >= 60 { yellow(&bar) } else { green(&bar) };
+    line(&format!(
+        "  {} [{}] {}",
+        dim("ctx"),
+        colored,
+        dim(&format!("{pct}%  ·  {}k / {}k tokens", used / 1_000, total / 1_000)),
+    ));
+}
+
 // Enter raw mode (and capture panics to restore the terminal even on crash).
 // We render inline on the primary screen so scrollback and text selection work.
 pub fn enter_alt(raw: bool) {

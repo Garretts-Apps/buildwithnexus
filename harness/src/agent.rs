@@ -112,7 +112,7 @@ fn model_summary(p: &Provider, middle: &[Msg]) -> String {
 }
 
 fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
-    let budget = p.context_tokens.saturating_mul(7) / 10;
+    let budget = p.context_tokens.saturating_mul(8) / 10;
     if budget == 0 || estimate_tokens(msgs) <= budget {
         return;
     }
@@ -367,6 +367,9 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
         msgs.push(Msg::User(task));
     }
 
+    // Track which files have been read this session so we can enforce read-before-write.
+    let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
+
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
             report::notice("interrupted");
@@ -441,6 +444,38 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 continue;
             }
 
+            // Record reads so we can enforce read-before-write below.
+            if call.name == "read_file" {
+                if let Some(raw) = call.input["path"].as_str() {
+                    let p = if std::path::Path::new(raw).is_absolute() {
+                        PathBuf::from(raw)
+                    } else {
+                        cwd.join(raw)
+                    };
+                    read_paths.insert(p);
+                }
+            }
+
+            // Require the model to read a file before overwriting or patching it.
+            if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                if let Some(raw) = call.input["path"].as_str() {
+                    let p = if std::path::Path::new(raw).is_absolute() {
+                        PathBuf::from(raw)
+                    } else {
+                        cwd.join(raw)
+                    };
+                    if p.exists() && !read_paths.contains(&p) {
+                        let msg = format!(
+                            "read_file('{}') required before editing. Read the file first, then retry.",
+                            p.display()
+                        );
+                        report::tool_denied(&msg);
+                        results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
+                        continue;
+                    }
+                }
+            }
+
             if call.name == "spawn_subagent" {
                 let out = spawn_subagent(p, perm, &call.input, cwd, depth);
                 report::tool_result(&call.name, &out, false);
@@ -470,6 +505,9 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
 
         msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
         msgs.push(Msg::Tool(results));
+        if !report::is_json() {
+            tui::context_meter(estimate_tokens(msgs), p.context_tokens);
+        }
         if let Some(s) = summary {
             return Ok(s);
         }
@@ -663,6 +701,9 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
 
             if reply.calls.is_empty() {
                 msgs.push(Msg::Assistant { text: reply.text.clone(), calls: vec![] });
+                if !report::is_json() {
+                    tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                }
                 break reply.text;
             }
 
@@ -695,6 +736,9 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
             }
             msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
             msgs.push(Msg::Tool(results));
+            if !report::is_json() {
+                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            }
         };
 
         // Check for mode-transition suggestion embedded in the reply.
