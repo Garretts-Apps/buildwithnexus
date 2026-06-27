@@ -60,6 +60,24 @@ buildwithnexus plan <task>     # decompose, approve, then execute
 buildwithnexus brainstorm <q>  # free-form chat
 buildwithnexus init            # (re)configure provider / model / key
 buildwithnexus providers       # list built-in providers
+buildwithnexus doctor          # diagnose setup (keys, tools, connectivity)
+```
+
+Inside the interactive session:
+
+```
+/model [name]             hot-swap the AI model mid-session
+/compact                  compress context (free up token budget)
+/review                   AI code review of current git diff
+/commit                   AI-drafted conventional commit message
+/pr                       AI-drafted pull request title + description
+/schedule <delay> <task>  run a task once in the background (5s, 2m, 1h)
+/loop <interval> <task>   run a task repeatedly in the background
+/workflows                list and manage background workflows
+/btw <context>            inject context into the next agent turn
+/config                   configure hooks, memory, and commands via AI
+/memory                   view and edit session memory
+/skills                   list skills and custom commands
 ```
 
 ## Permissions
