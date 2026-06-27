@@ -126,6 +126,9 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
 }
 
 fn interactive() {
+    // Always scaffold on interactive launch so existing users also get the
+    // directory skeleton and starter Agents.md if they're missing.
+    config::scaffold_home();
     let onboarded = config::load_settings().is_some();
     if !onboarded && onboarding::run().is_none() {
         return;

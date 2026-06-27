@@ -202,11 +202,21 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
         if tools::is_sensitive(p) {
             return confirm(&format!("access sensitive path {}", p.display()));
         }
+        // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
+        // crosses the OS boundary — always confirm, even in Auto mode.
+        if tools::is_mutating(name) && tools::is_wsl_windows_mount(p) {
+            return confirm(&format!("write to Windows filesystem {} (WSL2 boundary)", p.display()));
+        }
     }
     if name == "run_command" {
         if let Some(c) = input["command"].as_str() {
             if tools::catastrophic(c) {
                 return confirm(&format!("run dangerous command `{c}`"));
+            }
+            // In WSL2, commands that reference /mnt/<drive>/ target the Windows
+            // filesystem — confirm before running, even in Auto mode.
+            if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
+                return confirm(&format!("command targets Windows filesystem (WSL2): `{c}`"));
             }
         }
     }

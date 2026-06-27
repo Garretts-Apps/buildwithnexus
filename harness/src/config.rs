@@ -220,8 +220,53 @@ pub fn discover_hook_scripts(event: &str) -> Vec<PathBuf> {
 }
 
 pub fn ensure_home() {
-    let _ = fs::create_dir_all(home());
-    restrict(&home());
+    let h = home();
+    if let Err(e) = fs::create_dir_all(&h) {
+        // Surface the error immediately — on WSL this often means $HOME is
+        // pointing at a Windows path or the directory is read-only.
+        eprintln!("buildwithnexus: cannot create home directory {}: {e}", h.display());
+        eprintln!("  Tip: set NEXUS_HOME to a writable path, e.g. export NEXUS_HOME=$HOME/.buildwithnexus");
+        return;
+    }
+    restrict(&h);
+}
+
+/// Create the full directory skeleton and starter files on first use.
+/// Safe to call repeatedly — all operations are idempotent.
+pub fn scaffold_home() {
+    ensure_home();
+    let h = home();
+
+    // Sub-directories (created silently; errors ignored — missing dirs are
+    // handled gracefully everywhere they are used).
+    for sub in &["skills", "commands", "hooks/PreToolUse", "hooks/PostToolUse",
+                 "hooks/SessionStart", "hooks/SessionEnd", "hooks/UserPromptSubmit", "hooks/Stop"] {
+        let _ = fs::create_dir_all(h.join(sub));
+    }
+
+    // Starter Agents.md only if it doesn't exist yet.
+    let agents_md = h.join("Agents.md");
+    if !agents_md.exists() {
+        let _ = fs::write(&agents_md, "\
+# Agents
+
+Define custom agent roles here. Each section becomes available to the model
+so it can adopt specialised personas or delegate sub-tasks.
+
+## Engineer
+A senior full-stack engineer. Reads before writing. Prefers small, verifiable
+edits. Uses the finish tool when the task is done.
+
+## Researcher
+A meticulous research engineer. Investigates the codebase with read_file and
+list_dir before drawing conclusions. Cites file paths. Never modifies files
+unless explicitly asked.
+
+## Reviewer
+A careful code reviewer. Looks for correctness bugs, security issues, and
+unnecessary complexity. Produces a concise numbered list of findings.
+");
+    }
 }
 
 pub fn load_settings() -> Option<Settings> {

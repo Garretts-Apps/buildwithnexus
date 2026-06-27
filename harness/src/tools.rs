@@ -160,6 +160,50 @@ pub fn is_sensitive(p: &Path) -> bool {
         || name.ends_with(".pem")
 }
 
+// ── WSL2 filesystem boundary guard ───────────────────────────────────────────
+
+/// True when running inside WSL2 (Windows Subsystem for Linux).
+pub fn is_wsl() -> bool {
+    // WSL sets WSL_DISTRO_NAME in every shell launched from Windows Terminal.
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some() {
+        return true;
+    }
+    // Fallback: /proc/version contains "Microsoft" or "WSL" on WSL kernels.
+    std::fs::read_to_string("/proc/version")
+        .map(|v| { let l = v.to_lowercase(); l.contains("microsoft") || l.contains("wsl") })
+        .unwrap_or(false)
+}
+
+/// True when `path` is on a Windows drive mount (e.g. /mnt/c/) inside WSL2.
+/// Writes to these paths cross the WSL2 → Windows boundary and always need
+/// confirmation so the agent can't silently mutate the host filesystem.
+pub fn is_wsl_windows_mount(path: &Path) -> bool {
+    if !is_wsl() { return false; }
+    use std::path::Component;
+    let normed = normalize(path);
+    let comps = normed.components().collect::<Vec<_>>();
+    // /mnt/<single-letter>/ → Windows drive mount
+    if comps.len() >= 3 {
+        if let (Component::RootDir, Component::Normal(mnt), Component::Normal(drive)) =
+            (&comps[0], &comps[1], &comps[2])
+        {
+            return mnt.to_str() == Some("mnt")
+                && drive.to_str().map(|d| d.len() == 1 && d.is_ascii()).unwrap_or(false);
+        }
+    }
+    false
+}
+
+/// True when a shell command string references /mnt/<drive>/ paths in WSL2.
+/// Catches `cp /mnt/c/foo .`, `rm /mnt/d/bar`, etc.
+pub fn command_touches_wsl_mount(cmd: &str) -> bool {
+    if !is_wsl() { return false; }
+    // Simple heuristic: look for /mnt/<single-letter>/ token in the command.
+    cmd.split_whitespace().any(|tok| {
+        tok.starts_with("/mnt/") && tok.len() > 6 && tok.as_bytes().get(5).map(|b| b.is_ascii_alphabetic()).unwrap_or(false)
+    })
+}
+
 // Commands so destructive they require confirmation in every mode.
 pub fn catastrophic(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
