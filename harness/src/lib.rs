@@ -175,7 +175,7 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
 
     loop {
         tui::line("");
-        let task = match tui::ask(&format!("{} ", tui::accent("›"))) {
+        let task = match tui::ask_task(&format!("{} ", tui::accent("›"))) {
             None => return Ok(()),
             Some(t) => t,
         };
@@ -228,8 +228,8 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
                 continue;
             }
             "/help" => {
-                tui::line(&tui::dim("  /help  /clear  /new  /resume  /init  /exit   ·   !<cmd> shell"));
-                tui::line(&tui::dim("  edit: ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · ↑↓ history · ^G $EDITOR · paste ok"));
+                tui::line(&tui::dim("  /help  /clear  /new  /resume  /init  /exit   ·   !<cmd> shell   ·   Tab completes / and @"));
+                tui::line(&tui::dim("  edit: ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · ↑↓ history · ^G $EDITOR · \\+Enter newline"));
                 continue;
             }
             "/init" => {

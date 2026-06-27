@@ -242,7 +242,7 @@ pub fn interrupted() -> bool {
 // otherwise cooked stdin. Returns None on EOF / Ctrl-C / Ctrl-D.
 pub fn ask(prompt: &str) -> Option<String> {
     if is_raw() {
-        read_line_raw(prompt)
+        read_line_raw(prompt).map(|(s, _)| s)
     } else {
         print!("{prompt}");
         flush();
@@ -252,6 +252,44 @@ pub fn ask(prompt: &str) -> Option<String> {
             return None;
         }
         Some(buf.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
+// Like ask(), but multi-line: a trailing `\` then Enter adds another line; plain
+// Enter submits. Saves the final prompt to history. Used for the task prompt;
+// ask() stays single-line for confirmations and menus.
+pub fn ask_task(prompt: &str) -> Option<String> {
+    if !is_raw() {
+        return ask(prompt);
+    }
+    let mut acc = String::new();
+    let mut p = prompt.to_string();
+    loop {
+        let (text, cont) = read_line_raw(&p)?;
+        if acc.is_empty() {
+            acc = text;
+        } else {
+            acc.push('\n');
+            acc.push_str(&text);
+        }
+        if !cont {
+            push_history(&acc);
+            return Some(acc);
+        }
+        p = format!("{} ", dim("…")); // continuation prompt
+    }
+}
+
+// Record a submitted prompt in history (skip blanks, dedup consecutive, persist).
+fn push_history(s: &str) {
+    if s.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut h) = history().lock() {
+        if h.last().map(String::as_str) != Some(s) {
+            h.push(s.to_string());
+            crate::config::save_history(&h);
+        }
     }
 }
 
@@ -394,8 +432,9 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
 }
 
 // Full raw-mode line editor: cursor + word motion, kill-ring, history, paste,
-// Tab completion, open-in-$EDITOR. (Single visual line; multi-line lands next.)
-fn read_line_raw(prompt: &str) -> Option<String> {
+// Tab completion, open-in-$EDITOR. Returns (line, continue?) — `\`+Enter sets
+// continue so ask_task() can accumulate a multi-line prompt. None on cancel.
+fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
     print!("{prompt}");
     flush();
     let mut start = crossterm::cursor::position().unwrap_or((0, 0));
@@ -523,18 +562,17 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                 redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
+                // A trailing `\` continues onto a new line (multi-line); plain
+                // Enter submits. (History is saved by ask_task on the final line.)
+                let cont = cursor > 0 && buf[cursor - 1] == '\\';
+                if cont {
+                    buf.remove(cursor - 1);
+                    cursor -= 1;
+                    redraw(start, &buf, cursor, &mut scroll); // repaint without the backslash
+                }
                 print!("\r\n");
                 flush();
-                let s: String = buf.iter().collect();
-                if !s.trim().is_empty() {
-                    if let Ok(mut h) = history().lock() {
-                        if h.last().map(String::as_str) != Some(s.as_str()) {
-                            h.push(s.clone());
-                            crate::config::save_history(&h);
-                        }
-                    }
-                }
-                return Some(s);
+                return Some((buf.iter().collect(), cont));
             }
             KeyCode::Tab => {
                 let (tok_start, token) = token_at(&buf, cursor);

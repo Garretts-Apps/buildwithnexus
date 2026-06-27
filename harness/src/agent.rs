@@ -469,7 +469,7 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
         tui::line("");
         msgs.push(Msg::Assistant { text: reply.text, calls: vec![] });
 
-        match tui::ask(&format!("{} ", tui::blue("you ›"))) {
+        match tui::ask_task(&format!("{} ", tui::blue("you ›"))) {
             None => return Ok(()),
             Some(f) => {
                 let t = f.trim();
