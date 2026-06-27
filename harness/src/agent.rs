@@ -224,14 +224,27 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> 
 // One ReAct turn-and-tools loop. Shared by BUILD and the execution half of PLAN.
 // The Stop hook always fires once the turn ends, however it ended.
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
-    let r = build_inner(p, perm, role_id, task, cwd, 0).map(|_| ());
+    let mut transcript: Vec<Msg> = Vec::new();
+    run_build_into(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
+}
+
+// Continue a restored session: `seed` is the prior transcript, persisted under
+// the same `sid` so resume updates the session rather than forking it.
+pub fn run_build_resumed(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, mut seed: Vec<Msg>, sid: &str) -> Result<(), String> {
+    run_build_into(p, perm, role_id, task, cwd, &mut seed, sid)
+}
+
+fn run_build_into(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
+    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
     hooks::notify("Stop", cwd);
+    crate::session::save(sid, cwd, &p.model, transcript);
     r
 }
 
 // Returns the final assistant text / finish summary, so a parent can read a
 // spawned subagent's result. `depth` bounds recursion via spawn_subagent.
-fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize) -> Result<String, String> {
+// `msgs` is the working transcript (seeded for resume, otherwise empty).
+fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize, msgs: &mut Vec<Msg>) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
@@ -241,25 +254,28 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
         Ok(_) => task.to_string(),
     };
     let defs = tools::defs(depth < MAX_DEPTH);
-    let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
+    if msgs.is_empty() {
+        msgs.push(Msg::System(role(role_id).system.into()));
+    }
+    msgs.push(Msg::User(task));
 
     for _ in 0..MAX_ITERS {
         if tui::interrupted() {
             report::notice("interrupted");
             return Ok(String::new());
         }
-        maybe_compact(p, &mut msgs);
+        maybe_compact(p, msgs);
         // JSON mode buffers (one clean event); human mode streams tokens live,
         // with a spinner covering the gap until the first token so a slow model
         // never looks frozen.
         let reply: Reply = if report::is_json() {
-            let r = complete(p, &msgs, &defs)?;
+            let r = complete(p, msgs.as_slice(), &defs)?;
             report::assistant(&r.text);
             r
         } else {
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
-            let res = provider::stream(p, &msgs, &defs, &mut |c| {
+            let res = provider::stream(p, msgs.as_slice(), &defs, &mut |c| {
                 if let Some(s) = spin.take() {
                     tui::spinner_stop(s);
                 }
@@ -363,7 +379,9 @@ fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd
     };
 
     report::notice(&format!("  ↳ subagent: {task}"));
-    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1)
+    // A subagent gets its own fresh context window (not persisted as a session).
+    let mut child: Vec<Msg> = Vec::new();
+    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child)
         .unwrap_or_else(|e| format!("subagent error: {e}"));
     format!("{note}{result}")
 }

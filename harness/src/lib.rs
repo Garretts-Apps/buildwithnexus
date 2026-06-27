@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
+pub mod session;
 pub mod tools;
 pub mod tui;
 
@@ -46,6 +47,26 @@ pub fn run() {
         "run" | "build" => headless(|p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
         "plan" => headless(|p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
         "brainstorm" => headless(|p, _perm, _cwd| agent::run_brainstorm(p, &rest())),
+        "sessions" => {
+            for s in session::list() {
+                let title: String = s.title.chars().take(48).collect();
+                println!("  {}  {:<48}  {}", s.id, title, s.cwd);
+            }
+        }
+        // Continue the most recent session with a new task.
+        "continue" => headless(|p, perm, cwd| match session::latest() {
+            Some(s) => agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id),
+            None => Err("no sessions to continue".into()),
+        }),
+        // Resume a specific session by id: `resume <id> <task…>`.
+        "resume" => {
+            let id = args.get(1).cloned().unwrap_or_default();
+            let task = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
+            headless(|p, perm, cwd| match session::load(&id) {
+                Some(s) => agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id),
+                None => Err(format!("no session '{id}'")),
+            })
+        }
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -230,6 +251,9 @@ fn usage() {
          \x20 buildwithnexus run <task>      execute a task (agentic, headless)\n\
          \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
          \x20 buildwithnexus brainstorm <q>  free-form chat, no tools\n\
+         \x20 buildwithnexus continue <task> continue the most recent session\n\
+         \x20 buildwithnexus resume <id> <t> resume a specific session\n\
+         \x20 buildwithnexus sessions        list saved sessions\n\
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus version | help\n"
