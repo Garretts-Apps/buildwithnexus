@@ -388,11 +388,12 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
             let mut thinking_buf = String::new();
+            let mut renderer = tui::StreamRenderer::new();
             let res = provider::stream(p, msgs.as_slice(), &defs, &mut |c| {
                 if let Some(s) = spin.take() {
                     tui::spinner_stop(s);
                 }
-                report::assistant_delta(c);
+                renderer.push(c);
                 streamed = true;
             }, &mut |t| {
                 // Extended thinking: buffer and display as dim internal monologue.
@@ -410,6 +411,7 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 tui::spinner_stop(s);
             }
             let r = res?;
+            renderer.flush();
             if streamed {
                 report::assistant_end();
             }
@@ -681,9 +683,10 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
             let mut thinking_buf = String::new();
+            let mut renderer = if !report::is_json() { Some(tui::StreamRenderer::new()) } else { None };
             let res = provider::stream(p, &msgs, &defs, &mut |c| {
                 if let Some(s) = spin.take() { tui::spinner_stop(s); }
-                report::assistant_delta(c);
+                if let Some(r) = &mut renderer { r.push(c); } else { report::assistant_delta(c); }
                 streamed = true;
             }, &mut |t| {
                 thinking_buf.push_str(t);
@@ -697,6 +700,7 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
             });
             if let Some(s) = spin.take() { tui::spinner_stop(s); }
             let reply = res?;
+            if let Some(r) = &mut renderer { r.flush(); }
             if streamed { report::assistant_end(); }
 
             if reply.calls.is_empty() {
