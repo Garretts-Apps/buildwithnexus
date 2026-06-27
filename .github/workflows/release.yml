@@ -22,7 +22,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          # Cross-compile the Intel-mac binary on the Apple Silicon runner. The
+          # dedicated macos-13 (Intel) runners are scarce and can queue for hours;
+          # arm64 macOS cross-builds x86_64 macOS fine, so we never depend on them.
+          - os: macos-14
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
