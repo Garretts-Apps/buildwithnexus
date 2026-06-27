@@ -16,6 +16,122 @@ use crate::tui;
 const MAX_ITERS: usize = 30;
 const MAX_DEPTH: usize = 3;
 
+// ── context compaction ──────────────────────────────────────────────────────
+// Small models have small windows; long tool loops overflow them. When the
+// running conversation passes ~70% of the model's window, distill the older
+// middle into a summary and keep the system prompt + recent tail verbatim.
+const KEEP_RECENT: usize = 6;
+
+// Rough token estimate (~4 chars/token) — protocol-agnostic, enough to decide
+// when to compact without parsing each vendor's usage payload.
+fn estimate_tokens(msgs: &[Msg]) -> usize {
+    let mut chars = 0usize;
+    for m in msgs {
+        chars += match m {
+            Msg::System(s) | Msg::User(s) => s.len(),
+            Msg::Assistant { text, calls } => {
+                text.len() + calls.iter().map(|c| c.name.len() + c.input.to_string().len()).sum::<usize>()
+            }
+            Msg::Tool(rs) => rs.iter().map(|r| r.content.len()).sum(),
+        };
+    }
+    chars / 4
+}
+
+// Split indices: msgs[..sys_end] are leading system messages (kept) and
+// msgs[tail_start..] are the recent tail (kept); the middle is summarized.
+fn compaction_split(msgs: &[Msg]) -> (usize, usize) {
+    let sys_end = msgs.iter().take_while(|m| matches!(m, Msg::System(_))).count();
+    let tail_start = msgs.len().saturating_sub(KEEP_RECENT).max(sys_end);
+    (sys_end, tail_start)
+}
+
+// Deterministic, no-model fallback: list the actions taken in the middle.
+fn structural_summary(middle: &[Msg]) -> String {
+    let mut actions: Vec<String> = Vec::new();
+    for m in middle {
+        if let Msg::Assistant { calls, .. } = m {
+            for c in calls {
+                actions.push(tools::preview(&c.name, &c.input));
+            }
+        }
+    }
+    if actions.is_empty() {
+        "(earlier discussion)".to_string()
+    } else {
+        format!("Earlier steps taken: {}", actions.join("; "))
+    }
+}
+
+// Flatten messages to text for the summarizer (bounded per message).
+fn render_msgs(msgs: &[Msg]) -> String {
+    let mut s = String::new();
+    for m in msgs {
+        match m {
+            Msg::System(t) => { s.push_str("system: "); s.push_str(t); }
+            Msg::User(t) => { s.push_str("user: "); s.push_str(t); }
+            Msg::Assistant { text, calls } => {
+                s.push_str("assistant: ");
+                s.push_str(text);
+                for c in calls {
+                    s.push_str(&format!(" [tool {} {}]", c.name, c.input));
+                }
+            }
+            Msg::Tool(rs) => {
+                for r in rs {
+                    s.push_str("result: ");
+                    s.push_str(&r.content.chars().take(800).collect::<String>());
+                }
+            }
+        }
+        s.push('\n');
+    }
+    s
+}
+
+// Rebuild: system prefix + a single summary note + recent tail. `summarize` is a
+// closure so tests can inject a deterministic summary instead of a model call.
+fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
+    let (sys_end, tail_start) = compaction_split(&msgs);
+    if tail_start <= sys_end {
+        return msgs;
+    }
+    let mut it = msgs.into_iter();
+    let system: Vec<Msg> = it.by_ref().take(sys_end).collect();
+    let middle: Vec<Msg> = it.by_ref().take(tail_start - sys_end).collect();
+    let tail: Vec<Msg> = it.collect();
+    let summary = summarize(&middle);
+    let mut v = system;
+    v.push(Msg::User(format!("[Summary of earlier conversation, compacted to save context]\n{summary}")));
+    v.extend(tail);
+    v
+}
+
+// Ask the model to summarize; fall back to the structural summary on error.
+fn model_summary(p: &Provider, middle: &[Msg]) -> String {
+    let sys = "Summarize this AI coding-agent conversation into a terse brief that preserves the task, key findings, decisions, files changed, and the current state. Drop pleasantries; use compact bullet points.";
+    let q = vec![Msg::System(sys.into()), Msg::User(render_msgs(middle))];
+    match complete(p, &q, &[]) {
+        Ok(r) if !r.text.trim().is_empty() => r.text,
+        _ => structural_summary(middle),
+    }
+}
+
+// Compact in place when the running context exceeds ~70% of the window.
+fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
+    let budget = p.context_tokens.saturating_mul(7) / 10;
+    if budget == 0 || estimate_tokens(msgs) <= budget {
+        return;
+    }
+    let (sys_end, tail_start) = compaction_split(msgs);
+    if tail_start <= sys_end {
+        return;
+    }
+    report::notice("  ⟳ compacting context…");
+    let taken = std::mem::take(msgs);
+    *msgs = compact_with(taken, |middle| model_summary(p, middle));
+}
+
 #[derive(Clone, Copy)]
 pub enum Permission {
     Ask,
@@ -108,14 +224,29 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> 
 // One ReAct turn-and-tools loop. Shared by BUILD and the execution half of PLAN.
 // The Stop hook always fires once the turn ends, however it ended.
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
-    let r = build_inner(p, perm, role_id, task, cwd, 0).map(|_| ());
+    let mut transcript: Vec<Msg> = Vec::new();
+    run_build_session(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
+}
+
+// Continue a restored session: `seed` is the prior transcript, persisted under
+// the same `sid` so resume updates the session rather than forking it.
+pub fn run_build_resumed(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, mut seed: Vec<Msg>, sid: &str) -> Result<(), String> {
+    run_build_session(p, perm, role_id, task, cwd, &mut seed, sid)
+}
+
+// Run a BUILD task into a caller-owned transcript, persisting the session. The
+// REPL uses this to keep one continuous, resumable conversation across tasks.
+pub fn run_build_session(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
+    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
     hooks::notify("Stop", cwd);
+    crate::session::save(sid, cwd, &p.model, transcript);
     r
 }
 
 // Returns the final assistant text / finish summary, so a parent can read a
 // spawned subagent's result. `depth` bounds recursion via spawn_subagent.
-fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize) -> Result<String, String> {
+// `msgs` is the working transcript (seeded for resume, otherwise empty).
+fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize, msgs: &mut Vec<Msg>) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
@@ -125,24 +256,28 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
         Ok(_) => task.to_string(),
     };
     let defs = tools::defs(depth < MAX_DEPTH);
-    let mut msgs: Vec<Msg> = vec![Msg::System(role(role_id).system.into()), Msg::User(task)];
+    if msgs.is_empty() {
+        msgs.push(Msg::System(role(role_id).system.into()));
+    }
+    msgs.push(Msg::User(task));
 
     for _ in 0..MAX_ITERS {
         if tui::interrupted() {
             report::notice("interrupted");
             return Ok(String::new());
         }
+        maybe_compact(p, msgs);
         // JSON mode buffers (one clean event); human mode streams tokens live,
         // with a spinner covering the gap until the first token so a slow model
         // never looks frozen.
         let reply: Reply = if report::is_json() {
-            let r = complete(p, &msgs, &defs)?;
+            let r = complete(p, msgs.as_slice(), &defs)?;
             report::assistant(&r.text);
             r
         } else {
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
-            let res = provider::stream(p, &msgs, &defs, &mut |c| {
+            let res = provider::stream(p, msgs.as_slice(), &defs, &mut |c| {
                 if let Some(s) = spin.take() {
                     tui::spinner_stop(s);
                 }
@@ -246,7 +381,9 @@ fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd
     };
 
     report::notice(&format!("  ↳ subagent: {task}"));
-    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1)
+    // A subagent gets its own fresh context window (not persisted as a session).
+    let mut child: Vec<Msg> = Vec::new();
+    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child)
         .unwrap_or_else(|e| format!("subagent error: {e}"));
     format!("{note}{result}")
 }
@@ -319,6 +456,7 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
     let mut question = first.to_string();
     loop {
         msgs.push(Msg::User(question.clone()));
+        maybe_compact(p, &mut msgs);
         tui::line("");
         let mut streamed = false;
         let reply = provider::stream(p, &msgs, &[], &mut |c| {
@@ -331,7 +469,7 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
         tui::line("");
         msgs.push(Msg::Assistant { text: reply.text, calls: vec![] });
 
-        match tui::ask(&format!("{} ", tui::blue("you ›"))) {
+        match tui::ask_task(&format!("{} ", tui::blue("you ›"))) {
             None => return Ok(()),
             Some(f) => {
                 let t = f.trim();
@@ -434,5 +572,56 @@ mod tests {
         let cwd = Path::new("/proj");
         let r = gate(Permission::Ask, "read_file", &json!({"path": "/proj/a.rs"}), cwd);
         assert!(r.is_none());
+    }
+
+    // ── compaction ──────────────────────────────────────────────────────────
+    #[test]
+    fn estimate_tokens_counts_text() {
+        assert_eq!(estimate_tokens(&[Msg::User("a".repeat(40))]), 10); // ~4 chars/token
+    }
+
+    #[test]
+    fn compaction_split_keeps_system_and_recent_tail() {
+        let mut msgs = vec![Msg::System("s".into())];
+        for i in 0..10 {
+            msgs.push(Msg::User(format!("m{i}")));
+        }
+        let (sys_end, tail_start) = compaction_split(&msgs);
+        assert_eq!(sys_end, 1);
+        assert_eq!(tail_start, msgs.len() - KEEP_RECENT);
+    }
+
+    #[test]
+    fn compaction_split_noop_when_short() {
+        let msgs = vec![Msg::System("s".into()), Msg::User("u".into())];
+        let (sys_end, tail_start) = compaction_split(&msgs);
+        assert!(tail_start <= sys_end);
+    }
+
+    #[test]
+    fn compact_with_replaces_middle() {
+        let mut msgs = vec![Msg::System("sys".into())];
+        for i in 0..10 {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(msgs, |_| "SUMMARY".into());
+        assert_eq!(out.len(), 1 + 1 + KEEP_RECENT); // system + summary + tail
+        assert!(matches!(&out[0], Msg::System(s) if s == "sys"));
+        assert!(matches!(&out[1], Msg::User(s) if s.contains("SUMMARY")));
+        // The recent tail is preserved verbatim.
+        assert!(matches!(out.last(), Some(Msg::User(s)) if s == "u9"));
+    }
+
+    #[test]
+    fn structural_summary_lists_tool_actions() {
+        let msgs = vec![Msg::Assistant {
+            text: String::new(),
+            calls: vec![crate::provider::ToolCall {
+                id: "1".into(),
+                name: "run_command".into(),
+                input: json!({"command": "ls"}),
+            }],
+        }];
+        assert!(structural_summary(&msgs).contains("run: ls"));
     }
 }

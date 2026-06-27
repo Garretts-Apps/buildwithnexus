@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
+pub mod session;
 pub mod tools;
 pub mod tui;
 
@@ -46,6 +47,26 @@ pub fn run() {
         "run" | "build" => headless(|p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
         "plan" => headless(|p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
         "brainstorm" => headless(|p, _perm, _cwd| agent::run_brainstorm(p, &rest())),
+        "sessions" => {
+            for s in session::list() {
+                let title: String = s.title.chars().take(48).collect();
+                println!("  {}  {:<48}  {}", s.id, title, s.cwd);
+            }
+        }
+        // Continue the most recent session with a new task.
+        "continue" => headless(|p, perm, cwd| match session::latest() {
+            Some(s) => agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id),
+            None => Err("no sessions to continue".into()),
+        }),
+        // Resume a specific session by id: `resume <id> <task…>`.
+        "resume" => {
+            let id = args.get(1).cloned().unwrap_or_default();
+            let task = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
+            headless(|p, perm, cwd| match session::load(&id) {
+                Some(s) => agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id),
+                None => Err(format!("no session '{id}'")),
+            })
+        }
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         other => {
@@ -84,7 +105,14 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     if !preset.env_key.is_empty() && api_key.is_none() {
         return Err(format!("{} not set; run `buildwithnexus init`", preset.env_key));
     }
-    Ok(Provider { protocol: preset.protocol, base_url, api_key, model })
+    // Context window drives auto-compaction. Local models are small (compact
+    // early — exactly where it matters for SLM swarms); hosted models are large.
+    let context_tokens = match preset.id {
+        "anthropic" => 200_000,
+        _ if preset.local => 8_192,
+        _ => 128_000,
+    };
+    Ok(Provider { protocol: preset.protocol, base_url, api_key, model, context_tokens })
 }
 
 // Headless one-shot commands: no alt screen, pipe-friendly.
@@ -138,11 +166,16 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
     tui::line(&tui::accent("  buildwithnexus"));
     tui::line(&tui::dim(&format!("  {} · {} · {} · {}",
         settings.provider, provider.model, settings.permission, cwd.display())));
-    tui::line(&tui::dim("  describe a task, or /help"));
+    tui::line(&tui::dim("  describe a task · /help for commands · !<cmd> to run a shell command"));
+
+    // One continuous, persisted session across BUILD tasks (resumable via
+    // /resume). Compaction in the agent loop keeps it within the model window.
+    let mut transcript: Vec<provider::Msg> = Vec::new();
+    let mut sid = session::new_id();
 
     loop {
         tui::line("");
-        let task = match tui::ask(&format!("{} ", tui::accent("›"))) {
+        let task = match tui::ask_task(&format!("{} ", tui::accent("›"))) {
             None => return Ok(()),
             Some(t) => t,
         };
@@ -150,12 +183,53 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         if t.is_empty() {
             continue;
         }
+
+        // Shell mode: `!cmd` runs directly in the working dir, no model.
+        if let Some(cmd) = t.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                let out = tools::run("run_command", &serde_json::json!({ "command": cmd }), cwd);
+                for l in out.content.lines() {
+                    tui::line(&tui::dim(&format!("  {l}")));
+                }
+            }
+            continue;
+        }
+
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => { tui::clear(); continue; }
+            "/new" => {
+                transcript.clear();
+                sid = session::new_id();
+                tui::line(&tui::dim("  started a fresh session"));
+                continue;
+            }
+            "/resume" => {
+                let mut sessions = session::list();
+                if sessions.is_empty() {
+                    tui::line(&tui::dim("  no saved sessions yet"));
+                    continue;
+                }
+                tui::line(&tui::dim("  recent sessions:"));
+                for (i, s) in sessions.iter().take(15).enumerate() {
+                    tui::line(&format!("  {}  {}", tui::bold(&(i + 1).to_string()), s.title));
+                }
+                let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
+                    .as_deref().map(str::trim).and_then(|x| x.parse::<usize>().ok());
+                if let Some(n) = pick {
+                    if n >= 1 && n <= sessions.len().min(15) {
+                        let s = sessions.swap_remove(n - 1);
+                        tui::line(&tui::green(&format!("  ✓ resumed: {}", s.title)));
+                        transcript = s.msgs;
+                        sid = s.id;
+                    }
+                }
+                continue;
+            }
             "/help" => {
-                tui::line(&tui::dim("  /help   show this   ·   /clear  clear screen   ·   /init  reconfigure   ·   /exit  quit"));
-                tui::line(&tui::dim("  edit: ←→ move · ^A/^E ends · ^W word · ^U/^K kill · ↑↓ history · paste multi-line ok"));
+                tui::line(&tui::dim("  /help  /clear  /new  /resume  /init  /exit   ·   !<cmd> shell   ·   Tab completes / and @"));
+                tui::line(&tui::dim("  edit: ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · ↑↓ history · ^G $EDITOR · \\+Enter newline"));
                 continue;
             }
             "/init" => {
@@ -171,12 +245,13 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         tui::line("");
         let r = match mode {
             Mode::Plan => agent::run_plan(provider, perm, t, cwd),
-            Mode::Build => agent::run_build(provider, perm, "engineer", t, cwd),
+            Mode::Build => agent::run_build_session(provider, perm, "engineer", t, cwd, &mut transcript, &sid),
             Mode::Brainstorm => agent::run_brainstorm(provider, t),
         };
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {e}")));
         }
+        tui::bell(); // soft "turn finished" nudge for long tasks
     }
 }
 
@@ -223,6 +298,9 @@ fn usage() {
          \x20 buildwithnexus run <task>      execute a task (agentic, headless)\n\
          \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
          \x20 buildwithnexus brainstorm <q>  free-form chat, no tools\n\
+         \x20 buildwithnexus continue <task> continue the most recent session\n\
+         \x20 buildwithnexus resume <id> <t> resume a specific session\n\
+         \x20 buildwithnexus sessions        list saved sessions\n\
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus version | help\n"

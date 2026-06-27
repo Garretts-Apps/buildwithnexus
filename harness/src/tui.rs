@@ -4,7 +4,7 @@
 // "\r\n" and we echo keystrokes ourselves. Falls back to cooked line input when
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -206,6 +206,15 @@ pub fn flush() {
     let _ = io::stdout().flush();
 }
 
+// Terminal bell — a soft "turn finished" nudge (the OS/terminal decides whether
+// to flash, beep, or badge). No-op when output isn't a TTY.
+pub fn bell() {
+    if std::io::stdout().is_terminal() {
+        print!("\x07");
+        flush();
+    }
+}
+
 // Non-blocking: drain pending key events and report whether Ctrl-C was pressed
 // during a running turn (raw mode only). Lets the agent loop bail between steps.
 pub fn interrupted() -> bool {
@@ -233,7 +242,7 @@ pub fn interrupted() -> bool {
 // otherwise cooked stdin. Returns None on EOF / Ctrl-C / Ctrl-D.
 pub fn ask(prompt: &str) -> Option<String> {
     if is_raw() {
-        read_line_raw(prompt)
+        read_line_raw(prompt).map(|(s, _)| s)
     } else {
         print!("{prompt}");
         flush();
@@ -243,6 +252,44 @@ pub fn ask(prompt: &str) -> Option<String> {
             return None;
         }
         Some(buf.trim_end_matches(['\n', '\r']).to_string())
+    }
+}
+
+// Like ask(), but multi-line: a trailing `\` then Enter adds another line; plain
+// Enter submits. Saves the final prompt to history. Used for the task prompt;
+// ask() stays single-line for confirmations and menus.
+pub fn ask_task(prompt: &str) -> Option<String> {
+    if !is_raw() {
+        return ask(prompt);
+    }
+    let mut acc = String::new();
+    let mut p = prompt.to_string();
+    loop {
+        let (text, cont) = read_line_raw(&p)?;
+        if acc.is_empty() {
+            acc = text;
+        } else {
+            acc.push('\n');
+            acc.push_str(&text);
+        }
+        if !cont {
+            push_history(&acc);
+            return Some(acc);
+        }
+        p = format!("{} ", dim("…")); // continuation prompt
+    }
+}
+
+// Record a submitted prompt in history (skip blanks, dedup consecutive, persist).
+fn push_history(s: &str) {
+    if s.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut h) = history().lock() {
+        if h.last().map(String::as_str) != Some(s) {
+            h.push(s.to_string());
+            crate::config::save_history(&h);
+        }
     }
 }
 
@@ -320,9 +367,83 @@ fn edit_in_editor(current: &str) -> Option<String> {
     content.map(|c| c.trim_end_matches(['\n', '\r']).to_string())
 }
 
+// ── Tab completion ───────────────────────────────────────────────────────────
+const SLASH_COMMANDS: &[&str] = &["/help", "/clear", "/new", "/resume", "/init", "/exit", "/quit"];
+
+// The whitespace-delimited token ending at `cursor`, and where it starts.
+fn token_at(buf: &[char], cursor: usize) -> (usize, String) {
+    let mut start = cursor;
+    while start > 0 && !buf[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    (start, buf[start..cursor].iter().collect())
+}
+
+// Longest common prefix across candidates (char-wise).
+fn common_prefix(items: &[String]) -> String {
+    let mut iter = items.iter();
+    let mut prefix: Vec<char> = match iter.next() {
+        Some(s) => s.chars().collect(),
+        None => return String::new(),
+    };
+    for s in iter {
+        let sc: Vec<char> = s.chars().collect();
+        let n = prefix.iter().zip(sc.iter()).take_while(|(a, b)| a == b).count();
+        prefix.truncate(n);
+    }
+    prefix.into_iter().collect()
+}
+
+// File/dir names under `cwd` matching an `@partial` path (dir-aware, skips dotfiles).
+fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
+    let (base, dir, prefix) = match partial.rfind('/') {
+        Some(i) => (&partial[..=i], cwd.join(&partial[..=i]), &partial[i + 1..]),
+        None => ("", cwd.to_path_buf(), partial),
+    };
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) && !name.starts_with('.') {
+                let mut full = format!("{base}{name}");
+                if e.path().is_dir() {
+                    full.push('/');
+                }
+                out.push(full);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+// The `skip`-th newest history entry containing `query` (for Ctrl-R reverse
+// search). None when the query is empty or there's no further match.
+fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    hist.iter().rev().filter(|e| e.contains(query)).nth(skip).cloned()
+}
+
+// Candidates for the token under the cursor: slash-commands at line start, or
+// `@`-prefixed file paths anywhere.
+fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
+    let at_line_start = buf[..start].iter().all(|c| c.is_whitespace());
+    if at_line_start && token.starts_with('/') {
+        return SLASH_COMMANDS.iter().filter(|c| c.starts_with(token)).map(|c| c.to_string()).collect();
+    }
+    if let Some(partial) = token.strip_prefix('@') {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        return path_candidates(partial, &cwd).into_iter().map(|p| format!("@{p}")).collect();
+    }
+    Vec::new()
+}
+
 // Full raw-mode line editor: cursor + word motion, kill-ring, history, paste,
-// open-in-$EDITOR. (Single visual line; multi-line composing lands separately.)
-fn read_line_raw(prompt: &str) -> Option<String> {
+// Tab completion, open-in-$EDITOR. Returns (line, continue?) — `\`+Enter sets
+// continue so ask_task() can accumulate a multi-line prompt. None on cancel.
+fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
     print!("{prompt}");
     flush();
     let mut start = crossterm::cursor::position().unwrap_or((0, 0));
@@ -420,6 +541,58 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                 }
                 reline!();
             }
+            // Ctrl-R: incremental reverse search over history. Ctrl-R again cycles
+            // older matches; Enter runs it, Esc/Tab edits it, Ctrl-C/G cancels.
+            KeyCode::Char('r') if ctrl => {
+                let snapshot = (buf.clone(), cursor);
+                let mut query = String::new();
+                let mut skip = 0usize;
+                loop {
+                    let m = {
+                        let h = history().lock();
+                        h.ok().and_then(|h| history_search(&h, &query, skip))
+                    };
+                    {
+                        let mut out = io::stdout();
+                        let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
+                        let _ = write!(out, "{}{}",
+                            dim(&format!("(reverse-i-search)`{query}`: ")),
+                            m.clone().unwrap_or_default());
+                        let _ = out.flush();
+                    }
+                    let ev = match read() {
+                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
+                        Ok(_) => continue,
+                        Err(_) => { buf = snapshot.0; cursor = snapshot.1; break; }
+                    };
+                    let c = ev.modifiers.contains(KeyModifiers::CONTROL);
+                    match ev.code {
+                        KeyCode::Char('r') if c => { if m.is_some() { skip += 1; } }
+                        KeyCode::Char('c') | KeyCode::Char('g') if c => { buf = snapshot.0; cursor = snapshot.1; break; }
+                        KeyCode::Char(ch) if !c => { query.push(ch); skip = 0; }
+                        KeyCode::Backspace => { query.pop(); skip = 0; }
+                        KeyCode::Enter => {
+                            if let Some(e) = m {
+                                print!("\r\n");
+                                flush();
+                                return Some((e, false));
+                            }
+                            buf = snapshot.0;
+                            cursor = snapshot.1;
+                            break;
+                        }
+                        KeyCode::Esc | KeyCode::Tab => {
+                            match m {
+                                Some(e) => { buf = e.chars().collect(); cursor = buf.len(); }
+                                None => { buf = snapshot.0; cursor = snapshot.1; }
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                reline!();
+            }
             KeyCode::Char('b') if alt => { cursor = prev_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Char('f') if alt => { cursor = next_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Char(c) if !ctrl && !alt => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor, &mut scroll); }
@@ -450,18 +623,48 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                 redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
+                // A trailing `\` continues onto a new line (multi-line); plain
+                // Enter submits. (History is saved by ask_task on the final line.)
+                let cont = cursor > 0 && buf[cursor - 1] == '\\';
+                if cont {
+                    buf.remove(cursor - 1);
+                    cursor -= 1;
+                    redraw(start, &buf, cursor, &mut scroll); // repaint without the backslash
+                }
                 print!("\r\n");
                 flush();
-                let s: String = buf.iter().collect();
-                if !s.trim().is_empty() {
-                    if let Ok(mut h) = history().lock() {
-                        if h.last().map(String::as_str) != Some(s.as_str()) {
-                            h.push(s.clone());
-                            crate::config::save_history(&h);
+                return Some((buf.iter().collect(), cont));
+            }
+            KeyCode::Tab => {
+                let (tok_start, token) = token_at(&buf, cursor);
+                let cands = completions(&buf, tok_start, &token);
+                if cands.len() == 1 {
+                    let cand = &cands[0];
+                    let new: Vec<char> = cand.chars().collect();
+                    buf.splice(tok_start..cursor, new.iter().copied());
+                    cursor = tok_start + new.len();
+                    if !cand.ends_with('/') {
+                        buf.insert(cursor, ' ');
+                        cursor += 1;
+                    }
+                    redraw(start, &buf, cursor, &mut scroll);
+                } else if cands.len() > 1 {
+                    let common = common_prefix(&cands);
+                    if common.chars().count() > token.chars().count() {
+                        let new: Vec<char> = common.chars().collect();
+                        buf.splice(tok_start..cursor, new.iter().copied());
+                        cursor = tok_start + new.len();
+                        redraw(start, &buf, cursor, &mut scroll);
+                    } else {
+                        // Ambiguous — list the candidates, then reprint the line.
+                        print!("\r\n");
+                        for c in &cands {
+                            print!("  {}\r\n", dim(c));
                         }
+                        flush();
+                        reline!();
                     }
                 }
-                return Some(s);
             }
             KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
             _ => {}
@@ -624,6 +827,56 @@ mod tests {
         let (s, col) = viewport(5, 0, 3); // avail clamped to >=1
         assert!(col < 1 || s <= 5);
         let _ = (s, col);
+    }
+
+    #[test]
+    fn history_search_finds_newest_first() {
+        let h = vec!["git status".to_string(), "cargo test".to_string(), "git push".to_string()];
+        assert_eq!(history_search(&h, "git", 0).as_deref(), Some("git push"));
+        assert_eq!(history_search(&h, "git", 1).as_deref(), Some("git status"));
+        assert_eq!(history_search(&h, "git", 2), None);
+        assert_eq!(history_search(&h, "", 0), None);
+        assert_eq!(history_search(&h, "cargo", 0).as_deref(), Some("cargo test"));
+    }
+
+    #[test]
+    fn token_at_grabs_trailing_token() {
+        let b: Vec<char> = "go @src/ma".chars().collect();
+        let (start, tok) = token_at(&b, b.len());
+        assert_eq!((start, tok.as_str()), (3, "@src/ma"));
+    }
+
+    #[test]
+    fn common_prefix_works() {
+        assert_eq!(common_prefix(&["/resume".into(), "/run".into()]), "/r");
+        assert_eq!(common_prefix(&["abc".into()]), "abc");
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn completions_slash_only_at_line_start() {
+        let b: Vec<char> = "/re".chars().collect();
+        assert!(completions(&b, 0, "/re").contains(&"/resume".to_string()));
+        // Same token mid-line is not a command completion.
+        let b2: Vec<char> = "do /re".chars().collect();
+        assert!(completions(&b2, 3, "/re").is_empty());
+    }
+
+    #[test]
+    fn path_candidates_matches_prefix_and_marks_dirs() {
+        use std::fs;
+        let d = std::env::temp_dir().join(format!("bwn-comp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("alpha.txt"), "").unwrap();
+        fs::write(d.join("apple.txt"), "").unwrap();
+        fs::create_dir_all(d.join("assets")).unwrap();
+        fs::write(d.join("beta.txt"), "").unwrap();
+        assert_eq!(
+            path_candidates("a", &d),
+            vec!["alpha.txt".to_string(), "apple.txt".to_string(), "assets/".to_string()]
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

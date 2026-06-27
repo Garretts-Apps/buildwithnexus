@@ -196,14 +196,17 @@ fn restrict(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path) {}
 
+// Shared across every test that mutates the process-global NEXUS_HOME (config
+// and session tests both do), so they serialize against ONE lock and never
+// clobber each other's home directory mid-test.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Tests here mutate process-global env (NEXUS_HOME and key vars); serialize
-    // them so parallel runs don't clobber each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use super::TEST_ENV_LOCK as ENV_LOCK;
 
     fn unique_home() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
