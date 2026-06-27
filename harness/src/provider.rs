@@ -42,6 +42,9 @@ pub struct ToolResult {
 pub enum Msg {
     System(String),
     User(String),
+    /// User message with one or more attached images (base64-encoded, with media type).
+    /// Images are `(media_type, base64_data)` pairs, e.g. `("image/png", "iVBOR...")`.
+    UserImages { text: String, images: Vec<(String, String)> },
     Assistant { text: String, calls: Vec<ToolCall> },
     Tool(Vec<ToolResult>),
 }
@@ -128,22 +131,36 @@ pub fn ollama_models(base_url: &str) -> Vec<String> {
 // ── public entry points ────────────────────────────────────────────────────
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
-    request(p, msgs, tools, false, &mut sink)
+    let mut noop = |_: &str| {};
+    request(p, msgs, tools, false, &mut sink, &mut noop)
 }
 
-// Streams assistant text to `on_text` as it arrives; tool calls are accumulated
-// and returned once the turn completes.
-pub fn stream(p: &Provider, msgs: &[Msg], tools: &[ToolDef], on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
-    request(p, msgs, tools, true, on_text)
+// Streams assistant text to `on_text` and thinking tokens (when available) to
+// `on_thinking` as they arrive; tool calls are accumulated and returned on completion.
+pub fn stream(
+    p: &Provider,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    request(p, msgs, tools, true, on_text, on_thinking)
 }
 
-fn request(p: &Provider, msgs: &[Msg], tools: &[ToolDef], streaming: bool, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+fn request(
+    p: &Provider,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
     match p.protocol {
         Protocol::Anthropic => {
             let (req, mut body) = anthropic_request(p, msgs, tools)?;
             if streaming {
                 body["stream"] = json!(true);
-                anthropic_stream(send_raw(req, body)?.into_reader(), on_text)
+                anthropic_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
             } else {
                 anthropic_parse(send(req, body)?)
             }
@@ -238,6 +255,14 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
                 system.push_str(s);
             }
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::UserImages { text, images } => {
+                let mut parts: Vec<Value> = images.iter().map(|(mt, data)| json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mt, "data": data}
+                })).collect();
+                parts.push(json!({"type": "text", "text": text}));
+                messages.push(json!({"role": "user", "content": parts}));
+            }
             Msg::Assistant { text, calls } => {
                 let mut content: Vec<Value> = Vec::new();
                 if !text.is_empty() {
@@ -320,7 +345,11 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
     Ok(Reply { text, calls })
 }
 
-fn anthropic_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+fn anthropic_stream(
+    reader: impl Read,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
     let mut text = String::new();
     // index → (id, name, accumulated input JSON)
     let mut pending: Vec<(usize, String, String, String)> = Vec::new();
@@ -344,6 +373,12 @@ fn anthropic_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<
                         let t = d["text"].as_str().unwrap_or_default();
                         text.push_str(t);
                         on_text(t);
+                    }
+                    Some("thinking_delta") => {
+                        // Extended thinking tokens (claude-3-7+): surfaced separately so
+                        // the caller can render them as internal monologue.
+                        let t = d["thinking"].as_str().unwrap_or_default();
+                        on_thinking(t);
                     }
                     Some("input_json_delta") => {
                         let idx = v["index"].as_u64().unwrap_or(0) as usize;
@@ -373,6 +408,14 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
         match m {
             Msg::System(s) => messages.push(json!({"role": "system", "content": s})),
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::UserImages { text, images } => {
+                let mut parts: Vec<Value> = images.iter().map(|(mt, data)| json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{mt};base64,{data}")}
+                })).collect();
+                parts.push(json!({"type": "text", "text": text}));
+                messages.push(json!({"role": "user", "content": parts}));
+            }
             Msg::Assistant { text, calls } => {
                 let mut msg = json!({"role": "assistant", "content": text});
                 if !calls.is_empty() {
@@ -758,7 +801,8 @@ mod tests {
     // ── anthropic_stream ────────────────────────────────────────────────────
     fn drain_anthropic(sse: &str) -> Reply {
         let mut out = String::new();
-        anthropic_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t)).unwrap()
+        let mut _thinking = String::new();
+        anthropic_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t), &mut |t| _thinking.push_str(t)).unwrap()
     }
 
     #[test]

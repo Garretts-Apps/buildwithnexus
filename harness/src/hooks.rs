@@ -1,17 +1,24 @@
-// Claude Code-compatible lifecycle hooks, hardened against the clone-and-own
-// attack: a project's .buildwithnexus/settings.json can register shell commands,
-// so project hooks run ONLY after the user explicitly trusts that folder, and a
-// project hook can never *grant* a permission (only deny). Home settings are
-// trusted implicitly. Everything is parsed once per session, not per tool call.
+// Claude Code-compatible lifecycle hooks. Project hooks run only after the user
+// explicitly trusts that folder; a project hook can never grant a permission
+// (only deny). Home settings are trusted implicitly.
+//
+// Hook types supported:
+//   type: "command"  — shell command string (existing format)
+//   type: "python"   — path to a Python script (uses python3 or python)
+//   type: "script"   — any executable script path; runtime detected by extension
+//
+// Scripts in ~/.buildwithnexus/hooks/<Event>/*.{sh,py} are auto-discovered
+// without requiring settings.json entries.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
 use crate::config;
+use crate::report;
 use crate::tui;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -20,10 +27,17 @@ enum Source {
     Project,
 }
 
+// Resolved command to run: either a shell command string or an interpreter+path.
+#[derive(Clone)]
+enum HookCmd {
+    Shell(String),           // run via sh -c / cmd /C
+    Script(PathBuf),         // auto-detected interpreter by extension
+}
+
 struct Hook {
     event: String,
     matcher: String,
-    command: String,
+    cmd: HookCmd,
     source: Source,
 }
 
@@ -39,11 +53,10 @@ pub enum PreDecision {
     Deny(String),
 }
 
-// Load + parse settings once. Home is implicitly trusted; project hooks load
-// only if the folder is trusted (prompting once when interactive). Must be
-// called before the agent runs.
 pub fn init(cwd: &Path, interactive: bool) {
     let mut list = Vec::new();
+
+    // Explicit hooks from settings files.
     if let Ok(text) = std::fs::read_to_string(config::home().join("settings.json")) {
         parse_into(&text, Source::Home, &mut list);
     }
@@ -55,6 +68,20 @@ pub fn init(cwd: &Path, interactive: bool) {
             tui::line(&tui::dim("  (project hooks present but not trusted — skipped)"));
         }
     }
+
+    // Auto-discovered scripts from ~/.buildwithnexus/hooks/<Event>/.
+    for event in &["SessionStart", "SessionEnd", "UserPromptSubmit",
+                   "PreToolUse", "PostToolUse", "Stop"] {
+        for script in config::discover_hook_scripts(event) {
+            list.push(Hook {
+                event: event.to_string(),
+                matcher: "*".to_string(),
+                cmd: HookCmd::Script(script),
+                source: Source::Home,
+            });
+        }
+    }
+
     let _ = HOOKS.set(Hooks { list });
 }
 
@@ -67,10 +94,22 @@ fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
             let matcher = g["matcher"].as_str().unwrap_or("*").to_string();
             if let Some(hs) = g["hooks"].as_array() {
                 for h in hs {
-                    if h["type"].as_str() == Some("command") {
-                        if let Some(cmd) = h["command"].as_str() {
-                            out.push(Hook { event: event.clone(), matcher: matcher.clone(), command: cmd.to_string(), source });
+                    let cmd = match h["type"].as_str() {
+                        Some("command") => {
+                            h["command"].as_str().map(|c| HookCmd::Shell(c.to_string()))
                         }
+                        Some("python") => {
+                            h["script"].as_str().or_else(|| h["path"].as_str())
+                                .map(|p| HookCmd::Script(PathBuf::from(p)))
+                        }
+                        Some("script") => {
+                            h["path"].as_str().or_else(|| h["script"].as_str())
+                                .map(|p| HookCmd::Script(PathBuf::from(p)))
+                        }
+                        _ => None,
+                    };
+                    if let Some(cmd) = cmd {
+                        out.push(Hook { event: event.clone(), matcher: matcher.clone(), cmd, source });
                     }
                 }
             }
@@ -83,23 +122,22 @@ fn matches(matcher: &str, tool: &str) -> bool {
     m.is_empty() || m == "*" || m.split('|').any(|p| p.trim() == tool)
 }
 
-// (command, source) pairs for an event, optionally filtered by tool name.
-fn commands_for(event: &str, tool: Option<&str>) -> Vec<(&'static str, Source)> {
+fn commands_for(event: &str, tool: Option<&str>) -> Vec<(&'static HookCmd, Source)> {
     let Some(h) = HOOKS.get() else { return Vec::new() };
     h.list.iter()
         .filter(|hk| hk.event == event)
         .filter(|hk| tool.is_none_or(|t| matches(&hk.matcher, t)))
-        .map(|hk| (hk.command.as_str(), hk.source))
+        .map(|hk| {
+            // SAFETY: HOOKS is OnceLock with static lifetime so &hk.cmd is 'static.
+            let cmd: &'static HookCmd = unsafe { &*((&hk.cmd) as *const HookCmd) };
+            (cmd, hk.source)
+        })
         .collect()
 }
 
 // ── per-folder trust ────────────────────────────────────────────────────────
-fn trust_path() -> std::path::PathBuf {
-    config::home().join("trusted.json")
-}
+fn trust_path() -> PathBuf { config::home().join("trusted.json") }
 
-// Non-cryptographic content hash (djb2) — only used to detect that a trusted
-// settings file changed since consent, so a no-dep hash is sufficient.
 fn digest(s: &str) -> String {
     let mut h: u64 = 5381;
     for b in s.bytes() {
@@ -120,7 +158,7 @@ fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
         return true;
     }
     if !interactive {
-        return false; // never run untrusted project hooks unattended
+        return false;
     }
 
     let changed = store.get(&key).is_some();
@@ -143,7 +181,32 @@ fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
 }
 
 // ── execution ────────────────────────────────────────────────────────────────
-fn run_one(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
+fn interpreter_for(path: &Path) -> (&'static str, Vec<&'static str>) {
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+        Some("py") | Some("python") => {
+            // Prefer python3; fall back to python.
+            if std::process::Command::new("python3").arg("--version")
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+                ("python3", vec![])
+            } else {
+                ("python", vec![])
+            }
+        }
+        Some("bash") => ("bash", vec![]),
+        // Shell scripts: run as `sh /path/script.sh` — NOT `sh -c /path/script.sh`
+        // (the -c form treats the path as a command string, not a script file).
+        _ => ("sh", vec![]),
+    }
+}
+
+fn run_hook_cmd(cmd: &HookCmd, payload: &Value, cwd: &Path) -> (i32, String, String) {
+    match cmd {
+        HookCmd::Shell(s) => run_shell(s, payload, cwd),
+        HookCmd::Script(path) => run_script(path, payload, cwd),
+    }
+}
+
+fn run_shell(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
     let mut c = if cfg!(windows) {
         let mut x = Command::new("cmd");
         x.args(["/C", cmd]);
@@ -153,9 +216,28 @@ fn run_one(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
         x.args(["-c", cmd]);
         x
     };
-    c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd)
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let Ok(mut child) = c.spawn() else { return (0, String::new(), String::new()) };
+    run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+}
+
+fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String) {
+    let (interp, interp_args) = interpreter_for(path);
+    let mut c = Command::new(interp);
+    for a in interp_args { c.arg(a); }
+    c.arg(path);
+    run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+}
+
+fn run_child(c: &mut Command, payload: &Value) -> (i32, String, String) {
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match c.spawn() {
+        Ok(ch) => ch,
+        Err(e) => {
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!("  [hook] spawn failed: {e}")));
+            }
+            return (0, String::new(), String::new());
+        }
+    };
     if let Some(mut sin) = child.stdin.take() {
         let _ = sin.write_all(payload.to_string().as_bytes());
     }
@@ -165,7 +247,12 @@ fn run_one(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
             String::from_utf8_lossy(&o.stdout).into_owned(),
             String::from_utf8_lossy(&o.stderr).into_owned(),
         ),
-        Err(_) => (0, String::new(), String::new()),
+        Err(e) => {
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!("  [hook] wait failed: {e}")));
+            }
+            (0, String::new(), String::new())
+        }
     }
 }
 
@@ -181,7 +268,10 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
         "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
     });
     for (cmd, source) in commands_for("PreToolUse", Some(tool)) {
-        let (code, stdout, stderr) = run_one(cmd, &payload, cwd);
+        if !report::is_json() {
+            tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
+        }
+        let (code, stdout, stderr) = run_hook_cmd(cmd, &payload, cwd);
         if code == 2 {
             let r = stderr.trim();
             return PreDecision::Deny(if r.is_empty() { "blocked by PreToolUse hook".into() } else { r.to_string() });
@@ -193,8 +283,6 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
                         .or_else(|| j["reason"].as_str()).unwrap_or("denied by hook");
                     return PreDecision::Deny(reason.to_string());
                 }
-                // A project hook may only deny, never grant — otherwise a hostile
-                // repo could disarm the permission gate.
                 Some("allow") if source == Source::Home => return PreDecision::Allow,
                 _ => {}
             }
@@ -205,9 +293,7 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
 
 pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, cwd: &Path) {
     let cmds = commands_for("PostToolUse", Some(tool));
-    if cmds.is_empty() {
-        return;
-    }
+    if cmds.is_empty() { return; }
     let payload = json!({
         "hook_event_name": "PostToolUse", "session_id": std::process::id(),
         "tool_name": tool, "tool_input": input,
@@ -215,7 +301,7 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
         "cwd": cwd.to_string_lossy()
     });
     for (cmd, _) in cmds {
-        let _ = run_one(cmd, &payload, cwd);
+        let _ = run_hook_cmd(cmd, &payload, cwd);
     }
 }
 
@@ -226,7 +312,7 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
     });
     let mut ctx = String::new();
     for (cmd, _) in commands_for("UserPromptSubmit", None) {
-        let (code, stdout, stderr) = run_one(cmd, &payload, cwd);
+        let (code, stdout, stderr) = run_hook_cmd(cmd, &payload, cwd);
         if code == 2 {
             let r = stderr.trim();
             return Err(if r.is_empty() { "blocked by UserPromptSubmit hook".into() } else { r.to_string() });
@@ -241,12 +327,10 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
 
 pub fn notify(event: &str, cwd: &Path) {
     let cmds = commands_for(event, None);
-    if cmds.is_empty() {
-        return;
-    }
+    if cmds.is_empty() { return; }
     let payload = json!({"hook_event_name": event, "session_id": std::process::id(), "cwd": cwd.to_string_lossy()});
     for (cmd, _) in cmds {
-        let _ = run_one(cmd, &payload, cwd);
+        let _ = run_hook_cmd(cmd, &payload, cwd);
     }
 }
 
@@ -254,7 +338,6 @@ pub fn notify(event: &str, cwd: &Path) {
 mod tests {
     use super::*;
 
-    // ── matches ─────────────────────────────────────────────────────────────
     #[test]
     fn matches_wildcard_and_empty() {
         assert!(matches("*", "anything"));
@@ -275,7 +358,6 @@ mod tests {
         assert!(!matches("a|b|c", "d"));
     }
 
-    // ── digest ──────────────────────────────────────────────────────────────
     #[test]
     fn digest_is_stable_and_sensitive() {
         assert_eq!(digest("hello"), digest("hello"));
@@ -288,7 +370,6 @@ mod tests {
         assert_eq!(digest("").len(), 16);
     }
 
-    // ── decision_field ──────────────────────────────────────────────────────
     #[test]
     fn decision_field_reads_all_shapes() {
         assert_eq!(decision_field(&json!({"hookSpecificOutput": {"permissionDecision": "deny"}})), Some("deny"));
@@ -306,7 +387,6 @@ mod tests {
         assert_eq!(decision_field(&v), Some("allow"));
     }
 
-    // ── parse_into ──────────────────────────────────────────────────────────
     #[test]
     fn parse_into_extracts_command_hooks() {
         let text = r#"{
@@ -322,7 +402,23 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].event, "PreToolUse");
         assert_eq!(out[0].matcher, "run_command");
-        assert_eq!(out[0].command, "echo hi");
+        assert!(matches!(&out[0].cmd, HookCmd::Shell(s) if s == "echo hi"));
+    }
+
+    #[test]
+    fn parse_into_extracts_python_hooks() {
+        let text = r#"{
+            "hooks": {
+                "PostToolUse": [
+                    { "matcher": "*",
+                      "hooks": [{ "type": "python", "script": "/hooks/log.py" }] }
+                ]
+            }
+        }"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Home, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0].cmd, HookCmd::Script(p) if p == &PathBuf::from("/hooks/log.py")));
     }
 
     #[test]
@@ -334,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_into_skips_non_command_hooks() {
+    fn parse_into_skips_unknown_types() {
         let text = r#"{"hooks":{"Stop":[{"hooks":[{"type":"webhook","url":"x"}]}]}}"#;
         let mut out = Vec::new();
         parse_into(text, Source::Home, &mut out);

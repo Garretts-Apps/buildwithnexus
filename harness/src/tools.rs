@@ -36,18 +36,22 @@ pub mod bench {
 
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
-        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents.",
+        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Works anywhere on the filesystem.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
-        ToolDef { name: "list_dir", description: "List entries in a directory.",
+        ToolDef { name: "list_dir", description: "List entries in a directory. Works anywhere on the filesystem.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
         ToolDef { name: "write_file", description: "Create or overwrite a file with the given contents.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}) },
         ToolDef { name: "edit_file", description: "Replace the unique occurrence of `old` with `new` in a file.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}) },
-        ToolDef { name: "run_command", description: "Run a shell command in the working directory and return its output.",
+        ToolDef { name: "run_command", description: "Run a shell command (grep, find, git, cargo, etc.) and return its output. Use this for searching, building, or any shell operation.",
             schema: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}) },
         ToolDef { name: "finish", description: "Signal the task is complete with a short summary for the user.",
             schema: json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}) },
+        ToolDef { name: "save_memory", description: "Save a short note to persistent memory so it's available in future sessions. Use for preferences, recurring facts, or things the user says to remember.",
+            schema: json!({"type":"object","properties":{"note":{"type":"string","description":"Short fact or preference to remember (one line)"}},"required":["note"]}) },
+        ToolDef { name: "fetch_url", description: "Fetch the content of a URL via HTTP GET. Returns the response body as text. Use for reading documentation, API responses, changelogs, or any web content.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"}},"required":["url"]}) },
     ];
     if include_subagent {
         v.push(ToolDef {
@@ -68,6 +72,24 @@ pub fn is_mutating(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "run_command")
 }
 
+// Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
+// even in ReadOnly permission mode despite run_command being generically mutating.
+pub fn is_readonly_command(cmd: &str) -> bool {
+    let lower = cmd.trim().to_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    matches!(base, "grep" | "egrep" | "fgrep" | "rg" | "find" | "cat"
+               | "ls" | "head" | "tail" | "wc" | "sort" | "uniq" | "diff"
+               | "tree" | "stat" | "file" | "jq" | "sed")
+        || lower.starts_with("git log")
+        || lower.starts_with("git status")
+        || lower.starts_with("git diff")
+        || lower.starts_with("git show")
+        || lower.starts_with("git branch")
+        || lower.starts_with("git tag")
+        || lower.starts_with("git remote")
+}
+
 // A one-line, human-readable preview of what a call will do (shown at the gate).
 pub fn preview(name: &str, input: &Value) -> String {
     match name {
@@ -75,6 +97,7 @@ pub fn preview(name: &str, input: &Value) -> String {
         "edit_file" => format!("edit {}", input["path"].as_str().unwrap_or("?")),
         "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
         "spawn_subagent" => format!("subagent: {}", input["task"].as_str().unwrap_or("?")),
+        "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
         _ => name.to_string(),
     }
 }
@@ -135,6 +158,50 @@ pub fn is_sensitive(p: &Path) -> bool {
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
         || name.ends_with(".pem")
+}
+
+// ── WSL2 filesystem boundary guard ───────────────────────────────────────────
+
+/// True when running inside WSL2 (Windows Subsystem for Linux).
+pub fn is_wsl() -> bool {
+    // WSL sets WSL_DISTRO_NAME in every shell launched from Windows Terminal.
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some() {
+        return true;
+    }
+    // Fallback: /proc/version contains "Microsoft" or "WSL" on WSL kernels.
+    std::fs::read_to_string("/proc/version")
+        .map(|v| { let l = v.to_lowercase(); l.contains("microsoft") || l.contains("wsl") })
+        .unwrap_or(false)
+}
+
+/// True when `path` is on a Windows drive mount (e.g. /mnt/c/) inside WSL2.
+/// Writes to these paths cross the WSL2 → Windows boundary and always need
+/// confirmation so the agent can't silently mutate the host filesystem.
+pub fn is_wsl_windows_mount(path: &Path) -> bool {
+    if !is_wsl() { return false; }
+    use std::path::Component;
+    let normed = normalize(path);
+    let comps = normed.components().collect::<Vec<_>>();
+    // /mnt/<single-letter>/ → Windows drive mount
+    if comps.len() >= 3 {
+        if let (Component::RootDir, Component::Normal(mnt), Component::Normal(drive)) =
+            (&comps[0], &comps[1], &comps[2])
+        {
+            return mnt.to_str() == Some("mnt")
+                && drive.to_str().map(|d| d.len() == 1 && d.is_ascii()).unwrap_or(false);
+        }
+    }
+    false
+}
+
+/// True when a shell command string references /mnt/<drive>/ paths in WSL2.
+/// Catches `cp /mnt/c/foo .`, `rm /mnt/d/bar`, etc.
+pub fn command_touches_wsl_mount(cmd: &str) -> bool {
+    if !is_wsl() { return false; }
+    // Simple heuristic: look for /mnt/<single-letter>/ token in the command.
+    cmd.split_whitespace().any(|tok| {
+        tok.starts_with("/mnt/") && tok.len() > 6 && tok.as_bytes().get(5).map(|b| b.is_ascii_alphabetic()).unwrap_or(false)
+    })
 }
 
 // Commands so destructive they require confirmation in every mode.
@@ -246,6 +313,21 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     Outcome { content: truncate(s, MAX_OUT), is_error: !o.status.success(), finished: false }
                 }
                 Err(e) => err(format!("failed to spawn: {e}")),
+            }
+        }
+        "fetch_url" => {
+            let url = input["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                return err("url is required");
+            }
+            match ureq::get(url).call() {
+                Ok(resp) => {
+                    match resp.into_string() {
+                        Ok(body) => ok(truncate(body, MAX_OUT)),
+                        Err(e) => err(format!("failed to read response body: {e}")),
+                    }
+                }
+                Err(e) => err(format!("fetch failed: {e}")),
             }
         }
         "finish" => Outcome {

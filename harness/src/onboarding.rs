@@ -5,10 +5,26 @@ use crate::config::{self, Settings, PRESETS};
 use crate::{local, provider, tui};
 
 pub fn run() -> Option<Settings> {
-    config::ensure_home();
+    config::scaffold_home();
     tui::clear();
     tui::line(&tui::accent("  buildwithnexus"));
     tui::line(&tui::dim("  a hilariously fast, agentic AI CLI — remote or local models"));
+
+    // Warn the user if the home dir landed on a Windows mount — they should
+    // set NEXUS_HOME to a native Linux path (e.g. ~/. buildwithnexus in WSL).
+    let home = config::home();
+    if crate::tools::is_wsl() {
+        let h = home.to_string_lossy();
+        if h.starts_with("/mnt/") {
+            tui::line("");
+            tui::line(&tui::yellow("  ⚠ WSL2: home directory is on a Windows mount."));
+            tui::line(&tui::dim(&format!("    {}", h)));
+            tui::line(&tui::dim("    Set NEXUS_HOME to a Linux path to avoid cross-OS I/O:"));
+            tui::line(&tui::dim("    export NEXUS_HOME=$HOME/.buildwithnexus"));
+        } else {
+            tui::line(&tui::dim("  (WSL2 detected — Windows drive mounts are guarded)"));
+        }
+    }
     tui::line("");
     tui::line("  Let's get you set up. Pick a model provider:");
     tui::line("");

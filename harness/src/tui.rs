@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    poll, read, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    poll, read, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
@@ -23,34 +24,29 @@ pub fn is_raw() -> bool {
 }
 
 // ── theme ────────────────────────────────────────────────────────────────
-// A small semantic palette (à la opencode's theme tokens) rendered as truecolor
-// when the terminal advertises it (COLORTERM=truecolor/24bit), otherwise
-// down-sampled to the xterm-256 cube, and dropped entirely under NO_COLOR. One
-// place owns the colors so the rest of the UI just names a role.
 #[derive(Clone, Copy)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-// Dark theme (Catppuccin-ish) — cohesive on the dark terminals that dominate.
-const ACCENT: Rgb = Rgb(0xb4, 0x8e, 0xff); // brand violet — agent identity
+const ACCENT: Rgb = Rgb(0xb4, 0x8e, 0xff);
 const TEXT: Rgb = Rgb(0xcd, 0xd6, 0xf4);
-const MUTED: Rgb = Rgb(0x7f, 0x84, 0x9c); // secondary / hints
+const MUTED: Rgb = Rgb(0x7f, 0x84, 0x9c);
 const SUCCESS: Rgb = Rgb(0xa6, 0xe3, 0xa1);
 const WARNING: Rgb = Rgb(0xf9, 0xe2, 0xaf);
 const ERROR: Rgb = Rgb(0xf3, 0x8b, 0xa8);
 const INFO: Rgb = Rgb(0x89, 0xdc, 0xeb);
+const MODE_PLAN: Rgb = Rgb(0xa6, 0xe3, 0xa1);   // green — planning
+const MODE_BUILD: Rgb = Rgb(0x89, 0xdc, 0xeb);  // cyan — building
+const MODE_BSTORM: Rgb = Rgb(0xf9, 0xe2, 0xaf); // amber — thinking
 
 fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
 }
 
-// opencode requires truecolor for its full palette; mirror that, with a fallback.
 fn truecolor() -> bool {
     matches!(std::env::var("COLORTERM").ok().as_deref(), Some("truecolor") | Some("24bit"))
 }
 
-// Quantize an 8-bit channel onto xterm's 6-level cube.
 fn cube(c: u8) -> u32 {
-    // 0,95,135,175,215,255 are the cube's steps; nearest-step index 0..=5.
     let levels = [0u8, 95, 135, 175, 215, 255];
     let mut best = 0usize;
     let mut bd = u16::MAX;
@@ -75,14 +71,12 @@ fn paint(c: Rgb, s: &str) -> String {
     format!("\x1b[{}m{s}\x1b[0m", sgr_fg(c))
 }
 
-// Raw SGR for attributes that aren't colors (bold).
 fn attr(code: &str, s: &str) -> String {
     if no_color() { return s.to_string(); }
     format!("\x1b[{code}m{s}\x1b[0m")
 }
 
 pub fn bold(s: &str) -> String { attr("1", s) }
-// Roles. Legacy names kept (callers reference them) but routed through the theme.
 pub fn dim(s: &str) -> String { paint(MUTED, s) }
 pub fn red(s: &str) -> String { paint(ERROR, s) }
 pub fn green(s: &str) -> String { paint(SUCCESS, s) }
@@ -92,17 +86,27 @@ pub fn cyan(s: &str) -> String { paint(INFO, s) }
 pub fn accent(s: &str) -> String { paint(ACCENT, s) }
 pub fn text(s: &str) -> String { paint(TEXT, s) }
 
+// Mode-colored badge: PLAN (green), BUILD (cyan), BRAINSTORM (amber).
+pub fn mode_badge(mode: &str) -> String {
+    let (label, color) = match mode {
+        "PLAN"       => ("PLAN", MODE_PLAN),
+        "BRAINSTORM" => ("BRAINSTORM", MODE_BSTORM),
+        _            => ("BUILD", MODE_BUILD),
+    };
+    if no_color() {
+        format!("[{label}]")
+    } else {
+        format!("\x1b[{}m[{label}]\x1b[0m", sgr_fg(color))
+    }
+}
+
 // ── inline diff ────────────────────────────────────────────────────────────
-// opencode shows a colored diff for every file edit. Render a compact unified
-// view: trim the common head/tail lines, mark the changed middle with -/+, and
-// keep a couple of context lines so the change reads in place. Pure + bounded.
 pub fn diff(old: &str, new: &str) -> String {
     const CTX: usize = 2;
-    const MAX: usize = 60; // never flood the screen on a huge replacement
+    const MAX: usize = 60;
     let o: Vec<&str> = old.lines().collect();
     let n: Vec<&str> = new.lines().collect();
 
-    // Common prefix / suffix (line-wise).
     let mut head = 0;
     while head < o.len() && head < n.len() && o[head] == n[head] {
         head += 1;
@@ -136,7 +140,6 @@ pub fn diff(old: &str, new: &str) -> String {
     out.join("\n")
 }
 
-// First-N-lines preview of new file content, as additions.
 pub fn added_preview(content: &str) -> String {
     const MAX: usize = 40;
     let lines: Vec<&str> = content.lines().collect();
@@ -148,21 +151,242 @@ pub fn added_preview(content: &str) -> String {
     }
 }
 
-// Begin an interactive session. Deliberately NOT the alternate screen: rendering
-// inline on the normal buffer preserves the terminal's native scrollback, mouse
-// wheel, and text selection/copy — the same choice Claude Code makes. We still
-// enable raw mode for the key-driven line editor, and bracketed paste so multi-
-// line pastes arrive as one event.
+// ── streaming code-block renderer ────────────────────────────────────────────
+// Feeds line-by-line through assistant streaming output. Triple-backtick fenced
+// code blocks are rendered with a box border, and each block is automatically
+// copied to the clipboard via OSC 52 (supported by iTerm2, kitty, Alacritty,
+// WezTerm, macOS Terminal 2.12+, and most modern terminals).
+//
+// Usage: create one per assistant turn, call push() for each streamed chunk,
+// call flush() after streaming ends.
+
+enum StreamState {
+    Normal,
+    InCode { lang: String, lines: Vec<String> },
+}
+
+pub struct StreamRenderer {
+    pending: String,
+    state: StreamState,
+    w: usize, // terminal width cap for box drawing
+}
+
+impl StreamRenderer {
+    pub fn new() -> Self {
+        let w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(80);
+        StreamRenderer { pending: String::new(), state: StreamState::Normal, w }
+    }
+
+    pub fn push(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        self.drain(false);
+    }
+
+    // Call after the stream ends to flush any partial last line.
+    pub fn flush(&mut self) {
+        self.drain(true);
+    }
+
+    fn drain(&mut self, end: bool) {
+        loop {
+            match self.pending.find('\n') {
+                Some(nl) => {
+                    let line_text = self.pending[..nl].to_string();
+                    self.pending = self.pending[nl + 1..].to_string();
+                    self.process_line(&line_text);
+                }
+                None if end && !self.pending.is_empty() => {
+                    let last = std::mem::take(&mut self.pending);
+                    self.process_line(&last);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn process_line(&mut self, text: &str) {
+        // Pull out the current state so we can unconditionally assign self.state below.
+        let state = std::mem::replace(&mut self.state, StreamState::Normal);
+        match state {
+            StreamState::Normal => {
+                if text.starts_with("```") {
+                    // Opening fence — draw box header and enter code mode.
+                    let lang = text[3..].trim().to_string();
+                    let header = self.box_header(&lang);
+                    line(&header);
+                    self.state = StreamState::InCode { lang, lines: Vec::new() };
+                } else {
+                    // Regular text: preserve blank lines; no extra prefix (matches
+                    // the existing non-code streaming style).
+                    if is_raw() {
+                        print!("{}\r\n", text);
+                        let _ = io::stdout().flush();
+                    } else {
+                        println!("{text}");
+                    }
+                    self.state = StreamState::Normal;
+                }
+            }
+            StreamState::InCode { lang, mut lines } => {
+                if text.trim_end_matches('\r') == "```" {
+                    // Closing fence — draw footer, then copy to clipboard.
+                    line(&self.box_footer());
+                    let code = lines.join("\n");
+                    osc52_copy(&code);
+                    line(&dim("  ⎘ copied to clipboard"));
+                    self.state = StreamState::Normal;
+                    let _ = lang;
+                } else {
+                    // Code line — prefix with a dim vertical bar.
+                    let row = format!("  {} {text}", dim("│"));
+                    line(&row);
+                    lines.push(text.to_string());
+                    self.state = StreamState::InCode { lang, lines };
+                }
+            }
+        }
+    }
+
+    fn box_header(&self, lang: &str) -> String {
+        // "  ┌─ lang ─────────" or "  ┌────────" when no lang
+        let prefix = if lang.is_empty() {
+            "  ┌".to_string()
+        } else {
+            format!("  ┌─ {lang} ")
+        };
+        let used = prefix.chars().count();
+        let dashes = self.w.saturating_sub(used).max(1);
+        format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
+    }
+
+    fn box_footer(&self) -> String {
+        // "  └────────────────"
+        let prefix = "  └";
+        let dashes = self.w.saturating_sub(prefix.chars().count()).max(1);
+        format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
+    }
+}
+
+// Copy text to the terminal clipboard via the OSC 52 escape sequence.
+// Works in raw/interactive mode only; a no-op in cooked/piped sessions.
+fn osc52_copy(text: &str) {
+    if !is_raw() {
+        return;
+    }
+    let encoded = b64_encode(text.as_bytes());
+    print!("\x1b]52;c;{encoded}\x07");
+    let _ = io::stdout().flush();
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for ch in data.chunks(3) {
+        let b0 = ch[0] as usize;
+        let b1 = if ch.len() > 1 { ch[1] as usize } else { 0 };
+        let b2 = if ch.len() > 2 { ch[2] as usize } else { 0 };
+        out.push(A[b0 >> 2] as char);
+        out.push(A[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(if ch.len() > 1 { A[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
+        out.push(if ch.len() > 2 { A[b2 & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
+// ── startup banner ───────────────────────────────────────────────────────────
+// Gradient wordmark: each letter of "buildwithnexus" shifts across purple→cyan→green.
+fn wordmark() -> String {
+    if no_color() {
+        return "buildwithnexus".to_string();
+    }
+    // Gradient stops: ACCENT(purple) → INFO(cyan) → SUCCESS(green)
+    let stops: &[(u8, u8, u8)] = &[
+        (0xb4, 0x8e, 0xff), // purple  (b u i)
+        (0xa0, 0xa0, 0xff), //         (l d)
+        (0x89, 0xdc, 0xeb), // cyan    (w i t)
+        (0x89, 0xdc, 0xeb), //         (h n)
+        (0xa6, 0xe3, 0xa1), // green   (e x u s)
+    ];
+    let word = "buildwithnexus";
+    let n = word.len();
+    word.chars().enumerate().map(|(i, c)| {
+        let t = i as f32 / (n - 1) as f32;
+        let seg = (t * (stops.len() - 1) as f32) as usize;
+        let seg = seg.min(stops.len() - 2);
+        let local = t * (stops.len() - 1) as f32 - seg as f32;
+        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local) as u8;
+        let (r, g, b) = (lerp(stops[seg].0, stops[seg + 1].0),
+                         lerp(stops[seg].1, stops[seg + 1].1),
+                         lerp(stops[seg].2, stops[seg + 1].2));
+        paint(Rgb(r, g, b), &c.to_string())
+    }).collect::<Vec<_>>().join("")
+}
+
+// Print a rich full-screen-style header that establishes visual context without
+// taking over the alternate screen buffer (native scroll still works).
+// The UI chrome (mode badge, wordmark, keys) is identical regardless of model.
+pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
+    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80) as usize;
+    let w = width.min(80);
+    let bar = "─".repeat(w);
+
+    line(&accent(&bar));
+    // Wordmark row — gradient "buildwithnexus" + domain
+    line(&format!("  {}  {}  {}",
+        bold(&wordmark()),
+        dim("·"),
+        paint(Rgb(0xcb, 0xa6, 0xf7), "buildwithnexus.dev"),  // lavender
+    ));
+    // Context row — provider · model · cwd (truncated to fit)
+    let cwd_display: String = cwd.chars().rev().take(w.saturating_sub(30)).collect::<String>()
+        .chars().rev().collect();
+    let cwd_label = if cwd_display.len() < cwd.len() { format!("…{cwd_display}") } else { cwd.to_string() };
+    line(&dim(&format!("  {} · {} · {}", provider, model, cwd_label)));
+    // Mode row
+    line(&format!("  Mode: {}    {}  {}  {}",
+        mode_badge(mode),
+        dim("Shift+Tab to cycle"),
+        dim("·"),
+        dim("/help for commands"),
+    ));
+    line(&accent(&bar));
+}
+
+// Refresh the mode indicator line in-place after a mode change (no full clear).
+pub fn show_mode_change(mode: &str) {
+    line(&format!("  {} mode → {}", dim("switching"), mode_badge(mode)));
+}
+
+// Live context-window meter — call after each API round-trip.
+// Color shifts green → yellow → red as the window fills up.
+pub fn context_meter(used: usize, total: usize) {
+    if total == 0 {
+        return;
+    }
+    let pct = (used * 100 / total).min(100);
+    let bar_width = 20usize;
+    let filled = (pct * bar_width / 100).min(bar_width);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+    let colored = if pct >= 80 { red(&bar) } else if pct >= 60 { yellow(&bar) } else { green(&bar) };
+    line(&format!(
+        "  {} [{}] {}",
+        dim("ctx"),
+        colored,
+        dim(&format!("{pct}%  ·  {}k / {}k tokens", used / 1_000, total / 1_000)),
+    ));
+}
+
+// Enter raw mode (and capture panics to restore the terminal even on crash).
+// We render inline on the primary screen so scrollback and text selection work.
 pub fn enter_alt(raw: bool) {
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
-        let _ = execute!(io::stdout(), EnableBracketedPaste);
+        let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     }
-    // Always restore cooked mode, even on panic — never leave the user's terminal
-    // in raw mode with no echo.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         let _ = disable_raw_mode();
         prev(info);
     }));
@@ -170,7 +394,7 @@ pub fn enter_alt(raw: bool) {
 
 pub fn leave_alt() {
     if RAW.swap(false, Ordering::Relaxed) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         let _ = disable_raw_mode();
     }
 }
@@ -180,7 +404,6 @@ pub fn clear() {
     flush();
 }
 
-// Print a line, honoring raw mode's need for carriage returns.
 pub fn line(s: &str) {
     if is_raw() {
         print!("{}\r\n", s.replace('\n', "\r\n"));
@@ -190,10 +413,7 @@ pub fn line(s: &str) {
     }
 }
 
-// Stream a chunk of text (no trailing newline), translating newlines in raw mode.
 pub fn write_stream(chunk: &str) {
-    // Only allocate the \r\n translation when the chunk actually has a newline;
-    // the vast majority of token deltas don't.
     if is_raw() && chunk.contains('\n') {
         print!("{}", chunk.replace('\n', "\r\n"));
     } else {
@@ -206,8 +426,6 @@ pub fn flush() {
     let _ = io::stdout().flush();
 }
 
-// Terminal bell — a soft "turn finished" nudge (the OS/terminal decides whether
-// to flash, beep, or badge). No-op when output isn't a TTY.
 pub fn bell() {
     if std::io::stdout().is_terminal() {
         print!("\x07");
@@ -215,8 +433,7 @@ pub fn bell() {
     }
 }
 
-// Non-blocking: drain pending key events and report whether Ctrl-C was pressed
-// during a running turn (raw mode only). Lets the agent loop bail between steps.
+// Non-blocking: drain pending key events and report whether Ctrl-C was pressed.
 pub fn interrupted() -> bool {
     if !is_raw() {
         return false;
@@ -227,7 +444,6 @@ pub fn interrupted() -> bool {
             if k.kind != KeyEventKind::Press {
                 continue;
             }
-            // Esc, or Ctrl-C, interrupts the running turn.
             let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'));
             if ctrl_c || k.code == KeyCode::Esc {
@@ -238,11 +454,22 @@ pub fn interrupted() -> bool {
     hit
 }
 
-// Read one line after printing `prompt`. Raw mode uses a key-driven editor;
-// otherwise cooked stdin. Returns None on EOF / Ctrl-C / Ctrl-D.
+// ── input event ──────────────────────────────────────────────────────────────
+// Returned from ask_task so the REPL can distinguish a submitted line from a
+// mode-cycle request (Shift+Tab) without passing mutable mode state into tui.
+pub enum InputEvent {
+    Text(String),
+    CycleMode,
+}
+
+// ── single-line ask ──────────────────────────────────────────────────────────
 pub fn ask(prompt: &str) -> Option<String> {
     if is_raw() {
-        read_line_raw(prompt).map(|(s, _)| s)
+        match read_line_raw(prompt) {
+            None => None,
+            Some(RawLine::Submit(s, _)) => Some(s),
+            Some(RawLine::CycleMode) => None, // shouldn't cycle mode inside a y/n prompt
+        }
     } else {
         print!("{prompt}");
         flush();
@@ -255,32 +482,34 @@ pub fn ask(prompt: &str) -> Option<String> {
     }
 }
 
-// Like ask(), but multi-line: a trailing `\` then Enter adds another line; plain
-// Enter submits. Saves the final prompt to history. Used for the task prompt;
-// ask() stays single-line for confirmations and menus.
-pub fn ask_task(prompt: &str) -> Option<String> {
+// Multi-line task input. A trailing `\` + Enter adds another line; plain Enter
+// submits. Shift+Tab returns CycleMode without submitting.
+pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     if !is_raw() {
-        return ask(prompt);
+        return ask(prompt).map(InputEvent::Text);
     }
     let mut acc = String::new();
     let mut p = prompt.to_string();
     loop {
-        let (text, cont) = read_line_raw(&p)?;
-        if acc.is_empty() {
-            acc = text;
-        } else {
-            acc.push('\n');
-            acc.push_str(&text);
+        match read_line_raw(&p)? {
+            RawLine::CycleMode => return Some(InputEvent::CycleMode),
+            RawLine::Submit(text, cont) => {
+                if acc.is_empty() {
+                    acc = text;
+                } else {
+                    acc.push('\n');
+                    acc.push_str(&text);
+                }
+                if !cont {
+                    push_history(&acc);
+                    return Some(InputEvent::Text(acc));
+                }
+                p = format!("{} ", dim("…"));
+            }
         }
-        if !cont {
-            push_history(&acc);
-            return Some(acc);
-        }
-        p = format!("{} ", dim("…")); // continuation prompt
     }
 }
 
-// Record a submitted prompt in history (skip blanks, dedup consecutive, persist).
 fn push_history(s: &str) {
     if s.trim().is_empty() {
         return;
@@ -295,13 +524,15 @@ fn push_history(s: &str) {
 
 fn history() -> &'static std::sync::Mutex<Vec<String>> {
     static H: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    // Seed from the persisted history so Up recalls prompts from past sessions.
     H.get_or_init(|| std::sync::Mutex::new(crate::config::load_history()))
 }
 
-// Horizontal-scroll viewport: keep the cursor visible within `avail` columns,
-// scrolling the single render row as the buffer grows past the terminal width.
-// Returns the (possibly updated) scroll offset and the cursor's column in-row.
+// ── raw-mode editor internals ────────────────────────────────────────────────
+enum RawLine {
+    Submit(String, bool), // text, continue (multiline)?
+    CycleMode,
+}
+
 fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
     let avail = avail.max(1);
     let mut s = scroll;
@@ -313,9 +544,6 @@ fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
     (s, cursor - s)
 }
 
-// Repaint the editable buffer on one row, scrolling horizontally so long input
-// and the cursor stay visible regardless of terminal width. (One char == one
-// column; CJK width is approximate.)
 fn redraw(start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
     let avail = width.saturating_sub(start.0).max(8) as usize;
@@ -330,7 +558,6 @@ fn redraw(start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
     let _ = out.flush();
 }
 
-// Word-motion helpers (pure): index of the previous / next word boundary.
 fn prev_word(buf: &[char], mut i: usize) -> usize {
     while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
     while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
@@ -343,9 +570,6 @@ fn next_word(buf: &[char], mut i: usize) -> usize {
     i
 }
 
-// Hand the current draft to $VISUAL/$EDITOR (falling back to vi) — invaluable for
-// long prompts. Returns the edited text. Raw mode is dropped while the editor
-// owns the terminal, then restored.
 fn edit_in_editor(current: &str) -> Option<String> {
     let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".to_string());
     let path = std::env::temp_dir().join(format!("bwn-prompt-{}.txt", std::process::id()));
@@ -368,9 +592,28 @@ fn edit_in_editor(current: &str) -> Option<String> {
 }
 
 // ── Tab completion ───────────────────────────────────────────────────────────
-const SLASH_COMMANDS: &[&str] = &["/help", "/clear", "/new", "/resume", "/init", "/exit", "/quit"];
+// Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
+const SLASH_COMMANDS_BASE: &[&str] = &[
+    "/help", "/clear", "/new", "/resume", "/init",
+    "/mode", "/permissions", "/config", "/memory", "/skills", "/exit", "/quit",
+];
 
-// The whitespace-delimited token ending at `cursor`, and where it starts.
+fn load_slash_commands() -> Vec<String> {
+    let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
+    // Merge user-defined commands from ~/.buildwithnexus/commands/
+    if let Ok(rd) = std::fs::read_dir(crate::config::home().join("commands")) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.trim_end_matches(".md").trim_end_matches(".sh").trim_end_matches(".py");
+            let cmd = format!("/{stem}");
+            if !cmds.contains(&cmd) {
+                cmds.push(cmd);
+            }
+        }
+    }
+    cmds
+}
+
 fn token_at(buf: &[char], cursor: usize) -> (usize, String) {
     let mut start = cursor;
     while start > 0 && !buf[start - 1].is_whitespace() {
@@ -379,7 +622,6 @@ fn token_at(buf: &[char], cursor: usize) -> (usize, String) {
     (start, buf[start..cursor].iter().collect())
 }
 
-// Longest common prefix across candidates (char-wise).
 fn common_prefix(items: &[String]) -> String {
     let mut iter = items.iter();
     let mut prefix: Vec<char> = match iter.next() {
@@ -394,7 +636,6 @@ fn common_prefix(items: &[String]) -> String {
     prefix.into_iter().collect()
 }
 
-// File/dir names under `cwd` matching an `@partial` path (dir-aware, skips dotfiles).
 fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     let (base, dir, prefix) = match partial.rfind('/') {
         Some(i) => (&partial[..=i], cwd.join(&partial[..=i]), &partial[i + 1..]),
@@ -417,8 +658,6 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     out
 }
 
-// The `skip`-th newest history entry containing `query` (for Ctrl-R reverse
-// search). None when the query is empty or there's no further match.
 fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
     if query.is_empty() {
         return None;
@@ -426,12 +665,30 @@ fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
     hist.iter().rev().filter(|e| e.contains(query)).nth(skip).cloned()
 }
 
-// Candidates for the token under the cursor: slash-commands at line start, or
-// `@`-prefixed file paths anywhere.
 fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
     let at_line_start = buf[..start].iter().all(|c| c.is_whitespace());
     if at_line_start && token.starts_with('/') {
-        return SLASH_COMMANDS.iter().filter(|c| c.starts_with(token)).map(|c| c.to_string()).collect();
+        let cmds = load_slash_commands();
+        return cmds.into_iter().filter(|c| c.starts_with(token)).collect();
+    }
+    // Sub-argument completion: look at the command that precedes the current token.
+    let prefix: String = buf[..start].iter().collect();
+    match prefix.trim() {
+        "/mode" => {
+            return ["plan", "build", "brainstorm"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/permissions" => {
+            return ["ask", "auto", "readonly"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        _ => {}
     }
     if let Some(partial) = token.strip_prefix('@') {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -440,10 +697,7 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
     Vec::new()
 }
 
-// Full raw-mode line editor: cursor + word motion, kill-ring, history, paste,
-// Tab completion, open-in-$EDITOR. Returns (line, continue?) — `\`+Enter sets
-// continue so ask_task() can accumulate a multi-line prompt. None on cancel.
-fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
+fn read_line_raw(prompt: &str) -> Option<RawLine> {
     print!("{prompt}");
     flush();
     let mut start = crossterm::cursor::position().unwrap_or((0, 0));
@@ -453,8 +707,6 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
     let mut hist_idx: Option<usize> = None;
     let mut kill = String::new();
 
-    // Reprint the prompt + current line — after an external editor takes the
-    // screen, and for Ctrl-L.
     macro_rules! reline {
         () => {{
             print!("\r{prompt}");
@@ -468,9 +720,6 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
         let ev = match read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
             Ok(Event::Paste(s)) => {
-                // Single-line editor: fold newlines/tabs to spaces so multi-line
-                // pastes stay readable instead of fusing words ("a\nb" -> "a b"),
-                // and drop other control bytes that would corrupt the row.
                 for raw in s.chars() {
                     let c = match raw {
                         '\n' | '\r' | '\t' => ' ',
@@ -483,13 +732,31 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                 redraw(start, &buf, cursor, &mut scroll);
                 continue;
             }
+            Ok(Event::Mouse(m)) => {
+                // Left-click on the input row moves the cursor to the clicked column.
+                if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == start.1 {
+                    let col = m.column as usize;
+                    if col >= start.0 as usize {
+                        let offset = col - start.0 as usize + scroll;
+                        cursor = offset.min(buf.len());
+                        redraw(start, &buf, cursor, &mut scroll);
+                    }
+                }
+                continue;
+            }
             Ok(_) => continue,
             Err(_) => return None,
         };
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
         match ev.code {
-            // Ctrl-C clears a non-empty draft first, exits on the next press.
+            // Shift+Tab → cycle mode (clear the line and signal the REPL).
+            KeyCode::BackTab => {
+                buf.clear();
+                print!("\r\n");
+                flush();
+                return Some(RawLine::CycleMode);
+            }
             KeyCode::Char('c') if ctrl => {
                 if buf.is_empty() {
                     print!("\r\n");
@@ -509,7 +776,6 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
             }
             KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
-            // Kill bindings stash what they remove so Ctrl-Y can paste it back.
             KeyCode::Char('u') if ctrl => {
                 kill = buf[..cursor].iter().collect();
                 buf.drain(..cursor);
@@ -541,8 +807,6 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                 }
                 reline!();
             }
-            // Ctrl-R: incremental reverse search over history. Ctrl-R again cycles
-            // older matches; Enter runs it, Esc/Tab edits it, Ctrl-C/G cancels.
             KeyCode::Char('r') if ctrl => {
                 let snapshot = (buf.clone(), cursor);
                 let mut query = String::new();
@@ -575,7 +839,7 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                             if let Some(e) = m {
                                 print!("\r\n");
                                 flush();
-                                return Some((e, false));
+                                return Some(RawLine::Submit(e, false));
                             }
                             buf = snapshot.0;
                             cursor = snapshot.1;
@@ -623,17 +887,15 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                 redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
-                // A trailing `\` continues onto a new line (multi-line); plain
-                // Enter submits. (History is saved by ask_task on the final line.)
                 let cont = cursor > 0 && buf[cursor - 1] == '\\';
                 if cont {
                     buf.remove(cursor - 1);
                     cursor -= 1;
-                    redraw(start, &buf, cursor, &mut scroll); // repaint without the backslash
+                    redraw(start, &buf, cursor, &mut scroll);
                 }
                 print!("\r\n");
                 flush();
-                return Some((buf.iter().collect(), cont));
+                return Some(RawLine::Submit(buf.iter().collect(), cont));
             }
             KeyCode::Tab => {
                 let (tok_start, token) = token_at(&buf, cursor);
@@ -656,7 +918,6 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
                         cursor = tok_start + new.len();
                         redraw(start, &buf, cursor, &mut scroll);
                     } else {
-                        // Ambiguous — list the candidates, then reprint the line.
                         print!("\r\n");
                         for c in &cands {
                             print!("  {}\r\n", dim(c));
@@ -672,8 +933,7 @@ fn read_line_raw(prompt: &str) -> Option<(String, bool)> {
     }
 }
 
-// A running spinner the caller stops explicitly — used to fill the gap before
-// the first streamed token so a slow model never looks frozen.
+// ── spinner ───────────────────────────────────────────────────────────────────
 pub struct Spinner {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -690,8 +950,6 @@ pub fn spinner_start(label: &str) -> Spinner {
             print!("\r{} {}", accent(&frames[i % frames.len()].to_string()), dim(&label));
             flush();
             i += 1;
-            // Sleep in small slices so completion is noticed within ~10ms instead
-            // of parking the full frame interval past the work finishing.
             for _ in 0..8 {
                 if !r2.load(Ordering::Relaxed) {
                     break;
@@ -708,11 +966,10 @@ pub fn spinner_stop(mut s: Spinner) {
     if let Some(h) = s.handle.take() {
         let _ = h.join();
     }
-    print!("\r\x1b[2K"); // erase spinner line
+    print!("\r\x1b[2K");
     flush();
 }
 
-// Run `work` while a spinner animates, erasing it before returning.
 pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
     let s = spinner_start(label);
     let result = work();
@@ -724,7 +981,6 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
 mod tests {
     use super::*;
 
-    // Strip ANSI so assertions read the text content regardless of theme/term.
     fn plain(s: &str) -> String {
         let mut out = String::new();
         let mut chars = s.chars().peekable();
@@ -745,7 +1001,7 @@ mod tests {
         assert_eq!(cube(0), 0);
         assert_eq!(cube(255), 5);
         assert_eq!(cube(135), 2);
-        assert_eq!(cube(94), 1); // nearest 95
+        assert_eq!(cube(94), 1);
     }
 
     #[test]
@@ -755,7 +1011,6 @@ mod tests {
         let d = plain(&diff(old, new));
         assert!(d.contains("- c"), "{d}");
         assert!(d.contains("+ X"), "{d}");
-        // Unchanged neighbors render as context, not as changes.
         assert!(d.contains("  b") && d.contains("  d"), "{d}");
         assert!(!d.contains("- a") && !d.contains("+ e"), "{d}");
     }
@@ -796,35 +1051,26 @@ mod tests {
     #[test]
     fn word_motion_boundaries() {
         let b: Vec<char> = "foo  bar baz".chars().collect();
-        // prev_word from end -> start of "baz"
         assert_eq!(prev_word(&b, b.len()), 9);
-        // prev_word from start of a word skips the gap to the previous word
         assert_eq!(prev_word(&b, 9), 5);
         assert_eq!(prev_word(&b, 0), 0);
-        // next_word from 0 -> just past "foo"
         assert_eq!(next_word(&b, 0), 3);
-        // next_word across the double space -> past "bar"
         assert_eq!(next_word(&b, 3), 8);
         assert_eq!(next_word(&b, b.len()), b.len());
     }
 
     #[test]
     fn viewport_keeps_cursor_visible() {
-        // Cursor within the window: no scroll.
         assert_eq!(viewport(3, 10, 0), (0, 3));
-        // Cursor past the right edge: scroll so cursor sits at the last column.
         assert_eq!(viewport(20, 10, 0), (11, 9));
-        // Cursor before the current scroll: scroll back to the cursor.
         assert_eq!(viewport(2, 10, 11), (2, 0));
-        // Cursor exactly at the right edge stays put.
         assert_eq!(viewport(9, 10, 0), (0, 9));
-        // Stable when already in view.
         assert_eq!(viewport(15, 10, 11), (11, 4));
     }
 
     #[test]
     fn viewport_handles_zero_width() {
-        let (s, col) = viewport(5, 0, 3); // avail clamped to >=1
+        let (s, col) = viewport(5, 0, 3);
         assert!(col < 1 || s <= 5);
         let _ = (s, col);
     }
@@ -857,7 +1103,6 @@ mod tests {
     fn completions_slash_only_at_line_start() {
         let b: Vec<char> = "/re".chars().collect();
         assert!(completions(&b, 0, "/re").contains(&"/resume".to_string()));
-        // Same token mid-line is not a command completion.
         let b2: Vec<char> = "do /re".chars().collect();
         assert!(completions(&b2, 3, "/re").is_empty());
     }
@@ -881,8 +1126,16 @@ mod tests {
 
     #[test]
     fn no_color_strips_escapes() {
-        // With NO_COLOR set, paint() returns the raw string. (Env is process-wide;
-        // assert the no_color branch directly to avoid env races.)
         assert_eq!(plain("\x1b[31mhi\x1b[0m"), "hi");
+    }
+
+    #[test]
+    fn mode_badge_contains_label() {
+        let b = plain(&mode_badge("BUILD"));
+        assert!(b.contains("BUILD"), "{b}");
+        let p = plain(&mode_badge("PLAN"));
+        assert!(p.contains("PLAN"), "{p}");
+        let bs = plain(&mode_badge("BRAINSTORM"));
+        assert!(bs.contains("BRAINSTORM"), "{bs}");
     }
 }

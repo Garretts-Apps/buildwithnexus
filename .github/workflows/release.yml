@@ -2,6 +2,7 @@ name: release
 
 # Build the native harness for every supported platform and attach the binaries
 # to the GitHub Release. The npm postinstall downloads these as its fast path.
+# publish.yml chains off this workflow's completion to push to npm.
 on:
   push:
     tags: ["v*"]
@@ -9,7 +10,7 @@ on:
 
 permissions:
   contents: write
-  id-token: write        # for build provenance attestation
+  id-token: write      # for build provenance attestation
   attestations: write
 
 jobs:
@@ -20,29 +21,39 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
           - os: macos-14
             target: aarch64-apple-darwin
-          # Cross-compile the Intel-mac binary on the Apple Silicon runner. The
-          # dedicated macos-13 (Intel) runners are scarce and can queue for hours;
-          # arm64 macOS cross-builds x86_64 macOS fine, so we never depend on them.
-          - os: macos-14
-            target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Cross-compilation toolchain for Linux aarch64 (runs on x86_64 runner).
+      - name: Install aarch64-linux cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - name: Build
         working-directory: harness
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
+
       - name: Stage asset + checksum
         shell: bash
-        # Pass the matrix value through env so shellcheck sees a real shell
-        # variable (a literal ${{ … }} in the script trips SC2193).
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -50,36 +61,34 @@ jobs:
           src="harness/target/$TARGET/release/buildwithnexus${ext}"
           asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
-          # Per-asset checksum the postinstall verifies before chmod/exec.
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
-      # The release tag. On a tag push it's the pushed tag; on a manual run it's
-      # derived from package.json so it always matches the version npm publishes
-      # (postinstall fetches assets from releases/download/v<version>).
+
+      # The release tag is the pushed v* tag; on workflow_dispatch it is derived
+      # from package.json so it always matches the version npm will publish.
       - name: Resolve release tag
         id: meta
         shell: bash
         env:
-          EVENT: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
             v=$(node -p "require('./package.json').version")
             echo "tag=v${v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
-      # Creates the tag + release on a manual run (the GITHUB_TOKEN can do this);
-      # on a tag push it just attaches assets to the existing tag's release.
+
+      # Creates the tag + release on workflow_dispatch; on a tag push it just
+      # attaches assets to the existing release.
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          target_commitish: ${{ github.sha }}
           files: buildwithnexus-${{ matrix.target }}*

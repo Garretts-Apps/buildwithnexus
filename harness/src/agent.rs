@@ -1,12 +1,14 @@
-// The orchestration that replaces LangGraph: plain Rust control flow for the
-// three modes. PLAN decomposes + gates, BUILD is a ReAct tool loop, BRAINSTORM
-// is streaming-free chat. Roles are a small data table, not an agent framework.
+// The orchestration: plain Rust control flow for all three modes. PLAN
+// decomposes + gates, BUILD is a ReAct tool loop, BRAINSTORM is conversational —
+// but ALL modes have access to the full tool surface so the model can grep,
+// fetch, read files, and run commands regardless of which mode the user is in.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::config;
 use crate::hooks::{self, PreDecision};
 use crate::provider::{self, complete, Msg, Provider, Reply, ToolResult};
 use crate::report;
@@ -15,20 +17,15 @@ use crate::tui;
 
 const MAX_ITERS: usize = 30;
 const MAX_DEPTH: usize = 3;
-
-// ── context compaction ──────────────────────────────────────────────────────
-// Small models have small windows; long tool loops overflow them. When the
-// running conversation passes ~70% of the model's window, distill the older
-// middle into a summary and keep the system prompt + recent tail verbatim.
 const KEEP_RECENT: usize = 6;
 
-// Rough token estimate (~4 chars/token) — protocol-agnostic, enough to decide
-// when to compact without parsing each vendor's usage payload.
+// ── context compaction ────────────────────────────────────────────────────────
 fn estimate_tokens(msgs: &[Msg]) -> usize {
     let mut chars = 0usize;
     for m in msgs {
         chars += match m {
             Msg::System(s) | Msg::User(s) => s.len(),
+            Msg::UserImages { text, images } => text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>(),
             Msg::Assistant { text, calls } => {
                 text.len() + calls.iter().map(|c| c.name.len() + c.input.to_string().len()).sum::<usize>()
             }
@@ -38,15 +35,12 @@ fn estimate_tokens(msgs: &[Msg]) -> usize {
     chars / 4
 }
 
-// Split indices: msgs[..sys_end] are leading system messages (kept) and
-// msgs[tail_start..] are the recent tail (kept); the middle is summarized.
 fn compaction_split(msgs: &[Msg]) -> (usize, usize) {
     let sys_end = msgs.iter().take_while(|m| matches!(m, Msg::System(_))).count();
     let tail_start = msgs.len().saturating_sub(KEEP_RECENT).max(sys_end);
     (sys_end, tail_start)
 }
 
-// Deterministic, no-model fallback: list the actions taken in the middle.
 fn structural_summary(middle: &[Msg]) -> String {
     let mut actions: Vec<String> = Vec::new();
     for m in middle {
@@ -63,13 +57,16 @@ fn structural_summary(middle: &[Msg]) -> String {
     }
 }
 
-// Flatten messages to text for the summarizer (bounded per message).
 fn render_msgs(msgs: &[Msg]) -> String {
     let mut s = String::new();
     for m in msgs {
         match m {
             Msg::System(t) => { s.push_str("system: "); s.push_str(t); }
             Msg::User(t) => { s.push_str("user: "); s.push_str(t); }
+            Msg::UserImages { text, images } => {
+                s.push_str(&format!("user [+{} image(s)]: ", images.len()));
+                s.push_str(text);
+            }
             Msg::Assistant { text, calls } => {
                 s.push_str("assistant: ");
                 s.push_str(text);
@@ -89,8 +86,6 @@ fn render_msgs(msgs: &[Msg]) -> String {
     s
 }
 
-// Rebuild: system prefix + a single summary note + recent tail. `summarize` is a
-// closure so tests can inject a deterministic summary instead of a model call.
 fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
     let (sys_end, tail_start) = compaction_split(&msgs);
     if tail_start <= sys_end {
@@ -107,7 +102,6 @@ fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec
     v
 }
 
-// Ask the model to summarize; fall back to the structural summary on error.
 fn model_summary(p: &Provider, middle: &[Msg]) -> String {
     let sys = "Summarize this AI coding-agent conversation into a terse brief that preserves the task, key findings, decisions, files changed, and the current state. Drop pleasantries; use compact bullet points.";
     let q = vec![Msg::System(sys.into()), Msg::User(render_msgs(middle))];
@@ -117,9 +111,8 @@ fn model_summary(p: &Provider, middle: &[Msg]) -> String {
     }
 }
 
-// Compact in place when the running context exceeds ~70% of the window.
 fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
-    let budget = p.context_tokens.saturating_mul(7) / 10;
+    let budget = p.context_tokens.saturating_mul(8) / 10;
     if budget == 0 || estimate_tokens(msgs) <= budget {
         return;
     }
@@ -132,6 +125,7 @@ fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     *msgs = compact_with(taken, |middle| model_summary(p, middle));
 }
 
+// ── permissions ───────────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
 pub enum Permission {
     Ask,
@@ -147,6 +141,7 @@ pub fn permission(s: &str) -> Permission {
     }
 }
 
+// ── roles ─────────────────────────────────────────────────────────────────────
 pub struct Role {
     pub system: &'static str,
 }
@@ -154,14 +149,116 @@ pub struct Role {
 pub fn role(id: &str) -> Role {
     let system = match id {
         "researcher" => "You are a meticulous research engineer. Investigate the codebase with the read and list tools before drawing conclusions. Cite file paths. Do not modify files unless explicitly asked.",
-        _ => "You are an autonomous senior software engineer. Use the tools to inspect and modify the project directly. Prefer small, verifiable edits. Read before you write. When the task is complete, call the finish tool with a one-paragraph summary.",
+        _ => "You are an autonomous senior software engineer. \
+Use the tools to inspect and modify the project directly. \
+Prefer small, verifiable edits. Read before you write. \
+When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
+IMPORTANT — tool discipline:\n\
+• Before using run_command to install anything (npm install, pip install, cargo add, brew install, \
+apt install, etc.), FIRST check whether an existing package or built-in tool can do the job. \
+Look at package.json / Cargo.toml / requirements.txt / pyproject.toml to see what is already available. \
+Use run_command with grep/find/jq/awk/sed/git/curl/which before reaching for new installs.\n\
+• fetch_url is built-in — do NOT install curl/wget just to make an HTTP request.\n\
+• read_file / list_dir / edit_file are built-in — do NOT install file-management packages for basic I/O.\n\
+• If a system tool is already present (check with `which <tool>` or `command -v <tool>`) prefer it \
+over installing an alternative.",
     };
     Role { system }
 }
 
+// Build the system prompt prefix from memory and skills/agents files.
+fn context_prefix() -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Always include the tool manifest so the model knows what's built-in
+    // and doesn't try to install external tools to do things we already handle.
+    parts.push(tool_manifest());
+
+    // Probe which common system tools are actually present so the model can
+    // pick the right one without guessing or installing alternatives.
+    let env_snap = env_snapshot();
+    if !env_snap.is_empty() {
+        parts.push(format!("[Environment — tools already installed]\n{env_snap}"));
+    }
+
+    if let Some(mem) = config::load_memory() {
+        parts.push(format!("[Memory from previous sessions]\n{mem}"));
+    }
+    if let Some(agents) = config::load_agents() {
+        parts.push(format!("[Agent knowledge — Agents.md]\n{agents}"));
+    }
+    let skills = config::load_skills();
+    if !skills.is_empty() {
+        let joined = skills.iter()
+            .map(|(name, content)| format!("## Skill: {name}\n{content}"))
+            .collect::<Vec<_>>().join("\n\n");
+        parts.push(format!("[Available skills]\n{joined}"));
+    }
+
+    format!("{}\n\n", parts.join("\n\n"))
+}
+
+fn tool_manifest() -> String {
+    "[Built-in tools — always available, no install needed]\n\
+• read_file / list_dir   — read any file or directory on the filesystem\n\
+• write_file / edit_file — create or surgically modify files\n\
+• run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
+• fetch_url              — HTTP GET (no curl/wget needed)\n\
+• save_memory            — persist a note across sessions\n\
+• spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
+• finish                 — mark the task complete with a summary"
+    .to_string()
+}
+
+fn env_snapshot() -> String {
+    // Probe a fixed list of common tools so the model knows what's available.
+    // We run everything in parallel-ish with short timeouts via sequential calls —
+    // the total overhead is ~10ms on a modern machine.
+    let probes: &[(&str, &str)] = &[
+        ("node",    "node --version"),
+        ("npm",     "npm --version"),
+        ("npx",     "npx --version"),
+        ("python3", "python3 --version"),
+        ("pip3",    "pip3 --version"),
+        ("cargo",   "cargo --version"),
+        ("rustc",   "rustc --version"),
+        ("git",     "git --version"),
+        ("docker",  "docker --version"),
+        ("jq",      "jq --version"),
+        ("rg",      "rg --version"),
+        ("gh",      "gh --version"),
+        ("bun",     "bun --version"),
+        ("deno",    "deno --version"),
+        ("go",      "go version"),
+        ("ruby",    "ruby --version"),
+        ("java",    "java --version"),
+    ];
+
+    use std::process::Command;
+    let mut found: Vec<String> = Vec::new();
+    for (label, cmd) in probes {
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let bin = parts[0];
+        let arg = parts.get(1).copied().unwrap_or("--version");
+        let ok = Command::new(bin).arg(arg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map(|o| {
+                let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let txt = if txt.is_empty() { String::from_utf8_lossy(&o.stderr).trim().to_string() } else { txt };
+                txt.lines().next().unwrap_or("").to_string()
+            })
+            .ok()
+            .filter(|v| !v.is_empty());
+        if let Some(ver) = ok {
+            found.push(format!("• {label}: {ver}"));
+        }
+    }
+    found.join("\n")
+}
+
 fn confirm(label: &str) -> Option<String> {
-    // Never block waiting for input when no human can answer (JSON/automation or
-    // a non-terminal stdin) — deny by default instead of hanging.
     if report::is_json() || !std::io::stdin().is_terminal() {
         return Some(format!("blocked (no interactive terminal to confirm: {label})"));
     }
@@ -174,22 +271,31 @@ fn confirm(label: &str) -> Option<String> {
     }
 }
 
-// Returns Some(reason) when a call is blocked, None when allowed. Layers:
-// sensitive paths and catastrophic commands always require an explicit yes
-// (in auto/headless an un-answerable prompt safely resolves to denial); then
-// the chosen permission mode governs mutations and out-of-cwd reads.
-fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+// Permission gate — returns Some(reason) when blocked.
+// Read operations outside CWD are allowed in all modes (no CWD confinement for
+// reads); the user specifically asked for full filesystem access.
+pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
     let path = tools::touched_path(name, input, cwd);
 
     if let Some(p) = &path {
         if tools::is_sensitive(p) {
             return confirm(&format!("access sensitive path {}", p.display()));
         }
+        // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
+        // crosses the OS boundary — always confirm, even in Auto mode.
+        if tools::is_mutating(name) && tools::is_wsl_windows_mount(p) {
+            return confirm(&format!("write to Windows filesystem {} (WSL2 boundary)", p.display()));
+        }
     }
     if name == "run_command" {
         if let Some(c) = input["command"].as_str() {
             if tools::catastrophic(c) {
                 return confirm(&format!("run dangerous command `{c}`"));
+            }
+            // In WSL2, commands that reference /mnt/<drive>/ target the Windows
+            // filesystem — confirm before running, even in Auto mode.
+            if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
+                return confirm(&format!("command targets Windows filesystem (WSL2): `{c}`"));
             }
         }
     }
@@ -198,44 +304,40 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> 
         Permission::Auto => None,
         Permission::ReadOnly => {
             if tools::is_mutating(name) {
+                // run_command with clearly read-only shell tools (grep, find, etc.)
+                // should pass through even in ReadOnly mode.
+                if name == "run_command" {
+                    if let Some(c) = input["command"].as_str() {
+                        if tools::is_readonly_command(c) {
+                            return None;
+                        }
+                    }
+                }
                 return Some("read-only mode: mutation skipped".into());
             }
-            if let Some(p) = &path {
-                if tools::escapes_cwd(p, cwd) {
-                    return Some(format!("read-only: refusing to read outside the working directory ({})", p.display()));
-                }
-            }
-            None
+            None // reads anywhere are allowed in readonly mode
         }
         Permission::Ask => {
             if tools::is_mutating(name) {
                 return confirm(&tools::preview(name, input));
             }
-            if let Some(p) = &path {
-                if tools::escapes_cwd(p, cwd) {
-                    return confirm(&format!("read outside working directory: {}", p.display()));
-                }
-            }
+            // Out-of-cwd reads: just note it instead of hard-blocking.
+            // The user asked for full filesystem access.
             None
         }
     }
 }
 
-// One ReAct turn-and-tools loop. Shared by BUILD and the execution half of PLAN.
-// The Stop hook always fires once the turn ends, however it ended.
+// ── BUILD mode ────────────────────────────────────────────────────────────────
 pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
     let mut transcript: Vec<Msg> = Vec::new();
     run_build_session(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
 }
 
-// Continue a restored session: `seed` is the prior transcript, persisted under
-// the same `sid` so resume updates the session rather than forking it.
 pub fn run_build_resumed(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, mut seed: Vec<Msg>, sid: &str) -> Result<(), String> {
     run_build_session(p, perm, role_id, task, cwd, &mut seed, sid)
 }
 
-// Run a BUILD task into a caller-owned transcript, persisting the session. The
-// REPL uses this to keep one continuous, resumable conversation across tasks.
 pub fn run_build_session(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
     let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
     hooks::notify("Stop", cwd);
@@ -243,9 +345,6 @@ pub fn run_build_session(p: &Provider, perm: Permission, role_id: &str, task: &s
     r
 }
 
-// Returns the final assistant text / finish summary, so a parent can read a
-// spawned subagent's result. `depth` bounds recursion via spawn_subagent.
-// `msgs` is the working transcript (seeded for resume, otherwise empty).
 fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize, msgs: &mut Vec<Msg>) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
@@ -257,37 +356,62 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
     };
     let defs = tools::defs(depth < MAX_DEPTH);
     if msgs.is_empty() {
-        msgs.push(Msg::System(role(role_id).system.into()));
+        let prefix = context_prefix();
+        let sys = format!("{prefix}{}", role(role_id).system);
+        msgs.push(Msg::System(sys));
     }
-    msgs.push(Msg::User(task));
+    // If the caller already pushed a UserImages message (multimodal input), use its
+    // text as the task without pushing another User turn; otherwise push normally.
+    let already_pushed = matches!(msgs.last(), Some(Msg::UserImages { .. }));
+    if !already_pushed {
+        msgs.push(Msg::User(task));
+    }
 
-    for _ in 0..MAX_ITERS {
+    // Track which files have been read this session so we can enforce read-before-write.
+    let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
+
+    for step in 1..=MAX_ITERS {
         if tui::interrupted() {
             report::notice("interrupted");
             return Ok(String::new());
         }
         maybe_compact(p, msgs);
-        // JSON mode buffers (one clean event); human mode streams tokens live,
-        // with a spinner covering the gap until the first token so a slow model
-        // never looks frozen.
         let reply: Reply = if report::is_json() {
             let r = complete(p, msgs.as_slice(), &defs)?;
             report::assistant(&r.text);
             r
         } else {
+            // Show a step counter so the user can see multi-step reasoning progress.
+            if step > 1 {
+                tui::line(&tui::dim(&format!("  ↻ step {step}")));
+            }
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
+            let mut thinking_buf = String::new();
+            let mut renderer = tui::StreamRenderer::new();
             let res = provider::stream(p, msgs.as_slice(), &defs, &mut |c| {
                 if let Some(s) = spin.take() {
                     tui::spinner_stop(s);
                 }
-                report::assistant_delta(c);
+                renderer.push(c);
                 streamed = true;
+            }, &mut |t| {
+                // Extended thinking: buffer and display as dim internal monologue.
+                thinking_buf.push_str(t);
+                // Flush complete sentences/lines so output feels live.
+                while let Some(nl) = thinking_buf.find('\n') {
+                    let line = thinking_buf[..nl].trim().to_string();
+                    if !line.is_empty() {
+                        tui::write_stream(&format!("\r  {} {}\r\n", tui::dim("◌"), tui::dim(&line)));
+                    }
+                    thinking_buf = thinking_buf[nl + 1..].to_string();
+                }
             });
             if let Some(s) = spin.take() {
-                tui::spinner_stop(s); // no text streamed (tool-only turn) — clear it
+                tui::spinner_stop(s);
             }
             let r = res?;
+            renderer.flush();
             if streamed {
                 report::assistant_end();
             }
@@ -297,25 +421,20 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             if reply.text.trim().is_empty() {
                 report::notice("model returned no output");
             }
-            return Ok(reply.text); // model answered in prose
+            return Ok(reply.text);
         }
 
         let mut results = Vec::new();
         let mut summary: Option<String> = None;
         for call in &reply.calls {
-            // Reject calls whose JSON arguments didn't parse, with a message the
-            // model can act on (common failure mode for small local models).
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
                 let msg = format!("tool arguments were not valid JSON: {}", raw.chars().take(200).collect::<String>());
                 report::tool_denied(&msg);
                 results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
                 continue;
             }
-            // Show the proposed action (with an inline diff for edits) first, so
-            // the approval prompt that follows has visible context.
             report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
 
-            // PreToolUse hook can allow (skip the gate), deny, or defer to it.
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
@@ -327,11 +446,53 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 continue;
             }
 
+            // Record reads so we can enforce read-before-write below.
+            if call.name == "read_file" {
+                if let Some(raw) = call.input["path"].as_str() {
+                    let p = if std::path::Path::new(raw).is_absolute() {
+                        PathBuf::from(raw)
+                    } else {
+                        cwd.join(raw)
+                    };
+                    read_paths.insert(p);
+                }
+            }
+
+            // Require the model to read a file before overwriting or patching it.
+            if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                if let Some(raw) = call.input["path"].as_str() {
+                    let p = if std::path::Path::new(raw).is_absolute() {
+                        PathBuf::from(raw)
+                    } else {
+                        cwd.join(raw)
+                    };
+                    if p.exists() && !read_paths.contains(&p) {
+                        let msg = format!(
+                            "read_file('{}') required before editing. Read the file first, then retry.",
+                            p.display()
+                        );
+                        report::tool_denied(&msg);
+                        results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
+                        continue;
+                    }
+                }
+            }
+
             if call.name == "spawn_subagent" {
                 let out = spawn_subagent(p, perm, &call.input, cwd, depth);
                 report::tool_result(&call.name, &out, false);
                 results.push(ToolResult { id: call.id.clone(), content: out, is_error: false });
                 continue;
+            }
+            // Memory-save tool: the model can call save_memory to persist facts.
+            if call.name == "save_memory" {
+                if let Some(note) = call.input["note"].as_str() {
+                    config::append_memory(note);
+                    let msg = "memory saved".to_string();
+                    report::tool_result(&call.name, &msg, false);
+                    results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                    continue;
+                }
             }
 
             let out = tools::run(&call.name, &call.input, cwd);
@@ -346,6 +507,9 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
 
         msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
         msgs.push(Msg::Tool(results));
+        if !report::is_json() {
+            tui::context_meter(estimate_tokens(msgs), p.context_tokens);
+        }
         if let Some(s) = summary {
             return Ok(s);
         }
@@ -355,8 +519,6 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
 
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-// Delegate a self-contained sub-task to a fresh agent (own context window).
-// `isolate` runs it in a new git worktree so parallel edits never collide.
 fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd: &Path, depth: usize) -> String {
     if depth + 1 >= MAX_DEPTH {
         return "subagent depth limit reached".into();
@@ -381,7 +543,6 @@ fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd
     };
 
     report::notice(&format!("  ↳ subagent: {task}"));
-    // A subagent gets its own fresh context window (not persisted as a session).
     let mut child: Vec<Msg> = Vec::new();
     let result = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child)
         .unwrap_or_else(|e| format!("subagent error: {e}"));
@@ -401,13 +562,59 @@ fn make_worktree(cwd: &Path) -> Option<PathBuf> {
     out.status.success().then_some(wt)
 }
 
-// PLAN: ask for a numbered breakdown, let the user approve/edit, then execute.
+// ── PLAN mode ─────────────────────────────────────────────────────────────────
+// The planning phase now has tools available so the model can inspect the
+// codebase while breaking down the task. Execution still runs through BUILD.
 pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
-    let sys = "You are a planning engineer. Break the user's task into a concise numbered list of concrete steps (no prose, one step per line, max 8 steps). Output ONLY the list.";
-    let msgs = vec![Msg::System(sys.into()), Msg::User(task.into())];
-    let reply = tui::with_spinner("planning…", || complete(p, &msgs, &[]))?;
+    let prefix = context_prefix();
+    let sys = format!("{prefix}You are a planning engineer with full access to the codebase. \
+        Use read_file and list_dir and run_command to inspect the project as needed. \
+        Break the user's task into a concise numbered list of concrete steps \
+        (one step per line, max 8 steps). Output the numbered list and nothing else.");
 
-    let mut steps: Vec<String> = reply.text.lines()
+    let defs = tools::defs(false); // planning uses tools but not subagents
+    let mut msgs = vec![Msg::System(sys), Msg::User(task.into())];
+
+    // Let the model use tools while planning (e.g. read files to understand structure).
+    let plan_text = loop {
+        maybe_compact(p, &mut msgs);
+        let reply = tui::with_spinner("planning…", || complete(p, &msgs, &defs))?;
+
+        if reply.calls.is_empty() {
+            break reply.text;
+        }
+
+        // Execute tool calls during the planning phase.
+        let mut results = Vec::new();
+        for call in &reply.calls {
+            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+            let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+                PreDecision::Deny(r) => Some(r),
+                PreDecision::Allow => None,
+                PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
+            };
+            if let Some(reason) = reason {
+                results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
+                continue;
+            }
+            if call.name == "save_memory" {
+                if let Some(note) = call.input["note"].as_str() {
+                    config::append_memory(note);
+                    let msg = "memory saved".to_string();
+                    report::tool_result(&call.name, &msg, false);
+                    results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                    continue;
+                }
+            }
+            let out = tools::run(&call.name, &call.input, cwd);
+            report::tool_result(&call.name, &out.content, out.is_error);
+            results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
+        }
+        msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
+        msgs.push(Msg::Tool(results));
+    };
+
+    let mut steps: Vec<String> = plan_text.lines()
         .map(|l| l.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | ' ')).trim())
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
@@ -448,33 +655,128 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
     run_build(p, perm, "engineer", &full, cwd)
 }
 
-// BRAINSTORM: free-form chat, no tools, history retained across turns.
-pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
-    let mut msgs: Vec<Msg> = vec![Msg::System(
-        "You are a sharp, concise thought partner. Offer ideas, tradeoffs, and concrete suggestions. No fluff.".into(),
-    )];
+// ── BRAINSTORM mode ───────────────────────────────────────────────────────────
+// Brainstorm is conversational but has full tool access. The model can grep,
+// read files, fetch URLs, and run commands when the conversation calls for it.
+// It also has a mode-transition sensor: if it detects the user wants to build
+// or plan, it suggests switching.
+pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -> Result<Option<ModeHint>, String> {
+    let prefix = context_prefix();
+    let sys = format!("{prefix}You are a sharp, concise thought partner with full access to the codebase and the internet. \
+        Use tools freely to look things up, read files, grep for patterns, or run commands — \
+        whatever helps the conversation. \
+        When you think the user is ready to stop discussing and start building or planning, \
+        end your response with the exact token [SUGGEST:BUILD] or [SUGGEST:PLAN] on its own line. \
+        Otherwise just respond naturally. No fluff.");
+
+    let defs = tools::defs(false);
+    let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
     let mut question = first.to_string();
+
     loop {
         msgs.push(Msg::User(question.clone()));
         maybe_compact(p, &mut msgs);
-        tui::line("");
-        let mut streamed = false;
-        let reply = provider::stream(p, &msgs, &[], &mut |c| {
-            report::assistant_delta(c);
-            streamed = true;
-        })?;
-        if streamed {
-            report::assistant_end();
-        }
-        tui::line("");
-        msgs.push(Msg::Assistant { text: reply.text, calls: vec![] });
 
+        // Keep consuming tool calls until the model gives a text response.
+        let reply_text = loop {
+            tui::line("");
+            let mut spin = Some(tui::spinner_start("thinking…"));
+            let mut streamed = false;
+            let mut thinking_buf = String::new();
+            let mut renderer = if !report::is_json() { Some(tui::StreamRenderer::new()) } else { None };
+            let res = provider::stream(p, &msgs, &defs, &mut |c| {
+                if let Some(s) = spin.take() { tui::spinner_stop(s); }
+                if let Some(r) = &mut renderer { r.push(c); } else { report::assistant_delta(c); }
+                streamed = true;
+            }, &mut |t| {
+                thinking_buf.push_str(t);
+                while let Some(nl) = thinking_buf.find('\n') {
+                    let tl = thinking_buf[..nl].trim().to_string();
+                    if !tl.is_empty() {
+                        tui::write_stream(&format!("\r  {} {}\r\n", tui::dim("◌"), tui::dim(&tl)));
+                    }
+                    thinking_buf = thinking_buf[nl + 1..].to_string();
+                }
+            });
+            if let Some(s) = spin.take() { tui::spinner_stop(s); }
+            let reply = res?;
+            if let Some(r) = &mut renderer { r.flush(); }
+            if streamed { report::assistant_end(); }
+
+            if reply.calls.is_empty() {
+                msgs.push(Msg::Assistant { text: reply.text.clone(), calls: vec![] });
+                if !report::is_json() {
+                    tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                }
+                break reply.text;
+            }
+
+            // Execute tool calls inline.
+            let mut results = Vec::new();
+            for call in &reply.calls {
+                report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+                let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+                    PreDecision::Deny(r) => Some(r),
+                    PreDecision::Allow => None,
+                    PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
+                };
+                if let Some(reason) = reason {
+                    results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
+                    continue;
+                }
+                if call.name == "save_memory" {
+                    if let Some(note) = call.input["note"].as_str() {
+                        config::append_memory(note);
+                        let msg = "memory saved".to_string();
+                        report::tool_result(&call.name, &msg, false);
+                        results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                        continue;
+                    }
+                }
+                let out = tools::run(&call.name, &call.input, cwd);
+                hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
+                report::tool_result(&call.name, &out.content, out.is_error);
+                results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
+            }
+            msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
+            msgs.push(Msg::Tool(results));
+            if !report::is_json() {
+                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            }
+        };
+
+        // Check for mode-transition suggestion embedded in the reply.
+        let hint = if reply_text.contains("[SUGGEST:BUILD]") {
+            Some(ModeHint::Build)
+        } else if reply_text.contains("[SUGGEST:PLAN]") {
+            Some(ModeHint::Plan)
+        } else {
+            None
+        };
+
+        if let Some(ref h) = hint {
+            tui::line("");
+            let suggestion = match h {
+                ModeHint::Build     => "switch to BUILD mode and implement this?",
+                ModeHint::Plan      => "switch to PLAN mode and break this down?",
+                ModeHint::CycleMode => "cycle to the next mode?",
+            };
+            tui::line(&tui::yellow(&format!("  ↪ AI suggests: {suggestion}")));
+            tui::line(&tui::dim("  (y to switch, anything else to keep chatting)"));
+            let ans = tui::ask("  ").unwrap_or_default();
+            if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+                return Ok(Some(h.clone()));
+            }
+        }
+
+        tui::line("");
         match tui::ask_task(&format!("{} ", tui::blue("you ›"))) {
-            None => return Ok(()),
-            Some(f) => {
+            None => return Ok(None),
+            Some(tui::InputEvent::CycleMode) => return Ok(Some(ModeHint::CycleMode)),
+            Some(tui::InputEvent::Text(f)) => {
                 let t = f.trim();
                 if t.is_empty() || t == "exit" || t == "done" {
-                    return Ok(());
+                    return Ok(None);
                 }
                 question = t.to_string();
             }
@@ -482,12 +784,18 @@ pub fn run_brainstorm(p: &Provider, first: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Clone)]
+pub enum ModeHint {
+    Build,
+    Plan,
+    CycleMode,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── permission ──────────────────────────────────────────────────────────
     #[test]
     fn permission_parsing() {
         assert!(matches!(permission("auto"), Permission::Auto));
@@ -497,18 +805,13 @@ mod tests {
         assert!(matches!(permission(""), Permission::Ask));
     }
 
-    // ── role ────────────────────────────────────────────────────────────────
     #[test]
     fn role_selection() {
         assert!(role("researcher").system.contains("research"));
         assert!(role("engineer").system.contains("software engineer"));
-        // Unknown roles fall back to the engineer prompt.
         assert!(role("ceo").system.contains("software engineer"));
     }
 
-    // ── gate ────────────────────────────────────────────────────────────────
-    // These run with a non-terminal stdin, so any path that would prompt resolves
-    // to a denial (Some(reason)) rather than blocking.
     #[test]
     fn gate_auto_allows_ordinary_mutation() {
         let cwd = Path::new("/proj");
@@ -519,7 +822,6 @@ mod tests {
     #[test]
     fn gate_auto_still_confirms_sensitive_path() {
         let cwd = Path::new("/proj");
-        // Sensitive even under auto → would prompt → denied in non-terminal tests.
         let r = gate(Permission::Auto, "read_file", &json!({"path": "/proj/.env"}), cwd);
         assert!(r.is_some());
     }
@@ -546,38 +848,31 @@ mod tests {
     }
 
     #[test]
-    fn gate_readonly_blocks_out_of_cwd_read() {
+    fn gate_readonly_allows_reads_everywhere() {
+        // Reads outside CWD are now allowed — full filesystem access.
         let cwd = Path::new("/proj/work");
         let r = gate(Permission::ReadOnly, "read_file", &json!({"path": "/etc/passwd"}), cwd);
-        assert!(r.unwrap().contains("outside"));
+        assert!(r.is_none());
     }
 
     #[test]
-    fn gate_readonly_allows_in_cwd_read() {
-        let cwd = Path::new("/proj/work");
-        let r = gate(Permission::ReadOnly, "read_file", &json!({"path": "/proj/work/a.rs"}), cwd);
+    fn gate_ask_allows_out_of_cwd_read() {
+        // Full filesystem read access — no longer blocked in Ask mode.
+        let cwd = Path::new("/proj");
+        let r = gate(Permission::Ask, "read_file", &json!({"path": "/home/user/docs/README.md"}), cwd);
         assert!(r.is_none());
     }
 
     #[test]
     fn gate_ask_prompts_for_mutation() {
         let cwd = Path::new("/proj");
-        // Would prompt → denied in non-terminal test env.
         let r = gate(Permission::Ask, "write_file", &json!({"path": "a", "content": "x"}), cwd);
-        assert!(r.is_some());
+        assert!(r.is_some()); // non-terminal → denied
     }
 
-    #[test]
-    fn gate_ask_allows_in_cwd_read() {
-        let cwd = Path::new("/proj");
-        let r = gate(Permission::Ask, "read_file", &json!({"path": "/proj/a.rs"}), cwd);
-        assert!(r.is_none());
-    }
-
-    // ── compaction ──────────────────────────────────────────────────────────
     #[test]
     fn estimate_tokens_counts_text() {
-        assert_eq!(estimate_tokens(&[Msg::User("a".repeat(40))]), 10); // ~4 chars/token
+        assert_eq!(estimate_tokens(&[Msg::User("a".repeat(40))]), 10);
     }
 
     #[test]
@@ -605,10 +900,9 @@ mod tests {
             msgs.push(Msg::User(format!("u{i}")));
         }
         let out = compact_with(msgs, |_| "SUMMARY".into());
-        assert_eq!(out.len(), 1 + 1 + KEEP_RECENT); // system + summary + tail
+        assert_eq!(out.len(), 1 + 1 + KEEP_RECENT);
         assert!(matches!(&out[0], Msg::System(s) if s == "sys"));
         assert!(matches!(&out[1], Msg::User(s) if s.contains("SUMMARY")));
-        // The recent tail is preserved verbatim.
         assert!(matches!(out.last(), Some(Msg::User(s)) if s == "u9"));
     }
 
