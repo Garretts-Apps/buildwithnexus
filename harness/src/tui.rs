@@ -14,7 +14,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::event::{
     poll, read, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
 static RAW: AtomicBool = AtomicBool::new(false);
@@ -148,22 +148,24 @@ pub fn added_preview(content: &str) -> String {
     }
 }
 
+// Begin an interactive session. Deliberately NOT the alternate screen: rendering
+// inline on the normal buffer preserves the terminal's native scrollback, mouse
+// wheel, and text selection/copy — the same choice Claude Code makes. We still
+// enable raw mode for the key-driven line editor, and bracketed paste so multi-
+// line pastes arrive as one event.
 pub fn enter_alt(raw: bool) {
-    let _ = execute!(io::stdout(), EnterAlternateScreen);
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
         let _ = execute!(io::stdout(), EnableBracketedPaste);
     }
-    // Always restore the terminal, even on panic — never leave the user in a raw
-    // alt buffer with no echo.
+    // Always restore cooked mode, even on panic — never leave the user's terminal
+    // in raw mode with no echo.
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
         prev(info);
     }));
-    clear();
 }
 
 pub fn leave_alt() {
@@ -171,7 +173,6 @@ pub fn leave_alt() {
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
     }
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
 pub fn clear() {
@@ -247,14 +248,34 @@ fn history() -> &'static std::sync::Mutex<Vec<String>> {
     H.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-// Repaint the editable buffer from a fixed start column, then position the
-// cursor. Treats one char as one column (CJK width is approximate).
-fn redraw(start: (u16, u16), buf: &[char], cursor: usize) {
+// Horizontal-scroll viewport: keep the cursor visible within `avail` columns,
+// scrolling the single render row as the buffer grows past the terminal width.
+// Returns the (possibly updated) scroll offset and the cursor's column in-row.
+fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
+    let avail = avail.max(1);
+    let mut s = scroll;
+    if cursor < s {
+        s = cursor;
+    } else if cursor >= s + avail {
+        s = cursor + 1 - avail;
+    }
+    (s, cursor - s)
+}
+
+// Repaint the editable buffer on one row, scrolling horizontally so long input
+// and the cursor stay visible regardless of terminal width. (One char == one
+// column; CJK width is approximate.)
+fn redraw(start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
+    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+    let avail = width.saturating_sub(start.0).max(8) as usize;
+    let (s, col) = viewport(cursor, avail, *scroll);
+    *scroll = s;
+    let end = (s + avail).min(buf.len());
+    let shown: String = buf[s..end].iter().collect();
     let mut out = io::stdout();
-    let s: String = buf.iter().collect();
     let _ = queue!(out, MoveTo(start.0, start.1), Clear(ClearType::UntilNewLine));
-    let _ = write!(out, "{s}");
-    let _ = queue!(out, MoveTo(start.0.saturating_add(cursor as u16), start.1));
+    let _ = write!(out, "{shown}");
+    let _ = queue!(out, MoveTo(start.0.saturating_add(col as u16), start.1));
     let _ = out.flush();
 }
 
@@ -265,17 +286,26 @@ fn read_line_raw(prompt: &str) -> Option<String> {
     let start = crossterm::cursor::position().unwrap_or((0, 0));
     let mut buf: Vec<char> = Vec::new();
     let mut cursor = 0usize;
+    let mut scroll = 0usize;
     let mut hist_idx: Option<usize> = None;
 
     loop {
         let ev = match read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
             Ok(Event::Paste(s)) => {
-                for c in s.chars().filter(|c| *c != '\n' && *c != '\r') {
+                // Single-line editor: fold newlines/tabs to spaces so multi-line
+                // pastes stay readable instead of fusing words ("a\nb" -> "a b"),
+                // and drop other control bytes that would corrupt the row.
+                for raw in s.chars() {
+                    let c = match raw {
+                        '\n' | '\r' | '\t' => ' ',
+                        c if c.is_control() => continue,
+                        c => c,
+                    };
                     buf.insert(cursor, c);
                     cursor += 1;
                 }
-                redraw(start, &buf, cursor);
+                redraw(start, &buf, cursor, &mut scroll);
                 continue;
             }
             Ok(_) => continue,
@@ -295,24 +325,25 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                     return None;
                 }
             }
-            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor); }
-            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor); }
-            KeyCode::Char('u') if ctrl => { buf.clear(); cursor = 0; redraw(start, &buf, cursor); }
+            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('u') if ctrl => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('k') if ctrl => { buf.truncate(cursor); redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Char('w') if ctrl => {
                 let mut i = cursor;
                 while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
                 while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
                 buf.drain(i..cursor);
                 cursor = i;
-                redraw(start, &buf, cursor);
+                redraw(start, &buf, cursor, &mut scroll);
             }
-            KeyCode::Char(c) if !ctrl => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor); }
-            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(start, &buf, cursor); } }
-            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(start, &buf, cursor); } }
-            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(start, &buf, cursor); }
-            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(start, &buf, cursor); } }
-            KeyCode::Home => { cursor = 0; redraw(start, &buf, cursor); }
-            KeyCode::End => { cursor = buf.len(); redraw(start, &buf, cursor); }
+            KeyCode::Char(c) if !ctrl => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(start, &buf, cursor, &mut scroll); } }
+            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(start, &buf, cursor, &mut scroll); } }
+            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(start, &buf, cursor, &mut scroll); } }
+            KeyCode::Home => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::End => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Up => {
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
@@ -322,7 +353,7 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                         cursor = buf.len();
                     }
                 }
-                redraw(start, &buf, cursor);
+                redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Down => {
                 if let Ok(h) = history().lock() {
@@ -331,7 +362,7 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                         _ => { hist_idx = None; buf.clear(); cursor = 0; }
                     }
                 }
-                redraw(start, &buf, cursor);
+                redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
                 print!("\r\n");
@@ -346,7 +377,7 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                 }
                 return Some(s);
             }
-            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor); }
+            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
             _ => {}
         }
     }
@@ -471,6 +502,27 @@ mod tests {
         let p = plain(&added_preview(&content));
         assert!(p.contains("+ line 0"));
         assert!(p.contains("more lines"));
+    }
+
+    #[test]
+    fn viewport_keeps_cursor_visible() {
+        // Cursor within the window: no scroll.
+        assert_eq!(viewport(3, 10, 0), (0, 3));
+        // Cursor past the right edge: scroll so cursor sits at the last column.
+        assert_eq!(viewport(20, 10, 0), (11, 9));
+        // Cursor before the current scroll: scroll back to the cursor.
+        assert_eq!(viewport(2, 10, 11), (2, 0));
+        // Cursor exactly at the right edge stays put.
+        assert_eq!(viewport(9, 10, 0), (0, 9));
+        // Stable when already in view.
+        assert_eq!(viewport(15, 10, 11), (11, 4));
+    }
+
+    #[test]
+    fn viewport_handles_zero_width() {
+        let (s, col) = viewport(5, 0, 3); // avail clamped to >=1
+        assert!(col < 1 || s <= 5);
+        let _ = (s, col);
     }
 
     #[test]
