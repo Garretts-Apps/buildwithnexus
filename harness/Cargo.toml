@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 description = "A hilariously fast agentic AI CLI harness — remote or local models, alternate-screen TUI"
 license = "MIT"
