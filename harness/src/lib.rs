@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod config;
 pub mod hooks;
+pub mod local;
 pub mod onboarding;
 pub mod provider;
 pub mod report;

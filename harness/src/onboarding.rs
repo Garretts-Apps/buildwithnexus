@@ -2,7 +2,7 @@
 // pick remote-or-local, drop in a key if needed, choose a model and a trust level.
 
 use crate::config::{self, Settings, PRESETS};
-use crate::tui;
+use crate::{local, provider, tui};
 
 pub fn run() -> Option<Settings> {
     config::ensure_home();
@@ -39,6 +39,33 @@ pub fn run() -> Option<Settings> {
         }
     }
 
+    // For local providers, auto-detect what's actually installed so the model
+    // prompt offers real choices: Ollama's API for Ollama, GGUF files on disk
+    // for llama.cpp / LM Studio.
+    let detected: Vec<String> = if pick.local {
+        let found = if pick.id == "ollama" {
+            provider::ollama_models(base_url.as_deref().unwrap_or(pick.base_url))
+        } else {
+            local::scan_gguf()
+        };
+        tui::line("");
+        if found.is_empty() {
+            tui::line(&tui::yellow("  no local models detected."));
+            tui::line(&tui::dim("    • Ollama: run  ollama pull qwen2.5:3b"));
+            tui::line(&tui::dim(&format!("    • llama.cpp / LM Studio: drop a .gguf into {}", local::models_dir().display())));
+            tui::line(&tui::dim("      (or your LM Studio models folder), then start the server"));
+            tui::line(&tui::dim("    you can also just type a model name below, then re-run init once it's available"));
+        } else {
+            tui::line(&tui::dim("  detected local models:"));
+            for (i, m) in found.iter().take(20).enumerate() {
+                tui::line(&format!("    {}  {}", tui::bold(&(i + 1).to_string()), m));
+            }
+        }
+        found
+    } else {
+        Vec::new()
+    };
+
     // Key, only if the provider needs one and we don't already have it.
     if !pick.env_key.is_empty() && config::load_key(pick.env_key).is_none() {
         tui::line("");
@@ -52,9 +79,21 @@ pub fn run() -> Option<Settings> {
         tui::line(&tui::green(&format!("  ✓ {} already set ({})", pick.env_key, shown)));
     }
 
-    let model = match tui::ask(&format!("  model [{}]: ", pick.default_model)) {
-        Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-        _ => pick.default_model.to_string(),
+    // Model: pick a detected one by number (or name), else type/accept the default.
+    let model = if !detected.is_empty() {
+        let def = &detected[0];
+        match tui::ask(&format!("  model # or name [{def}]: ")).as_deref().map(str::trim) {
+            None | Some("") => def.clone(),
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= detected.len() => detected[n - 1].clone(),
+                _ => s.to_string(),
+            },
+        }
+    } else {
+        match tui::ask(&format!("  model [{}]: ", pick.default_model)) {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => pick.default_model.to_string(),
+        }
     };
 
     tui::line("");
