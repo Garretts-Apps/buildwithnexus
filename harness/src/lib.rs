@@ -133,14 +133,15 @@ fn interactive() {
 
 fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
-    loop {
-        tui::clear();
-        tui::line(&tui::accent("  buildwithnexus"));
-        tui::line(&tui::dim(&format!("  {} · {} · {} · {}",
-            settings.provider, provider.model, settings.permission, cwd.display())));
-        tui::line(&tui::dim("  describe a task, or /exit"));
-        tui::line("");
+    // Banner once. We render inline on the normal screen (no alt buffer), so the
+    // transcript stays in the terminal's scrollback — never cleared per task.
+    tui::line(&tui::accent("  buildwithnexus"));
+    tui::line(&tui::dim(&format!("  {} · {} · {} · {}",
+        settings.provider, provider.model, settings.permission, cwd.display())));
+    tui::line(&tui::dim("  describe a task, or /help"));
 
+    loop {
+        tui::line("");
         let task = match tui::ask(&format!("{} ", tui::accent("›"))) {
             None => return Ok(()),
             Some(t) => t,
@@ -149,14 +150,21 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         if t.is_empty() {
             continue;
         }
-        if t == "/exit" || t == "/quit" || t == "exit" {
-            return Ok(());
-        }
-        if t == "/init" {
-            tui::leave_alt();
-            onboarding::run();
-            tui::enter_alt(raw);
-            continue;
+        match t {
+            "/exit" | "/quit" | "exit" => return Ok(()),
+            "/clear" => { tui::clear(); continue; }
+            "/help" => {
+                tui::line(&tui::dim("  /help   show this   ·   /clear  clear screen   ·   /init  reconfigure   ·   /exit  quit"));
+                tui::line(&tui::dim("  edit: ←→ move · ^A/^E ends · ^W word · ^U/^K kill · ↑↓ history · paste multi-line ok"));
+                continue;
+            }
+            "/init" => {
+                tui::leave_alt();
+                onboarding::run();
+                tui::enter_alt(raw);
+                continue;
+            }
+            _ => {}
         }
 
         let mode = choose_mode(t);
@@ -169,8 +177,6 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {e}")));
         }
-        tui::line("");
-        let _ = tui::ask(&tui::dim("  [Enter] for a new task "));
     }
 }
 
