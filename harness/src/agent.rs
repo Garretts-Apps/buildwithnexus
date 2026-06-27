@@ -149,7 +149,19 @@ pub struct Role {
 pub fn role(id: &str) -> Role {
     let system = match id {
         "researcher" => "You are a meticulous research engineer. Investigate the codebase with the read and list tools before drawing conclusions. Cite file paths. Do not modify files unless explicitly asked.",
-        _ => "You are an autonomous senior software engineer. Use the tools to inspect and modify the project directly. Prefer small, verifiable edits. Read before you write. When the task is complete, call the finish tool with a one-paragraph summary.",
+        _ => "You are an autonomous senior software engineer. \
+Use the tools to inspect and modify the project directly. \
+Prefer small, verifiable edits. Read before you write. \
+When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
+IMPORTANT — tool discipline:\n\
+• Before using run_command to install anything (npm install, pip install, cargo add, brew install, \
+apt install, etc.), FIRST check whether an existing package or built-in tool can do the job. \
+Look at package.json / Cargo.toml / requirements.txt / pyproject.toml to see what is already available. \
+Use run_command with grep/find/jq/awk/sed/git/curl/which before reaching for new installs.\n\
+• fetch_url is built-in — do NOT install curl/wget just to make an HTTP request.\n\
+• read_file / list_dir / edit_file are built-in — do NOT install file-management packages for basic I/O.\n\
+• If a system tool is already present (check with `which <tool>` or `command -v <tool>`) prefer it \
+over installing an alternative.",
     };
     Role { system }
 }
@@ -157,6 +169,17 @@ pub fn role(id: &str) -> Role {
 // Build the system prompt prefix from memory and skills/agents files.
 fn context_prefix() -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    // Always include the tool manifest so the model knows what's built-in
+    // and doesn't try to install external tools to do things we already handle.
+    parts.push(tool_manifest());
+
+    // Probe which common system tools are actually present so the model can
+    // pick the right one without guessing or installing alternatives.
+    let env_snap = env_snapshot();
+    if !env_snap.is_empty() {
+        parts.push(format!("[Environment — tools already installed]\n{env_snap}"));
+    }
 
     if let Some(mem) = config::load_memory() {
         parts.push(format!("[Memory from previous sessions]\n{mem}"));
@@ -172,11 +195,67 @@ fn context_prefix() -> String {
         parts.push(format!("[Available skills]\n{joined}"));
     }
 
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n\n", parts.join("\n\n"))
+    format!("{}\n\n", parts.join("\n\n"))
+}
+
+fn tool_manifest() -> String {
+    "[Built-in tools — always available, no install needed]\n\
+• read_file / list_dir   — read any file or directory on the filesystem\n\
+• write_file / edit_file — create or surgically modify files\n\
+• run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
+• fetch_url              — HTTP GET (no curl/wget needed)\n\
+• save_memory            — persist a note across sessions\n\
+• spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
+• finish                 — mark the task complete with a summary"
+    .to_string()
+}
+
+fn env_snapshot() -> String {
+    // Probe a fixed list of common tools so the model knows what's available.
+    // We run everything in parallel-ish with short timeouts via sequential calls —
+    // the total overhead is ~10ms on a modern machine.
+    let probes: &[(&str, &str)] = &[
+        ("node",    "node --version"),
+        ("npm",     "npm --version"),
+        ("npx",     "npx --version"),
+        ("python3", "python3 --version"),
+        ("pip3",    "pip3 --version"),
+        ("cargo",   "cargo --version"),
+        ("rustc",   "rustc --version"),
+        ("git",     "git --version"),
+        ("docker",  "docker --version"),
+        ("jq",      "jq --version"),
+        ("rg",      "rg --version"),
+        ("gh",      "gh --version"),
+        ("bun",     "bun --version"),
+        ("deno",    "deno --version"),
+        ("go",      "go version"),
+        ("ruby",    "ruby --version"),
+        ("java",    "java --version"),
+    ];
+
+    use std::process::Command;
+    let mut found: Vec<String> = Vec::new();
+    for (label, cmd) in probes {
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        let bin = parts[0];
+        let arg = parts.get(1).copied().unwrap_or("--version");
+        let ok = Command::new(bin).arg(arg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map(|o| {
+                let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let txt = if txt.is_empty() { String::from_utf8_lossy(&o.stderr).trim().to_string() } else { txt };
+                txt.lines().next().unwrap_or("").to_string()
+            })
+            .ok()
+            .filter(|v| !v.is_empty());
+        if let Some(ver) = ok {
+            found.push(format!("• {label}: {ver}"));
+        }
     }
+    found.join("\n")
 }
 
 fn confirm(label: &str) -> Option<String> {
