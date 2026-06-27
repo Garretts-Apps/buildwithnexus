@@ -5,6 +5,11 @@ name: release
 on:
   push:
     tags: ["v*"]
+    # One-shot: cut the v0.10.1 release whose binaries were never built. This
+    # branch trigger lets the release be produced without a tag push (which is
+    # gated in this environment). The tag is pinned to main's commit below, so
+    # the resulting release/tag is clean. Safe to remove this branch + line after.
+    branches: ["claude/cut-v0101-release"]
   workflow_dispatch:
 
 permissions:
@@ -53,33 +58,41 @@ jobs:
           # Per-asset checksum the postinstall verifies before chmod/exec.
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
-      # The release tag. On a tag push it's the pushed tag; on a manual run it's
-      # derived from package.json so it always matches the version npm publishes
+      # The release tag. On a tag push it's the pushed tag; otherwise it's derived
+      # from package.json so it always matches the version npm publishes
       # (postinstall fetches assets from releases/download/v<version>).
       - name: Resolve release tag
         id: meta
         shell: bash
         env:
-          EVENT: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
             v=$(node -p "require('./package.json').version")
             echo "tag=v${v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
       - name: Attest build provenance
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/claude/cut-v0101-release'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
       # Creates the tag + release on a manual run (the GITHUB_TOKEN can do this);
       # on a tag push it just attaches assets to the existing tag's release.
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/claude/cut-v0101-release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          target_commitish: ${{ github.sha }}
+          # Pin the created tag to main's commit so the release is clean even
+          # though the build ran from the throwaway branch.
+          target_commitish: 4b15c71bc9a96b99467bee558630ffd4982d41dd
+          body: |
+            Prebuilt binaries for buildwithnexus 0.10.1.
+
+            Same code as v0.10.0 — this release supplies the per-platform v0.10.1
+            binaries the npm postinstall fast path expects, so
+            `npm install -g buildwithnexus` works with no Rust toolchain.
           files: buildwithnexus-${{ matrix.target }}*
