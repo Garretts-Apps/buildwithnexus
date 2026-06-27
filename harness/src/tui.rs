@@ -151,6 +151,149 @@ pub fn added_preview(content: &str) -> String {
     }
 }
 
+// ── streaming code-block renderer ────────────────────────────────────────────
+// Feeds line-by-line through assistant streaming output. Triple-backtick fenced
+// code blocks are rendered with a box border, and each block is automatically
+// copied to the clipboard via OSC 52 (supported by iTerm2, kitty, Alacritty,
+// WezTerm, macOS Terminal 2.12+, and most modern terminals).
+//
+// Usage: create one per assistant turn, call push() for each streamed chunk,
+// call flush() after streaming ends.
+
+enum StreamState {
+    Normal,
+    InCode { lang: String, lines: Vec<String> },
+}
+
+pub struct StreamRenderer {
+    pending: String,
+    state: StreamState,
+    w: usize, // terminal width cap for box drawing
+}
+
+impl StreamRenderer {
+    pub fn new() -> Self {
+        let w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(80);
+        StreamRenderer { pending: String::new(), state: StreamState::Normal, w }
+    }
+
+    pub fn push(&mut self, chunk: &str) {
+        self.pending.push_str(chunk);
+        self.drain(false);
+    }
+
+    // Call after the stream ends to flush any partial last line.
+    pub fn flush(&mut self) {
+        self.drain(true);
+    }
+
+    fn drain(&mut self, end: bool) {
+        loop {
+            match self.pending.find('\n') {
+                Some(nl) => {
+                    let line_text = self.pending[..nl].to_string();
+                    self.pending = self.pending[nl + 1..].to_string();
+                    self.process_line(&line_text);
+                }
+                None if end && !self.pending.is_empty() => {
+                    let last = std::mem::take(&mut self.pending);
+                    self.process_line(&last);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn process_line(&mut self, text: &str) {
+        // Pull out the current state so we can unconditionally assign self.state below.
+        let state = std::mem::replace(&mut self.state, StreamState::Normal);
+        match state {
+            StreamState::Normal => {
+                if text.starts_with("```") {
+                    // Opening fence — draw box header and enter code mode.
+                    let lang = text[3..].trim().to_string();
+                    let header = self.box_header(&lang);
+                    line(&header);
+                    self.state = StreamState::InCode { lang, lines: Vec::new() };
+                } else {
+                    // Regular text: preserve blank lines; no extra prefix (matches
+                    // the existing non-code streaming style).
+                    if is_raw() {
+                        print!("{}\r\n", text);
+                        let _ = io::stdout().flush();
+                    } else {
+                        println!("{text}");
+                    }
+                    self.state = StreamState::Normal;
+                }
+            }
+            StreamState::InCode { lang, mut lines } => {
+                if text.trim_end_matches('\r') == "```" {
+                    // Closing fence — draw footer, then copy to clipboard.
+                    line(&self.box_footer());
+                    let code = lines.join("\n");
+                    osc52_copy(&code);
+                    line(&dim("  ⎘ copied to clipboard"));
+                    self.state = StreamState::Normal;
+                    let _ = lang;
+                } else {
+                    // Code line — prefix with a dim vertical bar.
+                    let row = format!("  {} {text}", dim("│"));
+                    line(&row);
+                    lines.push(text.to_string());
+                    self.state = StreamState::InCode { lang, lines };
+                }
+            }
+        }
+    }
+
+    fn box_header(&self, lang: &str) -> String {
+        // "  ┌─ lang ─────────" or "  ┌────────" when no lang
+        let prefix = if lang.is_empty() {
+            "  ┌".to_string()
+        } else {
+            format!("  ┌─ {lang} ")
+        };
+        let used = prefix.chars().count();
+        let dashes = self.w.saturating_sub(used).max(1);
+        format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
+    }
+
+    fn box_footer(&self) -> String {
+        // "  └────────────────"
+        let prefix = "  └";
+        let dashes = self.w.saturating_sub(prefix.chars().count()).max(1);
+        format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
+    }
+}
+
+// Copy text to the terminal clipboard via the OSC 52 escape sequence.
+// Works in raw/interactive mode only; a no-op in cooked/piped sessions.
+fn osc52_copy(text: &str) {
+    if !is_raw() {
+        return;
+    }
+    let encoded = b64_encode(text.as_bytes());
+    print!("\x1b]52;c;{encoded}\x07");
+    let _ = io::stdout().flush();
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for ch in data.chunks(3) {
+        let b0 = ch[0] as usize;
+        let b1 = if ch.len() > 1 { ch[1] as usize } else { 0 };
+        let b2 = if ch.len() > 2 { ch[2] as usize } else { 0 };
+        out.push(A[b0 >> 2] as char);
+        out.push(A[((b0 & 3) << 4) | (b1 >> 4)] as char);
+        out.push(if ch.len() > 1 { A[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
+        out.push(if ch.len() > 2 { A[b2 & 0x3f] as char } else { '=' });
+    }
+    out
+}
+
 // ── startup banner ───────────────────────────────────────────────────────────
 // Gradient wordmark: each letter of "buildwithnexus" shifts across purple→cyan→green.
 fn wordmark() -> String {
