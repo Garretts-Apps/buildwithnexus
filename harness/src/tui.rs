@@ -215,10 +215,13 @@ pub fn interrupted() -> bool {
     let mut hit = false;
     while poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(k)) = read() {
-            if k.kind == KeyEventKind::Press
-                && k.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            // Esc, or Ctrl-C, interrupts the running turn.
+            let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'));
+            if ctrl_c || k.code == KeyCode::Esc {
                 hit = true;
             }
         }
@@ -245,7 +248,8 @@ pub fn ask(prompt: &str) -> Option<String> {
 
 fn history() -> &'static std::sync::Mutex<Vec<String>> {
     static H: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    // Seed from the persisted history so Up recalls prompts from past sessions.
+    H.get_or_init(|| std::sync::Mutex::new(crate::config::load_history()))
 }
 
 // Horizontal-scroll viewport: keep the cursor visible within `avail` columns,
@@ -279,15 +283,65 @@ fn redraw(start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
     let _ = out.flush();
 }
 
-// Full raw-mode line editor: cursor movement, word/line kill, history, paste.
+// Word-motion helpers (pure): index of the previous / next word boundary.
+fn prev_word(buf: &[char], mut i: usize) -> usize {
+    while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
+    while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
+    i
+}
+fn next_word(buf: &[char], mut i: usize) -> usize {
+    let n = buf.len();
+    while i < n && buf[i].is_whitespace() { i += 1; }
+    while i < n && !buf[i].is_whitespace() { i += 1; }
+    i
+}
+
+// Hand the current draft to $VISUAL/$EDITOR (falling back to vi) — invaluable for
+// long prompts. Returns the edited text. Raw mode is dropped while the editor
+// owns the terminal, then restored.
+fn edit_in_editor(current: &str) -> Option<String> {
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".to_string());
+    let path = std::env::temp_dir().join(format!("bwn-prompt-{}.txt", std::process::id()));
+    std::fs::write(&path, current).ok()?;
+    let was_raw = is_raw();
+    if was_raw {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
+    let mut parts = editor.split_whitespace();
+    let cmd = parts.next().unwrap_or("vi");
+    let _ = std::process::Command::new(cmd).args(parts).arg(&path).status();
+    if was_raw {
+        let _ = enable_raw_mode();
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
+    }
+    let content = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    content.map(|c| c.trim_end_matches(['\n', '\r']).to_string())
+}
+
+// Full raw-mode line editor: cursor + word motion, kill-ring, history, paste,
+// open-in-$EDITOR. (Single visual line; multi-line composing lands separately.)
 fn read_line_raw(prompt: &str) -> Option<String> {
     print!("{prompt}");
     flush();
-    let start = crossterm::cursor::position().unwrap_or((0, 0));
+    let mut start = crossterm::cursor::position().unwrap_or((0, 0));
     let mut buf: Vec<char> = Vec::new();
     let mut cursor = 0usize;
     let mut scroll = 0usize;
     let mut hist_idx: Option<usize> = None;
+    let mut kill = String::new();
+
+    // Reprint the prompt + current line — after an external editor takes the
+    // screen, and for Ctrl-L.
+    macro_rules! reline {
+        () => {{
+            print!("\r{prompt}");
+            flush();
+            start = crossterm::cursor::position().unwrap_or(start);
+            redraw(start, &buf, cursor, &mut scroll);
+        }};
+    }
 
     loop {
         let ev = match read() {
@@ -312,11 +366,18 @@ fn read_line_raw(prompt: &str) -> Option<String> {
             Err(_) => return None,
         };
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = ev.modifiers.contains(KeyModifiers::ALT);
         match ev.code {
+            // Ctrl-C clears a non-empty draft first, exits on the next press.
             KeyCode::Char('c') if ctrl => {
-                print!("\r\n");
-                flush();
-                return None;
+                if buf.is_empty() {
+                    print!("\r\n");
+                    flush();
+                    return None;
+                }
+                buf.clear();
+                cursor = 0;
+                redraw(start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('d') if ctrl => {
                 if buf.is_empty() {
@@ -327,17 +388,41 @@ fn read_line_raw(prompt: &str) -> Option<String> {
             }
             KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('u') if ctrl => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('k') if ctrl => { buf.truncate(cursor); redraw(start, &buf, cursor, &mut scroll); }
+            // Kill bindings stash what they remove so Ctrl-Y can paste it back.
+            KeyCode::Char('u') if ctrl => {
+                kill = buf[..cursor].iter().collect();
+                buf.drain(..cursor);
+                cursor = 0;
+                redraw(start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Char('k') if ctrl => {
+                kill = buf[cursor..].iter().collect();
+                buf.truncate(cursor);
+                redraw(start, &buf, cursor, &mut scroll);
+            }
             KeyCode::Char('w') if ctrl => {
-                let mut i = cursor;
-                while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
-                while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
+                let i = prev_word(&buf, cursor);
+                kill = buf[i..cursor].iter().collect();
                 buf.drain(i..cursor);
                 cursor = i;
                 redraw(start, &buf, cursor, &mut scroll);
             }
-            KeyCode::Char(c) if !ctrl => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('y') if ctrl => {
+                for c in kill.clone().chars() { buf.insert(cursor, c); cursor += 1; }
+                redraw(start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Char('l') if ctrl => reline!(),
+            KeyCode::Char('g') if ctrl => {
+                let cur: String = buf.iter().collect();
+                if let Some(edited) = edit_in_editor(&cur) {
+                    buf = edited.replace('\n', " ").chars().collect();
+                    cursor = buf.len();
+                }
+                reline!();
+            }
+            KeyCode::Char('b') if alt => { cursor = prev_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('f') if alt => { cursor = next_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char(c) if !ctrl && !alt => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor, &mut scroll); }
             KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(start, &buf, cursor, &mut scroll); } }
             KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(start, &buf, cursor, &mut scroll); } }
             KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(start, &buf, cursor, &mut scroll); }
@@ -372,6 +457,7 @@ fn read_line_raw(prompt: &str) -> Option<String> {
                     if let Ok(mut h) = history().lock() {
                         if h.last().map(String::as_str) != Some(s.as_str()) {
                             h.push(s.clone());
+                            crate::config::save_history(&h);
                         }
                     }
                 }
@@ -502,6 +588,21 @@ mod tests {
         let p = plain(&added_preview(&content));
         assert!(p.contains("+ line 0"));
         assert!(p.contains("more lines"));
+    }
+
+    #[test]
+    fn word_motion_boundaries() {
+        let b: Vec<char> = "foo  bar baz".chars().collect();
+        // prev_word from end -> start of "baz"
+        assert_eq!(prev_word(&b, b.len()), 9);
+        // prev_word from start of a word skips the gap to the previous word
+        assert_eq!(prev_word(&b, 9), 5);
+        assert_eq!(prev_word(&b, 0), 0);
+        // next_word from 0 -> just past "foo"
+        assert_eq!(next_word(&b, 0), 3);
+        // next_word across the double space -> past "bar"
+        assert_eq!(next_word(&b, 3), 8);
+        assert_eq!(next_word(&b, b.len()), b.len());
     }
 
     #[test]
