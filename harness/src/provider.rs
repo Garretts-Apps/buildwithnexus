@@ -9,6 +9,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::Protocol;
@@ -19,20 +20,25 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    pub context_tokens: usize, // model context window, for compaction thresholds
 }
 
 // Neutral conversation. The provider translates this into each vendor's shape;
-// the rest of the program never sees vendor JSON.
+// the rest of the program never sees vendor JSON. Serializable + cloneable so a
+// transcript can be persisted to a session file and restored on resume.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub input: Value,
 }
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
 }
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Msg {
     System(String),
     User(String),
