@@ -171,6 +171,10 @@ pub struct StreamRenderer {
     w: usize, // terminal width cap for box drawing
 }
 
+impl Default for StreamRenderer {
+    fn default() -> Self { Self::new() }
+}
+
 impl StreamRenderer {
     pub fn new() -> Self {
         let w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(80);
@@ -210,9 +214,9 @@ impl StreamRenderer {
         let state = std::mem::replace(&mut self.state, StreamState::Normal);
         match state {
             StreamState::Normal => {
-                if text.starts_with("```") {
+                if let Some(rest) = text.strip_prefix("```") {
                     // Opening fence — draw box header and enter code mode.
-                    let lang = text[3..].trim().to_string();
+                    let lang = rest.trim().to_string();
                     let header = self.box_header(&lang);
                     line(&header);
                     self.state = StreamState::InCode { lang, lines: Vec::new() };
@@ -281,7 +285,7 @@ fn osc52_copy(text: &str) {
 
 fn b64_encode(data: &[u8]) -> String {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for ch in data.chunks(3) {
         let b0 = ch[0] as usize;
         let b1 = if ch.len() > 1 { ch[1] as usize } else { 0 };

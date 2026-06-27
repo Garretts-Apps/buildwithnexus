@@ -402,12 +402,10 @@ fn mode_label(mode: &Mode) -> &'static str {
 // Suppresses the tip if it was already shown for this mode combo in the current session.
 fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
     let suggested = classify(task);
-    let mismatch = match (&suggested, current) {
+    let mismatch = matches!((&suggested, current),
         (Mode::Build, Mode::Brainstorm) |
         (Mode::Plan, Mode::Brainstorm) |
-        (Mode::Build, Mode::Plan) => true,
-        _ => false,
-    };
+        (Mode::Build, Mode::Plan));
     if mismatch {
         let sug_label = mode_label(&suggested);
         if *last_suggested != Some(sug_label) {
@@ -747,7 +745,7 @@ fn extract_images(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, St
 
 fn base64_encode(data: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
         let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
