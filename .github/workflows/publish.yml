@@ -57,7 +57,10 @@ jobs:
           # On the release-triggered path, publish exactly the tagged commit the
           # binaries were built from; on manual dispatch, the current branch.
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
-          token: ${{ secrets.NPM_PERMISSIONED_TOKEN }}
+          # Auth is OIDC Trusted Publisher (no npm token, no PAT). Checkout only
+          # needs read access to this public repo, so the default GITHUB_TOKEN is
+          # enough — do NOT require a secret here, or an unset secret makes
+          # checkout fail with "could not read Username" before publish runs.
           persist-credentials: true
           submodules: false
 
