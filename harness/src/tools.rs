@@ -50,6 +50,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}) },
         ToolDef { name: "save_memory", description: "Save a short note to persistent memory so it's available in future sessions. Use for preferences, recurring facts, or things the user says to remember.",
             schema: json!({"type":"object","properties":{"note":{"type":"string","description":"Short fact or preference to remember (one line)"}},"required":["note"]}) },
+        ToolDef { name: "fetch_url", description: "Fetch the content of a URL via HTTP GET. Returns the response body as text. Use for reading documentation, API responses, changelogs, or any web content.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"}},"required":["url"]}) },
     ];
     if include_subagent {
         v.push(ToolDef {
@@ -70,6 +72,24 @@ pub fn is_mutating(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file" | "run_command")
 }
 
+// Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
+// even in ReadOnly permission mode despite run_command being generically mutating.
+pub fn is_readonly_command(cmd: &str) -> bool {
+    let lower = cmd.trim().to_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    matches!(base, "grep" | "egrep" | "fgrep" | "rg" | "find" | "cat"
+               | "ls" | "head" | "tail" | "wc" | "sort" | "uniq" | "diff"
+               | "tree" | "stat" | "file" | "jq" | "sed")
+        || lower.starts_with("git log")
+        || lower.starts_with("git status")
+        || lower.starts_with("git diff")
+        || lower.starts_with("git show")
+        || lower.starts_with("git branch")
+        || lower.starts_with("git tag")
+        || lower.starts_with("git remote")
+}
+
 // A one-line, human-readable preview of what a call will do (shown at the gate).
 pub fn preview(name: &str, input: &Value) -> String {
     match name {
@@ -77,6 +97,7 @@ pub fn preview(name: &str, input: &Value) -> String {
         "edit_file" => format!("edit {}", input["path"].as_str().unwrap_or("?")),
         "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
         "spawn_subagent" => format!("subagent: {}", input["task"].as_str().unwrap_or("?")),
+        "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
         _ => name.to_string(),
     }
 }
@@ -248,6 +269,21 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     Outcome { content: truncate(s, MAX_OUT), is_error: !o.status.success(), finished: false }
                 }
                 Err(e) => err(format!("failed to spawn: {e}")),
+            }
+        }
+        "fetch_url" => {
+            let url = input["url"].as_str().unwrap_or("");
+            if url.is_empty() {
+                return err("url is required");
+            }
+            match ureq::get(url).call() {
+                Ok(resp) => {
+                    match resp.into_string() {
+                        Ok(body) => ok(truncate(body, MAX_OUT)),
+                        Err(e) => err(format!("failed to read response body: {e}")),
+                    }
+                }
+                Err(e) => err(format!("fetch failed: {e}")),
             }
         }
         "finish" => Outcome {

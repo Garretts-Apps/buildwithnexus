@@ -78,7 +78,7 @@ pub fn home() -> PathBuf {
     PathBuf::from(base).join(".buildwithnexus")
 }
 
-fn settings_path() -> PathBuf { home().join("config.json") }
+fn settings_path() -> PathBuf { home().join("settings.json") }
 fn keys_path() -> PathBuf { home().join(".env.keys") }
 pub fn history_path() -> PathBuf { home().join("history") }
 pub fn memory_path() -> PathBuf { home().join("memory.md") }
@@ -225,7 +225,16 @@ pub fn ensure_home() {
 }
 
 pub fn load_settings() -> Option<Settings> {
-    let text = fs::read_to_string(settings_path()).ok()?;
+    // Canonical file is settings.json. Try it first; if it can't be parsed as
+    // Settings (e.g. it's a hooks-only file), fall back to config.json so
+    // older installations keep working.
+    if let Ok(text) = fs::read_to_string(settings_path()) {
+        if let Ok(s) = serde_json::from_str::<Settings>(&text) {
+            return Some(s);
+        }
+        // settings.json exists but lacks provider/model/permission — fall through.
+    }
+    let text = fs::read_to_string(home().join("config.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 

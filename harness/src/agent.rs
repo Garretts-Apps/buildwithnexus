@@ -195,7 +195,7 @@ fn confirm(label: &str) -> Option<String> {
 // Permission gate — returns Some(reason) when blocked.
 // Read operations outside CWD are allowed in all modes (no CWD confinement for
 // reads); the user specifically asked for full filesystem access.
-fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
     let path = tools::touched_path(name, input, cwd);
 
     if let Some(p) = &path {
@@ -215,6 +215,15 @@ fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> 
         Permission::Auto => None,
         Permission::ReadOnly => {
             if tools::is_mutating(name) {
+                // run_command with clearly read-only shell tools (grep, find, etc.)
+                // should pass through even in ReadOnly mode.
+                if name == "run_command" {
+                    if let Some(c) = input["command"].as_str() {
+                        if tools::is_readonly_command(c) {
+                            return None;
+                        }
+                    }
+                }
                 return Some("read-only mode: mutation skipped".into());
             }
             None // reads anywhere are allowed in readonly mode
@@ -458,6 +467,15 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             if let Some(reason) = reason {
                 results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
                 continue;
+            }
+            if call.name == "save_memory" {
+                if let Some(note) = call.input["note"].as_str() {
+                    config::append_memory(note);
+                    let msg = "memory saved".to_string();
+                    report::tool_result(&call.name, &msg, false);
+                    results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                    continue;
+                }
             }
             let out = tools::run(&call.name, &call.input, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);

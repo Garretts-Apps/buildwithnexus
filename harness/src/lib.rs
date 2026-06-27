@@ -198,6 +198,17 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
             continue;
         }
 
+        // MODE-03: /mode with an inline argument, e.g. `/mode build`, `/mode 1`.
+        if let Some(mode_arg) = t.strip_prefix("/mode ") {
+            match mode_arg.trim() {
+                "1" | "plan"       => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
+                "2" | "build"      => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
+                "3" | "brainstorm" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
+                other => tui::line(&tui::red(&format!("  unknown mode '{other}' — try: plan, build, brainstorm"))),
+            }
+            continue;
+        }
+
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => { tui::clear(); continue; }
@@ -250,24 +261,50 @@ fn repl(provider: &Provider, perm: Permission, cwd: &std::path::Path, raw: bool)
 
         // Check for custom user-defined slash commands.
         if t.starts_with('/') {
-            let cmd_name = t.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            let mut words = t.trim_start_matches('/').splitn(2, char::is_whitespace);
+            let cmd_name = words.next().unwrap_or("");
+            let cmd_args = words.next().unwrap_or("").trim();
             if let Some(custom) = find_custom_command(cmd_name) {
                 if let Some(script) = custom.script {
-                    // Run the script and show output.
-                    let cmd = script.to_string_lossy();
-                    let out = tools::run("run_command", &serde_json::json!({"command": cmd.as_ref()}), cwd);
+                    // Shell-quote the script path to guard against spaces (UX-007).
+                    let escaped = script.to_string_lossy().replace('\'', "'\"'\"'");
+                    let shell_cmd = if cmd_args.is_empty() {
+                        format!("'{escaped}'")
+                    } else {
+                        format!("'{escaped}' {cmd_args}")
+                    };
+                    let tool_input = serde_json::json!({"command": shell_cmd});
+                    // UX-002: script-based custom commands must pass through the
+                    // permission gate and PreToolUse hooks just like any run_command.
+                    if let hooks::PreDecision::Deny(r) = hooks::pre_tool_use("run_command", &tool_input, cwd) {
+                        tui::line(&tui::red(&format!("  blocked by hook: {r}")));
+                        tui::bell();
+                        continue;
+                    }
+                    if let Some(reason) = agent::gate(perm, "run_command", &tool_input, cwd) {
+                        tui::line(&tui::red(&format!("  {reason}")));
+                        tui::bell();
+                        continue;
+                    }
+                    let out = tools::run("run_command", &tool_input, cwd);
                     for l in out.content.lines() {
                         tui::line(&format!("  {l}"));
                     }
                 } else {
                     // Inject the skill content as context and run in BUILD mode.
-                    let task_with_context = format!("{}\n\n[Skill: {cmd_name}]\n{}", t, custom.content);
+                    let user_input = if cmd_args.is_empty() { t.to_string() } else { format!("{t} {cmd_args}") };
+                    let task_with_context = format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
                     tui::line("");
                     if let Err(e) = agent::run_build_session(provider, perm, "engineer", &task_with_context, cwd, &mut transcript, &sid) {
                         tui::line(&tui::red(&format!("  {e}")));
                     }
                 }
                 tui::bell();
+                continue;
+            }
+            // UX-001: unknown slash command — show error instead of falling through to AI.
+            if !cmd_name.is_empty() {
+                tui::line(&tui::red(&format!("  unknown command /{cmd_name} — /help for all commands")));
                 continue;
             }
         }

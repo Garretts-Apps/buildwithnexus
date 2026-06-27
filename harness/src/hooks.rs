@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Value};
 
 use crate::config;
+use crate::report;
 use crate::tui;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -191,7 +192,10 @@ fn interpreter_for(path: &Path) -> (&'static str, Vec<&'static str>) {
                 ("python", vec![])
             }
         }
-        _ => ("sh", vec!["-c"]),
+        Some("bash") => ("bash", vec![]),
+        // Shell scripts: run as `sh /path/script.sh` — NOT `sh -c /path/script.sh`
+        // (the -c form treats the path as a command string, not a script file).
+        _ => ("sh", vec![]),
     }
 }
 
@@ -219,19 +223,21 @@ fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String)
     let (interp, interp_args) = interpreter_for(path);
     let mut c = Command::new(interp);
     for a in interp_args { c.arg(a); }
-    // For Python scripts, pass the path as a positional arg; for sh with -c the
-    // path is the script, so we use `sh script.sh` form (no -c needed).
-    if interp == "sh" || interp == "bash" {
-        c.arg(path);
-    } else {
-        c.arg(path);
-    }
+    c.arg(path);
     run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
 }
 
 fn run_child(c: &mut Command, payload: &Value) -> (i32, String, String) {
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let Ok(mut child) = c.spawn() else { return (0, String::new(), String::new()) };
+    let mut child = match c.spawn() {
+        Ok(ch) => ch,
+        Err(e) => {
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!("  [hook] spawn failed: {e}")));
+            }
+            return (0, String::new(), String::new());
+        }
+    };
     if let Some(mut sin) = child.stdin.take() {
         let _ = sin.write_all(payload.to_string().as_bytes());
     }
@@ -241,7 +247,12 @@ fn run_child(c: &mut Command, payload: &Value) -> (i32, String, String) {
             String::from_utf8_lossy(&o.stdout).into_owned(),
             String::from_utf8_lossy(&o.stderr).into_owned(),
         ),
-        Err(_) => (0, String::new(), String::new()),
+        Err(e) => {
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!("  [hook] wait failed: {e}")));
+            }
+            (0, String::new(), String::new())
+        }
     }
 }
 
@@ -257,6 +268,9 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
         "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
     });
     for (cmd, source) in commands_for("PreToolUse", Some(tool)) {
+        if !report::is_json() {
+            tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
+        }
         let (code, stdout, stderr) = run_hook_cmd(cmd, &payload, cwd);
         if code == 2 {
             let r = stderr.trim();
