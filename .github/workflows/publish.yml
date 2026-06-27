@@ -117,6 +117,21 @@ jobs:
       - name: Verify package contents
         run: npm pack --dry-run
 
+      # Idempotency: npm versions are immutable, so republishing one that already
+      # exists hard-fails. The release→publish chain can legitimately re-run for a
+      # version that's already live (e.g. a manual publish happened first), so
+      # skip the publish instead of failing the run.
+      - name: Check if this version is already on npm
+        id: published
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if npm view "buildwithnexus@$V" version >/dev/null 2>&1; then
+            echo "buildwithnexus@$V is already on npm — skipping publish."
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
       #   1. Trusted Publisher configured on npmjs.com for the
@@ -132,6 +147,7 @@ jobs:
       # Configure here:
       #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
       - name: Publish to npm (OIDC Trusted Publisher + provenance)
+        if: steps.published.outputs.already == 'false'
         run: npm publish --access public --provenance
 
       - name: Summary
