@@ -89,6 +89,31 @@ fn keys_path() -> PathBuf {
     home().join(".env.keys")
 }
 
+// Input history, persisted across sessions (newest last). Bounded so it can't
+// grow without limit.
+pub fn history_path() -> PathBuf {
+    home().join("history")
+}
+
+pub fn load_history() -> Vec<String> {
+    fs::read_to_string(history_path())
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+pub fn save_history(entries: &[String]) {
+    const MAX: usize = 1000;
+    ensure_home();
+    let tail = if entries.len() > MAX { &entries[entries.len() - MAX..] } else { entries };
+    // One entry per line; entries with embedded newlines are flattened so the
+    // file stays line-delimited.
+    let body: String = tail.iter().map(|e| format!("{}\n", e.replace('\n', " "))).collect();
+    let p = history_path();
+    if fs::write(&p, body).is_ok() {
+        restrict(&p);
+    }
+}
+
 pub fn ensure_home() {
     let _ = fs::create_dir_all(home());
     restrict(&home());
