@@ -132,17 +132,27 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             report::notice("interrupted");
             return Ok(String::new());
         }
-        // JSON mode buffers (one clean event); human mode streams tokens live.
+        // JSON mode buffers (one clean event); human mode streams tokens live,
+        // with a spinner covering the gap until the first token so a slow model
+        // never looks frozen.
         let reply: Reply = if report::is_json() {
             let r = complete(p, &msgs, &defs)?;
             report::assistant(&r.text);
             r
         } else {
+            let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
-            let r = provider::stream(p, &msgs, &defs, &mut |c| {
+            let res = provider::stream(p, &msgs, &defs, &mut |c| {
+                if let Some(s) = spin.take() {
+                    tui::spinner_stop(s);
+                }
                 report::assistant_delta(c);
                 streamed = true;
-            })?;
+            });
+            if let Some(s) = spin.take() {
+                tui::spinner_stop(s); // no text streamed (tool-only turn) — clear it
+            }
+            let r = res?;
             if streamed {
                 report::assistant_end();
             }
@@ -166,6 +176,10 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
                 continue;
             }
+            // Show the proposed action (with an inline diff for edits) first, so
+            // the approval prompt that follows has visible context.
+            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+
             // PreToolUse hook can allow (skip the gate), deny, or defer to it.
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
@@ -177,7 +191,6 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                 results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
                 continue;
             }
-            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
 
             if call.name == "spawn_subagent" {
                 let out = spawn_subagent(p, perm, &call.input, cwd, depth);

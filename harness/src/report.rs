@@ -53,15 +53,84 @@ pub fn assistant_end() {
 }
 
 pub fn tool_call(name: &str, preview: &str, input: &Value) {
-    match mode() {
-        Mode::Human => tui::line(&tui::dim(&format!("  • {preview}"))),
-        Mode::Json => emit(json!({"type": "tool_call", "name": name, "input": input})),
+    if mode() == Mode::Json {
+        emit(json!({"type": "tool_call", "name": name, "input": input}));
+        return;
     }
+    // `finish` is rendered by finish() — don't double up with a header line.
+    if name == "finish" {
+        return;
+    }
+    // A role-colored header line (icon + what it's about to do), opencode-style.
+    let (icon, head) = match name {
+        "read_file" | "list_dir" => ("◇", tui::cyan(preview)),
+        "write_file" | "edit_file" => ("◆", tui::yellow(preview)),
+        "run_command" => ("»", tui::blue(preview)),
+        "spawn_subagent" => ("⊞", tui::accent(preview)),
+        _ => ("•", tui::dim(preview)),
+    };
+    tui::line(&format!("  {} {}", tui::dim(icon), head));
+
+    // Inline colored diff for edits — see the change before/at the moment it lands.
+    let body = match name {
+        "edit_file" => Some(tui::diff(input["old"].as_str().unwrap_or(""), input["new"].as_str().unwrap_or(""))),
+        "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
+        _ => None,
+    };
+    if let Some(body) = body {
+        for l in body.lines() {
+            tui::line(&format!("    {l}"));
+        }
+    }
+}
+
+// First `max` lines (head); appends a "+N more" marker when clipped.
+fn clip_head(s: &str, max: usize) -> Vec<String> {
+    let lines: Vec<&str> = s.lines().collect();
+    let mut out: Vec<String> = lines.iter().take(max).map(|l| l.to_string()).collect();
+    if lines.len() > max {
+        out.push(format!("…(+{} more lines)", lines.len() - max));
+    }
+    out
+}
+
+// Last `max` lines (tail) — for command output, where the exit line and the most
+// recent output matter most.
+fn clip_tail(s: &str, max: usize) -> Vec<String> {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= max {
+        return lines.iter().map(|l| l.to_string()).collect();
+    }
+    let mut out = vec![format!("…(+{} earlier lines)", lines.len() - max)];
+    out.extend(lines[lines.len() - max..].iter().map(|l| l.to_string()));
+    out
 }
 
 pub fn tool_result(name: &str, content: &str, is_error: bool) {
     if mode() == Mode::Json {
         emit(json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}));
+        return;
+    }
+    // Human mode previously showed nothing here — the user couldn't see command
+    // output or errors. Surface results compactly, indented under the call.
+    if is_error {
+        for l in clip_head(content, 12) {
+            tui::line(&tui::red(&format!("    {l}")));
+        }
+        return;
+    }
+    match name {
+        "run_command" => {
+            for l in clip_tail(content, 12) {
+                tui::line(&tui::dim(&format!("    {l}")));
+            }
+        }
+        "read_file" | "list_dir" => {
+            let n = content.lines().count();
+            tui::line(&tui::dim(&format!("    ↳ {n} line{}", if n == 1 { "" } else { "s" })));
+        }
+        // write_file / edit_file / finish: the call header (+ diff) already said it.
+        _ => {}
     }
 }
 
