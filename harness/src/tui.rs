@@ -19,6 +19,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
 static RAW: AtomicBool = AtomicBool::new(false);
+// Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
+static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 pub fn is_raw() -> bool {
     RAW.load(Ordering::Relaxed)
 }
@@ -298,6 +301,86 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
+// ── typeahead ─────────────────────────────────────────────────────────────────
+// Buffers keystrokes typed while the agent is processing so they pre-fill the
+// next input prompt — matching Claude Code's typeahead behaviour.
+
+struct TypeAheadState {
+    buf: Vec<char>,
+    cursor: usize,
+}
+
+fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
+    static TA: std::sync::OnceLock<std::sync::Mutex<TypeAheadState>> = std::sync::OnceLock::new();
+    TA.get_or_init(|| std::sync::Mutex::new(TypeAheadState { buf: Vec::new(), cursor: 0 }))
+}
+
+/// Non-blocking drain of pending key events during agent processing.
+/// Buffers printable input; Ctrl+C clears the buffer and signals an interrupt.
+pub fn poll_typeahead() {
+    if !is_raw() { return; }
+    let mut any = false;
+    while poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(k)) = read() {
+            if k.kind != KeyEventKind::Press { continue; }
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            let mut ta = match typeahead().lock() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            match k.code {
+                KeyCode::Char('c') if ctrl => {
+                    TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
+                    ta.buf.clear();
+                    ta.cursor = 0;
+                }
+                KeyCode::Char('u') if ctrl => {
+                    let d = ta.cursor;
+                    ta.buf.drain(..d);
+                    ta.cursor = 0;
+                }
+                KeyCode::Esc => { ta.buf.clear(); ta.cursor = 0; }
+                KeyCode::Backspace if !ctrl => {
+                    if ta.cursor > 0 { let i = ta.cursor - 1; ta.buf.remove(i); ta.cursor = i; }
+                }
+                KeyCode::Delete => {
+                    let i = ta.cursor;
+                    if i < ta.buf.len() { ta.buf.remove(i); }
+                }
+                KeyCode::Left => { ta.cursor = ta.cursor.saturating_sub(1); }
+                KeyCode::Right => {
+                    let i = ta.cursor;
+                    if i < ta.buf.len() { ta.cursor += 1; }
+                }
+                KeyCode::Char(c) if !ctrl => { let i = ta.cursor; ta.buf.insert(i, c); ta.cursor += 1; }
+                _ => {}
+            }
+            any = true;
+        }
+    }
+    // Show a dim preview of buffered input only when new keystrokes arrived.
+    if any {
+        if let Ok(ta) = typeahead().lock() {
+            if !ta.buf.is_empty() {
+                let before: String = ta.buf[..ta.cursor].iter().collect();
+                let after: String = ta.buf[ta.cursor..].iter().collect();
+                line(&dim(&format!("  ⌨  {before}│{after}")));
+            }
+        }
+    }
+}
+
+fn take_typeahead() -> (Vec<char>, usize) {
+    match typeahead().lock() {
+        Ok(mut ta) => {
+            let buf = std::mem::take(&mut ta.buf);
+            let cur = std::mem::replace(&mut ta.cursor, 0);
+            (buf, cur)
+        }
+        Err(_) => (Vec::new(), 0),
+    }
+}
+
 // ── startup banner ───────────────────────────────────────────────────────────
 // Gradient wordmark: each letter of "buildwithnexus" shifts across purple→cyan→green.
 fn wordmark() -> String {
@@ -442,6 +525,10 @@ pub fn interrupted() -> bool {
     if !is_raw() {
         return false;
     }
+    // poll_typeahead() may have consumed a Ctrl+C and set this flag.
+    if TYPEAHEAD_INTERRUPTED.swap(false, Ordering::Relaxed) {
+        return true;
+    }
     let mut hit = false;
     while poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(k)) = read() {
@@ -488,14 +575,23 @@ pub fn ask(prompt: &str) -> Option<String> {
 
 // Multi-line task input. A trailing `\` + Enter adds another line; plain Enter
 // submits. Shift+Tab returns CycleMode without submitting.
+// Pre-fills the first line with any keystrokes typed during agent processing.
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     if !is_raw() {
         return ask(prompt).map(InputEvent::Text);
     }
+    let (prefill, prefill_cur) = take_typeahead();
     let mut acc = String::new();
     let mut p = prompt.to_string();
+    // Use the typeahead buffer to pre-fill only the very first read.
+    let mut first = Some((prefill, prefill_cur));
     loop {
-        match read_line_raw(&p)? {
+        let rl = if let Some((pf, pc)) = first.take() {
+            read_line_raw_prefill(&p, pf, pc)
+        } else {
+            read_line_raw(&p)
+        };
+        match rl? {
             RawLine::CycleMode => return Some(InputEvent::CycleMode),
             RawLine::Submit(text, cont) => {
                 if acc.is_empty() {
@@ -702,12 +798,19 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
 }
 
 fn read_line_raw(prompt: &str) -> Option<RawLine> {
+    read_line_raw_prefill(prompt, vec![], 0)
+}
+
+fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -> Option<RawLine> {
     print!("{prompt}");
     flush();
     let mut start = crossterm::cursor::position().unwrap_or((0, 0));
-    let mut buf: Vec<char> = Vec::new();
-    let mut cursor = 0usize;
+    let mut buf: Vec<char> = prefill;
+    let mut cursor = prefill_cur.min(buf.len());
     let mut scroll = 0usize;
+    if !buf.is_empty() {
+        redraw(start, &buf, cursor, &mut scroll);
+    }
     let mut hist_idx: Option<usize> = None;
     let mut kill = String::new();
 

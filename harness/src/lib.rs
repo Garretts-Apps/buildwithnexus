@@ -890,7 +890,8 @@ mod tests {
     #[test]
     fn build_provider_rejects_http_for_keyed_preset() {
         let s = Settings { provider: "openai".into(), model: String::new(),
-            permission: "ask".into(), base_url: Some("http://insecure.local/v1".into()) };
+            permission: "ask".into(), base_url: Some("http://insecure.local/v1".into()),
+            allowed_commands: Vec::new() };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("non-HTTPS")),
             Ok(_) => panic!("expected http base_url to be rejected"),
@@ -900,7 +901,7 @@ mod tests {
     #[test]
     fn build_provider_unknown_provider() {
         let s = Settings { provider: "does-not-exist".into(), model: String::new(),
-            permission: "ask".into(), base_url: None };
+            permission: "ask".into(), base_url: None, allowed_commands: Vec::new() };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("unknown provider")),
             Ok(_) => panic!("expected unknown provider error"),
@@ -910,7 +911,8 @@ mod tests {
     #[test]
     fn build_provider_local_preset_allows_http() {
         let s = Settings { provider: "ollama".into(), model: String::new(),
-            permission: "ask".into(), base_url: Some("http://localhost:11434/v1".into()) };
+            permission: "ask".into(), base_url: Some("http://localhost:11434/v1".into()),
+            allowed_commands: Vec::new() };
         match build_provider(&s) {
             Ok(p) => {
                 assert!(p.api_key.is_none());

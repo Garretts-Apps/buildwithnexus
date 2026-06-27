@@ -124,7 +124,7 @@ pub fn run() -> Option<Settings> {
     }
     .to_string();
 
-    let settings = Settings { provider: pick.id.to_string(), model, permission, base_url };
+    let settings = Settings { provider: pick.id.to_string(), model, permission, base_url, allowed_commands: Vec::new() };
     config::save_settings(&settings);
     tui::line("");
     tui::line(&tui::green("  ✓ ready"));

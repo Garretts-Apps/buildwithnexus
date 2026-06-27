@@ -61,12 +61,33 @@ pub struct Settings {
     pub permission: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings { provider: "anthropic".into(), model: String::new(),
-            permission: "ask".into(), base_url: None }
+            permission: "ask".into(), base_url: None, allowed_commands: Vec::new() }
+    }
+}
+
+fn default_allowed_commands() -> Vec<String> {
+    ["git", "cargo", "npm", "npx", "node", "python3", "pip3", "make",
+     "cmake", "bun", "deno", "rg", "grep", "find", "ls", "cat",
+     "curl", "wget", "jq", "gh", "rustc", "go", "ruby", "java",
+     "yarn", "pnpm", "docker", "kubectl", "sed", "awk", "sort",
+     "uniq", "wc", "head", "tail", "diff", "patch", "tar", "zip",
+     "unzip", "rsync", "mvn", "gradle"]
+        .iter().map(|s| s.to_string()).collect()
+}
+
+/// Returns the user's allowed-command list, falling back to built-in defaults.
+pub fn load_allowed_commands() -> Vec<String> {
+    match load_settings() {
+        Some(s) if !s.allowed_commands.is_empty() => s.allowed_commands,
+        _ => default_allowed_commands(),
     }
 }
 
@@ -427,7 +448,8 @@ mod tests {
     #[test]
     fn settings_roundtrip_json() {
         let s = Settings { provider: "ollama".into(), model: "llama3.2".into(),
-            permission: "auto".into(), base_url: Some("http://x".into()) };
+            permission: "auto".into(), base_url: Some("http://x".into()),
+            allowed_commands: Vec::new() };
         let text = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.provider, "ollama");
@@ -499,7 +521,7 @@ mod tests {
         std::env::set_var("NEXUS_HOME", &h);
         assert!(load_settings().is_none());
         let s = Settings { provider: "groq".into(), model: String::new(),
-            permission: "ask".into(), base_url: None };
+            permission: "ask".into(), base_url: None, allowed_commands: Vec::new() };
         save_settings(&s);
         assert_eq!(load_settings().unwrap().provider, "groq");
         std::env::remove_var("NEXUS_HOME");
