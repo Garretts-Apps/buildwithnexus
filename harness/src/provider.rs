@@ -44,8 +44,14 @@ pub enum Msg {
     User(String),
     /// User message with one or more attached images (base64-encoded, with media type).
     /// Images are `(media_type, base64_data)` pairs, e.g. `("image/png", "iVBOR...")`.
-    UserImages { text: String, images: Vec<(String, String)> },
-    Assistant { text: String, calls: Vec<ToolCall> },
+    UserImages {
+        text: String,
+        images: Vec<(String, String)>,
+    },
+    Assistant {
+        text: String,
+        calls: Vec<ToolCall>,
+    },
     Tool(Vec<ToolResult>),
 }
 pub struct Reply {
@@ -82,7 +88,9 @@ pub fn prewarm(p: &Provider) {
     std::thread::spawn(move || {
         let mut req = agent().get(&url).timeout(Duration::from_secs(5));
         req = match (proto, &key) {
-            (Protocol::Anthropic, Some(k)) => req.set("x-api-key", k).set("anthropic-version", "2023-06-01"),
+            (Protocol::Anthropic, Some(k)) => req
+                .set("x-api-key", k)
+                .set("anthropic-version", "2023-06-01"),
             (Protocol::OpenAi, Some(k)) => req.set("authorization", &format!("Bearer {k}")),
             _ => req,
         };
@@ -95,16 +103,25 @@ pub fn prewarm(p: &Provider) {
 #[doc(hidden)]
 pub mod bench {
     use super::*;
-    pub fn redact(s: &str) -> String { super::redact(s) }
-    pub fn parse_args(s: &str) -> Value { super::parse_args(s) }
-    pub fn cache_last_message(m: &mut [Value]) { super::cache_last_message(m) }
+    pub fn redact(s: &str) -> String {
+        super::redact(s)
+    }
+    pub fn parse_args(s: &str) -> Value {
+        super::parse_args(s)
+    }
+    pub fn cache_last_message(m: &mut [Value]) {
+        super::cache_last_message(m)
+    }
     pub fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
         super::anthropic_body(model, msgs, tools)
     }
     pub fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
         super::openai_body(model, msgs, tools)
     }
-    pub fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+    pub fn openai_stream(
+        reader: impl Read,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Reply, String> {
         super::openai_stream(reader, on_text)
     }
 }
@@ -114,7 +131,11 @@ pub mod bench {
 // (…/v1); Ollama's native API lives at the host root, so /v1 is trimmed.
 pub fn ollama_models(base_url: &str) -> Vec<String> {
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let resp = match agent().get(&format!("{root}/api/tags")).timeout(Duration::from_secs(2)).call() {
+    let resp = match agent()
+        .get(&format!("{root}/api/tags"))
+        .timeout(Duration::from_secs(2))
+        .call()
+    {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -124,7 +145,11 @@ pub fn ollama_models(base_url: &str) -> Vec<String> {
     };
     v["models"]
         .as_array()
-        .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -179,7 +204,9 @@ fn request(
 
 // ── HTTP plumbing ──────────────────────────────────────────────────────────
 fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
-    send_raw(req, body)?.into_json::<Value>().map_err(|e| format!("bad JSON from server: {e}"))
+    send_raw(req, body)?
+        .into_json::<Value>()
+        .map_err(|e| format!("bad JSON from server: {e}"))
 }
 
 fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
@@ -187,7 +214,10 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
         Ok(resp) => Ok(resp),
         Err(ureq::Error::Status(code, resp)) => {
             let detail = resp.into_string().unwrap_or_default();
-            Err(format!("HTTP {code}: {}", redact(&detail).chars().take(400).collect::<String>()))
+            Err(format!(
+                "HTTP {code}: {}",
+                redact(&detail).chars().take(400).collect::<String>()
+            ))
         }
         Err(e) => Err(format!("connection failed: {}", redact(&e.to_string()))),
     }
@@ -198,12 +228,22 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
 fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
         .map(|tok| {
-            let core = tok.trim_end_matches(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c));
+            let core =
+                tok.trim_end_matches(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c));
             let secretish = core.len() >= 12
-                && (core.starts_with("sk-") || core.starts_with("AIza") || core.starts_with("hf_")
+                && (core.starts_with("sk-")
+                    || core.starts_with("AIza")
+                    || core.starts_with("hf_")
                     || core.starts_with("Bearer")
-                    || (core.len() > 32 && core.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')));
-            if secretish { tok.replacen(core, "[redacted]", 1) } else { tok.to_string() }
+                    || (core.len() > 32
+                        && core
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')));
+            if secretish {
+                tok.replacen(core, "[redacted]", 1)
+            } else {
+                tok.to_string()
+            }
         })
         .collect()
 }
@@ -256,10 +296,15 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
             }
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images.iter().map(|(mt, data)| json!({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": mt, "data": data}
-                })).collect();
+                let mut parts: Vec<Value> = images
+                    .iter()
+                    .map(|(mt, data)| {
+                        json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mt, "data": data}
+                        })
+                    })
+                    .collect();
                 parts.push(json!({"type": "text", "text": text}));
                 messages.push(json!({"role": "user", "content": parts}));
             }
@@ -269,15 +314,22 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
                     content.push(json!({"type": "text", "text": text}));
                 }
                 for c in calls {
-                    content.push(json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.input}));
+                    content.push(
+                        json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.input}),
+                    );
                 }
                 messages.push(json!({"role": "assistant", "content": content}));
             }
             Msg::Tool(results) => {
-                let content: Vec<Value> = results.iter().map(|r| json!({
-                    "type": "tool_result", "tool_use_id": r.id,
-                    "content": r.content, "is_error": r.is_error
-                })).collect();
+                let content: Vec<Value> = results
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "type": "tool_result", "tool_use_id": r.id,
+                            "content": r.content, "is_error": r.is_error
+                        })
+                    })
+                    .collect();
                 messages.push(json!({"role": "user", "content": content}));
             }
         }
@@ -291,20 +343,32 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
 
     let mut body = json!({"model": model, "max_tokens": 4096, "messages": messages});
     if !system.is_empty() {
-        body["system"] = json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
+        body["system"] =
+            json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
     }
     if !tools.is_empty() {
-        body["tools"] = json!(tools.iter().map(|t| json!({
-            "name": t.name, "description": t.description, "input_schema": t.schema
-        })).collect::<Vec<_>>());
+        body["tools"] = json!(tools
+            .iter()
+            .map(|t| json!({
+                "name": t.name, "description": t.description, "input_schema": t.schema
+            }))
+            .collect::<Vec<_>>());
     }
     body
 }
 
-fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(ureq::Request, Value), String> {
+fn anthropic_request(
+    p: &Provider,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+) -> Result<(ureq::Request, Value), String> {
     let body = anthropic_body(&p.model, msgs, tools);
-    let key = p.api_key.as_deref().ok_or("Anthropic requires an API key")?;
-    let req = agent().post(&url(p, "/v1/messages"))
+    let key = p
+        .api_key
+        .as_deref()
+        .ok_or("Anthropic requires an API key")?;
+    let req = agent()
+        .post(&url(p, "/v1/messages"))
         .set("x-api-key", key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json");
@@ -314,7 +378,9 @@ fn anthropic_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<(u
 // Put an ephemeral cache breakpoint on the last content block of the last
 // message, normalizing a string body into a single text block if needed.
 fn cache_last_message(messages: &mut [Value]) {
-    let Some(last) = messages.last_mut() else { return };
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
     let content = &mut last["content"];
     if let Some(text) = content.as_str() {
         let text = text.to_string();
@@ -354,16 +420,20 @@ fn anthropic_stream(
     // index → (id, name, accumulated input JSON)
     let mut pending: Vec<(usize, String, String, String)> = Vec::new();
     for_each_sse(reader, |data| {
-        let Ok(v) = serde_json::from_str::<Value>(data) else { return false };
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
         match v["type"].as_str() {
             Some("content_block_start") => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 let cb = &v["content_block"];
                 if cb["type"].as_str() == Some("tool_use") {
-                    pending.push((idx,
+                    pending.push((
+                        idx,
                         cb["id"].as_str().unwrap_or_default().to_string(),
                         cb["name"].as_str().unwrap_or_default().to_string(),
-                        String::new()));
+                        String::new(),
+                    ));
                 }
             }
             Some("content_block_delta") => {
@@ -394,9 +464,14 @@ fn anthropic_stream(
         }
         false
     });
-    let calls = pending.into_iter().map(|(_, id, name, args)| ToolCall {
-        id, name, input: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
-    }).collect();
+    let calls = pending
+        .into_iter()
+        .map(|(_, id, name, args)| ToolCall {
+            id,
+            name,
+            input: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
+        })
+        .collect();
     Ok(Reply { text, calls })
 }
 
@@ -409,26 +484,35 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
             Msg::System(s) => messages.push(json!({"role": "system", "content": s})),
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images.iter().map(|(mt, data)| json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{mt};base64,{data}")}
-                })).collect();
+                let mut parts: Vec<Value> = images
+                    .iter()
+                    .map(|(mt, data)| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{mt};base64,{data}")}
+                        })
+                    })
+                    .collect();
                 parts.push(json!({"type": "text", "text": text}));
                 messages.push(json!({"role": "user", "content": parts}));
             }
             Msg::Assistant { text, calls } => {
                 let mut msg = json!({"role": "assistant", "content": text});
                 if !calls.is_empty() {
-                    msg["tool_calls"] = json!(calls.iter().map(|c| json!({
-                        "id": c.id, "type": "function",
-                        "function": {"name": c.name, "arguments": c.input.to_string()}
-                    })).collect::<Vec<_>>());
+                    msg["tool_calls"] = json!(calls
+                        .iter()
+                        .map(|c| json!({
+                            "id": c.id, "type": "function",
+                            "function": {"name": c.name, "arguments": c.input.to_string()}
+                        }))
+                        .collect::<Vec<_>>());
                 }
                 messages.push(msg);
             }
             Msg::Tool(results) => {
                 for r in results {
-                    messages.push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
+                    messages
+                        .push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
                 }
             }
         }
@@ -436,7 +520,8 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
 
     let mut body = json!({"model": model, "messages": messages});
     if !tools.is_empty() {
-        body["tools"] = json!(tools.iter().map(|t| json!({
+        body["tools"] =
+            json!(tools.iter().map(|t| json!({
             "type": "function",
             "function": {"name": t.name, "description": t.description, "parameters": t.schema}
         })).collect::<Vec<_>>());
@@ -446,7 +531,9 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
 
 fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
     let body = openai_body(&p.model, msgs, tools);
-    let mut req = agent().post(&url(p, "/chat/completions")).set("content-type", "application/json");
+    let mut req = agent()
+        .post(&url(p, "/chat/completions"))
+        .set("content-type", "application/json");
     if let Some(key) = &p.api_key {
         req = req.set("authorization", &format!("Bearer {key}"));
     }
@@ -462,7 +549,10 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
             let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
             calls.push(ToolCall {
                 id: tc["id"].as_str().unwrap_or_default().to_string(),
-                name: tc["function"]["name"].as_str().unwrap_or_default().to_string(),
+                name: tc["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 input: parse_args(args),
             });
         }
@@ -478,7 +568,9 @@ fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Rep
         if data == "[DONE]" {
             return true;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { return false };
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return false;
+        };
         let delta = &v["choices"][0]["delta"];
         if let Some(t) = delta["content"].as_str() {
             text.push_str(t);
@@ -492,10 +584,14 @@ fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Rep
                 }
                 let e = &mut pending[idx];
                 if let Some(id) = tc["id"].as_str() {
-                    if !id.is_empty() { e.0 = id.to_string(); }
+                    if !id.is_empty() {
+                        e.0 = id.to_string();
+                    }
                 }
                 if let Some(name) = tc["function"]["name"].as_str() {
-                    if !name.is_empty() { e.1 = name.to_string(); }
+                    if !name.is_empty() {
+                        e.1 = name.to_string();
+                    }
                 }
                 if let Some(args) = tc["function"]["arguments"].as_str() {
                     e.2.push_str(args);
@@ -504,9 +600,15 @@ fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Rep
         }
         false
     });
-    let calls = pending.into_iter().filter(|e| !e.1.is_empty()).map(|(id, name, args)| ToolCall {
-        id, name, input: parse_args(&args),
-    }).collect();
+    let calls = pending
+        .into_iter()
+        .filter(|e| !e.1.is_empty())
+        .map(|(id, name, args)| ToolCall {
+            id,
+            name,
+            input: parse_args(&args),
+        })
+        .collect();
     Ok(Reply { text, calls })
 }
 
@@ -516,7 +618,11 @@ mod tests {
     use std::io::Cursor;
 
     fn tc(id: &str, name: &str, input: Value) -> ToolCall {
-        ToolCall { id: id.into(), name: name.into(), input }
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }
     }
 
     // ── redact ──────────────────────────────────────────────────────────────
@@ -670,7 +776,9 @@ mod tests {
     #[test]
     fn anthropic_body_tool_results() {
         let msgs = vec![Msg::Tool(vec![ToolResult {
-            id: "t1".into(), content: "ok".into(), is_error: false,
+            id: "t1".into(),
+            content: "ok".into(),
+            is_error: false,
         }])];
         let b = anthropic_body("m", &msgs, &[]);
         let block = &b["messages"][0]["content"][0];
@@ -690,10 +798,7 @@ mod tests {
     // ── openai_body ─────────────────────────────────────────────────────────
     #[test]
     fn openai_body_roles() {
-        let msgs = vec![
-            Msg::System("sys".into()),
-            Msg::User("u".into()),
-        ];
+        let msgs = vec![Msg::System("sys".into()), Msg::User("u".into())];
         let b = openai_body("m", &msgs, &[]);
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["role"], "user");
@@ -710,14 +815,25 @@ mod tests {
         assert_eq!(call["function"]["name"], "run_command");
         // arguments must be a JSON *string*, per the OpenAI shape.
         assert!(call["function"]["arguments"].is_string());
-        assert_eq!(call["function"]["arguments"], json!({"cmd": "ls"}).to_string());
+        assert_eq!(
+            call["function"]["arguments"],
+            json!({"cmd": "ls"}).to_string()
+        );
     }
 
     #[test]
     fn openai_body_tool_results_each_become_a_message() {
         let msgs = vec![Msg::Tool(vec![
-            ToolResult { id: "a".into(), content: "1".into(), is_error: false },
-            ToolResult { id: "b".into(), content: "2".into(), is_error: true },
+            ToolResult {
+                id: "a".into(),
+                content: "1".into(),
+                is_error: false,
+            },
+            ToolResult {
+                id: "b".into(),
+                content: "2".into(),
+                is_error: true,
+            },
         ])];
         let b = openai_body("m", &msgs, &[]);
         assert_eq!(b["messages"].as_array().unwrap().len(), 2);
@@ -736,7 +852,10 @@ mod tests {
     // ── openai_stream ───────────────────────────────────────────────────────
     fn drain_openai(sse: &str) -> Reply {
         let mut out = String::new();
-        openai_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t)).unwrap()
+        openai_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| {
+            out.push_str(t)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -802,7 +921,12 @@ mod tests {
     fn drain_anthropic(sse: &str) -> Reply {
         let mut out = String::new();
         let mut _thinking = String::new();
-        anthropic_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| out.push_str(t), &mut |t| _thinking.push_str(t)).unwrap()
+        anthropic_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| out.push_str(t),
+            &mut |t| _thinking.push_str(t),
+        )
+        .unwrap()
     }
 
     #[test]

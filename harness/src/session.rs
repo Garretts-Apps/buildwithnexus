@@ -23,7 +23,10 @@ pub struct Session {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn dir() -> PathBuf {
@@ -105,7 +108,9 @@ mod tests {
     fn with_home<T>(f: impl FnOnce() -> T) -> T {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Serialize against config tests too — they share NEXUS_HOME.
-        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let home = std::env::temp_dir().join(format!("bwn-sess-{}-{id}", std::process::id()));
@@ -120,7 +125,10 @@ mod tests {
     #[test]
     fn save_load_roundtrip_and_title() {
         with_home(|| {
-            let msgs = vec![Msg::System("sys".into()), Msg::User("fix the parser bug".into())];
+            let msgs = vec![
+                Msg::System("sys".into()),
+                Msg::User("fix the parser bug".into()),
+            ];
             save("0000000000000001", Path::new("/proj"), "gpt-4o", &msgs);
             let s = load("0000000000000001").expect("session loads");
             assert_eq!(s.title, "fix the parser bug");
@@ -132,8 +140,18 @@ mod tests {
     #[test]
     fn list_orders_newest_first_and_empty_is_noop() {
         with_home(|| {
-            save("0000000000000001", Path::new("/p"), "m", &[Msg::User("first".into())]);
-            save("0000000000000002", Path::new("/p"), "m", &[Msg::User("second".into())]);
+            save(
+                "0000000000000001",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("first".into())],
+            );
+            save(
+                "0000000000000002",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("second".into())],
+            );
             save("0000000000000003", Path::new("/p"), "m", &[]); // empty: skipped
             let ls = list();
             assert_eq!(ls.len(), 2);

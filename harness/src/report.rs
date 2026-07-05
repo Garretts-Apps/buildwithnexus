@@ -63,7 +63,9 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     }
     // A role-colored header line (icon + what it's about to do), opencode-style.
     let (icon, head) = match name {
-        "read_file" | "list_dir" | "find_files" | "grep_files" => ("◇", tui::cyan(preview)),
+        "read_file" | "list_dir" | "find_paths" | "find_files" | "grep_files" => {
+            ("◇", tui::cyan(preview))
+        }
         "write_file" | "edit_file" => ("◆", tui::yellow(preview)),
         "run_command" => ("»", tui::blue(preview)),
         "spawn_subagent" => ("⊞", tui::accent(preview)),
@@ -73,7 +75,10 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
 
     // Inline colored diff for edits — see the change before/at the moment it lands.
     let body = match name {
-        "edit_file" => Some(tui::diff(input["old"].as_str().unwrap_or(""), input["new"].as_str().unwrap_or(""))),
+        "edit_file" => Some(tui::diff(
+            input["old"].as_str().unwrap_or(""),
+            input["new"].as_str().unwrap_or(""),
+        )),
         "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
         _ => None,
     };
@@ -108,7 +113,9 @@ fn clip_tail(s: &str, max: usize) -> Vec<String> {
 
 pub fn tool_result(name: &str, content: &str, is_error: bool) {
     if mode() == Mode::Json {
-        emit(json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}));
+        emit(
+            json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}),
+        );
         return;
     }
     // Human mode previously showed nothing here — the user couldn't see command
@@ -125,9 +132,12 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
                 tui::line(&tui::dim(&format!("    {l}")));
             }
         }
-        "read_file" | "list_dir" | "find_files" | "grep_files" => {
+        "read_file" | "list_dir" | "find_paths" | "find_files" | "grep_files" => {
             let n = content.lines().count();
-            tui::line(&tui::dim(&format!("    ↳ {n} line{}", if n == 1 { "" } else { "s" })));
+            tui::line(&tui::dim(&format!(
+                "    ↳ {n} line{}",
+                if n == 1 { "" } else { "s" }
+            )));
         }
         // write_file / edit_file / finish: the call header (+ diff) already said it.
         _ => {}

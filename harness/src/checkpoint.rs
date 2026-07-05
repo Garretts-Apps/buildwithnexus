@@ -93,11 +93,14 @@ pub fn undo_latest(cwd: &Path) -> Result<Checkpoint, String> {
     };
     if cp.existed {
         if let Some(parent) = cp.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        fs::write(&cp.path, &cp.content).map_err(|e| format!("cannot restore {}: {e}", cp.path.display()))?;
+        fs::write(&cp.path, &cp.content)
+            .map_err(|e| format!("cannot restore {}: {e}", cp.path.display()))?;
     } else if cp.path.exists() {
-        fs::remove_file(&cp.path).map_err(|e| format!("cannot remove {}: {e}", cp.path.display()))?;
+        fs::remove_file(&cp.path)
+            .map_err(|e| format!("cannot remove {}: {e}", cp.path.display()))?;
     }
     let _ = fs::remove_file(dir(cwd).join(format!("{}.json", cp.id)));
     Ok(cp)

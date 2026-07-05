@@ -41,12 +41,17 @@ fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 3 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
             collect_gguf(&p, depth + 1, out);
-        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")) {
+        } else if p
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+        {
             if let Some(name) = p.file_name() {
                 out.push(name.to_string_lossy().into_owned());
             }
@@ -60,7 +65,9 @@ mod tests {
 
     #[test]
     fn scan_finds_gguf_in_models_dir() {
-        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("bwn-local-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::env::set_var("NEXUS_HOME", &home);

@@ -5,15 +5,16 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
-    poll, read, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    poll, read, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+    EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,11 +23,40 @@ use crossterm::{execute, queue};
 
 static RAW: AtomicBool = AtomicBool::new(false);
 static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
+static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
+static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 // Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
 static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+fn transcript() -> &'static Mutex<Vec<String>> {
+    static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    LINES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn footer_text() -> &'static Mutex<String> {
+    static FOOTER: OnceLock<Mutex<String>> = OnceLock::new();
+    FOOTER.get_or_init(|| Mutex::new(String::new()))
+}
+
 pub fn is_raw() -> bool {
     RAW.load(Ordering::Relaxed)
+}
+
+pub fn set_mouse_capture(enabled: bool) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    if enabled {
+        if !MOUSE_CAPTURED.swap(true, Ordering::Relaxed) {
+            let _ = execute!(io::stdout(), EnableMouseCapture);
+        }
+    } else if MOUSE_CAPTURED.swap(false, Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
+
+pub fn mouse_capture_enabled() -> bool {
+    MOUSE_CAPTURED.load(Ordering::Relaxed)
 }
 
 // ── theme ────────────────────────────────────────────────────────────────
@@ -40,8 +70,8 @@ const SUCCESS: Rgb = Rgb(0xa6, 0xe3, 0xa1);
 const WARNING: Rgb = Rgb(0xf9, 0xe2, 0xaf);
 const ERROR: Rgb = Rgb(0xf3, 0x8b, 0xa8);
 const INFO: Rgb = Rgb(0x89, 0xdc, 0xeb);
-const MODE_PLAN: Rgb = Rgb(0xa6, 0xe3, 0xa1);   // green — planning
-const MODE_BUILD: Rgb = Rgb(0x89, 0xdc, 0xeb);  // cyan — building
+const MODE_PLAN: Rgb = Rgb(0xa6, 0xe3, 0xa1); // green — planning
+const MODE_BUILD: Rgb = Rgb(0x89, 0xdc, 0xeb); // cyan — building
 const MODE_BSTORM: Rgb = Rgb(0xf9, 0xe2, 0xaf); // amber — thinking
 
 fn no_color() -> bool {
@@ -49,7 +79,10 @@ fn no_color() -> bool {
 }
 
 fn truecolor() -> bool {
-    matches!(std::env::var("COLORTERM").ok().as_deref(), Some("truecolor") | Some("24bit"))
+    matches!(
+        std::env::var("COLORTERM").ok().as_deref(),
+        Some("truecolor") | Some("24bit")
+    )
 }
 
 fn cube(c: u8) -> u32 {
@@ -58,7 +91,10 @@ fn cube(c: u8) -> u32 {
     let mut bd = u16::MAX;
     for (i, &l) in levels.iter().enumerate() {
         let d = (l as i16 - c as i16).unsigned_abs();
-        if d < bd { bd = d; best = i; }
+        if d < bd {
+            bd = d;
+            best = i;
+        }
     }
     best as u32
 }
@@ -73,31 +109,53 @@ fn sgr_fg(c: Rgb) -> String {
 }
 
 fn paint(c: Rgb, s: &str) -> String {
-    if no_color() { return s.to_string(); }
+    if no_color() {
+        return s.to_string();
+    }
     format!("\x1b[{}m{s}\x1b[0m", sgr_fg(c))
 }
 
 fn attr(code: &str, s: &str) -> String {
-    if no_color() { return s.to_string(); }
+    if no_color() {
+        return s.to_string();
+    }
     format!("\x1b[{code}m{s}\x1b[0m")
 }
 
-pub fn bold(s: &str) -> String { attr("1", s) }
-pub fn dim(s: &str) -> String { paint(MUTED, s) }
-pub fn red(s: &str) -> String { paint(ERROR, s) }
-pub fn green(s: &str) -> String { paint(SUCCESS, s) }
-pub fn yellow(s: &str) -> String { paint(WARNING, s) }
-pub fn blue(s: &str) -> String { paint(INFO, s) }
-pub fn cyan(s: &str) -> String { paint(INFO, s) }
-pub fn accent(s: &str) -> String { paint(ACCENT, s) }
-pub fn text(s: &str) -> String { paint(TEXT, s) }
+pub fn bold(s: &str) -> String {
+    attr("1", s)
+}
+pub fn dim(s: &str) -> String {
+    paint(MUTED, s)
+}
+pub fn red(s: &str) -> String {
+    paint(ERROR, s)
+}
+pub fn green(s: &str) -> String {
+    paint(SUCCESS, s)
+}
+pub fn yellow(s: &str) -> String {
+    paint(WARNING, s)
+}
+pub fn blue(s: &str) -> String {
+    paint(INFO, s)
+}
+pub fn cyan(s: &str) -> String {
+    paint(INFO, s)
+}
+pub fn accent(s: &str) -> String {
+    paint(ACCENT, s)
+}
+pub fn text(s: &str) -> String {
+    paint(TEXT, s)
+}
 
 // Mode-colored badge: PLAN (green), BUILD (cyan), BRAINSTORM (amber).
 pub fn mode_badge(mode: &str) -> String {
     let (label, color) = match mode {
-        "PLAN"       => ("PLAN", MODE_PLAN),
+        "PLAN" => ("PLAN", MODE_PLAN),
         "BRAINSTORM" => ("BRAINSTORM", MODE_BSTORM),
-        _            => ("BUILD", MODE_BUILD),
+        _ => ("BUILD", MODE_BUILD),
     };
     if no_color() {
         format!("[{label}]")
@@ -118,7 +176,8 @@ pub fn diff(old: &str, new: &str) -> String {
         head += 1;
     }
     let mut tail = 0;
-    while tail < o.len() - head.min(o.len()) && tail < n.len() - head.min(n.len())
+    while tail < o.len() - head.min(o.len())
+        && tail < n.len() - head.min(n.len())
         && o[o.len() - 1 - tail] == n[n.len() - 1 - tail]
     {
         tail += 1;
@@ -141,7 +200,10 @@ pub fn diff(old: &str, new: &str) -> String {
     }
     if out.len() > MAX {
         let shown = out[..MAX].join("\n");
-        return format!("{shown}\n{}", dim(&format!("  …(+{} more lines)", out.len() - MAX)));
+        return format!(
+            "{shown}\n{}",
+            dim(&format!("  …(+{} more lines)", out.len() - MAX))
+        );
     }
     out.join("\n")
 }
@@ -149,9 +211,17 @@ pub fn diff(old: &str, new: &str) -> String {
 pub fn added_preview(content: &str) -> String {
     const MAX: usize = 40;
     let lines: Vec<&str> = content.lines().collect();
-    let shown: Vec<String> = lines.iter().take(MAX).map(|l| paint(SUCCESS, &format!("+ {l}"))).collect();
+    let shown: Vec<String> = lines
+        .iter()
+        .take(MAX)
+        .map(|l| paint(SUCCESS, &format!("+ {l}")))
+        .collect();
     if lines.len() > MAX {
-        format!("{}\n{}", shown.join("\n"), dim(&format!("  …(+{} more lines)", lines.len() - MAX)))
+        format!(
+            "{}\n{}",
+            shown.join("\n"),
+            dim(&format!("  …(+{} more lines)", lines.len() - MAX))
+        )
     } else {
         shown.join("\n")
     }
@@ -178,13 +248,19 @@ pub struct StreamRenderer {
 }
 
 impl Default for StreamRenderer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StreamRenderer {
     pub fn new() -> Self {
-        let w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).min(80);
-        StreamRenderer { pending: String::new(), state: StreamState::Normal, w }
+        let w = term_size().0 as usize;
+        StreamRenderer {
+            pending: String::new(),
+            state: StreamState::Normal,
+            w,
+        }
     }
 
     pub fn push(&mut self, chunk: &str) {
@@ -225,16 +301,14 @@ impl StreamRenderer {
                     let lang = rest.trim().to_string();
                     let header = self.box_header(&lang);
                     line(&header);
-                    self.state = StreamState::InCode { lang, lines: Vec::new() };
+                    self.state = StreamState::InCode {
+                        lang,
+                        lines: Vec::new(),
+                    };
                 } else {
                     // Regular text: preserve blank lines; no extra prefix (matches
                     // the existing non-code streaming style).
-                    if is_raw() {
-                        print!("{}\r\n", text);
-                        let _ = io::stdout().flush();
-                    } else {
-                        println!("{text}");
-                    }
+                    line(text);
                     self.state = StreamState::Normal;
                 }
             }
@@ -298,8 +372,16 @@ fn b64_encode(data: &[u8]) -> String {
         let b2 = if ch.len() > 2 { ch[2] as usize } else { 0 };
         out.push(A[b0 >> 2] as char);
         out.push(A[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if ch.len() > 1 { A[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if ch.len() > 2 { A[b2 & 0x3f] as char } else { '=' });
+        out.push(if ch.len() > 1 {
+            A[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if ch.len() > 2 {
+            A[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -315,62 +397,135 @@ struct TypeAheadState {
 
 fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
     static TA: std::sync::OnceLock<std::sync::Mutex<TypeAheadState>> = std::sync::OnceLock::new();
-    TA.get_or_init(|| std::sync::Mutex::new(TypeAheadState { buf: Vec::new(), cursor: 0 }))
+    TA.get_or_init(|| {
+        std::sync::Mutex::new(TypeAheadState {
+            buf: Vec::new(),
+            cursor: 0,
+        })
+    })
 }
 
 /// Non-blocking drain of pending key events during agent processing.
 /// Buffers printable input; Ctrl+C clears the buffer and signals an interrupt.
 pub fn poll_typeahead() {
-    if !is_raw() { return; }
+    if !is_raw() {
+        return;
+    }
     let mut any = false;
     while poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(k)) = read() {
-            if k.kind != KeyEventKind::Press { continue; }
-            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            let mut ta = match typeahead().lock() {
-                Ok(g) => g,
-                Err(_) => continue,
-            };
-            match k.code {
-                KeyCode::Char('c') if ctrl => {
-                    TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
-                    ta.buf.clear();
-                    ta.cursor = 0;
+        match read() {
+            Ok(Event::Key(k)) => {
+                if k.kind != KeyEventKind::Press {
+                    continue;
                 }
-                KeyCode::Char('u') if ctrl => {
-                    let d = ta.cursor;
-                    ta.buf.drain(..d);
-                    ta.cursor = 0;
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = k.modifiers.contains(KeyModifiers::ALT);
+                match k.code {
+                    KeyCode::PageUp => {
+                        scroll_page_up();
+                        continue;
+                    }
+                    KeyCode::PageDown => {
+                        scroll_page_down();
+                        continue;
+                    }
+                    KeyCode::Up if alt => {
+                        scroll_output(1);
+                        continue;
+                    }
+                    KeyCode::Down if alt => {
+                        scroll_output(-1);
+                        continue;
+                    }
+                    KeyCode::Home if alt => {
+                        scroll_output(isize::MAX / 4);
+                        continue;
+                    }
+                    KeyCode::End if alt => {
+                        scroll_to_bottom();
+                        clear_composer();
+                        render_footer();
+                        continue;
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => { ta.buf.clear(); ta.cursor = 0; }
-                KeyCode::Backspace if !ctrl => {
-                    if ta.cursor > 0 { let i = ta.cursor - 1; ta.buf.remove(i); ta.cursor = i; }
+                let mut ta = match typeahead().lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                match k.code {
+                    KeyCode::Char('c') if ctrl => {
+                        TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
+                        ta.buf.clear();
+                        ta.cursor = 0;
+                    }
+                    KeyCode::Char('u') if ctrl => {
+                        let d = ta.cursor;
+                        ta.buf.drain(..d);
+                        ta.cursor = 0;
+                    }
+                    KeyCode::Esc => {
+                        ta.buf.clear();
+                        ta.cursor = 0;
+                    }
+                    KeyCode::Backspace if !ctrl => {
+                        if ta.cursor > 0 {
+                            let i = ta.cursor - 1;
+                            ta.buf.remove(i);
+                            ta.cursor = i;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        let i = ta.cursor;
+                        if i < ta.buf.len() {
+                            ta.buf.remove(i);
+                        }
+                    }
+                    KeyCode::Left => {
+                        ta.cursor = ta.cursor.saturating_sub(1);
+                    }
+                    KeyCode::Right => {
+                        let i = ta.cursor;
+                        if i < ta.buf.len() {
+                            ta.cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        let i = ta.cursor;
+                        ta.buf.insert(i, c);
+                        ta.cursor += 1;
+                    }
+                    _ => {}
                 }
-                KeyCode::Delete => {
-                    let i = ta.cursor;
-                    if i < ta.buf.len() { ta.buf.remove(i); }
-                }
-                KeyCode::Left => { ta.cursor = ta.cursor.saturating_sub(1); }
-                KeyCode::Right => {
-                    let i = ta.cursor;
-                    if i < ta.buf.len() { ta.cursor += 1; }
-                }
-                KeyCode::Char(c) if !ctrl => { let i = ta.cursor; ta.buf.insert(i, c); ta.cursor += 1; }
-                _ => {}
+                any = true;
             }
-            any = true;
+            Ok(Event::Mouse(m)) => match m.kind {
+                MouseEventKind::ScrollUp => scroll_output(3),
+                MouseEventKind::ScrollDown => scroll_output(-3),
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
     // Show queued input in the persistent composer, not in scrollback.
     if any {
+        let mut out = io::stdout();
+        let _ = execute!(out, SavePosition);
         if let Ok(ta) = typeahead().lock() {
             if !ta.buf.is_empty() {
                 let mut scroll = 0usize;
-                render_composer(&format!("{} {} ", dim("queued"), accent("›")), &ta.buf, ta.cursor, &mut scroll);
+                render_composer(
+                    &format!("{} {} ", dim("queued"), accent("›")),
+                    &ta.buf,
+                    ta.cursor,
+                    &mut scroll,
+                );
             } else {
                 clear_composer();
             }
         }
+        let _ = execute!(out, RestorePosition);
     }
 }
 
@@ -386,10 +541,24 @@ fn take_typeahead() -> (Vec<char>, usize) {
 }
 
 fn term_size() -> (u16, u16) {
-    crossterm::terminal::size().unwrap_or((80, 24))
+    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+    (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
+}
+
+fn reserved_rows() -> u16 {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        2
+    } else {
+        1
+    }
 }
 
 fn composer_row() -> u16 {
+    let (_, h) = term_size();
+    h.saturating_sub(reserved_rows()).min(h.saturating_sub(1))
+}
+
+fn footer_row() -> u16 {
     term_size().1.saturating_sub(1)
 }
 
@@ -419,7 +588,7 @@ fn set_output_region() {
         return;
     }
     let (_, h) = term_size();
-    let bottom = h.saturating_sub(1).max(1);
+    let bottom = h.saturating_sub(reserved_rows()).max(1);
     print!("\x1b[1;{bottom}r\x1b[1;1H");
     flush();
 }
@@ -436,8 +605,114 @@ fn clear_composer() {
         return;
     }
     let mut out = io::stdout();
-    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = queue!(
+        out,
+        MoveTo(0, composer_row()),
+        Clear(ClearType::CurrentLine)
+    );
     let _ = out.flush();
+}
+
+fn render_footer() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(footer) = footer_text().lock() else {
+        return;
+    };
+    let (width, _) = term_size();
+    let mut out = io::stdout();
+    let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
+    if !footer.is_empty() {
+        let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
+        let text = if offset > 0 {
+            format!(
+                "{} {}",
+                footer.as_str(),
+                dim(&format!("· scroll +{offset}"))
+            )
+        } else {
+            footer.to_string()
+        };
+        let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
+    }
+    let _ = out.flush();
+}
+
+pub fn set_permission_mode(mode: &str) {
+    if let Ok(mut footer) = footer_text().lock() {
+        *footer = format!(
+            "{} {} {}",
+            dim("permission:"),
+            bold(mode),
+            dim("· /permissions ask|auto|readonly · wheel/PgUp scroll · /mouse off")
+        );
+    }
+    let mut out = io::stdout();
+    let _ = execute!(out, SavePosition);
+    render_footer();
+    let _ = execute!(out, RestorePosition);
+}
+
+fn render_output() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let (width, height) = term_size();
+    let width = width as usize;
+    let rows = height.saturating_sub(reserved_rows()) as usize;
+    let Ok(lines) = transcript().lock() else {
+        return;
+    };
+    let mut visible_lines = Vec::new();
+    for line in lines.iter() {
+        visible_lines.extend(wrap_ansi_line(line, width));
+    }
+    let max_offset = visible_lines.len().saturating_sub(rows);
+    let offset = SCROLL_OFFSET.load(Ordering::Relaxed).min(max_offset);
+    if offset != SCROLL_OFFSET.load(Ordering::Relaxed) {
+        SCROLL_OFFSET.store(offset, Ordering::Relaxed);
+    }
+    let start = visible_lines.len().saturating_sub(rows + offset);
+    let mut out = io::stdout();
+    for row in 0..rows {
+        let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
+        if let Some(line) = visible_lines.get(start + row) {
+            let _ = write!(out, "{line}");
+        }
+    }
+    let _ = out.flush();
+}
+
+fn scroll_output(delta: isize) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let current = SCROLL_OFFSET.load(Ordering::Relaxed);
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize)
+    };
+    SCROLL_OFFSET.store(next, Ordering::Relaxed);
+    render_output();
+    clear_composer();
+    render_footer();
+}
+
+fn scroll_page_up() {
+    let rows = term_size().1.saturating_sub(reserved_rows()).max(1) as usize;
+    scroll_output(rows.saturating_sub(1).max(1) as isize);
+}
+
+fn scroll_page_down() {
+    let rows = term_size().1.saturating_sub(reserved_rows()).max(1) as usize;
+    scroll_output(-((rows.saturating_sub(1).max(1)) as isize));
+}
+
+fn scroll_to_bottom() {
+    SCROLL_OFFSET.store(0, Ordering::Relaxed);
+    render_output();
 }
 
 fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize) {
@@ -452,14 +727,23 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     let end = (s + avail).min(buf.len());
     let shown: String = buf[s..end].iter().collect();
     let mut out = io::stdout();
-    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = queue!(
+        out,
+        MoveTo(0, composer_row()),
+        Clear(ClearType::CurrentLine)
+    );
     let _ = write!(out, "{prompt}{shown}");
-    let _ = queue!(out, MoveTo(pwidth.saturating_add(col as u16), composer_row()));
+    render_footer();
+    let _ = queue!(
+        out,
+        MoveTo(pwidth.saturating_add(col as u16), composer_row())
+    );
     let _ = out.flush();
 }
 
 fn echo_submitted(prompt: &str, text: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
+        SCROLL_OFFSET.store(0, Ordering::Relaxed);
         clear_composer();
         line(&format!("{prompt}{text}"));
     } else {
@@ -484,52 +768,82 @@ fn wordmark() -> String {
     ];
     let word = "buildwithnexus";
     let n = word.len();
-    word.chars().enumerate().map(|(i, c)| {
-        let t = i as f32 / (n - 1) as f32;
-        let seg = (t * (stops.len() - 1) as f32) as usize;
-        let seg = seg.min(stops.len() - 2);
-        let local = t * (stops.len() - 1) as f32 - seg as f32;
-        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local) as u8;
-        let (r, g, b) = (lerp(stops[seg].0, stops[seg + 1].0),
-                         lerp(stops[seg].1, stops[seg + 1].1),
-                         lerp(stops[seg].2, stops[seg + 1].2));
-        paint(Rgb(r, g, b), &c.to_string())
-    }).collect::<Vec<_>>().join("")
+    word.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let t = i as f32 / (n - 1) as f32;
+            let seg = (t * (stops.len() - 1) as f32) as usize;
+            let seg = seg.min(stops.len() - 2);
+            let local = t * (stops.len() - 1) as f32 - seg as f32;
+            let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local) as u8;
+            let (r, g, b) = (
+                lerp(stops[seg].0, stops[seg + 1].0),
+                lerp(stops[seg].1, stops[seg + 1].1),
+                lerp(stops[seg].2, stops[seg + 1].2),
+            );
+            paint(Rgb(r, g, b), &c.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 // Print a rich full-screen-style header that establishes visual context without
 // taking over the alternate screen buffer (native scroll still works).
 // The UI chrome (mode badge, wordmark, keys) is identical regardless of model.
 pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
-    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80) as usize;
-    let w = width.min(80);
+    let w = term_size().0 as usize;
     let bar = "─".repeat(w);
 
     line(&accent(&bar));
     // Wordmark row — gradient "buildwithnexus" + domain
-    line(&format!("  {}  {}  {}",
-        bold(&wordmark()),
-        dim("·"),
-        paint(Rgb(0xcb, 0xa6, 0xf7), "buildwithnexus.dev"),  // lavender
+    line(&clip_ansi_line(
+        &format!(
+            "  {}  {}  {}",
+            bold(&wordmark()),
+            dim("·"),
+            paint(Rgb(0xcb, 0xa6, 0xf7), "buildwithnexus.dev"), // lavender
+        ),
+        w,
     ));
     // Context row — provider · model · cwd (truncated to fit)
-    let cwd_display: String = cwd.chars().rev().take(w.saturating_sub(30)).collect::<String>()
-        .chars().rev().collect();
-    let cwd_label = if cwd_display.len() < cwd.len() { format!("…{cwd_display}") } else { cwd.to_string() };
-    line(&dim(&format!("  {} · {} · {}", provider, model, cwd_label)));
+    let cwd_display: String = cwd
+        .chars()
+        .rev()
+        .take(w.saturating_sub(30))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let cwd_label = if cwd_display.len() < cwd.len() {
+        format!("…{cwd_display}")
+    } else {
+        cwd.to_string()
+    };
+    line(&clip_ansi_line(
+        &dim(&format!("  {} · {} · {}", provider, model, cwd_label)),
+        w,
+    ));
     // Mode row
-    line(&format!("  Mode: {}    {}  {}  {}",
-        mode_badge(mode),
-        dim("Shift+Tab to cycle"),
-        dim("·"),
-        dim("/help for commands"),
+    line(&clip_ansi_line(
+        &format!(
+            "  Mode: {}    {}  {}  {}",
+            mode_badge(mode),
+            dim("Shift+Tab to cycle"),
+            dim("·"),
+            dim("/help for commands"),
+        ),
+        w,
     ));
     line(&accent(&bar));
 }
 
 // Refresh the mode indicator line in-place after a mode change (no full clear).
 pub fn show_mode_change(mode: &str) {
-    line(&format!("  {} mode → {}", dim("switching"), mode_badge(mode)));
+    line(&format!(
+        "  {} mode → {}",
+        dim("switching"),
+        mode_badge(mode)
+    ));
 }
 
 // Live context-window meter — call after each API round-trip.
@@ -542,12 +856,22 @@ pub fn context_meter(used: usize, total: usize) {
     let bar_width = 20usize;
     let filled = (pct * bar_width / 100).min(bar_width);
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-    let colored = if pct >= 80 { red(&bar) } else if pct >= 60 { yellow(&bar) } else { green(&bar) };
+    let colored = if pct >= 80 {
+        red(&bar)
+    } else if pct >= 60 {
+        yellow(&bar)
+    } else {
+        green(&bar)
+    };
     line(&format!(
         "  {} [{}] {}",
         dim("ctx"),
         colored,
-        dim(&format!("{pct}%  ·  {}k / {}k tokens", used / 1_000, total / 1_000)),
+        dim(&format!(
+            "{pct}%  ·  {}k / {}k tokens",
+            used / 1_000,
+            total / 1_000
+        )),
     ));
 }
 
@@ -556,19 +880,38 @@ pub fn context_meter(used: usize, total: usize) {
 // scrolls in the region above it.
 pub fn enter_alt(raw: bool) {
     if raw {
+        SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        if let Ok(mut lines) = transcript().lock() {
+            lines.clear();
+        }
         let mut out = io::stdout();
-        let _ = execute!(out, EnterAlternateScreen, Clear(ClearType::All), MoveTo(0, 0));
+        // Some terminals preserve the user's current scrollback viewport when
+        // switching buffers. Force the normal screen to its bottom first, then
+        // aggressively clear/home the alternate screen after entering it.
+        let _ = write!(out, "\x1b[9999B");
+        let _ = execute!(out, EnterAlternateScreen);
+        let _ = write!(out, "\x1b[H\x1b[2J\x1b[3J");
+        let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
+        let _ = out.flush();
         ALT_SCREEN.store(true, Ordering::Relaxed);
         set_output_region();
+        let _ = execute!(io::stdout(), MoveTo(0, 0));
     }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
         let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
+        MOUSE_CAPTURED.store(true, Ordering::Relaxed);
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         reset_output_region();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        MOUSE_CAPTURED.store(false, Ordering::Relaxed);
         ALT_SCREEN.store(false, Ordering::Relaxed);
         let _ = disable_raw_mode();
         prev(info);
@@ -580,6 +923,7 @@ pub fn leave_alt() {
     reset_output_region();
     if RAW.swap(false, Ordering::Relaxed) {
         let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+        MOUSE_CAPTURED.store(false, Ordering::Relaxed);
         let _ = disable_raw_mode();
     }
     if ALT_SCREEN.swap(false, Ordering::Relaxed) {
@@ -589,17 +933,183 @@ pub fn leave_alt() {
 
 pub fn clear() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
+        SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        if let Ok(mut lines) = transcript().lock() {
+            lines.clear();
+        }
         let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
         set_output_region();
         clear_composer();
+        render_footer();
     } else {
         print!("\x1b[2J\x1b[H");
         flush();
     }
 }
 
+pub fn browse_items(title: &str, items: &[(String, String)]) {
+    if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
+        line(&accent(&format!("  {title}")));
+        for (name, detail) in items {
+            let first = detail.lines().next().unwrap_or("");
+            line(&format!("  {}  {}", bold(name), dim(first)));
+        }
+        return;
+    }
+
+    reset_output_region();
+    let mut selected = 0usize;
+    let mut detail = false;
+    loop {
+        draw_browser(title, items, selected, detail);
+        match read() {
+            Ok(Event::Key(k)) => {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => break,
+                    KeyCode::Up | KeyCode::Char('k') if !detail => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !detail => {
+                        if selected + 1 < items.len() {
+                            selected += 1;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Right if !detail => detail = true,
+                    KeyCode::Left | KeyCode::Backspace if detail => detail = false,
+                    _ => {}
+                }
+            }
+            Ok(Event::Resize(_, _)) => {}
+            _ => {}
+        }
+    }
+    let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
+    set_output_region();
+    render_output();
+    clear_composer();
+    render_footer();
+}
+
+fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail: bool) {
+    let (width, height) = term_size();
+    let mut out = io::stdout();
+    let _ = queue!(out, MoveTo(0, 0), Clear(ClearType::All));
+    let _ = writeln!(out, "{}", accent(&format!("  {title}")));
+    let _ = writeln!(
+        out,
+        "{}",
+        dim("  ↑↓/jk navigate · Enter inspect · ← back · Esc/q close")
+    );
+    let _ = writeln!(out);
+
+    let body_rows = height.saturating_sub(4) as usize;
+    if detail {
+        if let Some((name, text)) = items.get(selected) {
+            let _ = writeln!(out, "  {}", bold(name));
+            let max = body_rows.saturating_sub(1);
+            for line in text.lines().take(max) {
+                let clipped: String = line
+                    .chars()
+                    .take(width.saturating_sub(4) as usize)
+                    .collect();
+                let _ = writeln!(out, "  {clipped}");
+            }
+        }
+    } else {
+        let start = selected.saturating_sub(body_rows / 2);
+        for (idx, (name, detail)) in items.iter().enumerate().skip(start).take(body_rows) {
+            let marker = if idx == selected {
+                accent("›")
+            } else {
+                dim(" ")
+            };
+            let first = detail.lines().next().unwrap_or("");
+            let row = format!("{marker} {}  {}", bold(name), dim(first));
+            let clipped: String = row.chars().take(width.saturating_sub(1) as usize).collect();
+            let _ = writeln!(out, "{clipped}");
+        }
+    }
+    let _ = out.flush();
+}
+
+fn clip_ansi_line(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut visible = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for d in chars.by_ref() {
+                out.push(d);
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= max_cols {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out
+}
+
+fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 {
+        return vec![String::new()];
+    }
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut visible = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            current.push(c);
+            for d in chars.by_ref() {
+                current.push(d);
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= max_cols {
+            out.push(std::mem::take(&mut current));
+            visible = 0;
+        }
+        current.push(c);
+        visible += 1;
+    }
+    out.push(current);
+    out
+}
+
 pub fn line(s: &str) {
-    if is_raw() {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        if let Ok(mut lines) = transcript().lock() {
+            for part in s.replace('\r', "").split('\n') {
+                lines.push(part.to_string());
+            }
+            const MAX_LINES: usize = 2_000;
+            if lines.len() > MAX_LINES {
+                let extra = lines.len() - MAX_LINES;
+                lines.drain(0..extra);
+            }
+        }
+        render_output();
+        clear_composer();
+    } else if is_raw() {
         print!("{}\r\n", s.replace('\n', "\r\n"));
         flush();
     } else {
@@ -608,7 +1118,30 @@ pub fn line(s: &str) {
 }
 
 pub fn write_stream(chunk: &str) {
-    if is_raw() && chunk.contains('\n') {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        if let Ok(mut lines) = transcript().lock() {
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            let normalized = chunk.replace('\r', "");
+            let mut parts = normalized.split('\n');
+            if let Some(first) = parts.next() {
+                if let Some(last) = lines.last_mut() {
+                    last.push_str(first);
+                }
+            }
+            for part in parts {
+                lines.push(part.to_string());
+            }
+            const MAX_LINES: usize = 2_000;
+            if lines.len() > MAX_LINES {
+                let extra = lines.len() - MAX_LINES;
+                lines.drain(0..extra);
+            }
+        }
+        render_output();
+        clear_composer();
+    } else if is_raw() && chunk.contains('\n') {
         print!("{}", chunk.replace('\n', "\r\n"));
     } else {
         print!("{chunk}");
@@ -763,26 +1296,40 @@ fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: 
     let end = (s + avail).min(buf.len());
     let shown: String = buf[s..end].iter().collect();
     let mut out = io::stdout();
-    let _ = queue!(out, MoveTo(start.0, start.1), Clear(ClearType::UntilNewLine));
+    let _ = queue!(
+        out,
+        MoveTo(start.0, start.1),
+        Clear(ClearType::UntilNewLine)
+    );
     let _ = write!(out, "{shown}");
     let _ = queue!(out, MoveTo(start.0.saturating_add(col as u16), start.1));
     let _ = out.flush();
 }
 
 fn prev_word(buf: &[char], mut i: usize) -> usize {
-    while i > 0 && buf[i - 1].is_whitespace() { i -= 1; }
-    while i > 0 && !buf[i - 1].is_whitespace() { i -= 1; }
+    while i > 0 && buf[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !buf[i - 1].is_whitespace() {
+        i -= 1;
+    }
     i
 }
 fn next_word(buf: &[char], mut i: usize) -> usize {
     let n = buf.len();
-    while i < n && buf[i].is_whitespace() { i += 1; }
-    while i < n && !buf[i].is_whitespace() { i += 1; }
+    while i < n && buf[i].is_whitespace() {
+        i += 1;
+    }
+    while i < n && !buf[i].is_whitespace() {
+        i += 1;
+    }
     i
 }
 
 fn edit_in_editor(current: &str) -> Option<String> {
-    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".to_string());
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
     let path = std::env::temp_dir().join(format!("bwn-prompt-{}.txt", std::process::id()));
     std::fs::write(&path, current).ok()?;
     let was_raw = is_raw();
@@ -792,7 +1339,10 @@ fn edit_in_editor(current: &str) -> Option<String> {
     }
     let mut parts = editor.split_whitespace();
     let cmd = parts.next().unwrap_or("vi");
-    let _ = std::process::Command::new(cmd).args(parts).arg(&path).status();
+    let _ = std::process::Command::new(cmd)
+        .args(parts)
+        .arg(&path)
+        .status();
     if was_raw {
         let _ = enable_raw_mode();
         let _ = execute!(io::stdout(), EnableBracketedPaste);
@@ -805,21 +1355,60 @@ fn edit_in_editor(current: &str) -> Option<String> {
 // ── Tab completion ───────────────────────────────────────────────────────────
 // Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
 const SLASH_COMMANDS_BASE: &[&str] = &[
-    "/help", "/clear", "/new", "/resume", "/init",
-    "/plan", "/build", "/brainstorm", "/doctor", "/debug",
-    "/mode", "/model", "/permissions", "/compact",
-    "/review", "/commit", "/pr", "/diff", "/context",
-    "/schedule", "/loop", "/workflows", "/tasks", "/btw",
-    "/config", "/memory", "/skills", "/agents", "/checkpoints", "/undo", "/rewind", "/exit", "/quit",
+    "/help",
+    "/clear",
+    "/new",
+    "/resume",
+    "/init",
+    "/plan",
+    "/build",
+    "/brainstorm",
+    "/doctor",
+    "/debug",
+    "/mode",
+    "/model",
+    "/permissions",
+    "/mouse",
+    "/compact",
+    "/review",
+    "/commit",
+    "/pr",
+    "/diff",
+    "/context",
+    "/schedule",
+    "/loop",
+    "/workflows",
+    "/tasks",
+    "/btw",
+    "/config",
+    "/memory",
+    "/skills",
+    "/tools",
+    "/trace",
+    "/agents",
+    "/checkpoints",
+    "/undo",
+    "/rewind",
+    "/exit",
+    "/quit",
 ];
 
 fn load_slash_commands() -> Vec<String> {
     let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
+    for (name, _) in crate::config::bundled_skills() {
+        let cmd = format!("/{name}");
+        if !cmds.contains(&cmd) {
+            cmds.push(cmd);
+        }
+    }
     // Merge user-defined commands from ~/.buildwithnexus/commands/
     if let Ok(rd) = std::fs::read_dir(crate::config::home().join("commands")) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let stem = name.trim_end_matches(".md").trim_end_matches(".sh").trim_end_matches(".py");
+            let stem = name
+                .trim_end_matches(".md")
+                .trim_end_matches(".sh")
+                .trim_end_matches(".py");
             let cmd = format!("/{stem}");
             if !cmds.contains(&cmd) {
                 cmds.push(cmd);
@@ -845,7 +1434,11 @@ fn common_prefix(items: &[String]) -> String {
     };
     for s in iter {
         let sc: Vec<char> = s.chars().collect();
-        let n = prefix.iter().zip(sc.iter()).take_while(|(a, b)| a == b).count();
+        let n = prefix
+            .iter()
+            .zip(sc.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         prefix.truncate(n);
     }
     prefix.into_iter().collect()
@@ -877,7 +1470,11 @@ fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
     if query.is_empty() {
         return None;
     }
-    hist.iter().rev().filter(|e| e.contains(query)).nth(skip).cloned()
+    hist.iter()
+        .rev()
+        .filter(|e| e.contains(query))
+        .nth(skip)
+        .cloned()
 }
 
 fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
@@ -903,11 +1500,21 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
                 .map(|s| s.to_string())
                 .collect();
         }
+        "/mouse" => {
+            return ["on", "off", "status"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
         _ => {}
     }
     if let Some(partial) = token.strip_prefix('@') {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        return path_candidates(partial, &cwd).into_iter().map(|p| format!("@{p}")).collect();
+        return path_candidates(partial, &cwd)
+            .into_iter()
+            .map(|p| format!("@{p}"))
+            .collect();
     }
     Vec::new()
 }
@@ -963,6 +1570,19 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 continue;
             }
             Ok(Event::Mouse(m)) => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        scroll_output(3);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        scroll_output(-3);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
+                    _ => {}
+                }
                 // Left-click on the input row moves the cursor to the clicked column.
                 if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == start.1 {
                     let col = m.column as usize;
@@ -974,12 +1594,49 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 continue;
             }
+            Ok(Event::Resize(_, _)) => {
+                if ALT_SCREEN.load(Ordering::Relaxed) {
+                    set_output_region();
+                    render_output();
+                    clear_composer();
+                    start = (prompt_width(prompt), composer_row());
+                    scroll = 0;
+                }
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+                continue;
+            }
             Ok(_) => continue,
             Err(_) => return None,
         };
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
         match ev.code {
+            KeyCode::PageUp => {
+                scroll_page_up();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::PageDown => {
+                scroll_page_down();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Up if alt => {
+                scroll_output(1);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Down if alt => {
+                scroll_output(-1);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Home if alt => {
+                scroll_output(isize::MAX / 4);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::End if alt => {
+                scroll_to_bottom();
+                clear_composer();
+                render_footer();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             // Shift+Tab → cycle mode (clear the line and signal the REPL).
             KeyCode::BackTab => {
                 buf.clear();
@@ -1010,8 +1667,14 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     return None;
                 }
             }
-            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('a') if ctrl => {
+                cursor = 0;
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Char('e') if ctrl => {
+                cursor = buf.len();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             KeyCode::Char('u') if ctrl => {
                 kill = buf[..cursor].iter().collect();
                 buf.drain(..cursor);
@@ -1031,7 +1694,10 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('y') if ctrl => {
-                for c in kill.clone().chars() { buf.insert(cursor, c); cursor += 1; }
+                for c in kill.clone().chars() {
+                    buf.insert(cursor, c);
+                    cursor += 1;
+                }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('l') if ctrl => reline!(),
@@ -1055,22 +1721,43 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     {
                         let mut out = io::stdout();
                         let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
-                        let _ = write!(out, "{}{}",
+                        let _ = write!(
+                            out,
+                            "{}{}",
                             dim(&format!("(reverse-i-search)`{query}`: ")),
-                            m.clone().unwrap_or_default());
+                            m.clone().unwrap_or_default()
+                        );
                         let _ = out.flush();
                     }
                     let ev = match read() {
                         Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
                         Ok(_) => continue,
-                        Err(_) => { buf = snapshot.0; cursor = snapshot.1; break; }
+                        Err(_) => {
+                            buf = snapshot.0;
+                            cursor = snapshot.1;
+                            break;
+                        }
                     };
                     let c = ev.modifiers.contains(KeyModifiers::CONTROL);
                     match ev.code {
-                        KeyCode::Char('r') if c => { if m.is_some() { skip += 1; } }
-                        KeyCode::Char('c') | KeyCode::Char('g') if c => { buf = snapshot.0; cursor = snapshot.1; break; }
-                        KeyCode::Char(ch) if !c => { query.push(ch); skip = 0; }
-                        KeyCode::Backspace => { query.pop(); skip = 0; }
+                        KeyCode::Char('r') if c => {
+                            if m.is_some() {
+                                skip += 1;
+                            }
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('g') if c => {
+                            buf = snapshot.0;
+                            cursor = snapshot.1;
+                            break;
+                        }
+                        KeyCode::Char(ch) if !c => {
+                            query.push(ch);
+                            skip = 0;
+                        }
+                        KeyCode::Backspace => {
+                            query.pop();
+                            skip = 0;
+                        }
                         KeyCode::Enter => {
                             if let Some(e) = m {
                                 print!("\r\n");
@@ -1083,8 +1770,14 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         }
                         KeyCode::Esc | KeyCode::Tab => {
                             match m {
-                                Some(e) => { buf = e.chars().collect(); cursor = buf.len(); }
-                                None => { buf = snapshot.0; cursor = snapshot.1; }
+                                Some(e) => {
+                                    buf = e.chars().collect();
+                                    cursor = buf.len();
+                                }
+                                None => {
+                                    buf = snapshot.0;
+                                    cursor = snapshot.1;
+                                }
                             }
                             break;
                         }
@@ -1093,19 +1786,58 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 reline!();
             }
-            KeyCode::Char('b') if alt => { cursor = prev_word(&buf, cursor); redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('f') if alt => { cursor = next_word(&buf, cursor); redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::Char(c) if !ctrl && !alt => { buf.insert(cursor, c); cursor += 1; redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(prompt, start, &buf, cursor, &mut scroll); } }
-            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(prompt, start, &buf, cursor, &mut scroll); } }
-            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(prompt, start, &buf, cursor, &mut scroll); } }
-            KeyCode::Home => { cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
-            KeyCode::End => { cursor = buf.len(); redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('b') if alt => {
+                cursor = prev_word(&buf, cursor);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Char('f') if alt => {
+                cursor = next_word(&buf, cursor);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                buf.insert(cursor, c);
+                cursor += 1;
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Backspace => {
+                if cursor > 0 {
+                    buf.remove(cursor - 1);
+                    cursor -= 1;
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                }
+            }
+            KeyCode::Delete => {
+                if cursor < buf.len() {
+                    buf.remove(cursor);
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                }
+            }
+            KeyCode::Left => {
+                cursor = cursor.saturating_sub(1);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Right => {
+                if cursor < buf.len() {
+                    cursor += 1;
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                }
+            }
+            KeyCode::Home => {
+                cursor = 0;
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::End => {
+                cursor = buf.len();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             KeyCode::Up => {
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
-                        let idx = match hist_idx { None => h.len() - 1, Some(0) => 0, Some(i) => i - 1 };
+                        let idx = match hist_idx {
+                            None => h.len() - 1,
+                            Some(0) => 0,
+                            Some(i) => i - 1,
+                        };
                         hist_idx = Some(idx);
                         buf = h[idx].chars().collect();
                         cursor = buf.len();
@@ -1116,8 +1848,16 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
             KeyCode::Down => {
                 if let Ok(h) = history().lock() {
                     match hist_idx {
-                        Some(i) if i + 1 < h.len() => { hist_idx = Some(i + 1); buf = h[i + 1].chars().collect(); cursor = buf.len(); }
-                        _ => { hist_idx = None; buf.clear(); cursor = 0; }
+                        Some(i) if i + 1 < h.len() => {
+                            hist_idx = Some(i + 1);
+                            buf = h[i + 1].chars().collect();
+                            cursor = buf.len();
+                        }
+                        _ => {
+                            hist_idx = None;
+                            buf.clear();
+                            cursor = 0;
+                        }
                     }
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
@@ -1165,7 +1905,11 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     }
                 }
             }
-            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Esc => {
+                buf.clear();
+                cursor = 0;
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             _ => {}
         }
     }
@@ -1185,8 +1929,30 @@ pub fn spinner_start(label: &str) -> Spinner {
         let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let mut i = 0usize;
         while r2.load(Ordering::Relaxed) {
-            print!("\r{} {}", accent(&frames[i % frames.len()].to_string()), dim(&label));
-            flush();
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                let mut out = io::stdout();
+                let _ = execute!(out, SavePosition);
+                let _ = queue!(
+                    out,
+                    MoveTo(0, composer_row()),
+                    Clear(ClearType::CurrentLine)
+                );
+                let _ = write!(
+                    out,
+                    "{} {}",
+                    accent(&frames[i % frames.len()].to_string()),
+                    dim(&label)
+                );
+                let _ = execute!(out, RestorePosition);
+                let _ = out.flush();
+            } else {
+                print!(
+                    "\r{} {}",
+                    accent(&frames[i % frames.len()].to_string()),
+                    dim(&label)
+                );
+                flush();
+            }
             i += 1;
             for _ in 0..8 {
                 if !r2.load(Ordering::Relaxed) {
@@ -1196,7 +1962,10 @@ pub fn spinner_start(label: &str) -> Spinner {
             }
         }
     });
-    Spinner { running, handle: Some(handle) }
+    Spinner {
+        running,
+        handle: Some(handle),
+    }
 }
 
 pub fn spinner_stop(mut s: Spinner) {
@@ -1204,8 +1973,12 @@ pub fn spinner_stop(mut s: Spinner) {
     if let Some(h) = s.handle.take() {
         let _ = h.join();
     }
-    print!("\r\x1b[2K");
-    flush();
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        clear_composer();
+    } else {
+        print!("\r\x1b[2K");
+        flush();
+    }
 }
 
 pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
@@ -1225,7 +1998,9 @@ mod tests {
         while let Some(c) = chars.next() {
             if c == '\x1b' {
                 for d in chars.by_ref() {
-                    if d == 'm' { break; }
+                    if d == 'm' {
+                        break;
+                    }
                 }
             } else {
                 out.push(c);
@@ -1315,12 +2090,19 @@ mod tests {
 
     #[test]
     fn history_search_finds_newest_first() {
-        let h = vec!["git status".to_string(), "cargo test".to_string(), "git push".to_string()];
+        let h = vec![
+            "git status".to_string(),
+            "cargo test".to_string(),
+            "git push".to_string(),
+        ];
         assert_eq!(history_search(&h, "git", 0).as_deref(), Some("git push"));
         assert_eq!(history_search(&h, "git", 1).as_deref(), Some("git status"));
         assert_eq!(history_search(&h, "git", 2), None);
         assert_eq!(history_search(&h, "", 0), None);
-        assert_eq!(history_search(&h, "cargo", 0).as_deref(), Some("cargo test"));
+        assert_eq!(
+            history_search(&h, "cargo", 0).as_deref(),
+            Some("cargo test")
+        );
     }
 
     #[test]
@@ -1357,7 +2139,11 @@ mod tests {
         fs::write(d.join("beta.txt"), "").unwrap();
         assert_eq!(
             path_candidates("a", &d),
-            vec!["alpha.txt".to_string(), "apple.txt".to_string(), "assets/".to_string()]
+            vec![
+                "alpha.txt".to_string(),
+                "apple.txt".to_string(),
+                "assets/".to_string()
+            ]
         );
         let _ = fs::remove_dir_all(&d);
     }

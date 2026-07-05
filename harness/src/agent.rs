@@ -3,6 +3,7 @@
 // but ALL modes have access to the full tool surface so the model can grep,
 // fetch, read files, and run commands regardless of which mode the user is in.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,11 +14,13 @@ use crate::hooks::{self, PreDecision};
 use crate::provider::{self, complete, Msg, Provider, Reply, ToolResult};
 use crate::report;
 use crate::tools;
+use crate::trace;
 use crate::tui;
 
 const MAX_ITERS: usize = 30;
 const MAX_DEPTH: usize = 3;
 const KEEP_RECENT: usize = 6;
+const MAX_IDENTICAL_TOOL_RESULTS: usize = 2;
 
 // ── context compaction ────────────────────────────────────────────────────────
 fn estimate_tokens(msgs: &[Msg]) -> usize {
@@ -25,9 +28,15 @@ fn estimate_tokens(msgs: &[Msg]) -> usize {
     for m in msgs {
         chars += match m {
             Msg::System(s) | Msg::User(s) => s.len(),
-            Msg::UserImages { text, images } => text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>(),
+            Msg::UserImages { text, images } => {
+                text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>()
+            }
             Msg::Assistant { text, calls } => {
-                text.len() + calls.iter().map(|c| c.name.len() + c.input.to_string().len()).sum::<usize>()
+                text.len()
+                    + calls
+                        .iter()
+                        .map(|c| c.name.len() + c.input.to_string().len())
+                        .sum::<usize>()
             }
             Msg::Tool(rs) => rs.iter().map(|r| r.content.len()).sum(),
         };
@@ -36,7 +45,10 @@ fn estimate_tokens(msgs: &[Msg]) -> usize {
 }
 
 fn compaction_split(msgs: &[Msg]) -> (usize, usize) {
-    let sys_end = msgs.iter().take_while(|m| matches!(m, Msg::System(_))).count();
+    let sys_end = msgs
+        .iter()
+        .take_while(|m| matches!(m, Msg::System(_)))
+        .count();
     let tail_start = msgs.len().saturating_sub(KEEP_RECENT).max(sys_end);
     (sys_end, tail_start)
 }
@@ -61,8 +73,14 @@ fn render_msgs(msgs: &[Msg]) -> String {
     let mut s = String::new();
     for m in msgs {
         match m {
-            Msg::System(t) => { s.push_str("system: "); s.push_str(t); }
-            Msg::User(t) => { s.push_str("user: "); s.push_str(t); }
+            Msg::System(t) => {
+                s.push_str("system: ");
+                s.push_str(t);
+            }
+            Msg::User(t) => {
+                s.push_str("user: ");
+                s.push_str(t);
+            }
             Msg::UserImages { text, images } => {
                 s.push_str(&format!("user [+{} image(s)]: ", images.len()));
                 s.push_str(text);
@@ -97,7 +115,9 @@ fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec
     let tail: Vec<Msg> = it.collect();
     let summary = summarize(&middle);
     let mut v = system;
-    v.push(Msg::User(format!("[Summary of earlier conversation, compacted to save context]\n{summary}")));
+    v.push(Msg::User(format!(
+        "[Summary of earlier conversation, compacted to save context]\n{summary}"
+    )));
     v.extend(tail);
     v
 }
@@ -123,6 +143,75 @@ fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     report::notice("  ⟳ compacting context…");
     let taken = std::mem::take(msgs);
     *msgs = compact_with(taken, |middle| model_summary(p, middle));
+}
+
+#[derive(Default)]
+struct ToolLoopGuard {
+    seen: HashMap<String, ToolLoopRecord>,
+}
+
+struct ToolLoopRecord {
+    content: String,
+    is_error: bool,
+    count: usize,
+}
+
+impl ToolLoopGuard {
+    fn note(
+        &mut self,
+        name: &str,
+        input: &serde_json::Value,
+        content: &str,
+        is_error: bool,
+    ) -> Option<String> {
+        let key = format!(
+            "{name}:{}",
+            serde_json::to_string(input).unwrap_or_default()
+        );
+        let rec = self.seen.entry(key).or_insert_with(|| ToolLoopRecord {
+            content: String::new(),
+            is_error,
+            count: 0,
+        });
+        if rec.content == content && rec.is_error == is_error {
+            rec.count += 1;
+        } else {
+            rec.content = content.to_string();
+            rec.is_error = is_error;
+            rec.count = 1;
+        }
+        if rec.count >= MAX_IDENTICAL_TOOL_RESULTS {
+            Some(repeated_tool_summary(name, input, content, is_error))
+        } else {
+            None
+        }
+    }
+}
+
+fn repeated_tool_summary(
+    name: &str,
+    input: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+) -> String {
+    let preview = tools::preview(name, input);
+    let shown = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if is_error {
+        format!(
+            "I stopped a repeated tool loop. `{preview}` returned the same error more than once:\n{shown}"
+        )
+    } else if shown.is_empty() {
+        format!("I stopped a repeated tool loop. `{preview}` returned no output more than once.")
+    } else {
+        format!(
+            "I stopped a repeated tool loop. `{preview}` returned the same result more than once, so here is the result I found:\n{shown}"
+        )
+    }
 }
 
 // ── permissions ───────────────────────────────────────────────────────────────
@@ -174,26 +263,44 @@ fn context_prefix() -> String {
     // Always include the tool manifest so the model knows what's built-in
     // and doesn't try to install external tools to do things we already handle.
     parts.push(tool_manifest());
+    parts.push(discovery_policy());
+    parts.push(skill_manifest());
 
     // Probe which common system tools are actually present so the model can
     // pick the right one without guessing or installing alternatives.
     let env_snap = env_snapshot();
     if !env_snap.is_empty() {
-        parts.push(format!("[Environment — tools already installed]\n{env_snap}"));
+        parts.push(format!(
+            "[Environment — tools already installed]\n{env_snap}"
+        ));
     }
 
     if let Some(mem) = config::load_memory() {
         parts.push(format!("[Memory from previous sessions]\n{mem}"));
     }
     if let Some(agents) = config::load_agents() {
+        trace::record_visible(
+            "agents",
+            "loaded Agents.md",
+            serde_json::json!({"bytes": agents.len(), "preview": trace::preview(&agents, 600)}),
+        );
         parts.push(format!("[Agent knowledge — Agents.md]\n{agents}"));
     }
     let skills = config::load_skills();
     if !skills.is_empty() {
-        let joined = skills.iter()
-            .map(|(name, content)| format!("## Skill: {name}\n{content}"))
-            .collect::<Vec<_>>().join("\n\n");
-        parts.push(format!("[Available skills]\n{joined}"));
+        let joined = skills
+            .iter()
+            .map(|(name, content)| {
+                let first = content.lines().next().unwrap_or("").trim();
+                format!("• /{name} — {first}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        parts.push(format!(
+            "[Available skills]\n{joined}\n\n\
+Use list_skills and load_skill to inspect full skill instructions only when they are relevant. \
+Do not load skills for simple greetings or casual replies."
+        ));
     }
 
     format!("{}\n\n", parts.join("\n\n"))
@@ -202,15 +309,45 @@ fn context_prefix() -> String {
 fn tool_manifest() -> String {
     "[Built-in tools — always available, no install needed]\n\
 • read_file / list_dir   — read any file or directory on the filesystem; read_file supports start_line/end_line\n\
-• find_files / grep_files — search the codebase without shelling out; prefer these for navigation before run_command\n\
+• list_tree              — inspect a bounded directory tree before guessing paths\n\
+• find_paths             — search files and directories; use kind=`dir` for folders like \"folder named nexus\"\n\
+• find_files / grep_files — search the filesystem without shelling out; use broad globs like `*project*`, `*repo*`, `*README*`\n\
 • write_file / edit_file — create or surgically modify files\n\
 • run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
 • fetch_url              — HTTP GET (no curl/wget needed)\n\
 • web_search             — DuckDuckGo web search (no API key, live results)\n\
+• list_skills / load_skill — discover and load skill instructions on demand\n\
 • save_memory            — persist a note across sessions\n\
 • spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
 • finish                 — mark the task complete with a summary"
     .to_string()
+}
+
+fn discovery_policy() -> String {
+    "[Filesystem discovery policy]\n\
+When the user refers to a file, project, repo, document, or directory by description instead of an exact path, do not invent a placeholder path. \
+First inspect the current workspace with list_tree/find_paths/find_files/grep_files. \
+If a direct read_file fails with \"No such file\" or similar, recover by searching for likely names instead of asking immediately.\n\
+For folder/directory requests, use find_paths with kind=`dir`; do not use find_files. \
+For requests involving the user's personal files, projects, downloads, or home directory, search likely roots such as `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos` with find_paths/find_files/grep_files. \
+If a broader home search is needed, use or propose a read-only command such as `find \"$HOME\" -iname '*project*' -maxdepth 4` or `rg --files \"$HOME\" | rg -i 'projects|repos'`. \
+Only ask the user for a path after bounded discovery fails or when the search would be too broad or sensitive."
+        .to_string()
+}
+
+fn skill_manifest() -> String {
+    let names = config::bundled_skills()
+        .into_iter()
+        .map(|(name, _)| format!("/{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "[Skill invocation policy]\n\
+Skills are first-class operating instructions. Before substantial work, choose and follow the most relevant skill from the loaded skills. \
+If the user names a skill or uses a skill slash command, treat that skill as active context. \
+Bundled skills are callable by users as slash commands: {names}. \
+Use /trace to inspect evidence of skill loading, tool calls, hooks, and subagents."
+    )
 }
 
 fn env_snapshot() -> String {
@@ -218,23 +355,23 @@ fn env_snapshot() -> String {
     // We run everything in parallel-ish with short timeouts via sequential calls —
     // the total overhead is ~10ms on a modern machine.
     let probes: &[(&str, &str)] = &[
-        ("node",    "node --version"),
-        ("npm",     "npm --version"),
-        ("npx",     "npx --version"),
+        ("node", "node --version"),
+        ("npm", "npm --version"),
+        ("npx", "npx --version"),
         ("python3", "python3 --version"),
-        ("pip3",    "pip3 --version"),
-        ("cargo",   "cargo --version"),
-        ("rustc",   "rustc --version"),
-        ("git",     "git --version"),
-        ("docker",  "docker --version"),
-        ("jq",      "jq --version"),
-        ("rg",      "rg --version"),
-        ("gh",      "gh --version"),
-        ("bun",     "bun --version"),
-        ("deno",    "deno --version"),
-        ("go",      "go version"),
-        ("ruby",    "ruby --version"),
-        ("java",    "java --version"),
+        ("pip3", "pip3 --version"),
+        ("cargo", "cargo --version"),
+        ("rustc", "rustc --version"),
+        ("git", "git --version"),
+        ("docker", "docker --version"),
+        ("jq", "jq --version"),
+        ("rg", "rg --version"),
+        ("gh", "gh --version"),
+        ("bun", "bun --version"),
+        ("deno", "deno --version"),
+        ("go", "go version"),
+        ("ruby", "ruby --version"),
+        ("java", "java --version"),
     ];
 
     use std::process::Command;
@@ -243,13 +380,18 @@ fn env_snapshot() -> String {
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
         let bin = parts[0];
         let arg = parts.get(1).copied().unwrap_or("--version");
-        let ok = Command::new(bin).arg(arg)
+        let ok = Command::new(bin)
+            .arg(arg)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
             .map(|o| {
                 let txt = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                let txt = if txt.is_empty() { String::from_utf8_lossy(&o.stderr).trim().to_string() } else { txt };
+                let txt = if txt.is_empty() {
+                    String::from_utf8_lossy(&o.stderr).trim().to_string()
+                } else {
+                    txt
+                };
                 txt.lines().next().unwrap_or("").to_string()
             })
             .ok()
@@ -263,9 +405,16 @@ fn env_snapshot() -> String {
 
 fn confirm(label: &str) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
-        return Some(format!("blocked (no interactive terminal to confirm: {label})"));
+        return Some(format!(
+            "blocked (no interactive terminal to confirm: {label})"
+        ));
     }
-    let q = format!("  {} {}? {} ", tui::yellow("➤"), tui::bold(label), tui::dim("[y/N]"));
+    let q = format!(
+        "  {} {}? {} ",
+        tui::yellow("➤"),
+        tui::bold(label),
+        tui::dim("[y/N]")
+    );
     let ans = tui::ask(&q).unwrap_or_default();
     if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
         None
@@ -277,7 +426,12 @@ fn confirm(label: &str) -> Option<String> {
 // Permission gate — returns Some(reason) when blocked.
 // Read operations outside CWD are allowed in all modes (no CWD confinement for
 // reads); the user specifically asked for full filesystem access.
-pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+pub(crate) fn gate(
+    perm: Permission,
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+) -> Option<String> {
     let path = tools::touched_path(name, input, cwd);
 
     if let Some(p) = &path {
@@ -287,7 +441,10 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
         // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
         // crosses the OS boundary — always confirm, even in Auto mode.
         if tools::is_mutating(name) && tools::is_wsl_windows_mount(p) {
-            return confirm(&format!("write to Windows filesystem {} (WSL2 boundary)", p.display()));
+            return confirm(&format!(
+                "write to Windows filesystem {} (WSL2 boundary)",
+                p.display()
+            ));
         }
     }
     if name == "run_command" {
@@ -328,7 +485,9 @@ pub(crate) fn gate(perm: Permission, name: &str, input: &serde_json::Value, cwd:
                     let first = c.split_whitespace().next().unwrap_or("");
                     // Accept both bare names and full paths (/usr/bin/git → git).
                     let bin = std::path::Path::new(first)
-                        .file_name().and_then(|n| n.to_str()).unwrap_or(first);
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(first);
                     if config::load_allowed_commands().iter().any(|a| a == bin) {
                         return None;
                     }
@@ -350,23 +509,61 @@ pub fn compact_msgs(p: &Provider, msgs: Vec<Msg>) -> Vec<Msg> {
 }
 
 // ── BUILD mode ────────────────────────────────────────────────────────────────
-pub fn run_build(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path) -> Result<(), String> {
+pub fn run_build(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+) -> Result<(), String> {
     let mut transcript: Vec<Msg> = Vec::new();
-    run_build_session(p, perm, role_id, task, cwd, &mut transcript, &crate::session::new_id())
+    run_build_session(
+        p,
+        perm,
+        role_id,
+        task,
+        cwd,
+        &mut transcript,
+        &crate::session::new_id(),
+    )
 }
 
-pub fn run_build_resumed(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, mut seed: Vec<Msg>, sid: &str) -> Result<(), String> {
+pub fn run_build_resumed(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    mut seed: Vec<Msg>,
+    sid: &str,
+) -> Result<(), String> {
     run_build_session(p, perm, role_id, task, cwd, &mut seed, sid)
 }
 
-pub fn run_build_session(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, transcript: &mut Vec<Msg>, sid: &str) -> Result<(), String> {
+pub fn run_build_session(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    transcript: &mut Vec<Msg>,
+    sid: &str,
+) -> Result<(), String> {
     let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
 }
 
-fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &Path, depth: usize, msgs: &mut Vec<Msg>) -> Result<String, String> {
+fn build_inner(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    depth: usize,
+    msgs: &mut Vec<Msg>,
+) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
@@ -390,6 +587,7 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
 
     // Track which files have been read this session so we can enforce read-before-write.
     let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
+    let mut loop_guard = ToolLoopGuard::default();
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -406,28 +604,45 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             if step > 1 {
                 tui::line(&tui::dim(&format!("  ↻ step {step}")));
             }
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!(
+                    "  thinking: asking {} with {} available tools",
+                    p.model,
+                    defs.len()
+                )));
+            }
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
             let mut thinking_buf = String::new();
             let mut renderer = tui::StreamRenderer::new();
-            let res = provider::stream(p, msgs.as_slice(), &defs, &mut |c| {
-                if let Some(s) = spin.take() {
-                    tui::spinner_stop(s);
-                }
-                renderer.push(c);
-                streamed = true;
-            }, &mut |t| {
-                // Extended thinking: buffer and display as dim internal monologue.
-                thinking_buf.push_str(t);
-                // Flush complete sentences/lines so output feels live.
-                while let Some(nl) = thinking_buf.find('\n') {
-                    let line = thinking_buf[..nl].trim().to_string();
-                    if !line.is_empty() {
-                        tui::write_stream(&format!("\r  {} {}\r\n", tui::dim("◌"), tui::dim(&line)));
+            let res = provider::stream(
+                p,
+                msgs.as_slice(),
+                &defs,
+                &mut |c| {
+                    if let Some(s) = spin.take() {
+                        tui::spinner_stop(s);
                     }
-                    thinking_buf = thinking_buf[nl + 1..].to_string();
-                }
-            });
+                    renderer.push(c);
+                    streamed = true;
+                },
+                &mut |t| {
+                    // Extended thinking: buffer and display as dim internal monologue.
+                    thinking_buf.push_str(t);
+                    // Flush complete sentences/lines so output feels live.
+                    while let Some(nl) = thinking_buf.find('\n') {
+                        let line = thinking_buf[..nl].trim().to_string();
+                        if !line.is_empty() {
+                            tui::write_stream(&format!(
+                                "\r  {} {}\r\n",
+                                tui::dim("◌"),
+                                tui::dim(&line)
+                            ));
+                        }
+                        thinking_buf = thinking_buf[nl + 1..].to_string();
+                    }
+                },
+            );
             if let Some(s) = spin.take() {
                 tui::spinner_stop(s);
             }
@@ -442,6 +657,10 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             if reply.text.trim().is_empty() {
                 report::notice("model returned no output");
             }
+            msgs.push(Msg::Assistant {
+                text: reply.text.clone(),
+                calls: vec![],
+            });
             return Ok(reply.text);
         }
 
@@ -449,12 +668,24 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
         let mut summary: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                let msg = format!("tool arguments were not valid JSON: {}", raw.chars().take(200).collect::<String>());
+                let msg = format!(
+                    "tool arguments were not valid JSON: {}",
+                    raw.chars().take(200).collect::<String>()
+                );
                 report::tool_denied(&msg);
-                results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: msg,
+                    is_error: true,
+                });
                 continue;
             }
-            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+            report::tool_call(
+                &call.name,
+                &tools::preview(&call.name, &call.input),
+                &call.input,
+            );
+            trace_tool_call(&call.name, &call.input, "build", depth);
 
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
@@ -463,7 +694,16 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             };
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
-                results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
+                trace::record_visible(
+                    "tool_denied",
+                    format!("{} denied", call.name),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "build", "depth": depth}),
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: reason,
+                    is_error: true,
+                });
                 continue;
             }
 
@@ -493,7 +733,11 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                             p.display()
                         );
                         report::tool_denied(&msg);
-                        results.push(ToolResult { id: call.id.clone(), content: msg, is_error: true });
+                        results.push(ToolResult {
+                            id: call.id.clone(),
+                            content: msg,
+                            is_error: true,
+                        });
                         continue;
                     }
                 }
@@ -502,7 +746,12 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             if call.name == "spawn_subagent" {
                 let out = spawn_subagent(p, perm, &call.input, cwd, depth);
                 report::tool_result(&call.name, &out, false);
-                results.push(ToolResult { id: call.id.clone(), content: out, is_error: false });
+                trace_tool_result(&call.name, &out, false, "build", depth);
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: out,
+                    is_error: false,
+                });
                 continue;
             }
             // Memory-save tool: the model can call save_memory to persist facts.
@@ -511,7 +760,12 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
                     config::append_memory(note);
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
-                    results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                    trace_tool_result(&call.name, &msg, false, "build", depth);
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: msg,
+                        is_error: false,
+                    });
                     continue;
                 }
             }
@@ -519,14 +773,27 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             let out = tools::run(&call.name, &call.input, cwd);
             hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
+            trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
             if out.finished {
                 report::finish(&out.content);
                 summary = Some(out.content.clone());
+            } else if let Some(loop_msg) =
+                loop_guard.note(&call.name, &call.input, &out.content, out.is_error)
+            {
+                report::assistant(&loop_msg);
+                summary = Some(loop_msg);
             }
-            results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
+            results.push(ToolResult {
+                id: call.id.clone(),
+                content: out.content,
+                is_error: out.is_error,
+            });
         }
 
-        msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
+        msgs.push(Msg::Assistant {
+            text: reply.text,
+            calls: reply.calls,
+        });
         msgs.push(Msg::Tool(results));
         if !report::is_json() {
             tui::context_meter(estimate_tokens(msgs), p.context_tokens);
@@ -536,12 +803,20 @@ fn build_inner(p: &Provider, perm: Permission, role_id: &str, task: &str, cwd: &
             return Ok(s);
         }
     }
-    Err(format!("reached the {MAX_ITERS}-step limit without finishing"))
+    Err(format!(
+        "reached the {MAX_ITERS}-step limit without finishing"
+    ))
 }
 
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd: &Path, depth: usize) -> String {
+fn spawn_subagent(
+    p: &Provider,
+    perm: Permission,
+    input: &serde_json::Value,
+    cwd: &Path,
+    depth: usize,
+) -> String {
     if depth + 1 >= MAX_DEPTH {
         return "subagent depth limit reached".into();
     }
@@ -558,16 +833,42 @@ fn spawn_subagent(p: &Provider, perm: Permission, input: &serde_json::Value, cwd
                 let n = format!("[isolated worktree: {}]\n", wt.display());
                 (wt, n)
             }
-            None => (cwd.to_path_buf(), "[worktree unavailable — ran in place]\n".into()),
+            None => (
+                cwd.to_path_buf(),
+                "[worktree unavailable — ran in place]\n".into(),
+            ),
         }
     } else {
         (cwd.to_path_buf(), String::new())
     };
 
     report::notice(&format!("  ↳ subagent: {task}"));
+    trace::record_visible(
+        "subagent_spawn",
+        format!("{role}: {}", trace::preview(task, 80)),
+        serde_json::json!({
+            "task": task,
+            "role": role,
+            "isolate": isolate,
+            "cwd": run_cwd.to_string_lossy(),
+            "parent_depth": depth,
+        }),
+    );
     let mut child: Vec<Msg> = Vec::new();
     let result = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child)
         .unwrap_or_else(|e| format!("subagent error: {e}"));
+    trace::record_visible(
+        "subagent_done",
+        format!("{role}: {}", trace::preview(task, 80)),
+        serde_json::json!({
+            "task": task,
+            "role": role,
+            "isolate": isolate,
+            "cwd": run_cwd.to_string_lossy(),
+            "result": result,
+            "depth": depth + 1,
+        }),
+    );
     format!("{note}{result}")
 }
 
@@ -589,10 +890,12 @@ fn make_worktree(cwd: &Path) -> Option<PathBuf> {
 // codebase while breaking down the task. Execution still runs through BUILD.
 pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
     let prefix = context_prefix();
-    let sys = format!("{prefix}You are a planning engineer with full access to the codebase. \
+    let sys = format!(
+        "{prefix}You are a planning engineer with full access to the codebase. \
         Use read_file and list_dir and run_command to inspect the project as needed. \
         Break the user's task into a concise numbered list of concrete steps \
-        (one step per line, max 8 steps). Output the numbered list and nothing else.");
+        (one step per line, max 8 steps). Output the numbered list and nothing else."
+    );
 
     let defs = tools::defs(false); // planning uses tools but not subagents
     let mut msgs = vec![Msg::System(sys), Msg::User(task.into())];
@@ -609,14 +912,28 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         // Execute tool calls during the planning phase.
         let mut results = Vec::new();
         for call in &reply.calls {
-            report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+            report::tool_call(
+                &call.name,
+                &tools::preview(&call.name, &call.input),
+                &call.input,
+            );
+            trace_tool_call(&call.name, &call.input, "plan", 0);
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
                 PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
             };
             if let Some(reason) = reason {
-                results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
+                trace::record_visible(
+                    "tool_denied",
+                    format!("{} denied", call.name),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "plan", "depth": 0}),
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: reason,
+                    is_error: true,
+                });
                 continue;
             }
             if call.name == "save_memory" {
@@ -624,20 +941,37 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     config::append_memory(note);
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
-                    results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                    trace_tool_result(&call.name, &msg, false, "plan", 0);
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: msg,
+                        is_error: false,
+                    });
                     continue;
                 }
             }
             let out = tools::run(&call.name, &call.input, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
-            results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
+            trace_tool_result(&call.name, &out.content, out.is_error, "plan", 0);
+            results.push(ToolResult {
+                id: call.id.clone(),
+                content: out.content,
+                is_error: out.is_error,
+            });
         }
-        msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
+        msgs.push(Msg::Assistant {
+            text: reply.text,
+            calls: reply.calls,
+        });
         msgs.push(Msg::Tool(results));
     };
 
-    let mut steps: Vec<String> = plan_text.lines()
-        .map(|l| l.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | ' ')).trim())
+    let mut steps: Vec<String> = plan_text
+        .lines()
+        .map(|l| {
+            l.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | ' '))
+                .trim()
+        })
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
         .collect();
@@ -649,8 +983,13 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             tui::line(&format!("  {}. {}", i + 1, s));
         }
         tui::line("");
-        let ans = tui::ask(&format!("  {} execute, {} edit <n>, {} cancel: ",
-            tui::bold("[Enter]"), tui::bold("e"), tui::bold("c"))).unwrap_or_default();
+        let ans = tui::ask(&format!(
+            "  {} execute, {} edit <n>, {} cancel: ",
+            tui::bold("[Enter]"),
+            tui::bold("e"),
+            tui::bold("c")
+        ))
+        .unwrap_or_default();
         let a = ans.trim();
         if a.is_empty() || a == "y" {
             break;
@@ -672,7 +1011,12 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         }
     }
 
-    let plan = steps.iter().enumerate().map(|(i, s)| format!("{}. {}", i + 1, s)).collect::<Vec<_>>().join("\n");
+    let plan = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n");
     let full = format!("{task}\n\nFollow this approved plan:\n{plan}");
     run_build(p, perm, "engineer", &full, cwd)
 }
@@ -682,7 +1026,12 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
 // read files, fetch URLs, and run commands when the conversation calls for it.
 // It also has a mode-transition sensor: if it detects the user wants to build
 // or plan, it suggests switching.
-pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -> Result<Option<ModeHint>, String> {
+pub fn run_brainstorm(
+    p: &Provider,
+    perm: Permission,
+    cwd: &Path,
+    first: &str,
+) -> Result<Option<ModeHint>, String> {
     let prefix = context_prefix();
     let sys = format!("{prefix}You are a sharp, concise thought partner with full access to the codebase and the internet. \
         Use tools freely to look things up, read files, grep for patterns, or run commands — \
@@ -694,6 +1043,7 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
     let defs = tools::defs(false);
     let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
     let mut question = first.to_string();
+    let mut loop_guard = ToolLoopGuard::default();
 
     loop {
         msgs.push(Msg::User(question.clone()));
@@ -702,31 +1052,67 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
         // Keep consuming tool calls until the model gives a text response.
         let reply_text = loop {
             tui::line("");
+            if !report::is_json() {
+                tui::line(&tui::dim(&format!(
+                    "  thinking: asking {} with {} available tools",
+                    p.model,
+                    defs.len()
+                )));
+            }
             let mut spin = Some(tui::spinner_start("thinking…"));
             let mut streamed = false;
             let mut thinking_buf = String::new();
-            let mut renderer = if !report::is_json() { Some(tui::StreamRenderer::new()) } else { None };
-            let res = provider::stream(p, &msgs, &defs, &mut |c| {
-                if let Some(s) = spin.take() { tui::spinner_stop(s); }
-                if let Some(r) = &mut renderer { r.push(c); } else { report::assistant_delta(c); }
-                streamed = true;
-            }, &mut |t| {
-                thinking_buf.push_str(t);
-                while let Some(nl) = thinking_buf.find('\n') {
-                    let tl = thinking_buf[..nl].trim().to_string();
-                    if !tl.is_empty() {
-                        tui::write_stream(&format!("\r  {} {}\r\n", tui::dim("◌"), tui::dim(&tl)));
+            let mut renderer = if !report::is_json() {
+                Some(tui::StreamRenderer::new())
+            } else {
+                None
+            };
+            let res = provider::stream(
+                p,
+                &msgs,
+                &defs,
+                &mut |c| {
+                    if let Some(s) = spin.take() {
+                        tui::spinner_stop(s);
                     }
-                    thinking_buf = thinking_buf[nl + 1..].to_string();
-                }
-            });
-            if let Some(s) = spin.take() { tui::spinner_stop(s); }
+                    if let Some(r) = &mut renderer {
+                        r.push(c);
+                    } else {
+                        report::assistant_delta(c);
+                    }
+                    streamed = true;
+                },
+                &mut |t| {
+                    thinking_buf.push_str(t);
+                    while let Some(nl) = thinking_buf.find('\n') {
+                        let tl = thinking_buf[..nl].trim().to_string();
+                        if !tl.is_empty() {
+                            tui::write_stream(&format!(
+                                "\r  {} {}\r\n",
+                                tui::dim("◌"),
+                                tui::dim(&tl)
+                            ));
+                        }
+                        thinking_buf = thinking_buf[nl + 1..].to_string();
+                    }
+                },
+            );
+            if let Some(s) = spin.take() {
+                tui::spinner_stop(s);
+            }
             let reply = res?;
-            if let Some(r) = &mut renderer { r.flush(); }
-            if streamed { report::assistant_end(); }
+            if let Some(r) = &mut renderer {
+                r.flush();
+            }
+            if streamed {
+                report::assistant_end();
+            }
 
             if reply.calls.is_empty() {
-                msgs.push(Msg::Assistant { text: reply.text.clone(), calls: vec![] });
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
                 if !report::is_json() {
                     tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
                 }
@@ -735,15 +1121,30 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
 
             // Execute tool calls inline.
             let mut results = Vec::new();
+            let mut loop_summary: Option<String> = None;
             for call in &reply.calls {
-                report::tool_call(&call.name, &tools::preview(&call.name, &call.input), &call.input);
+                report::tool_call(
+                    &call.name,
+                    &tools::preview(&call.name, &call.input),
+                    &call.input,
+                );
+                trace_tool_call(&call.name, &call.input, "brainstorm", 0);
                 let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                     PreDecision::Deny(r) => Some(r),
                     PreDecision::Allow => None,
                     PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
                 };
                 if let Some(reason) = reason {
-                    results.push(ToolResult { id: call.id.clone(), content: reason, is_error: true });
+                    trace::record_visible(
+                        "tool_denied",
+                        format!("{} denied", call.name),
+                        serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "brainstorm", "depth": 0}),
+                    );
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: reason,
+                        is_error: true,
+                    });
                     continue;
                 }
                 if call.name == "save_memory" {
@@ -751,20 +1152,42 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
                         config::append_memory(note);
                         let msg = "memory saved".to_string();
                         report::tool_result(&call.name, &msg, false);
-                        results.push(ToolResult { id: call.id.clone(), content: msg, is_error: false });
+                        trace_tool_result(&call.name, &msg, false, "brainstorm", 0);
+                        results.push(ToolResult {
+                            id: call.id.clone(),
+                            content: msg,
+                            is_error: false,
+                        });
                         continue;
                     }
                 }
                 let out = tools::run(&call.name, &call.input, cwd);
                 hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
                 report::tool_result(&call.name, &out.content, out.is_error);
-                results.push(ToolResult { id: call.id.clone(), content: out.content, is_error: out.is_error });
+                trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
+                if let Some(loop_msg) =
+                    loop_guard.note(&call.name, &call.input, &out.content, out.is_error)
+                {
+                    report::assistant(&loop_msg);
+                    loop_summary = Some(loop_msg);
+                }
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: out.content,
+                    is_error: out.is_error,
+                });
             }
-            msgs.push(Msg::Assistant { text: reply.text, calls: reply.calls });
+            msgs.push(Msg::Assistant {
+                text: reply.text,
+                calls: reply.calls,
+            });
             msgs.push(Msg::Tool(results));
             if !report::is_json() {
                 tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
                 tui::poll_typeahead();
+            }
+            if let Some(loop_msg) = loop_summary {
+                break loop_msg;
             }
         };
 
@@ -780,8 +1203,8 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
         if let Some(ref h) = hint {
             tui::line("");
             let suggestion = match h {
-                ModeHint::Build     => "switch to BUILD mode and implement this?",
-                ModeHint::Plan      => "switch to PLAN mode and break this down?",
+                ModeHint::Build => "switch to BUILD mode and implement this?",
+                ModeHint::Plan => "switch to PLAN mode and break this down?",
                 ModeHint::CycleMode => "cycle to the next mode?",
             };
             tui::line(&tui::yellow(&format!("  ↪ AI suggests: {suggestion}")));
@@ -805,6 +1228,22 @@ pub fn run_brainstorm(p: &Provider, perm: Permission, cwd: &Path, first: &str) -
             }
         }
     }
+}
+
+fn trace_tool_call(name: &str, input: &serde_json::Value, phase: &str, depth: usize) {
+    trace::record_visible(
+        "tool_call",
+        tools::preview(name, input),
+        serde_json::json!({"tool": name, "input": input, "phase": phase, "depth": depth}),
+    );
+}
+
+fn trace_tool_result(name: &str, content: &str, is_error: bool, phase: &str, depth: usize) {
+    trace::record_visible(
+        "tool_result",
+        format!("{name} {}", if is_error { "error" } else { "ok" }),
+        serde_json::json!({"tool": name, "is_error": is_error, "content": content, "phase": phase, "depth": depth}),
+    );
 }
 
 #[derive(Clone)]
@@ -842,35 +1281,60 @@ mod tests {
     #[test]
     fn gate_auto_allows_ordinary_mutation() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Auto, "write_file", &json!({"path": "a.txt", "content": "x"}), cwd);
+        let r = gate(
+            Permission::Auto,
+            "write_file",
+            &json!({"path": "a.txt", "content": "x"}),
+            cwd,
+        );
         assert!(r.is_none());
     }
 
     #[test]
     fn gate_auto_still_confirms_sensitive_path() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Auto, "read_file", &json!({"path": "/proj/.env"}), cwd);
+        let r = gate(
+            Permission::Auto,
+            "read_file",
+            &json!({"path": "/proj/.env"}),
+            cwd,
+        );
         assert!(r.is_some());
     }
 
     #[test]
     fn gate_auto_confirms_catastrophic_command() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Auto, "run_command", &json!({"command": "rm -rf /"}), cwd);
+        let r = gate(
+            Permission::Auto,
+            "run_command",
+            &json!({"command": "rm -rf /"}),
+            cwd,
+        );
         assert!(r.is_some());
     }
 
     #[test]
     fn gate_auto_allows_safe_command() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Auto, "run_command", &json!({"command": "ls"}), cwd);
+        let r = gate(
+            Permission::Auto,
+            "run_command",
+            &json!({"command": "ls"}),
+            cwd,
+        );
         assert!(r.is_none());
     }
 
     #[test]
     fn gate_readonly_blocks_mutation() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::ReadOnly, "write_file", &json!({"path": "a", "content": "x"}), cwd);
+        let r = gate(
+            Permission::ReadOnly,
+            "write_file",
+            &json!({"path": "a", "content": "x"}),
+            cwd,
+        );
         assert!(r.unwrap().contains("read-only"));
     }
 
@@ -878,7 +1342,12 @@ mod tests {
     fn gate_readonly_allows_reads_everywhere() {
         // Reads outside CWD are now allowed — full filesystem access.
         let cwd = Path::new("/proj/work");
-        let r = gate(Permission::ReadOnly, "read_file", &json!({"path": "/etc/passwd"}), cwd);
+        let r = gate(
+            Permission::ReadOnly,
+            "read_file",
+            &json!({"path": "/etc/passwd"}),
+            cwd,
+        );
         assert!(r.is_none());
     }
 
@@ -886,14 +1355,24 @@ mod tests {
     fn gate_ask_allows_out_of_cwd_read() {
         // Full filesystem read access — no longer blocked in Ask mode.
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Ask, "read_file", &json!({"path": "/home/user/docs/README.md"}), cwd);
+        let r = gate(
+            Permission::Ask,
+            "read_file",
+            &json!({"path": "/home/user/docs/README.md"}),
+            cwd,
+        );
         assert!(r.is_none());
     }
 
     #[test]
     fn gate_ask_prompts_for_mutation() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Ask, "write_file", &json!({"path": "a", "content": "x"}), cwd);
+        let r = gate(
+            Permission::Ask,
+            "write_file",
+            &json!({"path": "a", "content": "x"}),
+            cwd,
+        );
         assert!(r.is_some()); // non-terminal → denied
     }
 
@@ -901,8 +1380,18 @@ mod tests {
     fn gate_ask_allows_default_allowed_commands() {
         let cwd = Path::new("/proj");
         // git, cargo, npm are in the default allowed_commands list
-        for cmd in &["git status", "cargo test", "npm install", "git commit -m 'x'"] {
-            let r = gate(Permission::Ask, "run_command", &json!({"command": cmd}), cwd);
+        for cmd in &[
+            "git status",
+            "cargo test",
+            "npm install",
+            "git commit -m 'x'",
+        ] {
+            let r = gate(
+                Permission::Ask,
+                "run_command",
+                &json!({"command": cmd}),
+                cwd,
+            );
             assert!(r.is_none(), "expected {cmd} to be auto-allowed in Ask mode");
         }
     }
@@ -910,7 +1399,12 @@ mod tests {
     #[test]
     fn gate_ask_still_prompts_for_unknown_command() {
         let cwd = Path::new("/proj");
-        let r = gate(Permission::Ask, "run_command", &json!({"command": "mycustombinary --flag"}), cwd);
+        let r = gate(
+            Permission::Ask,
+            "run_command",
+            &json!({"command": "mycustombinary --flag"}),
+            cwd,
+        );
         assert!(r.is_some()); // not in allowed list → denied (non-terminal)
     }
 

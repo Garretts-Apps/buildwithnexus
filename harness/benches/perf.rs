@@ -27,7 +27,9 @@ fn long_conversation(turns: usize) -> Vec<Msg> {
             .repeat(4),
     )];
     for i in 0..turns {
-        msgs.push(Msg::User(format!("step {i}: please inspect and modify the project as needed")));
+        msgs.push(Msg::User(format!(
+            "step {i}: please inspect and modify the project as needed"
+        )));
         msgs.push(Msg::Assistant {
             text: format!("Working on step {i}. Reading the relevant files first."),
             calls: vec![ToolCall {
@@ -51,7 +53,13 @@ fn bench_body_builders(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("body_builders");
     g.bench_function("anthropic_body/30turns", |b| {
-        b.iter(|| pbench::anthropic_body(black_box("claude-sonnet-4-6"), black_box(&msgs), black_box(&defs)))
+        b.iter(|| {
+            pbench::anthropic_body(
+                black_box("claude-sonnet-4-6"),
+                black_box(&msgs),
+                black_box(&defs),
+            )
+        })
     });
     g.bench_function("openai_body/30turns", |b| {
         b.iter(|| pbench::openai_body(black_box("gpt-4o"), black_box(&msgs), black_box(&defs)))
@@ -87,7 +95,9 @@ fn bench_parse_args(c: &mut Criterion) {
     let invalid = "{not valid json at all, just a fragment";
     let mut g = c.benchmark_group("parse_args");
     g.bench_function("valid", |b| b.iter(|| pbench::parse_args(black_box(valid))));
-    g.bench_function("invalid", |b| b.iter(|| pbench::parse_args(black_box(invalid))));
+    g.bench_function("invalid", |b| {
+        b.iter(|| pbench::parse_args(black_box(invalid)))
+    });
     g.finish();
 }
 
@@ -121,23 +131,32 @@ fn bench_truncate(c: &mut Criterion) {
     let mut g = c.benchmark_group("truncate");
     g.bench_function("multibyte_cut", |b| {
         // Clone per iter since truncate consumes its String.
-        b.iter_with_setup(|| big.clone(), |s| tbench::truncate(black_box(s), 16 * 1024))
+        b.iter_with_setup(
+            || big.clone(),
+            |s| tbench::truncate(black_box(s), 16 * 1024),
+        )
     });
     g.finish();
 }
 
 fn bench_path_and_classify(c: &mut Criterion) {
     let deep = Path::new("a/b/./c/../d/e/../../f/g/h/./i/../j/k");
-    c.bench_function("normalize/deep", |b| b.iter(|| tbench::normalize(black_box(deep))));
+    c.bench_function("normalize/deep", |b| {
+        b.iter(|| tbench::normalize(black_box(deep)))
+    });
 
     let key = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     c.bench_function("mask", |b| b.iter(|| config::mask(black_box(key))));
 
     let task = "design and architect a new authentication subsystem with proper scoping";
-    c.bench_function("classify", |b| b.iter(|| buildwithnexus::classify(black_box(task))));
+    c.bench_function("classify", |b| {
+        b.iter(|| buildwithnexus::classify(black_box(task)))
+    });
 
     let id = "ollama";
-    c.bench_function("preset_lookup", |b| b.iter(|| config::preset(black_box(id))));
+    c.bench_function("preset_lookup", |b| {
+        b.iter(|| config::preset(black_box(id)))
+    });
 }
 
 criterion_group!(
