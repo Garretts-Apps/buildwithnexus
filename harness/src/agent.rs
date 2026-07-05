@@ -134,9 +134,10 @@ pub enum Permission {
 }
 
 pub fn permission(s: &str) -> Permission {
-    match s {
-        "auto" => Permission::Auto,
-        "readonly" => Permission::ReadOnly,
+    let normalized = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
+    match normalized.as_str() {
+        "auto" | "acceptedits" | "acceptedit" | "bypasspermissions" => Permission::Auto,
+        "readonly" | "read" | "plan" | "dontask" => Permission::ReadOnly,
         _ => Permission::Ask,
     }
 }
@@ -200,7 +201,8 @@ fn context_prefix() -> String {
 
 fn tool_manifest() -> String {
     "[Built-in tools — always available, no install needed]\n\
-• read_file / list_dir   — read any file or directory on the filesystem\n\
+• read_file / list_dir   — read any file or directory on the filesystem; read_file supports start_line/end_line\n\
+• find_files / grep_files — search the codebase without shelling out; prefer these for navigation before run_command\n\
 • write_file / edit_file — create or surgically modify files\n\
 • run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
 • fetch_url              — HTTP GET (no curl/wget needed)\n\
@@ -820,7 +822,11 @@ mod tests {
     #[test]
     fn permission_parsing() {
         assert!(matches!(permission("auto"), Permission::Auto));
+        assert!(matches!(permission("acceptEdits"), Permission::Auto));
+        assert!(matches!(permission("bypass-permissions"), Permission::Auto));
         assert!(matches!(permission("readonly"), Permission::ReadOnly));
+        assert!(matches!(permission("read-only"), Permission::ReadOnly));
+        assert!(matches!(permission("plan"), Permission::ReadOnly));
         assert!(matches!(permission("ask"), Permission::Ask));
         assert!(matches!(permission("anything-else"), Permission::Ask));
         assert!(matches!(permission(""), Permission::Ask));

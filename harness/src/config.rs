@@ -260,7 +260,7 @@ pub fn scaffold_home() {
 
     // Sub-directories (created silently; errors ignored — missing dirs are
     // handled gracefully everywhere they are used).
-    for sub in &["skills", "commands", "hooks/PreToolUse", "hooks/PostToolUse",
+    for sub in &["skills", "commands", "checkpoints", "hooks/PreToolUse", "hooks/PostToolUse",
                  "hooks/SessionStart", "hooks/SessionEnd", "hooks/UserPromptSubmit", "hooks/Stop"] {
         let _ = fs::create_dir_all(h.join(sub));
     }

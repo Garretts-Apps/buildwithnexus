@@ -2,6 +2,7 @@
 // suites can reach the internals directly.
 
 pub mod agent;
+pub mod checkpoint;
 pub mod config;
 pub mod hooks;
 pub mod local;
@@ -22,6 +23,35 @@ use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
+
+#[derive(Default, Clone)]
+struct CliOptions {
+    model: Option<String>,
+    permission_mode: Option<String>,
+}
+
+fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
+    let mut opts = CliOptions::default();
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(arg) = it.next() {
+        if let Some(v) = arg.strip_prefix("--model=") {
+            opts.model = Some(v.to_string());
+        } else if arg == "--model" {
+            opts.model = it.next();
+        } else if let Some(v) = arg.strip_prefix("--permission-mode=") {
+            opts.permission_mode = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--permission=") {
+            opts.permission_mode = Some(v.to_string());
+        } else if arg == "--permission-mode" || arg == "--permission" {
+            opts.permission_mode = it.next();
+        } else {
+            rest.push(arg);
+        }
+    }
+    (opts, rest)
+}
 
 pub fn run() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,11 +59,12 @@ pub fn run() {
         args.retain(|a| a != "--json");
         report::set(report::Mode::Json);
     }
+    let (opts, args) = parse_cli_options(args);
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
 
     match cmd {
-        "" => interactive(),
+        "" => interactive(None, opts),
         "init" | "da-init" | "setup" => {
             onboarding::run();
         }
@@ -43,9 +74,9 @@ pub fn run() {
                 println!("  {:<12} {:<26} {}", p.id, p.label, tag);
             }
         }
-        "run" | "build" => headless(|p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
-        "plan" => headless(|p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
-        "brainstorm" => headless(|p, perm, cwd| {
+        "run" | "build" | "-p" | "--print" => headless(&opts, |p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
+        "plan" => headless(&opts, |p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
+        "brainstorm" => headless(&opts, |p, perm, cwd| {
             agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
         }),
         "sessions" => {
@@ -54,14 +85,14 @@ pub fn run() {
                 println!("  {}  {:<48}  {}", s.id, title, s.cwd);
             }
         }
-        "continue" => headless(|p, perm, cwd| match session::latest() {
+        "continue" | "-c" | "--continue" => headless(&opts, |p, perm, cwd| match session::latest() {
             Some(s) => agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id),
             None => Err("no sessions to continue".into()),
         }),
-        "resume" => {
+        "resume" | "-r" | "--resume" => {
             let id = args.get(1).cloned().unwrap_or_default();
             let task = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
-            headless(|p, perm, cwd| match session::load(&id) {
+            headless(&opts, |p, perm, cwd| match session::load(&id) {
                 Some(s) => agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id),
                 None => Err(format!("no session '{id}'")),
             })
@@ -69,6 +100,7 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
+        _ if !args.is_empty() => interactive(Some(args.join(" ")), opts),
         other => {
             eprintln!("unknown command: {other}\n");
             usage();
@@ -77,12 +109,17 @@ pub fn run() {
     }
 }
 
-fn provider_or_onboard() -> Result<(Provider, Permission), String> {
+fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
     let settings = match config::load_settings() {
         Some(s) => s,
         None => onboarding::run().ok_or("setup cancelled")?,
     };
-    Ok((build_provider(&settings)?, agent::permission(&settings.permission)))
+    let mut provider = build_provider(&settings)?;
+    if let Some(model) = &opts.model {
+        provider.model = model.clone();
+    }
+    let perm_name = opts.permission_mode.as_deref().unwrap_or(&settings.permission);
+    Ok((provider, agent::permission(perm_name)))
 }
 
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
@@ -110,8 +147,8 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     Ok(Provider { protocol: preset.protocol, base_url, api_key, model, context_tokens })
 }
 
-fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>) {
-    let (provider, perm) = match provider_or_onboard() {
+fn headless(opts: &CliOptions, f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>) {
+    let (provider, perm) = match provider_or_onboard(opts) {
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
@@ -127,7 +164,7 @@ fn headless(f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>
     }
 }
 
-fn interactive() {
+fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // Always scaffold on interactive launch so existing users also get the
     // directory skeleton and starter Agents.md if they're missing.
     config::scaffold_home();
@@ -135,7 +172,7 @@ fn interactive() {
     if !onboarded && onboarding::run().is_none() {
         return;
     }
-    let (provider, perm) = match provider_or_onboard() {
+    let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
         Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
     };
@@ -146,7 +183,7 @@ fn interactive() {
     hooks::init(&cwd, raw);
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
-    let result = repl(provider, perm, &cwd, raw);
+    let result = repl(provider, perm, &cwd, raw, initial_prompt);
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -155,7 +192,7 @@ fn interactive() {
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
-fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool) -> Result<(), String> {
+fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool, initial_prompt: Option<String>) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
 
     // Show the full-screen header banner.
@@ -174,6 +211,7 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
     let mut last_suggested_mode: Option<&'static str> = None;
     // /btw: extra context injected into the next task without interrupting.
     let mut btw_ctx: Option<String> = None;
+    let mut pending_prompt = initial_prompt;
 
     loop {
         // Tick background workflows and surface any completion notifications.
@@ -189,17 +227,23 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             tui::line(&tui::dim(&format!("  ⟳ {} workflow{} in queue — /workflows to manage", active, if active == 1 { "" } else { "s" })));
         }
 
-        tui::line("");
-        let prompt = format!("{} {} ", tui::mode_badge(mode_label(&mode)), tui::accent("›"));
-        let task = match tui::ask_task(&prompt) {
-            None => return Ok(()),
-            Some(tui::InputEvent::CycleMode) => {
-                mode = mode.next();
-                last_suggested_mode = None;
-                tui::show_mode_change(mode_label(&mode));
-                continue;
+        let task = if let Some(prompted) = pending_prompt.take() {
+            tui::line("");
+            tui::line(&format!("{} {} {}", tui::mode_badge(mode_label(&mode)), tui::accent("›"), prompted));
+            prompted
+        } else {
+            tui::line("");
+            let prompt = format!("{} {} ", tui::mode_badge(mode_label(&mode)), tui::accent("›"));
+            match tui::ask_task(&prompt) {
+                None => return Ok(()),
+                Some(tui::InputEvent::CycleMode) => {
+                    mode = mode.next();
+                    last_suggested_mode = None;
+                    tui::show_mode_change(mode_label(&mode));
+                    continue;
+                }
+                Some(tui::InputEvent::Text(t)) => t,
             }
-            Some(tui::InputEvent::Text(t)) => t,
         };
         let t = task.trim();
         if t.is_empty() {
@@ -300,6 +344,31 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             continue;
         }
 
+        if let Some(task) = t.strip_prefix("/plan ") {
+            tui::line("");
+            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd) {
+                tui::line(&tui::red(&format!("  {e}")));
+            }
+            tui::bell();
+            continue;
+        }
+        if let Some(task) = t.strip_prefix("/build ") {
+            tui::line("");
+            if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task.trim(), cwd, &mut transcript, &sid) {
+                tui::line(&tui::red(&format!("  {e}")));
+            }
+            tui::bell();
+            continue;
+        }
+        if let Some(task) = t.strip_prefix("/brainstorm ") {
+            tui::line("");
+            if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, task.trim()).map(|_| ()) {
+                tui::line(&tui::red(&format!("  {e}")));
+            }
+            tui::bell();
+            continue;
+        }
+
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => { tui::clear(); continue; }
@@ -367,8 +436,32 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                 tui::bell();
                 continue;
             }
-            "/workflows" => {
+            "/workflows" | "/tasks" => {
                 handle_workflows();
+                continue;
+            }
+            "/doctor" | "/debug" => {
+                handle_doctor_tui();
+                continue;
+            }
+            "/diff" => {
+                handle_diff(cwd);
+                continue;
+            }
+            "/context" => {
+                handle_context(&transcript, provider.context_tokens);
+                continue;
+            }
+            "/agents" => {
+                handle_agents();
+                continue;
+            }
+            "/checkpoints" => {
+                handle_checkpoints(cwd);
+                continue;
+            }
+            "/undo" | "/rewind" => {
+                handle_undo(cwd);
                 continue;
             }
             "/mode" => {
@@ -472,9 +565,10 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         // Mode suggestion: hint once per unique suggestion (don't repeat if user stays in mode).
         suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
 
-        // Extract @image.png tokens → push a UserImages message so build_inner skips
+        // Extract @path tokens. Images become multimodal attachments; text files
+        // are appended into the prompt with optional @file:start-end ranges.
         // its own Msg::User push and uses this multimodal turn instead.
-        let (clean_task, image_data) = extract_images(t, cwd);
+        let (clean_task, image_data) = extract_attachments(t, cwd);
         let n_images = image_data.len();
         if n_images > 0 {
             transcript.push(Msg::UserImages { text: clean_task.clone(), images: image_data });
@@ -872,6 +966,78 @@ fn handle_permissions(perm: &mut Permission) {
     }
 }
 
+fn handle_diff(cwd: &std::path::Path) {
+    let out = tools::run("run_command", &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}), cwd);
+    for line in out.content.lines() {
+        tui::line(&tui::dim(&format!("  {line}")));
+    }
+}
+
+fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
+    let chars: usize = msgs
+        .iter()
+        .map(|m| match m {
+            provider::Msg::System(s) | provider::Msg::User(s) => s.len(),
+            provider::Msg::UserImages { text, images } => text.len() + images.len() * 1024,
+            provider::Msg::Assistant { text, calls } => text.len() + calls.iter().map(|c| c.input.to_string().len()).sum::<usize>(),
+            provider::Msg::Tool(results) => results.iter().map(|r| r.content.len()).sum(),
+        })
+        .sum();
+    chars / 4
+}
+
+fn handle_context(transcript: &[provider::Msg], total: usize) {
+    let used = msg_token_estimate(transcript);
+    tui::context_meter(used, total);
+    tui::line(&tui::dim(&format!("  {} messages in session", transcript.len())));
+}
+
+fn handle_checkpoints(cwd: &std::path::Path) {
+    let items = checkpoint::list(cwd);
+    if items.is_empty() {
+        tui::line(&tui::dim("  no checkpoints for this directory"));
+        return;
+    }
+    for cp in items.iter().take(10) {
+        tui::line(&format!("  {}  {}  {}", tui::bold(&cp.id), cp.action, cp.path.display()));
+    }
+}
+
+fn handle_undo(cwd: &std::path::Path) {
+    match checkpoint::undo_latest(cwd) {
+        Ok(cp) => tui::line(&tui::green(&format!("  restored {}", cp.path.display()))),
+        Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+    }
+}
+
+fn handle_agents() {
+    match config::load_agents() {
+        Some(agents) => {
+            for line in agents.lines().take(80) {
+                tui::line(&format!("  {line}"));
+            }
+        }
+        None => tui::line(&tui::dim("  no Agents.md found")),
+    }
+}
+
+fn handle_doctor_tui() {
+    tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));
+    match config::load_settings() {
+        Some(s) => {
+            tui::line(&format!("  provider: {}", s.provider));
+            tui::line(&format!("  model: {}", s.model));
+            tui::line(&format!("  permission: {}", s.permission));
+        }
+        None => tui::line(&tui::yellow("  settings: not configured")),
+    }
+    tui::line(&format!("  home: {}", config::home().display()));
+    tui::line(&format!("  rust: {}", std::process::Command::new("rustc").arg("--version").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "not found".to_string())));
+}
+
 fn print_help() {
     tui::line(&tui::accent("  buildwithnexus commands"));
     tui::line(&tui::dim("  ─────────────────────────────────────────────────────────────"));
@@ -881,16 +1047,22 @@ fn print_help() {
     tui::line(&tui::dim("               or just say: \"switch to build mode\" / \"use readonly\""));
     tui::line(&format!("  {}        hot-swap the AI model mid-session", tui::bold("/model")));
     tui::line(&format!("  {}      compact context  {}", tui::bold("/compact"), tui::dim("(free up token budget)")));
+    tui::line(&format!("  {}          show current context usage", tui::bold("/context")));
+    tui::line(&format!("  {}             show current git diff summary", tui::bold("/diff")));
     tui::line(&format!("  {}       AI code review of staged git diff", tui::bold("/review")));
     tui::line(&format!("  {}       AI-drafted conventional commit message", tui::bold("/commit")));
     tui::line(&format!("  {}           AI-drafted PR title + description", tui::bold("/pr")));
     tui::line(&format!("  {}    schedule a one-shot workflow  {}", tui::bold("/schedule"), tui::dim("<delay> <task>")));
     tui::line(&format!("  {}         start a repeating workflow  {}", tui::bold("/loop"), tui::dim("<interval> <task>")));
-    tui::line(&format!("  {}   list and manage background workflows", tui::bold("/workflows")));
+    tui::line(&format!("  {}   list and manage background workflows  {}", tui::bold("/workflows"), tui::dim("(/tasks)")));
     tui::line(&format!("  {}          inject context into next agent turn  {}", tui::bold("/btw"), tui::dim("<context>")));
     tui::line(&format!("  {}       configure hooks, memory, commands via AI", tui::bold("/config")));
     tui::line(&format!("  {}       view/edit session memory", tui::bold("/memory")));
     tui::line(&format!("  {}       list available skills and custom commands", tui::bold("/skills")));
+    tui::line(&format!("  {}       show loaded Agents.md context", tui::bold("/agents")));
+    tui::line(&format!("  {}  list edit checkpoints", tui::bold("/checkpoints")));
+    tui::line(&format!("  {}         restore latest checkpoint  {}", tui::bold("/undo"), tui::dim("(/rewind)")));
+    tui::line(&format!("  {}       diagnose setup", tui::bold("/doctor")));
     tui::line(&format!("  {}          start a fresh session", tui::bold("/new")));
     tui::line(&format!("  {}      pick a saved session to resume", tui::bold("/resume")));
     tui::line(&format!("  {}         run setup (keys, providers, local models)", tui::bold("/init")));
@@ -923,23 +1095,26 @@ impl Mode {
     }
 }
 
-// Parse `@path` image tokens from a task string. Returns the cleaned text and
-// a list of `(media_type, base64_data)` pairs for any recognized image paths.
-// Unreadable or non-image @-tokens are left in the text unchanged.
-fn extract_images(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
+// Parse `@path` attachment tokens. Images become multimodal entries; readable
+// text files are appended to the prompt. Unreadable tokens are left unchanged.
+fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
     use std::io::Read;
     let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
     let mut images: Vec<(String, String)> = Vec::new();
     let mut clean = String::new();
+    let mut text_attachments = Vec::new();
     for word in task.split_whitespace() {
         if let Some(raw_path) = word.strip_prefix('@') {
+            let (raw_path, range) = split_attachment_range(raw_path);
             let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
+            let p = if let Some(rest) = raw_path.strip_prefix("~/") {
+                std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf()).join(rest)
+            } else if raw_path.starts_with('/') {
+                PathBuf::from(raw_path)
+            } else {
+                cwd.join(raw_path)
+            };
             if image_exts.contains(&ext.as_str()) {
-                let p = if raw_path.starts_with('/') || raw_path.starts_with('~') {
-                    PathBuf::from(raw_path)
-                } else {
-                    cwd.join(raw_path)
-                };
                 if let Ok(mut f) = std::fs::File::open(&p) {
                     let mut buf = Vec::new();
                     if f.read_to_end(&mut buf).is_ok() {
@@ -955,12 +1130,55 @@ fn extract_images(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, St
                         continue;
                     }
                 }
+            } else if let Some(text) = read_text_attachment(&p, range) {
+                text_attachments.push(format!("[file: {}]\n{}", p.display(), text));
+                if !clean.is_empty() { clean.push(' '); }
+                clean.push_str(&format!("[file: {}]", p.display()));
+                continue;
             }
         }
         if !clean.is_empty() { clean.push(' '); }
         clean.push_str(word);
     }
+    if !text_attachments.is_empty() {
+        clean.push_str("\n\n[attached files]\n");
+        clean.push_str(&text_attachments.join("\n\n"));
+    }
     (clean, images)
+}
+
+fn split_attachment_range(raw: &str) -> (&str, Option<(usize, usize)>) {
+    let Some((path, suffix)) = raw.rsplit_once(':') else {
+        return (raw, None);
+    };
+    let parse_line = |s: &str| s.parse::<usize>().ok().filter(|n| *n > 0);
+    if let Some((a, b)) = suffix.split_once('-') {
+        if let (Some(start), Some(end)) = (parse_line(a), parse_line(b)) {
+            return (path, Some((start, end.max(start))));
+        }
+    } else if let Some(line) = parse_line(suffix) {
+        return (path, Some((line, line)));
+    }
+    (raw, None)
+}
+
+fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_ATTACHED_FILE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let Some((start, end)) = range else {
+        return Some(text);
+    };
+    Some(text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let line_no = i + 1;
+            if line_no >= start && line_no <= end { Some(line) } else { None }
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1016,16 +1234,19 @@ fn usage() {
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
+         \x20 /context               show current context usage\n\
+         \x20 /diff                  show current git diff summary\n\
          \x20 /review                AI code review of staged git diff\n\
          \x20 /commit                AI-drafted conventional commit message\n\
          \x20 /pr                    AI-drafted pull request title + description\n\
          \x20 /schedule <delay> <t>  one-shot workflow  (e.g. /schedule 5m cargo test)\n\
          \x20 /loop <interval> <t>   repeating workflow (e.g. /loop 30m cargo test)\n\
-         \x20 /workflows             list and manage background workflows\n\
+         \x20 /workflows /tasks      list and manage background workflows\n\
          \x20 /btw <context>         inject context into next agent turn\n\
          \x20 /config                configure hooks, memory, commands via AI\n\
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                list available skills and custom commands\n\
+         \x20 /agents /checkpoints /undo /doctor\n\
          \x20 /help /clear /new /resume /init /exit\n\
          \x20 !<cmd>                 run shell command directly\n\
          \x20 @<path>                Tab-complete a file path\n\
@@ -1183,6 +1404,42 @@ mod tests {
         assert_eq!(detect_permission_switch("change to auto"), Some("auto"));
         assert_eq!(detect_permission_switch("set permission to ask"), Some("ask"));
         assert_eq!(detect_permission_switch("use readonly mode"), Some("readonly"));
+    }
+
+    #[test]
+    fn parse_cli_options_extracts_model_and_permission() {
+        let (opts, rest) = parse_cli_options(vec![
+            "--model".into(),
+            "qwen3".into(),
+            "--permission-mode=acceptEdits".into(),
+            "fix".into(),
+            "tests".into(),
+        ]);
+        assert_eq!(opts.model.as_deref(), Some("qwen3"));
+        assert_eq!(opts.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(rest, vec!["fix", "tests"]);
+    }
+
+    #[test]
+    fn attachment_range_parsing() {
+        assert_eq!(split_attachment_range("src/lib.rs:10-12"), ("src/lib.rs", Some((10, 12))));
+        assert_eq!(split_attachment_range("src/lib.rs:5"), ("src/lib.rs", Some((5, 5))));
+        assert_eq!(split_attachment_range("src/lib.rs:nope"), ("src/lib.rs:nope", None));
+    }
+
+    #[test]
+    fn text_attachment_context_is_extracted() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+
+        let (text, images) = extract_attachments("please read @src/lib.rs:2-3", &dir);
+        assert!(images.is_empty());
+        assert!(text.contains("[file:"));
+        assert!(text.contains("two\nthree"));
+        assert!(!text.contains("\none\n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

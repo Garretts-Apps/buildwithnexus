@@ -15,10 +15,13 @@ use crossterm::event::{
     poll, read, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::{execute, queue};
 
 static RAW: AtomicBool = AtomicBool::new(false);
+static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 // Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
 static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -358,13 +361,14 @@ pub fn poll_typeahead() {
             any = true;
         }
     }
-    // Show a dim preview of buffered input only when new keystrokes arrived.
+    // Show queued input in the persistent composer, not in scrollback.
     if any {
         if let Ok(ta) = typeahead().lock() {
             if !ta.buf.is_empty() {
-                let before: String = ta.buf[..ta.cursor].iter().collect();
-                let after: String = ta.buf[ta.cursor..].iter().collect();
-                line(&dim(&format!("  ⌨  {before}│{after}")));
+                let mut scroll = 0usize;
+                render_composer(&format!("{} {} ", dim("queued"), accent("›")), &ta.buf, ta.cursor, &mut scroll);
+            } else {
+                clear_composer();
             }
         }
     }
@@ -378,6 +382,89 @@ fn take_typeahead() -> (Vec<char>, usize) {
             (buf, cur)
         }
         Err(_) => (Vec::new(), 0),
+    }
+}
+
+fn term_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((80, 24))
+}
+
+fn composer_row() -> u16 {
+    term_size().1.saturating_sub(1)
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn prompt_width(prompt: &str) -> u16 {
+    strip_ansi(prompt).chars().count().min(u16::MAX as usize) as u16
+}
+
+fn set_output_region() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let (_, h) = term_size();
+    let bottom = h.saturating_sub(1).max(1);
+    print!("\x1b[1;{bottom}r\x1b[1;1H");
+    flush();
+}
+
+fn reset_output_region() {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        print!("\x1b[r");
+        flush();
+    }
+}
+
+fn clear_composer() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut out = io::stdout();
+    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = out.flush();
+}
+
+fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let (width, _) = term_size();
+    let pwidth = prompt_width(prompt);
+    let avail = width.saturating_sub(pwidth).max(8) as usize;
+    let (s, col) = viewport(cursor, avail, *scroll);
+    *scroll = s;
+    let end = (s + avail).min(buf.len());
+    let shown: String = buf[s..end].iter().collect();
+    let mut out = io::stdout();
+    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = write!(out, "{prompt}{shown}");
+    let _ = queue!(out, MoveTo(pwidth.saturating_add(col as u16), composer_row()));
+    let _ = out.flush();
+}
+
+fn echo_submitted(prompt: &str, text: &str) {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        clear_composer();
+        line(&format!("{prompt}{text}"));
+    } else {
+        print!("\r\n");
+        flush();
     }
 }
 
@@ -464,31 +551,51 @@ pub fn context_meter(used: usize, total: usize) {
     ));
 }
 
-// Enter raw mode (and capture panics to restore the terminal even on crash).
-// We render inline on the primary screen so scrollback and text selection work.
+// Enter the alternate screen and raw mode (and capture panics to restore the
+// terminal even on crash). The bottom row is reserved for the composer; output
+// scrolls in the region above it.
 pub fn enter_alt(raw: bool) {
+    if raw {
+        let mut out = io::stdout();
+        let _ = execute!(out, EnterAlternateScreen, Clear(ClearType::All), MoveTo(0, 0));
+        ALT_SCREEN.store(true, Ordering::Relaxed);
+        set_output_region();
+    }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
         let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+        reset_output_region();
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
+        ALT_SCREEN.store(false, Ordering::Relaxed);
         let _ = disable_raw_mode();
         prev(info);
     }));
 }
 
 pub fn leave_alt() {
+    clear_composer();
+    reset_output_region();
     if RAW.swap(false, Ordering::Relaxed) {
         let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         let _ = disable_raw_mode();
     }
+    if ALT_SCREEN.swap(false, Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
 }
 
 pub fn clear() {
-    print!("\x1b[2J\x1b[H");
-    flush();
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
+        set_output_region();
+        clear_composer();
+    } else {
+        print!("\x1b[2J\x1b[H");
+        flush();
+    }
 }
 
 pub fn line(s: &str) {
@@ -644,7 +751,11 @@ fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
     (s, cursor - s)
 }
 
-fn redraw(start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
+fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        render_composer(prompt, buf, cursor, scroll);
+        return;
+    }
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
     let avail = width.saturating_sub(start.0).max(8) as usize;
     let (s, col) = viewport(cursor, avail, *scroll);
@@ -695,10 +806,11 @@ fn edit_in_editor(current: &str) -> Option<String> {
 // Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
 const SLASH_COMMANDS_BASE: &[&str] = &[
     "/help", "/clear", "/new", "/resume", "/init",
+    "/plan", "/build", "/brainstorm", "/doctor", "/debug",
     "/mode", "/model", "/permissions", "/compact",
-    "/review", "/commit", "/pr",
-    "/schedule", "/loop", "/workflows", "/btw",
-    "/config", "/memory", "/skills", "/exit", "/quit",
+    "/review", "/commit", "/pr", "/diff", "/context",
+    "/schedule", "/loop", "/workflows", "/tasks", "/btw",
+    "/config", "/memory", "/skills", "/agents", "/checkpoints", "/undo", "/rewind", "/exit", "/quit",
 ];
 
 fn load_slash_commands() -> Vec<String> {
@@ -805,24 +917,32 @@ fn read_line_raw(prompt: &str) -> Option<RawLine> {
 }
 
 fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -> Option<RawLine> {
-    print!("{prompt}");
-    flush();
-    let mut start = crossterm::cursor::position().unwrap_or((0, 0));
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        print!("{prompt}");
+        flush();
+    }
+    let mut start = if ALT_SCREEN.load(Ordering::Relaxed) {
+        (prompt_width(prompt), composer_row())
+    } else {
+        crossterm::cursor::position().unwrap_or((0, 0))
+    };
     let mut buf: Vec<char> = prefill;
     let mut cursor = prefill_cur.min(buf.len());
     let mut scroll = 0usize;
-    if !buf.is_empty() {
-        redraw(start, &buf, cursor, &mut scroll);
-    }
+    redraw(prompt, start, &buf, cursor, &mut scroll);
     let mut hist_idx: Option<usize> = None;
     let mut kill = String::new();
 
     macro_rules! reline {
         () => {{
-            print!("\r{prompt}");
-            flush();
-            start = crossterm::cursor::position().unwrap_or(start);
-            redraw(start, &buf, cursor, &mut scroll);
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                start = (prompt_width(prompt), composer_row());
+            } else {
+                print!("\r{prompt}");
+                flush();
+                start = crossterm::cursor::position().unwrap_or(start);
+            }
+            redraw(prompt, start, &buf, cursor, &mut scroll);
         }};
     }
 
@@ -839,7 +959,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     buf.insert(cursor, c);
                     cursor += 1;
                 }
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
                 continue;
             }
             Ok(Event::Mouse(m)) => {
@@ -849,7 +969,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     if col >= start.0 as usize {
                         let offset = col - start.0 as usize + scroll;
                         cursor = offset.min(buf.len());
-                        redraw(start, &buf, cursor, &mut scroll);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
                     }
                 }
                 continue;
@@ -863,50 +983,56 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
             // Shift+Tab → cycle mode (clear the line and signal the REPL).
             KeyCode::BackTab => {
                 buf.clear();
-                print!("\r\n");
+                clear_composer();
+                flush();
+                return Some(RawLine::CycleMode);
+            }
+            KeyCode::Tab if ev.modifiers.contains(KeyModifiers::SHIFT) => {
+                buf.clear();
+                clear_composer();
                 flush();
                 return Some(RawLine::CycleMode);
             }
             KeyCode::Char('c') if ctrl => {
                 if buf.is_empty() {
-                    print!("\r\n");
+                    clear_composer();
                     flush();
                     return None;
                 }
                 buf.clear();
                 cursor = 0;
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('d') if ctrl => {
                 if buf.is_empty() {
-                    print!("\r\n");
+                    clear_composer();
                     flush();
                     return None;
                 }
             }
-            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('a') if ctrl => { cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('e') if ctrl => { cursor = buf.len(); redraw(prompt, start, &buf, cursor, &mut scroll); }
             KeyCode::Char('u') if ctrl => {
                 kill = buf[..cursor].iter().collect();
                 buf.drain(..cursor);
                 cursor = 0;
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('k') if ctrl => {
                 kill = buf[cursor..].iter().collect();
                 buf.truncate(cursor);
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('w') if ctrl => {
                 let i = prev_word(&buf, cursor);
                 kill = buf[i..cursor].iter().collect();
                 buf.drain(i..cursor);
                 cursor = i;
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('y') if ctrl => {
                 for c in kill.clone().chars() { buf.insert(cursor, c); cursor += 1; }
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('l') if ctrl => reline!(),
             KeyCode::Char('g') if ctrl => {
@@ -967,15 +1093,15 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 reline!();
             }
-            KeyCode::Char('b') if alt => { cursor = prev_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Char('f') if alt => { cursor = next_word(&buf, cursor); redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Char(c) if !ctrl && !alt => { buf.insert(cursor, c); cursor += 1; redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(start, &buf, cursor, &mut scroll); } }
-            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(start, &buf, cursor, &mut scroll); } }
-            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(start, &buf, cursor, &mut scroll); } }
-            KeyCode::Home => { cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
-            KeyCode::End => { cursor = buf.len(); redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('b') if alt => { cursor = prev_word(&buf, cursor); redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Char('f') if alt => { cursor = next_word(&buf, cursor); redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Char(c) if !ctrl && !alt => { buf.insert(cursor, c); cursor += 1; redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Backspace => { if cursor > 0 { buf.remove(cursor - 1); cursor -= 1; redraw(prompt, start, &buf, cursor, &mut scroll); } }
+            KeyCode::Delete => { if cursor < buf.len() { buf.remove(cursor); redraw(prompt, start, &buf, cursor, &mut scroll); } }
+            KeyCode::Left => { cursor = cursor.saturating_sub(1); redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::Right => { if cursor < buf.len() { cursor += 1; redraw(prompt, start, &buf, cursor, &mut scroll); } }
+            KeyCode::Home => { cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
+            KeyCode::End => { cursor = buf.len(); redraw(prompt, start, &buf, cursor, &mut scroll); }
             KeyCode::Up => {
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
@@ -985,7 +1111,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         cursor = buf.len();
                     }
                 }
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Down => {
                 if let Ok(h) = history().lock() {
@@ -994,18 +1120,20 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         _ => { hist_idx = None; buf.clear(); cursor = 0; }
                     }
                 }
-                redraw(start, &buf, cursor, &mut scroll);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
                 let cont = cursor > 0 && buf[cursor - 1] == '\\';
                 if cont {
                     buf.remove(cursor - 1);
                     cursor -= 1;
-                    redraw(start, &buf, cursor, &mut scroll);
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
                 }
-                print!("\r\n");
-                flush();
-                return Some(RawLine::Submit(buf.iter().collect(), cont));
+                let text: String = buf.iter().collect();
+                if !cont {
+                    echo_submitted(prompt, &text);
+                }
+                return Some(RawLine::Submit(text, cont));
             }
             KeyCode::Tab => {
                 let (tok_start, token) = token_at(&buf, cursor);
@@ -1019,25 +1147,25 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         buf.insert(cursor, ' ');
                         cursor += 1;
                     }
-                    redraw(start, &buf, cursor, &mut scroll);
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
                 } else if cands.len() > 1 {
                     let common = common_prefix(&cands);
                     if common.chars().count() > token.chars().count() {
                         let new: Vec<char> = common.chars().collect();
                         buf.splice(tok_start..cursor, new.iter().copied());
                         cursor = tok_start + new.len();
-                        redraw(start, &buf, cursor, &mut scroll);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
                     } else {
-                        print!("\r\n");
+                        clear_composer();
                         for c in &cands {
-                            print!("  {}\r\n", dim(c));
+                            line(&format!("  {}", dim(c)));
                         }
                         flush();
                         reline!();
                     }
                 }
             }
-            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(start, &buf, cursor, &mut scroll); }
+            KeyCode::Esc => { buf.clear(); cursor = 0; redraw(prompt, start, &buf, cursor, &mut scroll); }
             _ => {}
         }
     }

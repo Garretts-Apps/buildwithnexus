@@ -8,6 +8,8 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+use crate::checkpoint;
+
 pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
@@ -25,6 +27,8 @@ fn err(s: impl Into<String>) -> Outcome { Outcome { content: s.into(), is_error:
 
 const MAX_READ: usize = 100 * 1024;
 const MAX_OUT: usize = 16 * 1024;
+const MAX_SEARCH_FILES: usize = 10_000;
+const DEFAULT_SEARCH_LIMIT: usize = 100;
 
 // Exposed only for the criterion perf suite (see provider::bench).
 #[doc(hidden)]
@@ -36,10 +40,14 @@ pub mod bench {
 
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
-        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Works anywhere on the filesystem.",
-            schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
+        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. Works anywhere on the filesystem.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}) },
         ToolDef { name: "list_dir", description: "List entries in a directory. Works anywhere on the filesystem.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
+        ToolDef { name: "find_files", description: "Recursively find files by a simple glob pattern such as `*.rs` or `src/*test*`. Skips heavy build/dependency directories.",
+            schema: json!({"type":"object","properties":{"root":{"type":"string","default":"."},"pattern":{"type":"string"},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
+        ToolDef { name: "grep_files", description: "Search text files for a literal pattern and return path:line matches. Optional file_pattern limits searched files, e.g. `*.rs`.",
+            schema: json!({"type":"object","properties":{"root":{"type":"string","default":"."},"pattern":{"type":"string"},"file_pattern":{"type":"string"},"case_sensitive":{"type":"boolean","default":false},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
         ToolDef { name: "write_file", description: "Create or overwrite a file with the given contents.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}) },
         ToolDef { name: "edit_file", description: "Replace the unique occurrence of `old` with `new` in a file.",
@@ -98,6 +106,8 @@ pub fn preview(name: &str, input: &Value) -> String {
         "write_file" => format!("write {}", input["path"].as_str().unwrap_or("?")),
         "edit_file" => format!("edit {}", input["path"].as_str().unwrap_or("?")),
         "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
+        "find_files" => format!("find files: {}", input["pattern"].as_str().unwrap_or("?")),
+        "grep_files" => format!("grep: {}", input["pattern"].as_str().unwrap_or("?")),
         "spawn_subagent" => format!("subagent: {}", input["task"].as_str().unwrap_or("?")),
         "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
         _ => name.to_string(),
@@ -120,6 +130,7 @@ pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
         "read_file" | "list_dir" | "write_file" | "edit_file" => {
             Some(resolve(cwd, input["path"].as_str().unwrap_or("")))
         }
+        "find_files" | "grep_files" => Some(resolve(cwd, input["root"].as_str().unwrap_or("."))),
         _ => None,
     }
 }
@@ -329,12 +340,116 @@ fn truncate(s: String, max: usize) -> String {
     out
 }
 
+fn line_range(input: &Value) -> Option<(usize, usize)> {
+    let start = input["start_line"].as_u64().map(|n| n.max(1) as usize);
+    let end = input["end_line"].as_u64().map(|n| n.max(1) as usize);
+    match (start, end) {
+        (Some(s), Some(e)) => Some((s, e.max(s))),
+        (Some(s), None) => Some((s, usize::MAX)),
+        (None, Some(e)) => Some((1, e)),
+        (None, None) => None,
+    }
+}
+
+fn apply_line_range(text: &str, range: Option<(usize, usize)>) -> String {
+    let Some((start, end)) = range else {
+        return text.to_string();
+    };
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let line_no = i + 1;
+            if line_no >= start && line_no <= end { Some(line) } else { None }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn skip_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+            | ".cache" | "vendor" | "__pycache__"
+    )
+}
+
+fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
+    if *seen >= MAX_SEARCH_FILES {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in rd.filter_map(|e| e.ok()) {
+        if *seen >= MAX_SEARCH_FILES {
+            break;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if !skip_dir(&path) {
+                collect_files(&path, out, seen);
+            }
+        } else if path.is_file() {
+            *seen += 1;
+            out.push(path);
+        }
+    }
+}
+
+fn simple_glob_match(pattern: &str, text: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return text == pattern || text.ends_with(pattern);
+    }
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let parts: Vec<&str> = pattern.split('*').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return true;
+    }
+    let mut rest = text;
+    for (idx, part) in parts.iter().enumerate() {
+        let Some(pos) = rest.find(part) else {
+            return false;
+        };
+        if idx == 0 && anchored_start && pos != 0 {
+            return false;
+        }
+        rest = &rest[pos + part.len()..];
+    }
+    if anchored_end {
+        if let Some(last) = parts.last() {
+            return text.ends_with(last);
+        }
+    }
+    true
+}
+
+fn display_path(path: &Path, cwd: &Path) -> String {
+    path.strip_prefix(cwd)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn search_limit(input: &Value) -> usize {
+    input["max"]
+        .as_u64()
+        .map(|n| n.clamp(1, 500) as usize)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+}
+
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     match name {
         "read_file" => {
             let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
             match fs::read_to_string(&p) {
-                Ok(c) => ok(truncate(c, MAX_READ)),
+                Ok(c) => ok(truncate(apply_line_range(&c, line_range(input)), MAX_READ)),
                 Err(e) => err(format!("cannot read {}: {e}", p.display())),
             }
         }
@@ -352,12 +467,80 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot list {}: {e}", p.display())),
             }
         }
+        "find_files" => {
+            let root = resolve(cwd, input["root"].as_str().unwrap_or("."));
+            let pattern = input["pattern"].as_str().unwrap_or("").trim();
+            if pattern.is_empty() {
+                return err("pattern is required");
+            }
+            let limit = search_limit(input);
+            let mut files = Vec::new();
+            let mut seen = 0;
+            collect_files(&root, &mut files, &mut seen);
+            files.sort();
+            let matches: Vec<String> = files
+                .into_iter()
+                .filter_map(|path| {
+                    let rel = display_path(&path, cwd);
+                    let name_match = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| simple_glob_match(pattern, name));
+                    if simple_glob_match(pattern, &rel) || name_match { Some(rel) } else { None }
+                })
+                .take(limit)
+                .collect();
+            if matches.is_empty() { ok(format!("no files matched {pattern}")) } else { ok(matches.join("\n")) }
+        }
+        "grep_files" => {
+            let root = resolve(cwd, input["root"].as_str().unwrap_or("."));
+            let pattern = input["pattern"].as_str().unwrap_or("");
+            if pattern.is_empty() {
+                return err("pattern is required");
+            }
+            let file_pattern = input["file_pattern"].as_str().unwrap_or("*");
+            let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
+            let needle = if case_sensitive { pattern.to_string() } else { pattern.to_lowercase() };
+            let limit = search_limit(input);
+            let mut files = Vec::new();
+            let mut seen = 0;
+            collect_files(&root, &mut files, &mut seen);
+            files.sort();
+            let mut matches = Vec::new();
+            for path in files {
+                if matches.len() >= limit {
+                    break;
+                }
+                let rel = display_path(&path, cwd);
+                let basename_matches = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| simple_glob_match(file_pattern, name));
+                if !simple_glob_match(file_pattern, &rel) && !basename_matches {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (idx, line) in text.lines().enumerate() {
+                    let haystack = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+                    if haystack.contains(&needle) {
+                        matches.push(format!("{}:{}:{}", rel, idx + 1, line.trim_end()));
+                        if matches.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+            if matches.is_empty() { ok(format!("no matches for {pattern}")) } else { ok(matches.join("\n")) }
+        }
         "write_file" => {
             let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
             let content = input["content"].as_str().unwrap_or("");
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
             }
+            checkpoint::record(cwd, &p, "write_file");
             match fs::write(&p, content) {
                 Ok(_) => ok(format!("wrote {} ({} bytes)", p.display(), content.len())),
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
@@ -382,6 +565,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if body[first + old.len()..].contains(old) {
                 return err("`old` text is not unique — add surrounding context");
             }
+            checkpoint::record(cwd, &p, "edit_file");
             match fs::write(&p, body.replacen(old, new, 1)) {
                 Ok(_) => ok(format!("edited {}", p.display())),
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
@@ -647,6 +831,37 @@ mod tests {
         let d = tempdir();
         let r = run("read_file", &json!({"path": "nope.txt"}), &d);
         assert!(r.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_read_file_line_range() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "f.txt", "content": "one\ntwo\nthree\nfour"}), &d);
+        let r = run("read_file", &json!({"path": "f.txt", "start_line": 2, "end_line": 3}), &d);
+        assert_eq!(r.content, "two\nthree");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_find_files_matches_glob_and_skips_heavy_dirs() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "src/main.rs", "content": ""}), &d);
+        run("write_file", &json!({"path": "target/debug/skip.rs", "content": ""}), &d);
+        let r = run("find_files", &json!({"root": ".", "pattern": "*.rs"}), &d);
+        assert!(r.content.contains("src/main.rs"), "{}", r.content);
+        assert!(!r.content.contains("target/debug/skip.rs"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_grep_files_returns_literal_path_line_matches() {
+        let d = tempdir();
+        run("write_file", &json!({"path": "src/lib.rs", "content": "alpha\nNeedle\nbeta"}), &d);
+        run("write_file", &json!({"path": "README.md", "content": "Needle"}), &d);
+        let r = run("grep_files", &json!({"root": ".", "pattern": "needle", "file_pattern": "*.rs"}), &d);
+        assert!(r.content.contains("src/lib.rs:2:Needle"), "{}", r.content);
+        assert!(!r.content.contains("README.md"), "{}", r.content);
         let _ = fs::remove_dir_all(&d);
     }
 

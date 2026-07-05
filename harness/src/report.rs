@@ -63,7 +63,7 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     }
     // A role-colored header line (icon + what it's about to do), opencode-style.
     let (icon, head) = match name {
-        "read_file" | "list_dir" => ("◇", tui::cyan(preview)),
+        "read_file" | "list_dir" | "find_files" | "grep_files" => ("◇", tui::cyan(preview)),
         "write_file" | "edit_file" => ("◆", tui::yellow(preview)),
         "run_command" => ("»", tui::blue(preview)),
         "spawn_subagent" => ("⊞", tui::accent(preview)),
@@ -125,7 +125,7 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
                 tui::line(&tui::dim(&format!("    {l}")));
             }
         }
-        "read_file" | "list_dir" => {
+        "read_file" | "list_dir" | "find_files" | "grep_files" => {
             let n = content.lines().count();
             tui::line(&tui::dim(&format!("    ↳ {n} line{}", if n == 1 { "" } else { "s" })));
         }

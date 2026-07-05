@@ -26,23 +26,54 @@ pub fn run() -> Option<Settings> {
         }
     }
     tui::line("");
-    tui::line("  Let's get you set up. Pick a model provider:");
+    let default_ollama_url = config::PRESETS
+        .iter()
+        .find(|p| p.id == "ollama")
+        .map(|p| p.base_url)
+        .unwrap_or("http://localhost:11434/v1");
+    let ollama_models = provider::ollama_models(default_ollama_url);
+    tui::line(&tui::accent("  Local model check"));
+    if ollama_models.is_empty() {
+        tui::line(&tui::dim("  Ollama is reachable only after it is installed, running, and has a model pulled."));
+    } else {
+        tui::line(&tui::green(&format!(
+            "  found Ollama with {} model{}",
+            ollama_models.len(),
+            if ollama_models.len() == 1 { "" } else { "s" }
+        )));
+    }
+    tui::line("");
+    tui::line("  Pick a model provider:");
     tui::line("");
 
-    for (i, p) in PRESETS.iter().enumerate() {
-        let tag = if p.local { tui::green("local") } else { tui::blue("remote") };
-        tui::line(&format!("  {}  {:<26} {}", tui::bold(&(i + 1).to_string()), p.label, tag));
+    if !ollama_models.is_empty() {
+        tui::line(&format!("  {}  {:<26} {}", tui::bold("0"), "Ollama", tui::green("recommended local")));
+    }
+    tui::line(&tui::dim("  Local"));
+    for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| p.local) {
+        tui::line(&format!("  {}  {:<26} {}", tui::bold(&(i + 1).to_string()), p.label, tui::green("local")));
+    }
+    tui::line(&tui::dim("  Remote"));
+    for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| !p.local) {
+        tui::line(&format!("  {}  {:<26} {}", tui::bold(&(i + 1).to_string()), p.label, tui::blue("remote")));
     }
     tui::line("");
 
     let pick = loop {
-        let ans = tui::ask("  provider number: ")?;
-        if let Ok(n) = ans.trim().parse::<usize>() {
+        let ans = tui::ask("  provider number or name: ")?;
+        let ans = ans.trim();
+        if ans == "0" && !ollama_models.is_empty() {
+            break PRESETS.iter().find(|p| p.id == "ollama").unwrap();
+        }
+        if let Ok(n) = ans.parse::<usize>() {
             if n >= 1 && n <= PRESETS.len() {
                 break &PRESETS[n - 1];
             }
         }
-        tui::line(&tui::red("  enter a number from the list"));
+        if let Some(p) = PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(ans) || p.label.eq_ignore_ascii_case(ans)) {
+            break p;
+        }
+        tui::line(&tui::red("  enter a number or provider name from the list"));
     };
 
     // Local endpoints can move (custom host/port); offer an override.
@@ -59,7 +90,9 @@ pub fn run() -> Option<Settings> {
     // prompt offers real choices: Ollama's API for Ollama, GGUF files on disk
     // for llama.cpp / LM Studio.
     let detected: Vec<String> = if pick.local {
-        let found = if pick.id == "ollama" {
+        let found = if pick.id == "ollama" && base_url.as_deref().unwrap_or(pick.base_url) == default_ollama_url {
+            ollama_models.clone()
+        } else if pick.id == "ollama" {
             provider::ollama_models(base_url.as_deref().unwrap_or(pick.base_url))
         } else {
             local::scan_gguf()
@@ -71,6 +104,15 @@ pub fn run() -> Option<Settings> {
             tui::line(&tui::dim(&format!("    • llama.cpp / LM Studio: drop a .gguf into {}", local::models_dir().display())));
             tui::line(&tui::dim("      (or your LM Studio models folder), then start the server"));
             tui::line(&tui::dim("    you can also just type a model name below, then re-run init once it's available"));
+            if pick.id == "ollama" {
+                let pull = tui::ask("  pull qwen2.5:3b now? [y/N]: ").unwrap_or_default();
+                if matches!(pull.trim(), "y" | "Y" | "yes" | "YES") {
+                    let out = crate::tools::run("run_command", &serde_json::json!({"command": "ollama pull qwen2.5:3b"}), std::path::Path::new("."));
+                    for line in out.content.lines() {
+                        tui::line(&tui::dim(&format!("    {line}")));
+                    }
+                }
+            }
         } else {
             tui::line(&tui::dim("  detected local models:"));
             for (i, m) in found.iter().take(20).enumerate() {
