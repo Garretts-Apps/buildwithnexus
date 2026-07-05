@@ -83,9 +83,14 @@ function buildFromSource() {
   return true;
 }
 
+function isLocalCheckout() {
+  return fs.existsSync(path.join(ROOT, '.git'));
+}
+
 async function obtain() {
   if (process.env.BWN_SKIP_INSTALL) return false;
-  if (existing()) return true;
+  if (isLocalCheckout() && hasCargo() && buildFromSource()) return true;
+  if (existing() && !isLocalCheckout()) return true;
 
   const t = target();
   if (t) {

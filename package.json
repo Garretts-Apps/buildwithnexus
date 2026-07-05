@@ -1,13 +1,13 @@
 {
   "name": "buildwithnexus",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "A hilariously fast, agentic AI CLI harness in Rust — remote (API key) or local models, full-screen TUI with sessions, plan/build/brainstorm modes, and hooks",
   "bin": {
     "buildwithnexus": "bin/buildwithnexus.js",
     "bwn": "bin/buildwithnexus.js"
   },
   "files": [
-    "bin/",
+    "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
     "scripts/postinstall.js",
     "harness/Cargo.toml",
