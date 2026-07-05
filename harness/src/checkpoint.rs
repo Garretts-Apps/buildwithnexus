@@ -83,7 +83,7 @@ pub fn list(cwd: &Path) -> Vec<Checkpoint> {
         .filter_map(|s| serde_json::from_str::<Checkpoint>(&s).ok())
         .filter(|cp| cp.cwd == cwd)
         .collect();
-    items.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    items.sort_by_key(|cp| std::cmp::Reverse(cp.created_ms));
     items
 }
 
