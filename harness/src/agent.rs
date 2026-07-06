@@ -288,8 +288,24 @@ over installing an alternative.",
 }
 
 // Build the system prompt prefix from memory and skills/agents files.
-fn context_prefix() -> String {
+fn context_prefix(cwd: &Path) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    let home_str = std::env::var("HOME").unwrap_or_default();
+    let mut path_info = format!(
+        "[Environment Paths]\n\
+         Workspace (CWD): {}\n\
+         User Home (~): {}\n",
+        cwd.display(),
+        home_str
+    );
+    if cwd.to_string_lossy().contains("/tmp/") || cwd.to_string_lossy().contains("/private/tmp/") {
+        path_info.push_str(
+            "Note: The current workspace is running in a temporary directory/mount. \
+             To find personal folders or files belonging to the user, you must search starting from the User Home (~).\n"
+        );
+    }
+    parts.push(path_info);
 
     // Always include the tool manifest so the model knows what's built-in
     // and doesn't try to install external tools to do things we already handle.
@@ -610,7 +626,7 @@ fn build_inner(
     };
     let defs = tools::defs(depth < MAX_DEPTH);
     if msgs.is_empty() {
-        let prefix = context_prefix();
+        let prefix = context_prefix(cwd);
         let sys = format!("{prefix}{}", role(role_id).system);
         msgs.push(Msg::System(sys));
     }
@@ -941,7 +957,7 @@ fn make_worktree(cwd: &Path) -> Option<PathBuf> {
 // The planning phase now has tools available so the model can inspect the
 // codebase while breaking down the task. Execution still runs through BUILD.
 pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
-    let prefix = context_prefix();
+    let prefix = context_prefix(cwd);
     let sys = format!(
         "{prefix}You are a planning engineer with full access to the codebase. \
         Use read_file and list_dir and run_command to inspect the project as needed. \
@@ -1095,7 +1111,7 @@ pub fn run_brainstorm(
     cwd: &Path,
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
-    let prefix = context_prefix();
+    let prefix = context_prefix(cwd);
     let sys = format!("{prefix}You are a sharp, concise thought partner with full access to the codebase and the internet. \
         Use tools freely to look things up, read files, grep for patterns, or run commands — \
         whatever helps the conversation. \
