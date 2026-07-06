@@ -1727,7 +1727,11 @@ fn search_limit(input: &Value) -> usize {
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     match name {
         "read" | "read_file" => {
-            let p = resolve(cwd, path_arg(input).unwrap_or(""));
+            let p_str = path_arg(input).unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             match fs::read_to_string(&p) {
                 Ok(c) => ok(truncate(apply_line_range(&c, line_range(input)), MAX_READ)),
                 Err(e) => err(format!(
@@ -1740,6 +1744,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let Some(paths) = input["paths"].as_array() else {
                 return err("paths is required");
             };
+            if paths.is_empty() {
+                return err("paths array cannot be empty");
+            }
             let max = input["max_bytes_per_file"]
                 .as_u64()
                 .unwrap_or(MAX_READ as u64)
@@ -1795,7 +1802,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "file_info" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            let p_str = input["path"].as_str().unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             match fs::metadata(&p) {
                 Ok(m) => {
                     let kind = if m.is_dir() {
@@ -1952,7 +1963,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "write" | "write_file" => {
-            let p = resolve(cwd, path_arg(input).unwrap_or(""));
+            let p_str = path_arg(input).unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             let content = input["content"].as_str().unwrap_or("");
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
@@ -1964,7 +1979,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "edit" | "edit_file" => {
-            let p = resolve(cwd, path_arg(input).unwrap_or(""));
+            let p_str = path_arg(input).unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             let old = input["old"]
                 .as_str()
                 .or_else(|| input["oldString"].as_str())
@@ -1995,10 +2014,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "multi_edit" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            let p_str = input["path"].as_str().unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             let Some(edits) = input["edits"].as_array() else {
                 return err("edits is required");
             };
+            if edits.is_empty() {
+                return err("edits array cannot be empty");
+            }
             let mut body = match fs::read_to_string(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
@@ -2057,15 +2083,24 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "create_dir" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            let p_str = input["path"].as_str().unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             match fs::create_dir_all(&p) {
                 Ok(_) => ok(format!("created {}", p.display())),
                 Err(e) => err(format!("cannot create {}: {e}", p.display())),
             }
         }
         "move_path" => {
-            let from = resolve(cwd, input["from"].as_str().unwrap_or(""));
-            let to = resolve(cwd, input["to"].as_str().unwrap_or(""));
+            let from_str = input["from"].as_str().unwrap_or("").trim();
+            let to_str = input["to"].as_str().unwrap_or("").trim();
+            if from_str.is_empty() || to_str.is_empty() {
+                return err("both 'from' and 'to' arguments are required and cannot be empty");
+            }
+            let from = resolve(cwd, from_str);
+            let to = resolve(cwd, to_str);
             if let Some(parent) = to.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -2080,7 +2115,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "remove_path" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            let p_str = input["path"].as_str().unwrap_or("").trim();
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             checkpoint::record(cwd, &p, "remove_path");
             let res = if p.is_dir() {
                 fs::remove_dir(&p)
@@ -2093,7 +2132,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "bash" | "run_command" => {
-            let cmd = input["command"].as_str().unwrap_or("");
+            let cmd = input["command"].as_str().unwrap_or("").trim();
+            if cmd.is_empty() {
+                return err("command argument is required and cannot be empty");
+            }
             let output = if cfg!(windows) {
                 Command::new("cmd")
                     .args(["/C", cmd])
@@ -2129,6 +2171,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let Some(items) = input["items"].as_array() else {
                 return err("items is required");
             };
+            if items.is_empty() {
+                return err("items array cannot be empty");
+            }
             let mut next = Vec::new();
             for item in items {
                 let task = item["task"]
@@ -3410,6 +3455,23 @@ mod tests {
             &d,
         );
         assert!(e.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_tools_empty_input_errors() {
+        let d = tempdir();
+        assert!(run("read_file", &json!({"path": ""}), &d).is_error);
+        assert!(run("write_file", &json!({"path": "", "content": "abc"}), &d).is_error);
+        assert!(run("edit_file", &json!({"path": "", "old": "a", "new": "b"}), &d).is_error);
+        assert!(run("multi_edit", &json!({"path": "", "edits": [{"old": "a", "new": "b"}]}), &d).is_error);
+        assert!(run("multi_edit", &json!({"path": "f.txt", "edits": []}), &d).is_error);
+        assert!(run("create_dir", &json!({"path": ""}), &d).is_error);
+        assert!(run("move_path", &json!({"from": "", "to": "b"}), &d).is_error);
+        assert!(run("move_path", &json!({"from": "a", "to": ""}), &d).is_error);
+        assert!(run("remove_path", &json!({"path": ""}), &d).is_error);
+        assert!(run("run_command", &json!({"command": ""}), &d).is_error);
+        assert!(run("todo_write", &json!({"items": []}), &d).is_error);
         let _ = fs::remove_dir_all(&d);
     }
 
