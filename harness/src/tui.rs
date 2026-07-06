@@ -435,6 +435,19 @@ fn osc52_copy(text: &str) {
     let encoded = b64_encode(text.as_bytes());
     print!("\x1b]52;c;{encoded}\x07");
     let _ = io::stdout().flush();
+    if crate::tools::is_wsl() {
+        if let Ok(mut child) = std::process::Command::new("clip.exe")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+        }
+    }
 }
 
 fn b64_encode(data: &[u8]) -> String {

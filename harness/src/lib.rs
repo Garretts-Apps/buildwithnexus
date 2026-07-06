@@ -2449,6 +2449,18 @@ fn run_doctor() {
         println!("  {glyph} {bin:<12} {label}");
     }
 
+    if crate::tools::is_wsl() {
+        println!();
+        println!("  ✓ WSL2 runtime     detected");
+        let home = config::home();
+        if crate::tools::is_wsl_windows_mount(&home) {
+            println!("  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).", home.display());
+            println!("                     Set NEXUS_HOME to a Linux path (~/.buildwithnexus) for 10x faster I/O.");
+        } else {
+            println!("  ✓ WSL2 filesystem  native Linux filesystem detected (optimal I/O speed)");
+        }
+    }
+
     // Connectivity (quick HEAD to detect outbound network)
     println!();
     println!("  checking connectivity...");
