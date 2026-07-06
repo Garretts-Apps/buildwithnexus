@@ -2785,29 +2785,26 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 }
                 "undo_edit" => {
                     let p = resolve(cwd, path);
-                    let backup = {
-                        let guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.clone()
-                    };
-                    if let Some((backup_path, old_content)) = backup {
-                        if backup_path == p {
-                            match fs::write(&p, &old_content) {
-                                Ok(_) => {
-                                    let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                                    *guard = None;
-                                    ok(format!(
-                                        "successfully reverted the last edit to {}",
-                                        p.display()
-                                    ))
-                                }
-                                Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                            }
-                        } else {
-                            err(format!(
+                    let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                    let is_match = guard.as_ref().map_or(false, |(bp, _)| *bp == p);
+                    if !is_match {
+                        if let Some((backup_path, _)) = &*guard {
+                            return err(format!(
                                 "the last edit was to {}, cannot undo for {}",
                                 backup_path.display(),
                                 p.display()
-                            ))
+                            ));
+                        } else {
+                            return err("no undo backup available for this file");
+                        }
+                    }
+                    if let Some((_, old_content)) = guard.take() {
+                        match fs::write(&p, &old_content) {
+                            Ok(_) => ok(format!("successfully reverted the last edit to {}", p.display())),
+                            Err(e) => {
+                                *guard = Some((p.clone(), old_content));
+                                err(format!("cannot write {}: {e}", p.display()))
+                            }
                         }
                     } else {
                         err("no undo backup available for this file")
