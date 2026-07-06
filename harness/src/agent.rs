@@ -1116,7 +1116,7 @@ fn build_inner(
     // text as the task without pushing another User turn; otherwise push normally.
     let already_pushed = matches!(msgs.last(), Some(Msg::UserImages { .. }));
     if !already_pushed {
-        msgs.push(Msg::User(task));
+        msgs.push(Msg::User(task.clone()));
     }
 
     // Track which files have been read this session so we can enforce read-before-write.
@@ -1560,6 +1560,33 @@ fn build_inner(
             tui::poll_typeahead();
         }
         if let Some(s) = summary {
+            if depth == 0 && !report::is_json() {
+                let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
+                let ctx = crate::verifier::VerificationContext {
+                    task_description: task.to_string(),
+                    task_type: None,
+                    changed_files: vec![],
+                    tool_calls: vec![],
+                    evidence_gathered: vec![],
+                    tests_added: vec![],
+                    dependencies_changed: vec![],
+                    git_diff: None,
+                };
+                let rep = verifier.verify(&ctx);
+                if matches!(
+                    rep.status,
+                    crate::verifier::VerificationStatus::PassedWithWarnings
+                        | crate::verifier::VerificationStatus::Blocked
+                        | crate::verifier::VerificationStatus::Failed
+                ) {
+                    report::notice(&format!("  [Verification: {}]", rep.status));
+                    if !rep.rule_violations.is_empty() {
+                        report::notice(&crate::rules::RuleEngine::format_violations(
+                            &rep.rule_violations,
+                        ));
+                    }
+                }
+            }
             return Ok(s);
         }
     }
