@@ -125,10 +125,9 @@ pub fn enqueue(task: &str, kind: WorkflowKind) -> usize {
 /// Cancel a workflow by ID. Kills the subprocess if running.
 pub fn cancel(id: usize) -> bool {
     let mut m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(a) = &mut m.active {
-        if a.id == id {
+    if m.active.as_ref().map_or(false, |a| a.id == id) {
+        if let Some(mut a) = m.active.take() {
             let _ = a.child.kill();
-            let a = m.active.take().unwrap();
             drop(a.child);
         }
     }
@@ -226,8 +225,9 @@ pub fn tick() -> Option<String> {
                 .map(|b| b.clone())
                 .unwrap_or_default();
             let ok = exit.success();
-            let a = m.active.take().unwrap();
-            drop(a.child);
+            if let Some(a) = m.active.take() {
+                drop(a.child);
+            }
 
             if let Some(wf) = m.workflows.iter_mut().find(|w| w.id == id) {
                 wf.output.extend(buf_lines);
