@@ -14,6 +14,9 @@ Use this skill whenever the task requires acting through buildwithnexus tools.
 - `write_file`: create or overwrite a file.
 - `edit_file`: replace one unique text occurrence in a file.
 - `multi_edit`: apply several exact replacements to one file.
+- `Artifact` / `publish_artifact`: Publish a structured document, webpage, SVG, diagram, or dataset.
+- `str_replace_editor` / `text_editor_20241022` / `text_editor_20250124`: A unified tool for viewing, creating, and editing files natively.
+- `AskUserQuestion`: Present the user with an interactive multiple-choice or written question.
 - `apply_patch`: apply a unified diff through `git apply`.
 - `create_dir`, `move_path`, `remove_path`: basic filesystem mutation.
 - `run_command`: run shell commands and return output.
@@ -24,6 +27,12 @@ Use this skill whenever the task requires acting through buildwithnexus tools.
 - `save_memory`: persist durable user preferences or facts.
 - `spawn_subagent`: delegate a self-contained task to a fresh agent context.
 - `finish`: complete the task with a short summary.
+
+## Tool Discipline
+
+- **Mandatory Tool Usage:** Whenever generating or editing code, HTML, or any file contents, you MUST use the appropriate tool (e.g., `Artifact`, `str_replace_editor`, `write_file`). NEVER just write the code in plain markdown as your text response.
+- **No Placeholders:** When using file modification tools or `Artifact`, the contents MUST be fully implemented code or text. DO NOT use placeholders like `// canvas game logic here`.
+
 
 ## Choosing tools
 
