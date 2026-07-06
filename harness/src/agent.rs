@@ -940,6 +940,7 @@ fn build_inner(
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
         }
+        let start_instant = std::time::Instant::now();
         let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
             Ok(r) => r,
             Err(e) => {
@@ -947,6 +948,11 @@ fn build_inner(
                 return Err(e);
             }
         };
+        let elapsed = start_instant.elapsed().as_secs_f64();
+        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
+        if !report::is_json() {
+            tui::inference_telemetry(gen_toks.max(10), elapsed);
+        }
         hooks::notify("PostResponse", cwd);
         if reply.calls.is_empty() {
             if let Some(input) = auto_static_artifact_input(&task_for_recovery, &reply.text) {
@@ -1649,7 +1655,13 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             ));
         }
         maybe_compact(p, &mut msgs);
+        let start_instant = std::time::Instant::now();
         let reply = request_reply(p, &msgs, &defs, "planning")?;
+        let elapsed = start_instant.elapsed().as_secs_f64();
+        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
+        if !report::is_json() {
+            tui::inference_telemetry(gen_toks.max(10), elapsed);
+        }
 
         if reply.calls.is_empty() {
             let candidate_steps = parse_plan_steps(&reply.text);
@@ -1878,7 +1890,13 @@ pub fn run_brainstorm(
                 );
             }
             tui::line("");
+            let start_instant = std::time::Instant::now();
             let reply = request_reply(p, &msgs, &defs, "thinking")?;
+            let elapsed = start_instant.elapsed().as_secs_f64();
+            let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
+            if !report::is_json() {
+                tui::inference_telemetry(gen_toks.max(10), elapsed);
+            }
 
             if reply.calls.is_empty() {
                 msgs.push(Msg::Assistant {

@@ -5,8 +5,7 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -28,10 +27,33 @@ static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 // Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
 static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static VIM_MODE: AtomicBool = AtomicBool::new(false);
+static VIM_STATE_VAL: AtomicU8 = AtomicU8::new(0); // 0 = Normal, 1 = Insert, 2 = Visual
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimState {
+    Insert,
+    Normal,
+    Visual(usize),
+}
+
+pub fn get_vim_state_label() -> &'static str {
+    if !is_vim_mode() {
+        return "";
+    }
+    match VIM_STATE_VAL.load(Ordering::Relaxed) {
+        0 => "NORMAL",
+        1 => "INSERT",
+        2 => "VISUAL",
+        _ => "NORMAL",
+    }
+}
 
 pub fn toggle_vim_mode() -> bool {
     let old = VIM_MODE.load(Ordering::Relaxed);
     VIM_MODE.store(!old, Ordering::Relaxed);
+    if !old {
+        VIM_STATE_VAL.store(0, Ordering::Relaxed); // Default to Normal mode
+    }
     !old
 }
 
@@ -678,14 +700,27 @@ fn render_footer() {
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
     if !footer.is_empty() {
         let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
+        let vim_badge = if is_vim_mode() {
+            let label = get_vim_state_label();
+            let colored = match label {
+                "NORMAL" => green(&format!("[VIM:{label}]")),
+                "INSERT" => yellow(&format!("[VIM:{label}]")),
+                "VISUAL" => cyan(&format!("[VIM:{label}]")),
+                _ => green("[VIM]"),
+            };
+            format!(" {} ", bold(&colored))
+        } else {
+            String::new()
+        };
         let text = if offset > 0 {
             format!(
-                "{} {}",
+                "{}{} {}",
+                vim_badge,
                 footer.as_str(),
                 dim(&format!("· scroll +{offset}"))
             )
         } else {
-            footer.to_string()
+            format!("{}{}", vim_badge, footer.as_str())
         };
         let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
     }
@@ -1062,6 +1097,26 @@ pub fn context_meter(used: usize, total: usize) {
             total / 1_000,
             est_cost
         )),
+    ));
+}
+
+pub fn inference_telemetry(tokens_generated: usize, elapsed_secs: f64) {
+    if elapsed_secs <= 0.0 || tokens_generated == 0 {
+        return;
+    }
+    let tok_per_sec = tokens_generated as f64 / elapsed_secs;
+    let speed_badge = if tok_per_sec >= 40.0 {
+        green(&format!("{:.1} tok/s", tok_per_sec))
+    } else if tok_per_sec >= 15.0 {
+        yellow(&format!("{:.1} tok/s", tok_per_sec))
+    } else {
+        red(&format!("{:.1} tok/s", tok_per_sec))
+    };
+    line(&format!(
+        "  {} [{}] {}",
+        dim("inference"),
+        speed_badge,
+        dim(&format!("~{} tokens generated in {:.2}s", tokens_generated, elapsed_secs)),
     ));
 }
 
@@ -1643,13 +1698,70 @@ fn common_prefix(items: &[String]) -> String {
 }
 
 fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
+    if let Some(query) = partial.strip_prefix("kb:") {
+        let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+        let mut out = Vec::new();
+        for (id, entity) in &kb.entities {
+            if id.to_lowercase().contains(&query.to_lowercase())
+                || entity.name.to_lowercase().contains(&query.to_lowercase())
+            {
+                out.push(format!("kb:{id}"));
+            }
+        }
+        out.sort();
+        return out;
+    }
+    if let Some(query) = partial.strip_prefix("symbol:") {
+        let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+        let mut out = Vec::new();
+        for (id, entity) in &kb.entities {
+            if matches!(
+                entity.entity_type,
+                crate::knowledge::EntityType::Function
+                    | crate::knowledge::EntityType::Class
+                    | crate::knowledge::EntityType::Interface
+                    | crate::knowledge::EntityType::Module
+            ) {
+                if id.to_lowercase().contains(&query.to_lowercase())
+                    || entity.name.to_lowercase().contains(&query.to_lowercase())
+                {
+                    out.push(format!("symbol:{id}"));
+                }
+            }
+        }
+        out.sort();
+        return out;
+    }
+    if let Some(query) = partial.strip_prefix("rules:") {
+        let mut engine = crate::rules::RuleEngine::load_defaults();
+        let rules_dir = cwd.join(".buildwithnexus").join("rules");
+        if let Ok(rd) = std::fs::read_dir(&rules_dir) {
+            for e in rd.flatten() {
+                if let Ok(loaded) = crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy()) {
+                    for r in loaded.rules {
+                        engine.add_rule(r);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for rule in &engine.rules {
+            if rule.id.to_lowercase().contains(&query.to_lowercase())
+                || rule.description.to_lowercase().contains(&query.to_lowercase())
+            {
+                out.push(format!("rules:{}", rule.id));
+            }
+        }
+        out.sort();
+        return out;
+    }
     let (base, dir, prefix) = match partial.rfind('/') {
         Some(i) => (&partial[..=i], cwd.join(&partial[..=i]), &partial[i + 1..]),
         None => ("", cwd.to_path_buf(), partial),
     };
     let mut out = Vec::new();
     if base.is_empty() {
-        for special in ["diff", "status", "rules", "kb:", "symbol:", "url:", "web:"] {
+        for special in ["diff", "status", "rules", "rules:", "kb:", "symbol:", "url:", "web:"] {
             if special.starts_with(prefix) {
                 out.push(special.to_string());
             }
@@ -1770,6 +1882,11 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     redraw(prompt, start, &buf, cursor, &mut scroll);
     let mut hist_idx: Option<usize> = None;
     let mut kill = String::new();
+    let mut vim_state = if is_vim_mode() { VimState::Normal } else { VimState::Insert };
+    let mut vim_undo_stack: Vec<Vec<char>> = vec![buf.clone()];
+    if is_vim_mode() {
+        VIM_STATE_VAL.store(0, Ordering::Relaxed);
+    }
 
     macro_rules! reline {
         () => {{
@@ -2044,14 +2161,117 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char(c) if !ctrl && !alt => {
-                buf.insert(cursor, c);
-                cursor += 1;
+                if is_vim_mode() && vim_state == VimState::Normal {
+                    match c {
+                        'i' => vim_state = VimState::Insert,
+                        'a' => {
+                            if cursor < buf.len() { cursor += 1; }
+                            vim_state = VimState::Insert;
+                        }
+                        'I' => {
+                            cursor = 0;
+                            vim_state = VimState::Insert;
+                        }
+                        'A' => {
+                            cursor = buf.len();
+                            vim_state = VimState::Insert;
+                        }
+                        'h' => cursor = cursor.saturating_sub(1),
+                        'l' => if cursor < buf.len() { cursor += 1; },
+                        '0' | '^' => cursor = 0,
+                        '$' => cursor = buf.len(),
+                        'w' => cursor = next_word(&buf, cursor),
+                        'b' => cursor = prev_word(&buf, cursor),
+                        'x' => {
+                            if cursor < buf.len() {
+                                kill = buf[cursor..=cursor].iter().collect();
+                                buf.remove(cursor);
+                            }
+                        }
+                        'D' => {
+                            kill = buf[cursor..].iter().collect();
+                            buf.truncate(cursor);
+                        }
+                        'C' => {
+                            kill = buf[cursor..].iter().collect();
+                            buf.truncate(cursor);
+                            vim_state = VimState::Insert;
+                        }
+                        'p' => {
+                            for ch in kill.chars() {
+                                if cursor < buf.len() {
+                                    buf.insert(cursor + 1, ch);
+                                    cursor += 1;
+                                } else {
+                                    buf.push(ch);
+                                    cursor = buf.len();
+                                }
+                            }
+                        }
+                        'u' => {
+                            if let Some(prev) = vim_undo_stack.pop() {
+                                buf = prev;
+                                cursor = cursor.min(buf.len());
+                            }
+                        }
+                        ':' => {
+                            buf.clear();
+                            buf.push('/');
+                            cursor = 1;
+                            vim_state = VimState::Insert;
+                        }
+                        'v' => vim_state = VimState::Visual(cursor),
+                        _ => {}
+                    }
+                } else if is_vim_mode() && matches!(vim_state, VimState::Visual(_)) {
+                    let VimState::Visual(start_idx) = vim_state else { unreachable!() };
+                    match c {
+                        'h' => cursor = cursor.saturating_sub(1),
+                        'l' => if cursor < buf.len() { cursor += 1; },
+                        'w' => cursor = next_word(&buf, cursor),
+                        'b' => cursor = prev_word(&buf, cursor),
+                        '0' | '^' => cursor = 0,
+                        '$' => cursor = buf.len(),
+                        'd' | 'x' => {
+                            let min_i = start_idx.min(cursor);
+                            let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
+                            if min_i <= max_i && max_i < buf.len() {
+                                kill = buf[min_i..=max_i].iter().collect();
+                                buf.drain(min_i..=max_i);
+                                cursor = min_i.min(buf.len());
+                            }
+                            vim_state = VimState::Normal;
+                        }
+                        'y' => {
+                            let min_i = start_idx.min(cursor);
+                            let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
+                            if min_i <= max_i && max_i < buf.len() {
+                                kill = buf[min_i..=max_i].iter().collect();
+                            }
+                            vim_state = VimState::Normal;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    if is_vim_mode() {
+                        vim_undo_stack.push(buf.clone());
+                        if vim_undo_stack.len() > 50 {
+                            vim_undo_stack.remove(0);
+                        }
+                    }
+                    buf.insert(cursor, c);
+                    cursor += 1;
+                }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Backspace => {
                 if cursor > 0 {
-                    buf.remove(cursor - 1);
-                    cursor -= 1;
+                    if is_vim_mode() && vim_state == VimState::Normal {
+                        cursor -= 1;
+                    } else {
+                        buf.remove(cursor - 1);
+                        cursor -= 1;
+                    }
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                 }
             }
@@ -2155,11 +2375,27 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
             }
             KeyCode::Esc => {
-                buf.clear();
-                cursor = 0;
-                redraw(prompt, start, &buf, cursor, &mut scroll);
+                if is_vim_mode() && vim_state != VimState::Normal {
+                    vim_state = VimState::Normal;
+                    if cursor > 0 {
+                        cursor -= 1;
+                    }
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                } else if !is_vim_mode() {
+                    buf.clear();
+                    cursor = 0;
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                }
             }
             _ => {}
+        }
+        if is_vim_mode() {
+            let val = match vim_state {
+                VimState::Normal => 0,
+                VimState::Insert => 1,
+                VimState::Visual(_) => 2,
+            };
+            VIM_STATE_VAL.store(val, Ordering::Relaxed);
         }
     }
 }
@@ -2416,5 +2652,38 @@ mod tests {
     fn test_context_meter_noop_when_zero() {
         super::context_meter(0, 0);
         super::context_meter(5000, 100000);
+    }
+
+    #[test]
+    fn test_inference_telemetry_noop_when_zero() {
+        super::inference_telemetry(0, 0.0);
+        super::inference_telemetry(100, 2.0);
+        super::inference_telemetry(500, 10.0);
+    }
+
+    #[test]
+    fn test_vim_mode_toggle_and_state_label() {
+        let initial = super::is_vim_mode();
+        if initial {
+            super::toggle_vim_mode();
+        }
+        assert_eq!(super::get_vim_state_label(), "");
+        super::toggle_vim_mode();
+        assert!(super::is_vim_mode());
+        assert_eq!(super::get_vim_state_label(), "NORMAL");
+        super::toggle_vim_mode();
+        assert!(!super::is_vim_mode());
+    }
+
+    #[test]
+    fn test_path_candidates_semantic_prefixes() {
+        use std::fs;
+        let d = std::env::temp_dir().join(format!("bwn-sem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let cands = super::path_candidates("rules:bug", &d);
+        assert!(!cands.is_empty());
+        assert!(cands.iter().any(|c| c.contains("bug_fix_requires_regression_test")));
+        let _ = fs::remove_dir_all(&d);
     }
 }

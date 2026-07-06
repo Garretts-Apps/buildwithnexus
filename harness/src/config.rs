@@ -928,4 +928,33 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }
+
+    #[test]
+    fn test_load_settings_from_dir_hierarchy_and_merging() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+
+        let proj = std::env::temp_dir().join(format!("bwn-cfg-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&proj);
+        fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+
+        fs::write(h.join("settings.json"), r#"{"provider": "openai", "model": "gpt-4o", "effort": "low", "allowed_commands": ["git status"]}"#).unwrap();
+        fs::write(h.join("settings.local.json"), r#"{"effort": "medium"}"#).unwrap();
+        fs::write(proj.join(".buildwithnexus").join("settings.json"), r#"{"model": "gpt-4o-mini", "allowed_commands": ["cargo check"]}"#).unwrap();
+        fs::write(proj.join(".buildwithnexus").join("settings.local.json"), r#"{"permission": "readonly", "allowed_commands": ["git status", "cargo test"]}"#).unwrap();
+
+        let s = load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.provider, "openai");
+        assert_eq!(s.model, "gpt-4o-mini");
+        assert_eq!(s.effort, "medium");
+        assert_eq!(s.permission, "readonly");
+        assert_eq!(s.allowed_commands, vec!["git status", "cargo check", "cargo test"]);
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&proj);
+    }
 }

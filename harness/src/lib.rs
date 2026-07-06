@@ -298,7 +298,7 @@ fn repl(
             )));
         }
 
-        let task = if let Some(prompted) = pending_prompt.take() {
+        let mut task = if let Some(prompted) = pending_prompt.take() {
             tui::line("");
             tui::line(&format!(
                 "{} {} {}",
@@ -325,7 +325,7 @@ fn repl(
                 Some(tui::InputEvent::Text(t)) => t,
             }
         };
-        let t = task.trim();
+        let mut t = task.trim();
         if t.is_empty() {
             continue;
         }
@@ -632,7 +632,15 @@ fn repl(
                 continue;
             }
             "/undo" | "/rewind" => {
-                handle_undo(cwd);
+                handle_undo(cwd, "");
+                continue;
+            }
+            "/grill-me" | "/align" | "/interview" => {
+                handle_align(cwd);
+                continue;
+            }
+            "/teamwork" | "/teamwork-preview" | "/swarm" => {
+                handle_teamwork();
                 continue;
             }
             "/mode" => {
@@ -703,15 +711,30 @@ fn repl(
                 tui::line(&format!("  Vim modal editing mode is now {}", if current { tui::green("ENABLED [Normal/Insert]") } else { tui::yellow("DISABLED [Standard Emacs/Readline]") }));
                 continue;
             }
-            "/voice" => {
-                handle_voice();
-                continue;
-            }
             "/local" => {
                 handle_local(&mut provider);
                 continue;
             }
             _ => {}
+        }
+
+        if let Some(arg) = t.strip_prefix("/voice") {
+            if let Some(voice_text) = handle_voice(arg) {
+                if !voice_text.trim().is_empty() {
+                    tui::line(&format!("  {} {}", tui::green("✓ Voice input transcribed:"), tui::bold(&voice_text)));
+                    task = voice_text;
+                    t = task.trim();
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        if let Some(arg) = t.strip_prefix("/undo ").or_else(|| t.strip_prefix("/rewind ")) {
+            handle_undo(cwd, arg);
+            continue;
         }
 
         if let Some(id) = t.strip_prefix("/trace ") {
@@ -1103,32 +1126,50 @@ fn handle_model(provider: &mut Provider) {
     }
 }
 
-fn handle_voice() {
+fn handle_voice(arg: &str) -> Option<String> {
     tui::line(&tui::accent("  /voice — audio transcription & voice input"));
-    tui::line("  Supported backends: local whisper, llama.cpp audio, ffmpeg, macOS dictation");
-    tui::line(&tui::dim("  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or use `whisper-cpp`"));
-    let audio_path = tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ").unwrap_or_default();
+    tui::line("  Supported backends: whisper-cpp, whisper-cli, openai-whisper, local models");
+    let audio_path = if arg.trim().is_empty() {
+        tui::line(&tui::dim("  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or pass `/voice <path>`"));
+        tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ").unwrap_or_default()
+    } else {
+        arg.trim().to_string()
+    };
     if audio_path.trim().is_empty() {
-        if std::process::Command::new("whisper-cpp").arg("--help").output().is_ok() || std::process::Command::new("whisper").arg("--help").output().is_ok() {
+        let has_whisper = std::process::Command::new("whisper-cpp").arg("--help").output().is_ok()
+            || std::process::Command::new("whisper-cli").arg("--help").output().is_ok()
+            || std::process::Command::new("whisper").arg("--help").output().is_ok();
+        if has_whisper {
             tui::line(&tui::green("  Local whisper binary detected! Ready for voice-to-text transcription."));
+            tui::line(&tui::dim("  To transcribe and run a prompt, use `/voice <path_to_audio_file>`"));
         } else {
             tui::line(&tui::yellow("  No local whisper binary found in PATH."));
             tui::line(&tui::dim("  To enable offline zero-latency voice input, install `whisper-cpp` or `openai-whisper`."));
         }
+        None
     } else {
         let path = audio_path.trim();
         if std::path::Path::new(path).exists() {
             tui::line(&format!("  Transcribing audio from {}...", tui::bold(path)));
-            if let Ok(_o) = std::process::Command::new("whisper-cpp").args(["-f", path, "-otxt"]).output() {
-                tui::line(&tui::green("  Transcription complete!"));
-                if let Ok(txt) = std::fs::read_to_string(format!("{path}.txt")) {
-                    tui::line(&format!("  Transcribed: {}", tui::bold(&txt)));
+            let bins = ["whisper-cpp", "whisper-cli", "whisper"];
+            for bin in bins {
+                if let Ok(_o) = std::process::Command::new(bin).args(["-f", path, "-otxt"]).output() {
+                    tui::line(&tui::green(&format!("  Transcription complete via {bin}!")));
+                    let txt_path = format!("{path}.txt");
+                    if let Ok(txt) = std::fs::read_to_string(&txt_path) {
+                        let _ = std::fs::remove_file(&txt_path);
+                        return Some(txt.trim().to_string());
+                    }
+                    if let Ok(txt) = std::fs::read_to_string(path.replace(".wav", ".txt").replace(".mp3", ".txt")) {
+                        return Some(txt.trim().to_string());
+                    }
                 }
-            } else {
-                tui::line(&tui::yellow("  Please install `whisper-cpp` to transcribe audio files locally."));
             }
+            tui::line(&tui::yellow("  Could not transcribe: please ensure `whisper-cpp`, `whisper-cli`, or `whisper` is installed and the audio format is supported."));
+            None
         } else {
             tui::line(&tui::red(&format!("  File not found: {path}")));
+            None
         }
     }
 }
@@ -1504,11 +1545,99 @@ fn handle_checkpoints(cwd: &std::path::Path) {
     }
 }
 
-fn handle_undo(cwd: &std::path::Path) {
-    match checkpoint::undo_latest(cwd) {
-        Ok(cp) => tui::line(&tui::green(&format!("  restored {}", cp.path.display()))),
-        Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+fn handle_undo(cwd: &std::path::Path, arg: &str) {
+    let arg = arg.trim();
+    if arg == "git" {
+        match checkpoint::git_rollback(cwd) {
+            Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
+            Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
+        }
+    } else if arg == "all" || arg == "session" {
+        let since = checkpoint::now_ms().saturating_sub(24 * 3600 * 1000);
+        match checkpoint::undo_all_since(cwd, since) {
+            Ok(cps) => {
+                tui::line(&tui::green(&format!("  ✓ restored {} files across session:", cps.len())));
+                for c in cps {
+                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                }
+            }
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else if !arg.is_empty() {
+        match checkpoint::undo_by_id(cwd, arg) {
+            Ok(cp) => tui::line(&tui::green(&format!("  ✓ restored checkpoint {} ({})", cp.id, cp.path.display()))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else {
+        match checkpoint::undo_latest(cwd) {
+            Ok(cp) => tui::line(&tui::green(&format!("  ✓ restored latest {}", cp.path.display()))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
     }
+}
+
+fn handle_align(cwd: &std::path::Path) {
+    tui::line(&tui::accent("  /grill-me — Interactive Operational Alignment & Decision Grill"));
+    tui::line("  We will conduct an operational alignment review before proceeding with complex modifications.");
+    
+    let q1 = tui::ask("  1. What is the primary operational risk? [1: Regression | 2: Data Loss | 3: Performance | 4: Security]: ").unwrap_or_default();
+    let risk_label = match q1.trim() {
+        "2" => "Data Loss",
+        "3" => "Performance Degradation",
+        "4" => "Security Vulnerability",
+        _ => "System Regression",
+    };
+
+    let q2 = tui::ask("  2. What is the reversibility of this change? [1: Easy (flag/config) | 2: Moderate (revert) | 3: Hard (db/contract) | 4: Irreversible]: ").unwrap_or_default();
+    let rev_label = match q2.trim() {
+        "1" => "Easy (Feature Flag / Config)",
+        "3" => "Hard (Database Migration / API Contract)",
+        "4" => "Irreversible",
+        _ => "Moderate (Code Revert)",
+    };
+
+    let q3 = tui::ask("  3. What is the target confidence threshold? [1: High (>90%) | 2: Medium (>75%) | 3: Exploratory]: ").unwrap_or_default();
+    let conf_label = match q3.trim() {
+        "1" => "High (>90%)",
+        "3" => "Exploratory / Prototype",
+        _ => "Medium (>75%)",
+    };
+
+    tui::line(&tui::green("  ✓ Operational alignment recorded!"));
+    tui::line(&format!("    • Primary Risk: {}", tui::bold(risk_label)));
+    tui::line(&format!("    • Reversibility: {}", tui::bold(rev_label)));
+    tui::line(&format!("    • Confidence Threshold: {}", tui::bold(conf_label)));
+
+    let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+    let id = format!("dec-{}", crate::checkpoint::now_ms());
+    let entity = crate::knowledge::Entity {
+        id: id.clone(),
+        entity_type: crate::knowledge::EntityType::ArchitectureDecision,
+        name: format!("Operational Alignment ({})", risk_label),
+        path: None,
+        description: Some(format!("Risk: {}, Reversibility: {}, Confidence: {}", risk_label, rev_label, conf_label)),
+        metadata: serde_json::json!({
+            "risk": risk_label,
+            "reversibility": rev_label,
+            "confidence_target": conf_label,
+            "timestamp": crate::checkpoint::now_ms()
+        }),
+        relationships: vec![],
+        last_updated: "now".to_string(),
+    };
+    kb.add_entity(entity);
+    let _ = kb.save();
+    tui::line(&tui::dim("  Decision recorded into structured knowledge base (.buildwithnexus/knowledge/)."));
+}
+
+fn handle_teamwork() {
+    tui::line(&tui::accent("  /teamwork-preview — Autonomous Multi-Agent Swarm Preview"));
+    tui::line("  When executing complex projects, buildwithnexus orchestrates specialized subagent teams:");
+    tui::line(&format!("    • {} — Explores documentation, code graphs, and symbol trees", tui::bold("Researcher Subagent")));
+    tui::line(&format!("    • {} — Analyzes logs, stack traces, and test regressions", tui::bold("Debugger Subagent")));
+    tui::line(&format!("    • {} — Edits code files, runs migrations, and applies patches", tui::bold("Code Writer Subagent")));
+    tui::line(&format!("    • {} — Checks engineering rules, static analysis, and confidence", tui::bold("Verifier Subagent")));
+    tui::line(&tui::dim("  Tip: Use `invoke_subagent` in your custom rules/workflows to dispatch tasks to this team."));
 }
 
 fn handle_agents() {
@@ -1658,9 +1787,16 @@ fn print_help() {
         tui::bold("/checkpoints")
     ));
     tui::line(&format!(
-        "  {}         restore latest checkpoint  {}",
-        tui::bold("/undo"),
-        tui::dim("(/rewind)")
+        "  {}         restore checkpoint (<git|all|id>)",
+        tui::bold("/undo")
+    ));
+    tui::line(&format!(
+        "  {}     interactive operational alignment & decision grill",
+        tui::bold("/grill-me")
+    ));
+    tui::line(&format!(
+        "  {}     autonomous multi-agent swarm preview",
+        tui::bold("/teamwork")
     ));
     tui::line(&format!("  {}       diagnose setup", tui::bold("/doctor")));
     tui::line(&format!(
@@ -2328,5 +2464,11 @@ mod tests {
             }
             Err(e) => panic!("local http should build: {e}"),
         }
+    }
+
+    #[test]
+    fn test_handle_voice_missing_file_returns_none() {
+        let res = super::handle_voice("/nonexistent/audio/path.wav");
+        assert!(res.is_none());
     }
 }
