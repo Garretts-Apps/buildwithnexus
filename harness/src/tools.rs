@@ -3187,7 +3187,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_start_list_stop_server_roundtrip() {
-        let _guard = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempdir().join("home");
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("NEXUS_HOME", &home);

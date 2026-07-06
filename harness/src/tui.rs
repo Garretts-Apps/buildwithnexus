@@ -615,6 +615,9 @@ pub fn render_queued_composer() {
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    if poll(Duration::ZERO).unwrap_or(false) {
+        return;
+    }
     let mut out = io::stdout();
     let _ = execute!(out, SavePosition);
     if let Ok(ta) = typeahead().lock() {
@@ -713,7 +716,7 @@ fn clear_composer() {
     let _ = out.flush();
 }
 
-fn render_footer() {
+fn queue_footer(out: &mut io::Stdout) {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
@@ -721,7 +724,6 @@ fn render_footer() {
         return;
     };
     let (width, _) = term_size();
-    let mut out = io::stdout();
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
     if !footer.is_empty() {
         let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
@@ -749,6 +751,14 @@ fn render_footer() {
         };
         let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
     }
+}
+
+fn render_footer() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut out = io::stdout();
+    queue_footer(&mut out);
     let _ = out.flush();
 }
 
@@ -982,7 +992,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         Clear(ClearType::CurrentLine)
     );
     let _ = write!(out, "{prompt}{shown}");
-    render_footer();
+    queue_footer(&mut out);
     let _ = queue!(
         out,
         MoveTo(pwidth.saturating_add(col as u16), composer_row())
@@ -1567,6 +1577,9 @@ fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
 }
 
 fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
+    if poll(Duration::ZERO).unwrap_or(false) {
+        return;
+    }
     if ALT_SCREEN.load(Ordering::Relaxed) {
         render_composer(prompt, buf, cursor, scroll);
         return;

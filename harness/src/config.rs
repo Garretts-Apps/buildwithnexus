@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn keys_file_parsing_and_env_precedence() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
         fs::create_dir_all(&h).unwrap();
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn save_and_load_key_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
         std::env::set_var("NEXUS_HOME", &h);
@@ -912,7 +912,7 @@ mod tests {
 
     #[test]
     fn load_settings_none_when_absent() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
         fs::create_dir_all(&h).unwrap();
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn memory_roundtrip() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
         std::env::set_var("NEXUS_HOME", &h);
@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_load_settings_from_dir_hierarchy_and_merging() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
         fs::create_dir_all(&h).unwrap();
