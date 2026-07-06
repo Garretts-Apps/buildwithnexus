@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::provider::Msg;
 
+/// Represents a persisted user conversation session.
+///
+/// Sessions are stored as JSON files in `~/.buildwithnexus/sessions/<id>.json`
+/// and can be resumed across runs via `/resume` or `--continue`.
 #[derive(Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -33,7 +37,9 @@ fn dir() -> PathBuf {
     config::home().join("sessions")
 }
 
-// Monotonic-ish id from the wall clock (ms), zero-padded so lexical == temporal.
+/// Generates a new zero-padded 16-character session ID based on wall-clock milliseconds.
+///
+/// Zero-padding ensures that lexical sorting of session IDs matches temporal order.
 pub fn new_id() -> String {
     format!("{:016}", now_ms())
 }
@@ -55,8 +61,9 @@ fn title_of(msgs: &[Msg]) -> String {
     "(untitled)".to_string()
 }
 
-// Create or update the session for `id` from the current transcript. Preserves
-// the original created time across updates. No-op for an empty transcript.
+/// Creates or updates a persisted session file for `id` from the provided transcript.
+///
+/// Preserves the original creation timestamp across updates. A no-op if `msgs` is empty.
 pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
     if msgs.is_empty() {
         return;
@@ -77,12 +84,13 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
     }
 }
 
+/// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
 pub fn load(id: &str) -> Option<Session> {
     let text = std::fs::read_to_string(file(id)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-// All sessions, newest first.
+/// Lists all persisted sessions, ordered newest-first by last update timestamp.
 pub fn list() -> Vec<Session> {
     let mut v: Vec<Session> = match std::fs::read_dir(dir()) {
         Ok(rd) => rd
@@ -97,6 +105,7 @@ pub fn list() -> Vec<Session> {
     v
 }
 
+/// Returns the most recently updated session, or `None` if no sessions exist.
 pub fn latest() -> Option<Session> {
     list().into_iter().next()
 }

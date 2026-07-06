@@ -435,6 +435,7 @@ fn is_placeholder_path(path: &str) -> bool {
 #[derive(Default)]
 struct ThinkingStream {
     active: bool,
+    step: usize,
 }
 
 impl ThinkingStream {
@@ -473,7 +474,10 @@ impl ThinkingStream {
 
     fn start(&mut self) {
         if !self.active {
-            tui::write_stream(&format!("  {} ", tui::dim("thinking ›")));
+            let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let s = spinners[self.step % spinners.len()];
+            self.step += 1;
+            tui::write_stream(&format!("  {} {} ", tui::cyan(s), tui::dim("thinking ›")));
             self.active = true;
         }
     }
@@ -490,11 +494,13 @@ fn request_reply(
         report::assistant(&r.text);
         return Ok(r);
     }
-    tui::line(&tui::dim(&format!(
-        "  ⚡ {label} · reasoning with {} [{} tools available]",
-        p.model,
-        defs.len()
-    )));
+    tui::line(&format!(
+        "  {} {} · {} [{}]",
+        tui::yellow("⚡"),
+        tui::bold(label),
+        tui::cyan(&format!("reasoning with {}", p.model)),
+        tui::dim(&format!("{} tools available", defs.len()))
+    ));
     let thinking = std::cell::RefCell::new(ThinkingStream::default());
     let mut streamed = false;
     let mut renderer = tui::StreamRenderer::new();
@@ -780,6 +786,7 @@ Use start_server/list_servers/wait_for_url/read_server_log/stop_server for long-
 [CRITICAL TOOL DISCIPLINE]\n\
 • For generated/edited code, HTML, or file contents, call write_file/edit_file/Artifact; never paste code as plain markdown.\n\
 • For canvas games, browser games, standalone demos, landing pages, and small web apps: publish a complete runnable static HTML artifact with embedded CSS/JS unless a framework is explicitly requested. Include controls, restart/error states, responsive sizing, and touch/mobile support when useful; then open_browser if possible.\n\
+• When tasked to build, create, or write code/applications/games, build them locally from scratch. NEVER search the web or attempt to fetch non-existent repositories or URLs from GitHub or the internet unless the user explicitly provides a URL or asks to download from external sources.\n\
 • No placeholders. No asking for theme/layout/permission when a reasonable default works. Build immediately."
         .to_string()
 }
