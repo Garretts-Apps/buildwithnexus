@@ -381,7 +381,7 @@ impl KnowledgeBase {
     }
 }
 
-fn chrono_now_iso() -> String {
+pub fn chrono_now_iso() -> String {
     // Simple ISO 8601 UTC string without pulling in chrono crate if avoidable
     "2026-07-06T08:00:00Z".to_string()
 }

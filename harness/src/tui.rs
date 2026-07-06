@@ -1574,6 +1574,20 @@ fn next_word(buf: &[char], mut i: usize) -> usize {
     i
 }
 
+fn end_word(buf: &[char], mut i: usize) -> usize {
+    let n = buf.len();
+    if i < n && !buf[i].is_whitespace() {
+        i += 1;
+    }
+    while i < n && buf[i].is_whitespace() {
+        i += 1;
+    }
+    while i + 1 < n && !buf[i + 1].is_whitespace() {
+        i += 1;
+    }
+    i.min(n)
+}
+
 fn edit_in_editor(current: &str) -> Option<String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -1642,6 +1656,14 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/checkpoints",
     "/undo",
     "/rewind",
+    "/vim",
+    "/voice",
+    "/local",
+    "/rules",
+    "/kb",
+    "/index",
+    "/grill-me",
+    "/teamwork",
     "/exit",
     "/quit",
 ];
@@ -2182,6 +2204,24 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         '$' => cursor = buf.len(),
                         'w' => cursor = next_word(&buf, cursor),
                         'b' => cursor = prev_word(&buf, cursor),
+                        'e' => cursor = end_word(&buf, cursor),
+                        's' => {
+                            if cursor < buf.len() {
+                                kill = buf[cursor..=cursor].iter().collect();
+                                buf.remove(cursor);
+                            }
+                            vim_state = VimState::Insert;
+                        }
+                        'o' => {
+                            buf.push('\n');
+                            cursor = buf.len();
+                            vim_state = VimState::Insert;
+                        }
+                        'O' => {
+                            buf.insert(0, '\n');
+                            cursor = 0;
+                            vim_state = VimState::Insert;
+                        }
                         'x' => {
                             if cursor < buf.len() {
                                 kill = buf[cursor..=cursor].iter().collect();
@@ -2230,6 +2270,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         'l' => if cursor < buf.len() { cursor += 1; },
                         'w' => cursor = next_word(&buf, cursor),
                         'b' => cursor = prev_word(&buf, cursor),
+                        'e' => cursor = end_word(&buf, cursor),
                         '0' | '^' => cursor = 0,
                         '$' => cursor = buf.len(),
                         'd' | 'x' => {
@@ -2685,5 +2726,13 @@ mod tests {
         assert!(!cands.is_empty());
         assert!(cands.iter().any(|c| c.contains("bug_fix_requires_regression_test")));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_end_word_helper() {
+        let b: Vec<char> = "hello world foo".chars().collect();
+        assert_eq!(super::end_word(&b, 0), 4);
+        assert_eq!(super::end_word(&b, 4), 10);
+        assert_eq!(super::end_word(&b, 10), 14);
     }
 }

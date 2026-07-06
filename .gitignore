@@ -12,6 +12,8 @@ harness/vendor/
 harness/.cargo/
 /bin/buildwithnexus
 /bin/buildwithnexus.exe
+/buildwithnexus
+/buildwithnexus.exe
 *.tar.gz
 
 # Local runtime artifacts

@@ -715,6 +715,14 @@ fn repl(
                 handle_local(&mut provider);
                 continue;
             }
+            "/rules" => {
+                handle_rules(cwd);
+                continue;
+            }
+            "/kb" | "/index" => {
+                handle_kb_index(cwd);
+                continue;
+            }
             _ => {}
         }
 
@@ -1206,6 +1214,143 @@ fn handle_local(_provider: &mut Provider) {
         }
     }
     tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
+}
+
+fn handle_rules(cwd: &std::path::Path) {
+    tui::line(&tui::accent("  /rules — active engineering constraints & business logic rules"));
+    let mut engine = crate::rules::RuleEngine::load_defaults();
+    let rules_dir = cwd.join(".buildwithnexus").join("rules");
+    if let Ok(rd) = std::fs::read_dir(&rules_dir) {
+        for e in rd.flatten() {
+            if let Ok(loaded) = crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy()) {
+                for r in loaded.rules {
+                    engine.add_rule(r);
+                }
+            }
+        }
+    }
+    tui::line(&format!("  {} active rules loaded for workspace:", tui::bold(&engine.rules.len().to_string())));
+    for r in &engine.rules {
+        let sev_badge = match r.severity {
+            crate::rules::Severity::Critical => tui::red("CRITICAL"),
+            crate::rules::Severity::High => tui::red("HIGH"),
+            crate::rules::Severity::Medium => tui::yellow("MEDIUM"),
+            crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
+        };
+        tui::line(&format!("  [{sev_badge}] {} — {}", tui::bold(&r.id), r.description));
+    }
+    tui::line(&tui::dim("  Tip: Add custom JSON/YAML rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt"));
+}
+
+fn handle_kb_index(cwd: &std::path::Path) {
+    tui::line(&tui::accent("  /kb (/index) — project structured knowledge base & symbol indexing"));
+    let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+    tui::line(&format!("  Current knowledge base contains {} entities.", tui::bold(&kb.entities.len().to_string())));
+    
+    tui::line("  Scanning workspace for source files and extracting symbols...");
+    let mut count = 0;
+    let mut dirs_to_visit = vec![cwd.to_path_buf()];
+    while let Some(dir) = dirs_to_visit.pop() {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name == "target" || name == "node_modules" || name == "vendor" || name == "dist" {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs_to_visit.push(path);
+                } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
+                        let rel_path = path.strip_prefix(cwd).unwrap_or(&path).to_string_lossy().to_string();
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            for line in content.lines() {
+                                let trimmed = line.trim();
+                                let mut entity_type = None;
+                                let mut sym_name = None;
+                                if ext == "rs" {
+                                    if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(idx) = trimmed.find("fn ") {
+                                            let rest = &trimmed[idx + 3..];
+                                            if let Some(paren) = rest.find('(') {
+                                                sym_name = Some(rest[..paren].trim().to_string());
+                                            }
+                                        }
+                                    } else if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("struct ") {
+                                            let rest = &trimmed[idx + 7..];
+                                            let name_part = rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(name_part.trim_matches(|c| c == '{' || c == '(' || c == ';').to_string());
+                                        }
+                                    } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("enum ") {
+                                            let rest = &trimmed[idx + 5..];
+                                            let name_part = rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(name_part.trim_matches(|c| c == '{' || c == '(' || c == ';').to_string());
+                                        }
+                                    }
+                                } else if ext == "py" {
+                                    if trimmed.starts_with("def ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(paren) = trimmed[4..].find('(') {
+                                            sym_name = Some(trimmed[4..4 + paren].trim().to_string());
+                                        }
+                                    } else if trimmed.starts_with("class ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(paren) = trimmed[6..].find(|c| c == '(' || c == ':') {
+                                            sym_name = Some(trimmed[6..6 + paren].trim().to_string());
+                                        }
+                                    }
+                                } else if matches!(ext, "js" | "ts") {
+                                    if trimmed.starts_with("function ") || trimmed.starts_with("export function ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(idx) = trimmed.find("function ") {
+                                            let rest = &trimmed[idx + 9..];
+                                            if let Some(paren) = rest.find('(') {
+                                                sym_name = Some(rest[..paren].trim().to_string());
+                                            }
+                                        }
+                                    } else if trimmed.starts_with("class ") || trimmed.starts_with("export class ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("class ") {
+                                            let rest = &trimmed[idx + 6..];
+                                            let name_part = rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(name_part.trim_matches(|c| c == '{').to_string());
+                                        }
+                                    }
+                                }
+                                if let (Some(et), Some(sn)) = (entity_type, sym_name) {
+                                    if !sn.is_empty() && sn.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                                        let id = format!("{sn}@{rel_path}");
+                                        kb.add_entity(crate::knowledge::Entity {
+                                            id,
+                                            entity_type: et,
+                                            name: sn,
+                                            path: Some(rel_path.clone()),
+                                            description: Some(format!("Extracted symbol from {rel_path}")),
+                                            metadata: serde_json::json!({"auto_indexed": true}),
+                                            relationships: vec![],
+                                            last_updated: crate::knowledge::chrono_now_iso(),
+                                        });
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Err(e) = kb.save() {
+        tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
+    } else {
+        tui::line(&tui::green(&format!("  ✓ Successfully scanned workspace and indexed {count} symbols into `.buildwithnexus/knowledge/entities.json`!")));
+        tui::line(&tui::dim("  Tip: Use `@kb:<name>` or `@symbol:<name>` in your prompts to inject symbol definitions."));
+    }
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -2470,5 +2615,23 @@ mod tests {
     fn test_handle_voice_missing_file_returns_none() {
         let res = super::handle_voice("/nonexistent/audio/path.wav");
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_handle_kb_index_and_rules() {
+        let dir = std::env::temp_dir().join(format!("bwn-kb-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test_code.rs");
+        std::fs::write(&file_path, "pub fn authenticate_user() {}\npub struct SessionData {}").unwrap();
+        super::handle_kb_index(&dir);
+        
+        let kb = crate::knowledge::KnowledgeBase::new(&dir.to_string_lossy());
+        assert!(!kb.entities.is_empty());
+        assert!(kb.entities.values().any(|e| e.name == "authenticate_user"));
+        assert!(kb.entities.values().any(|e| e.name == "SessionData"));
+
+        super::handle_rules(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
