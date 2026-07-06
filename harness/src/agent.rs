@@ -215,24 +215,61 @@ fn repeated_tool_summary(
 }
 
 fn answer_question(input: &serde_json::Value) -> (String, bool) {
-    let question = input["question"].as_str().unwrap_or("").trim();
+    let question = if let Some(qs) = input["questions"].as_array() {
+        let mut acc = Vec::new();
+        for item in qs {
+            if let Some(s) = item.as_str() {
+                acc.push(s.to_string());
+            } else if let Some(s) = item["question"].as_str() {
+                acc.push(s.to_string());
+            }
+        }
+        if acc.is_empty() {
+            input["question"].as_str().unwrap_or("").to_string()
+        } else {
+            acc.join("\n")
+        }
+    } else {
+        input["question"].as_str().unwrap_or("").to_string()
+    };
+    let question = question.trim();
     if question.is_empty() {
         return ("question is required".to_string(), true);
     }
+
+    let mut options_str = String::new();
+    if let Some(opts) = input["options"].as_array() {
+        options_str.push_str("\nOptions:\n");
+        for (i, opt) in opts.iter().enumerate() {
+            if let Some(s) = opt.as_str() {
+                options_str.push_str(&format!("  {}. {}\n", i + 1, s));
+            } else {
+                let label = opt["label"].as_str().unwrap_or("");
+                let desc = opt["description"].as_str().unwrap_or("");
+                if !desc.is_empty() {
+                    options_str.push_str(&format!("  {}. {} - {}\n", i + 1, label, desc));
+                } else {
+                    options_str.push_str(&format!("  {}. {}\n", i + 1, label));
+                }
+            }
+        }
+    }
+
+    let full_prompt = format!("{}{}", question, options_str);
     if report::is_json() || !std::io::stdin().is_terminal() {
         return (
-            format!("blocked (no interactive terminal to answer question: {question})"),
+            format!("blocked (no interactive terminal to answer question: {full_prompt})"),
             true,
         );
     }
     let default = input["default"].as_str().unwrap_or("").trim();
     let prompt = if default.is_empty() {
-        format!("  {} {} ", tui::yellow("?"), tui::bold(question))
+        format!("  {} {}\n  Answer: ", tui::yellow("?"), tui::bold(&full_prompt))
     } else {
         format!(
-            "  {} {} {} ",
+            "  {} {}\n  Answer {} ",
             tui::yellow("?"),
-            tui::bold(question),
+            tui::bold(&full_prompt),
             tui::dim(&format!("[{default}]"))
         )
     };
@@ -493,7 +530,7 @@ pub(crate) fn gate(
         }
         // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
         // crosses the OS boundary — always confirm, even in Auto mode.
-        if tools::is_mutating(name) && tools::is_wsl_windows_mount(p) {
+        if tools::is_mutating_call(name, input) && tools::is_wsl_windows_mount(p) {
             return confirm(&format!(
                 "write to Windows filesystem {} (WSL2 boundary)",
                 p.display()
@@ -516,7 +553,7 @@ pub(crate) fn gate(
     match perm {
         Permission::Auto => None,
         Permission::ReadOnly => {
-            if tools::is_mutating(name) {
+            if tools::is_mutating_call(name, input) {
                 // run_command with clearly read-only shell tools (grep, find, etc.)
                 // should pass through even in ReadOnly mode.
                 if name == "run_command" {
@@ -546,7 +583,7 @@ pub(crate) fn gate(
                     }
                 }
             }
-            if tools::is_mutating(name) {
+            if tools::is_mutating_call(name, input) {
                 return confirm(&tools::preview(name, input));
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
@@ -740,7 +777,7 @@ fn build_inner(
             );
             trace_tool_call(&call.name, &call.input, "build", depth);
 
-            if call.name == "question" {
+            if call.name == "question" || call.name == "AskUserQuestion" {
                 let (answer, is_error) = answer_question(&call.input);
                 report::tool_result(&call.name, &answer, is_error);
                 trace_tool_result(&call.name, &answer, is_error, "build", depth);
@@ -987,7 +1024,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 &call.input,
             );
             trace_tool_call(&call.name, &call.input, "plan", 0);
-            if call.name == "question" {
+            if call.name == "question" || call.name == "AskUserQuestion" {
                 let (answer, is_error) = answer_question(&call.input);
                 report::tool_result(&call.name, &answer, is_error);
                 trace_tool_result(&call.name, &answer, is_error, "plan", 0);
@@ -1209,7 +1246,7 @@ pub fn run_brainstorm(
                     &call.input,
                 );
                 trace_tool_call(&call.name, &call.input, "brainstorm", 0);
-                if call.name == "question" {
+                if call.name == "question" || call.name == "AskUserQuestion" {
                     let (answer, is_error) = answer_question(&call.input);
                     report::tool_result(&call.name, &answer, is_error);
                     trace_tool_result(&call.name, &answer, is_error, "brainstorm", 0);

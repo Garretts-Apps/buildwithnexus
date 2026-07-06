@@ -43,6 +43,8 @@ const MAX_OUT: usize = 16 * 1024;
 const MAX_SEARCH_FILES: usize = 10_000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
 
+static UNDO_BACKUP: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
+
 // Exposed only for the criterion perf suite (see provider::bench).
 #[doc(hidden)]
 pub mod bench {
@@ -83,6 +85,102 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
         ToolDef { name: "question", description: "Ask the user a concise clarifying question when discovery is insufficient or user approval is needed.",
             schema: json!({"type":"object","properties":{"question":{"type":"string"},"default":{"type":"string"}},"required":["question"]}) },
+        ToolDef { name: "AskUserQuestion", description: "Ask the user a structured clarifying question when discovery is insufficient or user approval is needed.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string"}
+                            },
+                            "required": ["question"]
+                        }
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "description": {"type": "string"}
+                            },
+                            "required": ["label"]
+                        }
+                    }
+                }
+            })
+        },
+        ToolDef { name: "str_replace_editor", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+                    "path": {"type": "string"},
+                    "file_text": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                    "insert_line": {"type": "integer"},
+                    "view_range": {"type": "array", "items": {"type": "integer"}}
+                },
+                "required": ["command", "path"]
+            })
+        },
+        ToolDef { name: "text_editor_20241022", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+                    "path": {"type": "string"},
+                    "file_text": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                    "insert_line": {"type": "integer"},
+                    "view_range": {"type": "array", "items": {"type": "integer"}}
+                },
+                "required": ["command", "path"]
+            })
+        },
+        ToolDef { name: "text_editor_20250124", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+                    "path": {"type": "string"},
+                    "file_text": {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                    "insert_line": {"type": "integer"},
+                    "view_range": {"type": "array", "items": {"type": "integer"}}
+                },
+                "required": ["command", "path"]
+            })
+        },
+        ToolDef { name: "Artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "contents": {"type": "string"},
+                    "type": {"type": "string", "enum": ["html", "markdown", "svg", "json", "text"]}
+                },
+                "required": ["contents"]
+            })
+        },
+        ToolDef { name: "publish_artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact.",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "contents": {"type": "string"},
+                    "type": {"type": "string", "enum": ["html", "markdown", "svg", "json", "text"]}
+                },
+                "required": ["contents"]
+            })
+        },
         ToolDef { name: "list_python_tools", description: "List Python tool scripts in .buildwithnexus/tools and $NEXUS_HOME/tools. Python tools read JSON on stdin and print text or JSON.",
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "python_tool", description: "Run a Python tool script with JSON input on stdin. Use for specialized local tools that are easier to maintain outside Rust.",
@@ -183,7 +281,21 @@ pub fn is_mutating(name: &str) -> bool {
             | "todowrite"
             | "todo_write"
             | "create_docx"
+            | "Artifact"
+            | "publish_artifact"
     )
+}
+
+pub fn is_mutating_call(name: &str, input: &Value) -> bool {
+    if matches!(
+        name,
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
+    ) {
+        let cmd = input["command"].as_str().unwrap_or("view");
+        cmd != "view"
+    } else {
+        is_mutating(name)
+    }
 }
 
 // Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
@@ -254,6 +366,17 @@ pub fn preview(name: &str, input: &Value) -> String {
             format!("load skill: {}", input["name"].as_str().unwrap_or("?"))
         }
         "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
+            let cmd = input["command"].as_str().unwrap_or("view");
+            format!(
+                "editor ({}) {}",
+                cmd,
+                path_arg(input).unwrap_or("?")
+            )
+        }
+        "Artifact" | "publish_artifact" => {
+            format!("publish artifact: {}", input["title"].as_str().unwrap_or("untitled"))
+        }
         _ => name.to_string(),
     }
 }
@@ -295,7 +418,8 @@ pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
     match name {
         "read" | "read_file" | "list" | "list_dir" | "list_tree" | "file_info" | "write"
         | "write_file" | "edit" | "edit_file" | "multi_edit" | "create_dir" | "remove_path"
-        | "create_docx" | "python_tool" => {
+        | "create_docx" | "python_tool" | "str_replace_editor" | "text_editor_20241022"
+        | "text_editor_20250124" => {
             Some(resolve(cwd, path_arg(input).unwrap_or("")))
         }
         "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or(""))),
@@ -1467,6 +1591,191 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             err(format!("skill not found: {wanted}"))
         }
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
+            let command = input["command"].as_str().unwrap_or("view");
+            let path = input["path"].as_str().or_else(|| input["filePath"].as_str()).unwrap_or("");
+            if path.is_empty() {
+                return err("path is required");
+            }
+            match command {
+                "view" => {
+                    let p = resolve(cwd, path);
+                    if p.is_dir() {
+                        match fs::read_dir(&p) {
+                            Ok(rd) => {
+                                let mut names: Vec<String> = rd
+                                    .filter_map(|e| e.ok())
+                                    .map(|e| {
+                                        let n = e.file_name().to_string_lossy().into_owned();
+                                        if e.path().is_dir() {
+                                            format!("{n}/")
+                                        } else {
+                                            n
+                                        }
+                                    })
+                                    .collect();
+                                names.sort();
+                                ok(names.join("\n"))
+                            }
+                            Err(e) => err(format!("cannot list {}: {e}", p.display())),
+                        }
+                    } else {
+                        match fs::read_to_string(&p) {
+                            Ok(c) => {
+                                let lines: Vec<&str> = c.lines().collect();
+                                let total_lines = lines.len();
+                                let (start, end) = if let Some(range) = input["view_range"].as_array() {
+                                    let start = range.get(0).and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                                    let end = range.get(1).and_then(|v| v.as_u64()).unwrap_or(total_lines as u64) as usize;
+                                    (start.clamp(1, total_lines.max(1)), end.clamp(1, total_lines.max(1)))
+                                } else {
+                                    (1, 500.min(total_lines))
+                                };
+                                let mut selected_lines = Vec::new();
+                                for i in (start - 1)..=(end - 1).min(total_lines - 1) {
+                                    selected_lines.push(format!("{:>4}: {}", i + 1, lines[i]));
+                                }
+                                ok(selected_lines.join("\n"))
+                            }
+                            Err(e) => err(format!("cannot view {}: {e}", p.display())),
+                        }
+                    }
+                }
+                "create" => {
+                    let p = resolve(cwd, path);
+                    let file_text = input["file_text"].as_str().unwrap_or("");
+                    if let Some(dir) = p.parent() {
+                        let _ = fs::create_dir_all(dir);
+                    }
+                    if let Ok(old_content) = fs::read_to_string(&p) {
+                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        *guard = Some((p.clone(), old_content));
+                    } else {
+                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        *guard = None;
+                    }
+                    match fs::write(&p, file_text) {
+                        Ok(_) => ok(format!("successfully created file {}", p.display())),
+                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                    }
+                }
+                "str_replace" => {
+                    let p = resolve(cwd, path);
+                    let old_str = input["old_str"].as_str().unwrap_or("");
+                    let new_str = input["new_str"].as_str().unwrap_or("");
+                    if old_str.is_empty() {
+                        return err("old_str cannot be empty");
+                    }
+                    let body = match fs::read_to_string(&p) {
+                        Ok(b) => b,
+                        Err(e) => return err(format!("cannot read {}: {e}", p.display())),
+                    };
+                    let count = body.matches(old_str).count();
+                    if count == 0 {
+                        return err(format!(
+                            "old text not found in {}\n\nold text sought:\n{}",
+                            p.display(),
+                            old_str
+                        ));
+                    }
+                    if count > 1 {
+                        return err(format!(
+                            "ambiguous replacement: old text matches {count} times in {}",
+                            p.display()
+                        ));
+                    }
+                    let next = body.replace(old_str, new_str);
+                    {
+                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        *guard = Some((p.clone(), body));
+                    }
+                    match fs::write(&p, &next) {
+                        Ok(_) => ok(format!("successfully edited file {}", p.display())),
+                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                    }
+                }
+                "insert" => {
+                    let p = resolve(cwd, path);
+                    let insert_line = input["insert_line"].as_u64().unwrap_or(1) as usize;
+                    let new_str = input["new_str"].as_str().unwrap_or("");
+                    let body = match fs::read_to_string(&p) {
+                        Ok(b) => b,
+                        Err(e) => return err(format!("cannot read {}: {e}", p.display())),
+                    };
+                    let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
+                    let idx = (insert_line - 1).min(lines.len());
+                    lines.insert(idx, new_str.to_string());
+                    let next = lines.join("\n") + if body.ends_with('\n') { "\n" } else { "" };
+                    {
+                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        *guard = Some((p.clone(), body));
+                    }
+                    match fs::write(&p, &next) {
+                        Ok(_) => ok(format!("successfully inserted line at {}", p.display())),
+                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                    }
+                }
+                "undo_edit" => {
+                    let p = resolve(cwd, path);
+                    let backup = {
+                        let guard = UNDO_BACKUP.lock().unwrap();
+                        guard.clone()
+                    };
+                    if let Some((backup_path, old_content)) = backup {
+                        if backup_path == p {
+                            match fs::write(&p, &old_content) {
+                                Ok(_) => {
+                                    let mut guard = UNDO_BACKUP.lock().unwrap();
+                                    *guard = None;
+                                    ok(format!("successfully reverted the last edit to {}", p.display()))
+                                }
+                                Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                            }
+                        } else {
+                            err(format!(
+                                "the last edit was to {}, cannot undo for {}",
+                                backup_path.display(),
+                                p.display()
+                            ))
+                        }
+                    } else {
+                        err("no undo backup available for this file")
+                    }
+                }
+                other => err(format!("unknown editor command: {other}")),
+            }
+        }
+        "Artifact" | "publish_artifact" => {
+            let contents = input["contents"].as_str().unwrap_or("");
+            let title = input["title"].as_str().unwrap_or("artifact");
+            let kind = input["type"].as_str().unwrap_or("html");
+            let safe_title: String = title
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect();
+            let ext = match kind {
+                "html" => "html",
+                "markdown" => "md",
+                "svg" => "svg",
+                "json" => "json",
+                _ => "txt",
+            };
+            let dir = cwd.join(".buildwithnexus").join("artifacts");
+            let _ = fs::create_dir_all(&dir);
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let filename = format!("{}_{timestamp}.{ext}", safe_title);
+            let p = dir.join(&filename);
+            match fs::write(&p, contents) {
+                Ok(_) => ok(format!(
+                    "Artifact successfully published locally to: {}",
+                    p.display()
+                )),
+                Err(e) => err(format!("cannot write artifact: {e}")),
+            }
+        }
         "finish" => Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
             is_error: false,
@@ -1917,6 +2226,90 @@ mod tests {
         let d = tempdir();
         let r = run("bogus", &json!({}), &d);
         assert!(r.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_str_replace_editor_view_create_replace_insert_undo() {
+        let d = tempdir();
+        
+        // 1. Create file via editor
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "create", "path": "test.txt", "file_text": "line1\nline2\nline3"}),
+            &d,
+        );
+        assert!(!r.is_error);
+        assert!(d.join("test.txt").exists());
+        
+        // 2. View file via editor
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "view", "path": "test.txt", "view_range": [1, 2]}),
+            &d,
+        );
+        assert!(!r.is_error);
+        assert!(r.content.contains("line1"));
+        assert!(r.content.contains("line2"));
+        assert!(!r.content.contains("line3"));
+        
+        // 3. View dir via editor
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "view", "path": "."}),
+            &d,
+        );
+        assert!(!r.is_error);
+        assert!(r.content.contains("test.txt"));
+        
+        // 4. Replace text
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "str_replace", "path": "test.txt", "old_str": "line2", "new_str": "line2-replaced"}),
+            &d,
+        );
+        assert!(!r.is_error);
+        let contents = fs::read_to_string(d.join("test.txt")).unwrap();
+        assert!(contents.contains("line2-replaced"));
+        
+        // 5. Insert text
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "insert", "path": "test.txt", "insert_line": 2, "new_str": "inserted-line"}),
+            &d,
+        );
+        assert!(!r.is_error);
+        let contents = fs::read_to_string(d.join("test.txt")).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines[1], "inserted-line");
+        
+        // 6. Undo edit
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "undo_edit", "path": "test.txt"}),
+            &d,
+        );
+        assert!(!r.is_error);
+        let contents = fs::read_to_string(d.join("test.txt")).unwrap();
+        assert!(!contents.contains("inserted-line")); // undone to previous state
+        
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_artifact_publishing() {
+        let d = tempdir();
+        let r = run(
+            "Artifact",
+            &json!({
+                "title": "my-viz",
+                "contents": "<h1>viz</h1>",
+                "type": "html"
+            }),
+            &d,
+        );
+        assert!(!r.is_error);
+        assert!(r.content.contains("Artifact successfully published locally to"));
         let _ = fs::remove_dir_all(&d);
     }
 }
