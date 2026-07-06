@@ -310,6 +310,7 @@ pub fn role(id: &str) -> Role {
         _ => "You are an autonomous senior software engineer. \
 Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
+When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
 When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
 IMPORTANT — tool discipline:\n\
 • Before using run_command to install anything (npm install, pip install, cargo add, brew install, \

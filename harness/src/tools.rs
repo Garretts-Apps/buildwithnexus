@@ -114,7 +114,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 }
             })
         },
-        ToolDef { name: "str_replace_editor", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+        ToolDef { name: "str_replace_editor", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -129,7 +129,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 "required": ["command", "path"]
             })
         },
-        ToolDef { name: "text_editor_20241022", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+        ToolDef { name: "text_editor_20241022", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -144,7 +144,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 "required": ["command", "path"]
             })
         },
-        ToolDef { name: "text_editor_20250124", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+        ToolDef { name: "text_editor_20250124", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -159,7 +159,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 "required": ["command", "path"]
             })
         },
-        ToolDef { name: "Artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact.",
+        ToolDef { name: "Artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -170,7 +170,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 "required": ["contents"]
             })
         },
-        ToolDef { name: "publish_artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact.",
+        ToolDef { name: "publish_artifact", description: "Publish a structured document, webpage, SVG, diagram, or dataset as a self-contained local artifact. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
                 "properties": {
