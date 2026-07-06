@@ -227,9 +227,9 @@ pub fn text(s: &str) -> String {
 // Mode-colored badge: PLAN (green), BUILD (cyan), BRAINSTORM (amber).
 pub fn mode_badge(mode: &str) -> String {
     let (label, color) = match mode {
-        "PLAN" => ("PLAN", MODE_PLAN),
-        "BRAINSTORM" => ("BRAINSTORM", MODE_BSTORM),
-        _ => ("BUILD", MODE_BUILD),
+        "PLAN" => ("⚡ PLAN", MODE_PLAN),
+        "BRAINSTORM" => ("💡 BRAINSTORM", MODE_BSTORM),
+        _ => ("🚀 BUILD", MODE_BUILD),
     };
     if no_color() {
         format!("[{label}]")
@@ -392,7 +392,7 @@ impl StreamRenderer {
                     line(&self.box_footer());
                     let code = lines.join("\n");
                     osc52_copy(&code);
-                    line(&dim("  ⎘ copied to clipboard"));
+                    line(&dim("  ✓ ⎘ copied to clipboard"));
                     self.state = StreamState::Normal;
                     let _ = lang;
                 } else {
@@ -407,11 +407,10 @@ impl StreamRenderer {
     }
 
     fn box_header(&self, lang: &str) -> String {
-        // "  ┌─ lang ─────────" or "  ┌────────" when no lang
         let prefix = if lang.is_empty() {
-            "  ┌".to_string()
+            "  ╭─".to_string()
         } else {
-            format!("  ┌─ {lang} ")
+            format!("  ╭─ ⟨ {} ⟩ ", lang)
         };
         let used = prefix.chars().count();
         let dashes = self.w.saturating_sub(used).max(1);
@@ -419,8 +418,7 @@ impl StreamRenderer {
     }
 
     fn box_footer(&self) -> String {
-        // "  └────────────────"
-        let prefix = "  └";
+        let prefix = "  ╰";
         let dashes = self.w.saturating_sub(prefix.chars().count()).max(1);
         format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
     }
@@ -1028,16 +1026,19 @@ fn wordmark() -> String {
 // The UI chrome (mode badge, wordmark, keys) is identical regardless of model.
 pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
     let w = term_size().0 as usize;
-    let bar = "─".repeat(w);
+    let top_bar = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
+    let bot_bar = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
 
-    line(&accent(&bar));
+    line(&accent(&top_bar));
     // Wordmark row — gradient "buildwithnexus" + domain
     line(&clip_ansi_line(
         &format!(
-            "  {}  {}  {}",
+            "  {}  {}  {}  {}  {}",
             bold(&wordmark()),
             dim("·"),
             paint(ACCENT, "buildwithnexus.dev"),
+            dim("·"),
+            dim(&format!("v{}", crate::VERSION)),
         ),
         w,
     ));
@@ -1056,7 +1057,7 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         cwd.to_string()
     };
     line(&clip_ansi_line(
-        &dim(&format!("  {} · {} · {}", provider, model, cwd_label)),
+        &dim(&format!("  ⚙ Provider: {}  ·  🤖 Model: {}  ·  📂 {}", provider, model, cwd_label)),
         w,
     ));
     // Mode row
@@ -1064,20 +1065,20 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         &format!(
             "  Mode: {}    {}  {}  {}",
             mode_badge(mode),
-            dim("Shift+Tab to cycle"),
+            dim("[Shift+Tab] cycle mode"),
             dim("·"),
-            dim("/help for commands"),
+            dim("[/help] commands"),
         ),
         w,
     ));
-    line(&accent(&bar));
+    line(&accent(&bot_bar));
 }
 
 // Refresh the mode indicator line in-place after a mode change (no full clear).
 pub fn show_mode_change(mode: &str) {
     line(&format!(
         "  {} mode → {}",
-        dim("switching"),
+        dim("⟳ switching"),
         mode_badge(mode)
     ));
 }

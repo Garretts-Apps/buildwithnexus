@@ -66,19 +66,19 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "webfetch" | "websearch" | "fetch_url" | "web_search"
         | "headless_browser" | "list_servers" | "read_server_log" | "wait_for_url"
-        | "list_python_tools" => ("◇", tui::cyan(preview)),
+        | "list_python_tools" => ("◈", tui::cyan(preview)),
         "write" | "write_file" | "edit" | "edit_file" | "patch" | "apply_patch" => {
-            ("◆", tui::yellow(preview))
+            ("✦", tui::yellow(preview))
         }
         "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
-            ("»", tui::blue(preview))
+            ("⚡", tui::blue(preview))
         }
         "open_browser" => ("↗", tui::accent(preview)),
-        "task" | "spawn_subagent" => ("⊞", tui::accent(preview)),
+        "task" | "spawn_subagent" => ("❖", tui::accent(preview)),
         "question" => ("?", tui::yellow(preview)),
         _ => ("•", tui::dim(preview)),
     };
-    tui::line(&format!("  {} {}", tui::dim(icon), head));
+    tui::line(&format!("  {} {}", tui::accent(icon), head));
 
     // Inline colored diff for edits — see the change before/at the moment it lands.
     let body = match name {

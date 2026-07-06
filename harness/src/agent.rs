@@ -380,7 +380,7 @@ fn request_reply(
         return Ok(r);
     }
     tui::line(&tui::dim(&format!(
-        "  {label}: asking {} with {} available tools",
+        "  ⚡ {label} · reasoning with {} [{} tools available]",
         p.model,
         defs.len()
     )));
