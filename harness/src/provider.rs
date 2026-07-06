@@ -211,16 +211,39 @@ fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
 }
 
 fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
-    match req.send_json(body) {
-        Ok(resp) => Ok(resp),
-        Err(ureq::Error::Status(code, resp)) => {
-            let detail = resp.into_string().unwrap_or_default();
-            Err(format!(
-                "HTTP {code}: {}",
-                redact(&detail).chars().take(400).collect::<String>()
-            ))
+    let mut attempts = 0;
+    let max_attempts = 4;
+    let mut delay_ms = 500;
+
+    loop {
+        attempts += 1;
+        let req_clone = req.clone();
+        let body_clone = body.clone();
+
+        match req_clone.send_json(body_clone) {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = resp.into_string().unwrap_or_default();
+                let is_transient = code == 429 || (500..=504).contains(&code);
+                if is_transient && attempts < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms *= 2;
+                    continue;
+                }
+                return Err(format!(
+                    "HTTP {code}: {}",
+                    redact(&detail).chars().take(400).collect::<String>()
+                ));
+            }
+            Err(e) => {
+                if attempts < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms *= 2;
+                    continue;
+                }
+                return Err(format!("connection failed: {}", redact(&e.to_string())));
+            }
         }
-        Err(e) => Err(format!("connection failed: {}", redact(&e.to_string()))),
     }
 }
 

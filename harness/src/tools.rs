@@ -2226,7 +2226,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if url.is_empty() {
                 return err("url is required");
             }
-            match ureq::get(url).call() {
+            match http_get_with_retry(ureq::get(url)) {
                 Ok(resp) => match resp.into_string() {
                     Ok(body) => ok(truncate(body, MAX_OUT)),
                     Err(e) => err(format!("failed to read response body: {e}")),
@@ -2241,10 +2241,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let encoded = url_encode(query);
             let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
-            match ureq::get(&search_url)
-                .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)")
-                .call()
-            {
+            match http_get_with_retry(
+                ureq::get(&search_url).set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+            ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => ok(truncate(strip_html(&html), MAX_OUT)),
                     Err(e) => err(format!("search response error: {e}")),
@@ -2258,10 +2257,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err("url is required");
             }
             let extract_links = input["extract_links"].as_bool().unwrap_or(false);
-            match ureq::get(url)
-                .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)")
-                .call()
-            {
+            match http_get_with_retry(
+                ureq::get(url).set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+            ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
                         // Extract <title>
@@ -2884,6 +2882,33 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     }
 }
 
+// Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)
+// up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
+fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, ureq::Error> {
+    let mut attempts = 0;
+    let max_attempts = 4;
+    let mut delay_ms = 500;
+
+    loop {
+        attempts += 1;
+        let req_clone = req.clone();
+        match req_clone.call() {
+            Ok(resp) => return Ok(resp),
+            Err(ureq::Error::Status(code, _resp)) if (code == 429 || (500..=504).contains(&code)) && attempts < max_attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms *= 2;
+                continue;
+            }
+            Err(ureq::Error::Transport(_)) if attempts < max_attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms *= 2;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3472,6 +3497,9 @@ mod tests {
         assert!(run("remove_path", &json!({"path": ""}), &d).is_error);
         assert!(run("run_command", &json!({"command": ""}), &d).is_error);
         assert!(run("todo_write", &json!({"items": []}), &d).is_error);
+        assert!(run("webfetch", &json!({"url": ""}), &d).is_error);
+        assert!(run("websearch", &json!({"query": ""}), &d).is_error);
+        assert!(run("headless_browser", &json!({"url": ""}), &d).is_error);
         let _ = fs::remove_dir_all(&d);
     }
 
