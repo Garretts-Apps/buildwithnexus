@@ -578,6 +578,33 @@ fn context_prefix(cwd: &Path) -> String {
         );
         parts.push(format!("[Agent knowledge — Agents.md]\n{agents}"));
     }
+
+    // Inject active rules for operational judgment
+    let mut engine = crate::rules::RuleEngine::load_defaults();
+    let rules_dir = config::home().join("rules");
+    if let Ok(rd) = std::fs::read_dir(&rules_dir) {
+        for e in rd.flatten() {
+            if let Ok(loaded) = crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy()) {
+                for r in loaded.rules {
+                    engine.add_rule(r);
+                }
+            }
+        }
+    }
+    let mut rules_summary = String::from("The following engineering constraints and business logic rules MUST be strictly enforced for operational judgment:\n");
+    for r in &engine.rules {
+        if r.enabled {
+            rules_summary.push_str(&format!("• [{}] {} — {}\n", r.severity, r.id, r.description));
+        }
+    }
+    parts.push(format!("[Operational Judgment — Engineering Constraints & Rules]\n{}", rules_summary.trim()));
+
+    // Inject structured knowledge base if present
+    let kb = crate::knowledge::KnowledgeBase::new(".");
+    if !kb.entities.is_empty() {
+        parts.push(format!("[Structured Knowledge Base — Known Project Entities]\n{}", kb.generate_context_summary(&[])));
+    }
+
     let active_hooks = hooks::list_active();
     if !active_hooks.is_empty() {
         parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));

@@ -83,7 +83,7 @@ pub fn run() {
                 println!("  {:<12} {:<26} {}", p.id, p.label, tag);
             }
         }
-        "run" | "build" | "-p" | "--print" => headless(&opts, |p, perm, cwd| {
+        "run" | "build" | "headless" | "--headless" | "-p" | "--print" => headless(&opts, |p, perm, cwd| {
             agent::run_build(p, perm, "engineer", &rest(), &cwd)
         }),
         "plan" => headless(&opts, |p, perm, cwd| {
@@ -189,8 +189,8 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     Ok(Provider {
         protocol: preset.protocol,
         base_url,
-        api_key,
         model,
+        api_key,
         context_tokens,
     })
 }
@@ -210,8 +210,31 @@ fn headless(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
     hooks::notify("SessionStart", &cwd);
+
+    if !report::is_json() {
+        println!("{}", tui::bold(&format!("╭── buildwithnexus headless [v{}] ──────────────────────────────────╮", crate::VERSION)));
+        println!("│ Provider: {:<24} Model: {:<30} │", provider.protocol, provider.model);
+        println!("│ Working Dir: {:<58} │", cwd.display());
+        println!("│ Mode: High-Quality Non-Interactive Operational Execution               │");
+        println!("╰───────────────────────────────────────────────────────────────────────╯");
+        println!();
+        check_and_offer_install_dependencies(false);
+    }
+
+    let start_time = std::time::Instant::now();
     let r = f(&provider, perm, cwd.clone());
+    let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
+
+    if !report::is_json() {
+        println!();
+        if r.is_ok() {
+            println!("{}", tui::green(&format!("✓ Headless execution completed successfully in {:.2?}.", elapsed)));
+        } else {
+            println!("{}", tui::red(&format!("✗ Headless execution failed after {:.2?}.", elapsed)));
+        }
+    }
+
     if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
         std::process::exit(1);
@@ -270,6 +293,7 @@ fn repl(
     tui::line(&tui::dim(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
+    check_and_offer_install_dependencies(false);
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();
@@ -721,6 +745,10 @@ fn repl(
             }
             "/kb" | "/index" => {
                 handle_kb_index(cwd);
+                continue;
+            }
+            "/verify" | "/audit" => {
+                handle_verify_audit(cwd);
                 continue;
             }
             _ => {}
@@ -1351,6 +1379,64 @@ fn handle_kb_index(cwd: &std::path::Path) {
         tui::line(&tui::green(&format!("  ✓ Successfully scanned workspace and indexed {count} symbols into `.buildwithnexus/knowledge/entities.json`!")));
         tui::line(&tui::dim("  Tip: Use `@kb:<name>` or `@symbol:<name>` in your prompts to inject symbol definitions."));
     }
+}
+
+fn handle_verify_audit(cwd: &std::path::Path) {
+    tui::line(&tui::accent("  /verify (/audit) — running operational judgment verifier on workspace"));
+    
+    let mut changed_files = Vec::new();
+    if let Ok(o) = std::process::Command::new("git").args(["status", "-s"]).current_dir(cwd).output() {
+        if o.status.success() {
+            let out = String::from_utf8_lossy(&o.stdout);
+            for line in out.lines() {
+                if line.len() > 3 {
+                    let path = line[3..].trim().to_string();
+                    changed_files.push(path);
+                }
+            }
+        }
+    }
+    if changed_files.is_empty() {
+        tui::line(&tui::dim("  No modified git files detected. Running verifier against recent files in workspace..."));
+        if let Ok(rd) = std::fs::read_dir(cwd) {
+            for e in rd.flatten() {
+                if let Some(s) = e.path().to_str() {
+                    if !s.contains(".git") && !s.contains("target") && !s.contains("node_modules") {
+                        changed_files.push(e.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
+    let ctx = crate::verifier::VerificationContext {
+        task_description: "Interactive workspace verification and operational audit".to_string(),
+        task_type: Some(crate::rules::TaskType::CodeReview),
+        changed_files: changed_files.clone(),
+        tool_calls: vec![],
+        evidence_gathered: vec![],
+        tests_added: vec![],
+        dependencies_changed: vec![],
+        git_diff: None,
+    };
+
+    let report = verifier.verify(&ctx);
+    let report_str = crate::verifier::Verifier::format_report(&report);
+    for line in report_str.lines() {
+        if line.starts_with("=== ") {
+            tui::line(&tui::bold(line));
+        } else if line.contains("PASSED") {
+            tui::line(&tui::green(line));
+        } else if line.contains("WARNING") || line.contains("MEDIUM") {
+            tui::line(&tui::yellow(line));
+        } else if line.contains("FAILED") || line.contains("CRITICAL") || line.contains("HIGH") {
+            tui::line(&tui::red(line));
+        } else {
+            tui::line(line);
+        }
+    }
+    tui::line(&tui::dim("  Tip: Use `@rules:<id>` or `/rules` to inspect specific constraints."));
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -2389,7 +2475,81 @@ fn run_doctor() {
     }
 
     println!();
+    check_and_offer_install_dependencies(true);
+    println!();
     println!("  Run `buildwithnexus init` to fix any missing configuration.");
+}
+
+pub fn check_and_offer_install_dependencies(interactive: bool) {
+    let tools_to_check = [
+        ("git", "git", "git", "Version control & workspace tracking"),
+        ("rg", "ripgrep", "ripgrep", "High-speed semantic file searching"),
+        ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
+        ("npm", "node", "npm", "Node package manager"),
+        ("python3", "python", "python3", "Python runtime & data scripting"),
+    ];
+
+    let mut missing = Vec::new();
+    for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
+        let found = std::process::Command::new("which")
+            .arg(bin)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
+        }
+    }
+
+    if missing.is_empty() {
+        if interactive {
+            tui::line(&tui::green("  ✓ All required OOTB dependencies (git, rg, node, npm, python3) are installed!"));
+        }
+        return;
+    }
+
+    tui::line(&tui::yellow(&format!("  ⚠ Missing {} OOTB development tool(s):", missing.len())));
+    for (bin, _, _, desc) in &missing {
+        tui::line(&format!("    • {} — {}", tui::bold(bin), desc));
+    }
+
+    if !interactive {
+        tui::line(&tui::dim("  Tip: Run `buildwithnexus init` or `buildwithnexus doctor` to auto-install missing dependencies."));
+        return;
+    }
+
+    let brew_available = std::process::Command::new("which").arg("brew").output().map(|o| o.status.success()).unwrap_or(false);
+    let apt_available = std::process::Command::new("which").arg("apt-get").output().map(|o| o.status.success()).unwrap_or(false);
+
+    for (bin, brew_pkg, apt_pkg, desc) in missing {
+        let ask_msg = format!("  Would you like to install '{}' ({}) now? [Y/n]: ", bin, desc);
+        let ans = match tui::ask(&ask_msg) {
+            Some(a) => a.trim().to_lowercase(),
+            None => break,
+        };
+        if ans == "n" || ans == "no" {
+            tui::line(&tui::dim(&format!("    Skipped installing {bin}.")));
+            continue;
+        }
+
+        if brew_available {
+            tui::line(&tui::accent(&format!("    Running `brew install {brew_pkg}`...")));
+            let res = std::process::Command::new("brew").args(["install", brew_pkg]).status();
+            match res {
+                Ok(s) if s.success() => tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!"))),
+                _ => tui::line(&tui::red(&format!("    ✗ Failed to install {brew_pkg} via Homebrew."))),
+            }
+        } else if apt_available {
+            tui::line(&tui::accent(&format!("    Running `sudo apt-get install -y {apt_pkg}`...")));
+            let res = std::process::Command::new("sudo").args(["apt-get", "install", "-y", apt_pkg]).status();
+            match res {
+                Ok(s) if s.success() => tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!"))),
+                _ => tui::line(&tui::red(&format!("    ✗ Failed to install {apt_pkg} via apt-get."))),
+            }
+        } else {
+            tui::line(&tui::yellow(&format!("    Neither Homebrew nor apt-get found. Please install '{bin}' manually.")));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2633,5 +2793,21 @@ mod tests {
 
         super::handle_rules(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_verify_audit() {
+        let dir = std::env::temp_dir().join(format!("bwn-verify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test_file.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        super::handle_verify_audit(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_check_and_offer_install_dependencies() {
+        super::check_and_offer_install_dependencies(false);
     }
 }

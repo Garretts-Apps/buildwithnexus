@@ -11,6 +11,8 @@ pub fn run() -> Option<Settings> {
     tui::line(&tui::dim(
         "  a hilariously fast, agentic AI CLI — remote or local models",
     ));
+    tui::line("");
+    crate::check_and_offer_install_dependencies(true);
 
     // Warn the user if the home dir landed on a Windows mount — they should
     // set NEXUS_HOME to a native Linux path (e.g. ~/. buildwithnexus in WSL).

@@ -1662,6 +1662,8 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/rules",
     "/kb",
     "/index",
+    "/verify",
+    "/audit",
     "/grill-me",
     "/teamwork",
     "/exit",
@@ -2226,15 +2228,18 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             if cursor < buf.len() {
                                 kill = buf[cursor..=cursor].iter().collect();
                                 buf.remove(cursor);
+                                if !kill.is_empty() { osc52_copy(&kill); }
                             }
                         }
                         'D' => {
                             kill = buf[cursor..].iter().collect();
                             buf.truncate(cursor);
+                            if !kill.is_empty() { osc52_copy(&kill); }
                         }
                         'C' => {
                             kill = buf[cursor..].iter().collect();
                             buf.truncate(cursor);
+                            if !kill.is_empty() { osc52_copy(&kill); }
                             vim_state = VimState::Insert;
                         }
                         'p' => {
@@ -2280,6 +2285,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                                 kill = buf[min_i..=max_i].iter().collect();
                                 buf.drain(min_i..=max_i);
                                 cursor = min_i.min(buf.len());
+                                if !kill.is_empty() { osc52_copy(&kill); }
                             }
                             vim_state = VimState::Normal;
                         }
@@ -2288,6 +2294,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
                             if min_i <= max_i && max_i < buf.len() {
                                 kill = buf[min_i..=max_i].iter().collect();
+                                if !kill.is_empty() { osc52_copy(&kill); }
                             }
                             vim_state = VimState::Normal;
                         }
