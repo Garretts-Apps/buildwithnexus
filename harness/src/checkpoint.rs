@@ -9,6 +9,7 @@ use crate::config;
 
 const MAX_SNAPSHOT_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Represents a file modification snapshot recorded prior to an edit tool operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: String,
@@ -32,6 +33,7 @@ fn dir(cwd: &Path) -> PathBuf {
         .join(sanitize_id_part(&cwd.to_string_lossy()))
 }
 
+/// Returns the current Unix timestamp in milliseconds.
 pub fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -45,6 +47,8 @@ fn sanitize_id_part(s: &str) -> String {
         .collect()
 }
 
+/// Records a file modification checkpoint before an edit tool mutates `path`.
+/// Stores the previous contents (or empty if the file did not exist) in `.buildwithnexus/checkpoints`.
 pub fn record(cwd: &Path, path: &Path, action: &str) {
     let existed = path.exists();
     let content = if existed {
@@ -73,6 +77,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
     }
 }
 
+/// Returns all recorded checkpoints for the given workspace directory, sorted newest first.
 pub fn list(cwd: &Path) -> Vec<Checkpoint> {
     let Ok(rd) = fs::read_dir(dir(cwd)) else {
         return Vec::new();
@@ -102,6 +107,7 @@ fn restore_one(cp: &Checkpoint) -> Result<(), String> {
     Ok(())
 }
 
+/// Restores the most recently recorded checkpoint for the workspace, removing its checkpoint file.
 pub fn undo_latest(cwd: &Path) -> Result<Checkpoint, String> {
     let Some(cp) = list(cwd).into_iter().next() else {
         return Err("no checkpoints for this directory".into());
@@ -111,6 +117,7 @@ pub fn undo_latest(cwd: &Path) -> Result<Checkpoint, String> {
     Ok(cp)
 }
 
+/// Restores a specific checkpoint by its unique ID (`<timestamp>-<action>`), removing its checkpoint file.
 pub fn undo_by_id(cwd: &Path, id: &str) -> Result<Checkpoint, String> {
     let all = list(cwd);
     let Some(cp) = all.into_iter().find(|c| c.id == id) else {
@@ -121,6 +128,7 @@ pub fn undo_by_id(cwd: &Path, id: &str) -> Result<Checkpoint, String> {
     Ok(cp)
 }
 
+/// Restores all checkpoints recorded at or after `since_ms`, rolling back multiple edits in reverse chronological order.
 pub fn undo_all_since(cwd: &Path, since_ms: u128) -> Result<Vec<Checkpoint>, String> {
     let all = list(cwd);
     let mut restored = Vec::new();
@@ -138,6 +146,7 @@ pub fn undo_all_since(cwd: &Path, since_ms: u128) -> Result<Vec<Checkpoint>, Str
     }
 }
 
+/// Performs a hard rollback of the workspace using `git checkout -- .`, discarding all unstaged working directory changes.
 pub fn git_rollback(cwd: &Path) -> Result<String, String> {
     let mut out = String::new();
     let st = std::process::Command::new("git")
