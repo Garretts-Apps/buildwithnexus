@@ -410,12 +410,16 @@ OpenCode-compatible names are supported: bash, read, write, edit, glob, grep, li
 • websearch / web_search — DuckDuckGo web search (no API key, live results)\n\
 • todowrite / todoread   — track multi-step work\n\
 • skill / load_skill     — discover and load skill instructions on demand\n\
-• question               — ask the user only after bounded discovery is insufficient\n\
+• question               — ask the user interactive questions ONLY when blocked on critical missing information; NEVER use to ask for themes, styling, or permission\n\
 • list_python_tools / python_tool — discover and run Python-backed local tools from .buildwithnexus/tools or $NEXUS_HOME/tools\n\
 • save_memory            — persist a note across sessions\n\
 • task / spawn_subagent  — delegate a sub-task to a fresh agent with its own context\n\
-• finish                 — mark the task complete with a summary"
-    .to_string()
+• finish                 — mark the task complete with a summary\n\n\
+[CRITICAL TOOL DISCIPLINE]\n\
+• Mandatory Tool Usage: Whenever generating or editing code, HTML, or any file contents, you MUST use write_file or edit_file. NEVER write code in plain text or markdown as your response.\n\
+• No Placeholders: Write complete, fully working code. DO NOT use placeholders like `// ... rest of code`.\n\
+• No Permission Seeking / Chatting: DO NOT ask the user for permission, themes, or layout choices. If instructions are open-ended (e.g. 'pick a theme' or 'make it cool'), make a reasonable decision and just build it immediately! Do not reply with conversational filler."
+        .to_string()
 }
 
 fn discovery_policy() -> String {

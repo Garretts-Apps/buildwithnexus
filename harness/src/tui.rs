@@ -645,7 +645,7 @@ pub fn set_permission_mode(mode: &str) {
             "{} {} {}",
             dim("permission:"),
             bold(mode),
-            dim("· /permissions ask|auto|readonly · wheel/PgUp scroll · /mouse off")
+            dim("· /permissions ask|auto|readonly · PgUp/wheel scroll · /mouse on|off")
         );
     }
     let mut out = io::stdout();
@@ -899,8 +899,8 @@ pub fn enter_alt(raw: bool) {
     }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
-        let _ = execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture);
-        MOUSE_CAPTURED.store(true, Ordering::Relaxed);
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
+        MOUSE_CAPTURED.store(false, Ordering::Relaxed);
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

@@ -1303,7 +1303,8 @@ fn handle_permissions(perm: &mut Permission) {
 }
 
 fn handle_mouse(arg: Option<&str>) {
-    match arg.unwrap_or("status") {
+    let cmd = arg.unwrap_or("").trim();
+    match cmd {
         "on" | "enable" => {
             tui::set_mouse_capture(true);
             tui::line(&tui::green(
@@ -1316,7 +1317,20 @@ fn handle_mouse(arg: Option<&str>) {
                 "  ✓ mouse: off — normal text selection enabled; use PgUp/PgDn to scroll",
             ));
         }
-        "status" | "" => {
+        "" | "toggle" => {
+            let new_state = !tui::mouse_capture_enabled();
+            tui::set_mouse_capture(new_state);
+            if new_state {
+                tui::line(&tui::green(
+                    "  ✓ mouse: on — wheel scroll enabled; text selection may require Option/Alt",
+                ));
+            } else {
+                tui::line(&tui::green(
+                    "  ✓ mouse: off — normal text selection enabled; use PgUp/PgDn to scroll",
+                ));
+            }
+        }
+        "status" => {
             let state = if tui::mouse_capture_enabled() {
                 "on"
             } else {
@@ -1329,7 +1343,7 @@ fn handle_mouse(arg: Option<&str>) {
             ));
         }
         other => tui::line(&tui::red(&format!(
-            "  unknown mouse setting '{other}' — try: on, off, status"
+            "  unknown mouse setting '{other}' — try: on, off, toggle, status"
         ))),
     }
 }

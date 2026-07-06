@@ -479,9 +479,21 @@ fn anthropic_stream(
 // Pure body builder (see `anthropic_body` for the rationale).
 fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
     let mut messages: Vec<Value> = Vec::new();
+    let mut system = String::new();
+    for m in msgs {
+        if let Msg::System(s) = m {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(s);
+        }
+    }
+    if !system.is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
     for m in msgs {
         match m {
-            Msg::System(s) => messages.push(json!({"role": "system", "content": s})),
+            Msg::System(_) => {}
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
             Msg::UserImages { text, images } => {
                 let mut parts: Vec<Value> = images
