@@ -372,6 +372,10 @@ fn context_prefix(cwd: &Path) -> String {
         );
         parts.push(format!("[Agent knowledge — Agents.md]\n{agents}"));
     }
+    let active_hooks = hooks::list_active();
+    if !active_hooks.is_empty() {
+        parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));
+    }
     let skills = config::load_skills();
     if !skills.is_empty() {
         let joined = skills

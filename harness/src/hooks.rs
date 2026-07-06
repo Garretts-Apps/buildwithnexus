@@ -475,6 +475,20 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
     Ok(ctx)
 }
 
+pub fn list_active() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(hooks) = HOOKS.get() {
+        for h in &hooks.list {
+            let cmd_str = match &h.cmd {
+                HookCmd::Shell(s) => s.clone(),
+                HookCmd::Script(p) => p.display().to_string(),
+            };
+            out.push(format!("{} ({}): {}", h.event, h.matcher, cmd_str));
+        }
+    }
+    out
+}
+
 pub fn notify(event: &str, cwd: &Path) {
     let cmds = commands_for(event, None);
     if cmds.is_empty() {
