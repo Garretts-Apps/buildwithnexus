@@ -1040,14 +1040,16 @@ pub fn context_meter(used: usize, total: usize) {
     } else {
         green(&bar)
     };
+    let est_cost = (used as f64 / 1000.0) * 0.003;
     line(&format!(
         "  {} [{}] {}",
-        dim("ctx"),
+        dim("telemetry"),
         colored,
         dim(&format!(
-            "{pct}%  ·  {}k / {}k tokens",
+            "{pct}% sat  ·  {}k / {}k tokens  ·  est. cost: ${:.4}",
             used / 1_000,
-            total / 1_000
+            total / 1_000,
+            est_cost
         )),
     ));
 }
@@ -2390,5 +2392,11 @@ mod tests {
         assert!(p.contains("PLAN"), "{p}");
         let bs = plain(&mode_badge("BRAINSTORM"));
         assert!(bs.contains("BRAINSTORM"), "{bs}");
+    }
+
+    #[test]
+    fn test_context_meter_noop_when_zero() {
+        super::context_meter(0, 0);
+        super::context_meter(5000, 100000);
     }
 }

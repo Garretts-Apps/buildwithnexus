@@ -3,11 +3,12 @@
 // but ALL modes have access to the full tool surface so the model can grep,
 // fetch, read files, and run commands regardless of which mode the user is in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::config;
 use crate::hooks::{self, PreDecision};
@@ -693,7 +694,32 @@ fn env_snapshot() -> String {
     found.join("\n")
 }
 
+static SESSION_ALLOWED_TOOLS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn is_session_allowed_tool(key: &str) -> bool {
+    if key.is_empty() { return false; }
+    if let Ok(guard) = SESSION_ALLOWED_TOOLS.lock() {
+        if let Some(set) = guard.as_ref() {
+            return set.contains(key);
+        }
+    }
+    false
+}
+
+fn add_session_allowed_tool(key: &str) {
+    if key.is_empty() { return; }
+    if let Ok(mut guard) = SESSION_ALLOWED_TOOLS.lock() {
+        let set = guard.get_or_insert_with(HashSet::new);
+        set.insert(key.to_string());
+    }
+}
+
+#[allow(dead_code)]
 fn confirm(label: &str) -> Option<String> {
+    confirm_tool(label, "")
+}
+
+fn confirm_tool(label: &str, tool_key: &str) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
         return Some(format!(
             "blocked (no interactive terminal to confirm: {label})"
@@ -703,11 +729,35 @@ fn confirm(label: &str) -> Option<String> {
         "  {} {}? {} ",
         tui::yellow("➤"),
         tui::bold(label),
-        tui::dim("[y/N]")
+        tui::dim("[y: yes | n: no | s: allow session | a: allow always | d <reason>: deny with feedback]")
     );
     let ans = tui::ask(&q).unwrap_or_default();
-    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+    let trimmed = ans.trim();
+    let lower = trimmed.to_lowercase();
+    if matches!(lower.as_str(), "y" | "yes") {
         None
+    } else if matches!(lower.as_str(), "s" | "session") {
+        add_session_allowed_tool(tool_key);
+        None
+    } else if matches!(lower.as_str(), "a" | "always") {
+        add_session_allowed_tool(tool_key);
+        if !tool_key.is_empty() {
+            if let Some(mut s) = crate::config::load_settings() {
+                if !s.allowed_commands.contains(&tool_key.to_string()) {
+                    s.allowed_commands.push(tool_key.to_string());
+                    let _ = crate::config::save_settings(&s);
+                }
+            }
+        }
+        None
+    } else if lower.starts_with("d ") || lower.starts_with("deny ") || lower.starts_with("n ") || lower.starts_with("no ") {
+        let idx = trimmed.find(' ').unwrap_or(0);
+        let feedback = trimmed[idx..].trim();
+        if feedback.is_empty() {
+            Some("denied by user".into())
+        } else {
+            Some(format!("denied by user with feedback: {feedback}"))
+        }
     } else {
         Some("denied by user".into())
     }
@@ -722,29 +772,40 @@ pub(crate) fn gate(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
+    let tool_key = if let Some(c) = tools::command_arg_for(name, input) {
+        let first = c.split_whitespace().next().unwrap_or("");
+        std::path::Path::new(first)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(first)
+            .to_string()
+    } else {
+        name.to_string()
+    };
+
     let path = tools::touched_path(name, input, cwd);
 
     if let Some(p) = &path {
         if tools::is_sensitive(p) {
-            return confirm(&format!("access sensitive path {}", p.display()));
+            return confirm_tool(&format!("access sensitive path {}", p.display()), &tool_key);
         }
         // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
         // crosses the OS boundary — always confirm, even in Auto mode.
         if tools::is_mutating_call(name, input) && tools::is_wsl_windows_mount(p) {
-            return confirm(&format!(
+            return confirm_tool(&format!(
                 "write to Windows filesystem {} (WSL2 boundary)",
                 p.display()
-            ));
+            ), &tool_key);
         }
     }
     if let Some(c) = tools::command_arg_for(name, input) {
         if tools::catastrophic(c) {
-            return confirm(&format!("run dangerous command `{c}`"));
+            return confirm_tool(&format!("run dangerous command `{c}`"), &tool_key);
         }
         // In WSL2, commands that reference /mnt/<drive>/ target the Windows
         // filesystem — confirm before running, even in Auto mode.
         if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
-            return confirm(&format!("command targets Windows filesystem (WSL2): `{c}`"));
+            return confirm_tool(&format!("command targets Windows filesystem (WSL2): `{c}`"), &tool_key);
         }
     }
 
@@ -766,19 +827,11 @@ pub(crate) fn gate(
         Permission::Ask => {
             // run_command calls whose binary appears in allowed_commands skip the
             // confirmation prompt — git, cargo, npm, etc. should just work.
-            if let Some(c) = tools::command_arg_for(name, input) {
-                let first = c.split_whitespace().next().unwrap_or("");
-                // Accept both bare names and full paths (/usr/bin/git → git).
-                let bin = std::path::Path::new(first)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(first);
-                if config::load_allowed_commands().iter().any(|a| a == bin) {
-                    return None;
-                }
+            if config::load_allowed_commands().iter().any(|a| a == &tool_key) || is_session_allowed_tool(&tool_key) {
+                return None;
             }
             if tools::is_mutating_call(name, input) {
-                return confirm(&tools::preview(name, input));
+                return confirm_tool(&tools::preview(name, input), &tool_key);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.
@@ -2314,5 +2367,12 @@ mod tests {
             }],
         }];
         assert!(structural_summary(&msgs).contains("run: ls"));
+    }
+
+    #[test]
+    fn test_session_allowlist() {
+        assert!(!super::is_session_allowed_tool("custom_test_tool"));
+        super::add_session_allowed_tool("custom_test_tool");
+        assert!(super::is_session_allowed_tool("custom_test_tool"));
     }
 }

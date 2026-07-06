@@ -252,6 +252,16 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task.",
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
+        ToolDef { name: "kb_query", description: "Query the project's local structured knowledge base (.buildwithnexus/knowledge/) for entities, relationships, and architectural decisions.",
+            schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
+        ToolDef { name: "kb_record", description: "Record an entity, relationship, or architectural decision (with risk, cost, and reversibility primitives) into the local knowledge base.",
+            schema: json!({"type":"object","properties":{"name":{"type":"string"},"entity_type":{"type":"string","enum":["Function","Class","Module","Package","Service","Endpoint","DatabaseTable","Migration","ArchitectureDecision"]},"description":{"type":"string"},"path":{"type":"string"}},"required":["name","entity_type"]}) },
+        ToolDef { name: "rule_check", description: "Evaluate the current project state and changed files against the project's engineering rules (.buildwithnexus/rules/).",
+            schema: json!({"type":"object","properties":{"changed_files":{"type":"array","items":{"type":"string"}},"task_type":{"type":"string"}}}) },
+        ToolDef { name: "verify", description: "Run the verification layer (rules, tests, static analysis, confidence calculation) to generate a structured quality and safety report.",
+            schema: json!({"type":"object","properties":{"task_description":{"type":"string"},"changed_files":{"type":"array","items":{"type":"string"}}},"required":["task_description"]}) },
+        ToolDef { name: "mcp_call", description: "Call a tool or query a resource on an enterprise Model Context Protocol (MCP) server configured in settings.json.",
+            schema: json!({"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}) },
     ];
     if include_subagent {
         v.push(ToolDef {
@@ -313,6 +323,9 @@ pub fn defs_readonly() -> Vec<ToolDef> {
                     | "wait_for_url"
                     | "list_skills"
                     | "load_skill"
+                    | "kb_query"
+                    | "rule_check"
+                    | "verify"
             )
         })
         .collect()
@@ -345,6 +358,8 @@ pub fn is_mutating(name: &str) -> bool {
             | "create_docx"
             | "Artifact"
             | "publish_artifact"
+            | "kb_record"
+            | "mcp_call"
     )
 }
 
@@ -439,6 +454,11 @@ pub fn preview(name: &str, input: &Value) -> String {
         "skill" | "load_skill" => {
             format!("load skill: {}", input["name"].as_str().unwrap_or("?"))
         }
+        "kb_query" => format!("query knowledge base: {}", input["query"].as_str().unwrap_or("?")),
+        "kb_record" => format!("record knowledge base entity: {}", input["name"].as_str().unwrap_or("?")),
+        "rule_check" => "evaluate engineering rules".to_string(),
+        "verify" => format!("verify task: {}", input["task_description"].as_str().unwrap_or("?")),
+        "mcp_call" => format!("MCP call: {}/{}", input["server"].as_str().unwrap_or("?"), input["tool"].as_str().unwrap_or("?")),
         "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
             let cmd = input["command"].as_str().unwrap_or("view");
@@ -2283,6 +2303,154 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ))
             }
         }
+        "kb_query" => {
+            let query = input["query"].as_str().unwrap_or("");
+            let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+            let results = kb.search(query);
+            if results.is_empty() {
+                ok("No matching knowledge base entities found.")
+            } else {
+                let formatted: Vec<String> = results.iter().map(|e| {
+                    format!("ID: {}\nType: {:?}\nName: {}\nDesc: {}\n", e.id, e.entity_type, e.name, e.description.as_deref().unwrap_or("none"))
+                }).collect();
+                ok(formatted.join("\n---\n"))
+            }
+        }
+        "kb_record" => {
+            let name = input["name"].as_str().unwrap_or("unnamed");
+            let etype = match input["entity_type"].as_str().unwrap_or("Service") {
+                "Function" => crate::knowledge::EntityType::Function,
+                "Class" => crate::knowledge::EntityType::Class,
+                "Module" => crate::knowledge::EntityType::Module,
+                "Package" => crate::knowledge::EntityType::Package,
+                "Endpoint" => crate::knowledge::EntityType::Endpoint,
+                "DatabaseTable" => crate::knowledge::EntityType::DatabaseTable,
+                "Migration" => crate::knowledge::EntityType::Migration,
+                "ArchitectureDecision" => crate::knowledge::EntityType::ArchitectureDecision,
+                _ => crate::knowledge::EntityType::Service,
+            };
+            let desc = input["description"].as_str().map(|s| s.to_string());
+            let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+            let entity = crate::knowledge::Entity {
+                id: format!("{}-{}", name.to_lowercase().replace(' ', "-"), kb.entities.len() + 1),
+                entity_type: etype,
+                name: name.to_string(),
+                path: input["path"].as_str().map(|s| s.to_string()),
+                description: desc,
+                metadata: input["metadata"].clone(),
+                relationships: vec![],
+                last_updated: "2026-07-06T00:00:00Z".to_string(),
+            };
+            let id = entity.id.clone();
+            kb.add_entity(entity);
+            let _ = kb.save();
+            ok(format!("Successfully recorded knowledge entity: {id}"))
+        }
+        "rule_check" => {
+            let engine = crate::rules::RuleEngine::load_defaults();
+            let mut changed = Vec::new();
+            if let Some(arr) = input["changed_files"].as_array() {
+                for v in arr { if let Some(s) = v.as_str() { changed.push(s.to_string()); } }
+            }
+            let ctx = crate::rules::EvaluationContext {
+                task_type: None,
+                changed_files: changed,
+                tools_called: vec![],
+                tests_added: vec![],
+                tests_run: false,
+                dependencies_added: vec![],
+                dependencies_removed: vec![],
+                migration_type: None,
+                has_rollback_plan: false,
+                has_changelog_entry: false,
+                security_review_done: false,
+                custom_facts: std::collections::HashMap::new(),
+            };
+            let violations = engine.evaluate(&ctx);
+            if violations.is_empty() {
+                ok("All engineering rules passed! No violations found.")
+            } else {
+                ok(crate::rules::RuleEngine::format_violations(&violations))
+            }
+        }
+        "verify" => {
+            let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
+            let mut changed = Vec::new();
+            if let Some(arr) = input["changed_files"].as_array() {
+                for v in arr { if let Some(s) = v.as_str() { changed.push(s.to_string()); } }
+            }
+            let ctx = crate::verifier::VerificationContext {
+                task_description: input["task_description"].as_str().unwrap_or("Task verification").to_string(),
+                task_type: None,
+                changed_files: changed,
+                tool_calls: vec![],
+                evidence_gathered: vec![],
+                tests_added: vec![],
+                dependencies_changed: vec![],
+                git_diff: None,
+            };
+            let report = verifier.verify(&ctx);
+            ok(crate::verifier::Verifier::format_report(&report))
+        }
+        "mcp_call" => {
+            let server = input["server"].as_str().unwrap_or("");
+            let tool = input["tool"].as_str().unwrap_or("");
+            let args = &input["arguments"];
+            if server.is_empty() || tool.is_empty() {
+                return err("server and tool names are required");
+            }
+            let s = crate::config::load_settings().unwrap_or_default();
+            if let Some(srv_config) = s.mcp_servers.get(server) {
+                let cmd = srv_config["command"].as_str().unwrap_or("");
+                let srv_args: Vec<&str> = srv_config["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                if cmd.is_empty() {
+                    return err(format!("MCP server '{server}' has no command configured in settings"));
+                }
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool,
+                        "arguments": args
+                    }
+                });
+                let mut child = match std::process::Command::new(cmd)
+                    .args(&srv_args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn() {
+                        Ok(c) => c,
+                        Err(e) => return err(format!("failed to spawn MCP server '{server}' ({cmd}): {e}")),
+                    };
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = std::io::Write::write_all(&mut stdin, payload.to_string().as_bytes());
+                    let _ = std::io::Write::write_all(&mut stdin, b"\n");
+                }
+                match child.wait_with_output() {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                            if let Some(res) = resp.get("result") {
+                                return ok(res.to_string());
+                            } else if let Some(err_val) = resp.get("error") {
+                                return err(format!("MCP server error: {}", err_val));
+                            }
+                        }
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if !o.status.success() || stdout.trim().is_empty() {
+                            err(format!("MCP server exited with status {}: stdout: {} stderr: {}", o.status, stdout, stderr))
+                        } else {
+                            ok(stdout.to_string())
+                        }
+                    }
+                    Err(e) => err(format!("failed to read from MCP server '{server}': {e}")),
+                }
+            } else {
+                err(format!("MCP server '{server}' not found in settings.json mcp_servers"))
+            }
+        }
         "skill" | "load_skill" => {
             let wanted = input["name"]
                 .as_str()
@@ -3313,6 +3481,45 @@ print("hello " + data.get("name", "world"))
         assert!(r
             .content
             .contains("Artifact successfully published locally to"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_operational_judgment_tools() {
+        let d = tempdir();
+        let rec = run(
+            "kb_record",
+            &json!({
+                "name": "AuthService",
+                "entity_type": "Service",
+                "description": "Authentication microservice",
+                "path": "src/auth.rs"
+            }),
+            &d,
+        );
+        assert!(!rec.is_error, "{}", rec.content);
+        assert!(rec.content.contains("Successfully recorded knowledge entity"));
+
+        let q = run("kb_query", &json!({"query": "AuthService"}), &d);
+        assert!(!q.is_error, "{}", q.content);
+        assert!(q.content.contains("AuthService"));
+
+        let rc = run("rule_check", &json!({"changed_files": ["src/auth.rs"]}), &d);
+        assert!(!rc.is_error, "{}", rc.content);
+
+        let ver = run("verify", &json!({"task_description": "Add auth service", "changed_files": ["src/auth.rs"]}), &d);
+        assert!(!ver.is_error, "{}", ver.content);
+        assert!(ver.content.contains("Verification Report"));
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_mcp_call_missing_server() {
+        let d = tempdir();
+        let res = run("mcp_call", &json!({"server": "nonexistent_server", "tool": "test_tool"}), &d);
+        assert!(res.is_error);
+        assert!(res.content.contains("not found in settings.json mcp_servers"));
         let _ = fs::remove_dir_all(&d);
     }
 }

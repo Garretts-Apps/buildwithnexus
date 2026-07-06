@@ -694,6 +694,10 @@ fn repl(
                 handle_tools();
                 continue;
             }
+            "/mcp" => {
+                handle_mcp();
+                continue;
+            }
             _ => {}
         }
 
@@ -1042,6 +1046,23 @@ fn handle_tools() {
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
     tui::browse_items("tools", &items);
+}
+
+fn handle_mcp() {
+    let mut items = Vec::new();
+    if let Some(s) = config::load_settings() {
+        for (name, val) in &s.mcp_servers {
+            let desc = serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
+            items.push((name.clone(), format!("MCP Server Configuration:\n{desc}")));
+        }
+    }
+    if items.is_empty() {
+        tui::line(&tui::dim("  No MCP servers configured in settings.json (mcp_servers)."));
+        tui::line(&tui::dim("  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`."));
+        return;
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    tui::browse_items("mcp servers", &items);
 }
 
 fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
@@ -1542,6 +1563,10 @@ fn print_help() {
     tui::line(&format!(
         "  {}        browse callable tools",
         tui::bold("/tools")
+    ));
+    tui::line(&format!(
+        "  {}          inspect configured enterprise MCP servers",
+        tui::bold("/mcp")
     ));
     tui::line(&format!(
         "  {}        inspect hooks, tools, skills, and subagents",
