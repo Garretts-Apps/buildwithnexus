@@ -31,6 +31,7 @@ const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
 
 #[derive(Default, Clone)]
 struct CliOptions {
+    provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     prompt: Option<String>,
@@ -41,7 +42,11 @@ fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
     let mut rest = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
-        if let Some(v) = arg.strip_prefix("--model=") {
+        if let Some(v) = arg.strip_prefix("--provider=") {
+            opts.provider = Some(v.to_string());
+        } else if arg == "--provider" {
+            opts.provider = it.next();
+        } else if let Some(v) = arg.strip_prefix("--model=") {
             opts.model = Some(v.to_string());
         } else if arg == "--model" {
             opts.model = it.next();
@@ -133,10 +138,13 @@ pub fn run() {
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
-    let settings = match config::load_settings() {
+    let mut settings = match config::load_settings() {
         Some(s) => s,
         None => onboarding::run().ok_or("setup cancelled")?,
     };
+    if let Some(p) = &opts.provider {
+        settings.provider = p.clone();
+    }
     let mut provider = build_provider(&settings)?;
     if let Some(model) = &opts.model {
         provider.model = model.clone();
