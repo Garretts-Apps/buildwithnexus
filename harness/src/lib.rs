@@ -30,6 +30,7 @@ const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
 struct CliOptions {
     model: Option<String>,
     permission_mode: Option<String>,
+    prompt: Option<String>,
 }
 
 fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
@@ -47,6 +48,10 @@ fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
             opts.permission_mode = Some(v.to_string());
         } else if arg == "--permission-mode" || arg == "--permission" {
             opts.permission_mode = it.next();
+        } else if let Some(v) = arg.strip_prefix("--prompt=") {
+            opts.prompt = Some(v.to_string());
+        } else if arg == "--prompt" {
+            opts.prompt = it.next();
         } else {
             rest.push(arg);
         }
@@ -65,7 +70,7 @@ pub fn run() {
     let rest = || args[1..].join(" ");
 
     match cmd {
-        "" => interactive(None, opts),
+        "" => interactive(opts.prompt.clone(), opts),
         "init" | "da-init" | "setup" => {
             onboarding::run();
         }
@@ -115,7 +120,7 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
-        _ if !args.is_empty() => interactive(Some(args.join(" ")), opts),
+        _ if !args.is_empty() => interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts),
         other => {
             eprintln!("unknown command: {other}\n");
             usage();

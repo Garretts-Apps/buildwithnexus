@@ -33,7 +33,7 @@ Use this skill whenever the task requires acting through buildwithnexus tools.
 - **Mandatory Tool Usage:** Whenever generating or editing code, HTML, or any file contents, you MUST use the appropriate tool (e.g., `Artifact`, `str_replace_editor`, `write_file`). NEVER just write the code in plain markdown as your text response.
 - **No Placeholders:** When using file modification tools or `Artifact`, the contents MUST be fully implemented code or text. DO NOT use placeholders like `// canvas game logic here`.
 
-
+- **No Permission Seeking:** DO NOT ask the user for permission, themes, or layout choices. If instructions are open-ended, make a reasonable decision and just build it.
 ## Choosing tools
 
 - Read/search/list tools are the default first step.

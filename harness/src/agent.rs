@@ -311,6 +311,7 @@ pub fn role(id: &str) -> Role {
 Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
+DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
 When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
 IMPORTANT — tool discipline:\n\
 • Before using run_command to install anything (npm install, pip install, cargo add, brew install, \
