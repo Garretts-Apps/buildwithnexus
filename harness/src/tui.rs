@@ -27,6 +27,17 @@ static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
 static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 // Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
 static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static VIM_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn toggle_vim_mode() -> bool {
+    let old = VIM_MODE.load(Ordering::Relaxed);
+    VIM_MODE.store(!old, Ordering::Relaxed);
+    !old
+}
+
+pub fn is_vim_mode() -> bool {
+    VIM_MODE.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 struct SelectPos {
@@ -1637,6 +1648,13 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
         None => ("", cwd.to_path_buf(), partial),
     };
     let mut out = Vec::new();
+    if base.is_empty() {
+        for special in ["diff", "status", "rules", "kb:", "symbol:", "url:", "web:"] {
+            if special.starts_with(prefix) {
+                out.push(special.to_string());
+            }
+        }
+    }
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();

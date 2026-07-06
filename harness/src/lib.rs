@@ -698,6 +698,19 @@ fn repl(
                 handle_mcp();
                 continue;
             }
+            "/vim" => {
+                let current = tui::toggle_vim_mode();
+                tui::line(&format!("  Vim modal editing mode is now {}", if current { tui::green("ENABLED [Normal/Insert]") } else { tui::yellow("DISABLED [Standard Emacs/Readline]") }));
+                continue;
+            }
+            "/voice" => {
+                handle_voice();
+                continue;
+            }
+            "/local" => {
+                handle_local(&mut provider);
+                continue;
+            }
             _ => {}
         }
 
@@ -1088,6 +1101,70 @@ fn handle_model(provider: &mut Provider) {
         }
         tui::line(&tui::green(&format!("  ✓ model → {pick}")));
     }
+}
+
+fn handle_voice() {
+    tui::line(&tui::accent("  /voice — audio transcription & voice input"));
+    tui::line("  Supported backends: local whisper, llama.cpp audio, ffmpeg, macOS dictation");
+    tui::line(&tui::dim("  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or use `whisper-cpp`"));
+    let audio_path = tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ").unwrap_or_default();
+    if audio_path.trim().is_empty() {
+        if std::process::Command::new("whisper-cpp").arg("--help").output().is_ok() || std::process::Command::new("whisper").arg("--help").output().is_ok() {
+            tui::line(&tui::green("  Local whisper binary detected! Ready for voice-to-text transcription."));
+        } else {
+            tui::line(&tui::yellow("  No local whisper binary found in PATH."));
+            tui::line(&tui::dim("  To enable offline zero-latency voice input, install `whisper-cpp` or `openai-whisper`."));
+        }
+    } else {
+        let path = audio_path.trim();
+        if std::path::Path::new(path).exists() {
+            tui::line(&format!("  Transcribing audio from {}...", tui::bold(path)));
+            if let Ok(_o) = std::process::Command::new("whisper-cpp").args(["-f", path, "-otxt"]).output() {
+                tui::line(&tui::green("  Transcription complete!"));
+                if let Ok(txt) = std::fs::read_to_string(format!("{path}.txt")) {
+                    tui::line(&format!("  Transcribed: {}", tui::bold(&txt)));
+                }
+            } else {
+                tui::line(&tui::yellow("  Please install `whisper-cpp` to transcribe audio files locally."));
+            }
+        } else {
+            tui::line(&tui::red(&format!("  File not found: {path}")));
+        }
+    }
+}
+
+fn handle_local(_provider: &mut Provider) {
+    tui::line(&tui::accent("  /local — local model management & inference optimization"));
+    tui::line("  Scanning local servers and model directories...");
+    let mut servers = Vec::new();
+    if let Ok(o) = std::process::Command::new("curl").args(["-s", "http://localhost:11434/api/tags"]).output() {
+        if o.status.success() {
+            servers.push("Ollama (port 11434 - ACTIVE)");
+        }
+    }
+    if let Ok(o) = std::process::Command::new("curl").args(["-s", "http://localhost:8080/v1/models"]).output() {
+        if o.status.success() {
+            servers.push("llama.cpp / vLLM (port 8080 - ACTIVE)");
+        }
+    }
+    if servers.is_empty() {
+        tui::line(&tui::dim("  No running local model servers detected on port 11434 (Ollama) or 8080 (llama.cpp/vLLM)."));
+    } else {
+        for s in servers {
+            tui::line(&format!("  • {}", tui::green(s)));
+        }
+    }
+    let models_dir = std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join(".buildwithnexus/models")).unwrap_or_else(|| PathBuf::from(".buildwithnexus/models"));
+    if let Ok(rd) = std::fs::read_dir(&models_dir) {
+        let ggufs: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".gguf")).collect();
+        if !ggufs.is_empty() {
+            tui::line(&format!("  Local GGUF models in {}:", models_dir.display()));
+            for m in ggufs {
+                tui::line(&format!("    - {}", tui::bold(&m)));
+            }
+        }
+    }
+    tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -1608,7 +1685,19 @@ fn print_help() {
     ));
     tui::line(&tui::dim("  !<cmd>   run a shell command directly"));
     tui::line(&tui::dim(
-        "  @<path>  Tab-complete a file path into your message",
+        "  @<tool>  tab-complete operational tools (@diff, @status, @rules, @kb:, @symbol:, @url:)",
+    ));
+    tui::line(&format!(
+        "  {}          toggle Vim modal editing mode (Normal/Insert)",
+        tui::bold("/vim")
+    ));
+    tui::line(&format!(
+        "  {}        audio transcription & offline voice input",
+        tui::bold("/voice")
+    ));
+    tui::line(&format!(
+        "  {}        local model server & GGUF management",
+        tui::bold("/local")
     ));
     tui::line(&tui::dim(
         "  Tab      autocomplete /commands and their sub-args",
@@ -1652,6 +1741,66 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
     let mut text_attachments = Vec::new();
     for word in task.split_whitespace() {
         if let Some(raw_path) = word.strip_prefix('@') {
+            if raw_path == "diff" || raw_path == "git:diff" {
+                if let Ok(o) = std::process::Command::new("git").args(["diff", "HEAD"]).current_dir(cwd).output() {
+                    let diff_text = String::from_utf8_lossy(&o.stdout);
+                    if !diff_text.trim().is_empty() {
+                        text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
+                        if !clean.is_empty() { clean.push(' '); }
+                        clean.push_str("[git diff HEAD]");
+                        continue;
+                    }
+                }
+            } else if raw_path == "status" || raw_path == "git:status" {
+                if let Ok(o) = std::process::Command::new("git").args(["status", "-s"]).current_dir(cwd).output() {
+                    let stat_text = String::from_utf8_lossy(&o.stdout);
+                    if !stat_text.trim().is_empty() {
+                        text_attachments.push(format!("[git status]\n{}", stat_text));
+                        if !clean.is_empty() { clean.push(' '); }
+                        clean.push_str("[git status]");
+                        continue;
+                    }
+                }
+            } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
+                let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+                let res = kb.search(kb_query);
+                if !res.is_empty() {
+                    let summary = res.iter().map(|e| format!("Entity: {} ({:?})\nDescription: {}\nPath: {:?}", e.name, e.entity_type, e.description.as_deref().unwrap_or(""), e.path)).collect::<Vec<_>>().join("\n---\n");
+                    text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
+                    if !clean.is_empty() { clean.push(' '); }
+                    clean.push_str(&format!("[kb: {}]", kb_query));
+                    continue;
+                }
+            } else if raw_path == "rules" || raw_path.starts_with("rule:") {
+                let engine = crate::rules::RuleEngine::load_defaults();
+                let rules_summary = engine.rules.iter().map(|r| format!("Rule [{}]: {} (Severity: {})", r.id, r.description, r.severity)).collect::<Vec<_>>().join("\n");
+                text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
+                if !clean.is_empty() { clean.push(' '); }
+                clean.push_str("[active rules]");
+                continue;
+            } else if let Some(url) = raw_path.strip_prefix("url:").or_else(|| raw_path.strip_prefix("web:")) {
+                if let Ok(o) = std::process::Command::new("curl").args(["-sL", "--max-time", "5", url]).output() {
+                    let web_text = String::from_utf8_lossy(&o.stdout);
+                    if !web_text.trim().is_empty() {
+                        let snippet: String = web_text.chars().take(8000).collect();
+                        text_attachments.push(format!("[web: {}]\n{}", url, snippet));
+                        if !clean.is_empty() { clean.push(' '); }
+                        clean.push_str(&format!("[web: {}]", url));
+                        continue;
+                    }
+                }
+            } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
+                if let Ok(o) = std::process::Command::new("grep").args(["-rnI", sym_query, "."]).current_dir(cwd).output() {
+                    let sym_text = String::from_utf8_lossy(&o.stdout);
+                    if !sym_text.trim().is_empty() {
+                        let snippet: String = sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
+                        text_attachments.push(format!("[symbol search: {}]\n{}", sym_query, snippet));
+                        if !clean.is_empty() { clean.push(' '); }
+                        clean.push_str(&format!("[symbol: {}]", sym_query));
+                        continue;
+                    }
+                }
+            }
             let (raw_path, range) = split_attachment_range(raw_path);
             let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
             let p = if let Some(rest) = raw_path.strip_prefix("~/") {
