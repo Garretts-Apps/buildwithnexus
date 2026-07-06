@@ -582,21 +582,27 @@ pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
     // 1. Global config.json (legacy base)
     if let Ok(text) = fs::read_to_string(home().join("config.json")) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() { sources.push(val); }
+            if val.is_object() {
+                sources.push(val);
+            }
         }
     }
 
     // 2. Global settings.json
     if let Ok(text) = fs::read_to_string(settings_path()) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() { sources.push(val); }
+            if val.is_object() {
+                sources.push(val);
+            }
         }
     }
 
     // 3. Global settings.local.json
     if let Ok(text) = fs::read_to_string(home().join("settings.local.json")) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() { sources.push(val); }
+            if val.is_object() {
+                sources.push(val);
+            }
         }
     }
 
@@ -604,7 +610,9 @@ pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
     let proj_path = workdir.join(".buildwithnexus").join("settings.json");
     if let Ok(text) = fs::read_to_string(&proj_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() { sources.push(val); }
+            if val.is_object() {
+                sources.push(val);
+            }
         }
     }
 
@@ -612,7 +620,9 @@ pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
     let local_path = workdir.join(".buildwithnexus").join("settings.local.json");
     if let Ok(text) = fs::read_to_string(&local_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() { sources.push(val); }
+            if val.is_object() {
+                sources.push(val);
+            }
         }
     }
 
@@ -633,7 +643,11 @@ fn merge_json_values(target: &mut serde_json::Value, source: serde_json::Value) 
         (serde_json::Value::Object(ref mut target_map), serde_json::Value::Object(source_map)) => {
             for (k, v) in source_map {
                 if k == "allowed_commands" {
-                    if let (Some(serde_json::Value::Array(ref mut target_arr)), serde_json::Value::Array(source_arr)) = (target_map.get_mut(&k), v.clone()) {
+                    if let (
+                        Some(serde_json::Value::Array(ref mut target_arr)),
+                        serde_json::Value::Array(source_arr),
+                    ) = (target_map.get_mut(&k), v.clone())
+                    {
                         for item in source_arr {
                             if !target_arr.contains(&item) {
                                 target_arr.push(item);
@@ -952,15 +966,26 @@ mod tests {
 
         fs::write(h.join("settings.json"), r#"{"provider": "openai", "model": "gpt-4o", "effort": "low", "allowed_commands": ["git status"]}"#).unwrap();
         fs::write(h.join("settings.local.json"), r#"{"effort": "medium"}"#).unwrap();
-        fs::write(proj.join(".buildwithnexus").join("settings.json"), r#"{"model": "gpt-4o-mini", "allowed_commands": ["cargo check"]}"#).unwrap();
-        fs::write(proj.join(".buildwithnexus").join("settings.local.json"), r#"{"permission": "readonly", "allowed_commands": ["git status", "cargo test"]}"#).unwrap();
+        fs::write(
+            proj.join(".buildwithnexus").join("settings.json"),
+            r#"{"model": "gpt-4o-mini", "allowed_commands": ["cargo check"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.join(".buildwithnexus").join("settings.local.json"),
+            r#"{"permission": "readonly", "allowed_commands": ["git status", "cargo test"]}"#,
+        )
+        .unwrap();
 
         let s = load_settings_from_dir(&proj).unwrap();
         assert_eq!(s.provider, "openai");
         assert_eq!(s.model, "gpt-4o-mini");
         assert_eq!(s.effort, "medium");
         assert_eq!(s.permission, "readonly");
-        assert_eq!(s.allowed_commands, vec!["git status", "cargo check", "cargo test"]);
+        assert_eq!(
+            s.allowed_commands,
+            vec!["git status", "cargo check", "cargo test"]
+        );
 
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);

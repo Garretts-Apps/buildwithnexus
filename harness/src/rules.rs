@@ -150,13 +150,16 @@ impl RuleEngine {
     /// Loads built-in default engineering constraints.
     pub fn load_defaults() -> Self {
         let mut engine = Self::new();
-        
+
         engine.add_rule(Rule {
             id: "bug_fix_requires_regression_test".to_string(),
             description: "Bug fixes must include a regression test".to_string(),
             severity: Severity::Medium,
             applies_when: vec![Condition::TaskTypeIs(TaskType::BugFix)],
-            requires: vec!["failing_test_before_fix".to_string(), "passing_test_after_fix".to_string()],
+            requires: vec![
+                "failing_test_before_fix".to_string(),
+                "passing_test_after_fix".to_string(),
+            ],
             message: "Bug fix does not include a regression test.".to_string(),
             enabled: true,
         });
@@ -166,8 +169,13 @@ impl RuleEngine {
             description: "Public API changes require caller analysis and changelog".to_string(),
             severity: Severity::High,
             applies_when: vec![Condition::ChangeTouches("public_api".to_string())],
-            requires: vec!["caller_search".to_string(), "changelog_entry".to_string(), "compatibility_assessment".to_string()],
-            message: "Public API contract changed without caller search or changelog entry.".to_string(),
+            requires: vec![
+                "caller_search".to_string(),
+                "changelog_entry".to_string(),
+                "compatibility_assessment".to_string(),
+            ],
+            message: "Public API contract changed without caller search or changelog entry."
+                .to_string(),
             enabled: true,
         });
 
@@ -176,7 +184,11 @@ impl RuleEngine {
             description: "Destructive migrations require rollback plan".to_string(),
             severity: Severity::Critical,
             applies_when: vec![Condition::MigrationType("destructive".to_string())],
-            requires: vec!["rollback_plan".to_string(), "backup_plan".to_string(), "approval".to_string()],
+            requires: vec![
+                "rollback_plan".to_string(),
+                "backup_plan".to_string(),
+                "approval".to_string(),
+            ],
             message: "Destructive database migration proposed without a rollback plan.".to_string(),
             enabled: true,
         });
@@ -197,7 +209,8 @@ impl RuleEngine {
             severity: Severity::High,
             applies_when: vec![Condition::ChangeTouches("auth".to_string())],
             requires: vec!["security_review".to_string()],
-            message: "Authentication or authorization code changed without security review.".to_string(),
+            message: "Authentication or authorization code changed without security review."
+                .to_string(),
             enabled: true,
         });
 
@@ -207,7 +220,8 @@ impl RuleEngine {
             severity: Severity::Critical,
             applies_when: vec![Condition::ChangeTouches("logging".to_string())],
             requires: vec!["secret_scan".to_string()],
-            message: "Logging code changed — verify no secrets or credentials are logged.".to_string(),
+            message: "Logging code changed — verify no secrets or credentials are logged."
+                .to_string(),
             enabled: true,
         });
 
@@ -216,8 +230,13 @@ impl RuleEngine {
             description: "Critical path changes should use feature flags".to_string(),
             severity: Severity::Medium,
             applies_when: vec![Condition::ChangeTouches("critical_path".to_string())],
-            requires: vec!["feature_flag".to_string(), "staged_rollout_plan".to_string()],
-            message: "Critical path service modified without a feature flag or staged rollout plan.".to_string(),
+            requires: vec![
+                "feature_flag".to_string(),
+                "staged_rollout_plan".to_string(),
+            ],
+            message:
+                "Critical path service modified without a feature flag or staged rollout plan."
+                    .to_string(),
             enabled: true,
         });
 
@@ -236,14 +255,17 @@ impl RuleEngine {
 
     /// Loads rules from a JSON or YAML file (using JSON parser here for minimal deps).
     pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let data = fs::read_to_string(path).map_err(|e| format!("Failed to read rules file {}: {}", path, e))?;
+        let data = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read rules file {}: {}", path, e))?;
         #[derive(Deserialize)]
         struct RulesWrapper {
             rules: Vec<Rule>,
         }
         let wrapper: RulesWrapper = serde_json::from_str(&data)
             .map_err(|e| format!("Failed to parse rules file {}: {}", path, e))?;
-        Ok(Self { rules: wrapper.rules })
+        Ok(Self {
+            rules: wrapper.rules,
+        })
     }
 
     /// Adds a rule to the engine.
@@ -273,13 +295,22 @@ impl RuleEngine {
             match cond {
                 Condition::TaskTypeIs(tt) => {
                     if let Some(ref ctt) = ctx.task_type {
-                        if ctt == tt { applies = true; }
+                        if ctt == tt {
+                            applies = true;
+                        }
                     }
                 }
                 Condition::ChangeTouches(keyword) => {
                     let kw = keyword.to_lowercase();
-                    if ctx.changed_files.iter().any(|f| f.to_lowercase().contains(&kw))
-                        || ctx.tools_called.iter().any(|t| t.to_lowercase().contains(&kw)) {
+                    if ctx
+                        .changed_files
+                        .iter()
+                        .any(|f| f.to_lowercase().contains(&kw))
+                        || ctx
+                            .tools_called
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&kw))
+                    {
                         applies = true;
                     }
                 }
@@ -290,7 +321,7 @@ impl RuleEngine {
                     }
                 }
                 Condition::DependencyAdded(expected) => {
-                    if !ctx.dependencies_added.is_empty() == *expected {
+                    if ctx.dependencies_added.is_empty() != *expected {
                         applies = true;
                     }
                 }
@@ -303,7 +334,9 @@ impl RuleEngine {
                 }
                 Condition::Custom(key, val) => {
                     if let Some(cval) = ctx.custom_facts.get(key) {
-                        if cval == val { applies = true; }
+                        if cval == val {
+                            applies = true;
+                        }
                     }
                 }
             }
@@ -320,20 +353,32 @@ impl RuleEngine {
                 "failing_test_before_fix" | "passing_test_after_fix" | "tests_for_new_files" => {
                     !ctx.tests_added.is_empty() || ctx.tests_run
                 }
-                "caller_search" => {
-                    ctx.tools_called.iter().any(|t| t.contains("grep") || t.contains("search") || t.contains("find"))
-                }
+                "caller_search" => ctx
+                    .tools_called
+                    .iter()
+                    .any(|t| t.contains("grep") || t.contains("search") || t.contains("find")),
                 "changelog_entry" => {
-                    ctx.has_changelog_entry || ctx.changed_files.iter().any(|f| f.to_lowercase().contains("changelog") || f.to_lowercase().contains("release_notes"))
+                    ctx.has_changelog_entry
+                        || ctx.changed_files.iter().any(|f| {
+                            f.to_lowercase().contains("changelog")
+                                || f.to_lowercase().contains("release_notes")
+                        })
                 }
                 "rollback_plan" | "backup_plan" => ctx.has_rollback_plan,
                 "security_review" | "secret_scan" => ctx.security_review_done,
-                "license_check" | "vulnerability_check" | "maintenance_check" | "size_impact_review" => {
-                    ctx.tools_called.iter().any(|t| t.contains("search") || t.contains("web") || t.contains("fetch"))
-                }
+                "license_check"
+                | "vulnerability_check"
+                | "maintenance_check"
+                | "size_impact_review" => ctx
+                    .tools_called
+                    .iter()
+                    .any(|t| t.contains("search") || t.contains("web") || t.contains("fetch")),
                 _ => {
                     // Check if custom fact claims it's satisfied
-                    ctx.custom_facts.get(req).and_then(|v| v.as_bool()).unwrap_or(false)
+                    ctx.custom_facts
+                        .get(req)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
                 }
             };
 
@@ -347,9 +392,19 @@ impl RuleEngine {
                 rule_id: rule.id.clone(),
                 rule_description: rule.description.clone(),
                 severity: rule.severity,
-                message: format!("{} Missing required checks: {}", rule.message, missing_reqs.join(", ")),
-                evidence: Some(format!("Changed files: {:?}, Tools called: {:?}", ctx.changed_files, ctx.tools_called)),
-                suggested_action: Some(format!("Satisfy requirements: {}", missing_reqs.join(", "))),
+                message: format!(
+                    "{} Missing required checks: {}",
+                    rule.message,
+                    missing_reqs.join(", ")
+                ),
+                evidence: Some(format!(
+                    "Changed files: {:?}, Tools called: {:?}",
+                    ctx.changed_files, ctx.tools_called
+                )),
+                suggested_action: Some(format!(
+                    "Satisfy requirements: {}",
+                    missing_reqs.join(", ")
+                )),
             })
         } else {
             None
@@ -370,7 +425,12 @@ impl RuleEngine {
         }
         let mut out = String::from("### Rule Violations\n\n");
         for v in violations {
-            out.push_str(&format!("- **[{}]** `{}`: {}\n", v.severity.to_string().to_uppercase(), v.rule_id, v.message));
+            out.push_str(&format!(
+                "- **[{}]** `{}`: {}\n",
+                v.severity.to_string().to_uppercase(),
+                v.rule_id,
+                v.message
+            ));
             if let Some(ref act) = v.suggested_action {
                 out.push_str(&format!("  - *Suggested Action*: {}\n", act));
             }
@@ -400,6 +460,8 @@ mod tests {
             ..Default::default()
         };
         let violations = engine.evaluate(&ctx);
-        assert!(violations.iter().any(|v| v.rule_id == "bug_fix_requires_regression_test"));
+        assert!(violations
+            .iter()
+            .any(|v| v.rule_id == "bug_fix_requires_regression_test"));
     }
 }

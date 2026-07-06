@@ -5,7 +5,7 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -744,7 +744,7 @@ pub fn set_permission_mode(mode: &str) {
             "{} {} {}",
             dim("permission:"),
             bold(mode),
-            dim("· /permissions ask|auto|readonly · wheel/PgUp scroll · drag copies · /scroll on|off")
+            dim("· /permissions · wheel/PgUp · drag-copy · /mouse")
         );
     }
     let mut out = io::stdout();
@@ -1057,7 +1057,10 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         cwd.to_string()
     };
     line(&clip_ansi_line(
-        &dim(&format!("  ⚙ Provider: {}  ·  🤖 Model: {}  ·  📂 {}", provider, model, cwd_label)),
+        &dim(&format!(
+            "  ⚙ Provider: {}  ·  🤖 Model: {}  ·  📂 {}",
+            provider, model, cwd_label
+        )),
         w,
     ));
     // Mode row
@@ -1130,7 +1133,10 @@ pub fn inference_telemetry(tokens_generated: usize, elapsed_secs: f64) {
         "  {} [{}] {}",
         dim("inference"),
         speed_badge,
-        dim(&format!("~{} tokens generated in {:.2}s", tokens_generated, elapsed_secs)),
+        dim(&format!(
+            "~{} tokens generated in {:.2}s",
+            tokens_generated, elapsed_secs
+        )),
     ));
 }
 
@@ -1159,7 +1165,7 @@ pub fn enter_alt(raw: bool) {
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
         let _ = execute!(io::stdout(), EnableBracketedPaste);
-        MOUSE_CAPTURED.store(false, Ordering::Relaxed);
+        set_mouse_capture(true);
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1759,12 +1765,10 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
                     | crate::knowledge::EntityType::Class
                     | crate::knowledge::EntityType::Interface
                     | crate::knowledge::EntityType::Module
-            ) {
-                if id.to_lowercase().contains(&query.to_lowercase())
-                    || entity.name.to_lowercase().contains(&query.to_lowercase())
-                {
-                    out.push(format!("symbol:{id}"));
-                }
+            ) && (id.to_lowercase().contains(&query.to_lowercase())
+                || entity.name.to_lowercase().contains(&query.to_lowercase()))
+            {
+                out.push(format!("symbol:{id}"));
             }
         }
         out.sort();
@@ -1775,7 +1779,9 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
         let rules_dir = cwd.join(".buildwithnexus").join("rules");
         if let Ok(rd) = std::fs::read_dir(&rules_dir) {
             for e in rd.flatten() {
-                if let Ok(loaded) = crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy()) {
+                if let Ok(loaded) =
+                    crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
+                {
                     for r in loaded.rules {
                         engine.add_rule(r);
                     }
@@ -1785,7 +1791,10 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
         for rule in &engine.rules {
             if rule.id.to_lowercase().contains(&query.to_lowercase())
-                || rule.description.to_lowercase().contains(&query.to_lowercase())
+                || rule
+                    .description
+                    .to_lowercase()
+                    .contains(&query.to_lowercase())
             {
                 out.push(format!("rules:{}", rule.id));
             }
@@ -1799,7 +1808,9 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     };
     let mut out = Vec::new();
     if base.is_empty() {
-        for special in ["diff", "status", "rules", "rules:", "kb:", "symbol:", "url:", "web:"] {
+        for special in [
+            "diff", "status", "rules", "rules:", "kb:", "symbol:", "url:", "web:",
+        ] {
             if special.starts_with(prefix) {
                 out.push(special.to_string());
             }
@@ -1920,7 +1931,11 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     redraw(prompt, start, &buf, cursor, &mut scroll);
     let mut hist_idx: Option<usize> = None;
     let mut kill = String::new();
-    let mut vim_state = if is_vim_mode() { VimState::Normal } else { VimState::Insert };
+    let mut vim_state = if is_vim_mode() {
+        VimState::Normal
+    } else {
+        VimState::Insert
+    };
     let mut vim_undo_stack: Vec<Vec<char>> = vec![buf.clone()];
     if is_vim_mode() {
         VIM_STATE_VAL.store(0, Ordering::Relaxed);
@@ -2203,7 +2218,9 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     match c {
                         'i' => vim_state = VimState::Insert,
                         'a' => {
-                            if cursor < buf.len() { cursor += 1; }
+                            if cursor < buf.len() {
+                                cursor += 1;
+                            }
                             vim_state = VimState::Insert;
                         }
                         'I' => {
@@ -2215,7 +2232,11 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             vim_state = VimState::Insert;
                         }
                         'h' => cursor = cursor.saturating_sub(1),
-                        'l' => if cursor < buf.len() { cursor += 1; },
+                        'l' => {
+                            if cursor < buf.len() {
+                                cursor += 1;
+                            }
+                        }
                         '0' | '^' => cursor = 0,
                         '$' => cursor = buf.len(),
                         'w' => cursor = next_word(&buf, cursor),
@@ -2242,18 +2263,24 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             if cursor < buf.len() {
                                 kill = buf[cursor..=cursor].iter().collect();
                                 buf.remove(cursor);
-                                if !kill.is_empty() { osc52_copy(&kill); }
+                                if !kill.is_empty() {
+                                    osc52_copy(&kill);
+                                }
                             }
                         }
                         'D' => {
                             kill = buf[cursor..].iter().collect();
                             buf.truncate(cursor);
-                            if !kill.is_empty() { osc52_copy(&kill); }
+                            if !kill.is_empty() {
+                                osc52_copy(&kill);
+                            }
                         }
                         'C' => {
                             kill = buf[cursor..].iter().collect();
                             buf.truncate(cursor);
-                            if !kill.is_empty() { osc52_copy(&kill); }
+                            if !kill.is_empty() {
+                                osc52_copy(&kill);
+                            }
                             vim_state = VimState::Insert;
                         }
                         'p' => {
@@ -2283,10 +2310,16 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         _ => {}
                     }
                 } else if is_vim_mode() && matches!(vim_state, VimState::Visual(_)) {
-                    let VimState::Visual(start_idx) = vim_state else { unreachable!() };
+                    let VimState::Visual(start_idx) = vim_state else {
+                        unreachable!()
+                    };
                     match c {
                         'h' => cursor = cursor.saturating_sub(1),
-                        'l' => if cursor < buf.len() { cursor += 1; },
+                        'l' => {
+                            if cursor < buf.len() {
+                                cursor += 1;
+                            }
+                        }
                         'w' => cursor = next_word(&buf, cursor),
                         'b' => cursor = prev_word(&buf, cursor),
                         'e' => cursor = end_word(&buf, cursor),
@@ -2299,7 +2332,9 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                                 kill = buf[min_i..=max_i].iter().collect();
                                 buf.drain(min_i..=max_i);
                                 cursor = min_i.min(buf.len());
-                                if !kill.is_empty() { osc52_copy(&kill); }
+                                if !kill.is_empty() {
+                                    osc52_copy(&kill);
+                                }
                             }
                             vim_state = VimState::Normal;
                         }
@@ -2308,7 +2343,9 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
                             if min_i <= max_i && max_i < buf.len() {
                                 kill = buf[min_i..=max_i].iter().collect();
-                                if !kill.is_empty() { osc52_copy(&kill); }
+                                if !kill.is_empty() {
+                                    osc52_copy(&kill);
+                                }
                             }
                             vim_state = VimState::Normal;
                         }
@@ -2439,9 +2476,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
             KeyCode::Esc => {
                 if is_vim_mode() && vim_state != VimState::Normal {
                     vim_state = VimState::Normal;
-                    if cursor > 0 {
-                        cursor -= 1;
-                    }
+                    cursor = cursor.saturating_sub(1);
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                 } else if !is_vim_mode() {
                     buf.clear();
@@ -2636,6 +2671,24 @@ mod tests {
     }
 
     #[test]
+    fn selection_range_handles_single_and_multi_line_drags() {
+        let one = Selection {
+            anchor: SelectPos { row: 2, col: 3 },
+            focus: SelectPos { row: 2, col: 7 },
+        };
+        assert_eq!(selection_range_for(one, 2, 20), Some((3, 8)));
+        assert_eq!(selection_range_for(one, 1, 20), None);
+
+        let many = Selection {
+            anchor: SelectPos { row: 1, col: 4 },
+            focus: SelectPos { row: 3, col: 2 },
+        };
+        assert_eq!(selection_range_for(many, 1, 10), Some((4, 10)));
+        assert_eq!(selection_range_for(many, 2, 10), Some((0, 10)));
+        assert_eq!(selection_range_for(many, 3, 10), Some((0, 3)));
+    }
+
+    #[test]
     fn history_search_finds_newest_first() {
         let h = vec![
             "git status".to_string(),
@@ -2672,6 +2725,8 @@ mod tests {
         assert!(completions(&b, 0, "/re").contains(&"/resume".to_string()));
         let b2: Vec<char> = "do /re".chars().collect();
         assert!(completions(&b2, 3, "/re").is_empty());
+        let b3: Vec<char> = "/scr".chars().collect();
+        assert!(completions(&b3, 0, "/scr").contains(&"/scroll".to_string()));
     }
 
     #[test]
@@ -2745,7 +2800,9 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let cands = super::path_candidates("rules:bug", &d);
         assert!(!cands.is_empty());
-        assert!(cands.iter().any(|c| c.contains("bug_fix_requires_regression_test")));
+        assert!(cands
+            .iter()
+            .any(|c| c.contains("bug_fix_requires_regression_test")));
         let _ = fs::remove_dir_all(&d);
     }
 

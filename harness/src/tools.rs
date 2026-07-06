@@ -117,6 +117,10 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
                 }
             })
         },
+        ToolDef { name: "exit_plan", description: "Submit the final actionable plan for the user's task after read-only inspection. The plan must describe task steps, not this tool.",
+            schema: json!({"type":"object","properties":{"plan":{"type":"string","description":"Numbered task plan, e.g. 1. Inspect files\\n2. Apply changes\\n3. Verify"},"steps":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":12,"description":"Concrete task steps"}}}) },
+        ToolDef { name: "ExitPlanMode", description: "Alias for exit_plan. Submit concrete task steps for approval before BUILD executes.",
+            schema: json!({"type":"object","properties":{"plan":{"type":"string","description":"Numbered task plan for the user's task"},"steps":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":12,"description":"Concrete task steps"}}}) },
         ToolDef { name: "str_replace_editor", description: "A tool for viewing, creating, and editing files. Supported commands: `view`, `create`, `str_replace`, `insert`, `undo_edit`. The contents MUST be fully implemented code or text. DO NOT use placeholders.",
             schema: json!({
                 "type": "object",
@@ -288,6 +292,70 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     v
 }
 
+pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<ToolDef> {
+    let all = defs(include_subagent);
+    if context_tokens > 8192 {
+        return all;
+    }
+    all.into_iter().filter(|d| compact_tool(d.name)).collect()
+}
+
+fn compact_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "read"
+            | "write"
+            | "edit"
+            | "patch"
+            | "glob"
+            | "grep"
+            | "list"
+            | "webfetch"
+            | "todowrite"
+            | "todoread"
+            | "skill"
+            | "question"
+            | "str_replace_editor"
+            | "Artifact"
+            | "publish_artifact"
+            | "list_python_tools"
+            | "python_tool"
+            | "read_file"
+            | "read_many_files"
+            | "list_dir"
+            | "list_tree"
+            | "file_info"
+            | "find_paths"
+            | "find_files"
+            | "grep_files"
+            | "write_file"
+            | "edit_file"
+            | "multi_edit"
+            | "apply_patch"
+            | "create_dir"
+            | "move_path"
+            | "remove_path"
+            | "run_command"
+            | "todo_write"
+            | "todo_read"
+            | "create_docx"
+            | "finish"
+            | "save_memory"
+            | "fetch_url"
+            | "start_server"
+            | "list_servers"
+            | "stop_server"
+            | "read_server_log"
+            | "wait_for_url"
+            | "open_browser"
+            | "list_skills"
+            | "load_skill"
+            | "task"
+            | "spawn_subagent"
+    )
+}
+
 pub fn defs_readonly() -> Vec<ToolDef> {
     defs(false)
         .into_iter()
@@ -305,6 +373,8 @@ pub fn defs_readonly() -> Vec<ToolDef> {
                     | "skill"
                     | "question"
                     | "AskUserQuestion"
+                    | "exit_plan"
+                    | "ExitPlanMode"
                     | "read_file"
                     | "read_many_files"
                     | "list_dir"
@@ -434,6 +504,7 @@ pub fn preview(name: &str, input: &Value) -> String {
         "task" | "spawn_subagent" => {
             format!("subagent: {}", task_arg(input).unwrap_or("?"))
         }
+        "exit_plan" | "ExitPlanMode" => "exit plan mode".to_string(),
         "webfetch" | "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
         "websearch" | "web_search" => {
             format!("web search: {}", input["query"].as_str().unwrap_or("?"))
@@ -454,11 +525,24 @@ pub fn preview(name: &str, input: &Value) -> String {
         "skill" | "load_skill" => {
             format!("load skill: {}", input["name"].as_str().unwrap_or("?"))
         }
-        "kb_query" => format!("query knowledge base: {}", input["query"].as_str().unwrap_or("?")),
-        "kb_record" => format!("record knowledge base entity: {}", input["name"].as_str().unwrap_or("?")),
+        "kb_query" => format!(
+            "query knowledge base: {}",
+            input["query"].as_str().unwrap_or("?")
+        ),
+        "kb_record" => format!(
+            "record knowledge base entity: {}",
+            input["name"].as_str().unwrap_or("?")
+        ),
         "rule_check" => "evaluate engineering rules".to_string(),
-        "verify" => format!("verify task: {}", input["task_description"].as_str().unwrap_or("?")),
-        "mcp_call" => format!("MCP call: {}/{}", input["server"].as_str().unwrap_or("?"), input["tool"].as_str().unwrap_or("?")),
+        "verify" => format!(
+            "verify task: {}",
+            input["task_description"].as_str().unwrap_or("?")
+        ),
+        "mcp_call" => format!(
+            "MCP call: {}/{}",
+            input["server"].as_str().unwrap_or("?"),
+            input["tool"].as_str().unwrap_or("?")
+        ),
         "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
             let cmd = input["command"].as_str().unwrap_or("view");
@@ -2310,9 +2394,18 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if results.is_empty() {
                 ok("No matching knowledge base entities found.")
             } else {
-                let formatted: Vec<String> = results.iter().map(|e| {
-                    format!("ID: {}\nType: {:?}\nName: {}\nDesc: {}\n", e.id, e.entity_type, e.name, e.description.as_deref().unwrap_or("none"))
-                }).collect();
+                let formatted: Vec<String> = results
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "ID: {}\nType: {:?}\nName: {}\nDesc: {}\n",
+                            e.id,
+                            e.entity_type,
+                            e.name,
+                            e.description.as_deref().unwrap_or("none")
+                        )
+                    })
+                    .collect();
                 ok(formatted.join("\n---\n"))
             }
         }
@@ -2332,7 +2425,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let desc = input["description"].as_str().map(|s| s.to_string());
             let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
             let entity = crate::knowledge::Entity {
-                id: format!("{}-{}", name.to_lowercase().replace(' ', "-"), kb.entities.len() + 1),
+                id: format!(
+                    "{}-{}",
+                    name.to_lowercase().replace(' ', "-"),
+                    kb.entities.len() + 1
+                ),
                 entity_type: etype,
                 name: name.to_string(),
                 path: input["path"].as_str().map(|s| s.to_string()),
@@ -2350,7 +2447,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let engine = crate::rules::RuleEngine::load_defaults();
             let mut changed = Vec::new();
             if let Some(arr) = input["changed_files"].as_array() {
-                for v in arr { if let Some(s) = v.as_str() { changed.push(s.to_string()); } }
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        changed.push(s.to_string());
+                    }
+                }
             }
             let ctx = crate::rules::EvaluationContext {
                 task_type: None,
@@ -2377,10 +2478,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
             let mut changed = Vec::new();
             if let Some(arr) = input["changed_files"].as_array() {
-                for v in arr { if let Some(s) = v.as_str() { changed.push(s.to_string()); } }
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        changed.push(s.to_string());
+                    }
+                }
             }
             let ctx = crate::verifier::VerificationContext {
-                task_description: input["task_description"].as_str().unwrap_or("Task verification").to_string(),
+                task_description: input["task_description"]
+                    .as_str()
+                    .unwrap_or("Task verification")
+                    .to_string(),
                 task_type: None,
                 changed_files: changed,
                 tool_calls: vec![],
@@ -2402,9 +2510,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let s = crate::config::load_settings().unwrap_or_default();
             if let Some(srv_config) = s.mcp_servers.get(server) {
                 let cmd = srv_config["command"].as_str().unwrap_or("");
-                let srv_args: Vec<&str> = srv_config["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                let srv_args: Vec<&str> = srv_config["args"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
                 if cmd.is_empty() {
-                    return err(format!("MCP server '{server}' has no command configured in settings"));
+                    return err(format!(
+                        "MCP server '{server}' has no command configured in settings"
+                    ));
                 }
                 let payload = json!({
                     "jsonrpc": "2.0",
@@ -2420,10 +2533,15 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
-                    .spawn() {
-                        Ok(c) => c,
-                        Err(e) => return err(format!("failed to spawn MCP server '{server}' ({cmd}): {e}")),
-                    };
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return err(format!(
+                            "failed to spawn MCP server '{server}' ({cmd}): {e}"
+                        ))
+                    }
+                };
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = std::io::Write::write_all(&mut stdin, payload.to_string().as_bytes());
                     let _ = std::io::Write::write_all(&mut stdin, b"\n");
@@ -2440,7 +2558,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         }
                         let stderr = String::from_utf8_lossy(&o.stderr);
                         if !o.status.success() || stdout.trim().is_empty() {
-                            err(format!("MCP server exited with status {}: stdout: {} stderr: {}", o.status, stdout, stderr))
+                            err(format!(
+                                "MCP server exited with status {}: stdout: {} stderr: {}",
+                                o.status, stdout, stderr
+                            ))
                         } else {
                             ok(stdout.to_string())
                         }
@@ -2448,7 +2569,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     Err(e) => err(format!("failed to read from MCP server '{server}': {e}")),
                 }
             } else {
-                err(format!("MCP server '{server}' not found in settings.json mcp_servers"))
+                err(format!(
+                    "MCP server '{server}' not found in settings.json mcp_servers"
+                ))
             }
         }
         "skill" | "load_skill" => {
@@ -2550,10 +2673,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         let _ = fs::create_dir_all(dir);
                     }
                     if let Ok(old_content) = fs::read_to_string(&p) {
-                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), old_content));
                     } else {
-                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = None;
                     }
                     match fs::write(&p, file_text) {
@@ -2588,7 +2711,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     }
                     let next = body.replace(old_str, new_str);
                     {
-                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
                     match fs::write(&p, &next) {
@@ -2609,7 +2732,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     lines.insert(idx, new_str.to_string());
                     let next = lines.join("\n") + if body.ends_with('\n') { "\n" } else { "" };
                     {
-                        let mut guard = UNDO_BACKUP.lock().unwrap();
+                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
                     match fs::write(&p, &next) {
@@ -2620,14 +2743,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 "undo_edit" => {
                     let p = resolve(cwd, path);
                     let backup = {
-                        let guard = UNDO_BACKUP.lock().unwrap();
+                        let guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         guard.clone()
                     };
                     if let Some((backup_path, old_content)) = backup {
                         if backup_path == p {
                             match fs::write(&p, &old_content) {
                                 Ok(_) => {
-                                    let mut guard = UNDO_BACKUP.lock().unwrap();
+                                    let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                                     *guard = None;
                                     ok(format!(
                                         "successfully reverted the last edit to {}",
@@ -2691,6 +2814,27 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             is_error: false,
             finished: true,
         },
+        "exit_plan" | "ExitPlanMode" => {
+            if let Some(steps) = input["steps"].as_array() {
+                let rows = steps
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .enumerate()
+                    .map(|(idx, step)| format!("{}. {step}", idx + 1))
+                    .collect::<Vec<_>>();
+                if rows.is_empty() {
+                    err("exit_plan requires plan or non-empty steps")
+                } else {
+                    ok(rows.join("\n"))
+                }
+            } else if let Some(plan) = input["plan"].as_str().filter(|s| !s.trim().is_empty()) {
+                ok(plan.trim().to_string())
+            } else {
+                err("exit_plan requires plan or non-empty steps")
+            }
+        }
         other => err(format!("unknown tool: {other}")),
     }
 }
@@ -2835,6 +2979,8 @@ mod tests {
         assert!(!is_mutating("list_servers"));
         assert!(!is_mutating("read_server_log"));
         assert!(!is_mutating("wait_for_url"));
+        assert!(!is_mutating("exit_plan"));
+        assert!(!is_mutating("ExitPlanMode"));
         assert!(!is_mutating("finish"));
     }
 
@@ -2884,6 +3030,48 @@ mod tests {
     }
 
     #[test]
+    fn defs_for_small_context_keeps_core_tools_and_drops_bulk() {
+        let compact = defs_for_context(false, 8192)
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        let full = defs_for_context(false, 32768)
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        for name in [
+            "read_file",
+            "write_file",
+            "grep_files",
+            "Artifact",
+            "start_server",
+            "wait_for_url",
+            "open_browser",
+            "python_tool",
+        ] {
+            assert!(compact.contains(&name), "{name} should stay in compact set");
+        }
+        for name in [
+            "mcp_call",
+            "kb_query",
+            "kb_record",
+            "verify",
+            "text_editor_20250124",
+            "AskUserQuestion",
+        ] {
+            assert!(
+                !compact.contains(&name),
+                "{name} should be omitted from compact set"
+            );
+            assert!(
+                full.contains(&name),
+                "{name} should remain available normally"
+            );
+        }
+        assert!(compact.len() < full.len());
+    }
+
+    #[test]
     fn defs_readonly_omits_write_tools() {
         let names = defs_readonly()
             .into_iter()
@@ -2894,6 +3082,8 @@ mod tests {
         assert!(names.contains(&"list_servers"));
         assert!(names.contains(&"read_server_log"));
         assert!(names.contains(&"wait_for_url"));
+        assert!(names.contains(&"exit_plan"));
+        assert!(names.contains(&"ExitPlanMode"));
         for name in [
             "write",
             "edit",
@@ -3348,6 +3538,32 @@ print("hello " + data.get("name", "world"))
     }
 
     #[test]
+    fn run_exit_plan_returns_plan_text() {
+        let d = tempdir();
+        let r = run(
+            "exit_plan",
+            &json!({"steps": ["Inspect the code.", "Implement the change."]}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert!(!r.finished);
+        assert_eq!(r.content, "1. Inspect the code.\n2. Implement the change.");
+        let alias = run("ExitPlanMode", &json!({"plan": "1. Verify behavior."}), &d);
+        assert!(!alias.is_error, "{}", alias.content);
+        assert_eq!(alias.content, "1. Verify behavior.");
+        let both = run(
+            "exit_plan",
+            &json!({"plan": "Exit PLAN mode with a proposed implementation plan.", "steps": ["Inspect files.", "Apply fix."]}),
+            &d,
+        );
+        assert!(!both.is_error, "{}", both.content);
+        assert_eq!(both.content, "1. Inspect files.\n2. Apply fix.");
+        let missing = run("exit_plan", &json!({}), &d);
+        assert!(missing.is_error);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn run_unknown_tool_errors() {
         let d = tempdir();
         let r = run("bogus", &json!({}), &d);
@@ -3498,7 +3714,9 @@ print("hello " + data.get("name", "world"))
             &d,
         );
         assert!(!rec.is_error, "{}", rec.content);
-        assert!(rec.content.contains("Successfully recorded knowledge entity"));
+        assert!(rec
+            .content
+            .contains("Successfully recorded knowledge entity"));
 
         let q = run("kb_query", &json!({"query": "AuthService"}), &d);
         assert!(!q.is_error, "{}", q.content);
@@ -3507,7 +3725,11 @@ print("hello " + data.get("name", "world"))
         let rc = run("rule_check", &json!({"changed_files": ["src/auth.rs"]}), &d);
         assert!(!rc.is_error, "{}", rc.content);
 
-        let ver = run("verify", &json!({"task_description": "Add auth service", "changed_files": ["src/auth.rs"]}), &d);
+        let ver = run(
+            "verify",
+            &json!({"task_description": "Add auth service", "changed_files": ["src/auth.rs"]}),
+            &d,
+        );
         assert!(!ver.is_error, "{}", ver.content);
         assert!(ver.content.contains("Verification Report"));
 
@@ -3517,9 +3739,15 @@ print("hello " + data.get("name", "world"))
     #[test]
     fn test_mcp_call_missing_server() {
         let d = tempdir();
-        let res = run("mcp_call", &json!({"server": "nonexistent_server", "tool": "test_tool"}), &d);
+        let res = run(
+            "mcp_call",
+            &json!({"server": "nonexistent_server", "tool": "test_tool"}),
+            &d,
+        );
         assert!(res.is_error);
-        assert!(res.content.contains("not found in settings.json mcp_servers"));
+        assert!(res
+            .content
+            .contains("not found in settings.json mcp_servers"));
         let _ = fs::remove_dir_all(&d);
     }
 }

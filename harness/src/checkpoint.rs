@@ -140,18 +140,28 @@ pub fn undo_all_since(cwd: &Path, since_ms: u128) -> Result<Vec<Checkpoint>, Str
 
 pub fn git_rollback(cwd: &Path) -> Result<String, String> {
     let mut out = String::new();
-    let st = std::process::Command::new("git").args(["checkout", "--", "."]).current_dir(cwd).output();
+    let st = std::process::Command::new("git")
+        .args(["checkout", "--", "."])
+        .current_dir(cwd)
+        .output();
     if let Ok(o) = st {
         out.push_str(&String::from_utf8_lossy(&o.stdout));
         out.push_str(&String::from_utf8_lossy(&o.stderr));
     } else {
         return Err("git checkout failed".into());
     }
-    let st2 = std::process::Command::new("git").args(["clean", "-fd"]).current_dir(cwd).output();
+    let st2 = std::process::Command::new("git")
+        .args(["clean", "-fd"])
+        .current_dir(cwd)
+        .output();
     if let Ok(o) = st2 {
         out.push_str(&String::from_utf8_lossy(&o.stdout));
     }
-    Ok(if out.trim().is_empty() { "working tree reset cleanly".to_string() } else { out.trim().to_string() })
+    Ok(if out.trim().is_empty() {
+        "working tree reset cleanly".to_string()
+    } else {
+        out.trim().to_string()
+    })
 }
 
 #[cfg(test)]

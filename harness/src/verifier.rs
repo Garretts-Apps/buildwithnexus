@@ -136,18 +136,33 @@ impl Verifier {
     /// Main entry point: verifies the task context and returns a comprehensive report.
     pub fn verify(&self, ctx: &VerificationContext) -> VerificationReport {
         // 1. Build EvaluationContext for RuleEngine
-        let tools_called: Vec<String> = ctx.tool_calls.iter().map(|c| c.tool_name.clone()).collect();
+        let tools_called: Vec<String> =
+            ctx.tool_calls.iter().map(|c| c.tool_name.clone()).collect();
         let eval_ctx = EvaluationContext {
             task_type: ctx.task_type.clone(),
             changed_files: ctx.changed_files.clone(),
             tools_called: tools_called.clone(),
             tests_added: ctx.tests_added.clone(),
-            tests_run: tools_called.iter().any(|t| t == "bash" || t == "run_command"),
-            dependencies_added: ctx.dependencies_changed.iter().filter(|(_, action)| action == "added").map(|(name, _)| name.clone()).collect(),
-            dependencies_removed: ctx.dependencies_changed.iter().filter(|(_, action)| action == "removed").map(|(name, _)| name.clone()).collect(),
+            tests_run: tools_called
+                .iter()
+                .any(|t| t == "bash" || t == "run_command"),
+            dependencies_added: ctx
+                .dependencies_changed
+                .iter()
+                .filter(|(_, action)| action == "added")
+                .map(|(name, _)| name.clone())
+                .collect(),
+            dependencies_removed: ctx
+                .dependencies_changed
+                .iter()
+                .filter(|(_, action)| action == "removed")
+                .map(|(name, _)| name.clone())
+                .collect(),
             migration_type: None,
             has_rollback_plan: false,
-            has_changelog_entry: ctx.changed_files.iter().any(|f| f.to_lowercase().contains("changelog") || f.to_lowercase().contains("release_notes")),
+            has_changelog_entry: ctx.changed_files.iter().any(|f| {
+                f.to_lowercase().contains("changelog") || f.to_lowercase().contains("release_notes")
+            }),
             security_review_done: false,
             custom_facts: Default::default(),
         };
@@ -156,13 +171,16 @@ impl Verifier {
         let rule_violations = self.rule_engine.evaluate(&eval_ctx);
 
         // 3. Check tests and static analysis
-        let tests_status = self.check_tests(&ctx.changed_files, &ctx.tests_added, eval_ctx.tests_run);
+        let tests_status =
+            self.check_tests(&ctx.changed_files, &ctx.tests_added, eval_ctx.tests_run);
         let static_analysis_status = self.run_static_analysis(&ctx.changed_files);
 
         // 4. Determine missing evidence
         let mut missing_evidence = Vec::new();
         if ctx.evidence_gathered.is_empty() && ctx.task_type == Some(TaskType::DecisionSupport) {
-            missing_evidence.push("No evidence items gathered for decision support recommendation.".to_string());
+            missing_evidence.push(
+                "No evidence items gathered for decision support recommendation.".to_string(),
+            );
         }
         for violation in &rule_violations {
             if let Some(ref act) = violation.suggested_action {
@@ -195,7 +213,10 @@ impl Verifier {
         };
 
         // 6. Determine overall status
-        if rule_violations.iter().any(|v| v.severity == Severity::Critical || v.severity == Severity::High) {
+        if rule_violations
+            .iter()
+            .any(|v| v.severity == Severity::Critical || v.severity == Severity::High)
+        {
             report.status = VerificationStatus::Blocked;
         } else if !rule_violations.is_empty() || !report.missing_evidence.is_empty() {
             report.status = VerificationStatus::PassedWithWarnings;
@@ -222,17 +243,16 @@ impl Verifier {
 
         score -= (report.missing_evidence.len() as f64) * 0.05;
 
-        if score < 0.0 {
-            0.0
-        } else if score > 1.0 {
-            1.0
-        } else {
-            score
-        }
+        score.clamp(0.0, 1.0)
     }
 
     /// Checks test status based on changed files and tool history.
-    pub fn check_tests(&self, _changed_files: &[String], tests_added: &[String], tests_run: bool) -> TestsStatus {
+    pub fn check_tests(
+        &self,
+        _changed_files: &[String],
+        tests_added: &[String],
+        tests_run: bool,
+    ) -> TestsStatus {
         TestsStatus {
             tests_run,
             tests_passed: if tests_run { Some(1) } else { None },
@@ -249,16 +269,34 @@ impl Verifier {
 
     /// Formats the verification report as human-readable Markdown text.
     pub fn format_report(report: &VerificationReport) -> String {
-        let mut out = format!("## Verification Report: {}\n\n", report.status.to_string().to_uppercase());
+        let mut out = format!(
+            "## Verification Report: {}\n\n",
+            report.status.to_string().to_uppercase()
+        );
         out.push_str(&format!("- **Task**: {}\n", report.task_description));
-        out.push_str(&format!("- **Confidence**: {:.2} ({})\n", report.confidence, report.confidence_level.to_uppercase()));
-        out.push_str(&format!("- **Files Changed**: {}\n", report.files_changed.len()));
-        out.push_str(&format!("- **Tests Run**: {}\n\n", report.tests_status.tests_run));
+        out.push_str(&format!(
+            "- **Confidence**: {:.2} ({})\n",
+            report.confidence,
+            report.confidence_level.to_uppercase()
+        ));
+        out.push_str(&format!(
+            "- **Files Changed**: {}\n",
+            report.files_changed.len()
+        ));
+        out.push_str(&format!(
+            "- **Tests Run**: {}\n\n",
+            report.tests_status.tests_run
+        ));
 
         if !report.rule_violations.is_empty() {
             out.push_str("### Rule Violations\n");
             for v in &report.rule_violations {
-                out.push_str(&format!("- **[{}]** `{}`: {}\n", v.severity.to_string().to_uppercase(), v.rule_id, v.message));
+                out.push_str(&format!(
+                    "- **[{}]** `{}`: {}\n",
+                    v.severity.to_string().to_uppercase(),
+                    v.rule_id,
+                    v.message
+                ));
             }
             out.push('\n');
         }
@@ -282,7 +320,11 @@ impl Verifier {
     /// Formats a decision support memo incorporating verification results.
     pub fn format_decision_memo(report: &VerificationReport) -> String {
         let mut out = String::from("# Decision Memo\n\n");
-        out.push_str(&format!("**Confidence**: {:.2} ({})\n\n", report.confidence, report.confidence_level.to_uppercase()));
+        out.push_str(&format!(
+            "**Confidence**: {:.2} ({})\n\n",
+            report.confidence,
+            report.confidence_level.to_uppercase()
+        ));
         out.push_str("## Evidence Inspected\n");
         if report.evidence_used.is_empty() {
             out.push_str("- *No explicit evidence recorded.*\n");
@@ -296,7 +338,12 @@ impl Verifier {
         if !report.rule_violations.is_empty() {
             out.push_str("## Applicable Constraints & Violations\n");
             for v in &report.rule_violations {
-                out.push_str(&format!("- **[{}]** `{}`: {}\n", v.severity.to_string().to_uppercase(), v.rule_id, v.message));
+                out.push_str(&format!(
+                    "- **[{}]** `{}`: {}\n",
+                    v.severity.to_string().to_uppercase(),
+                    v.rule_id,
+                    v.message
+                ));
             }
             out.push('\n');
         }
@@ -319,7 +366,10 @@ mod tests {
             ..Default::default()
         };
         let report = verifier.verify(&ctx);
-        assert!(report.rule_violations.iter().any(|v| v.rule_id == "bug_fix_requires_regression_test"));
+        assert!(report
+            .rule_violations
+            .iter()
+            .any(|v| v.rule_id == "bug_fix_requires_regression_test"));
         assert!(report.confidence < 1.0);
     }
 }

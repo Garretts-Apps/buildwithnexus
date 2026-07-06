@@ -88,9 +88,11 @@ pub fn run() {
                 println!("  {:<12} {:<26} {}", p.id, p.label, tag);
             }
         }
-        "run" | "build" | "headless" | "--headless" | "-p" | "--print" => headless(&opts, |p, perm, cwd| {
-            agent::run_build(p, perm, "engineer", &rest(), &cwd)
-        }),
+        "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
+            headless(&opts, |p, perm, cwd| {
+                agent::run_build(p, perm, "engineer", &rest(), &cwd)
+            })
+        }
         "plan" => headless(&opts, |p, perm, cwd| {
             agent::run_plan(p, perm, &rest(), &cwd)
         }),
@@ -128,7 +130,9 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
-        _ if !args.is_empty() => interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts),
+        _ if !args.is_empty() => {
+            interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts)
+        }
         other => {
             eprintln!("unknown command: {other}\n");
             usage();
@@ -220,8 +224,17 @@ fn headless(
     hooks::notify("SessionStart", &cwd);
 
     if !report::is_json() {
-        println!("{}", tui::bold(&format!("╭── buildwithnexus headless [v{}] ──────────────────────────────────╮", crate::VERSION)));
-        println!("│ Provider: {:<24} Model: {:<30} │", provider.protocol, provider.model);
+        println!(
+            "{}",
+            tui::bold(&format!(
+                "╭── buildwithnexus headless [v{}] ──────────────────────────────────╮",
+                crate::VERSION
+            ))
+        );
+        println!(
+            "│ Provider: {:<24} Model: {:<30} │",
+            provider.protocol, provider.model
+        );
         println!("│ Working Dir: {:<58} │", cwd.display());
         println!("│ Mode: High-Quality Non-Interactive Operational Execution               │");
         println!("╰───────────────────────────────────────────────────────────────────────╯");
@@ -237,9 +250,21 @@ fn headless(
     if !report::is_json() {
         println!();
         if r.is_ok() {
-            println!("{}", tui::green(&format!("✓ Headless execution completed successfully in {:.2?}.", elapsed)));
+            println!(
+                "{}",
+                tui::green(&format!(
+                    "✓ Headless execution completed successfully in {:.2?}.",
+                    elapsed
+                ))
+            );
         } else {
-            println!("{}", tui::red(&format!("✗ Headless execution failed after {:.2?}.", elapsed)));
+            println!(
+                "{}",
+                tui::red(&format!(
+                    "✗ Headless execution failed after {:.2?}.",
+                    elapsed
+                ))
+            );
         }
     }
 
@@ -412,8 +437,13 @@ fn repl(
             continue;
         }
 
-        // /mouse on|off — opt into mouse-wheel transcript scrolling. Off allows normal text selection.
+        // /mouse or /scroll on|off — wheel transcript scrolling is on by
+        // default; off restores terminal-native text selection.
         if let Some(mouse_arg) = t.strip_prefix("/mouse ") {
+            handle_mouse(Some(mouse_arg.trim()));
+            continue;
+        }
+        if let Some(mouse_arg) = t.strip_prefix("/scroll ") {
             handle_mouse(Some(mouse_arg.trim()));
             continue;
         }
@@ -540,7 +570,11 @@ fn repl(
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
             "/clear" => {
+                transcript.clear();
+                sid = session::new_id();
+                trace::set_session(&sid);
                 tui::clear();
+                tui::line(&tui::dim("  ✓ context cleared — fresh session"));
                 continue;
             }
             "/new" => {
@@ -718,6 +752,10 @@ fn repl(
                 handle_mouse(None);
                 continue;
             }
+            "/scroll" => {
+                handle_mouse(None);
+                continue;
+            }
             "/config" => {
                 handle_config(&provider, perm, cwd);
                 continue;
@@ -740,7 +778,14 @@ fn repl(
             }
             "/vim" => {
                 let current = tui::toggle_vim_mode();
-                tui::line(&format!("  Vim modal editing mode is now {}", if current { tui::green("ENABLED [Normal/Insert]") } else { tui::yellow("DISABLED [Standard Emacs/Readline]") }));
+                tui::line(&format!(
+                    "  Vim modal editing mode is now {}",
+                    if current {
+                        tui::green("ENABLED [Normal/Insert]")
+                    } else {
+                        tui::yellow("DISABLED [Standard Emacs/Readline]")
+                    }
+                ));
                 continue;
             }
             "/local" => {
@@ -765,7 +810,11 @@ fn repl(
         if let Some(arg) = t.strip_prefix("/voice") {
             if let Some(voice_text) = handle_voice(arg) {
                 if !voice_text.trim().is_empty() {
-                    tui::line(&format!("  {} {}", tui::green("✓ Voice input transcribed:"), tui::bold(&voice_text)));
+                    tui::line(&format!(
+                        "  {} {}",
+                        tui::green("✓ Voice input transcribed:"),
+                        tui::bold(&voice_text)
+                    ));
                     task = voice_text;
                     t = task.trim();
                 } else {
@@ -776,7 +825,10 @@ fn repl(
             }
         }
 
-        if let Some(arg) = t.strip_prefix("/undo ").or_else(|| t.strip_prefix("/rewind ")) {
+        if let Some(arg) = t
+            .strip_prefix("/undo ")
+            .or_else(|| t.strip_prefix("/rewind "))
+        {
             handle_undo(cwd, arg);
             continue;
         }
@@ -1137,8 +1189,12 @@ fn handle_mcp() {
         }
     }
     if items.is_empty() {
-        tui::line(&tui::dim("  No MCP servers configured in settings.json (mcp_servers)."));
-        tui::line(&tui::dim("  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`."));
+        tui::line(&tui::dim(
+            "  No MCP servers configured in settings.json (mcp_servers).",
+        ));
+        tui::line(&tui::dim(
+            "  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`.",
+        ));
         return;
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1152,21 +1208,80 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
 }
 
 fn handle_model(provider: &mut Provider) {
-    tui::line(&tui::accent("  /model — model hot-swap"));
-    tui::line(&format!("  Current: {}", tui::bold(&provider.model)));
-    tui::line(&tui::dim(
-        "  Tip: /model <name>  e.g. /model claude-opus-4-5",
-    ));
+    tui::line(&tui::accent("  /model — interactive model selection & hot-swap"));
+    tui::line(&format!("  Current active model: {}", tui::bold(&provider.model)));
     tui::line("");
-    let pick = tui::ask("  new model (Enter to keep): ").unwrap_or_default();
+
+    let mut options: Vec<(String, String)> = Vec::new();
+
+    // 1. Scan for local GGUF models
+    let mut gguf_found = false;
+    let scan_dirs = [
+        config::home().join("models"),
+        PathBuf::from(".buildwithnexus/models"),
+        PathBuf::from("models"),
+    ];
+    for dir in &scan_dirs {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".gguf") {
+                    if !gguf_found {
+                        tui::line(&tui::bold("  [Local GGUF Models Found]"));
+                        gguf_found = true;
+                    }
+                    let model_id = format!("local/{}", name);
+                    options.push((model_id.clone(), format!("GGUF in {}", dir.display())));
+                }
+            }
+        }
+    }
+    if !gguf_found {
+        tui::line(&tui::dim("  [No local GGUF models found in ~/.buildwithnexus/models or ./models]"));
+    }
+
+    tui::line("");
+    tui::line(&tui::bold("  [Standard Cloud & Server Presets]"));
+    let presets = [
+        ("claude-3-7-sonnet", "Anthropic Claude 3.7 Sonnet (Reasoning)"),
+        ("claude-3-5-sonnet", "Anthropic Claude 3.5 Sonnet (Balanced)"),
+        ("claude-3-haiku", "Anthropic Claude 3 Haiku (Fast/Light)"),
+        ("gpt-4o", "OpenAI GPT-4o (Multimodal Flagship)"),
+        ("gpt-4o-mini", "OpenAI GPT-4o Mini (Fast/Economic)"),
+        ("gemini-2.5-pro", "Google Gemini 2.5 Pro (Long Context)"),
+        ("gemini-2.5-flash", "Google Gemini 2.5 Flash (Fast/High Volume)"),
+        ("ollama/llama3", "Local Ollama Llama 3"),
+        ("ollama/qwen2.5-coder", "Local Ollama Qwen 2.5 Coder"),
+    ];
+    for (id, desc) in presets {
+        options.push((id.to_string(), desc.to_string()));
+    }
+
+    for (idx, (id, desc)) in options.iter().enumerate() {
+        let num = format!("{:>2}", idx + 1);
+        tui::line(&format!("  {} {} — {}", tui::accent(&num), tui::bold(id), tui::dim(desc)));
+    }
+    tui::line("");
+    tui::line(&tui::dim("  Tip: Type a number (e.g. `1`), a model name, or press Enter to keep current."));
+
+    let pick = tui::ask("  Select model: ").unwrap_or_default();
     let pick = pick.trim();
     if !pick.is_empty() {
-        provider.model = pick.to_string();
+        let chosen = if let Ok(idx) = pick.parse::<usize>() {
+            if idx > 0 && idx <= options.len() {
+                options[idx - 1].0.clone()
+            } else {
+                pick.to_string()
+            }
+        } else {
+            pick.to_string()
+        };
+        provider.model = chosen.clone();
         if let Some(mut s) = config::load_settings() {
-            s.model = pick.to_string();
+            s.model = chosen.clone();
             config::save_settings(&s);
         }
-        tui::line(&tui::green(&format!("  ✓ model → {pick}")));
+        tui::line(&tui::green(&format!("  ✓ active model hot-swapped → {chosen}")));
     }
 }
 
@@ -1174,18 +1289,34 @@ fn handle_voice(arg: &str) -> Option<String> {
     tui::line(&tui::accent("  /voice — audio transcription & voice input"));
     tui::line("  Supported backends: whisper-cpp, whisper-cli, openai-whisper, local models");
     let audio_path = if arg.trim().is_empty() {
-        tui::line(&tui::dim("  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or pass `/voice <path>`"));
-        tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ").unwrap_or_default()
+        tui::line(&tui::dim(
+            "  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or pass `/voice <path>`",
+        ));
+        tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ")
+            .unwrap_or_default()
     } else {
         arg.trim().to_string()
     };
     if audio_path.trim().is_empty() {
-        let has_whisper = std::process::Command::new("whisper-cpp").arg("--help").output().is_ok()
-            || std::process::Command::new("whisper-cli").arg("--help").output().is_ok()
-            || std::process::Command::new("whisper").arg("--help").output().is_ok();
+        let has_whisper = std::process::Command::new("whisper-cpp")
+            .arg("--help")
+            .output()
+            .is_ok()
+            || std::process::Command::new("whisper-cli")
+                .arg("--help")
+                .output()
+                .is_ok()
+            || std::process::Command::new("whisper")
+                .arg("--help")
+                .output()
+                .is_ok();
         if has_whisper {
-            tui::line(&tui::green("  Local whisper binary detected! Ready for voice-to-text transcription."));
-            tui::line(&tui::dim("  To transcribe and run a prompt, use `/voice <path_to_audio_file>`"));
+            tui::line(&tui::green(
+                "  Local whisper binary detected! Ready for voice-to-text transcription.",
+            ));
+            tui::line(&tui::dim(
+                "  To transcribe and run a prompt, use `/voice <path_to_audio_file>`",
+            ));
         } else {
             tui::line(&tui::yellow("  No local whisper binary found in PATH."));
             tui::line(&tui::dim("  To enable offline zero-latency voice input, install `whisper-cpp` or `openai-whisper`."));
@@ -1197,14 +1328,19 @@ fn handle_voice(arg: &str) -> Option<String> {
             tui::line(&format!("  Transcribing audio from {}...", tui::bold(path)));
             let bins = ["whisper-cpp", "whisper-cli", "whisper"];
             for bin in bins {
-                if let Ok(_o) = std::process::Command::new(bin).args(["-f", path, "-otxt"]).output() {
+                if let Ok(_o) = std::process::Command::new(bin)
+                    .args(["-f", path, "-otxt"])
+                    .output()
+                {
                     tui::line(&tui::green(&format!("  Transcription complete via {bin}!")));
                     let txt_path = format!("{path}.txt");
                     if let Ok(txt) = std::fs::read_to_string(&txt_path) {
                         let _ = std::fs::remove_file(&txt_path);
                         return Some(txt.trim().to_string());
                     }
-                    if let Ok(txt) = std::fs::read_to_string(path.replace(".wav", ".txt").replace(".mp3", ".txt")) {
+                    if let Ok(txt) = std::fs::read_to_string(
+                        path.replace(".wav", ".txt").replace(".mp3", ".txt"),
+                    ) {
                         return Some(txt.trim().to_string());
                     }
                 }
@@ -1219,15 +1355,23 @@ fn handle_voice(arg: &str) -> Option<String> {
 }
 
 fn handle_local(_provider: &mut Provider) {
-    tui::line(&tui::accent("  /local — local model management & inference optimization"));
+    tui::line(&tui::accent(
+        "  /local — local model management & inference optimization",
+    ));
     tui::line("  Scanning local servers and model directories...");
     let mut servers = Vec::new();
-    if let Ok(o) = std::process::Command::new("curl").args(["-s", "http://localhost:11434/api/tags"]).output() {
+    if let Ok(o) = std::process::Command::new("curl")
+        .args(["-s", "http://localhost:11434/api/tags"])
+        .output()
+    {
         if o.status.success() {
             servers.push("Ollama (port 11434 - ACTIVE)");
         }
     }
-    if let Ok(o) = std::process::Command::new("curl").args(["-s", "http://localhost:8080/v1/models"]).output() {
+    if let Ok(o) = std::process::Command::new("curl")
+        .args(["-s", "http://localhost:8080/v1/models"])
+        .output()
+    {
         if o.status.success() {
             servers.push("llama.cpp / vLLM (port 8080 - ACTIVE)");
         }
@@ -1239,9 +1383,16 @@ fn handle_local(_provider: &mut Provider) {
             tui::line(&format!("  • {}", tui::green(s)));
         }
     }
-    let models_dir = std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join(".buildwithnexus/models")).unwrap_or_else(|| PathBuf::from(".buildwithnexus/models"));
+    let models_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".buildwithnexus/models"))
+        .unwrap_or_else(|| PathBuf::from(".buildwithnexus/models"));
     if let Ok(rd) = std::fs::read_dir(&models_dir) {
-        let ggufs: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".gguf")).collect();
+        let ggufs: Vec<String> = rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".gguf"))
+            .collect();
         if !ggufs.is_empty() {
             tui::line(&format!("  Local GGUF models in {}:", models_dir.display()));
             for m in ggufs {
@@ -1253,19 +1404,26 @@ fn handle_local(_provider: &mut Provider) {
 }
 
 fn handle_rules(cwd: &std::path::Path) {
-    tui::line(&tui::accent("  /rules — active engineering constraints & business logic rules"));
+    tui::line(&tui::accent(
+        "  /rules — active engineering constraints & business logic rules",
+    ));
     let mut engine = crate::rules::RuleEngine::load_defaults();
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
     if let Ok(rd) = std::fs::read_dir(&rules_dir) {
         for e in rd.flatten() {
-            if let Ok(loaded) = crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy()) {
+            if let Ok(loaded) =
+                crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
+            {
                 for r in loaded.rules {
                     engine.add_rule(r);
                 }
             }
         }
     }
-    tui::line(&format!("  {} active rules loaded for workspace:", tui::bold(&engine.rules.len().to_string())));
+    tui::line(&format!(
+        "  {} active rules loaded for workspace:",
+        tui::bold(&engine.rules.len().to_string())
+    ));
     for r in &engine.rules {
         let sev_badge = match r.severity {
             crate::rules::Severity::Critical => tui::red("CRITICAL"),
@@ -1273,16 +1431,25 @@ fn handle_rules(cwd: &std::path::Path) {
             crate::rules::Severity::Medium => tui::yellow("MEDIUM"),
             crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
         };
-        tui::line(&format!("  [{sev_badge}] {} — {}", tui::bold(&r.id), r.description));
+        tui::line(&format!(
+            "  [{sev_badge}] {} — {}",
+            tui::bold(&r.id),
+            r.description
+        ));
     }
     tui::line(&tui::dim("  Tip: Add custom JSON/YAML rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt"));
 }
 
 fn handle_kb_index(cwd: &std::path::Path) {
-    tui::line(&tui::accent("  /kb (/index) — project structured knowledge base & symbol indexing"));
+    tui::line(&tui::accent(
+        "  /kb (/index) — project structured knowledge base & symbol indexing",
+    ));
     let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
-    tui::line(&format!("  Current knowledge base contains {} entities.", tui::bold(&kb.entities.len().to_string())));
-    
+    tui::line(&format!(
+        "  Current knowledge base contains {} entities.",
+        tui::bold(&kb.entities.len().to_string())
+    ));
+
     tui::line("  Scanning workspace for source files and extracting symbols...");
     let mut count = 0;
     let mut dirs_to_visit = vec![cwd.to_path_buf()];
@@ -1291,21 +1458,34 @@ fn handle_kb_index(cwd: &std::path::Path) {
             for entry in rd.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || name == "target" || name == "node_modules" || name == "vendor" || name == "dist" {
+                if name.starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "vendor"
+                    || name == "dist"
+                {
                     continue;
                 }
                 if path.is_dir() {
                     dirs_to_visit.push(path);
                 } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     if matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
-                        let rel_path = path.strip_prefix(cwd).unwrap_or(&path).to_string_lossy().to_string();
+                        let rel_path = path
+                            .strip_prefix(cwd)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
                         if let Ok(content) = std::fs::read_to_string(&path) {
                             for line in content.lines() {
                                 let trimmed = line.trim();
                                 let mut entity_type = None;
                                 let mut sym_name = None;
                                 if ext == "rs" {
-                                    if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") || trimmed.starts_with("async fn ") || trimmed.starts_with("pub async fn ") {
+                                    if trimmed.starts_with("fn ")
+                                        || trimmed.starts_with("pub fn ")
+                                        || trimmed.starts_with("async fn ")
+                                        || trimmed.starts_with("pub async fn ")
+                                    {
                                         entity_type = Some(crate::knowledge::EntityType::Function);
                                         if let Some(idx) = trimmed.find("fn ") {
                                             let rest = &trimmed[idx + 3..];
@@ -1313,35 +1493,55 @@ fn handle_kb_index(cwd: &std::path::Path) {
                                                 sym_name = Some(rest[..paren].trim().to_string());
                                             }
                                         }
-                                    } else if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+                                    } else if trimmed.starts_with("struct ")
+                                        || trimmed.starts_with("pub struct ")
+                                    {
                                         entity_type = Some(crate::knowledge::EntityType::Class);
                                         if let Some(idx) = trimmed.find("struct ") {
                                             let rest = &trimmed[idx + 7..];
-                                            let name_part = rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(name_part.trim_matches(|c| c == '{' || c == '(' || c == ';').to_string());
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part
+                                                    .trim_matches(|c| {
+                                                        c == '{' || c == '(' || c == ';'
+                                                    })
+                                                    .to_string(),
+                                            );
                                         }
-                                    } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+                                    } else if trimmed.starts_with("enum ")
+                                        || trimmed.starts_with("pub enum ")
+                                    {
                                         entity_type = Some(crate::knowledge::EntityType::Class);
                                         if let Some(idx) = trimmed.find("enum ") {
                                             let rest = &trimmed[idx + 5..];
-                                            let name_part = rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(name_part.trim_matches(|c| c == '{' || c == '(' || c == ';').to_string());
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part
+                                                    .trim_matches(|c| {
+                                                        c == '{' || c == '(' || c == ';'
+                                                    })
+                                                    .to_string(),
+                                            );
                                         }
                                     }
                                 } else if ext == "py" {
-                                    if trimmed.starts_with("def ") {
+                                    if let Some(rest) = trimmed.strip_prefix("def ") {
                                         entity_type = Some(crate::knowledge::EntityType::Function);
-                                        if let Some(paren) = trimmed[4..].find('(') {
-                                            sym_name = Some(trimmed[4..4 + paren].trim().to_string());
+                                        if let Some(paren) = rest.find('(') {
+                                            sym_name = Some(rest[..paren].trim().to_string());
                                         }
-                                    } else if trimmed.starts_with("class ") {
+                                    } else if let Some(rest) = trimmed.strip_prefix("class ") {
                                         entity_type = Some(crate::knowledge::EntityType::Class);
-                                        if let Some(paren) = trimmed[6..].find(|c| c == '(' || c == ':') {
-                                            sym_name = Some(trimmed[6..6 + paren].trim().to_string());
+                                        if let Some(paren) = rest.find(['(', ':']) {
+                                            sym_name = Some(rest[..paren].trim().to_string());
                                         }
                                     }
                                 } else if matches!(ext, "js" | "ts") {
-                                    if trimmed.starts_with("function ") || trimmed.starts_with("export function ") {
+                                    if trimmed.starts_with("function ")
+                                        || trimmed.starts_with("export function ")
+                                    {
                                         entity_type = Some(crate::knowledge::EntityType::Function);
                                         if let Some(idx) = trimmed.find("function ") {
                                             let rest = &trimmed[idx + 9..];
@@ -1349,24 +1549,35 @@ fn handle_kb_index(cwd: &std::path::Path) {
                                                 sym_name = Some(rest[..paren].trim().to_string());
                                             }
                                         }
-                                    } else if trimmed.starts_with("class ") || trimmed.starts_with("export class ") {
+                                    } else if trimmed.starts_with("class ")
+                                        || trimmed.starts_with("export class ")
+                                    {
                                         entity_type = Some(crate::knowledge::EntityType::Class);
                                         if let Some(idx) = trimmed.find("class ") {
                                             let rest = &trimmed[idx + 6..];
-                                            let name_part = rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(name_part.trim_matches(|c| c == '{').to_string());
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part.trim_matches(|c| c == '{').to_string(),
+                                            );
                                         }
                                     }
                                 }
                                 if let (Some(et), Some(sn)) = (entity_type, sym_name) {
-                                    if !sn.is_empty() && sn.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                                    if !sn.is_empty()
+                                        && sn
+                                            .chars()
+                                            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                                    {
                                         let id = format!("{sn}@{rel_path}");
                                         kb.add_entity(crate::knowledge::Entity {
                                             id,
                                             entity_type: et,
                                             name: sn,
                                             path: Some(rel_path.clone()),
-                                            description: Some(format!("Extracted symbol from {rel_path}")),
+                                            description: Some(format!(
+                                                "Extracted symbol from {rel_path}"
+                                            )),
                                             metadata: serde_json::json!({"auto_indexed": true}),
                                             relationships: vec![],
                                             last_updated: crate::knowledge::chrono_now_iso(),
@@ -1390,10 +1601,16 @@ fn handle_kb_index(cwd: &std::path::Path) {
 }
 
 fn handle_verify_audit(cwd: &std::path::Path) {
-    tui::line(&tui::accent("  /verify (/audit) — running operational judgment verifier on workspace"));
-    
+    tui::line(&tui::accent(
+        "  /verify (/audit) — running operational judgment verifier on workspace",
+    ));
+
     let mut changed_files = Vec::new();
-    if let Ok(o) = std::process::Command::new("git").args(["status", "-s"]).current_dir(cwd).output() {
+    if let Ok(o) = std::process::Command::new("git")
+        .args(["status", "-s"])
+        .current_dir(cwd)
+        .output()
+    {
         if o.status.success() {
             let out = String::from_utf8_lossy(&o.stdout);
             for line in out.lines() {
@@ -1444,7 +1661,9 @@ fn handle_verify_audit(cwd: &std::path::Path) {
             tui::line(line);
         }
     }
-    tui::line(&tui::dim("  Tip: Use `@rules:<id>` or `/rules` to inspect specific constraints."));
+    tui::line(&tui::dim(
+        "  Tip: Use `@rules:<id>` or `/rules` to inspect specific constraints.",
+    ));
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -1689,13 +1908,13 @@ fn handle_mouse(arg: Option<&str>) {
         "on" | "enable" => {
             tui::set_mouse_capture(true);
             tui::line(&tui::green(
-                "  ✓ mouse: on — wheel scroll enabled; text selection may require Option/Alt",
+                "  ✓ mouse: on — wheel scroll and drag-to-copy are enabled",
             ));
         }
         "off" | "disable" => {
             tui::set_mouse_capture(false);
             tui::line(&tui::green(
-                "  ✓ mouse: off — normal text selection enabled; use PgUp/PgDn to scroll",
+                "  ✓ mouse: off — terminal-native selection restored; use PgUp/PgDn to scroll",
             ));
         }
         "" | "toggle" => {
@@ -1703,11 +1922,11 @@ fn handle_mouse(arg: Option<&str>) {
             tui::set_mouse_capture(new_state);
             if new_state {
                 tui::line(&tui::green(
-                    "  ✓ mouse: on — wheel scroll enabled; text selection may require Option/Alt",
+                    "  ✓ mouse: on — wheel scroll and drag-to-copy are enabled",
                 ));
             } else {
                 tui::line(&tui::green(
-                    "  ✓ mouse: off — normal text selection enabled; use PgUp/PgDn to scroll",
+                    "  ✓ mouse: off — terminal-native selection restored; use PgUp/PgDn to scroll",
                 ));
             }
         }
@@ -1720,7 +1939,7 @@ fn handle_mouse(arg: Option<&str>) {
             tui::line(&tui::accent("  /mouse — mouse wheel scrolling"));
             tui::line(&format!("  Current: {}", tui::bold(state)));
             tui::line(&tui::dim(
-                "  /mouse on enables wheel scrolling; /mouse off restores normal text selection",
+                "  Default is on: wheel scrolls transcript and drag copies selected transcript text. /mouse off restores terminal-native selection.",
             ));
         }
         other => tui::line(&tui::red(&format!(
@@ -1795,7 +2014,10 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
         let since = checkpoint::now_ms().saturating_sub(24 * 3600 * 1000);
         match checkpoint::undo_all_since(cwd, since) {
             Ok(cps) => {
-                tui::line(&tui::green(&format!("  ✓ restored {} files across session:", cps.len())));
+                tui::line(&tui::green(&format!(
+                    "  ✓ restored {} files across session:",
+                    cps.len()
+                )));
                 for c in cps {
                     tui::line(&format!("    - {} ({})", c.path.display(), c.action));
                 }
@@ -1804,21 +2026,30 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
         }
     } else if !arg.is_empty() {
         match checkpoint::undo_by_id(cwd, arg) {
-            Ok(cp) => tui::line(&tui::green(&format!("  ✓ restored checkpoint {} ({})", cp.id, cp.path.display()))),
+            Ok(cp) => tui::line(&tui::green(&format!(
+                "  ✓ restored checkpoint {} ({})",
+                cp.id,
+                cp.path.display()
+            ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
     } else {
         match checkpoint::undo_latest(cwd) {
-            Ok(cp) => tui::line(&tui::green(&format!("  ✓ restored latest {}", cp.path.display()))),
+            Ok(cp) => tui::line(&tui::green(&format!(
+                "  ✓ restored latest {}",
+                cp.path.display()
+            ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
     }
 }
 
 fn handle_align(cwd: &std::path::Path) {
-    tui::line(&tui::accent("  /grill-me — Interactive Operational Alignment & Decision Grill"));
+    tui::line(&tui::accent(
+        "  /grill-me — Interactive Operational Alignment & Decision Grill",
+    ));
     tui::line("  We will conduct an operational alignment review before proceeding with complex modifications.");
-    
+
     let q1 = tui::ask("  1. What is the primary operational risk? [1: Regression | 2: Data Loss | 3: Performance | 4: Security]: ").unwrap_or_default();
     let risk_label = match q1.trim() {
         "2" => "Data Loss",
@@ -1845,7 +2076,10 @@ fn handle_align(cwd: &std::path::Path) {
     tui::line(&tui::green("  ✓ Operational alignment recorded!"));
     tui::line(&format!("    • Primary Risk: {}", tui::bold(risk_label)));
     tui::line(&format!("    • Reversibility: {}", tui::bold(rev_label)));
-    tui::line(&format!("    • Confidence Threshold: {}", tui::bold(conf_label)));
+    tui::line(&format!(
+        "    • Confidence Threshold: {}",
+        tui::bold(conf_label)
+    ));
 
     let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
     let id = format!("dec-{}", crate::checkpoint::now_ms());
@@ -1854,7 +2088,10 @@ fn handle_align(cwd: &std::path::Path) {
         entity_type: crate::knowledge::EntityType::ArchitectureDecision,
         name: format!("Operational Alignment ({})", risk_label),
         path: None,
-        description: Some(format!("Risk: {}, Reversibility: {}, Confidence: {}", risk_label, rev_label, conf_label)),
+        description: Some(format!(
+            "Risk: {}, Reversibility: {}, Confidence: {}",
+            risk_label, rev_label, conf_label
+        )),
         metadata: serde_json::json!({
             "risk": risk_label,
             "reversibility": rev_label,
@@ -1866,16 +2103,32 @@ fn handle_align(cwd: &std::path::Path) {
     };
     kb.add_entity(entity);
     let _ = kb.save();
-    tui::line(&tui::dim("  Decision recorded into structured knowledge base (.buildwithnexus/knowledge/)."));
+    tui::line(&tui::dim(
+        "  Decision recorded into structured knowledge base (.buildwithnexus/knowledge/).",
+    ));
 }
 
 fn handle_teamwork() {
-    tui::line(&tui::accent("  /teamwork-preview — Autonomous Multi-Agent Swarm Preview"));
+    tui::line(&tui::accent(
+        "  /teamwork-preview — Autonomous Multi-Agent Swarm Preview",
+    ));
     tui::line("  When executing complex projects, buildwithnexus orchestrates specialized subagent teams:");
-    tui::line(&format!("    • {} — Explores documentation, code graphs, and symbol trees", tui::bold("Researcher Subagent")));
-    tui::line(&format!("    • {} — Analyzes logs, stack traces, and test regressions", tui::bold("Debugger Subagent")));
-    tui::line(&format!("    • {} — Edits code files, runs migrations, and applies patches", tui::bold("Code Writer Subagent")));
-    tui::line(&format!("    • {} — Checks engineering rules, static analysis, and confidence", tui::bold("Verifier Subagent")));
+    tui::line(&format!(
+        "    • {} — Explores documentation, code graphs, and symbol trees",
+        tui::bold("Researcher Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Analyzes logs, stack traces, and test regressions",
+        tui::bold("Debugger Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Edits code files, runs migrations, and applies patches",
+        tui::bold("Code Writer Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Checks engineering rules, static analysis, and confidence",
+        tui::bold("Verifier Subagent")
+    ));
     tui::line(&tui::dim("  Tip: Use `invoke_subagent` in your custom rules/workflows to dispatch tasks to this team."));
 }
 
@@ -1935,7 +2188,7 @@ fn print_help() {
     tui::line(&format!(
         "  {}         mouse wheel scrolling  {}",
         tui::bold("/mouse"),
-        tui::dim("[on|off]  on by default; off restores normal text selection")
+        tui::dim("[on|off]  on by default; /scroll is an alias")
     ));
     tui::line(&format!(
         "  {}        scroll transcript",
@@ -2117,21 +2370,33 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
     for word in task.split_whitespace() {
         if let Some(raw_path) = word.strip_prefix('@') {
             if raw_path == "diff" || raw_path == "git:diff" {
-                if let Ok(o) = std::process::Command::new("git").args(["diff", "HEAD"]).current_dir(cwd).output() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["diff", "HEAD"])
+                    .current_dir(cwd)
+                    .output()
+                {
                     let diff_text = String::from_utf8_lossy(&o.stdout);
                     if !diff_text.trim().is_empty() {
                         text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
-                        if !clean.is_empty() { clean.push(' '); }
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
                         clean.push_str("[git diff HEAD]");
                         continue;
                     }
                 }
             } else if raw_path == "status" || raw_path == "git:status" {
-                if let Ok(o) = std::process::Command::new("git").args(["status", "-s"]).current_dir(cwd).output() {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["status", "-s"])
+                    .current_dir(cwd)
+                    .output()
+                {
                     let stat_text = String::from_utf8_lossy(&o.stdout);
                     if !stat_text.trim().is_empty() {
                         text_attachments.push(format!("[git status]\n{}", stat_text));
-                        if !clean.is_empty() { clean.push(' '); }
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
                         clean.push_str("[git status]");
                         continue;
                     }
@@ -2140,37 +2405,79 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
                 let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
                 let res = kb.search(kb_query);
                 if !res.is_empty() {
-                    let summary = res.iter().map(|e| format!("Entity: {} ({:?})\nDescription: {}\nPath: {:?}", e.name, e.entity_type, e.description.as_deref().unwrap_or(""), e.path)).collect::<Vec<_>>().join("\n---\n");
+                    let summary = res
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
+                                e.name,
+                                e.entity_type,
+                                e.description.as_deref().unwrap_or(""),
+                                e.path
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n---\n");
                     text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
-                    if !clean.is_empty() { clean.push(' '); }
+                    if !clean.is_empty() {
+                        clean.push(' ');
+                    }
                     clean.push_str(&format!("[kb: {}]", kb_query));
                     continue;
                 }
             } else if raw_path == "rules" || raw_path.starts_with("rule:") {
                 let engine = crate::rules::RuleEngine::load_defaults();
-                let rules_summary = engine.rules.iter().map(|r| format!("Rule [{}]: {} (Severity: {})", r.id, r.description, r.severity)).collect::<Vec<_>>().join("\n");
+                let rules_summary = engine
+                    .rules
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "Rule [{}]: {} (Severity: {})",
+                            r.id, r.description, r.severity
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
-                if !clean.is_empty() { clean.push(' '); }
+                if !clean.is_empty() {
+                    clean.push(' ');
+                }
                 clean.push_str("[active rules]");
                 continue;
-            } else if let Some(url) = raw_path.strip_prefix("url:").or_else(|| raw_path.strip_prefix("web:")) {
-                if let Ok(o) = std::process::Command::new("curl").args(["-sL", "--max-time", "5", url]).output() {
+            } else if let Some(url) = raw_path
+                .strip_prefix("url:")
+                .or_else(|| raw_path.strip_prefix("web:"))
+            {
+                if let Ok(o) = std::process::Command::new("curl")
+                    .args(["-sL", "--max-time", "5", url])
+                    .output()
+                {
                     let web_text = String::from_utf8_lossy(&o.stdout);
                     if !web_text.trim().is_empty() {
                         let snippet: String = web_text.chars().take(8000).collect();
                         text_attachments.push(format!("[web: {}]\n{}", url, snippet));
-                        if !clean.is_empty() { clean.push(' '); }
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
                         clean.push_str(&format!("[web: {}]", url));
                         continue;
                     }
                 }
             } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
-                if let Ok(o) = std::process::Command::new("grep").args(["-rnI", sym_query, "."]).current_dir(cwd).output() {
+                if let Ok(o) = std::process::Command::new("grep")
+                    .args(["-rnI", sym_query, "."])
+                    .current_dir(cwd)
+                    .output()
+                {
                     let sym_text = String::from_utf8_lossy(&o.stdout);
                     if !sym_text.trim().is_empty() {
-                        let snippet: String = sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
-                        text_attachments.push(format!("[symbol search: {}]\n{}", sym_query, snippet));
-                        if !clean.is_empty() { clean.push(' '); }
+                        let snippet: String =
+                            sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
+                        text_attachments
+                            .push(format!("[symbol search: {}]\n{}", sym_query, snippet));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
                         clean.push_str(&format!("[symbol: {}]", sym_query));
                         continue;
                     }
@@ -2371,6 +2678,7 @@ fn usage() {
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
          \x20 /context               show current context usage\n\
@@ -2462,7 +2770,10 @@ fn run_doctor() {
         println!("  ✓ WSL2 runtime     detected");
         let home = config::home();
         if crate::tools::is_wsl_windows_mount(&home) {
-            println!("  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).", home.display());
+            println!(
+                "  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).",
+                home.display()
+            );
             println!("                     Set NEXUS_HOME to a Linux path (~/.buildwithnexus) for 10x faster I/O.");
         } else {
             println!("  ✓ WSL2 filesystem  native Linux filesystem detected (optimal I/O speed)");
@@ -2503,10 +2814,20 @@ fn run_doctor() {
 pub fn check_and_offer_install_dependencies(interactive: bool) {
     let tools_to_check = [
         ("git", "git", "git", "Version control & workspace tracking"),
-        ("rg", "ripgrep", "ripgrep", "High-speed semantic file searching"),
+        (
+            "rg",
+            "ripgrep",
+            "ripgrep",
+            "High-speed semantic file searching",
+        ),
         ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
         ("npm", "node", "npm", "Node package manager"),
-        ("python3", "python", "python3", "Python runtime & data scripting"),
+        (
+            "python3",
+            "python",
+            "python3",
+            "Python runtime & data scripting",
+        ),
     ];
 
     let mut missing = Vec::new();
@@ -2523,12 +2844,17 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
 
     if missing.is_empty() {
         if interactive {
-            tui::line(&tui::green("  ✓ All required OOTB dependencies (git, rg, node, npm, python3) are installed!"));
+            tui::line(&tui::green(
+                "  ✓ All required OOTB dependencies (git, rg, node, npm, python3) are installed!",
+            ));
         }
         return;
     }
 
-    tui::line(&tui::yellow(&format!("  ⚠ Missing {} OOTB development tool(s):", missing.len())));
+    tui::line(&tui::yellow(&format!(
+        "  ⚠ Missing {} OOTB development tool(s):",
+        missing.len()
+    )));
     for (bin, _, _, desc) in &missing {
         tui::line(&format!("    • {} — {}", tui::bold(bin), desc));
     }
@@ -2538,11 +2864,22 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
         return;
     }
 
-    let brew_available = std::process::Command::new("which").arg("brew").output().map(|o| o.status.success()).unwrap_or(false);
-    let apt_available = std::process::Command::new("which").arg("apt-get").output().map(|o| o.status.success()).unwrap_or(false);
+    let brew_available = std::process::Command::new("which")
+        .arg("brew")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let apt_available = std::process::Command::new("which")
+        .arg("apt-get")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
 
     for (bin, brew_pkg, apt_pkg, desc) in missing {
-        let ask_msg = format!("  Would you like to install '{}' ({}) now? [Y/n]: ", bin, desc);
+        let ask_msg = format!(
+            "  Would you like to install '{}' ({}) now? [Y/n]: ",
+            bin, desc
+        );
         let ans = match tui::ask(&ask_msg) {
             Some(a) => a.trim().to_lowercase(),
             None => break,
@@ -2553,21 +2890,39 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
         }
 
         if brew_available {
-            tui::line(&tui::accent(&format!("    Running `brew install {brew_pkg}`...")));
-            let res = std::process::Command::new("brew").args(["install", brew_pkg]).status();
+            tui::line(&tui::accent(&format!(
+                "    Running `brew install {brew_pkg}`..."
+            )));
+            let res = std::process::Command::new("brew")
+                .args(["install", brew_pkg])
+                .status();
             match res {
-                Ok(s) if s.success() => tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!"))),
-                _ => tui::line(&tui::red(&format!("    ✗ Failed to install {brew_pkg} via Homebrew."))),
+                Ok(s) if s.success() => {
+                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
+                }
+                _ => tui::line(&tui::red(&format!(
+                    "    ✗ Failed to install {brew_pkg} via Homebrew."
+                ))),
             }
         } else if apt_available {
-            tui::line(&tui::accent(&format!("    Running `sudo apt-get install -y {apt_pkg}`...")));
-            let res = std::process::Command::new("sudo").args(["apt-get", "install", "-y", apt_pkg]).status();
+            tui::line(&tui::accent(&format!(
+                "    Running `sudo apt-get install -y {apt_pkg}`..."
+            )));
+            let res = std::process::Command::new("sudo")
+                .args(["apt-get", "install", "-y", apt_pkg])
+                .status();
             match res {
-                Ok(s) if s.success() => tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!"))),
-                _ => tui::line(&tui::red(&format!("    ✗ Failed to install {apt_pkg} via apt-get."))),
+                Ok(s) if s.success() => {
+                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
+                }
+                _ => tui::line(&tui::red(&format!(
+                    "    ✗ Failed to install {apt_pkg} via apt-get."
+                ))),
             }
         } else {
-            tui::line(&tui::yellow(&format!("    Neither Homebrew nor apt-get found. Please install '{bin}' manually.")));
+            tui::line(&tui::yellow(&format!(
+                "    Neither Homebrew nor apt-get found. Please install '{bin}' manually."
+            )));
         }
     }
 }
@@ -2803,9 +3158,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test_code.rs");
-        std::fs::write(&file_path, "pub fn authenticate_user() {}\npub struct SessionData {}").unwrap();
+        std::fs::write(
+            &file_path,
+            "pub fn authenticate_user() {}\npub struct SessionData {}",
+        )
+        .unwrap();
         super::handle_kb_index(&dir);
-        
+
         let kb = crate::knowledge::KnowledgeBase::new(&dir.to_string_lossy());
         assert!(!kb.entities.is_empty());
         assert!(kb.entities.values().any(|e| e.name == "authenticate_user"));

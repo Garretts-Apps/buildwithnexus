@@ -228,8 +228,11 @@ impl KnowledgeBase {
     /// Creates or loads a KnowledgeBase from `.buildwithnexus/knowledge/entities.json`.
     pub fn new(workdir: &str) -> Self {
         let root = PathBuf::from(workdir);
-        let path = root.join(".buildwithnexus").join("knowledge").join("entities.json");
-        
+        let path = root
+            .join(".buildwithnexus")
+            .join("knowledge")
+            .join("entities.json");
+
         let mut kb = if path.exists() {
             fs::read_to_string(&path)
                 .ok()
@@ -266,7 +269,9 @@ impl KnowledgeBase {
                 e.name.to_lowercase().contains(&q)
                     || e.id.to_lowercase().contains(&q)
                     || e.entity_type.to_string().to_lowercase().contains(&q)
-                    || e.description.as_ref().map_or(false, |d| d.to_lowercase().contains(&q))
+                    || e.description
+                        .as_ref()
+                        .is_some_and(|d| d.to_lowercase().contains(&q))
             })
             .collect()
     }
@@ -308,15 +313,27 @@ impl KnowledgeBase {
     pub fn index_from_tree_sitter_output(&mut self, symbols_json: &str) -> Result<usize, String> {
         let items: Vec<Value> = serde_json::from_str(symbols_json)
             .map_err(|e| format!("Invalid JSON symbol output: {}", e))?;
-        
+
         let mut count = 0;
         let now = chrono_now_iso();
 
         for item in items {
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let kind_str = item.get("kind").and_then(|v| v.as_str()).unwrap_or("function");
-            let path = item.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let desc = item.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let kind_str = item
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("function");
+            let path = item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let desc = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let entity_type = match kind_str.to_lowercase().as_str() {
                 "class" | "struct" => EntityType::Class,
@@ -362,7 +379,10 @@ impl KnowledgeBase {
 
         for id in ids {
             if let Some(e) = self.entities.get(id) {
-                out.push_str(&format!("- **{}** (`{}`): {}\n", e.name, e.entity_type, e.id));
+                out.push_str(&format!(
+                    "- **{}** (`{}`): {}\n",
+                    e.name, e.entity_type, e.id
+                ));
                 if let Some(ref p) = e.path {
                     out.push_str(&format!("  - Path: {}\n", p));
                 }
