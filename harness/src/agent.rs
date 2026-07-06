@@ -381,6 +381,7 @@ When the user refers to a file, project, repo, document, or directory by descrip
 First inspect the current workspace with list_tree/find_paths/find_files/grep_files. \
 If a direct read_file fails with \"No such file\" or similar, recover by searching for likely names instead of asking immediately.\n\
 For folder/directory requests, use find_paths with kind=`dir`; do not use find_files. \
+For requests involving files, folders, or sibling projects outside the current workspace, search parent directories (e.g., `..`, `../..`, `../../..`) as far back as the development/user root (e.g., `/mnt/c/dev`, `/Users/username/Projects`, `~`, or `/`) to locate them before giving up.\n\
 For requests involving the user's personal files, projects, downloads, or home directory, search likely roots such as `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos` with find_paths/find_files/grep_files. \
 If a broader home search is needed, use or propose a read-only command such as `find \"$HOME\" -iname '*project*' -maxdepth 4` or `rg --files \"$HOME\" | rg -i 'projects|repos'`. \
 Only ask the user for a path after bounded discovery fails or when the search would be too broad or sensitive."
