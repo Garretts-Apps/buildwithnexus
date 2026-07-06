@@ -221,7 +221,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}},"required":["task","status"]},"minItems":0,"maxItems":30}},"required":["items"]}) },
         ToolDef { name: "todo_read", description: "Read the current task todo list.",
             schema: json!({"type":"object","properties":{}}) },
-        ToolDef { name: "create_docx", description: "Create a simple .docx document from a title and markdown-like body text. Supports headings, bullets, numbered items, and paragraphs.",
+        ToolDef { name: "create_docx", description: "Create a simple .docx Word document from a title and markdown-like body text. MUST ONLY be used for .docx files. Do NOT use for code, HTML, or plain text.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"}},"required":["path","title","body"]}) },
         ToolDef { name: "finish", description: "Signal the task is complete with a short summary for the user.",
             schema: json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}) },
@@ -1464,6 +1464,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         },
         "create_docx" => {
             let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            if p.extension().and_then(|e| e.to_str()) != Some("docx") {
+                return err("path must end with .docx");
+            }
             let title = input["title"].as_str().unwrap_or("Document");
             let body = input["body"].as_str().unwrap_or("");
             if let Some(dir) = p.parent() {

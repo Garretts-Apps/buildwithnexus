@@ -21,7 +21,7 @@ Use this skill whenever the task requires acting through buildwithnexus tools.
 - `create_dir`, `move_path`, `remove_path`: basic filesystem mutation.
 - `run_command`: run shell commands and return output.
 - `todo_write`, `todo_read`: maintain a structured task list.
-- `create_docx`: create a simple Word document from title and body.
+- `create_docx`: create a simple Word Document (.docx) from title and body. Do NOT use for HTML or code.
 - `fetch_url`: HTTP GET for a specific URL.
 - `web_search`: DuckDuckGo-backed web search.
 - `save_memory`: persist durable user preferences or facts.
