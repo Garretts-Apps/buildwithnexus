@@ -2202,6 +2202,10 @@ fn print_help() {
         tui::bold("/model")
     ));
     tui::line(&format!(
+        "  {}        switch to local GGUF or Ollama models",
+        tui::bold("/local")
+    ));
+    tui::line(&format!(
         "  {}      compact context  {}",
         tui::bold("/compact"),
         tui::dim("(free up token budget)")
@@ -2247,6 +2251,11 @@ fn print_help() {
         tui::dim("<context>")
     ));
     tui::line(&format!(
+        "  {}        transcribe voice input from audio file  {}",
+        tui::bold("/voice"),
+        tui::dim("<file>")
+    ));
+    tui::line(&format!(
         "  {}       configure hooks, memory, commands via AI",
         tui::bold("/config")
     ));
@@ -2261,6 +2270,20 @@ fn print_help() {
     tui::line(&format!(
         "  {}        browse callable tools",
         tui::bold("/tools")
+    ));
+    tui::line(&format!(
+        "  {}        inspect engineering rules and violations",
+        tui::bold("/rules")
+    ));
+    tui::line(&format!(
+        "  {}           query or index project knowledge base  {}",
+        tui::bold("/kb"),
+        tui::dim("(/index)")
+    ));
+    tui::line(&format!(
+        "  {}       verify codebase against rules and tests  {}",
+        tui::bold("/verify"),
+        tui::dim("(/audit)")
     ));
     tui::line(&format!(
         "  {}          inspect configured enterprise MCP servers",
