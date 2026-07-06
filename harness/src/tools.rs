@@ -57,6 +57,36 @@ pub mod bench {
 
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
+        ToolDef { name: "bash", description: "OpenCode-compatible alias: run a shell command in the project environment. Prefer glob/grep/read/list for simple navigation.",
+            schema: json!({"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}) },
+        ToolDef { name: "read", description: "OpenCode-compatible alias: read a UTF-8 text file. Accepts path or filePath and expands `~`.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}) },
+        ToolDef { name: "write", description: "OpenCode-compatible alias: create or overwrite a file. Accepts path or filePath.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"content":{"type":"string"}},"required":["content"]}) },
+        ToolDef { name: "edit", description: "OpenCode-compatible alias: replace a unique string in a file. Accepts old/new or oldString/newString.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}}}) },
+        ToolDef { name: "glob", description: "OpenCode-compatible alias: find files and directories by glob/name pattern. Use for folder lookup too.",
+            schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","default":"."},"root":{"type":"string"},"kind":{"type":"string","enum":["any","file","dir"],"default":"any"},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
+        ToolDef { name: "grep", description: "OpenCode-compatible alias: search text files for a literal pattern. Optional include limits file names.",
+            schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","default":"."},"root":{"type":"string"},"include":{"type":"string"},"file_pattern":{"type":"string"},"case_sensitive":{"type":"boolean","default":false},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
+        ToolDef { name: "list", description: "OpenCode-compatible alias: list entries in a directory.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string","default":"."}}}) },
+        ToolDef { name: "webfetch", description: "OpenCode-compatible alias: fetch a URL via HTTP GET.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
+        ToolDef { name: "websearch", description: "OpenCode-compatible alias: search the web and return relevant excerpts.",
+            schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
+        ToolDef { name: "todowrite", description: "OpenCode-compatible alias: replace the current task todo list.",
+            schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}}},"minItems":0,"maxItems":30}},"required":["items"]}) },
+        ToolDef { name: "todoread", description: "OpenCode-compatible alias: read the current task todo list.",
+            schema: json!({"type":"object","properties":{}}) },
+        ToolDef { name: "skill", description: "OpenCode-compatible alias: load the full instructions for one named skill.",
+            schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
+        ToolDef { name: "question", description: "Ask the user a concise clarifying question when discovery is insufficient or user approval is needed.",
+            schema: json!({"type":"object","properties":{"question":{"type":"string"},"default":{"type":"string"}},"required":["question"]}) },
+        ToolDef { name: "list_python_tools", description: "List Python tool scripts in .buildwithnexus/tools and $NEXUS_HOME/tools. Python tools read JSON on stdin and print text or JSON.",
+            schema: json!({"type":"object","properties":{}}) },
+        ToolDef { name: "python_tool", description: "Run a Python tool script with JSON input on stdin. Use for specialized local tools that are easier to maintain outside Rust.",
+            schema: json!({"type":"object","properties":{"path":{"type":"string"},"input":{"type":"object"}},"required":["path"]}) },
         ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. Works anywhere on the filesystem and expands `~`.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}) },
         ToolDef { name: "read_many_files", description: "Read several UTF-8 text files at once. Use for comparing related files without repeated round trips.",
@@ -110,6 +140,16 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     ];
     if include_subagent {
         v.push(ToolDef {
+            name: "task",
+            description: "OpenCode-compatible alias: delegate a self-contained sub-task to a fresh agent.",
+            schema: json!({"type":"object","properties":{
+                "task":{"type":"string"},
+                "description":{"type":"string"},
+                "role":{"type":"string","enum":["engineer","researcher"]},
+                "isolate":{"type":"boolean"}
+            }}),
+        });
+        v.push(ToolDef {
             name: "spawn_subagent",
             description: "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.",
             schema: json!({"type":"object","properties":{
@@ -126,14 +166,21 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
 pub fn is_mutating(name: &str) -> bool {
     matches!(
         name,
-        "write_file"
+        "write"
+            | "write_file"
+            | "edit"
             | "edit_file"
             | "multi_edit"
             | "apply_patch"
             | "create_dir"
             | "move_path"
             | "remove_path"
+            | "bash"
             | "run_command"
+            | "python_tool"
+            | "task"
+            | "spawn_subagent"
+            | "todowrite"
             | "todo_write"
             | "create_docx"
     )
@@ -177,8 +224,8 @@ pub fn is_readonly_command(cmd: &str) -> bool {
 // A one-line, human-readable preview of what a call will do (shown at the gate).
 pub fn preview(name: &str, input: &Value) -> String {
     match name {
-        "write_file" => format!("write {}", input["path"].as_str().unwrap_or("?")),
-        "edit_file" => format!("edit {}", input["path"].as_str().unwrap_or("?")),
+        "write" | "write_file" => format!("write {}", path_arg(input).unwrap_or("?")),
+        "edit" | "edit_file" => format!("edit {}", path_arg(input).unwrap_or("?")),
         "multi_edit" => format!("multi-edit {}", input["path"].as_str().unwrap_or("?")),
         "apply_patch" => "apply patch".to_string(),
         "create_dir" => format!("mkdir {}", input["path"].as_str().unwrap_or("?")),
@@ -189,16 +236,34 @@ pub fn preview(name: &str, input: &Value) -> String {
         ),
         "remove_path" => format!("remove {}", input["path"].as_str().unwrap_or("?")),
         "create_docx" => format!("create docx {}", input["path"].as_str().unwrap_or("?")),
-        "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
-        "find_paths" => format!("find paths: {}", input["pattern"].as_str().unwrap_or("?")),
+        "bash" | "run_command" => format!("run: {}", input["command"].as_str().unwrap_or("?")),
+        "glob" | "find_paths" => {
+            format!("find paths: {}", input["pattern"].as_str().unwrap_or("?"))
+        }
         "find_files" => format!("find files: {}", input["pattern"].as_str().unwrap_or("?")),
-        "grep_files" => format!("grep: {}", input["pattern"].as_str().unwrap_or("?")),
-        "spawn_subagent" => format!("subagent: {}", input["task"].as_str().unwrap_or("?")),
-        "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
+        "grep" | "grep_files" => format!("grep: {}", input["pattern"].as_str().unwrap_or("?")),
+        "task" | "spawn_subagent" => {
+            format!("subagent: {}", task_arg(input).unwrap_or("?"))
+        }
+        "webfetch" | "fetch_url" => format!("GET {}", input["url"].as_str().unwrap_or("?")),
+        "websearch" | "web_search" => {
+            format!("web search: {}", input["query"].as_str().unwrap_or("?"))
+        }
         "list_skills" => "list skills".to_string(),
-        "load_skill" => format!("load skill: {}", input["name"].as_str().unwrap_or("?")),
+        "skill" | "load_skill" => {
+            format!("load skill: {}", input["name"].as_str().unwrap_or("?"))
+        }
+        "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
         _ => name.to_string(),
     }
+}
+
+fn path_arg(input: &Value) -> Option<&str> {
+    input["path"].as_str().or_else(|| input["filePath"].as_str())
+}
+
+fn task_arg(input: &Value) -> Option<&str> {
+    input["task"].as_str().or_else(|| input["description"].as_str())
 }
 
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -228,16 +293,24 @@ pub const INVALID_ARGS: &str = "__bwn_invalid_args__";
 // cwd. None for non-path tools.
 pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
     match name {
-        "read_file" | "list_dir" | "list_tree" | "file_info" | "write_file" | "edit_file"
-        | "multi_edit" | "create_dir" | "remove_path" | "create_docx" => {
-            Some(resolve(cwd, input["path"].as_str().unwrap_or("")))
+        "read" | "read_file" | "list" | "list_dir" | "list_tree" | "file_info" | "write"
+        | "write_file" | "edit" | "edit_file" | "multi_edit" | "create_dir" | "remove_path"
+        | "create_docx" | "python_tool" => {
+            Some(resolve(cwd, path_arg(input).unwrap_or("")))
         }
         "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or(""))),
-        "find_paths" | "find_files" | "grep_files" => {
-            Some(resolve(cwd, input["root"].as_str().unwrap_or(".")))
+        "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
+            Some(resolve(cwd, root_arg(input)))
         }
         _ => None,
     }
+}
+
+fn root_arg(input: &Value) -> &str {
+    input["root"]
+        .as_str()
+        .or_else(|| input["path"].as_str())
+        .unwrap_or(".")
 }
 
 // Lexically fold `.`/`..` without touching the filesystem (works for paths that
@@ -652,6 +725,49 @@ fn todo_store() -> &'static Mutex<Vec<(String, String)>> {
     TODO.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn python_tool_dirs(cwd: &Path) -> Vec<PathBuf> {
+    vec![
+        cwd.join(".buildwithnexus").join("tools"),
+        crate::config::home().join("tools"),
+    ]
+}
+
+fn find_python_tool(cwd: &Path, raw: &str) -> PathBuf {
+    let direct = resolve(cwd, raw);
+    if direct.exists() || raw.contains('/') || raw.contains('\\') {
+        return direct;
+    }
+    for dir in python_tool_dirs(cwd) {
+        let plain = dir.join(raw);
+        if plain.exists() {
+            return plain;
+        }
+        let py = dir.join(format!("{raw}.py"));
+        if py.exists() {
+            return py;
+        }
+    }
+    direct
+}
+
+fn list_python_tools(cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in python_tool_dirs(cwd) {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("py") {
+                out.push(display_path(&path, cwd));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -789,8 +905,8 @@ fn search_limit(input: &Value) -> usize {
 
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     match name {
-        "read_file" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+        "read" | "read_file" => {
+            let p = resolve(cwd, path_arg(input).unwrap_or(""));
             match fs::read_to_string(&p) {
                 Ok(c) => ok(truncate(apply_line_range(&c, line_range(input)), MAX_READ)),
                 Err(e) => err(format!(
@@ -821,8 +937,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             ok(truncate(sections.join("\n\n"), MAX_READ))
         }
-        "list_dir" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or("."));
+        "list" | "list_dir" => {
+            let p = resolve(cwd, path_arg(input).unwrap_or("."));
             match fs::read_dir(&p) {
                 Ok(rd) => {
                     let mut names: Vec<String> = rd
@@ -839,7 +955,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     names.sort();
                     ok(names.join("\n"))
                 }
-                Err(e) => err(format!("cannot list {}: {e}", p.display())),
+                Err(e) => err(format!(
+                    "cannot list {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
+                    p.display()
+                )),
             }
         }
         "list_tree" => {
@@ -879,11 +998,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     })
                     .to_string())
                 }
-                Err(e) => err(format!("cannot stat {}: {e}", p.display())),
+                Err(e) => err(format!(
+                    "cannot stat {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
+                    p.display()
+                )),
             }
         }
-        "find_paths" => {
-            let root = resolve(cwd, input["root"].as_str().unwrap_or("."));
+        "glob" | "find_paths" => {
+            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -951,13 +1073,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(matches.join("\n"))
             }
         }
-        "grep_files" => {
-            let root = resolve(cwd, input["root"].as_str().unwrap_or("."));
+        "grep" | "grep_files" => {
+            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("");
             if pattern.is_empty() {
                 return err("pattern is required");
             }
-            let file_pattern = input["file_pattern"].as_str().unwrap_or("*");
+            let file_pattern = input["file_pattern"]
+                .as_str()
+                .or_else(|| input["include"].as_str())
+                .unwrap_or("*");
             let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
             let needle = if case_sensitive {
                 pattern.to_string()
@@ -1005,8 +1130,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(matches.join("\n"))
             }
         }
-        "write_file" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+        "write" | "write_file" => {
+            let p = resolve(cwd, path_arg(input).unwrap_or(""));
             let content = input["content"].as_str().unwrap_or("");
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
@@ -1017,10 +1142,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "edit_file" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
-            let old = input["old"].as_str().unwrap_or("");
-            let new = input["new"].as_str().unwrap_or("");
+        "edit" | "edit_file" => {
+            let p = resolve(cwd, path_arg(input).unwrap_or(""));
+            let old = input["old"]
+                .as_str()
+                .or_else(|| input["oldString"].as_str())
+                .unwrap_or("");
+            let new = input["new"]
+                .as_str()
+                .or_else(|| input["newString"].as_str())
+                .unwrap_or("");
             let body = match fs::read_to_string(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
@@ -1140,7 +1271,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot remove {}: {e}", p.display())),
             }
         }
-        "run_command" => {
+        "bash" | "run_command" => {
             let cmd = input["command"].as_str().unwrap_or("");
             let output = if cfg!(windows) {
                 Command::new("cmd")
@@ -1173,13 +1304,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("failed to spawn: {e}")),
             }
         }
-        "todo_write" => {
+        "todowrite" | "todo_write" => {
             let Some(items) = input["items"].as_array() else {
                 return err("items is required");
             };
             let mut next = Vec::new();
             for item in items {
-                let task = item["task"].as_str().unwrap_or("").trim();
+                let task = item["task"]
+                    .as_str()
+                    .or_else(|| item["content"].as_str())
+                    .unwrap_or("")
+                    .trim();
                 let status = item["status"].as_str().unwrap_or("pending");
                 if !task.is_empty() {
                     next.push((task.to_string(), status.to_string()));
@@ -1193,7 +1328,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(_) => err("todo store unavailable"),
             }
         }
-        "todo_read" => match todo_store().lock() {
+        "todoread" | "todo_read" => match todo_store().lock() {
             Ok(todos) if todos.is_empty() => ok("no todo items"),
             Ok(todos) => ok(todos
                 .iter()
@@ -1217,7 +1352,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "fetch_url" => {
+        "webfetch" | "fetch_url" => {
             let url = input["url"].as_str().unwrap_or("");
             if url.is_empty() {
                 return err("url is required");
@@ -1230,7 +1365,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("fetch failed: {e}")),
             }
         }
-        "web_search" => {
+        "websearch" | "web_search" => {
             let query = input["query"].as_str().unwrap_or("").trim();
             if query.is_empty() {
                 return err("query is required");
@@ -1248,6 +1383,55 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("web search failed: {e}")),
             }
         }
+        "list_python_tools" => {
+            let rows = list_python_tools(cwd);
+            if rows.is_empty() {
+                ok("no Python tools found in .buildwithnexus/tools or $NEXUS_HOME/tools")
+            } else {
+                ok(rows.join("\n"))
+            }
+        }
+        "python_tool" => {
+            let raw = input["path"].as_str().unwrap_or("").trim();
+            if raw.is_empty() {
+                return err("path is required");
+            }
+            let path = find_python_tool(cwd, raw);
+            let payload = input.get("input").cloned().unwrap_or_else(|| json!({}));
+            let mut child = match Command::new("python3")
+                .arg(&path)
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => return err(format!("failed to spawn python3 {}: {e}", path.display())),
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = std::io::Write::write_all(&mut stdin, payload.to_string().as_bytes());
+            }
+            match child.wait_with_output() {
+                Ok(o) => {
+                    let mut s = String::new();
+                    s.push_str(&String::from_utf8_lossy(&o.stdout));
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    if !e.trim().is_empty() {
+                        s.push_str("\n[stderr]\n");
+                        s.push_str(&e);
+                    }
+                    let code = o.status.code().unwrap_or(-1);
+                    s.push_str(&format!("\n[exit {code}]"));
+                    Outcome {
+                        content: truncate(s, MAX_OUT),
+                        is_error: !o.status.success(),
+                        finished: false,
+                    }
+                }
+                Err(e) => err(format!("failed to wait for python tool: {e}")),
+            }
+        }
         "list_skills" => {
             let rows = crate::config::load_skills()
                 .into_iter()
@@ -1262,7 +1446,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(rows.join("\n"))
             }
         }
-        "load_skill" => {
+        "skill" | "load_skill" => {
             let wanted = input["name"]
                 .as_str()
                 .unwrap_or("")

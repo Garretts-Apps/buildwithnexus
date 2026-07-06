@@ -63,23 +63,32 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     }
     // A role-colored header line (icon + what it's about to do), opencode-style.
     let (icon, head) = match name {
-        "read_file" | "list_dir" | "find_paths" | "find_files" | "grep_files" => {
-            ("◇", tui::cyan(preview))
-        }
-        "write_file" | "edit_file" => ("◆", tui::yellow(preview)),
-        "run_command" => ("»", tui::blue(preview)),
-        "spawn_subagent" => ("⊞", tui::accent(preview)),
+        "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths"
+        | "find_files" | "grep" | "grep_files" | "webfetch" | "websearch" | "fetch_url"
+        | "web_search" | "list_python_tools" => ("◇", tui::cyan(preview)),
+        "write" | "write_file" | "edit" | "edit_file" => ("◆", tui::yellow(preview)),
+        "bash" | "run_command" | "python_tool" => ("»", tui::blue(preview)),
+        "task" | "spawn_subagent" => ("⊞", tui::accent(preview)),
+        "question" => ("?", tui::yellow(preview)),
         _ => ("•", tui::dim(preview)),
     };
     tui::line(&format!("  {} {}", tui::dim(icon), head));
 
     // Inline colored diff for edits — see the change before/at the moment it lands.
     let body = match name {
-        "edit_file" => Some(tui::diff(
-            input["old"].as_str().unwrap_or(""),
-            input["new"].as_str().unwrap_or(""),
+        "edit" | "edit_file" => Some(tui::diff(
+            input["old"]
+                .as_str()
+                .or_else(|| input["oldString"].as_str())
+                .unwrap_or(""),
+            input["new"]
+                .as_str()
+                .or_else(|| input["newString"].as_str())
+                .unwrap_or(""),
         )),
-        "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
+        "write" | "write_file" => {
+            Some(tui::added_preview(input["content"].as_str().unwrap_or("")))
+        }
         _ => None,
     };
     if let Some(body) = body {
@@ -127,12 +136,13 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         return;
     }
     match name {
-        "run_command" => {
+        "bash" | "run_command" | "python_tool" => {
             for l in clip_tail(content, 12) {
                 tui::line(&tui::dim(&format!("    {l}")));
             }
         }
-        "read_file" | "list_dir" | "find_paths" | "find_files" | "grep_files" => {
+        "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths"
+        | "find_files" | "grep" | "grep_files" | "list_python_tools" => {
             let n = content.lines().count();
             tui::line(&tui::dim(&format!(
                 "    ↳ {n} line{}",

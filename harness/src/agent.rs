@@ -214,6 +214,37 @@ fn repeated_tool_summary(
     }
 }
 
+fn answer_question(input: &serde_json::Value) -> (String, bool) {
+    let question = input["question"].as_str().unwrap_or("").trim();
+    if question.is_empty() {
+        return ("question is required".to_string(), true);
+    }
+    if report::is_json() || !std::io::stdin().is_terminal() {
+        return (
+            format!("blocked (no interactive terminal to answer question: {question})"),
+            true,
+        );
+    }
+    let default = input["default"].as_str().unwrap_or("").trim();
+    let prompt = if default.is_empty() {
+        format!("  {} {} ", tui::yellow("?"), tui::bold(question))
+    } else {
+        format!(
+            "  {} {} {} ",
+            tui::yellow("?"),
+            tui::bold(question),
+            tui::dim(&format!("[{default}]"))
+        )
+    };
+    let ans = tui::ask(&prompt).unwrap_or_default();
+    let out = if ans.trim().is_empty() && !default.is_empty() {
+        default.to_string()
+    } else {
+        ans
+    };
+    (out, false)
+}
+
 // ── permissions ───────────────────────────────────────────────────────────────
 #[derive(Clone, Copy)]
 pub enum Permission {
@@ -308,17 +339,22 @@ Do not load skills for simple greetings or casual replies."
 
 fn tool_manifest() -> String {
     "[Built-in tools — always available, no install needed]\n\
-• read_file / list_dir   — read any file or directory on the filesystem; read_file supports start_line/end_line\n\
+OpenCode-compatible names are supported: bash, read, write, edit, glob, grep, list, task, todowrite, todoread, webfetch, websearch, skill, question.\n\
+• read / read_file       — read any file on the filesystem; supports start_line/end_line\n\
+• list / list_dir        — list a directory\n\
 • list_tree              — inspect a bounded directory tree before guessing paths\n\
-• find_paths             — search files and directories; use kind=`dir` for folders like \"folder named nexus\"\n\
-• find_files / grep_files — search the filesystem without shelling out; use broad globs like `*project*`, `*repo*`, `*README*`\n\
-• write_file / edit_file — create or surgically modify files\n\
-• run_command            — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
-• fetch_url              — HTTP GET (no curl/wget needed)\n\
-• web_search             — DuckDuckGo web search (no API key, live results)\n\
-• list_skills / load_skill — discover and load skill instructions on demand\n\
+• glob / find_paths      — search files and directories; use kind=`dir` for folders like \"folder named nexus\"\n\
+• grep / grep_files      — search text files without shelling out; use include/file_pattern to narrow files\n\
+• write / write_file, edit / edit_file — create or surgically modify files\n\
+• bash / run_command     — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
+• webfetch / fetch_url   — HTTP GET (no curl/wget needed)\n\
+• websearch / web_search — DuckDuckGo web search (no API key, live results)\n\
+• todowrite / todoread   — track multi-step work\n\
+• skill / load_skill     — discover and load skill instructions on demand\n\
+• question               — ask the user only after bounded discovery is insufficient\n\
+• list_python_tools / python_tool — discover and run Python-backed local tools from .buildwithnexus/tools or $NEXUS_HOME/tools\n\
 • save_memory            — persist a note across sessions\n\
-• spawn_subagent         — delegate a sub-task to a fresh agent with its own context\n\
+• task / spawn_subagent  — delegate a sub-task to a fresh agent with its own context\n\
 • finish                 — mark the task complete with a summary"
     .to_string()
 }
@@ -687,6 +723,18 @@ fn build_inner(
             );
             trace_tool_call(&call.name, &call.input, "build", depth);
 
+            if call.name == "question" {
+                let (answer, is_error) = answer_question(&call.input);
+                report::tool_result(&call.name, &answer, is_error);
+                trace_tool_result(&call.name, &answer, is_error, "build", depth);
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: answer,
+                    is_error,
+                });
+                continue;
+            }
+
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
@@ -743,7 +791,7 @@ fn build_inner(
                 }
             }
 
-            if call.name == "spawn_subagent" {
+            if matches!(call.name.as_str(), "task" | "spawn_subagent") {
                 let out = spawn_subagent(p, perm, &call.input, cwd, depth);
                 report::tool_result(&call.name, &out, false);
                 trace_tool_result(&call.name, &out, false, "build", depth);
@@ -820,7 +868,11 @@ fn spawn_subagent(
     if depth + 1 >= MAX_DEPTH {
         return "subagent depth limit reached".into();
     }
-    let task = input["task"].as_str().unwrap_or("").trim();
+    let task = input["task"]
+        .as_str()
+        .or_else(|| input["description"].as_str())
+        .unwrap_or("")
+        .trim();
     if task.is_empty() {
         return "spawn_subagent requires a task".into();
     }
@@ -918,6 +970,17 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 &call.input,
             );
             trace_tool_call(&call.name, &call.input, "plan", 0);
+            if call.name == "question" {
+                let (answer, is_error) = answer_question(&call.input);
+                report::tool_result(&call.name, &answer, is_error);
+                trace_tool_result(&call.name, &answer, is_error, "plan", 0);
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: answer,
+                    is_error,
+                });
+                continue;
+            }
             let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
@@ -1129,6 +1192,17 @@ pub fn run_brainstorm(
                     &call.input,
                 );
                 trace_tool_call(&call.name, &call.input, "brainstorm", 0);
+                if call.name == "question" {
+                    let (answer, is_error) = answer_question(&call.input);
+                    report::tool_result(&call.name, &answer, is_error);
+                    trace_tool_result(&call.name, &answer, is_error, "brainstorm", 0);
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: answer,
+                        is_error,
+                    });
+                    continue;
+                }
                 let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
                     PreDecision::Deny(r) => Some(r),
                     PreDecision::Allow => None,
