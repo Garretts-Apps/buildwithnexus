@@ -2431,7 +2431,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "kb_query" => {
-            let query = input["query"].as_str().unwrap_or("");
+            let query = input["query"].as_str().unwrap_or("").trim();
+            if query.is_empty() {
+                return err("query is required");
+            }
             let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
             let results = kb.search(query);
             if results.is_empty() {
@@ -2453,7 +2456,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "kb_record" => {
-            let name = input["name"].as_str().unwrap_or("unnamed");
+            let name = input["name"].as_str().unwrap_or("").trim();
+            if name.is_empty() {
+                return err("name is required");
+            }
             let etype = match input["entity_type"].as_str().unwrap_or("Service") {
                 "Function" => crate::knowledge::EntityType::Function,
                 "Class" => crate::knowledge::EntityType::Class,
@@ -3497,6 +3503,8 @@ mod tests {
         assert!(run("webfetch", &json!({"url": ""}), &d).is_error);
         assert!(run("websearch", &json!({"query": ""}), &d).is_error);
         assert!(run("headless_browser", &json!({"url": ""}), &d).is_error);
+        assert!(run("kb_query", &json!({"query": ""}), &d).is_error);
+        assert!(run("kb_record", &json!({"name": ""}), &d).is_error);
         let _ = fs::remove_dir_all(&d);
     }
 
