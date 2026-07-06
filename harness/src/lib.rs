@@ -5,14 +5,17 @@ pub mod agent;
 pub mod checkpoint;
 pub mod config;
 pub mod hooks;
+pub mod knowledge;
 pub mod local;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
+pub mod rules;
 pub mod session;
 pub mod tools;
 pub mod trace;
 pub mod tui;
+pub mod verifier;
 pub mod workflow;
 
 use std::io::IsTerminal;
@@ -2110,6 +2113,7 @@ mod tests {
             permission: "ask".into(),
             base_url: Some("http://insecure.local/v1".into()),
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("non-HTTPS")),
@@ -2125,6 +2129,7 @@ mod tests {
             permission: "ask".into(),
             base_url: None,
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("unknown provider")),
@@ -2140,6 +2145,7 @@ mod tests {
             permission: "ask".into(),
             base_url: Some("http://localhost:11434/v1".into()),
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
         match build_provider(&s) {
             Ok(p) => {

@@ -61,6 +61,9 @@ pub fn init(cwd: &Path, interactive: bool) {
     if let Ok(text) = std::fs::read_to_string(config::home().join("settings.json")) {
         parse_into(&text, Source::Home, &mut list);
     }
+    if let Ok(text) = std::fs::read_to_string(config::home().join("settings.local.json")) {
+        parse_into(&text, Source::Home, &mut list);
+    }
     let proj = cwd.join(".buildwithnexus/settings.json");
     if let Ok(text) = std::fs::read_to_string(&proj) {
         if project_trusted(cwd, &text, interactive) {
@@ -71,14 +74,27 @@ pub fn init(cwd: &Path, interactive: bool) {
             ));
         }
     }
+    let proj_local = cwd.join(".buildwithnexus/settings.local.json");
+    if let Ok(text) = std::fs::read_to_string(&proj_local) {
+        if project_trusted(cwd, &text, interactive) {
+            parse_into(&text, Source::Project, &mut list);
+        } else if interactive {
+            tui::line(&tui::dim(
+                "  (project local hooks present but not trusted — skipped)",
+            ));
+        }
+    }
 
     // Auto-discovered scripts from ~/.buildwithnexus/hooks/<Event>/.
     for event in &[
         "SessionStart",
         "SessionEnd",
         "UserPromptSubmit",
+        "PrePrompt",
+        "PostResponse",
         "PreToolUse",
         "PostToolUse",
+        "OnError",
         "Stop",
     ] {
         for script in config::discover_hook_scripts(event) {
@@ -277,6 +293,9 @@ fn run_shell(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
 }
 
 fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String) {
+    if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
+        return run_rust_hook(path, payload, cwd);
+    }
     let (interp, interp_args) = interpreter_for(path);
     let mut c = Command::new(interp);
     for a in interp_args {
@@ -284,6 +303,45 @@ fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String)
     }
     c.arg(path);
     run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+}
+
+fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String) {
+    if Command::new("rust-script")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+    {
+        let mut c = Command::new("rust-script");
+        c.arg(path);
+        return run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload);
+    }
+    let temp_dir = std::env::temp_dir().join("bwn_rust_hooks");
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let bin_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hook".into());
+    let bin_path = temp_dir.join(&bin_name);
+    let compile_status = Command::new("rustc")
+        .args(["--edition=2021", "-O"])
+        .arg(path)
+        .arg("-o")
+        .arg(&bin_path)
+        .status();
+    match compile_status {
+        Ok(s) if s.success() => {
+            let mut c = Command::new(&bin_path);
+            run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+        }
+        Ok(s) => (
+            s.code().unwrap_or(1),
+            String::new(),
+            format!("rustc compilation failed with status: {s}"),
+        ),
+        Err(e) => (1, String::new(), format!("failed to invoke rustc: {e}")),
+    }
 }
 
 fn run_child(c: &mut Command, payload: &Value) -> (i32, String, String) {

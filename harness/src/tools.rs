@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -59,29 +60,31 @@ pub mod bench {
 
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
-        ToolDef { name: "bash", description: "OpenCode-compatible alias: run a shell command in the project environment. Prefer glob/grep/read/list for simple navigation.",
+        ToolDef { name: "bash", description: "Common coding-agent alias: run a shell command in the project environment. Prefer glob/grep/read/list for simple navigation.",
             schema: json!({"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}) },
-        ToolDef { name: "read", description: "OpenCode-compatible alias: read a UTF-8 text file. Accepts path or filePath and expands `~`.",
+        ToolDef { name: "read", description: "Common coding-agent alias: read a UTF-8 text file. Accepts path or filePath and expands `~`.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}}) },
-        ToolDef { name: "write", description: "OpenCode-compatible alias: create or overwrite a file. Accepts path or filePath.",
+        ToolDef { name: "write", description: "Common coding-agent alias: create or overwrite a file. Accepts path or filePath.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"content":{"type":"string"}},"required":["content"]}) },
-        ToolDef { name: "edit", description: "OpenCode-compatible alias: replace a unique string in a file. Accepts old/new or oldString/newString.",
+        ToolDef { name: "edit", description: "Common coding-agent alias: replace a unique string in a file. Accepts old/new or oldString/newString.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"filePath":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"},"oldString":{"type":"string"},"newString":{"type":"string"}}}) },
-        ToolDef { name: "glob", description: "OpenCode-compatible alias: find files and directories by glob/name pattern. Use for folder lookup too.",
+        ToolDef { name: "patch", description: "Common coding-agent alias: apply a unified diff patch to the current repository using git apply.",
+            schema: json!({"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}) },
+        ToolDef { name: "glob", description: "Common coding-agent alias: find files and directories by glob/name pattern. Use for folder lookup too.",
             schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","default":"."},"root":{"type":"string"},"kind":{"type":"string","enum":["any","file","dir"],"default":"any"},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
-        ToolDef { name: "grep", description: "OpenCode-compatible alias: search text files for a literal pattern. Optional include limits file names.",
+        ToolDef { name: "grep", description: "Common coding-agent alias: search text files for a literal pattern. Optional include limits file names.",
             schema: json!({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string","default":"."},"root":{"type":"string"},"include":{"type":"string"},"file_pattern":{"type":"string"},"case_sensitive":{"type":"boolean","default":false},"max":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"]}) },
-        ToolDef { name: "list", description: "OpenCode-compatible alias: list entries in a directory.",
+        ToolDef { name: "list", description: "Common coding-agent alias: list entries in a directory.",
             schema: json!({"type":"object","properties":{"path":{"type":"string","default":"."}}}) },
-        ToolDef { name: "webfetch", description: "OpenCode-compatible alias: fetch a URL via HTTP GET.",
+        ToolDef { name: "webfetch", description: "Common coding-agent alias: fetch a URL via HTTP GET.",
             schema: json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) },
-        ToolDef { name: "websearch", description: "OpenCode-compatible alias: search the web and return relevant excerpts.",
+        ToolDef { name: "websearch", description: "Common coding-agent alias: search the web and return relevant excerpts.",
             schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
-        ToolDef { name: "todowrite", description: "OpenCode-compatible alias: replace the current task todo list.",
+        ToolDef { name: "todowrite", description: "Common coding-agent alias: replace the current task todo list.",
             schema: json!({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]}}},"minItems":0,"maxItems":30}},"required":["items"]}) },
-        ToolDef { name: "todoread", description: "OpenCode-compatible alias: read the current task todo list.",
+        ToolDef { name: "todoread", description: "Common coding-agent alias: read the current task todo list.",
             schema: json!({"type":"object","properties":{}}) },
-        ToolDef { name: "skill", description: "OpenCode-compatible alias: load the full instructions for one named skill.",
+        ToolDef { name: "skill", description: "Common coding-agent alias: load the full instructions for one named skill.",
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
         ToolDef { name: "question", description: "Ask the user a concise clarifying question when discovery is insufficient or user approval is needed.",
             schema: json!({"type":"object","properties":{"question":{"type":"string"},"default":{"type":"string"}},"required":["question"]}) },
@@ -231,6 +234,20 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"}},"required":["url"]}) },
         ToolDef { name: "web_search", description: "Search the web via DuckDuckGo and return relevant excerpts. Use for current events, documentation lookup, or any question that benefits from live web results.",
             schema: json!({"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}) },
+        ToolDef { name: "headless_browser", description: "Fetch a web page and extract clean text content and links. Returns structured output with title, body text, and extracted links. Use for reading documentation, extracting data from web pages, or following links.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string","description":"URL to fetch and extract content from"},"extract_links":{"type":"boolean","description":"If true, also extract all links from the page"}},"required":["url"]}) },
+        ToolDef { name: "start_server", description: "Start a long-running local development server in the background. Prefer this over run_command for npm dev/vite/next/cargo/python servers. Stores logs and a server record so list_servers/stop_server can manage it.",
+            schema: json!({"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"cwd":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535}},"required":["command"]}) },
+        ToolDef { name: "list_servers", description: "List background servers started by start_server, including status, cwd, port, command, and log path.",
+            schema: json!({"type":"object","properties":{}}) },
+        ToolDef { name: "stop_server", description: "Stop a background server previously started by start_server.",
+            schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
+        ToolDef { name: "read_server_log", description: "Read the tail of a background server log. Use after starting a server to verify readiness or diagnose failures.",
+            schema: json!({"type":"object","properties":{"name":{"type":"string"},"lines":{"type":"integer","minimum":1,"maximum":500}},"required":["name"]}) },
+        ToolDef { name: "wait_for_url", description: "Poll a local or remote URL until it responds with the expected status/text. Use after start_server before open_browser or finalizing web work.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"expect_status":{"type":"integer","minimum":100,"maximum":599},"expect_text":{"type":"string"}},"required":["url"]}) },
+        ToolDef { name: "open_browser", description: "Open a URL or local file in the user's default browser. Use after publishing an HTML artifact or starting a web server.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string"}}}) },
         ToolDef { name: "list_skills", description: "List available skill names and short descriptions. Use before load_skill when choosing task-specific instructions.",
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task.",
@@ -239,7 +256,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     if include_subagent {
         v.push(ToolDef {
             name: "task",
-            description: "OpenCode-compatible alias: delegate a self-contained sub-task to a fresh agent.",
+            description:
+                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.",
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
                 "description":{"type":"string"},
@@ -260,6 +278,46 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     v
 }
 
+pub fn defs_readonly() -> Vec<ToolDef> {
+    defs(false)
+        .into_iter()
+        .filter(|d| {
+            matches!(
+                d.name,
+                "bash"
+                    | "read"
+                    | "glob"
+                    | "grep"
+                    | "list"
+                    | "webfetch"
+                    | "websearch"
+                    | "todoread"
+                    | "skill"
+                    | "question"
+                    | "AskUserQuestion"
+                    | "read_file"
+                    | "read_many_files"
+                    | "list_dir"
+                    | "list_tree"
+                    | "file_info"
+                    | "find_paths"
+                    | "find_files"
+                    | "grep_files"
+                    | "run_command"
+                    | "todo_read"
+                    | "fetch_url"
+                    | "web_search"
+                    | "headless_browser"
+                    | "list_servers"
+                    | "read_server_log"
+                    | "wait_for_url"
+                    | "list_skills"
+                    | "load_skill"
+            )
+        })
+        .collect()
+}
+
 // Mutating tools pass through the permission gate; reads never do.
 pub fn is_mutating(name: &str) -> bool {
     matches!(
@@ -269,12 +327,16 @@ pub fn is_mutating(name: &str) -> bool {
             | "edit"
             | "edit_file"
             | "multi_edit"
+            | "patch"
             | "apply_patch"
             | "create_dir"
             | "move_path"
             | "remove_path"
             | "bash"
             | "run_command"
+            | "start_server"
+            | "stop_server"
+            | "open_browser"
             | "python_tool"
             | "task"
             | "spawn_subagent"
@@ -339,7 +401,7 @@ pub fn preview(name: &str, input: &Value) -> String {
         "write" | "write_file" => format!("write {}", path_arg(input).unwrap_or("?")),
         "edit" | "edit_file" => format!("edit {}", path_arg(input).unwrap_or("?")),
         "multi_edit" => format!("multi-edit {}", input["path"].as_str().unwrap_or("?")),
-        "apply_patch" => "apply patch".to_string(),
+        "patch" | "apply_patch" => "apply patch".to_string(),
         "create_dir" => format!("mkdir {}", input["path"].as_str().unwrap_or("?")),
         "move_path" => format!(
             "move {} -> {}",
@@ -361,6 +423,18 @@ pub fn preview(name: &str, input: &Value) -> String {
         "websearch" | "web_search" => {
             format!("web search: {}", input["query"].as_str().unwrap_or("?"))
         }
+        "start_server" => format!("start server: {}", input["command"].as_str().unwrap_or("?")),
+        "list_servers" => "list servers".to_string(),
+        "stop_server" => format!("stop server: {}", input["name"].as_str().unwrap_or("?")),
+        "read_server_log" => format!("server log: {}", input["name"].as_str().unwrap_or("?")),
+        "wait_for_url" => format!("wait for URL: {}", input["url"].as_str().unwrap_or("?")),
+        "open_browser" => format!(
+            "open browser: {}",
+            input["url"]
+                .as_str()
+                .or_else(|| input["path"].as_str())
+                .unwrap_or("?")
+        ),
         "list_skills" => "list skills".to_string(),
         "skill" | "load_skill" => {
             format!("load skill: {}", input["name"].as_str().unwrap_or("?"))
@@ -368,25 +442,28 @@ pub fn preview(name: &str, input: &Value) -> String {
         "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
             let cmd = input["command"].as_str().unwrap_or("view");
-            format!(
-                "editor ({}) {}",
-                cmd,
-                path_arg(input).unwrap_or("?")
-            )
+            format!("editor ({}) {}", cmd, path_arg(input).unwrap_or("?"))
         }
         "Artifact" | "publish_artifact" => {
-            format!("publish artifact: {}", input["title"].as_str().unwrap_or("untitled"))
+            format!(
+                "publish artifact: {}",
+                input["title"].as_str().unwrap_or("untitled")
+            )
         }
         _ => name.to_string(),
     }
 }
 
 fn path_arg(input: &Value) -> Option<&str> {
-    input["path"].as_str().or_else(|| input["filePath"].as_str())
+    input["path"]
+        .as_str()
+        .or_else(|| input["filePath"].as_str())
 }
 
 fn task_arg(input: &Value) -> Option<&str> {
-    input["task"].as_str().or_else(|| input["description"].as_str())
+    input["task"]
+        .as_str()
+        .or_else(|| input["description"].as_str())
 }
 
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
@@ -416,15 +493,61 @@ pub const INVALID_ARGS: &str = "__bwn_invalid_args__";
 // cwd. None for non-path tools.
 pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
     match name {
-        "read" | "read_file" | "list" | "list_dir" | "list_tree" | "file_info" | "write"
-        | "write_file" | "edit" | "edit_file" | "multi_edit" | "create_dir" | "remove_path"
-        | "create_docx" | "python_tool" | "str_replace_editor" | "text_editor_20241022"
-        | "text_editor_20250124" => {
-            Some(resolve(cwd, path_arg(input).unwrap_or("")))
-        }
+        "read"
+        | "read_file"
+        | "list"
+        | "list_dir"
+        | "list_tree"
+        | "file_info"
+        | "write"
+        | "write_file"
+        | "edit"
+        | "edit_file"
+        | "multi_edit"
+        | "create_dir"
+        | "remove_path"
+        | "create_docx"
+        | "python_tool"
+        | "str_replace_editor"
+        | "text_editor_20241022"
+        | "text_editor_20250124" => Some(resolve(cwd, path_arg(input).unwrap_or(""))),
         "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or(""))),
         "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
             Some(resolve(cwd, root_arg(input)))
+        }
+        _ => None,
+    }
+}
+
+pub fn command_arg_for<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    if matches!(name, "bash" | "run_command") {
+        input["command"].as_str()
+    } else {
+        None
+    }
+}
+
+pub fn read_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
+    match name {
+        "read" | "read_file" => path_arg(input).map(|p| resolve(cwd, p)),
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
+            if input["command"].as_str().unwrap_or("view") == "view" =>
+        {
+            path_arg(input).map(|p| resolve(cwd, p))
+        }
+        _ => None,
+    }
+}
+
+pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
+    match name {
+        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" => {
+            path_arg(input).map(|p| resolve(cwd, p))
+        }
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
+            if input["command"].as_str().unwrap_or("view") != "view" =>
+        {
+            path_arg(input).map(|p| resolve(cwd, p))
         }
         _ => None,
     }
@@ -435,6 +558,476 @@ fn root_arg(input: &Value) -> &str {
         .as_str()
         .or_else(|| input["path"].as_str())
         .unwrap_or(".")
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn safe_name(name: &str) -> String {
+    let mut out = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    if out.is_empty() {
+        "server".to_string()
+    } else {
+        out
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+fn servers_dir() -> PathBuf {
+    let dir = crate::config::home().join("servers");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn server_logs_dir() -> PathBuf {
+    let dir = crate::config::home().join("server-logs");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn server_record_path(name: &str) -> PathBuf {
+    servers_dir().join(format!("{}.json", safe_name(name)))
+}
+
+fn command_available(command: &str) -> bool {
+    Command::new(command)
+        .arg("-V")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn tmux_running(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn pid_running(pid: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn server_is_running(record: &Value) -> bool {
+    if let Some(session) = record["tmux_session"].as_str() {
+        return tmux_running(session);
+    }
+    record["pid"].as_u64().map(pid_running).unwrap_or(false)
+}
+
+fn read_server_record(name: &str) -> Result<Value, String> {
+    let path = server_record_path(name);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read server record {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("invalid server record {}: {e}", path.display()))
+}
+
+fn write_server_record(name: &str, record: &Value) -> Result<(), String> {
+    let path = server_record_path(name);
+    let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    fs::write(&path, text)
+        .map_err(|e| format!("cannot write server record {}: {e}", path.display()))
+}
+
+fn start_server(input: &Value, cwd: &Path) -> Outcome {
+    let command = input["command"].as_str().unwrap_or("").trim();
+    if command.is_empty() {
+        return err("command is required");
+    }
+    let requested_name = input["name"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or_else(|| {
+            if input["port"].as_u64().is_some() {
+                "dev-server"
+            } else {
+                "server"
+            }
+        });
+    let base_name = safe_name(requested_name);
+    let name = if server_record_path(&base_name).exists() {
+        format!("{}-{}", base_name, now_ms())
+    } else {
+        base_name
+    };
+    let run_cwd = input["cwd"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .map(|p| resolve(cwd, p))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let log_path = server_logs_dir().join(format!("{name}.log"));
+    let port = input["port"].as_u64();
+
+    let mut record = json!({
+        "name": name,
+        "command": command,
+        "cwd": run_cwd.to_string_lossy(),
+        "log": log_path.to_string_lossy(),
+        "port": port,
+        "started_ms": now_ms(),
+    });
+
+    if command_available("tmux") {
+        let session = format!("bwn-{}", safe_name(&name));
+        let shell = format!(
+            "cd {} && {} 2>&1 | tee {}",
+            shell_quote(&run_cwd.to_string_lossy()),
+            command,
+            shell_quote(&log_path.to_string_lossy())
+        );
+        match Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session])
+            .arg(shell)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                record["tmux_session"] = json!(session);
+                if let Err(e) =
+                    write_server_record(record["name"].as_str().unwrap_or("server"), &record)
+                {
+                    return err(e);
+                }
+                ok(format!(
+                    "server '{}' started in tmux session '{}'\nlog: {}\n{}",
+                    record["name"].as_str().unwrap_or("server"),
+                    record["tmux_session"].as_str().unwrap_or(""),
+                    log_path.display(),
+                    port.map(|p| format!("url: http://127.0.0.1:{p}"))
+                        .unwrap_or_default()
+                ))
+            }
+            Ok(out) => err(format!(
+                "tmux failed to start server: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )),
+            Err(e) => err(format!("cannot start tmux: {e}")),
+        }
+    } else {
+        let log = match fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return err(format!(
+                    "cannot open server log {}: {e}",
+                    log_path.display()
+                ))
+            }
+        };
+        let err_log = match log.try_clone() {
+            Ok(f) => f,
+            Err(e) => return err(format!("cannot clone server log handle: {e}")),
+        };
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-lc", command]);
+            c
+        };
+        match cmd
+            .current_dir(&run_cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
+            .spawn()
+        {
+            Ok(child) => {
+                record["pid"] = json!(child.id());
+                if let Err(e) =
+                    write_server_record(record["name"].as_str().unwrap_or("server"), &record)
+                {
+                    return err(e);
+                }
+                ok(format!(
+                    "server '{}' started with pid {}\nlog: {}\n{}",
+                    record["name"].as_str().unwrap_or("server"),
+                    child.id(),
+                    log_path.display(),
+                    port.map(|p| format!("url: http://127.0.0.1:{p}"))
+                        .unwrap_or_default()
+                ))
+            }
+            Err(e) => err(format!("cannot start server: {e}")),
+        }
+    }
+}
+
+fn list_servers() -> Outcome {
+    let mut rows = Vec::new();
+    if let Ok(rd) = fs::read_dir(servers_dir()) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            rows.push(json!({
+                "name": record["name"],
+                "running": server_is_running(&record),
+                "port": record["port"],
+                "cwd": record["cwd"],
+                "command": record["command"],
+                "log": record["log"],
+                "tmux_session": record["tmux_session"],
+                "pid": record["pid"],
+            }));
+        }
+    }
+    ok(serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string()))
+}
+
+fn stop_server(input: &Value) -> Outcome {
+    let name = input["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return err("name is required");
+    }
+    let record = match read_server_record(name) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let mut stopped = false;
+    if let Some(session) = record["tmux_session"].as_str() {
+        stopped = Command::new("tmux")
+            .args(["kill-session", "-t", session])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    } else if let Some(pid) = record["pid"].as_u64() {
+        #[cfg(unix)]
+        {
+            stopped = Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        }
+    }
+    let _ = fs::remove_file(server_record_path(name));
+    if stopped {
+        ok(format!("server '{name}' stopped"))
+    } else {
+        ok(format!(
+            "server '{name}' record removed; process was not running or could not be confirmed"
+        ))
+    }
+}
+
+fn read_server_log(input: &Value) -> Outcome {
+    let name = input["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return err("name is required");
+    }
+    let record = match read_server_record(name) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let Some(log) = record["log"].as_str() else {
+        return err("server record has no log path");
+    };
+    let lines = input["lines"].as_u64().unwrap_or(120).clamp(1, 500) as usize;
+    match fs::read_to_string(log) {
+        Ok(text) => {
+            let tail = text.lines().rev().take(lines).collect::<Vec<_>>();
+            ok(tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+        }
+        Err(e) => err(format!("cannot read server log {log}: {e}")),
+    }
+}
+
+fn wait_for_url(input: &Value) -> Outcome {
+    let url = input["url"].as_str().unwrap_or("").trim();
+    if url.is_empty() {
+        return err("url is required");
+    }
+    let timeout = input["timeout_seconds"]
+        .as_u64()
+        .unwrap_or(15)
+        .clamp(1, 120);
+    let expect_status = input["expect_status"].as_u64().map(|s| s as u16);
+    let expect_text = input["expect_text"].as_str().filter(|s| !s.is_empty());
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(timeout);
+
+    loop {
+        let last_error = match ureq::get(url)
+            .set("User-Agent", "buildwithnexus/1.0")
+            .call()
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.into_string().unwrap_or_default();
+                let status_ok = expect_status
+                    .map(|expected| status == expected)
+                    .unwrap_or((200..300).contains(&status));
+                let text_ok = expect_text
+                    .map(|needle| body.contains(needle))
+                    .unwrap_or(true);
+                if status_ok && text_ok {
+                    return ok(json!({
+                        "url": url,
+                        "status": status,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "matched_text": expect_text.is_some(),
+                        "response_excerpt": truncate(body, 1000),
+                    })
+                    .to_string());
+                }
+                format!(
+                    "status {status}{}",
+                    expect_text
+                        .filter(|needle| !body.contains(*needle))
+                        .map(|needle| format!(", missing expected text '{needle}'"))
+                        .unwrap_or_default()
+                )
+            }
+            Err(ureq::Error::Status(status, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                let status_ok = expect_status
+                    .map(|expected| status == expected)
+                    .unwrap_or(false);
+                let text_ok = expect_text
+                    .map(|needle| body.contains(needle))
+                    .unwrap_or(true);
+                if status_ok && text_ok {
+                    return ok(json!({
+                        "url": url,
+                        "status": status,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "matched_text": expect_text.is_some(),
+                        "response_excerpt": truncate(body, 1000),
+                    })
+                    .to_string());
+                }
+                format!("HTTP {status}: {}", truncate(body, 300))
+            }
+            Err(e) => e.to_string(),
+        };
+
+        if std::time::Instant::now() >= deadline {
+            return err(format!(
+                "timed out after {timeout}s waiting for {url}: {last_error}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn open_browser(input: &Value, cwd: &Path) -> Outcome {
+    let target = if let Some(url) = input["url"].as_str().filter(|s| !s.trim().is_empty()) {
+        url.trim().to_string()
+    } else if let Some(path) = input["path"].as_str().filter(|s| !s.trim().is_empty()) {
+        resolve(cwd, path).to_string_lossy().into_owned()
+    } else {
+        return err("url or path is required");
+    };
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(&target).status()
+    } else if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", "start", "", &target])
+            .status()
+    } else {
+        Command::new("xdg-open").arg(&target).status()
+    };
+    match status {
+        Ok(s) if s.success() => ok(format!("opened in browser: {target}")),
+        Ok(s) => err(format!("browser opener exited with status {s}: {target}")),
+        Err(e) => err(format!("cannot open browser for {target}: {e}")),
+    }
+}
+
+fn html_artifact_quality_error(title: &str, contents: &str) -> Option<String> {
+    let title_lower = title.to_lowercase();
+    let lower = contents.to_lowercase();
+    if contents.trim().len() < 300 {
+        return Some("HTML artifact is too small to be a complete runnable app; include full HTML, CSS, and JavaScript in the artifact contents".to_string());
+    }
+    for marker in [
+        "todo",
+        "placeholder",
+        "your code here",
+        "canvas game logic here",
+        "...",
+    ] {
+        if lower.contains(marker) {
+            return Some(format!(
+                "HTML artifact contains placeholder marker '{marker}'; provide complete implemented code"
+            ));
+        }
+    }
+    if lower.contains("<script src=") && !(lower.contains("https://") || lower.contains("http://"))
+    {
+        return Some("HTML artifact references a local external script; embed the JavaScript so the artifact is self-contained".to_string());
+    }
+    if title_lower.contains("game") || title_lower.contains("canvas") || lower.contains("<canvas") {
+        if !lower.contains("<canvas") {
+            return Some("canvas game artifact must include a <canvas> element".to_string());
+        }
+        if !lower.contains("requestanimationframe") {
+            return Some(
+                "canvas game artifact must include a requestAnimationFrame game loop".to_string(),
+            );
+        }
+        if lower.contains("<script src=") {
+            return Some("canvas game artifact must embed its game script instead of referencing a separate script file".to_string());
+        }
+    }
+    None
 }
 
 // Lexically fold `.`/`..` without touching the filesystem (works for paths that
@@ -1331,7 +1924,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "apply_patch" => {
+        "patch" | "apply_patch" => {
             let patch = input["patch"].as_str().unwrap_or("");
             if patch.trim().is_empty() {
                 return err("patch is required");
@@ -1498,7 +2091,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err("query is required");
             }
             let encoded = url_encode(query);
-            let search_url = format!("https://html.duckduckgo.com/html/?q={encoded}");
+            let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
             match ureq::get(&search_url)
                 .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)")
                 .call()
@@ -1510,6 +2103,123 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("web search failed: {e}")),
             }
         }
+        "headless_browser" => {
+            let url = input["url"].as_str().unwrap_or("").trim();
+            if url.is_empty() {
+                return err("url is required");
+            }
+            let extract_links = input["extract_links"].as_bool().unwrap_or(false);
+            match ureq::get(url)
+                .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)")
+                .call()
+            {
+                Ok(resp) => match resp.into_string() {
+                    Ok(html) => {
+                        // Extract <title>
+                        let title = {
+                            let lower = html.to_lowercase();
+                            if let Some(start) = lower.find("<title") {
+                                let after_tag = &html[start..];
+                                if let Some(gt) = after_tag.find('>') {
+                                    let rest = &after_tag[gt + 1..];
+                                    if let Some(end) = rest.to_lowercase().find("</title") {
+                                        rest[..end].trim().to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        };
+
+                        // Extract clean text content
+                        let content = strip_html(&html);
+
+                        // Extract links if requested
+                        let links: Vec<String> = if extract_links {
+                            let mut found = Vec::new();
+                            let bytes = html.as_bytes();
+                            let len = bytes.len();
+                            let mut i = 0;
+                            while i + 2 < len {
+                                // Look for <a (case-insensitive)
+                                if (bytes[i] == b'<')
+                                    && (bytes[i + 1] == b'a' || bytes[i + 1] == b'A')
+                                    && (bytes[i + 2] == b' '
+                                        || bytes[i + 2] == b'\t'
+                                        || bytes[i + 2] == b'\n')
+                                {
+                                    // Find the closing > of this tag
+                                    let tag_start = i;
+                                    let mut tag_end = i + 3;
+                                    while tag_end < len && bytes[tag_end] != b'>' {
+                                        tag_end += 1;
+                                    }
+                                    if tag_end < len {
+                                        let tag_content = &html[tag_start..=tag_end];
+                                        // Find href="..." or href='...'
+                                        let tag_lower = tag_content.to_lowercase();
+                                        if let Some(href_pos) = tag_lower.find("href=") {
+                                            let after_href = &tag_content[href_pos + 5..];
+                                            let href_val = if let Some(rest) =
+                                                after_href.strip_prefix('"')
+                                            {
+                                                rest.find('"').map(|end| &rest[..end])
+                                            } else if let Some(rest) = after_href.strip_prefix('\'')
+                                            {
+                                                rest.find('\'').map(|end| &rest[..end])
+                                            } else {
+                                                // Unquoted: take up to whitespace or >
+                                                let end = after_href
+                                                    .find(|c: char| c.is_whitespace() || c == '>')
+                                                    .unwrap_or(after_href.len());
+                                                Some(&after_href[..end])
+                                            };
+                                            if let Some(href) = href_val {
+                                                let href = href.trim();
+                                                if !href.is_empty()
+                                                    && !href.starts_with('#')
+                                                    && !href.starts_with("javascript:")
+                                                {
+                                                    found.push(href.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    i = tag_end + 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            found.dedup();
+                            found
+                        } else {
+                            Vec::new()
+                        };
+
+                        let mut result = json!({
+                            "title": title,
+                            "content": content,
+                        });
+                        if extract_links {
+                            result["links"] = json!(links);
+                        }
+                        ok(truncate(result.to_string(), MAX_OUT))
+                    }
+                    Err(e) => err(format!("failed to read response body: {e}")),
+                },
+                Err(e) => err(format!("headless_browser fetch failed: {e}")),
+            }
+        }
+        "start_server" => start_server(input, cwd),
+        "list_servers" => list_servers(),
+        "stop_server" => stop_server(input),
+        "read_server_log" => read_server_log(input),
+        "wait_for_url" => wait_for_url(input),
+        "open_browser" => open_browser(input, cwd),
         "list_python_tools" => {
             let rows = list_python_tools(cwd);
             if rows.is_empty() {
@@ -1560,17 +2270,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "list_skills" => {
-            let rows = crate::config::load_skills()
+            let rows = crate::config::load_skill_descriptions()
                 .into_iter()
-                .map(|(name, content)| {
-                    let first = content.lines().next().unwrap_or("").trim().to_string();
-                    format!("{name}: {first}")
-                })
+                .map(|(name, desc)| format!("{name}: {desc}"))
                 .collect::<Vec<_>>();
             if rows.is_empty() {
                 ok("no skills available")
             } else {
-                ok(rows.join("\n"))
+                ok(format!(
+                    "{}\n\nUse load_skill with a skill name to load its full instructions.",
+                    rows.join("\n")
+                ))
             }
         }
         "skill" | "load_skill" => {
@@ -1596,7 +2306,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         }
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
             let command = input["command"].as_str().unwrap_or("view");
-            let path = input["path"].as_str().or_else(|| input["filePath"].as_str()).unwrap_or("");
+            let path = input["path"]
+                .as_str()
+                .or_else(|| input["filePath"].as_str())
+                .unwrap_or("");
             if path.is_empty() {
                 return err("path is required");
             }
@@ -1627,16 +2340,34 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                             Ok(c) => {
                                 let lines: Vec<&str> = c.lines().collect();
                                 let total_lines = lines.len();
-                                let (start, end) = if let Some(range) = input["view_range"].as_array() {
-                                    let start = range.get(0).and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                                    let end = range.get(1).and_then(|v| v.as_u64()).unwrap_or(total_lines as u64) as usize;
-                                    (start.clamp(1, total_lines.max(1)), end.clamp(1, total_lines.max(1)))
+                                if total_lines == 0 {
+                                    return ok(String::new());
+                                }
+                                let (start, end) = if let Some(range) =
+                                    input["view_range"].as_array()
+                                {
+                                    let start = range.first().and_then(|v| v.as_u64()).unwrap_or(1)
+                                        as usize;
+                                    let end = range
+                                        .get(1)
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(total_lines as u64)
+                                        as usize;
+                                    (
+                                        start.clamp(1, total_lines.max(1)),
+                                        end.clamp(1, total_lines.max(1)),
+                                    )
                                 } else {
                                     (1, 500.min(total_lines))
                                 };
                                 let mut selected_lines = Vec::new();
-                                for i in (start - 1)..=(end - 1).min(total_lines - 1) {
-                                    selected_lines.push(format!("{:>4}: {}", i + 1, lines[i]));
+                                for (i, line) in lines
+                                    .iter()
+                                    .enumerate()
+                                    .take((end - 1).min(total_lines - 1) + 1)
+                                    .skip(start - 1)
+                                {
+                                    selected_lines.push(format!("{:>4}: {}", i + 1, line));
                                 }
                                 ok(selected_lines.join("\n"))
                             }
@@ -1730,7 +2461,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                                 Ok(_) => {
                                     let mut guard = UNDO_BACKUP.lock().unwrap();
                                     *guard = None;
-                                    ok(format!("successfully reverted the last edit to {}", p.display()))
+                                    ok(format!(
+                                        "successfully reverted the last edit to {}",
+                                        p.display()
+                                    ))
                                 }
                                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
                             }
@@ -1752,6 +2486,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let contents = input["contents"].as_str().unwrap_or("");
             let title = input["title"].as_str().unwrap_or("artifact");
             let kind = input["type"].as_str().unwrap_or("html");
+            if kind == "html" {
+                if let Some(reason) = html_artifact_quality_error(title, contents) {
+                    return err(reason);
+                }
+            }
             let safe_title: String = title
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -1920,8 +2659,14 @@ mod tests {
         assert!(is_mutating("write_file"));
         assert!(is_mutating("edit_file"));
         assert!(is_mutating("run_command"));
+        assert!(is_mutating("start_server"));
+        assert!(is_mutating("stop_server"));
+        assert!(is_mutating("open_browser"));
         assert!(!is_mutating("read_file"));
         assert!(!is_mutating("list_dir"));
+        assert!(!is_mutating("list_servers"));
+        assert!(!is_mutating("read_server_log"));
+        assert!(!is_mutating("wait_for_url"));
         assert!(!is_mutating("finish"));
     }
 
@@ -1953,6 +2698,131 @@ mod tests {
     fn defs_includes_subagent_only_when_requested() {
         assert!(!defs(false).iter().any(|d| d.name == "spawn_subagent"));
         assert!(defs(true).iter().any(|d| d.name == "spawn_subagent"));
+    }
+
+    #[test]
+    fn defs_include_server_and_browser_tools() {
+        let names = defs(false).into_iter().map(|d| d.name).collect::<Vec<_>>();
+        for name in [
+            "start_server",
+            "list_servers",
+            "stop_server",
+            "read_server_log",
+            "wait_for_url",
+            "open_browser",
+        ] {
+            assert!(names.contains(&name), "{name} should be advertised");
+        }
+    }
+
+    #[test]
+    fn defs_readonly_omits_write_tools() {
+        let names = defs_readonly()
+            .into_iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"run_command"));
+        assert!(names.contains(&"list_servers"));
+        assert!(names.contains(&"read_server_log"));
+        assert!(names.contains(&"wait_for_url"));
+        for name in [
+            "write",
+            "edit",
+            "patch",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "create_docx",
+            "start_server",
+            "stop_server",
+            "open_browser",
+            "spawn_subagent",
+        ] {
+            assert!(
+                !names.contains(&name),
+                "{name} should not be advertised in PLAN"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_name_strips_shell_sensitive_characters() {
+        assert_eq!(safe_name("npm dev:8080"), "npm-dev-8080");
+        assert_eq!(safe_name("../../../"), "server");
+        assert_eq!(safe_name("my_server-1"), "my_server-1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_start_list_stop_server_roundtrip() {
+        let _guard = crate::config::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempdir().join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+
+        let cwd = tempdir();
+        let name = format!("test-server-{}", now_ms());
+        let expected = safe_name(&name);
+        let started = run(
+            "start_server",
+            &json!({"name": name, "command": "while true; do sleep 1; done"}),
+            &cwd,
+        );
+        assert!(!started.is_error, "{}", started.content);
+
+        let listed = run("list_servers", &json!({}), &cwd);
+        assert!(!listed.is_error, "{}", listed.content);
+        let rows: Value = serde_json::from_str(&listed.content).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["name"], expected);
+        assert_eq!(rows[0]["running"], true);
+
+        let stopped = run("stop_server", &json!({"name": expected}), &cwd);
+        assert!(!stopped.is_error, "{}", stopped.content);
+
+        let listed = run("list_servers", &json!({}), &cwd);
+        let rows: Value = serde_json::from_str(&listed.content).unwrap();
+        assert!(rows.as_array().unwrap().is_empty());
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn run_wait_for_url_detects_ready_http_response() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf);
+            let body = "ready: buildwithnexus";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let out = run(
+            "wait_for_url",
+            &json!({
+                "url": format!("http://{addr}/ready"),
+                "timeout_seconds": 3,
+                "expect_text": "buildwithnexus"
+            }),
+            Path::new("/tmp"),
+        );
+        handle.join().unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let value: Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["status"], 200);
+        assert_eq!(value["matched_text"], true);
     }
 
     // ── run: filesystem tools against a tempdir ─────────────────────────────
@@ -2216,6 +3086,91 @@ mod tests {
     }
 
     #[test]
+    fn run_common_aliases_cover_file_search_shell_and_patch() {
+        let d = tempdir();
+        let w = run(
+            "write",
+            &json!({"filePath": "Projects/Nexus/README.md", "content": "alpha beta\n"}),
+            &d,
+        );
+        assert!(!w.is_error, "{}", w.content);
+
+        let r = run("read", &json!({"filePath": "Projects/Nexus/README.md"}), &d);
+        assert_eq!(r.content, "alpha beta\n");
+
+        let g = run(
+            "glob",
+            &json!({"root": ".", "pattern": "nexus", "kind": "dir"}),
+            &d,
+        );
+        assert!(g.content.contains("Projects/Nexus"), "{}", g.content);
+
+        let gr = run(
+            "grep",
+            &json!({"root": ".", "pattern": "beta", "include": "*.md"}),
+            &d,
+        );
+        assert!(
+            gr.content.contains("Projects/Nexus/README.md"),
+            "{}",
+            gr.content
+        );
+
+        let e = run(
+            "edit",
+            &json!({"filePath": "Projects/Nexus/README.md", "oldString": "beta", "newString": "gamma"}),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+
+        let b = run("bash", &json!({"command": "printf alias-ok"}), &d);
+        assert!(!b.is_error, "{}", b.content);
+        assert!(b.content.contains("alias-ok"), "{}", b.content);
+
+        let p = run(
+            "patch",
+            &json!({"patch": "diff --git a/Projects/Nexus/README.md b/Projects/Nexus/README.md\n--- a/Projects/Nexus/README.md\n+++ b/Projects/Nexus/README.md\n@@ -1 +1 @@\n-alpha gamma\n+alpha delta\n"}),
+            &d,
+        );
+        assert!(!p.is_error, "{}", p.content);
+        let final_read = run("read", &json!({"path": "Projects/Nexus/README.md"}), &d);
+        assert_eq!(final_read.content, "alpha delta\n");
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn python_tool_discovers_and_runs_json_stdin_script() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let d = tempdir();
+        let script = r#"import json, sys
+data = json.load(sys.stdin)
+print("hello " + data.get("name", "world"))
+"#;
+        let w = run(
+            "write_file",
+            &json!({"path": ".buildwithnexus/tools/hello.py", "content": script}),
+            &d,
+        );
+        assert!(!w.is_error, "{}", w.content);
+
+        let listed = run("list_python_tools", &json!({}), &d);
+        assert!(listed.content.contains("hello.py"), "{}", listed.content);
+
+        let out = run(
+            "python_tool",
+            &json!({"path": "hello", "input": {"name": "nexus"}}),
+            &d,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("hello nexus"), "{}", out.content);
+
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn run_finish_sets_finished_flag() {
         let d = tempdir();
         let r = run("finish", &json!({"summary": "all done"}), &d);
@@ -2235,7 +3190,7 @@ mod tests {
     #[test]
     fn run_str_replace_editor_view_create_replace_insert_undo() {
         let d = tempdir();
-        
+
         // 1. Create file via editor
         let r = run(
             "str_replace_editor",
@@ -2244,7 +3199,7 @@ mod tests {
         );
         assert!(!r.is_error);
         assert!(d.join("test.txt").exists());
-        
+
         // 2. View file via editor
         let r = run(
             "str_replace_editor",
@@ -2255,7 +3210,7 @@ mod tests {
         assert!(r.content.contains("line1"));
         assert!(r.content.contains("line2"));
         assert!(!r.content.contains("line3"));
-        
+
         // 3. View dir via editor
         let r = run(
             "str_replace_editor",
@@ -2264,7 +3219,7 @@ mod tests {
         );
         assert!(!r.is_error);
         assert!(r.content.contains("test.txt"));
-        
+
         // 4. Replace text
         let r = run(
             "str_replace_editor",
@@ -2274,7 +3229,7 @@ mod tests {
         assert!(!r.is_error);
         let contents = fs::read_to_string(d.join("test.txt")).unwrap();
         assert!(contents.contains("line2-replaced"));
-        
+
         // 5. Insert text
         let r = run(
             "str_replace_editor",
@@ -2285,7 +3240,7 @@ mod tests {
         let contents = fs::read_to_string(d.join("test.txt")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines[1], "inserted-line");
-        
+
         // 6. Undo edit
         let r = run(
             "str_replace_editor",
@@ -2295,7 +3250,7 @@ mod tests {
         assert!(!r.is_error);
         let contents = fs::read_to_string(d.join("test.txt")).unwrap();
         assert!(!contents.contains("inserted-line")); // undone to previous state
-        
+
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2311,8 +3266,53 @@ mod tests {
             }),
             &d,
         );
-        assert!(!r.is_error);
-        assert!(r.content.contains("Artifact successfully published locally to"));
+        assert!(r.is_error);
+        assert!(r.content.contains("too small"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_artifact_rejects_external_canvas_game_shell() {
+        let d = tempdir();
+        let r = run(
+            "Artifact",
+            &json!({
+                "title": "Canvas Game",
+                "contents": "<!doctype html><canvas></canvas><script src='game.js'></script>",
+                "type": "html"
+            }),
+            &d,
+        );
+        assert!(r.is_error);
+        assert!(
+            r.content.contains("too small")
+                || r.content.contains("self-contained")
+                || r.content.contains("requestAnimationFrame")
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_artifact_accepts_embedded_canvas_game() {
+        let d = tempdir();
+        let body = format!(
+            "<!doctype html><html><head><style>{}</style></head><body><canvas id='game'></canvas><script>{}</script></body></html>",
+            "html,body{margin:0;background:#111;color:white}canvas{display:block;width:100vw;height:100vh}",
+            "const c=document.getElementById('game');const ctx=c.getContext('2d');function loop(){ctx.fillRect(0,0,10,10);requestAnimationFrame(loop)}loop();"
+        );
+        let r = run(
+            "Artifact",
+            &json!({
+                "title": "Canvas Game",
+                "contents": body,
+                "type": "html"
+            }),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r
+            .content
+            .contains("Artifact successfully published locally to"));
         let _ = fs::remove_dir_all(&d);
     }
 }

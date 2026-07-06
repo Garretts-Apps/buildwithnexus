@@ -1,0 +1,262 @@
+{
+  "version": "1.0.0",
+  "project": {
+    "name": "buildwithnexus",
+    "description": "A hilariously fast, agentic AI CLI harness written in Rust. Remote models via API key, or local models. Plans, edits files, runs commands with approval gates.",
+    "repository": "https://github.com/Garretts-Apps/buildwithnexus",
+    "primary_language": "rust",
+    "indexed_at": "2026-07-06T08:00:00Z"
+  },
+  "entities": [
+    {
+      "id": "mod:agent",
+      "entity_type": "module",
+      "name": "agent",
+      "path": "harness/src/agent.rs",
+      "description": "Core agent loop implementing BUILD, PLAN, and BRAINSTORM modes. Contains the ReAct tool-calling loop, permission gates, hook integration, and context management.",
+      "tags": ["critical_path", "core"],
+      "relationships": [
+        { "target_id": "mod:tools", "relation": "depends_on" },
+        { "target_id": "mod:hooks", "relation": "depends_on" },
+        { "target_id": "mod:config", "relation": "depends_on" },
+        { "target_id": "mod:provider", "relation": "depends_on" },
+        { "target_id": "mod:trace", "relation": "depends_on" },
+        { "target_id": "mod:checkpoint", "relation": "depends_on" },
+        { "target_id": "mod:session", "relation": "depends_on" },
+        { "target_id": "mod:report", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:tools",
+      "entity_type": "module",
+      "name": "tools",
+      "path": "harness/src/tools.rs",
+      "description": "Tool definitions and dispatch. Contains 40+ tools (file I/O, search, shell, web, server management, skills, artifacts). Uses match-based dispatch.",
+      "tags": ["critical_path", "core", "public_api"],
+      "relationships": [
+        { "target_id": "mod:report", "relation": "depends_on" },
+        { "target_id": "mod:checkpoint", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:hooks",
+      "entity_type": "module",
+      "name": "hooks",
+      "path": "harness/src/hooks.rs",
+      "description": "Lifecycle hooks system supporting PreToolUse, PostToolUse, UserPromptSubmit, and other events. Hooks can deny, allow, or inject context.",
+      "tags": ["extension_point", "security"],
+      "relationships": [
+        { "target_id": "mod:config", "relation": "depends_on" },
+        { "target_id": "mod:trace", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:config",
+      "entity_type": "module",
+      "name": "config",
+      "path": "harness/src/config.rs",
+      "description": "Configuration loading from env vars, ~/.buildwithnexus/, and .buildwithnexus/. Manages providers, skills, settings, and custom commands.",
+      "tags": ["core"],
+      "relationships": []
+    },
+    {
+      "id": "mod:provider",
+      "entity_type": "module",
+      "name": "provider",
+      "path": "harness/src/provider.rs",
+      "description": "LLM API client supporting Anthropic and OpenAI-compatible protocols. Handles streaming, token counting, and request construction.",
+      "tags": ["critical_path", "core"],
+      "relationships": [
+        { "target_id": "mod:config", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:lib",
+      "entity_type": "module",
+      "name": "lib",
+      "path": "harness/src/lib.rs",
+      "description": "Library root and REPL. Handles CLI parsing, interactive mode, slash commands, and mode switching.",
+      "tags": ["core"],
+      "relationships": [
+        { "target_id": "mod:agent", "relation": "depends_on" },
+        { "target_id": "mod:tools", "relation": "depends_on" },
+        { "target_id": "mod:config", "relation": "depends_on" },
+        { "target_id": "mod:workflow", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:workflow",
+      "entity_type": "module",
+      "name": "workflow",
+      "path": "harness/src/workflow.rs",
+      "description": "Background workflow system for scheduled and recurring tasks via /schedule and /loop commands.",
+      "tags": [],
+      "relationships": []
+    },
+    {
+      "id": "mod:trace",
+      "entity_type": "module",
+      "name": "trace",
+      "path": "harness/src/trace.rs",
+      "description": "Execution trace ledger. Records tool calls, hooks, skills, and subagent events. Persisted as JSONL.",
+      "tags": ["observability"],
+      "relationships": []
+    },
+    {
+      "id": "mod:session",
+      "entity_type": "module",
+      "name": "session",
+      "path": "harness/src/session.rs",
+      "description": "Session persistence for conversation continuity via /resume and --continue.",
+      "tags": [],
+      "relationships": []
+    },
+    {
+      "id": "mod:checkpoint",
+      "entity_type": "module",
+      "name": "checkpoint",
+      "path": "harness/src/checkpoint.rs",
+      "description": "Edit checkpoints for undo. Captures file state before mutations.",
+      "tags": ["safety"],
+      "relationships": []
+    },
+    {
+      "id": "mod:report",
+      "entity_type": "module",
+      "name": "report",
+      "path": "harness/src/report.rs",
+      "description": "Output sink with Human (colored TUI) and JSON (structured events) modes.",
+      "tags": [],
+      "relationships": []
+    },
+    {
+      "id": "mod:knowledge",
+      "entity_type": "module",
+      "name": "knowledge",
+      "path": "harness/src/knowledge.rs",
+      "description": "Local knowledge base for structured storage of project entities, relationships, and judgment metadata. Supports evidence tracking and context generation.",
+      "tags": ["new", "knowledge_layer"],
+      "relationships": [
+        { "target_id": "mod:config", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:rules",
+      "entity_type": "module",
+      "name": "rules",
+      "path": "harness/src/rules.rs",
+      "description": "Rule engine for explicit engineering constraints. Evaluates rules against task context and produces violations with severity levels.",
+      "tags": ["new", "verification"],
+      "relationships": [
+        { "target_id": "mod:knowledge", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "mod:verifier",
+      "entity_type": "module",
+      "name": "verifier",
+      "path": "harness/src/verifier.rs",
+      "description": "Verification layer that combines rule engine, static analysis, and test execution to validate agent output before presentation.",
+      "tags": ["new", "verification"],
+      "relationships": [
+        { "target_id": "mod:rules", "relation": "depends_on" },
+        { "target_id": "mod:knowledge", "relation": "depends_on" }
+      ]
+    },
+    {
+      "id": "dep:crossterm",
+      "entity_type": "dependency",
+      "name": "crossterm",
+      "description": "Cross-platform terminal control. Used for alt-screen, raw mode, TUI rendering.",
+      "metadata": { "version": "0.28", "kind": "runtime" },
+      "tags": []
+    },
+    {
+      "id": "dep:ureq",
+      "entity_type": "dependency",
+      "name": "ureq",
+      "description": "Blocking HTTP client with rustls. Used for LLM API calls.",
+      "metadata": { "version": "2.10", "kind": "runtime", "features": ["json", "tls"] },
+      "tags": ["critical_path"]
+    },
+    {
+      "id": "dep:serde",
+      "entity_type": "dependency",
+      "name": "serde",
+      "description": "Serialization framework. Used throughout for JSON data handling.",
+      "metadata": { "version": "1", "kind": "runtime", "features": ["derive"] },
+      "tags": ["core"]
+    },
+    {
+      "id": "dep:serde_json",
+      "entity_type": "dependency",
+      "name": "serde_json",
+      "description": "JSON serialization/deserialization. Used for API payloads, tool args, and configuration.",
+      "metadata": { "version": "1", "kind": "runtime" },
+      "tags": ["core"]
+    },
+    {
+      "id": "adr:001",
+      "entity_type": "architecture_decision",
+      "name": "No async runtime",
+      "description": "The harness uses synchronous I/O exclusively — no tokio, no async-std. This minimizes binary size, startup time, and complexity.",
+      "metadata": { "status": "accepted", "date": "2025-01-01" },
+      "tags": ["architecture"]
+    },
+    {
+      "id": "adr:002",
+      "entity_type": "architecture_decision",
+      "name": "Match-based dispatch over trait objects",
+      "description": "Tools are dispatched via a single match statement rather than dyn trait objects or a registry pattern. Favors simplicity and compiler optimization.",
+      "metadata": { "status": "accepted", "date": "2025-01-01" },
+      "tags": ["architecture"]
+    },
+    {
+      "id": "adr:003",
+      "entity_type": "architecture_decision",
+      "name": "Four dependencies maximum",
+      "description": "The harness keeps runtime dependencies to crossterm, ureq, serde, serde_json. No additional crates without strong justification.",
+      "metadata": { "status": "accepted", "date": "2025-01-01" },
+      "tags": ["architecture", "dependency"]
+    }
+  ],
+  "architecture_decisions": [
+    {
+      "id": "adr:001",
+      "title": "No async runtime",
+      "status": "accepted",
+      "date": "2025-01-01",
+      "context": "Async runtimes (tokio, async-std) add significant binary size, startup overhead, and complexity. The harness makes sequential HTTP calls and does not benefit from concurrent I/O.",
+      "decision": "Use synchronous I/O exclusively. ureq for HTTP, std::fs for file I/O, std::process::Command for shell.",
+      "consequences": "Fast cold start, small binary, simple control flow. Cannot do concurrent HTTP requests (acceptable for sequential agent loop).",
+      "related_entities": ["dep:ureq", "mod:provider"]
+    },
+    {
+      "id": "adr:002",
+      "title": "Match-based dispatch over trait objects",
+      "status": "accepted",
+      "date": "2025-01-01",
+      "context": "The tool dispatch could use a trait-based registry, a HashMap of fn pointers, or a simple match statement.",
+      "decision": "Use a single match statement in tools::run(). Add new tools by adding match arms.",
+      "consequences": "Easy to read, fast dispatch, good inlining. Adding tools requires editing tools.rs directly (acceptable given the monolithic design).",
+      "related_entities": ["mod:tools"]
+    },
+    {
+      "id": "adr:003",
+      "title": "Four dependencies maximum",
+      "status": "accepted",
+      "date": "2025-01-01",
+      "context": "Each dependency increases build time, binary size, and supply chain risk.",
+      "decision": "Limit runtime dependencies to crossterm, ureq, serde, serde_json. Solve everything else with std or hand-rolled code.",
+      "consequences": "Small binary (~5MB), fast builds, minimal supply chain surface. May require more hand-written code for features like YAML parsing or database access.",
+      "related_entities": ["dep:crossterm", "dep:ureq", "dep:serde", "dep:serde_json"]
+    }
+  ],
+  "business_rules": [],
+  "judgment_context": {
+    "critical_paths": ["mod:agent", "mod:tools", "mod:provider"],
+    "security_boundaries": ["mod:hooks", "mod:config"],
+    "scaling_bottlenecks": [],
+    "tech_debt": []
+  }
+}

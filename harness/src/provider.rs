@@ -7,7 +7,7 @@
 // knows each vendor's JSON shape.
 
 use std::io::{BufRead, BufReader, Read};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -121,8 +121,9 @@ pub mod bench {
     pub fn openai_stream(
         reader: impl Read,
         on_text: &mut dyn FnMut(&str),
+        on_thinking: &mut dyn FnMut(&str),
     ) -> Result<Reply, String> {
-        super::openai_stream(reader, on_text)
+        super::openai_stream(reader, on_text, on_thinking)
     }
 }
 
@@ -194,7 +195,7 @@ fn request(
             let (req, mut body) = openai_request(p, msgs, tools);
             if streaming {
                 body["stream"] = json!(true);
-                openai_stream(send_raw(req, body)?.into_reader(), on_text)
+                openai_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
             } else {
                 openai_parse(send(req, body)?)
             }
@@ -264,11 +265,16 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
     // Reuse one buffer across lines instead of allocating a String per line.
     let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
+    let mut last_poll = Instant::now();
     loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
+                if last_poll.elapsed() >= Duration::from_millis(50) {
+                    crate::tui::poll_typeahead();
+                    last_poll = Instant::now();
+                }
                 if let Some(payload) = line.strip_prefix("data:") {
                     if f(payload.trim()) {
                         break;
@@ -572,8 +578,60 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
     Ok(Reply { text, calls })
 }
 
-fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Reply, String> {
+fn route_openai_content(
+    chunk: &str,
+    in_think: &mut bool,
+    text: &mut String,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) {
+    let mut rest = chunk;
+    loop {
+        if *in_think {
+            if let Some(end) = rest.find("</think>") {
+                let thought = &rest[..end];
+                if !thought.is_empty() {
+                    on_thinking(thought);
+                }
+                *in_think = false;
+                rest = &rest[end + "</think>".len()..];
+                if rest.is_empty() {
+                    break;
+                }
+            } else {
+                if !rest.is_empty() {
+                    on_thinking(rest);
+                }
+                break;
+            }
+        } else if let Some(start) = rest.find("<think>") {
+            let before = &rest[..start];
+            if !before.is_empty() {
+                text.push_str(before);
+                on_text(before);
+            }
+            *in_think = true;
+            rest = &rest[start + "<think>".len()..];
+            if rest.is_empty() {
+                break;
+            }
+        } else {
+            if !rest.is_empty() {
+                text.push_str(rest);
+                on_text(rest);
+            }
+            break;
+        }
+    }
+}
+
+fn openai_stream(
+    reader: impl Read,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
     let mut text = String::new();
+    let mut in_think = false;
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
     for_each_sse(reader, |data| {
@@ -584,9 +642,14 @@ fn openai_stream(reader: impl Read, on_text: &mut dyn FnMut(&str)) -> Result<Rep
             return false;
         };
         let delta = &v["choices"][0]["delta"];
+        if let Some(r) = delta["reasoning_content"]
+            .as_str()
+            .or_else(|| delta["reasoning"].as_str())
+        {
+            on_thinking(r);
+        }
         if let Some(t) = delta["content"].as_str() {
-            text.push_str(t);
-            on_text(t);
+            route_openai_content(t, &mut in_think, &mut text, on_text, on_thinking);
         }
         if let Some(tcs) = delta["tool_calls"].as_array() {
             for tc in tcs {
@@ -864,10 +927,46 @@ mod tests {
     // ── openai_stream ───────────────────────────────────────────────────────
     fn drain_openai(sse: &str) -> Reply {
         let mut out = String::new();
-        openai_stream(Cursor::new(sse.as_bytes().to_vec()), &mut |t| {
-            out.push_str(t)
-        })
+        openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| out.push_str(t),
+            &mut |_| {},
+        )
         .unwrap()
+    }
+
+    #[test]
+    fn openai_stream_extracts_reasoning_and_think_tags() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"reasoning...\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"<think>deep thought\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"ing</think>Hello\"}}]}\n\
+                   data: [DONE]\n";
+        let mut text_out = String::new();
+        let mut think_out = String::new();
+        openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| text_out.push_str(t),
+            &mut |t| think_out.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(text_out, "Hello");
+        assert_eq!(think_out, "reasoning...deep thoughting");
+    }
+
+    #[test]
+    fn openai_stream_extracts_think_tag_when_single_chunk_contains_answer() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>inspect first</think>Done\"}}]}\n\
+                   data: [DONE]\n";
+        let mut text_out = String::new();
+        let mut think_out = String::new();
+        openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| text_out.push_str(t),
+            &mut |t| think_out.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(text_out, "Done");
+        assert_eq!(think_out, "inspect first");
     }
 
     #[test]

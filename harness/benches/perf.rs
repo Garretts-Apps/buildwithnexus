@@ -119,7 +119,12 @@ fn bench_sse_parse(c: &mut Criterion) {
     g.bench_function("openai_stream/2000deltas", |b| {
         b.iter(|| {
             let mut sink = |_: &str| {};
-            let _ = pbench::openai_stream(black_box(Cursor::new(sse.as_bytes())), &mut sink);
+            let mut think_sink = |_: &str| {};
+            let _ = pbench::openai_stream(
+                black_box(Cursor::new(sse.as_bytes())),
+                &mut sink,
+                &mut think_sink,
+            );
         })
     });
     g.finish();

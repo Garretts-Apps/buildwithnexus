@@ -6,9 +6,15 @@ dist/
 .omc/
 
 # Rust build output, vendored deps, and the native binary (built by postinstall)
+target/
 harness/target/
 harness/vendor/
 harness/.cargo/
 /bin/buildwithnexus
 /bin/buildwithnexus.exe
 *.tar.gz
+
+# Local runtime artifacts
+.buildwithnexus/artifacts/
+.buildwithnexus/settings.local.json
+test_output.log

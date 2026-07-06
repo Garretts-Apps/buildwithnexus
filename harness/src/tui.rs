@@ -28,6 +28,18 @@ static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 // Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
 static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy)]
+struct SelectPos {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Clone, Copy)]
+struct Selection {
+    anchor: SelectPos,
+    focus: SelectPos,
+}
+
 fn transcript() -> &'static Mutex<Vec<String>> {
     static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     LINES.get_or_init(|| Mutex::new(Vec::new()))
@@ -36,6 +48,16 @@ fn transcript() -> &'static Mutex<Vec<String>> {
 fn footer_text() -> &'static Mutex<String> {
     static FOOTER: OnceLock<Mutex<String>> = OnceLock::new();
     FOOTER.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn visible_rows() -> &'static Mutex<Vec<String>> {
+    static ROWS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    ROWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn selection() -> &'static Mutex<Option<Selection>> {
+    static SELECTION: OnceLock<Mutex<Option<Selection>>> = OnceLock::new();
+    SELECTION.get_or_init(|| Mutex::new(None))
 }
 
 pub fn is_raw() -> bool {
@@ -63,16 +85,17 @@ pub fn mouse_capture_enabled() -> bool {
 #[derive(Clone, Copy)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-const ACCENT: Rgb = Rgb(0xb4, 0x8e, 0xff);
-const TEXT: Rgb = Rgb(0xcd, 0xd6, 0xf4);
-const MUTED: Rgb = Rgb(0x7f, 0x84, 0x9c);
-const SUCCESS: Rgb = Rgb(0xa6, 0xe3, 0xa1);
-const WARNING: Rgb = Rgb(0xf9, 0xe2, 0xaf);
-const ERROR: Rgb = Rgb(0xf3, 0x8b, 0xa8);
-const INFO: Rgb = Rgb(0x89, 0xdc, 0xeb);
-const MODE_PLAN: Rgb = Rgb(0xa6, 0xe3, 0xa1); // green — planning
-const MODE_BUILD: Rgb = Rgb(0x89, 0xdc, 0xeb); // cyan — building
-const MODE_BSTORM: Rgb = Rgb(0xf9, 0xe2, 0xaf); // amber — thinking
+const BACKGROUND: Rgb = Rgb(0x1a, 0x1b, 0x26);
+const ACCENT: Rgb = Rgb(0xbb, 0x9a, 0xf7);
+const TEXT: Rgb = Rgb(0xc0, 0xca, 0xf5);
+const MUTED: Rgb = Rgb(0x56, 0x5f, 0x89);
+const SUCCESS: Rgb = Rgb(0x9e, 0xce, 0x6a);
+const WARNING: Rgb = Rgb(0xe0, 0xaf, 0x68);
+const ERROR: Rgb = Rgb(0xf7, 0x76, 0x8e);
+const INFO: Rgb = Rgb(0x7d, 0xcf, 0xff);
+const MODE_PLAN: Rgb = Rgb(0x9e, 0xce, 0x6a);
+const MODE_BUILD: Rgb = Rgb(0x7a, 0xa2, 0xf7);
+const MODE_BSTORM: Rgb = Rgb(0xe0, 0xaf, 0x68);
 
 fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
@@ -108,18 +131,36 @@ fn sgr_fg(c: Rgb) -> String {
     }
 }
 
+fn sgr_bg(c: Rgb) -> String {
+    if truecolor() {
+        format!("48;2;{};{};{}", c.0, c.1, c.2)
+    } else {
+        let idx = 16 + 36 * cube(c.0) + 6 * cube(c.1) + cube(c.2);
+        format!("48;5;{idx}")
+    }
+}
+
+fn theme_bg() -> String {
+    if no_color() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", sgr_bg(BACKGROUND))
+    }
+}
+
 fn paint(c: Rgb, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    format!("\x1b[{}m{s}\x1b[0m", sgr_fg(c))
+    format!("\x1b[{}m{s}\x1b[39m", sgr_fg(c))
 }
 
 fn attr(code: &str, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    format!("\x1b[{code}m{s}\x1b[0m")
+    let reset = if code == "1" { "22" } else { "0" };
+    format!("\x1b[{code}m{s}\x1b[{reset}m")
 }
 
 pub fn bold(s: &str) -> String {
@@ -411,7 +452,6 @@ pub fn poll_typeahead() {
     if !is_raw() {
         return;
     }
-    let mut any = false;
     while poll(Duration::ZERO).unwrap_or(false) {
         match read() {
             Ok(Event::Key(k)) => {
@@ -497,36 +537,38 @@ pub fn poll_typeahead() {
                     }
                     _ => {}
                 }
-                any = true;
             }
             Ok(Event::Mouse(m)) => match m.kind {
                 MouseEventKind::ScrollUp => scroll_output(3),
                 MouseEventKind::ScrollDown => scroll_output(-3),
+                MouseEventKind::Down(MouseButton::Left) => selection_start(m.row, m.column),
+                MouseEventKind::Drag(MouseButton::Left) => selection_drag(m.row, m.column),
+                MouseEventKind::Up(MouseButton::Left) => selection_finish(m.row, m.column),
                 _ => {}
             },
             Ok(_) => {}
             Err(_) => break,
         }
     }
-    // Show queued input in the persistent composer, not in scrollback.
-    if any {
-        let mut out = io::stdout();
-        let _ = execute!(out, SavePosition);
-        if let Ok(ta) = typeahead().lock() {
-            if !ta.buf.is_empty() {
-                let mut scroll = 0usize;
-                render_composer(
-                    &format!("{} {} ", dim("queued"), accent("›")),
-                    &ta.buf,
-                    ta.cursor,
-                    &mut scroll,
-                );
-            } else {
-                clear_composer();
-            }
-        }
-        let _ = execute!(out, RestorePosition);
+    render_queued_composer();
+}
+
+pub fn render_queued_composer() {
+    if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
     }
+    let mut out = io::stdout();
+    let _ = execute!(out, SavePosition);
+    if let Ok(ta) = typeahead().lock() {
+        let mut scroll = 0usize;
+        render_composer(
+            &format!("{} {} ", dim("queued"), accent("›")),
+            &ta.buf,
+            ta.cursor,
+            &mut scroll,
+        );
+    }
+    let _ = execute!(out, RestorePosition);
 }
 
 fn take_typeahead() -> (Vec<char>, usize) {
@@ -645,7 +687,7 @@ pub fn set_permission_mode(mode: &str) {
             "{} {} {}",
             dim("permission:"),
             bold(mode),
-            dim("· /permissions ask|auto|readonly · PgUp/wheel scroll · /mouse on|off")
+            dim("· /permissions ask|auto|readonly · wheel/PgUp scroll · drag copies · /scroll on|off")
         );
     }
     let mut out = io::stdout();
@@ -675,11 +717,32 @@ fn render_output() {
     }
     let start = visible_lines.len().saturating_sub(rows + offset);
     let mut out = io::stdout();
+    let sel = selection().lock().ok().and_then(|g| *g);
+    let mut plain_rows = Vec::with_capacity(rows);
     for row in 0..rows {
         let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
         if let Some(line) = visible_lines.get(start + row) {
-            let _ = write!(out, "{line}");
+            let plain = strip_ansi(line);
+            plain_rows.push(plain.clone());
+            if let Some(sel) = sel {
+                if let Some(range) = selection_range_for(sel, row as u16, plain.chars().count()) {
+                    let _ = write!(
+                        out,
+                        "{}",
+                        clip_ansi_line(&selected_line(&plain, range), width)
+                    );
+                } else {
+                    let _ = write!(out, "{line}");
+                }
+            } else {
+                let _ = write!(out, "{line}");
+            }
+        } else {
+            plain_rows.push(String::new());
         }
+    }
+    if let Ok(mut rows) = visible_rows().lock() {
+        *rows = plain_rows;
     }
     let _ = out.flush();
 }
@@ -713,6 +776,121 @@ fn scroll_page_down() {
 fn scroll_to_bottom() {
     SCROLL_OFFSET.store(0, Ordering::Relaxed);
     render_output();
+}
+
+fn in_output_region(row: u16) -> bool {
+    ALT_SCREEN.load(Ordering::Relaxed) && row < composer_row()
+}
+
+fn selection_start(row: u16, col: u16) {
+    if !in_output_region(row) {
+        return;
+    }
+    let pos = SelectPos { row, col };
+    if let Ok(mut sel) = selection().lock() {
+        *sel = Some(Selection {
+            anchor: pos,
+            focus: pos,
+        });
+    }
+    render_output();
+    render_queued_composer();
+}
+
+fn selection_drag(row: u16, col: u16) {
+    if !in_output_region(row) {
+        return;
+    }
+    if let Ok(mut sel) = selection().lock() {
+        if let Some(s) = sel.as_mut() {
+            s.focus = SelectPos { row, col };
+        }
+    }
+    render_output();
+    render_queued_composer();
+}
+
+fn selection_finish(row: u16, col: u16) {
+    if in_output_region(row) {
+        if let Ok(mut sel) = selection().lock() {
+            if let Some(s) = sel.as_mut() {
+                s.focus = SelectPos { row, col };
+            }
+        }
+    }
+    let copied = selected_text();
+    if let Ok(mut sel) = selection().lock() {
+        *sel = None;
+    }
+    render_output();
+    if let Some(text) = copied.filter(|s| !s.trim().is_empty()) {
+        osc52_copy(&text);
+    }
+    render_queued_composer();
+}
+
+fn normalized_selection(sel: Selection) -> (SelectPos, SelectPos) {
+    let a = sel.anchor;
+    let b = sel.focus;
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn selection_range_for(sel: Selection, row: u16, line_len: usize) -> Option<(usize, usize)> {
+    let (start, end) = normalized_selection(sel);
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let from = if row == start.row {
+        start.col as usize
+    } else {
+        0
+    }
+    .min(line_len);
+    let to = if row == end.row {
+        (end.col as usize).saturating_add(1)
+    } else {
+        line_len
+    }
+    .min(line_len);
+    (to > from).then_some((from, to))
+}
+
+fn inverse(s: &str) -> String {
+    if no_color() {
+        s.to_string()
+    } else {
+        format!("\x1b[7m{s}\x1b[27m")
+    }
+}
+
+fn selected_line(line: &str, range: (usize, usize)) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let (from, to) = range;
+    let before: String = chars.iter().take(from).collect();
+    let mid: String = chars.iter().skip(from).take(to - from).collect();
+    let after: String = chars.iter().skip(to).collect();
+    format!("{before}{}{after}", inverse(&mid))
+}
+
+fn selected_text() -> Option<String> {
+    let sel = selection().lock().ok().and_then(|g| *g)?;
+    let rows = visible_rows().lock().ok()?;
+    let (start, end) = normalized_selection(sel);
+    let mut out = Vec::new();
+    for row in start.row..=end.row {
+        let line = rows.get(row as usize).map(String::as_str).unwrap_or("");
+        let len = line.chars().count();
+        if let Some((from, to)) = selection_range_for(sel, row, len) {
+            out.push(line.chars().skip(from).take(to - from).collect::<String>());
+        } else if row > start.row && row < end.row {
+            out.push(String::new());
+        }
+    }
+    Some(out.join("\n"))
 }
 
 fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize) {
@@ -758,13 +936,12 @@ fn wordmark() -> String {
     if no_color() {
         return "buildwithnexus".to_string();
     }
-    // Gradient stops: ACCENT(purple) → INFO(cyan) → SUCCESS(green)
+    // Gradient stops: Tokyo Night purple → blue → cyan → green.
     let stops: &[(u8, u8, u8)] = &[
-        (0xb4, 0x8e, 0xff), // purple  (b u i)
-        (0xa0, 0xa0, 0xff), //         (l d)
-        (0x89, 0xdc, 0xeb), // cyan    (w i t)
-        (0x89, 0xdc, 0xeb), //         (h n)
-        (0xa6, 0xe3, 0xa1), // green   (e x u s)
+        (0xbb, 0x9a, 0xf7),
+        (0x7a, 0xa2, 0xf7),
+        (0x7d, 0xcf, 0xff),
+        (0x9e, 0xce, 0x6a),
     ];
     let word = "buildwithnexus";
     let n = word.len();
@@ -801,7 +978,7 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
             "  {}  {}  {}",
             bold(&wordmark()),
             dim("·"),
-            paint(Rgb(0xcb, 0xa6, 0xf7), "buildwithnexus.dev"), // lavender
+            paint(ACCENT, "buildwithnexus.dev"),
         ),
         w,
     ));
@@ -890,7 +1067,7 @@ pub fn enter_alt(raw: bool) {
         // aggressively clear/home the alternate screen after entering it.
         let _ = write!(out, "\x1b[9999B");
         let _ = execute!(out, EnterAlternateScreen);
-        let _ = write!(out, "\x1b[H\x1b[2J\x1b[3J");
+        let _ = write!(out, "{}\x1b[H\x1b[2J\x1b[3J", theme_bg());
         let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
         let _ = out.flush();
         ALT_SCREEN.store(true, Ordering::Relaxed);
@@ -905,6 +1082,7 @@ pub fn enter_alt(raw: bool) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         reset_output_region();
+        let _ = write!(io::stdout(), "\x1b[0m");
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
@@ -927,6 +1105,7 @@ pub fn leave_alt() {
         let _ = disable_raw_mode();
     }
     if ALT_SCREEN.swap(false, Ordering::Relaxed) {
+        let _ = write!(io::stdout(), "\x1b[0m");
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
@@ -937,6 +1116,7 @@ pub fn clear() {
         if let Ok(mut lines) = transcript().lock() {
             lines.clear();
         }
+        let _ = write!(io::stdout(), "{}", theme_bg());
         let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
         set_output_region();
         clear_composer();
@@ -1368,6 +1548,11 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/mode",
     "/model",
     "/permissions",
+    "/effort",
+    "/mcp",
+    "/plugin",
+    "/marketplace",
+    "/scroll",
     "/mouse",
     "/compact",
     "/review",
@@ -1500,12 +1685,38 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
                 .map(|s| s.to_string())
                 .collect();
         }
-        "/mouse" => {
+        "/scroll" | "/mouse" => {
             return ["on", "off", "status"]
                 .iter()
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())
                 .collect();
+        }
+        "/effort" => {
+            return ["low", "medium", "high", "max"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/mcp" | "/plugin" | "/marketplace" => {
+            return [
+                "list",
+                "add",
+                "remove",
+                "install",
+                "filesystem",
+                "github",
+                "git",
+                "sqlite",
+                "brave-search",
+                "memory",
+                "duckduckgo",
+            ]
+            .iter()
+            .filter(|&&s| s.starts_with(token))
+            .map(|s| s.to_string())
+            .collect();
         }
         _ => {}
     }
@@ -1581,10 +1792,28 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                         redraw(prompt, start, &buf, cursor, &mut scroll);
                         continue;
                     }
+                    MouseEventKind::Down(MouseButton::Left) if in_output_region(m.row) => {
+                        selection_start(m.row, m.column);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if in_output_region(m.row) => {
+                        selection_drag(m.row, m.column);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if in_output_region(m.row) => {
+                        selection_finish(m.row, m.column);
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
                     _ => {}
                 }
-                // Left-click on the input row moves the cursor to the clicked column.
-                if m.kind == MouseEventKind::Down(MouseButton::Left) && m.row == start.1 {
+                // Left-click or drag on the input row moves the cursor to the clicked/dragged column.
+                if (m.kind == MouseEventKind::Down(MouseButton::Left)
+                    || m.kind == MouseEventKind::Drag(MouseButton::Left))
+                    && m.row == start.1
+                {
                     let col = m.column as usize;
                     if col >= start.0 as usize {
                         let offset = col - start.0 as usize + scroll;

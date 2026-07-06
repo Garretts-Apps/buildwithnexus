@@ -29,5 +29,3 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "perf"
 harness = false
-
-

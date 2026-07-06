@@ -21,6 +21,8 @@ const MAX_ITERS: usize = 30;
 const MAX_DEPTH: usize = 3;
 const KEEP_RECENT: usize = 6;
 const MAX_IDENTICAL_TOOL_RESULTS: usize = 2;
+const MAX_PLAN_TOOL_ROUNDS: usize = 10;
+const MAX_CHAT_TOOL_ROUNDS: usize = 12;
 
 // ── context compaction ────────────────────────────────────────────────────────
 fn estimate_tokens(msgs: &[Msg]) -> usize {
@@ -67,6 +69,18 @@ fn structural_summary(middle: &[Msg]) -> String {
     } else {
         format!("Earlier steps taken: {}", actions.join("; "))
     }
+}
+
+fn assistant_tool_turn_text(text: String, calls: &[provider::ToolCall]) -> String {
+    if calls.is_empty() || text.len() <= 500 {
+        return text;
+    }
+    let actions = calls
+        .iter()
+        .map(|c| tools::preview(&c.name, &c.input))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Requested tool call(s): {actions}")
 }
 
 fn render_msgs(msgs: &[Msg]) -> String {
@@ -214,6 +228,188 @@ fn repeated_tool_summary(
     }
 }
 
+fn note_loop_result(
+    guard: &mut ToolLoopGuard,
+    name: &str,
+    input: &serde_json::Value,
+    content: &str,
+    is_error: bool,
+    summary: &mut Option<String>,
+) {
+    if summary.is_some() {
+        return;
+    }
+    if let Some(loop_msg) = guard.note(name, input, content, is_error) {
+        report::assistant(&loop_msg);
+        *summary = Some(loop_msg);
+    }
+}
+
+fn tool_input_for_execution(
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+    phase: &str,
+    depth: usize,
+) -> serde_json::Value {
+    let Some(repaired) = repair_placeholder_tool_input(name, input, cwd) else {
+        return input.clone();
+    };
+    report::notice(&format!(
+        "  recovery: using current workspace for placeholder path in {name}"
+    ));
+    trace::record_visible(
+        "tool_input_repaired",
+        format!("{name} placeholder path repaired"),
+        serde_json::json!({
+            "tool": name,
+            "original": input,
+            "repaired": &repaired,
+            "cwd": cwd.to_string_lossy(),
+            "phase": phase,
+            "depth": depth,
+        }),
+    );
+    repaired
+}
+
+fn repair_placeholder_tool_input(
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+) -> Option<serde_json::Value> {
+    let keys: &[&str] = match name {
+        "list" | "list_dir" | "list_tree" | "file_info" => &["path", "filePath"],
+        "glob" | "grep" => &["root", "path"],
+        "find_paths" | "find_files" | "grep_files" => &["root"],
+        _ => return None,
+    };
+
+    let mut repaired = input.clone();
+    let mut changed = false;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    for key in keys {
+        if let Some(value) = repaired.get_mut(*key) {
+            let Some(path) = value.as_str() else {
+                continue;
+            };
+            if is_placeholder_path(path) {
+                *value = serde_json::Value::String(cwd_str.clone());
+                changed = true;
+            }
+        }
+    }
+    changed.then_some(repaired)
+}
+
+fn is_placeholder_path(path: &str) -> bool {
+    let lower = path.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower == "." || lower == "./" || lower == "~" {
+        return false;
+    }
+    lower.contains("/path/to/")
+        || lower.contains("path/to/your")
+        || lower.contains("your/project")
+        || lower.contains("your-project")
+        || lower.contains("your_project")
+        || lower.contains("project-directory")
+        || lower.contains("project_directory")
+        || matches!(
+            lower.as_str(),
+            "/path/to/project" | "path/to/project" | "<project-path>" | "{project-path}"
+        )
+}
+
+#[derive(Default)]
+struct ThinkingStream {
+    active: bool,
+}
+
+impl ThinkingStream {
+    fn push(&mut self, chunk: &str) {
+        if report::is_json() {
+            return;
+        }
+        tui::poll_typeahead();
+        let mut rest = chunk.replace('\r', "");
+        if rest.is_empty() {
+            return;
+        }
+        while let Some(nl) = rest.find('\n') {
+            let part = rest[..nl].trim_end();
+            if !part.is_empty() || self.active {
+                self.start();
+                tui::write_stream(&tui::dim(part));
+                tui::write_stream("\n");
+                self.active = false;
+            }
+            rest = rest[nl + 1..].to_string();
+        }
+        if !rest.is_empty() {
+            self.start();
+            tui::write_stream(&tui::dim(&rest));
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            tui::write_stream("\n");
+            self.active = false;
+        }
+        tui::render_queued_composer();
+    }
+
+    fn start(&mut self) {
+        if !self.active {
+            tui::write_stream(&format!("  {} ", tui::dim("thinking ›")));
+            self.active = true;
+        }
+    }
+}
+
+fn request_reply(
+    p: &Provider,
+    msgs: &[Msg],
+    defs: &[tools::ToolDef],
+    label: &str,
+) -> Result<Reply, String> {
+    if report::is_json() {
+        let r = complete(p, msgs, defs)?;
+        report::assistant(&r.text);
+        return Ok(r);
+    }
+    tui::line(&tui::dim(&format!(
+        "  {label}: asking {} with {} available tools",
+        p.model,
+        defs.len()
+    )));
+    let thinking = std::cell::RefCell::new(ThinkingStream::default());
+    let mut streamed = false;
+    let mut renderer = tui::StreamRenderer::new();
+    let res = provider::stream(
+        p,
+        msgs,
+        defs,
+        &mut |c| {
+            thinking.borrow_mut().finish();
+            renderer.push(c);
+            tui::poll_typeahead();
+            tui::render_queued_composer();
+            streamed = true;
+        },
+        &mut |t| {
+            thinking.borrow_mut().push(t);
+        },
+    );
+    thinking.borrow_mut().finish();
+    let r = res?;
+    renderer.flush();
+    if streamed {
+        report::assistant_end();
+    }
+    Ok(r)
+}
+
 fn answer_question(input: &serde_json::Value) -> (String, bool) {
     let question = if let Some(qs) = input["questions"].as_array() {
         let mut acc = Vec::new();
@@ -264,7 +460,11 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
     }
     let default = input["default"].as_str().unwrap_or("").trim();
     let prompt = if default.is_empty() {
-        format!("  {} {}\n  Answer: ", tui::yellow("?"), tui::bold(&full_prompt))
+        format!(
+            "  {} {}\n  Answer: ",
+            tui::yellow("?"),
+            tui::bold(&full_prompt)
+        )
     } else {
         format!(
             "  {} {}\n  Answer {} ",
@@ -311,6 +511,10 @@ pub fn role(id: &str) -> Role {
 Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
+BUILD mode means execute: for any concrete build/fix/create/change request, inspect the project and make the needed edits instead of replying with a capability statement. \
+For simple browser games, canvas demos, landing pages, prototypes, and static visual apps, build an actual runnable artifact. Prefer a single self-contained HTML file via Artifact/publish_artifact unless the user explicitly asks for a framework. \
+For local web apps that require a dev server, use start_server, wait_for_url, inspect read_server_log if readiness fails, then open_browser when useful. \
+If a path or file is missing, use discovery tools before asking the user. \
 DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
 When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
 IMPORTANT — tool discipline:\n\
@@ -349,6 +553,7 @@ fn context_prefix(cwd: &Path) -> String {
     // Always include the tool manifest so the model knows what's built-in
     // and doesn't try to install external tools to do things we already handle.
     parts.push(tool_manifest());
+    parts.push(visible_reasoning_policy());
     parts.push(discovery_policy());
     parts.push(skill_manifest());
 
@@ -376,19 +581,17 @@ fn context_prefix(cwd: &Path) -> String {
     if !active_hooks.is_empty() {
         parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));
     }
-    let skills = config::load_skills();
-    if !skills.is_empty() {
-        let joined = skills
+    let skill_descs = config::load_skill_descriptions();
+    if !skill_descs.is_empty() {
+        let joined = skill_descs
             .iter()
-            .map(|(name, content)| {
-                let first = content.lines().next().unwrap_or("").trim();
-                format!("• /{name} — {first}")
-            })
+            .map(|(name, desc)| format!("• /{name} — {desc}"))
             .collect::<Vec<_>>()
-            .join("\n\n");
+            .join("\n");
         parts.push(format!(
-            "[Available skills]\n{joined}\n\n\
-Use list_skills and load_skill to inspect full skill instructions only when they are relevant. \
+            "[Available skills — descriptions only]\n{joined}\n\n\
+To use a skill, call load_skill with the skill name to load its full instructions. \
+Only load skills that are directly relevant to the current task. \
 Do not load skills for simple greetings or casual replies."
         ));
     }
@@ -398,40 +601,27 @@ Do not load skills for simple greetings or casual replies."
 
 fn tool_manifest() -> String {
     "[Built-in tools — always available, no install needed]\n\
-OpenCode-compatible names are supported: bash, read, write, edit, glob, grep, list, task, todowrite, todoread, webfetch, websearch, skill, question.\n\
-• read / read_file       — read any file on the filesystem; supports start_line/end_line\n\
-• list / list_dir        — list a directory\n\
-• list_tree              — inspect a bounded directory tree before guessing paths\n\
-• glob / find_paths      — search files and directories; use kind=`dir` for folders like \"folder named nexus\"\n\
-• grep / grep_files      — search text files without shelling out; use include/file_pattern to narrow files\n\
-• write / write_file, edit / edit_file — create or surgically modify files\n\
-• bash / run_command     — run any shell command: grep, find, git, cargo, make, npm, python3, etc.\n\
-• webfetch / fetch_url   — HTTP GET (no curl/wget needed)\n\
-• websearch / web_search — DuckDuckGo web search (no API key, live results)\n\
-• todowrite / todoread   — track multi-step work\n\
-• skill / load_skill     — discover and load skill instructions on demand\n\
-• question               — ask the user interactive questions ONLY when blocked on critical missing information; NEVER use to ask for themes, styling, or permission\n\
-• list_python_tools / python_tool — discover and run Python-backed local tools from .buildwithnexus/tools or $NEXUS_HOME/tools\n\
-• save_memory            — persist a note across sessions\n\
-• task / spawn_subagent  — delegate a sub-task to a fresh agent with its own context\n\
-• finish                 — mark the task complete with a summary\n\n\
+Aliases are supported: bash/read/write/edit/patch/glob/grep/list/task/todowrite/todoread/webfetch/websearch/skill/question. \
+Use built-ins before installing anything. Use list_tree/find_paths/grep_files before guessing paths; use find_paths kind=`dir` for folders. \
+Use start_server/list_servers/wait_for_url/read_server_log/stop_server for long-running local dev servers, and open_browser for local URLs or generated HTML.\n\n\
 [CRITICAL TOOL DISCIPLINE]\n\
-• Mandatory Tool Usage: Whenever generating or editing code, HTML, or any file contents, you MUST use write_file or edit_file. NEVER write code in plain text or markdown as your response.\n\
-• No Placeholders: Write complete, fully working code. DO NOT use placeholders like `// ... rest of code`.\n\
-• No Permission Seeking / Chatting: DO NOT ask the user for permission, themes, or layout choices. If instructions are open-ended (e.g. 'pick a theme' or 'make it cool'), make a reasonable decision and just build it immediately! Do not reply with conversational filler."
+• For generated/edited code, HTML, or file contents, call write_file/edit_file/Artifact; never paste code as plain markdown.\n\
+• For canvas games, browser games, standalone demos, landing pages, and small web apps: publish a complete runnable static HTML artifact with embedded CSS/JS unless a framework is explicitly requested. Include controls, restart/error states, responsive sizing, and touch/mobile support when useful; then open_browser if possible.\n\
+• No placeholders. No asking for theme/layout/permission when a reasonable default works. Build immediately."
+        .to_string()
+}
+
+fn visible_reasoning_policy() -> String {
+    "[Visible reasoning]\n\
+Emit short operational `<think>...</think>` notes before tool calls, recovery decisions, and final answers. Think briefly, then act."
         .to_string()
 }
 
 fn discovery_policy() -> String {
     "[Filesystem discovery policy]\n\
-When the user refers to a file, project, repo, document, or directory by description instead of an exact path, do not invent a placeholder path. \
-First inspect the current workspace with list_tree/find_paths/find_files/grep_files. \
-If a direct read_file fails with \"No such file\" or similar, recover by searching for likely names instead of asking immediately.\n\
-For folder/directory requests, use find_paths with kind=`dir`; do not use find_files. \
-For requests involving files, folders, or sibling projects outside the current workspace, search parent directories (e.g., `..`, `../..`, `../../..`) as far back as the development/user root (e.g., `/mnt/c/dev`, `/Users/username/Projects`, `~`, or `/`) to locate them before giving up.\n\
-For requests involving the user's personal files, projects, downloads, or home directory, search likely roots such as `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos` with find_paths/find_files/grep_files. \
-If a broader home search is needed, use or propose a read-only command such as `find \"$HOME\" -iname '*project*' -maxdepth 4` or `rg --files \"$HOME\" | rg -i 'projects|repos'`. \
-Only ask the user for a path after bounded discovery fails or when the search would be too broad or sensitive."
+Do not invent placeholder paths. If a path is vague or a read/list fails, search with list_tree/find_paths/find_files/grep_files before asking. \
+For folders use find_paths kind=`dir`. For user files/projects, search likely roots such as ~, ~/Documents, ~/Desktop, ~/Downloads, ~/Projects, ~/repos, then bounded parent directories. \
+Only ask for a path after bounded discovery fails or the search would be too broad/sensitive."
         .to_string()
 }
 
@@ -547,16 +737,14 @@ pub(crate) fn gate(
             ));
         }
     }
-    if name == "run_command" {
-        if let Some(c) = input["command"].as_str() {
-            if tools::catastrophic(c) {
-                return confirm(&format!("run dangerous command `{c}`"));
-            }
-            // In WSL2, commands that reference /mnt/<drive>/ target the Windows
-            // filesystem — confirm before running, even in Auto mode.
-            if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
-                return confirm(&format!("command targets Windows filesystem (WSL2): `{c}`"));
-            }
+    if let Some(c) = tools::command_arg_for(name, input) {
+        if tools::catastrophic(c) {
+            return confirm(&format!("run dangerous command `{c}`"));
+        }
+        // In WSL2, commands that reference /mnt/<drive>/ target the Windows
+        // filesystem — confirm before running, even in Auto mode.
+        if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
+            return confirm(&format!("command targets Windows filesystem (WSL2): `{c}`"));
         }
     }
 
@@ -566,11 +754,9 @@ pub(crate) fn gate(
             if tools::is_mutating_call(name, input) {
                 // run_command with clearly read-only shell tools (grep, find, etc.)
                 // should pass through even in ReadOnly mode.
-                if name == "run_command" {
-                    if let Some(c) = input["command"].as_str() {
-                        if tools::is_readonly_command(c) {
-                            return None;
-                        }
+                if let Some(c) = tools::command_arg_for(name, input) {
+                    if tools::is_readonly_command(c) {
+                        return None;
                     }
                 }
                 return Some("read-only mode: mutation skipped".into());
@@ -580,17 +766,15 @@ pub(crate) fn gate(
         Permission::Ask => {
             // run_command calls whose binary appears in allowed_commands skip the
             // confirmation prompt — git, cargo, npm, etc. should just work.
-            if name == "run_command" {
-                if let Some(c) = input["command"].as_str() {
-                    let first = c.split_whitespace().next().unwrap_or("");
-                    // Accept both bare names and full paths (/usr/bin/git → git).
-                    let bin = std::path::Path::new(first)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(first);
-                    if config::load_allowed_commands().iter().any(|a| a == bin) {
-                        return None;
-                    }
+            if let Some(c) = tools::command_arg_for(name, input) {
+                let first = c.split_whitespace().next().unwrap_or("");
+                // Accept both bare names and full paths (/usr/bin/git → git).
+                let bin = std::path::Path::new(first)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(first);
+                if config::load_allowed_commands().iter().any(|a| a == bin) {
+                    return None;
                 }
             }
             if tools::is_mutating_call(name, input) {
@@ -649,7 +833,9 @@ pub fn run_build_session(
     transcript: &mut Vec<Msg>,
     sid: &str,
 ) -> Result<(), String> {
+    hooks::notify("SessionStart", cwd);
     let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
+    hooks::notify("SessionEnd", cwd);
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
@@ -672,6 +858,7 @@ fn build_inner(
         Ok(ctx) if !ctx.is_empty() => format!("{task}\n\n[hook context]\n{ctx}"),
         Ok(_) => task.to_string(),
     };
+    let task_for_recovery = task.clone();
     let defs = tools::defs(depth < MAX_DEPTH);
     if msgs.is_empty() {
         let prefix = context_prefix(cwd);
@@ -688,6 +875,8 @@ fn build_inner(
     // Track which files have been read this session so we can enforce read-before-write.
     let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
     let mut loop_guard = ToolLoopGuard::default();
+    let mut artifact_error_count = 0usize;
+    let mut static_artifact_recovery_count = 0usize;
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -695,65 +884,111 @@ fn build_inner(
             return Ok(String::new());
         }
         maybe_compact(p, msgs);
-        let reply: Reply = if report::is_json() {
-            let r = complete(p, msgs.as_slice(), &defs)?;
-            report::assistant(&r.text);
-            r
-        } else {
-            // Show a step counter so the user can see multi-step reasoning progress.
-            if step > 1 {
-                tui::line(&tui::dim(&format!("  ↻ step {step}")));
+        if step > 1 && !report::is_json() {
+            tui::line(&tui::dim(&format!("  ↻ step {step}")));
+        }
+        let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
+            Ok(r) => r,
+            Err(e) => {
+                hooks::notify("OnError", cwd);
+                return Err(e);
             }
-            if !report::is_json() {
-                tui::line(&tui::dim(&format!(
-                    "  thinking: asking {} with {} available tools",
-                    p.model,
-                    defs.len()
-                )));
-            }
-            let mut spin = Some(tui::spinner_start("thinking…"));
-            let mut streamed = false;
-            let mut thinking_buf = String::new();
-            let mut renderer = tui::StreamRenderer::new();
-            let res = provider::stream(
-                p,
-                msgs.as_slice(),
-                &defs,
-                &mut |c| {
-                    if let Some(s) = spin.take() {
-                        tui::spinner_stop(s);
-                    }
-                    renderer.push(c);
-                    streamed = true;
-                },
-                &mut |t| {
-                    // Extended thinking: buffer and display as dim internal monologue.
-                    thinking_buf.push_str(t);
-                    // Flush complete sentences/lines so output feels live.
-                    while let Some(nl) = thinking_buf.find('\n') {
-                        let line = thinking_buf[..nl].trim().to_string();
-                        if !line.is_empty() {
-                            tui::write_stream(&format!(
-                                "\r  {} {}\r\n",
-                                tui::dim("◌"),
-                                tui::dim(&line)
+        };
+        hooks::notify("PostResponse", cwd);
+        if reply.calls.is_empty() {
+            if let Some(input) = auto_static_artifact_input(&task_for_recovery, &reply.text) {
+                report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
+                trace_tool_call("Artifact", &input, "build", depth);
+                let out = tools::run("Artifact", &input, cwd);
+                report::tool_result("Artifact", &out.content, out.is_error);
+                trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
+                if out.is_error {
+                    if canvas_game_requested(&task_for_recovery) {
+                        let fallback = fallback_canvas_game_input(&task_for_recovery);
+                        report::tool_call(
+                            "Artifact",
+                            &tools::preview("Artifact", &fallback),
+                            &fallback,
+                        );
+                        trace_tool_call("Artifact", &fallback, "build", depth);
+                        let fallback_out = tools::run("Artifact", &fallback, cwd);
+                        report::tool_result(
+                            "Artifact",
+                            &fallback_out.content,
+                            fallback_out.is_error,
+                        );
+                        trace_tool_result(
+                            "Artifact",
+                            &fallback_out.content,
+                            fallback_out.is_error,
+                            "build",
+                            depth,
+                        );
+                        if !fallback_out.is_error {
+                            return Ok(format!(
+                                "{}\n\nThe model produced incomplete canvas HTML, so buildwithnexus published a complete self-contained fallback canvas game.",
+                                fallback_out.content
                             ));
                         }
-                        thinking_buf = thinking_buf[nl + 1..].to_string();
+                        return Err(fallback_out.content);
                     }
-                },
-            );
-            if let Some(s) = spin.take() {
-                tui::spinner_stop(s);
+                    msgs.push(Msg::Assistant {
+                        text: reply.text.clone(),
+                        calls: vec![],
+                    });
+                    msgs.push(Msg::User(format!(
+                        "The HTML artifact you wrote in plain text was rejected: {}. \
+                         Rewrite it as one complete self-contained HTML artifact and call Artifact/publish_artifact. \
+                         Do not answer with markdown code.",
+                        out.content
+                    )));
+                    continue;
+                }
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
+                return Ok(out.content);
             }
-            let r = res?;
-            renderer.flush();
-            if streamed {
-                report::assistant_end();
+            if static_artifact_requested(&task_for_recovery) {
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
+                if static_artifact_recovery_count == 0 {
+                    static_artifact_recovery_count += 1;
+                    msgs.push(Msg::User(static_artifact_recovery_prompt(
+                        &task_for_recovery,
+                    )));
+                    continue;
+                }
+                if canvas_game_requested(&task_for_recovery) {
+                    let fallback = fallback_canvas_game_input(&task_for_recovery);
+                    report::tool_call(
+                        "Artifact",
+                        &tools::preview("Artifact", &fallback),
+                        &fallback,
+                    );
+                    trace_tool_call("Artifact", &fallback, "build", depth);
+                    let fallback_out = tools::run("Artifact", &fallback, cwd);
+                    report::tool_result("Artifact", &fallback_out.content, fallback_out.is_error);
+                    trace_tool_result(
+                        "Artifact",
+                        &fallback_out.content,
+                        fallback_out.is_error,
+                        "build",
+                        depth,
+                    );
+                    if !fallback_out.is_error {
+                        return Ok(format!(
+                            "{}\n\nThe model did not produce a runnable canvas artifact after being asked to proceed with reasonable defaults, so buildwithnexus published a complete self-contained fallback canvas game.",
+                            fallback_out.content
+                        ));
+                    }
+                    return Err(fallback_out.content);
+                }
+                return Ok(reply.text);
             }
-            r
-        };
-        if reply.calls.is_empty() {
             if reply.text.trim().is_empty() {
                 report::notice("model returned no output");
             }
@@ -773,6 +1008,14 @@ fn build_inner(
                     raw.chars().take(200).collect::<String>()
                 );
                 report::tool_denied(&msg);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &msg,
+                    true,
+                    &mut summary,
+                );
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: msg,
@@ -780,17 +1023,26 @@ fn build_inner(
                 });
                 continue;
             }
+            let call_input = tool_input_for_execution(&call.name, &call.input, cwd, "build", depth);
             report::tool_call(
                 &call.name,
-                &tools::preview(&call.name, &call.input),
-                &call.input,
+                &tools::preview(&call.name, &call_input),
+                &call_input,
             );
-            trace_tool_call(&call.name, &call.input, "build", depth);
+            trace_tool_call(&call.name, &call_input, "build", depth);
 
             if call.name == "question" || call.name == "AskUserQuestion" {
-                let (answer, is_error) = answer_question(&call.input);
+                let (answer, is_error) = answer_question(&call_input);
                 report::tool_result(&call.name, &answer, is_error);
                 trace_tool_result(&call.name, &answer, is_error, "build", depth);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &answer,
+                    is_error,
+                    &mut summary,
+                );
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: answer,
@@ -799,17 +1051,25 @@ fn build_inner(
                 continue;
             }
 
-            let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
-                PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
+                PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
             };
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
                     "tool_denied",
                     format!("{} denied", call.name),
-                    serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "build", "depth": depth}),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "build", "depth": depth}),
+                );
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &reason,
+                    true,
+                    &mut summary,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -820,43 +1080,37 @@ fn build_inner(
             }
 
             // Record reads so we can enforce read-before-write below.
-            if call.name == "read_file" {
-                if let Some(raw) = call.input["path"].as_str() {
-                    let p = if std::path::Path::new(raw).is_absolute() {
-                        PathBuf::from(raw)
-                    } else {
-                        cwd.join(raw)
-                    };
-                    read_paths.insert(p);
-                }
+            if let Some(p) = tools::read_tracking_path(&call.name, &call_input, cwd) {
+                read_paths.insert(p);
             }
 
             // Require the model to read a file before overwriting or patching it.
-            if matches!(call.name.as_str(), "write_file" | "edit_file") {
-                if let Some(raw) = call.input["path"].as_str() {
-                    let p = if std::path::Path::new(raw).is_absolute() {
-                        PathBuf::from(raw)
-                    } else {
-                        cwd.join(raw)
-                    };
-                    if p.exists() && !read_paths.contains(&p) {
-                        let msg = format!(
-                            "read_file('{}') required before editing. Read the file first, then retry.",
-                            p.display()
-                        );
-                        report::tool_denied(&msg);
-                        results.push(ToolResult {
-                            id: call.id.clone(),
-                            content: msg,
-                            is_error: true,
-                        });
-                        continue;
-                    }
+            if let Some(p) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
+                if p.exists() && !read_paths.contains(&p) {
+                    let msg = format!(
+                        "read('{}') required before editing. Read the file first, then retry.",
+                        p.display()
+                    );
+                    report::tool_denied(&msg);
+                    note_loop_result(
+                        &mut loop_guard,
+                        &call.name,
+                        &call_input,
+                        &msg,
+                        true,
+                        &mut summary,
+                    );
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: msg,
+                        is_error: true,
+                    });
+                    continue;
                 }
             }
 
             if matches!(call.name.as_str(), "task" | "spawn_subagent") {
-                let out = spawn_subagent(p, perm, &call.input, cwd, depth);
+                let out = spawn_subagent(p, perm, &call_input, cwd, depth);
                 report::tool_result(&call.name, &out, false);
                 trace_tool_result(&call.name, &out, false, "build", depth);
                 results.push(ToolResult {
@@ -868,7 +1122,7 @@ fn build_inner(
             }
             // Memory-save tool: the model can call save_memory to persist facts.
             if call.name == "save_memory" {
-                if let Some(note) = call.input["note"].as_str() {
+                if let Some(note) = call_input["note"].as_str() {
                     config::append_memory(note);
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
@@ -882,18 +1136,55 @@ fn build_inner(
                 }
             }
 
-            let out = tools::run(&call.name, &call.input, cwd);
-            hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
+            let out = tools::run(&call.name, &call_input, cwd);
+            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            if out.is_error {
+                hooks::notify("OnError", cwd);
+            }
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
+            if matches!(call.name.as_str(), "Artifact" | "publish_artifact")
+                && out.is_error
+                && canvas_game_requested(&task_for_recovery)
+            {
+                artifact_error_count += 1;
+                if artifact_error_count >= 1 {
+                    let fallback = fallback_canvas_game_input(&task_for_recovery);
+                    report::tool_call(
+                        "Artifact",
+                        &tools::preview("Artifact", &fallback),
+                        &fallback,
+                    );
+                    trace_tool_call("Artifact", &fallback, "build", depth);
+                    let fallback_out = tools::run("Artifact", &fallback, cwd);
+                    report::tool_result("Artifact", &fallback_out.content, fallback_out.is_error);
+                    trace_tool_result(
+                        "Artifact",
+                        &fallback_out.content,
+                        fallback_out.is_error,
+                        "build",
+                        depth,
+                    );
+                    if !fallback_out.is_error {
+                        summary = Some(format!(
+                            "{}\n\nThe model repeatedly produced incomplete canvas HTML, so buildwithnexus published a complete self-contained fallback canvas game.",
+                            fallback_out.content
+                        ));
+                    }
+                }
+            }
             if out.finished {
                 report::finish(&out.content);
                 summary = Some(out.content.clone());
-            } else if let Some(loop_msg) =
-                loop_guard.note(&call.name, &call.input, &out.content, out.is_error)
-            {
-                report::assistant(&loop_msg);
-                summary = Some(loop_msg);
+            } else {
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &out.content,
+                    out.is_error,
+                    &mut summary,
+                );
             }
             results.push(ToolResult {
                 id: call.id.clone(),
@@ -903,7 +1194,7 @@ fn build_inner(
         }
 
         msgs.push(Msg::Assistant {
-            text: reply.text,
+            text: assistant_tool_turn_text(reply.text, &reply.calls),
             calls: reply.calls,
         });
         msgs.push(Msg::Tool(results));
@@ -1001,6 +1292,281 @@ fn make_worktree(cwd: &Path) -> Option<PathBuf> {
     out.status.success().then_some(wt)
 }
 
+fn parse_plan_steps(plan_text: &str) -> Vec<String> {
+    let mut listed = Vec::new();
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("```") {
+            continue;
+        }
+        if let Some(step) = strip_plan_marker(trimmed) {
+            let step = strip_markdown_emphasis(step);
+            if !step.is_empty() {
+                listed.push(step);
+            }
+        }
+    }
+    if !listed.is_empty() {
+        return listed.into_iter().take(8).collect();
+    }
+    Vec::new()
+}
+
+fn plan_steps_are_actionable(steps: &[String]) -> bool {
+    !steps.is_empty() && steps.iter().all(|step| plan_step_is_actionable(step))
+}
+
+fn plan_step_is_actionable(step: &str) -> bool {
+    let first = step
+        .trim()
+        .trim_start_matches(['`', '\'', '"', '['])
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_ascii_alphabetic())
+        .to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "add"
+            | "analyze"
+            | "audit"
+            | "build"
+            | "check"
+            | "compare"
+            | "configure"
+            | "create"
+            | "document"
+            | "edit"
+            | "find"
+            | "fix"
+            | "generate"
+            | "identify"
+            | "implement"
+            | "inspect"
+            | "install"
+            | "list"
+            | "load"
+            | "open"
+            | "publish"
+            | "read"
+            | "refactor"
+            | "remove"
+            | "review"
+            | "run"
+            | "search"
+            | "start"
+            | "stop"
+            | "summarize"
+            | "test"
+            | "update"
+            | "use"
+            | "verify"
+            | "write"
+    )
+}
+
+fn strip_plan_marker(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+        return Some(rest);
+    }
+    let mut saw_digit = false;
+    for (idx, ch) in line.char_indices() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if saw_digit && matches!(ch, '.' | ')') {
+            return Some(line[idx + ch.len_utf8()..].trim_start());
+        }
+        break;
+    }
+    None
+}
+
+fn strip_markdown_emphasis(line: &str) -> String {
+    let mut cleaned = line.trim().to_string();
+    if let Some(rest) = cleaned.strip_prefix("**") {
+        cleaned = rest.to_string();
+        if let Some(idx) = cleaned.rfind("**") {
+            cleaned.replace_range(idx..idx + 2, "");
+        }
+    }
+    strip_step_label(cleaned.trim()).to_string()
+}
+
+fn strip_step_label(line: &str) -> &str {
+    let lower = line.to_ascii_lowercase();
+    if !lower.starts_with("step ") {
+        return line;
+    }
+    let rest = &line[5..];
+    let mut saw_digit = false;
+    for (idx, ch) in rest.char_indices() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if saw_digit && ch == ':' {
+            return rest[idx + 1..].trim_start();
+        }
+        break;
+    }
+    line
+}
+
+fn auto_static_artifact_input(task: &str, text: &str) -> Option<serde_json::Value> {
+    if !static_artifact_requested(task) {
+        return None;
+    }
+    let html = extract_html_from_text(text)?;
+    let title = extract_html_title(&html).unwrap_or_else(|| "static-artifact".to_string());
+    Some(serde_json::json!({
+        "title": title,
+        "contents": html,
+        "type": "html",
+    }))
+}
+
+fn static_artifact_requested(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "canvas game",
+        "browser game",
+        "static html",
+        "static artifact",
+        "single html",
+        "standalone html",
+        "landing page",
+        "prototype",
+        "demo",
+        "website",
+        "web app",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn static_artifact_recovery_prompt(task: &str) -> String {
+    format!(
+        "This is a BUILD task, not a clarification request. Proceed with reasonable defaults for: {task}\n\n\
+         If this is a canvas/browser game or static web artifact, build the runnable artifact now. \
+         Call Artifact/publish_artifact with one complete self-contained HTML file. \
+         Include all CSS and JavaScript inline. Do not ask the user for assets or a concept unless the task is impossible without them."
+    )
+}
+
+fn extract_html_from_text(text: &str) -> Option<String> {
+    if let Some(fenced) = extract_fenced_html(text) {
+        return Some(fenced);
+    }
+    let lower = text.to_lowercase();
+    let start = lower
+        .find("<!doctype html")
+        .or_else(|| lower.find("<html"))?;
+    let html = text[start..].trim();
+    if html.contains("</html>") {
+        Some(html.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_fenced_html(text: &str) -> Option<String> {
+    let mut in_html = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_html {
+                return Some(out.join("\n").trim().to_string());
+            }
+            let tag = trimmed.trim_start_matches("```").trim().to_lowercase();
+            if tag == "html" || tag.is_empty() {
+                in_html = true;
+                out.clear();
+            }
+            continue;
+        }
+        if in_html {
+            out.push(line);
+        }
+    }
+    None
+}
+
+fn extract_html_title(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let start = lower.find("<title")?;
+    let after_tag = &html[start..];
+    let gt = after_tag.find('>')?;
+    let rest = &after_tag[gt + 1..];
+    let end = rest.to_lowercase().find("</title")?;
+    let title = rest[..end].trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+fn canvas_game_requested(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    lower.contains("canvas game") || lower.contains("browser game") || lower.contains("game")
+}
+
+fn fallback_canvas_game_input(task: &str) -> serde_json::Value {
+    let title = if task.to_lowercase().contains("orbit") {
+        "Orbit Dodge"
+    } else {
+        "Canvas Dodge"
+    };
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title>
+<style>
+html,body{{margin:0;height:100%;overflow:hidden;background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}}
+#wrap{{position:fixed;inset:0;display:grid;place-items:center;background:radial-gradient(circle at 50% 35%,#1f2937,#030712 70%)}}
+canvas{{width:min(94vw,860px);height:min(72vh,560px);background:#050816;border:1px solid #334155;box-shadow:0 24px 80px #0008}}
+#hud{{position:fixed;left:18px;right:18px;top:14px;display:flex;justify-content:space-between;gap:16px;font-weight:700;text-shadow:0 2px 8px #000}}
+#help{{position:fixed;left:18px;right:18px;bottom:14px;text-align:center;color:#9ca3af;font-size:14px}}
+#pad{{position:fixed;right:18px;bottom:56px;display:grid;grid-template-columns:48px 48px 48px;gap:8px}}
+button{{background:#1f2937cc;color:#e5e7eb;border:1px solid #475569;border-radius:8px;min-height:44px;font:inherit}}
+@media (pointer:fine){{#pad{{display:none}}}}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="860" height="560"></canvas></div>
+<div id="hud"><span id="score">Score 0</span><span id="state">Move to start</span></div>
+<div id="help">WASD/Arrows move · Space/P pause · R restart · Dodge the orbiting sparks</div>
+<div id="pad"><span></span><button data-k="ArrowUp">↑</button><span></span><button data-k="ArrowLeft">←</button><button data-k=" ">Ⅱ</button><button data-k="ArrowRight">→</button><span></span><button data-k="ArrowDown">↓</button><span></span></div>
+<script>
+const c=document.getElementById('game'),x=c.getContext('2d'),scoreEl=document.getElementById('score'),stateEl=document.getElementById('state');
+const keys=new Set();let player,orbs,score,best=0,over=false,paused=false,last=0;
+function reset(){{player={{x:c.width/2,y:c.height/2,r:11,vx:0,vy:0}};orbs=[];score=0;over=false;paused=false;last=0;stateEl.textContent='Survive';for(let i=0;i<7;i++)orbs.push({{a:i*.9,d:70+i*34,s:.7+i*.08,r:8+i%3}});}}
+function key(k,on){{if(on)keys.add(k);else keys.delete(k);if(k==='r'||k==='R')reset();if(k===' '||k==='p'||k==='P')paused=!paused;}}
+addEventListener('keydown',e=>{{key(e.key,true);if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key))e.preventDefault();}});
+addEventListener('keyup',e=>key(e.key,false));
+document.querySelectorAll('button').forEach(b=>{{b.onpointerdown=e=>{{b.setPointerCapture(e.pointerId);key(b.dataset.k,true)}};b.onpointerup=e=>key(b.dataset.k,false);}});
+function step(t){{requestAnimationFrame(step);let dt=Math.min(.033,(t-last)/1000||0);last=t;if(paused){{draw();stateEl.textContent='Paused';return}}if(over){{draw();stateEl.textContent='Game over · R to restart';return}}
+let ax=(keys.has('ArrowRight')||keys.has('d')||keys.has('D'))-(keys.has('ArrowLeft')||keys.has('a')||keys.has('A'));
+let ay=(keys.has('ArrowDown')||keys.has('s')||keys.has('S'))-(keys.has('ArrowUp')||keys.has('w')||keys.has('W'));
+player.vx=(player.vx+ax*900*dt)*.86;player.vy=(player.vy+ay*900*dt)*.86;player.x=Math.max(player.r,Math.min(c.width-player.r,player.x+player.vx*dt));player.y=Math.max(player.r,Math.min(c.height-player.r,player.y+player.vy*dt));
+score+=dt*10;best=Math.max(best,score);scoreEl.textContent=`Score ${{score|0}} · Best ${{best|0}}`;
+for(const o of orbs){{o.a+=o.s*dt;let ox=c.width/2+Math.cos(o.a)*o.d,oy=c.height/2+Math.sin(o.a*1.35)*o.d;if(Math.hypot(player.x-ox,player.y-oy)<player.r+o.r)over=true;}}
+draw();}}
+function draw(){{x.clearRect(0,0,c.width,c.height);x.fillStyle='#111827';x.fillRect(0,0,c.width,c.height);x.strokeStyle='#1f9cf0';x.globalAlpha=.18;for(let r=70;r<330;r+=34){{x.beginPath();x.ellipse(c.width/2,c.height/2,r,r*.72,0,0,7);x.stroke();}}x.globalAlpha=1;for(const o of orbs){{let ox=c.width/2+Math.cos(o.a)*o.d,oy=c.height/2+Math.sin(o.a*1.35)*o.d;x.fillStyle='#f97316';x.beginPath();x.arc(ox,oy,o.r,0,7);x.fill();}}x.fillStyle=over?'#ef4444':'#22c55e';x.beginPath();x.arc(player.x,player.y,player.r,0,7);x.fill();}}
+reset();requestAnimationFrame(step);
+</script>
+</body>
+</html>"#
+    );
+    serde_json::json!({
+        "title": title,
+        "contents": html,
+        "type": "html",
+    })
+}
+
 // ── PLAN mode ─────────────────────────────────────────────────────────────────
 // The planning phase now has tools available so the model can inspect the
 // codebase while breaking down the task. Execution still runs through BUILD.
@@ -1008,36 +1574,92 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
     let prefix = context_prefix(cwd);
     let sys = format!(
         "{prefix}You are a planning engineer with full access to the codebase. \
-        Use read_file and list_dir and run_command to inspect the project as needed. \
+        Use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect the project as needed. \
+        Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
+        Do not include code fences, shell snippets, intro text, or outro text in the plan. \
         Break the user's task into a concise numbered list of concrete steps \
         (one step per line, max 8 steps). Output the numbered list and nothing else."
     );
 
-    let defs = tools::defs(false); // planning uses tools but not subagents
+    let defs = tools::defs_readonly(); // planning inspects context but never writes
     let mut msgs = vec![Msg::System(sys), Msg::User(task.into())];
+    let mut loop_guard = ToolLoopGuard::default();
+    let mut tool_rounds = 0usize;
+    let mut plan_format_recovery_count = 0usize;
 
     // Let the model use tools while planning (e.g. read files to understand structure).
     let plan_text = loop {
+        tool_rounds += 1;
+        if tool_rounds > MAX_PLAN_TOOL_ROUNDS {
+            return Err(format!(
+                "planning stopped after {MAX_PLAN_TOOL_ROUNDS} tool rounds without producing a plan"
+            ));
+        }
         maybe_compact(p, &mut msgs);
-        let reply = tui::with_spinner("planning…", || complete(p, &msgs, &defs))?;
+        let reply = request_reply(p, &msgs, &defs, "planning")?;
 
         if reply.calls.is_empty() {
+            let candidate_steps = parse_plan_steps(&reply.text);
+            if !plan_steps_are_actionable(&candidate_steps) && plan_format_recovery_count < 2 {
+                plan_format_recovery_count += 1;
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
+                msgs.push(Msg::User(format!(
+                    "That was not a valid plan. Use the actual current workspace, not placeholder paths: {}\n\
+                     If you need context, call read-only tools now. Otherwise output only a concise numbered list of concrete steps, max 8, with no prose.",
+                    cwd.display()
+                )));
+                continue;
+            }
             break reply.text;
         }
 
         // Execute tool calls during the planning phase.
         let mut results = Vec::new();
+        let mut loop_summary: Option<String> = None;
         for call in &reply.calls {
+            if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                let msg = format!(
+                    "tool arguments were not valid JSON: {}",
+                    raw.chars().take(200).collect::<String>()
+                );
+                report::tool_denied(&msg);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &msg,
+                    true,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: msg,
+                    is_error: true,
+                });
+                continue;
+            }
+            let call_input = tool_input_for_execution(&call.name, &call.input, cwd, "plan", 0);
             report::tool_call(
                 &call.name,
-                &tools::preview(&call.name, &call.input),
-                &call.input,
+                &tools::preview(&call.name, &call_input),
+                &call_input,
             );
-            trace_tool_call(&call.name, &call.input, "plan", 0);
+            trace_tool_call(&call.name, &call_input, "plan", 0);
             if call.name == "question" || call.name == "AskUserQuestion" {
-                let (answer, is_error) = answer_question(&call.input);
+                let (answer, is_error) = answer_question(&call_input);
                 report::tool_result(&call.name, &answer, is_error);
                 trace_tool_result(&call.name, &answer, is_error, "plan", 0);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &answer,
+                    is_error,
+                    &mut loop_summary,
+                );
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: answer,
@@ -1045,16 +1667,24 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 });
                 continue;
             }
-            let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
-                PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
+                PreDecision::Continue => gate(Permission::ReadOnly, &call.name, &call_input, cwd),
             };
             if let Some(reason) = reason {
                 trace::record_visible(
                     "tool_denied",
                     format!("{} denied", call.name),
-                    serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "plan", "depth": 0}),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "plan", "depth": 0}),
+                );
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &reason,
+                    true,
+                    &mut loop_summary,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -1064,7 +1694,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 continue;
             }
             if call.name == "save_memory" {
-                if let Some(note) = call.input["note"].as_str() {
+                if let Some(note) = call_input["note"].as_str() {
                     config::append_memory(note);
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
@@ -1077,9 +1707,17 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     continue;
                 }
             }
-            let out = tools::run(&call.name, &call.input, cwd);
+            let out = tools::run(&call.name, &call_input, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "plan", 0);
+            note_loop_result(
+                &mut loop_guard,
+                &call.name,
+                &call_input,
+                &out.content,
+                out.is_error,
+                &mut loop_summary,
+            );
             results.push(ToolResult {
                 id: call.id.clone(),
                 content: out.content,
@@ -1087,21 +1725,22 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             });
         }
         msgs.push(Msg::Assistant {
-            text: reply.text,
+            text: assistant_tool_turn_text(reply.text, &reply.calls),
             calls: reply.calls,
         });
         msgs.push(Msg::Tool(results));
+        if let Some(loop_msg) = loop_summary {
+            return Err(loop_msg);
+        }
     };
 
-    let mut steps: Vec<String> = plan_text
-        .lines()
-        .map(|l| {
-            l.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | ')' | '-' | ' '))
-                .trim()
-        })
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect();
+    let mut steps = parse_plan_steps(&plan_text);
+    if !plan_steps_are_actionable(&steps) {
+        return Err(
+            "planning did not produce an actionable numbered or bulleted plan after recovery attempts"
+                .into(),
+        );
+    }
 
     loop {
         tui::line("");
@@ -1177,63 +1816,16 @@ pub fn run_brainstorm(
         maybe_compact(p, &mut msgs);
 
         // Keep consuming tool calls until the model gives a text response.
+        let mut tool_rounds = 0usize;
         let reply_text = loop {
+            tool_rounds += 1;
+            if tool_rounds > MAX_CHAT_TOOL_ROUNDS {
+                break format!(
+                    "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
+                );
+            }
             tui::line("");
-            if !report::is_json() {
-                tui::line(&tui::dim(&format!(
-                    "  thinking: asking {} with {} available tools",
-                    p.model,
-                    defs.len()
-                )));
-            }
-            let mut spin = Some(tui::spinner_start("thinking…"));
-            let mut streamed = false;
-            let mut thinking_buf = String::new();
-            let mut renderer = if !report::is_json() {
-                Some(tui::StreamRenderer::new())
-            } else {
-                None
-            };
-            let res = provider::stream(
-                p,
-                &msgs,
-                &defs,
-                &mut |c| {
-                    if let Some(s) = spin.take() {
-                        tui::spinner_stop(s);
-                    }
-                    if let Some(r) = &mut renderer {
-                        r.push(c);
-                    } else {
-                        report::assistant_delta(c);
-                    }
-                    streamed = true;
-                },
-                &mut |t| {
-                    thinking_buf.push_str(t);
-                    while let Some(nl) = thinking_buf.find('\n') {
-                        let tl = thinking_buf[..nl].trim().to_string();
-                        if !tl.is_empty() {
-                            tui::write_stream(&format!(
-                                "\r  {} {}\r\n",
-                                tui::dim("◌"),
-                                tui::dim(&tl)
-                            ));
-                        }
-                        thinking_buf = thinking_buf[nl + 1..].to_string();
-                    }
-                },
-            );
-            if let Some(s) = spin.take() {
-                tui::spinner_stop(s);
-            }
-            let reply = res?;
-            if let Some(r) = &mut renderer {
-                r.flush();
-            }
-            if streamed {
-                report::assistant_end();
-            }
+            let reply = request_reply(p, &msgs, &defs, "thinking")?;
 
             if reply.calls.is_empty() {
                 msgs.push(Msg::Assistant {
@@ -1250,16 +1842,47 @@ pub fn run_brainstorm(
             let mut results = Vec::new();
             let mut loop_summary: Option<String> = None;
             for call in &reply.calls {
+                if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                    let msg = format!(
+                        "tool arguments were not valid JSON: {}",
+                        raw.chars().take(200).collect::<String>()
+                    );
+                    report::tool_denied(&msg);
+                    note_loop_result(
+                        &mut loop_guard,
+                        &call.name,
+                        &call.input,
+                        &msg,
+                        true,
+                        &mut loop_summary,
+                    );
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: msg,
+                        is_error: true,
+                    });
+                    continue;
+                }
+                let call_input =
+                    tool_input_for_execution(&call.name, &call.input, cwd, "brainstorm", 0);
                 report::tool_call(
                     &call.name,
-                    &tools::preview(&call.name, &call.input),
-                    &call.input,
+                    &tools::preview(&call.name, &call_input),
+                    &call_input,
                 );
-                trace_tool_call(&call.name, &call.input, "brainstorm", 0);
+                trace_tool_call(&call.name, &call_input, "brainstorm", 0);
                 if call.name == "question" || call.name == "AskUserQuestion" {
-                    let (answer, is_error) = answer_question(&call.input);
+                    let (answer, is_error) = answer_question(&call_input);
                     report::tool_result(&call.name, &answer, is_error);
                     trace_tool_result(&call.name, &answer, is_error, "brainstorm", 0);
+                    note_loop_result(
+                        &mut loop_guard,
+                        &call.name,
+                        &call_input,
+                        &answer,
+                        is_error,
+                        &mut loop_summary,
+                    );
                     results.push(ToolResult {
                         id: call.id.clone(),
                         content: answer,
@@ -1267,16 +1890,24 @@ pub fn run_brainstorm(
                     });
                     continue;
                 }
-                let reason = match hooks::pre_tool_use(&call.name, &call.input, cwd) {
+                let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
                     PreDecision::Deny(r) => Some(r),
                     PreDecision::Allow => None,
-                    PreDecision::Continue => gate(perm, &call.name, &call.input, cwd),
+                    PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
                 };
                 if let Some(reason) = reason {
                     trace::record_visible(
                         "tool_denied",
                         format!("{} denied", call.name),
-                        serde_json::json!({"tool": call.name, "reason": reason, "input": call.input, "phase": "brainstorm", "depth": 0}),
+                        serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "brainstorm", "depth": 0}),
+                    );
+                    note_loop_result(
+                        &mut loop_guard,
+                        &call.name,
+                        &call_input,
+                        &reason,
+                        true,
+                        &mut loop_summary,
                     );
                     results.push(ToolResult {
                         id: call.id.clone(),
@@ -1286,7 +1917,7 @@ pub fn run_brainstorm(
                     continue;
                 }
                 if call.name == "save_memory" {
-                    if let Some(note) = call.input["note"].as_str() {
+                    if let Some(note) = call_input["note"].as_str() {
                         config::append_memory(note);
                         let msg = "memory saved".to_string();
                         report::tool_result(&call.name, &msg, false);
@@ -1299,16 +1930,18 @@ pub fn run_brainstorm(
                         continue;
                     }
                 }
-                let out = tools::run(&call.name, &call.input, cwd);
-                hooks::post_tool_use(&call.name, &call.input, &out.content, out.is_error, cwd);
+                let out = tools::run(&call.name, &call_input, cwd);
+                hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
                 report::tool_result(&call.name, &out.content, out.is_error);
                 trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
-                if let Some(loop_msg) =
-                    loop_guard.note(&call.name, &call.input, &out.content, out.is_error)
-                {
-                    report::assistant(&loop_msg);
-                    loop_summary = Some(loop_msg);
-                }
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &out.content,
+                    out.is_error,
+                    &mut loop_summary,
+                );
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: out.content,
@@ -1316,7 +1949,7 @@ pub fn run_brainstorm(
                 });
             }
             msgs.push(Msg::Assistant {
-                text: reply.text,
+                text: assistant_tool_turn_text(reply.text, &reply.calls),
                 calls: reply.calls,
             });
             msgs.push(Msg::Tool(results));
@@ -1414,6 +2047,94 @@ mod tests {
         assert!(role("researcher").system.contains("research"));
         assert!(role("engineer").system.contains("software engineer"));
         assert!(role("ceo").system.contains("software engineer"));
+    }
+
+    #[test]
+    fn parse_plan_steps_keeps_only_list_items() {
+        let steps = parse_plan_steps(
+            "Intro prose.\n\
+             1. **Inspect the content of `hello.txt`**.\n\
+             ```bash\n\
+             write_file hello.txt nope\n\
+             ```\n\
+             2. Step 2: Summarize the file.\n\
+             Outro.",
+        );
+        assert_eq!(
+            steps,
+            vec![
+                "Inspect the content of `hello.txt`.".to_string(),
+                "Summarize the file.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_plan_steps_rejects_prose_only_plan() {
+        let steps = parse_plan_steps(
+            "The project directory does not exist. I will attempt to list files if you provide a path.",
+        );
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn plan_steps_must_be_actions_not_file_lists() {
+        let files = vec![
+            "`.env.example`".to_string(),
+            "`README.md`".to_string(),
+            "`harness/`".to_string(),
+        ];
+        assert!(!plan_steps_are_actionable(&files));
+        let actions = vec![
+            "Inspect the current workspace root.".to_string(),
+            "List the top-level files.".to_string(),
+            "Summarize the result.".to_string(),
+        ];
+        assert!(plan_steps_are_actionable(&actions));
+    }
+
+    #[test]
+    fn placeholder_project_path_is_repaired_for_discovery_tools() {
+        let cwd = Path::new("/tmp/example-project");
+        let repaired =
+            repair_placeholder_tool_input("list", &json!({"path": "/path/to/your/project"}), cwd)
+                .unwrap();
+        assert_eq!(repaired["path"], "/tmp/example-project");
+        assert!(repair_placeholder_tool_input(
+            "read_file",
+            &json!({"path": "your-project-file.txt"}),
+            cwd
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn auto_static_artifact_extracts_html_response() {
+        let input = auto_static_artifact_input(
+            "build me a canvas game",
+            "HTML:\n```html\n<!doctype html><html><head><title>Orbit</title></head><body><canvas></canvas><script>requestAnimationFrame(()=>{})</script></body></html>\n```",
+        )
+        .unwrap();
+        assert_eq!(input["title"], "Orbit");
+        assert!(input["contents"].as_str().unwrap().contains("<canvas>"));
+    }
+
+    #[test]
+    fn auto_static_artifact_ignores_non_static_tasks() {
+        assert!(auto_static_artifact_input(
+            "explain this code",
+            "<!doctype html><html><body></body></html>"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn static_artifact_recovery_prompt_tells_model_to_build() {
+        let prompt = static_artifact_recovery_prompt("build me a canvas game");
+        assert!(prompt.contains("BUILD task"));
+        assert!(prompt.contains("reasonable defaults"));
+        assert!(prompt.contains("Artifact/publish_artifact"));
+        assert!(prompt.contains("self-contained HTML"));
     }
 
     #[test]

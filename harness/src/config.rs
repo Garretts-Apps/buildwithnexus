@@ -107,11 +107,21 @@ pub struct Settings {
     pub provider: String,
     pub model: String,
     pub permission: String,
+    #[serde(default = "default_effort")]
+    pub effort: String,
     #[serde(default)]
     pub base_url: Option<String>,
     /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub plugins: BTreeMap<String, serde_json::Value>,
+}
+
+fn default_effort() -> String {
+    "low".into()
 }
 
 impl Default for Settings {
@@ -120,8 +130,11 @@ impl Default for Settings {
             provider: "anthropic".into(),
             model: String::new(),
             permission: "ask".into(),
+            effort: "low".into(),
             base_url: None,
             allowed_commands: Vec::new(),
+            mcp_servers: BTreeMap::new(),
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -300,6 +313,42 @@ pub fn load_skills() -> Vec<(String, String)> {
     out
 }
 
+/// Extract a short description from a skill's markdown content.
+/// Looks for the first non-heading, non-empty line (typically "Use this skill for/when...").
+/// Falls back to the first heading text if no description line is found.
+pub fn skill_description(content: &str) -> String {
+    let mut title = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            if title.is_empty() {
+                title = trimmed.trim_start_matches('#').trim().to_string();
+            }
+            continue;
+        }
+        // First non-heading, non-empty line is the description.
+        return trimmed.to_string();
+    }
+    title
+}
+
+/// Returns (name, short_description) pairs for all skills.
+/// Only extracts the description line — never loads the full skill body into the
+/// model's context. Bad/small models benefit from this because the system prompt
+/// stays small and they can selectively load_skill the ones they need.
+pub fn load_skill_descriptions() -> Vec<(String, String)> {
+    load_skills()
+        .into_iter()
+        .map(|(name, content)| {
+            let desc = skill_description(&content);
+            (name, desc)
+        })
+        .collect()
+}
+
 pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
     vec![
         (
@@ -340,6 +389,7 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
             include_str!("bundled_skills/data-analysis.md"),
         ),
         ("frontend-ux", include_str!("bundled_skills/frontend-ux.md")),
+        ("static-app", include_str!("bundled_skills/static-app.md")),
     ]
 }
 
@@ -414,7 +464,10 @@ pub fn discover_hook_scripts(event: &str) -> Vec<PathBuf> {
         for e in entries {
             let p = e.path();
             if let Some(ext) = p.extension().map(|x| x.to_string_lossy().to_lowercase()) {
-                if matches!(ext.as_str(), "sh" | "bash" | "py" | "python") {
+                if matches!(
+                    ext.as_str(),
+                    "sh" | "bash" | "py" | "python" | "rs" | "rust"
+                ) {
                     scripts.push(p);
                 }
             }
@@ -455,6 +508,9 @@ pub fn scaffold_home() {
         "hooks/SessionStart",
         "hooks/SessionEnd",
         "hooks/UserPromptSubmit",
+        "hooks/PrePrompt",
+        "hooks/PostResponse",
+        "hooks/OnError",
         "hooks/Stop",
     ] {
         let _ = fs::create_dir_all(h.join(sub));
@@ -477,12 +533,16 @@ the most relevant skill instructions. Bundled skills are callable as slash
 commands, for example /self-knowledge, /tool-use, /codebase-repair,
 /rust-cli, /spec-writing, /document-generation, /test-engineering,
 /code-review, /security-review, /release-notes, /research, /data-analysis,
-and /frontend-ux.
+/frontend-ux, and /static-app.
 
 When a user names a skill or uses a skill slash command, treat that skill as
 active context for the task. When no skill is named, choose the closest relevant
 skill yourself and follow it. Use /trace to inspect evidence of loaded skills,
 tool calls, hooks, and subagents.
+
+For browser games, canvas demos, standalone prototypes, and simple websites,
+load and follow /static-app. Build an actual runnable artifact rather than
+replying with code in markdown.
 
 ## Engineer
 A senior full-stack engineer. Reads before writing. Prefers small, verifiable
@@ -502,17 +562,90 @@ unnecessary complexity. Produces a concise numbered list of findings.
 }
 
 pub fn load_settings() -> Option<Settings> {
-    // Canonical file is settings.json. Try it first; if it can't be parsed as
-    // Settings (e.g. it's a hooks-only file), fall back to config.json so
-    // older installations keep working.
-    if let Ok(text) = fs::read_to_string(settings_path()) {
-        if let Ok(s) = serde_json::from_str::<Settings>(&text) {
-            return Some(s);
+    load_settings_from_dir(&std::env::current_dir().unwrap_or_else(|_| home()))
+}
+
+/// Loads settings from global ~/.buildwithnexus/config.json, settings.json, settings.local.json,
+/// and project .buildwithnexus/settings.json, settings.local.json, merging them in hierarchy order.
+pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
+    let mut sources = Vec::new();
+
+    // 1. Global config.json (legacy base)
+    if let Ok(text) = fs::read_to_string(home().join("config.json")) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if val.is_object() { sources.push(val); }
         }
-        // settings.json exists but lacks provider/model/permission — fall through.
     }
-    let text = fs::read_to_string(home().join("config.json")).ok()?;
-    serde_json::from_str(&text).ok()
+
+    // 2. Global settings.json
+    if let Ok(text) = fs::read_to_string(settings_path()) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if val.is_object() { sources.push(val); }
+        }
+    }
+
+    // 3. Global settings.local.json
+    if let Ok(text) = fs::read_to_string(home().join("settings.local.json")) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if val.is_object() { sources.push(val); }
+        }
+    }
+
+    // 4. Project settings.json
+    let proj_path = workdir.join(".buildwithnexus").join("settings.json");
+    if let Ok(text) = fs::read_to_string(&proj_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if val.is_object() { sources.push(val); }
+        }
+    }
+
+    // 5. Project settings.local.json
+    let local_path = workdir.join(".buildwithnexus").join("settings.local.json");
+    if let Ok(text) = fs::read_to_string(&local_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            if val.is_object() { sources.push(val); }
+        }
+    }
+
+    if sources.is_empty() {
+        return None;
+    }
+
+    let mut merged = sources.remove(0);
+    for source in sources {
+        merge_json_values(&mut merged, source);
+    }
+
+    serde_json::from_value(merged).ok()
+}
+
+fn merge_json_values(target: &mut serde_json::Value, source: serde_json::Value) {
+    match (target, source) {
+        (serde_json::Value::Object(ref mut target_map), serde_json::Value::Object(source_map)) => {
+            for (k, v) in source_map {
+                if k == "allowed_commands" {
+                    if let (Some(serde_json::Value::Array(ref mut target_arr)), serde_json::Value::Array(source_arr)) = (target_map.get_mut(&k), v.clone()) {
+                        for item in source_arr {
+                            if !target_arr.contains(&item) {
+                                target_arr.push(item);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let Some(target_val) = target_map.get_mut(&k) {
+                    if target_val.is_object() && v.is_object() {
+                        merge_json_values(target_val, v);
+                        continue;
+                    }
+                }
+                target_map.insert(k, v);
+            }
+        }
+        (target, source) => {
+            *target = source;
+        }
+    }
 }
 
 pub fn save_settings(s: &Settings) {
@@ -651,6 +784,16 @@ mod tests {
     }
 
     #[test]
+    fn bundled_skills_include_static_app() {
+        let names = bundled_skills()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"static-app"));
+        assert!(names.contains(&"frontend-ux"));
+    }
+
+    #[test]
     fn remote_presets_use_https() {
         for p in PRESETS.iter().filter(|p| !p.local) {
             assert!(p.base_url.starts_with("https://"), "{} not https", p.id);
@@ -672,12 +815,15 @@ mod tests {
             provider: "ollama".into(),
             model: "llama3.2".into(),
             permission: "auto".into(),
+            effort: "high".into(),
             base_url: Some("http://x".into()),
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(back.provider, "ollama");
+        assert_eq!(back.effort, "high");
         assert_eq!(back.base_url.as_deref(), Some("http://x"));
     }
 
@@ -753,8 +899,10 @@ mod tests {
             provider: "groq".into(),
             model: String::new(),
             permission: "ask".into(),
+            effort: "low".into(),
             base_url: None,
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
         save_settings(&s);
         assert_eq!(load_settings().unwrap().provider, "groq");

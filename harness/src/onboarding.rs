@@ -233,6 +233,7 @@ pub fn run() -> Option<Settings> {
         permission,
         base_url,
         allowed_commands: Vec::new(),
+        ..Default::default()
     };
     config::save_settings(&settings);
     tui::line("");
