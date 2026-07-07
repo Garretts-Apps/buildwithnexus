@@ -188,3 +188,44 @@ pub fn notice(msg: &str) {
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clip_head_short_and_exact() {
+        assert_eq!(clip_head("", 5), Vec::<String>::new());
+        assert_eq!(clip_head("one\ntwo", 5), vec!["one", "two"]);
+        assert_eq!(clip_head("a\nb\nc", 3), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_clip_head_truncation() {
+        let input = "1\n2\n3\n4\n5\n6\n7";
+        let clipped = clip_head(input, 3);
+        assert_eq!(clipped.len(), 4);
+        assert_eq!(clipped[0], "1");
+        assert_eq!(clipped[1], "2");
+        assert_eq!(clipped[2], "3");
+        assert_eq!(clipped[3], "…(+4 more lines)");
+    }
+
+    #[test]
+    fn test_clip_tail_short_and_exact() {
+        assert_eq!(clip_tail("", 5), Vec::<String>::new());
+        assert_eq!(clip_tail("one\ntwo", 5), vec!["one", "two"]);
+        assert_eq!(clip_tail("a\nb\nc", 3), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_clip_tail_truncation() {
+        let input = "1\n2\n3\n4\n5\n6\n7";
+        let clipped = clip_tail(input, 3);
+        assert_eq!(clipped.len(), 4);
+        assert_eq!(clipped[0], "…(+4 earlier lines)");
+        assert_eq!(clipped[1], "5");
+        assert_eq!(clipped[2], "6");
+        assert_eq!(clipped[3], "7");
+    }
+}
