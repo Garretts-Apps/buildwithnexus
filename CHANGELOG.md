@@ -4,6 +4,40 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-07-07
+
+Document generation, web-content quality, TUI, and small-model streaming
+refinements — all additive fixes, no breaking changes.
+
+### Added
+- **Rich Word document generation.** `create_docx` now renders inline markdown
+  (`**bold**`, `*italic*`, `` `code` ``) as real Word runs instead of literal
+  asterisks, and converts markdown tables (`| col | col |`) into bordered Word
+  tables with a bold header row. Emphasis is conservative — arithmetic like
+  `5 * 3`, glob patterns, and `snake_case` are left untouched.
+- **Structured web search.** `web_search` returns numbered `title / url /
+  snippet` results (recovering the real target URL from DuckDuckGo's redirect
+  wrapper) instead of the raw page run through an HTML stripper — far easier for
+  small models to read. Falls back to the stripped text if the markup changes.
+
+### Fixed
+- **Numeric HTML entities in fetched content.** `strip_html` and the search
+  parser now decode decimal/hex character references (`&#8217;`, `&#x2019;`,
+  `&mdash;`), so fetched pages and snippets no longer show garbled curly quotes
+  and dashes.
+- **TUI markdown emphasis.** An unbalanced `` ` ``, `**`, or single `*` (e.g.
+  `5 * 3`) no longer styles the rest of the line — the inline renderer only
+  opens a style when a matching closer exists ahead and the marker flanks
+  non-space text.
+- **`<think>` reasoning leakage.** Reasoning models (DeepSeek-R1 distills, Qwen
+  thinking variants) that emit `<think>…</think>` inline in content no longer
+  leak that into the final answer or written files: it's stripped on the
+  non-streaming parse path, and a `<think>`/`</think>` tag split across streaming
+  chunks (routine with token-by-token local streaming) is now reassembled
+  instead of leaking a partial marker.
+
+[0.11.2]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.11.2
+
 ## [0.11.1] - 2026-07-07
 
 ### Fixed
