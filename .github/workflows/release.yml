@@ -58,7 +58,8 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           ext=""; [[ "$TARGET" == *windows* ]] && ext=".exe"
-          src="harness/target/$TARGET/release/buildwithnexus${ext}"
+          src="target/$TARGET/release/buildwithnexus${ext}"
+          [[ ! -f "$src" ]] && src="harness/target/$TARGET/release/buildwithnexus${ext}"
           asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
