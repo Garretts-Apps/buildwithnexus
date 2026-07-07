@@ -4,6 +4,30 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-07-07
+
+Gemma local-model support, from a real gemma-2-2b-it session on llama.cpp.
+
+### Added
+- **Parse Gemma's `tool_code` tool-call format.** Gemma emits tool calls as a
+  ```` ```tool_code ```` fenced Python call — `write_file("/p", """…""")`,
+  sometimes wrapped in `print(...)`. The harness only understood JSON/`<tools>`,
+  so it treated the call as prose and (eventually) published an empty artifact.
+  The recovery parser now handles the Python-call syntax: it unwraps `print()`,
+  splits arguments while skipping triple/single/double-quoted strings, and maps
+  keyword and positional args through each tool's signature. Verified: Gemma's
+  `write_file` now executes on the first attempt.
+
+### Fixed
+- **Gemma multi-turn no longer crashes on the chat template.** Gemma's llama.cpp
+  template rejects the `system`/`tool` roles and requires strictly alternating
+  user/assistant turns, so any turn carrying a tool result 400'd and the agentic
+  loop died after one step. On such a template error the OpenAI-compatible path
+  now retries once with a flattened, strictly-alternating message body. (qwen's
+  template accepts the standard roles, so its path is unchanged.)
+
+[0.11.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.11.4
+
 ## [0.11.3] - 2026-07-07
 
 Small-model BUILD reliability, from a real qwen2.5-coder-1.5b session that
