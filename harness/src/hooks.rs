@@ -13,6 +13,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -405,18 +406,39 @@ fn hook_warn(msg: &str) {
     }
 }
 
-fn drain_pipe<R: Read + Send + 'static>(r: Option<R>) -> Option<thread::JoinHandle<Vec<u8>>> {
+// Drain a pipe on its own thread and deliver the bytes over a channel. A
+// channel (rather than a JoinHandle) lets the collector bound how long it waits:
+// when a timed-out hook leaves a grandchild holding the pipe open, `read_to_end`
+// never returns, and joining the thread would block for the grandchild's full
+// lifetime. The orphaned thread ends on its own when the pipe finally closes.
+// Human-readable hook timeout: whole seconds when ≥1s, else milliseconds, so a
+// sub-second deadline doesn't render as a confusing "0s".
+fn fmt_duration(d: Duration) -> String {
+    if d.as_secs() >= 1 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+fn drain_pipe<R: Read + Send + 'static>(r: Option<R>) -> Option<mpsc::Receiver<Vec<u8>>> {
     r.map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     })
 }
 
-fn join_pipe(h: Option<thread::JoinHandle<Vec<u8>>>) -> String {
-    h.and_then(|h| h.join().ok())
+// Collect drained bytes, waiting at most `grace`. On the normal path the child
+// has already exited (pipes at EOF), so the thread has sent and this returns at
+// once; on the timeout path it caps the wait instead of blocking on a surviving
+// grandchild.
+fn join_pipe(rx: Option<mpsc::Receiver<Vec<u8>>>, grace: Duration) -> String {
+    rx.and_then(|rx| rx.recv_timeout(grace).ok())
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default()
 }
@@ -476,8 +498,15 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, Strin
     if let Some(h) = stdin_h {
         let _ = h.join();
     }
-    let stdout = join_pipe(stdout_h);
-    let stderr = join_pipe(stderr_h);
+    // On a clean exit the pipes are already at EOF so this returns immediately;
+    // after a timeout it caps how long we wait on a possibly-orphaned pipe.
+    let grace = if timed_out {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(5)
+    };
+    let stdout = join_pipe(stdout_h, grace);
+    let stderr = join_pipe(stderr_h, grace);
     match status {
         Some(st) => match st.code() {
             Some(code) => (code, stdout, stderr),
@@ -488,14 +517,14 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, Strin
             }
         },
         None if timed_out => {
-            let secs = timeout.as_secs();
+            let dur = fmt_duration(timeout);
             hook_warn(&format!(
-                "hook `{label}` timed out after {secs}s and was killed"
+                "hook `{label}` timed out after {dur} and was killed"
             ));
             (
                 HOOK_TIMEOUT_CODE,
                 stdout,
-                format!("{stderr}\nhook timed out after {secs}s")
+                format!("{stderr}\nhook timed out after {dur}")
                     .trim()
                     .to_string(),
             )
