@@ -195,6 +195,134 @@ pub fn stream(
     request(p, msgs, tools, true, on_text, on_thinking)
 }
 
+// A restrictive chat template (notably Gemma's on llama.cpp) rejected the
+// standard message roles: it can't render the `system`/`tool` roles or requires
+// strictly alternating user/assistant turns. Detected from the server's 400 so
+// the retry only fires for models that need it (qwen's template accepts them).
+fn is_template_role_error(e: &str) -> bool {
+    let l = e.to_lowercase();
+    l.contains("roles must alternate")
+        || l.contains("conversation roles")
+        || l.contains("unable to generate parser")
+        || l.contains("does not support")
+        || (l.contains("template") && l.contains("role"))
+}
+
+// Flatten a message's content (string or multimodal parts) to plain text.
+fn message_text(content: &Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    String::new()
+}
+
+// Rewrite the request body's messages into the shape restrictive templates
+// accept: strictly alternating user/assistant with no `system`/`tool` roles.
+// System and tool-result content fold into user turns, an assistant turn's
+// tool_calls render as text, consecutive same-role turns merge, and the native
+// `tools` field is dropped — the model then emits tool_code/text calls, which
+// the agent's recovery parser handles.
+fn flatten_openai_messages(body: &mut Value) {
+    let Some(msgs) = body["messages"].as_array() else {
+        return;
+    };
+    let mut folded: Vec<(String, String)> = Vec::new();
+    for m in msgs {
+        let role = m["role"].as_str().unwrap_or("user");
+        let text = message_text(&m["content"]);
+        match role {
+            // Keep only the assistant's own prose. A prior tool_call is NOT
+            // rendered as text — a small model will imitate whatever call-shaped
+            // marker it sees and stop making real calls. The following "Tool
+            // result:" user turn already conveys what happened.
+            "assistant" => {
+                if !text.is_empty() {
+                    folded.push(("assistant".into(), text));
+                }
+            }
+            "tool" => {
+                if !text.is_empty() {
+                    folded.push(("user".into(), format!("Tool result:\n{text}")));
+                }
+            }
+            _ => folded.push(("user".into(), text)),
+        }
+    }
+    // Merge consecutive same-role turns so roles strictly alternate.
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (role, text) in folded {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == role {
+                if !text.is_empty() {
+                    if !last.1.is_empty() {
+                        last.1.push_str("\n\n");
+                    }
+                    last.1.push_str(&text);
+                }
+                continue;
+            }
+        }
+        merged.push((role, text));
+    }
+    // These templates require the first turn to be `user`.
+    if merged.first().is_some_and(|(r, _)| r == "assistant") {
+        merged.insert(0, ("user".into(), String::new()));
+    }
+    body["messages"] = json!(merged
+        .iter()
+        .map(|(r, t)| json!({"role": r, "content": t}))
+        .collect::<Vec<_>>());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("tools");
+    }
+}
+
+// Send an OpenAI-compatible request; on a template/role rejection, retry once
+// with a flattened, strictly-alternating message body.
+fn openai_exchange(
+    req: ureq::Request,
+    mut body: Value,
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    if streaming {
+        body["stream"] = json!(true);
+    }
+    match send_raw(req.clone(), body.clone()) {
+        Ok(resp) => finish_openai(resp, streaming, on_text, on_thinking),
+        Err(e) if is_template_role_error(&e) => {
+            flatten_openai_messages(&mut body);
+            let resp = send_raw(req, body)?;
+            finish_openai(resp, streaming, on_text, on_thinking)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn finish_openai(
+    resp: ureq::Response,
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    if streaming {
+        openai_stream(resp.into_reader(), on_text, on_thinking)
+    } else {
+        let v = resp
+            .into_json::<Value>()
+            .map_err(|e| format!("bad JSON from server: {e}"))?;
+        openai_parse(v)
+    }
+}
+
 fn request(
     p: &Provider,
     msgs: &[Msg],
@@ -214,13 +342,8 @@ fn request(
             }
         }
         Protocol::OpenAi => {
-            let (req, mut body) = openai_request(p, msgs, tools);
-            if streaming {
-                body["stream"] = json!(true);
-                openai_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
-            } else {
-                openai_parse(send(req, body)?)
-            }
+            let (req, body) = openai_request(p, msgs, tools);
+            openai_exchange(req, body, streaming, on_text, on_thinking)
         }
         Protocol::OllamaNative => {
             // The native path exists to set options.num_ctx (unavailable on
@@ -242,13 +365,8 @@ fn request(
                 None => {
                     warn_ollama_fallback();
                     let base = format!("{}/v1", ollama_root(&p.base_url));
-                    let (req, mut body) = openai_request_at(p, &base, msgs, tools);
-                    if streaming {
-                        body["stream"] = json!(true);
-                        openai_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
-                    } else {
-                        openai_parse(send(req, body)?)
-                    }
+                    let (req, body) = openai_request_at(p, &base, msgs, tools);
+                    openai_exchange(req, body, streaming, on_text, on_thinking)
                 }
             }
         }
@@ -1518,6 +1636,67 @@ mod tests {
             call["function"]["arguments"],
             json!({"cmd": "ls"}).to_string()
         );
+    }
+
+    #[test]
+    fn template_role_error_detected() {
+        assert!(is_template_role_error(
+            "HTTP 400: Unable to generate parser for this template. Conversation roles must alternate user/assistant"
+        ));
+        assert!(!is_template_role_error("HTTP 500: internal error"));
+        assert!(!is_template_role_error("HTTP 429: rate limited"));
+    }
+
+    #[test]
+    fn flatten_messages_produces_alternating_user_assistant() {
+        // system, user, assistant(+tool_call), tool-result → must collapse to
+        // strictly alternating user/assistant with no system/tool roles.
+        let mut body = json!({
+            "model": "gemma",
+            "tools": [{"type": "function"}],
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "build it"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\":\"a\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "1", "content": "wrote a"}
+            ]
+        });
+        flatten_openai_messages(&mut body);
+        let m = body["messages"].as_array().unwrap();
+        // The empty tool-call-only assistant turn is dropped (no call-shaped
+        // text for a small model to imitate), so the remaining turns are all
+        // user/assistant with none of the system/tool roles.
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert!(roles.iter().all(|r| *r == "user" || *r == "assistant"));
+        let joined: String = m
+            .iter()
+            .map(|x| x["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("You are helpful"));
+        assert!(joined.contains("build it"));
+        assert!(joined.contains("Tool result"));
+        // A synthetic "[called …]" marker must never leak into the prompt.
+        assert!(!joined.contains("[called"));
+        // The native tools field is dropped for the restrictive template.
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn flatten_messages_prepends_user_when_starting_on_assistant() {
+        let mut body = json!({
+            "messages": [{"role": "assistant", "content": "hi"}]
+        });
+        flatten_openai_messages(&mut body);
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
     }
 
     #[test]
