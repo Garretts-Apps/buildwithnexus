@@ -531,7 +531,7 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
     }
     let stop_reason = v["stop_reason"].as_str().map(normalize_stop_reason);
     Ok(Reply {
-        text,
+        text: strip_think(&text),
         calls,
         stop_reason,
     })
@@ -729,9 +729,35 @@ fn openai_request_at(
     (req, body)
 }
 
+// Remove `<think>…</think>` reasoning blocks that local reasoning models
+// (DeepSeek-R1 distills, Qwen thinking variants) emit inline in `content` on
+// the non-streaming path. Handles multiple blocks and an unclosed `<think>`
+// (drops the trailing leaked chain-of-thought). Text without think tags is
+// returned untouched. The streaming path already routes these to on_thinking.
+fn strip_think(text: &str) -> String {
+    if !text.contains("<think>") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        match after.find("</think>") {
+            Some(end) => rest = &after[end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 fn openai_parse(v: Value) -> Result<Reply, String> {
     let msg = &v["choices"][0]["message"];
-    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let text = strip_think(msg["content"].as_str().unwrap_or_default());
     let mut calls = Vec::new();
     if let Some(tcs) = msg["tool_calls"].as_array() {
         for tc in tcs {
@@ -1084,7 +1110,7 @@ fn ollama_call(i: usize, tc: &Value) -> ToolCall {
 
 fn ollama_parse(v: Value) -> Result<Reply, String> {
     let msg = &v["message"];
-    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let text = strip_think(msg["content"].as_str().unwrap_or_default());
     let mut calls = Vec::new();
     if let Some(tcs) = msg["tool_calls"].as_array() {
         for tc in tcs {
@@ -1742,6 +1768,40 @@ mod tests {
         ]}}]});
         let r = openai_parse(v).unwrap();
         assert_eq!(r.calls[0].input, json!({}));
+    }
+
+    // ── think-tag stripping ─────────────────────────────────────────────────
+    #[test]
+    fn strip_think_removes_blocks_and_keeps_answer() {
+        assert_eq!(
+            strip_think("<think>let me reason</think>The answer is 42."),
+            "The answer is 42."
+        );
+        // Multiple blocks, with real content between them.
+        assert_eq!(strip_think("<think>a</think>X<think>b</think>Y"), "XY");
+        // No tags → untouched.
+        assert_eq!(strip_think("plain answer"), "plain answer");
+    }
+
+    #[test]
+    fn strip_think_drops_unclosed_reasoning() {
+        // An unterminated <think> means the model never emitted a final answer;
+        // the leaked reasoning must not become the answer.
+        assert_eq!(strip_think("intro <think>reasoning with no close"), "intro");
+    }
+
+    #[test]
+    fn openai_parse_strips_think_from_content() {
+        let v = json!({"choices": [{"message": {"content": "<think>plan</think>done"}}]});
+        let r = openai_parse(v).unwrap();
+        assert_eq!(r.text, "done");
+    }
+
+    #[test]
+    fn ollama_parse_strips_think_from_content() {
+        let v = json!({"message": {"content": "<think>hmm</think>result"}, "done_reason": "stop"});
+        let r = ollama_parse(v).unwrap();
+        assert_eq!(r.text, "result");
     }
 
     // ── stop_reason ─────────────────────────────────────────────────────────
