@@ -1006,6 +1006,21 @@ fn format_inline_md(text: &str) -> String {
     out
 }
 
+/// Renders a single line of Markdown into ANSI SGR terminal escape sequences.
+///
+/// This function parses and styles block-level constructs at the start of the line:
+/// - Headers (`# `, `## `, `### `): Formatted in bold accent, cyan, and blue respectively.
+/// - Blockquotes (`> `): Rendered with a dimmed vertical accent bar (`│`) and italicized text.
+/// - Unordered lists (`- `, `* `): Rendered with a dimmed bullet point (`•`).
+/// - Numbered lists (`1. `, `2. `): Formatted with bold cyan numbers.
+///
+/// It also processes inline formatting across the line:
+/// - Inline code spans (`` `code` ``): Highlighted in yellow.
+/// - Bold text (`**text**`): Styled with ANSI bold (`\x1b[1m`).
+/// - Italic text (`*text*`): Styled with ANSI italic (`\x1b[3m`).
+/// - Hyperlinks (`[label](url)`): Formatted with an underlined cyan label and dimmed URL.
+///
+/// If color is disabled via `NO_COLOR`, this returns the original unformatted line.
 pub fn render_md_line(s: &str) -> String {
     if no_color() {
         return s.to_string();
@@ -1048,6 +1063,10 @@ pub fn render_md_line(s: &str) -> String {
     }
 }
 
+/// Renders a multiline Markdown document into formatted ANSI terminal output.
+///
+/// Splits the input text by newline, applies [`render_md_line`] to each line,
+/// and re-joins them with newline characters.
 pub fn render_md(text: &str) -> String {
     text.lines()
         .map(render_md_line)
