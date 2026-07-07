@@ -318,11 +318,14 @@ pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<To
 }
 
 // The compact surface advertises one canonical tool per capability — read,
-// write, edit, shell, glob, grep, list, artifact publishing, plus the
-// finish/question control tools and python_tool for local extensions. Pure
-// aliases (`read`/`write`/`edit`/`bash`, `publish_artifact`) still dispatch in
-// `run` if a model insists, but advertising duplicates wastes prompt tokens
-// and confuses weak models. Keep this list at 12 defs or fewer.
+// write, edit, shell, glob, grep, list, artifact publishing, plus the finish
+// control tool and python_tool for local extensions. The `question` tool is
+// deliberately omitted: small models use it to stall (endlessly re-asking a
+// clarifying question instead of building), so on the compact surface they must
+// act on sensible defaults. Pure aliases (`read`/`write`/`edit`/`bash`,
+// `publish_artifact`) still dispatch in `run` if a model insists, but
+// advertising duplicates wastes prompt tokens and confuses weak models. Keep
+// this list at 12 defs or fewer.
 fn compact_tool(name: &str) -> bool {
     matches!(
         name,
@@ -334,7 +337,6 @@ fn compact_tool(name: &str) -> bool {
             | "grep_files"
             | "list_dir"
             | "finish"
-            | "question"
             | "Artifact"
             | "python_tool"
     )
@@ -1182,6 +1184,57 @@ fn first_local_script_src(contents: &str) -> Option<String> {
     None
 }
 
+// True if `val` is a local relative path (not an absolute URL or data: URI) —
+// such a reference won't exist next to a published single-file artifact.
+fn is_local_asset(val: &str) -> bool {
+    let v = val.trim().to_ascii_lowercase();
+    !v.is_empty()
+        && !v.starts_with("http://")
+        && !v.starts_with("https://")
+        && !v.starts_with("//")
+        && !v.starts_with("data:")
+}
+
+// Extract a (possibly quoted) attribute value from the text right after `attr=`.
+fn attr_after(after: &str) -> String {
+    let v = if let Some(rest) = after.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else if let Some(rest) = after.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("")
+    } else {
+        after
+            .split(|c: char| c.is_whitespace() || c == '>')
+            .next()
+            .unwrap_or("")
+    };
+    v.trim().to_string()
+}
+
+// A `<link rel="stylesheet" href="local.css">` pointing at a local file that
+// won't exist next to the published artifact. Returns the local href, else None.
+fn first_local_stylesheet_href(contents: &str) -> Option<String> {
+    let lower = contents.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(rel) = lower[at..].find("<link") {
+        let tag_start = at + rel;
+        let tag_end = lower[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(lower.len());
+        let tag_lower = &lower[tag_start..tag_end];
+        if tag_lower.contains("stylesheet") {
+            if let Some(hp) = tag_lower.find("href=") {
+                let val = attr_after(&contents[tag_start + hp + "href=".len()..tag_end]);
+                if is_local_asset(&val) {
+                    return Some(val);
+                }
+            }
+        }
+        at = tag_end.max(tag_start + "<link".len());
+    }
+    None
+}
+
 // Rejection reasons for artifact contents. Every message quotes the offending
 // snippet and the exact rule, plus what to change — cheap models can't fix
 // what they can't see.
@@ -1196,7 +1249,12 @@ fn artifact_quality_error(contents: &str, kind: &str) -> Option<String> {
         let trimmed_len = contents.trim().len();
         if trimmed_len < 300 {
             return Some(format!(
-                "HTML artifact is too small to be a complete runnable app: {trimmed_len} chars, but the minimum is 300. Resend the artifact with the full HTML document — markup, embedded CSS, and embedded JavaScript — in `contents`."
+                "HTML artifact is too small to be a complete runnable app: {trimmed_len} chars, but the minimum is 300. It must be ONE self-contained file: do NOT link external files (no <link rel=stylesheet> or <script src=…>); put ALL CSS inside a <style> block and ALL JavaScript — the full working logic — inside a <script> block. Resend the complete document in `contents`."
+            ));
+        }
+        if let Some(href) = first_local_stylesheet_href(contents) {
+            return Some(format!(
+                "HTML artifact links a local stylesheet via <link rel=\"stylesheet\" href=\"{href}\">, which will not exist next to the published file. Move those styles into an inline <style>…</style> block so the artifact is self-contained."
             ));
         }
         if let Some(src) = first_local_script_src(contents) {
@@ -4570,7 +4628,6 @@ mod tests {
             "grep_files",
             "list_dir",
             "finish",
-            "question",
             "Artifact",
             "python_tool",
         ] {
@@ -4583,6 +4640,7 @@ mod tests {
             "kb_record",
             "verify",
             "text_editor_20250124",
+            "question",
             "AskUserQuestion",
             "read",
             "write",
@@ -5409,6 +5467,53 @@ print("hello " + data.get("name", "world"))
         assert!(r.is_error);
         assert!(r.content.contains("app.js"), "{}", r.content);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_rejects_local_stylesheet_link() {
+        let d = tempdir();
+        // A 1.5B model's canvas-game stub linked <link rel=stylesheet href=styles.css>;
+        // it must be rejected with a message naming the file and telling the
+        // model to inline the CSS.
+        let body = html_app("draw();").replace(
+            "<head>",
+            "<head><link rel=\"stylesheet\" href=\"styles.css\">",
+        );
+        let r = run(
+            "Artifact",
+            &json!({"title": "Game", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(r.is_error);
+        assert!(r.content.contains("styles.css"), "{}", r.content);
+        assert!(r.content.contains("<style"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_allows_external_stylesheet_link() {
+        let d = tempdir();
+        let body = html_app("draw();").replace(
+            "<head>",
+            "<head><link rel=\"stylesheet\" href=\"https://cdn.example.com/x.css\">",
+        );
+        let r = run(
+            "Artifact",
+            &json!({"title": "Game", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn is_local_asset_classifies_paths() {
+        assert!(is_local_asset("styles.css"));
+        assert!(is_local_asset("./css/app.css"));
+        assert!(!is_local_asset("https://x.com/a.css"));
+        assert!(!is_local_asset("//cdn/a.css"));
+        assert!(!is_local_asset("data:text/css,body{}"));
+        assert!(!is_local_asset(""));
     }
 
     #[test]
