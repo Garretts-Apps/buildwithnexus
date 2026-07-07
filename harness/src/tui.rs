@@ -948,7 +948,10 @@ pub fn str_width(s: &str) -> usize {
 }
 
 fn format_links(s: &str) -> String {
-    let mut out = String::new();
+    if !s.contains('[') || !s.contains("](") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 32);
     let mut rest = s;
     while let Some(start) = rest.find('[') {
         if let Some(mid) = rest[start..].find("](") {
@@ -971,36 +974,36 @@ fn format_links(s: &str) -> String {
 }
 
 fn format_italics(s: &str) -> String {
-    let mut out = String::new();
-    let parts: Vec<&str> = s.split('*').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if i % 2 == 1 && parts.len() > 1 {
+    if !s.contains('*') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut is_italic = false;
+    for (i, part) in s.split('*').enumerate() {
+        if i > 0 && is_italic {
             out.push_str(&italic(part));
         } else {
             out.push_str(part);
         }
+        is_italic = !is_italic;
     }
     out
 }
 
 fn format_inline_md(text: &str) -> String {
-    let mut out = String::new();
-    let code_parts: Vec<&str> = text.split('`').collect();
-    for (i, part) in code_parts.iter().enumerate() {
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, part) in text.split('`').enumerate() {
         if i % 2 == 1 {
             out.push_str(&yellow(part));
         } else {
             let with_links = format_links(part);
-            let mut bold_out = String::new();
-            let bold_parts: Vec<&str> = with_links.split("**").collect();
-            for (j, bpart) in bold_parts.iter().enumerate() {
+            for (j, bpart) in with_links.split("**").enumerate() {
                 if j % 2 == 1 {
-                    bold_out.push_str(&bold(bpart));
+                    out.push_str(&bold(bpart));
                 } else {
-                    bold_out.push_str(&format_italics(bpart));
+                    out.push_str(&format_italics(bpart));
                 }
             }
-            out.push_str(&bold_out);
         }
     }
     out
@@ -1068,10 +1071,14 @@ pub fn render_md_line(s: &str) -> String {
 /// Splits the input text by newline, applies [`render_md_line`] to each line,
 /// and re-joins them with newline characters.
 pub fn render_md(text: &str) -> String {
-    text.lines()
-        .map(render_md_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&render_md_line(line));
+    }
+    out
 }
 
 fn strip_ansi(s: &str) -> String {
