@@ -4,6 +4,21 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-07-07
+
+### Fixed
+- **Qwen2.5-Coder tool calls now work on llama.cpp/Ollama.** Small local coder
+  models emit tool calls as `<tools>{…}</tools>` / `<tool_call>{…}</tool_call>`
+  text in the message content rather than as native `tool_calls`. The text
+  recovery parser only understood bare or ```json-fenced JSON, so these calls
+  were treated as prose and the model never acted (an end-to-end run against
+  qwen2.5-coder-1.5b produced no file). The parser now strips the XML tool tags
+  and extracts a string-aware balanced JSON object, so a `content` field full of
+  CSS `{ }` braces no longer truncates the parse. Also recovers a bare JSON
+  object embedded after a leading sentence.
+
+[0.11.1]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.11.1
+
 ## [0.11.0] - 2026-07-06
 
 Reliability, small-open-weight-model support, and TUI UX overhaul. Grounded in a
