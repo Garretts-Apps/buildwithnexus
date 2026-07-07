@@ -31,7 +31,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: Format check
+        run: cargo fmt --check
 
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -66,6 +69,31 @@ jobs:
       # a typo can't ship to npm and break `npm install` for everyone.
       - name: Check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
+
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Advisory DB scan of the harness lockfile. New advisories in unchanged
+      # deps shouldn't block unrelated PRs — on PRs the report is informational;
+      # on main pushes it fails the build.
+      - name: Audit dependencies
+        working-directory: harness
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: cargo audit
 
   actionlint:
     name: Lint workflows

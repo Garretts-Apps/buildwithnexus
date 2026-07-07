@@ -2,6 +2,7 @@
 // single `match` — no registry, no dyn dispatch (Casey: don't build the plugin
 // system before there are plugins).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +44,16 @@ const MAX_READ: usize = 100 * 1024;
 const MAX_OUT: usize = 16 * 1024;
 const MAX_SEARCH_FILES: usize = 10_000;
 const DEFAULT_SEARCH_LIMIT: usize = 100;
+// Head kept by head+tail truncation of command output (the rest of MAX_OUT
+// goes to the tail, where failures and the `[exit N]` marker live).
+const HEAD_KEEP: usize = 4 * 1024;
+// Per-line cap for grep/list output so one minified line can't eat the budget.
+const MAX_MATCH_LINE: usize = 500;
+// Default deadline for run_command / python_tool; long-running processes
+// should use start_server instead.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+// Deadline for a single MCP tools/call round trip.
+const MCP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static UNDO_BACKUP: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
 
@@ -292,14 +303,26 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     v
 }
 
+// Models reporting at most this many context tokens get the compact tool set.
+// Small open-weight models degrade sharply with large tool catalogs, so
+// everything in local-model range (≤32k) gets the trimmed surface; remote
+// frontier providers report much larger contexts and keep the full set.
+const COMPACT_TOOLS_MAX_CONTEXT: usize = 32_768;
+
 pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<ToolDef> {
     let all = defs(include_subagent);
-    if context_tokens > 8192 {
+    if context_tokens > COMPACT_TOOLS_MAX_CONTEXT {
         return all;
     }
     all.into_iter().filter(|d| compact_tool(d.name)).collect()
 }
 
+// The compact surface advertises one canonical tool per capability — read,
+// write, edit, shell, glob, grep, list, artifact publishing, plus the
+// finish/question control tools and python_tool for local extensions. Pure
+// aliases (`read`/`write`/`edit`/`bash`, `publish_artifact`) still dispatch in
+// `run` if a model insists, but advertising duplicates wastes prompt tokens
+// and confuses weak models. Keep this list at 12 defs or fewer.
 fn compact_tool(name: &str) -> bool {
     matches!(
         name,
@@ -313,16 +336,7 @@ fn compact_tool(name: &str) -> bool {
             | "finish"
             | "question"
             | "Artifact"
-            | "publish_artifact"
-            | "start_server"
-            | "stop_server"
-            | "wait_for_url"
-            | "open_browser"
             | "python_tool"
-            | "read"
-            | "write"
-            | "edit"
-            | "bash"
     )
 }
 
@@ -418,36 +432,44 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
 // Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
 // even in ReadOnly permission mode despite run_command being generically mutating.
 pub fn is_readonly_command(cmd: &str) -> bool {
-    let lower = cmd.trim().to_lowercase();
-    let first = lower.split_whitespace().next().unwrap_or("");
+    let trimmed = cmd.trim();
+    // Shell composition, redirection, and substitution can smuggle a mutating
+    // tail behind a read-only first token (`cat x; rm -rf ~`), so any
+    // metacharacter disqualifies the fast path. `|` also covers `||` and `&`
+    // covers `&&`.
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '`'))
+        || trimmed.contains("$(")
+    {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or("");
     let base = first.rsplit('/').next().unwrap_or(first);
-    matches!(
-        base,
-        "grep"
-            | "egrep"
-            | "fgrep"
-            | "rg"
-            | "find"
-            | "cat"
-            | "ls"
-            | "head"
-            | "tail"
-            | "wc"
-            | "sort"
-            | "uniq"
-            | "diff"
-            | "tree"
-            | "stat"
-            | "file"
-            | "jq"
-            | "sed"
-    ) || lower.starts_with("git log")
-        || lower.starts_with("git status")
-        || lower.starts_with("git diff")
-        || lower.starts_with("git show")
-        || lower.starts_with("git branch")
-        || lower.starts_with("git tag")
-        || lower.starts_with("git remote")
+    match base {
+        // `find -delete`/`-exec` mutate; plain lookups are reads. Note that
+        // `sed` is deliberately absent (sed -i edits in place), as are `xargs`
+        // and `tee` (they exist to run/write things).
+        "find" => !words.any(|w| matches!(w, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")),
+        // Only known-readonly git subcommands; `git clean`, `git tag <name>`,
+        // and branch delete/rename mutate.
+        "git" => match words.next().unwrap_or("") {
+            "status" | "log" | "diff" | "show" | "blame" => true,
+            "remote" => words.all(|w| w == "-v" || w == "--verbose"),
+            "branch" => !words.any(|w| {
+                matches!(
+                    w,
+                    "-d" | "-D" | "-m" | "-M" | "--delete" | "--move" | "--force"
+                )
+            }),
+            _ => false,
+        },
+        "grep" | "egrep" | "fgrep" | "rg" | "cat" | "ls" | "head" | "tail" | "wc" | "sort"
+        | "uniq" | "diff" | "tree" | "stat" | "file" | "jq" => true,
+        _ => false,
+    }
 }
 
 // A one-line, human-readable preview of what a call will do (shown at the gate).
@@ -1083,43 +1105,142 @@ fn open_browser(input: &Value, cwd: &Path) -> Outcome {
     }
 }
 
-fn html_artifact_quality_error(title: &str, contents: &str) -> Option<String> {
-    let title_lower = title.to_lowercase();
-    let lower = contents.to_lowercase();
-    if contents.trim().len() < 300 {
-        return Some("HTML artifact is too small to be a complete runnable app; include full HTML, CSS, and JavaScript in the artifact contents".to_string());
+// Comment/line-anchored placeholder patterns. Bare `...`/`todo` are legal
+// content (JS spread syntax, "Loading..." strings, todo apps) and must not
+// trip this — only explicit stub markers count.
+const PLACEHOLDER_MARKERS: [&str; 7] = [
+    "// todo",
+    "/* todo",
+    "<!-- todo",
+    "// placeholder",
+    "your code here",
+    "rest of the code",
+    "code goes here",
+];
+
+// Case-insensitive scan for the earliest placeholder marker. Uses ASCII
+// lowering so byte offsets in the lowered copy align with `contents`.
+fn find_placeholder(contents: &str) -> Option<(usize, &'static str)> {
+    let lower = contents.to_ascii_lowercase();
+    PLACEHOLDER_MARKERS
+        .iter()
+        .filter_map(|m| lower.find(m).map(|pos| (pos, *m)))
+        .min_by_key(|(pos, _)| *pos)
+}
+
+// ~80 chars of context around an offending byte range, clamped to char
+// boundaries, so rejection messages can quote exactly what tripped the check.
+fn snippet_around(contents: &str, pos: usize, len: usize) -> String {
+    let mut start = pos.saturating_sub(40);
+    while start > 0 && !contents.is_char_boundary(start) {
+        start -= 1;
     }
-    for marker in [
-        "todo",
-        "placeholder",
-        "your code here",
-        "canvas game logic here",
-        "...",
-    ] {
-        if lower.contains(marker) {
+    let mut end = (pos + len + 40).min(contents.len());
+    while end < contents.len() && !contents.is_char_boundary(end) {
+        end += 1;
+    }
+    contents[start..end].replace(['\n', '\r'], " ")
+}
+
+// First <script src=…> value that points at a local file. External http(s),
+// protocol-relative, and data: URLs are fine; a bare `app.js` will not exist
+// next to the published artifact.
+fn first_local_script_src(contents: &str) -> Option<String> {
+    let lower = contents.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(rel) = lower[at..].find("<script") {
+        let tag_start = at + rel;
+        let tag_end = lower[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(lower.len());
+        if let Some(sp) = lower[tag_start..tag_end].find("src=") {
+            let after = &contents[tag_start + sp + 4..tag_end];
+            let val = if let Some(rest) = after.strip_prefix('"') {
+                rest.split('"').next().unwrap_or("")
+            } else if let Some(rest) = after.strip_prefix('\'') {
+                rest.split('\'').next().unwrap_or("")
+            } else {
+                after
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or("")
+            };
+            let val = val.trim();
+            let val_lower = val.to_ascii_lowercase();
+            if !val.is_empty()
+                && !val_lower.starts_with("http://")
+                && !val_lower.starts_with("https://")
+                && !val_lower.starts_with("//")
+                && !val_lower.starts_with("data:")
+            {
+                return Some(val.to_string());
+            }
+        }
+        at = tag_end.max(tag_start + "<script".len());
+    }
+    None
+}
+
+// Rejection reasons for artifact contents. Every message quotes the offending
+// snippet and the exact rule, plus what to change — cheap models can't fix
+// what they can't see.
+fn artifact_quality_error(contents: &str, kind: &str) -> Option<String> {
+    if let Some((pos, marker)) = find_placeholder(contents) {
+        return Some(format!(
+            "artifact contains the placeholder marker '{marker}' near: \"…{}…\" — placeholders are rejected; replace it with the real, fully implemented content and resend the complete artifact",
+            snippet_around(contents, pos, marker.len())
+        ));
+    }
+    if kind == "html" {
+        let trimmed_len = contents.trim().len();
+        if trimmed_len < 300 {
             return Some(format!(
-                "HTML artifact contains placeholder marker '{marker}'; provide complete implemented code"
+                "HTML artifact is too small to be a complete runnable app: {trimmed_len} chars, but the minimum is 300. Resend the artifact with the full HTML document — markup, embedded CSS, and embedded JavaScript — in `contents`."
+            ));
+        }
+        if let Some(src) = first_local_script_src(contents) {
+            return Some(format!(
+                "HTML artifact references a local script via <script src=\"{src}\">, which will not exist next to the published file. Inline that JavaScript in a <script>…</script> block so the artifact is self-contained."
             ));
         }
     }
-    if lower.contains("<script src=") && !(lower.contains("https://") || lower.contains("http://"))
-    {
-        return Some("HTML artifact references a local external script; embed the JavaScript so the artifact is self-contained".to_string());
-    }
-    if title_lower.contains("game") || title_lower.contains("canvas") || lower.contains("<canvas") {
-        if !lower.contains("<canvas") {
-            return Some("canvas game artifact must include a <canvas> element".to_string());
-        }
-        if !lower.contains("requestanimationframe") {
-            return Some(
-                "canvas game artifact must include a requestAnimationFrame game loop".to_string(),
-            );
-        }
-        if lower.contains("<script src=") {
-            return Some("canvas game artifact must embed its game script instead of referencing a separate script file".to_string());
-        }
-    }
     None
+}
+
+// The canvas-game heuristic is advisory only: a "game" title without a
+// <canvas>/requestAnimationFrame loop is suspicious but not necessarily wrong
+// (text games, DOM games), so warn instead of rejecting.
+fn artifact_game_warning(title: &str, contents: &str, kind: &str) -> Option<String> {
+    if kind != "html" || !title.to_ascii_lowercase().contains("game") {
+        return None;
+    }
+    let lower = contents.to_ascii_lowercase();
+    let mut missing = Vec::new();
+    if !lower.contains("<canvas") {
+        missing.push("a <canvas> element");
+    }
+    if !lower.contains("requestanimationframe") {
+        missing.push("a requestAnimationFrame loop");
+    }
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "warning: the title mentions a game but the HTML lacks {}; verify the artifact is actually playable",
+            missing.join(" and ")
+        ))
+    }
+}
+
+// Browser auto-open bookkeeping: each artifact name opens at most once per
+// session so republishing doesn't spawn a new tab every time.
+fn mark_artifact_opened(name: &str) -> bool {
+    static OPENED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let set = OPENED.get_or_init(|| Mutex::new(HashSet::new()));
+    set.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_string())
 }
 
 // Lexically fold `.`/`..` without touching the filesystem (works for paths that
@@ -1139,10 +1260,74 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-// True if the path resolves outside the working directory.
+// Canonicalize the deepest existing ancestor and re-append the remainder, so
+// symlinked prefixes (macOS `/tmp` → `/private/tmp`) compare consistently even
+// for paths that don't exist yet (e.g. write targets).
+fn canonicalize_lenient(p: &Path) -> PathBuf {
+    let normed = normalize(p);
+    if let Ok(c) = normed.canonicalize() {
+        return c;
+    }
+    let mut rest = Vec::new();
+    let mut cur = normed.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_os_string());
+        }
+        if let Ok(mut out) = parent.canonicalize() {
+            for name in rest.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        cur = parent;
+    }
+    normed
+}
+
+// True if the path resolves outside the working directory. Both sides go
+// through the same lenient canonicalization — canonicalizing only the base
+// (as this used to) made cwd=/tmp/x become /private/tmp/x on macOS while the
+// target stayed /tmp/x/f, misclassifying in both directions.
 pub fn escapes_cwd(p: &Path, cwd: &Path) -> bool {
-    let base = cwd.canonicalize().unwrap_or_else(|_| normalize(cwd));
-    !normalize(p).starts_with(&base)
+    let base = canonicalize_lenient(cwd);
+    !canonicalize_lenient(p).starts_with(&base)
+}
+
+// The resolved out-of-cwd path for a mutating file-tool call, if any. The
+// permission gate can route this through the same confirmation flow used for
+// sensitive paths; `run` also refuses such writes outright so a target outside
+// the working directory is never silently written. Reads stay unrestricted.
+pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
+    if !is_mutating_call(name, input) {
+        return None;
+    }
+    let candidate = match name {
+        "write"
+        | "write_file"
+        | "edit"
+        | "edit_file"
+        | "multi_edit"
+        | "create_dir"
+        | "remove_path"
+        | "create_docx"
+        | "str_replace_editor"
+        | "text_editor_20241022"
+        | "text_editor_20250124" => touched_path(name, input, cwd)?,
+        "move_path" => {
+            let from = resolve(cwd, input["from"].as_str().unwrap_or(""));
+            if escapes_cwd(&from, cwd) {
+                return Some(from);
+            }
+            resolve(cwd, input["to"].as_str().unwrap_or(""))
+        }
+        _ => return None,
+    };
+    if escapes_cwd(&candidate, cwd) {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 // Paths that should never be read/written without explicit confirmation, even in
@@ -1334,7 +1519,7 @@ fn strip_html(html: &str) -> String {
 pub fn catastrophic(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
     let nospace: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
-    nospace.contains("rm-rf/")          // rm -rf of an absolute path
+    if nospace.contains("rm-rf/")          // rm -rf of an absolute path
         || nospace.contains("rm-fr/")
         || nospace.contains(":(){:|:&};:") // fork bomb
         || nospace.contains("mkfs")
@@ -1342,6 +1527,40 @@ pub fn catastrophic(cmd: &str) -> bool {
         || nospace.contains(">/dev/sd")
         || nospace.contains(">/dev/nvme")
         || nospace.contains("chmod-r777/")
+    {
+        return true;
+    }
+    // rm with recursive+force flags (joined `-rf`/`-fr` or split `-r -f`)
+    // aimed at a root-ish target: `/abs`, `~`, `~/`, `*`, `.`, `..`.
+    let toks: Vec<&str> = lower.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        if *t != "rm" {
+            continue;
+        }
+        let (mut recursive, mut force) = (false, false);
+        for arg in &toks[i + 1..] {
+            if let Some(flags) = arg.strip_prefix('-').filter(|f| !f.starts_with('-')) {
+                recursive |= flags.contains('r');
+                force |= flags.contains('f');
+            } else if *arg == "--recursive" {
+                recursive = true;
+            } else if *arg == "--force" {
+                force = true;
+            }
+        }
+        if !(recursive && force) {
+            continue;
+        }
+        for arg in &toks[i + 1..] {
+            if arg.starts_with('-') {
+                continue;
+            }
+            if matches!(*arg, "~" | "~/" | "*" | "." | "..") || arg.starts_with('/') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn truncate(s: String, max: usize) -> String {
@@ -1358,6 +1577,63 @@ fn truncate(s: String, max: usize) -> String {
     let mut out = s[..end].to_string();
     out.push_str("\n…[truncated]");
     out
+}
+
+// Head+tail truncation for command-ish output: test/build failures and the
+// `[exit N]` marker live at the tail, so keep both ends and cut the middle.
+// File reads keep plain head truncation (see `truncate_read`).
+fn truncate_head_tail(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let head_len = HEAD_KEEP.min(max / 2);
+    let tail_len = max - head_len;
+    let mut head_end = head_len;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - tail_len;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n…[{omitted} bytes omitted]…\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
+// Head truncation for file reads, with a marker that tells the model the total
+// size and how to fetch the rest instead of a bare "[truncated]".
+fn truncate_read(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let total_bytes = s.len();
+    let total_lines = s.lines().count();
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown_lines = s[..end].lines().count();
+    format!(
+        "{}\n…[truncated: content is {total_bytes} bytes / {total_lines} lines total; showing the first {shown_lines} lines — pass start_line/end_line to read the rest in ranges]",
+        &s[..end]
+    )
+}
+
+// Cap a single output line (grep matches, listings), marking the cut so the
+// model knows content is missing rather than silently absent.
+fn clip_line(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[line truncated]", &line[..end])
 }
 
 fn line_range(input: &Value) -> Option<(usize, usize)> {
@@ -1712,7 +1988,393 @@ fn search_limit(input: &Value) -> usize {
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
 }
 
+// Captured result of a spawned command run under a deadline.
+struct CommandCapture {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    timed_out: bool,
+}
+
+// Run a command with piped stdio and a hard deadline. `Command::output()`
+// blocks forever on hanging commands; here stdout/stderr are drained on
+// threads while the parent polls `try_wait`, killing the child on expiry and
+// returning whatever partial output was collected.
+fn run_with_timeout(
+    mut cmd: Command,
+    stdin_payload: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
+    cmd.stdin(if stdin_payload.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
+    if let Some(payload) = stdin_payload {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, &payload);
+        } // dropping stdin closes it so the child sees EOF
+    }
+    // Reader threads forward chunks over channels instead of being joined:
+    // a killed shell can leave grandchildren holding the pipe write end, and
+    // joining a blocked read_to_end would hang exactly like Command::output().
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(mut p) = pipe {
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match std::io::Read::read(&mut p, &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        rx
+    }
+    // Drain whatever is buffered, then wait up to `grace` for stragglers; a
+    // clean EOF disconnects the channel and exits immediately.
+    fn collect(rx: &std::sync::mpsc::Receiver<Vec<u8>>, out: &mut Vec<u8>, grace: Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(chunk) => out.extend_from_slice(&chunk),
+                Err(_) => break, // disconnected (EOF) or grace expired
+            }
+        }
+    }
+    let out_rx = drain(child.stdout.take());
+    let err_rx = drain(child.stderr.take());
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let code = loop {
+        while let Ok(chunk) = out_rx.try_recv() {
+            stdout_bytes.extend_from_slice(&chunk);
+        }
+        while let Ok(chunk) = err_rx.try_recv() {
+            stderr_bytes.extend_from_slice(&chunk);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("failed to wait for command: {e}")),
+        }
+    };
+    let grace = Duration::from_millis(250);
+    collect(&out_rx, &mut stdout_bytes, grace);
+    collect(&err_rx, &mut stderr_bytes, grace);
+    Ok(CommandCapture {
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        code,
+        timed_out,
+    })
+}
+
+// Format captured command output the way run_command/python_tool report it,
+// including the timeout notice or `[exit N]` marker at the tail.
+fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
+    let mut s = cap.stdout;
+    if !cap.stderr.trim().is_empty() {
+        s.push_str("\n[stderr]\n");
+        s.push_str(&cap.stderr);
+    }
+    if cap.timed_out {
+        s.push_str(&format!(
+            "\n[error] command timed out after {}s; long-running processes should use start_server",
+            timeout.as_secs()
+        ));
+        return Outcome {
+            content: truncate_head_tail(s, MAX_OUT),
+            is_error: true,
+            finished: false,
+        };
+    }
+    let code = cap.code.unwrap_or(-1);
+    s.push_str(&format!("\n[exit {code}]"));
+    Outcome {
+        content: truncate_head_tail(s, MAX_OUT),
+        is_error: code != 0,
+        finished: false,
+    }
+}
+
+// UTC calendar conversion (Howard Hinnant's civil-from-days) so kb_record can
+// stamp real timestamps without pulling in a date dependency.
+fn iso8601_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+fn iso8601_utc_now() -> String {
+    iso8601_utc(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+// Best-effort locator for edit mismatches: collapse whitespace and look for
+// the first non-empty line of `old` so the model gets a concrete line number
+// to re-read instead of a bare "not found".
+fn whitespace_relaxed_hit(body: &str, old: &str) -> Option<usize> {
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let target = old.lines().map(squash).find(|l| !l.is_empty())?;
+    body.lines()
+        .position(|line| squash(line).contains(&target))
+        .map(|i| i + 1)
+}
+
+// Hint text shared by the edit tools when `old` text is missing from the file.
+fn edit_not_found_hint(body: &str, old: &str) -> String {
+    match whitespace_relaxed_hit(body, old) {
+        Some(line) => format!(
+            "closest match at line {line} differs in indentation/whitespace — re-read the file and copy the text exactly, including whitespace"
+        ),
+        None => "re-read the file and copy the exact current text for the old string".to_string(),
+    }
+}
+
+// ── Tiered lenient edit matching ─────────────────────────────────────────
+// When the exact `old` text is missing, small models have usually re-sent the
+// right lines with drifted trailing whitespace or a uniform indentation shift.
+// Those two failure shapes are unambiguous to repair, so a UNIQUE
+// whitespace-tolerant hit is auto-applied. Anything looser (similarity-based
+// fuzzy matching) is dangerous and stays diagnostic-only via
+// `edit_not_found_hint`.
+
+// Suffix appended to edit success messages when a lenient tier applied, so the
+// model learns its copy of the text had drifted.
+const LENIENT_MATCH_NOTE: &str =
+    "matched with whitespace tolerance — original text differed in indentation";
+
+// Re-indent transform recorded by a lenient match so the replacement text
+// lands at the file's actual indentation rather than the model's drifted copy.
+enum LenientReindent {
+    // Tier 1: lines matched after trailing-whitespace trim; use `new` verbatim.
+    Verbatim,
+    // Tier 2: every file line is `prefix` deeper than the needle; prepend
+    // `prefix` to each non-blank replacement line.
+    Add(String),
+    // Tier 2: every needle line is `prefix` deeper than the file; strip
+    // `prefix` from each replacement line that carries it.
+    Strip(String),
+}
+
+// A unique lenient match: the byte range of the matched file region plus the
+// re-indent transform for the replacement text.
+struct LenientHit {
+    start: usize,
+    end: usize,
+    reindent: LenientReindent,
+}
+
+enum LenientMatch {
+    Hit(LenientHit),
+    // Multiple candidate regions — too ambiguous to auto-apply.
+    Ambiguous,
+    Miss,
+}
+
+// Whole-line lenient search for `old` in `body`. Tier 1 compares lines after
+// trailing-whitespace trim; tier 2 additionally allows one constant
+// leading-indent delta across all non-blank lines. Each tier only produces a
+// hit when its match is unique in the file.
+fn lenient_find(body: &str, old: &str) -> LenientMatch {
+    let needle: Vec<&str> = old.lines().collect();
+    if needle.is_empty() {
+        return LenientMatch::Miss;
+    }
+    let needle_ends_nl = old.ends_with('\n');
+    // Byte offset + content (newline excluded) + whether a newline follows, so
+    // a line-window hit can be mapped back to a byte splice range.
+    let mut lines: Vec<(usize, &str, bool)> = Vec::new();
+    let mut pos = 0usize;
+    for seg in body.split_inclusive('\n') {
+        let has_nl = seg.ends_with('\n');
+        let content = if has_nl { &seg[..seg.len() - 1] } else { seg };
+        lines.push((pos, content, has_nl));
+        pos += seg.len();
+    }
+    if lines.len() < needle.len() {
+        return LenientMatch::Miss;
+    }
+    let mut rstrip_hits: Vec<usize> = Vec::new();
+    let mut shift_hits: Vec<(usize, LenientReindent)> = Vec::new();
+    for w in 0..=lines.len() - needle.len() {
+        let window = &lines[w..w + needle.len()];
+        // A needle that ends in a newline must consume one in the file too.
+        if needle_ends_nl && !window[needle.len() - 1].2 {
+            continue;
+        }
+        if window
+            .iter()
+            .zip(&needle)
+            .all(|((_, f, _), o)| f.trim_end() == o.trim_end())
+        {
+            rstrip_hits.push(w);
+        } else if let Some(reindent) = uniform_indent_shift(window, &needle) {
+            shift_hits.push((w, reindent));
+        }
+    }
+    // Tier 1 wins outright when unique; tier 2 only applies when tier 1 found
+    // nothing. Two candidates in the deciding tier keep the edit failing.
+    let (w, reindent) = match (rstrip_hits.len(), shift_hits.len()) {
+        (1, _) => (rstrip_hits[0], LenientReindent::Verbatim),
+        (0, 1) => shift_hits.remove(0),
+        (0, 0) => return LenientMatch::Miss,
+        _ => return LenientMatch::Ambiguous,
+    };
+    let (last_start, last_content, _) = lines[w + needle.len() - 1];
+    let end = last_start + last_content.len() + usize::from(needle_ends_nl);
+    LenientMatch::Hit(LenientHit {
+        start: lines[w].0,
+        end,
+        reindent,
+    })
+}
+
+// Checks whether a window of file lines equals the needle after shifting every
+// non-blank line by one constant leading-whitespace delta (all deeper or all
+// shallower). Blank lines only match blank lines; a tab-for-space swap is not
+// a uniform shift and stays diagnostic-only.
+fn uniform_indent_shift(
+    window: &[(usize, &str, bool)],
+    needle: &[&str],
+) -> Option<LenientReindent> {
+    let mut shift: Option<LenientReindent> = None;
+    for ((_, file_line, _), needle_line) in window.iter().zip(needle) {
+        let f = file_line.trim_end();
+        let o = needle_line.trim_end();
+        match (f.is_empty(), o.is_empty()) {
+            (true, true) => continue,
+            (true, false) | (false, true) => return None,
+            (false, false) => {}
+        }
+        match &shift {
+            None => {
+                // Direction and prefix come from the first non-blank pair;
+                // every later non-blank pair must shift by the exact same
+                // whitespace prefix.
+                let (deeper, prefix) = if let Some(p) = f.strip_suffix(o) {
+                    (true, p)
+                } else if let Some(p) = o.strip_suffix(f) {
+                    (false, p)
+                } else {
+                    return None;
+                };
+                if prefix.is_empty() || !prefix.chars().all(char::is_whitespace) {
+                    return None;
+                }
+                shift = Some(if deeper {
+                    LenientReindent::Add(prefix.to_string())
+                } else {
+                    LenientReindent::Strip(prefix.to_string())
+                });
+            }
+            Some(LenientReindent::Add(prefix)) => {
+                if f.strip_prefix(prefix.as_str()) != Some(o) {
+                    return None;
+                }
+            }
+            Some(LenientReindent::Strip(prefix)) => {
+                if o.strip_prefix(prefix.as_str()) != Some(f) {
+                    return None;
+                }
+            }
+            // Never stored by this function.
+            Some(LenientReindent::Verbatim) => return None,
+        }
+    }
+    shift
+}
+
+// Splices a lenient hit into the body, re-indenting replacement lines by the
+// same delta the match observed so the edit lands at the file's real depth.
+fn apply_lenient(body: &str, hit: &LenientHit, new: &str) -> String {
+    let replacement: String = match &hit.reindent {
+        LenientReindent::Verbatim => new.to_string(),
+        LenientReindent::Add(prefix) => new
+            .split_inclusive('\n')
+            .map(|seg| {
+                if seg.trim().is_empty() {
+                    seg.to_string()
+                } else {
+                    format!("{prefix}{seg}")
+                }
+            })
+            .collect(),
+        LenientReindent::Strip(prefix) => new
+            .split_inclusive('\n')
+            .map(|seg| seg.strip_prefix(prefix.as_str()).unwrap_or(seg))
+            .collect(),
+    };
+    format!("{}{}{}", &body[..hit.start], replacement, &body[hit.end..])
+}
+
+// Small edit distance for "did you mean" suggestions on unknown tool names.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
+    // Mutating file tools never silently write outside the working directory;
+    // the permission gate can confirm such calls, but the execution layer
+    // refuses regardless so an unwired gate cannot leak a stray write.
+    if let Some(p) = out_of_cwd_mutation(name, input, cwd) {
+        return err(format!(
+            "refusing to write outside the working directory: {} resolves beyond {}. Out-of-cwd writes require explicit user approval — ask the user first (question tool), and once approved perform the change with run_command, or have the user restart the session in the target directory.",
+            p.display(),
+            cwd.display()
+        ));
+    }
     match name {
         "read" | "read_file" => {
             let p_str = path_arg(input).unwrap_or("").trim();
@@ -1721,11 +2383,24 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let p = resolve(cwd, p_str);
             match fs::read_to_string(&p) {
-                Ok(c) => ok(truncate(apply_line_range(&c, line_range(input)), MAX_READ)),
-                Err(e) => err(format!(
-                    "cannot read {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
-                    p.display()
+                Ok(c) => ok(truncate_read(
+                    apply_line_range(&c, line_range(input)),
+                    MAX_READ,
                 )),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::InvalidData => err(format!(
+                        "cannot read {}: contents are not valid UTF-8 — this looks like a binary file. Do not retry read_file; use run_command with a targeted extractor instead (e.g. `file`, `strings`, `xxd | head`, or a format-specific CLI).",
+                        p.display()
+                    )),
+                    std::io::ErrorKind::PermissionDenied => err(format!(
+                        "cannot read {}: permission denied — the file exists but this process lacks read access. Check ownership/permissions or ask the user to grant access; do not retry the same call unchanged.",
+                        p.display()
+                    )),
+                    _ => err(format!(
+                        "cannot read {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
+                        p.display()
+                    )),
+                },
             }
         }
         "read_many_files" => {
@@ -1773,7 +2448,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         })
                         .collect();
                     names.sort();
-                    ok(names.join("\n"))
+                    ok(truncate(names.join("\n"), MAX_OUT))
                 }
                 Err(e) => err(format!(
                     "cannot list {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
@@ -1790,7 +2465,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if entries.is_empty() {
                 ok(format!("no entries under {}", root.display()))
             } else {
-                ok(entries.join("\n"))
+                ok(truncate(entries.join("\n"), MAX_OUT))
             }
         }
         "file_info" => {
@@ -1919,10 +2594,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             collect_files(&root, &mut files, &mut seen);
             files.sort();
             let mut matches = Vec::new();
+            let mut total = 0usize;
             for path in files {
-                if matches.len() >= limit {
-                    break;
-                }
                 let rel = display_path(&path, cwd);
                 let basename_matches = path
                     .file_name()
@@ -1941,9 +2614,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         line.to_lowercase()
                     };
                     if haystack.contains(&needle) {
-                        matches.push(format!("{}:{}:{}", rel, idx + 1, line.trim_end()));
-                        if matches.len() >= limit {
-                            break;
+                        // Keep counting past the limit so the cap header can
+                        // report how much was left out.
+                        total += 1;
+                        if matches.len() < limit {
+                            matches.push(format!(
+                                "{}:{}:{}",
+                                rel,
+                                idx + 1,
+                                clip_line(line.trim_end(), MAX_MATCH_LINE)
+                            ));
                         }
                     }
                 }
@@ -1951,7 +2631,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if matches.is_empty() {
                 ok(format!("no matches for {pattern}"))
             } else {
-                ok(matches.join("\n"))
+                let shown = matches.len();
+                let body = matches.join("\n");
+                let out = if total > shown {
+                    format!("{total} matches, showing {shown} (raise `max` or narrow the pattern)\n{body}")
+                } else {
+                    body
+                };
+                ok(truncate(out, MAX_OUT))
             }
         }
         "write" | "write_file" => {
@@ -1960,13 +2647,30 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err("path argument is required and cannot be empty");
             }
             let p = resolve(cwd, p_str);
-            let content = input["content"].as_str().unwrap_or("");
+            // Distinguish an absent `content` key from an explicit empty
+            // string — a dropped key must not silently produce an empty file.
+            let Some(content) = input["content"].as_str() else {
+                return err(
+                    "missing required param `content` — the file was NOT written; re-send the full write call including the complete `content` string (use an explicit empty string to create an empty file)",
+                );
+            };
+            let overwrite_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if content.is_empty() && overwrite_len > 0 {
+                return err(format!(
+                    "refusing to overwrite non-empty file {} ({overwrite_len} bytes) with empty content — if you really intend to empty it, remove it with remove_path first or write the intended replacement content",
+                    p.display()
+                ));
+            }
             if let Some(dir) = p.parent() {
                 let _ = fs::create_dir_all(dir);
             }
             checkpoint::record(cwd, &p, "write_file");
+            let prior = fs::read_to_string(&p).unwrap_or_default();
             match fs::write(&p, content) {
-                Ok(_) => ok(format!("wrote {} ({} bytes)", p.display(), content.len())),
+                Ok(_) => {
+                    crate::report::diff(&p.display().to_string(), &prior, content);
+                    ok(format!("wrote {} ({} bytes)", p.display(), content.len()))
+                }
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
@@ -1991,17 +2695,43 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if old.is_empty() {
                 return err("`old` text cannot be empty");
             }
-            // One pass to locate, a partial pass to confirm uniqueness — instead
-            // of matches().count() (materializes all) plus a separate replace.
+            // One pass to locate, a counting pass over the remainder for the
+            // occurrence total — still avoids a separate full replace scan.
             let Some(first) = body.find(old) else {
-                return err("`old` text not found in file");
+                // Tiered lenient fallback: a unique whitespace-tolerant hit is
+                // auto-applied; ambiguous or absent text keeps the diagnostic.
+                if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
+                    checkpoint::record(cwd, &p, "edit_file");
+                    let updated = apply_lenient(&body, &hit, new);
+                    return match fs::write(&p, &updated) {
+                        Ok(_) => {
+                            crate::report::diff(&p.display().to_string(), &body, &updated);
+                            ok(format!("edited {} ({LENIENT_MATCH_NOTE})", p.display()))
+                        }
+                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                    };
+                }
+                return err(format!(
+                    "`old` text not found in {}. {}.",
+                    p.display(),
+                    edit_not_found_hint(&body, old)
+                ));
             };
-            if body[first + old.len()..].contains(old) {
-                return err("`old` text is not unique — add surrounding context");
+            let extra = body[first + old.len()..].matches(old).count();
+            if extra > 0 {
+                return err(format!(
+                    "`old` text is not unique — it appears {} times in {}; add surrounding context so it matches exactly once",
+                    extra + 1,
+                    p.display()
+                ));
             }
             checkpoint::record(cwd, &p, "edit_file");
-            match fs::write(&p, body.replacen(old, new, 1)) {
-                Ok(_) => ok(format!("edited {}", p.display())),
+            let updated = body.replacen(old, new, 1);
+            match fs::write(&p, &updated) {
+                Ok(_) => {
+                    crate::report::diff(&p.display().to_string(), &body, &updated);
+                    ok(format!("edited {}", p.display()))
+                }
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
@@ -2021,28 +2751,55 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
-            for edit in edits {
+            let prior = body.clone();
+            let n = edits.len();
+            let mut lenient_applied = 0usize;
+            for (i, edit) in edits.iter().enumerate() {
+                let which = format!("edit #{} of {n}", i + 1);
                 let old = edit["old"].as_str().unwrap_or("");
                 if old.is_empty() {
-                    return err("old text cannot be empty");
-                }
-                let count = body.matches(old).count();
-                if count == 0 {
-                    return err("old text not found");
-                }
-                if count > 1 {
-                    return err("old text is not unique — add surrounding context");
+                    return err(format!(
+                        "{which}: old text cannot be empty (no edits were written)"
+                    ));
                 }
                 let new = edit["new"].as_str().unwrap_or("");
+                let count = body.matches(old).count();
+                if count == 0 {
+                    // Tiered lenient fallback: a unique whitespace-tolerant
+                    // hit is auto-applied; ambiguous or absent text keeps the
+                    // diagnostic and aborts before anything is written.
+                    if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
+                        body = apply_lenient(&body, &hit, new);
+                        lenient_applied += 1;
+                        continue;
+                    }
+                    return err(format!(
+                        "{which} failed: old text not found. Note that earlier edits in this batch had already changed the content later edits are matched against. {}. No edits were written.",
+                        edit_not_found_hint(&body, old)
+                    ));
+                }
+                if count > 1 {
+                    return err(format!(
+                        "{which} failed: old text appears {count} times — add surrounding context so it matches exactly once. No edits were written."
+                    ));
+                }
                 body = body.replacen(old, new, 1);
             }
             checkpoint::record(cwd, &p, "multi_edit");
-            match fs::write(&p, body) {
-                Ok(_) => ok(format!(
-                    "edited {} with {} replacements",
-                    p.display(),
-                    edits.len()
-                )),
+            let note = if lenient_applied > 0 {
+                format!(" ({lenient_applied} {LENIENT_MATCH_NOTE})")
+            } else {
+                String::new()
+            };
+            match fs::write(&p, &body) {
+                Ok(_) => {
+                    crate::report::diff(&p.display().to_string(), &prior, &body);
+                    ok(format!(
+                        "edited {} with {} replacements{note}",
+                        p.display(),
+                        edits.len()
+                    ))
+                }
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
@@ -2128,35 +2885,19 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if cmd.is_empty() {
                 return err("command argument is required and cannot be empty");
             }
-            let output = if cfg!(windows) {
-                Command::new("cmd")
-                    .args(["/C", cmd])
-                    .current_dir(cwd)
-                    .output()
+            let mut command = if cfg!(windows) {
+                let mut c = Command::new("cmd");
+                c.args(["/C", cmd]);
+                c
             } else {
-                Command::new("sh")
-                    .args(["-c", cmd])
-                    .current_dir(cwd)
-                    .output()
+                let mut c = Command::new("sh");
+                c.args(["-c", cmd]);
+                c
             };
-            match output {
-                Ok(o) => {
-                    let mut s = String::new();
-                    s.push_str(&String::from_utf8_lossy(&o.stdout));
-                    let e = String::from_utf8_lossy(&o.stderr);
-                    if !e.trim().is_empty() {
-                        s.push_str("\n[stderr]\n");
-                        s.push_str(&e);
-                    }
-                    let code = o.status.code().unwrap_or(-1);
-                    s.push_str(&format!("\n[exit {code}]"));
-                    Outcome {
-                        content: truncate(s, MAX_OUT),
-                        is_error: !o.status.success(),
-                        finished: false,
-                    }
-                }
-                Err(e) => err(format!("failed to spawn: {e}")),
+            command.current_dir(cwd);
+            match run_with_timeout(command, None, COMMAND_TIMEOUT) {
+                Ok(cap) => command_outcome(cap, COMMAND_TIMEOUT),
+                Err(e) => err(e),
             }
         }
         "todowrite" | "todo_write" => {
@@ -2379,38 +3120,15 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let path = find_python_tool(cwd, raw);
             let payload = input.get("input").cloned().unwrap_or_else(|| json!({}));
-            let mut child = match Command::new("python3")
-                .arg(&path)
-                .current_dir(cwd)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => return err(format!("failed to spawn python3 {}: {e}", path.display())),
-            };
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = std::io::Write::write_all(&mut stdin, payload.to_string().as_bytes());
-            }
-            match child.wait_with_output() {
-                Ok(o) => {
-                    let mut s = String::new();
-                    s.push_str(&String::from_utf8_lossy(&o.stdout));
-                    let e = String::from_utf8_lossy(&o.stderr);
-                    if !e.trim().is_empty() {
-                        s.push_str("\n[stderr]\n");
-                        s.push_str(&e);
-                    }
-                    let code = o.status.code().unwrap_or(-1);
-                    s.push_str(&format!("\n[exit {code}]"));
-                    Outcome {
-                        content: truncate(s, MAX_OUT),
-                        is_error: !o.status.success(),
-                        finished: false,
-                    }
-                }
-                Err(e) => err(format!("failed to wait for python tool: {e}")),
+            let mut command = Command::new("python3");
+            command.arg(&path).current_dir(cwd);
+            match run_with_timeout(
+                command,
+                Some(payload.to_string().into_bytes()),
+                COMMAND_TIMEOUT,
+            ) {
+                Ok(cap) => command_outcome(cap, COMMAND_TIMEOUT),
+                Err(e) => err(format!("python tool {}: {e}", path.display())),
             }
         }
         "list_skills" => {
@@ -2482,7 +3200,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 description: desc,
                 metadata: input["metadata"].clone(),
                 relationships: vec![],
-                last_updated: "2026-07-06T00:00:00Z".to_string(),
+                last_updated: iso8601_utc_now(),
             };
             let id = entity.id.clone();
             kb.add_entity(entity);
@@ -2565,20 +3283,38 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         "MCP server '{server}' has no command configured in settings"
                     ));
                 }
-                let payload = json!({
+                // A real MCP server hangs without the initialize handshake, and
+                // waiting for process exit hangs forever on servers that keep
+                // stdin open — so handshake first, then read the tools/call
+                // response line-by-line under a deadline.
+                let init = json!({
                     "jsonrpc": "2.0",
                     "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "buildwithnexus", "version": "1.0"}
+                    }
+                });
+                let initialized = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                });
+                let call_req = json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
                     "method": "tools/call",
                     "params": {
                         "name": tool,
                         "arguments": args
                     }
                 });
-                let mut child = match std::process::Command::new(cmd)
+                let mut child = match Command::new(cmd)
                     .args(&srv_args)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
                     .spawn()
                 {
                     Ok(c) => c,
@@ -2588,32 +3324,70 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         ))
                     }
                 };
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = std::io::Write::write_all(&mut stdin, payload.to_string().as_bytes());
-                    let _ = std::io::Write::write_all(&mut stdin, b"\n");
+                let mut stdin = child.stdin.take();
+                if let Some(w) = stdin.as_mut() {
+                    for msg in [&init, &initialized, &call_req] {
+                        let _ = std::io::Write::write_all(w, msg.to_string().as_bytes());
+                        let _ = std::io::Write::write_all(w, b"\n");
+                    }
+                    let _ = std::io::Write::flush(w);
                 }
-                match child.wait_with_output() {
-                    Ok(o) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                            if let Some(res) = resp.get("result") {
-                                return ok(res.to_string());
-                            } else if let Some(err_val) = resp.get("error") {
-                                return err(format!("MCP server error: {}", err_val));
+                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                if let Some(stdout) = child.stdout.take() {
+                    std::thread::spawn(move || {
+                        let reader = std::io::BufReader::new(stdout);
+                        for line in std::io::BufRead::lines(reader) {
+                            let Ok(line) = line else { break };
+                            if tx.send(line).is_err() {
+                                break;
                             }
                         }
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if !o.status.success() || stdout.trim().is_empty() {
-                            err(format!(
-                                "MCP server exited with status {}: stdout: {} stderr: {}",
-                                o.status, stdout, stderr
+                    });
+                }
+                let deadline = std::time::Instant::now() + MCP_TIMEOUT;
+                let outcome = loop {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break err(format!(
+                            "MCP server '{server}' did not answer tools/call within {}s; verify the server command and tool name",
+                            MCP_TIMEOUT.as_secs()
+                        ));
+                    }
+                    match rx.recv_timeout(remaining) {
+                        // Skip the initialize response (id 1) and any
+                        // notifications; only id 2 is our tools/call answer.
+                        Ok(line) => {
+                            let Ok(resp) = serde_json::from_str::<Value>(&line) else {
+                                continue;
+                            };
+                            if resp["id"] != json!(2) {
+                                continue;
+                            }
+                            if let Some(res) = resp.get("result") {
+                                break ok(res.to_string());
+                            }
+                            if let Some(err_val) = resp.get("error") {
+                                break err(format!("MCP server error: {err_val}"));
+                            }
+                            break ok(resp.to_string());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            break err(format!(
+                                "MCP server '{server}' did not answer tools/call within {}s; verify the server command and tool name",
+                                MCP_TIMEOUT.as_secs()
                             ))
-                        } else {
-                            ok(stdout.to_string())
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break err(format!(
+                                "MCP server '{server}' exited before answering tools/call"
+                            ))
                         }
                     }
-                    Err(e) => err(format!("failed to read from MCP server '{server}': {e}")),
-                }
+                };
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                outcome
             } else {
                 err(format!(
                     "MCP server '{server}' not found in settings.json mcp_servers"
@@ -2714,7 +3488,20 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 }
                 "create" => {
                     let p = resolve(cwd, path);
-                    let file_text = input["file_text"].as_str().unwrap_or("");
+                    // A dropped `file_text` key must not silently produce an
+                    // empty file (see the same guard on write_file).
+                    let Some(file_text) = input["file_text"].as_str() else {
+                        return err(
+                            "missing required param `file_text` — the file was NOT written; re-send the full create call including the complete `file_text` string (use an explicit empty string to create an empty file)",
+                        );
+                    };
+                    let overwrite_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    if file_text.is_empty() && overwrite_len > 0 {
+                        return err(format!(
+                            "refusing to overwrite non-empty file {} ({overwrite_len} bytes) with empty content — if you really intend to empty it, remove it first or send the intended replacement content",
+                            p.display()
+                        ));
+                    }
                     if let Some(dir) = p.parent() {
                         let _ = fs::create_dir_all(dir);
                     }
@@ -2743,9 +3530,28 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     };
                     let count = body.matches(old_str).count();
                     if count == 0 {
+                        // Tiered lenient fallback: a unique whitespace-tolerant
+                        // hit is auto-applied; ambiguous or absent text keeps
+                        // the diagnostic.
+                        if let LenientMatch::Hit(hit) = lenient_find(&body, old_str) {
+                            let next = apply_lenient(&body, &hit, new_str);
+                            {
+                                let mut guard =
+                                    UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                                *guard = Some((p.clone(), body));
+                            }
+                            return match fs::write(&p, &next) {
+                                Ok(_) => ok(format!(
+                                    "successfully edited file {} ({LENIENT_MATCH_NOTE})",
+                                    p.display()
+                                )),
+                                Err(e) => err(format!("cannot write {}: {e}", p.display())),
+                            };
+                        }
                         return err(format!(
-                            "old text not found in {}\n\nold text sought:\n{}",
+                            "old text not found in {}. {}.\n\nold text sought:\n{}",
                             p.display(),
+                            edit_not_found_hint(&body, old_str),
                             old_str
                         ));
                     }
@@ -2767,22 +3573,34 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 }
                 "insert" => {
                     let p = resolve(cwd, path);
-                    let insert_line = input["insert_line"].as_u64().unwrap_or(1) as usize;
+                    // Standard text_editor semantics: insert AFTER line
+                    // `insert_line`; 0 means the top of the file. (The old
+                    // `insert_line - 1` both inserted before the line and
+                    // underflowed on 0.)
+                    let insert_line = input["insert_line"].as_u64().unwrap_or(0) as usize;
                     let new_str = input["new_str"].as_str().unwrap_or("");
                     let body = match fs::read_to_string(&p) {
                         Ok(b) => b,
                         Err(e) => return err(format!("cannot read {}: {e}", p.display())),
                     };
                     let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
-                    let idx = (insert_line - 1).min(lines.len());
+                    let idx = insert_line.min(lines.len());
                     lines.insert(idx, new_str.to_string());
-                    let next = lines.join("\n") + if body.ends_with('\n') { "\n" } else { "" };
+                    // Preserve the file's existing line-ending convention.
+                    let eol = if body.contains("\r\n") { "\r\n" } else { "\n" };
+                    let mut next = lines.join(eol);
+                    if body.ends_with('\n') {
+                        next.push_str(eol);
+                    }
                     {
                         let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
                     match fs::write(&p, &next) {
-                        Ok(_) => ok(format!("successfully inserted line at {}", p.display())),
+                        Ok(_) => ok(format!(
+                            "successfully inserted text after line {insert_line} in {}",
+                            p.display()
+                        )),
                         Err(e) => err(format!("cannot write {}: {e}", p.display())),
                     }
                 }
@@ -2822,12 +3640,24 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         "Artifact" | "publish_artifact" => {
             let contents = input["contents"].as_str().unwrap_or("");
             let title = input["title"].as_str().unwrap_or("artifact");
-            let kind = input["type"].as_str().unwrap_or("html");
-            if kind == "html" {
-                if let Some(reason) = html_artifact_quality_error(title, contents) {
-                    return err(reason);
+            // When the model omits `type`, sniff the contents instead of
+            // assuming HTML — markdown reports were being rejected by
+            // HTML-app rules.
+            let kind = match input["type"].as_str() {
+                Some(k) => k,
+                None => {
+                    let head = contents.trim_start().to_ascii_lowercase();
+                    if head.starts_with("<!doctype") || head.starts_with("<html") {
+                        "html"
+                    } else {
+                        "markdown"
+                    }
                 }
+            };
+            if let Some(reason) = artifact_quality_error(contents, kind) {
+                return err(reason);
             }
+            let warning = artifact_game_warning(title, contents, kind);
             let safe_title: String = title
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -2847,30 +3677,52 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .unwrap_or(0);
             let filename = format!("{}_{timestamp}.{ext}", safe_title);
             let p = dir.join(&filename);
-            let clean_name = if (safe_title.is_empty() || safe_title == "_" || safe_title.eq_ignore_ascii_case("artifact") || safe_title.eq_ignore_ascii_case("index")) && ext == "html" {
+            if let Err(e) = fs::write(&p, contents) {
+                return err(format!("cannot write artifact: {e}"));
+            }
+            let clean_name = if (safe_title.is_empty()
+                || safe_title == "_"
+                || safe_title.eq_ignore_ascii_case("artifact")
+                || safe_title.eq_ignore_ascii_case("index"))
+                && ext == "html"
+            {
                 "index".to_string()
             } else {
                 safe_title.to_lowercase()
             };
             let direct_file = cwd.join(format!("{clean_name}.{ext}"));
-            let _ = fs::write(&direct_file, contents);
-            if ext == "html" {
+            // The workspace copy can clobber an existing cwd/index.html —
+            // checkpoint it first so /undo can restore, and surface a failed
+            // write instead of swallowing it.
+            if direct_file.exists() {
+                checkpoint::record(cwd, &direct_file, "publish_artifact");
+            }
+            if let Err(e) = fs::write(&direct_file, contents) {
+                return err(format!(
+                    "artifact archived to {} but the workspace copy {} could not be written: {e}",
+                    p.display(),
+                    direct_file.display()
+                ));
+            }
+            // Auto-open at most once per session per artifact name so
+            // republishing doesn't spawn a new browser tab every time.
+            if ext == "html" && mark_artifact_opened(&clean_name) && !cfg!(test) {
                 let _ = if cfg!(target_os = "macos") {
                     Command::new("open").arg(&direct_file).status()
                 } else if cfg!(windows) {
-                    Command::new("cmd").args(["/C", "start", "", &direct_file.to_string_lossy()]).status()
+                    Command::new("cmd")
+                        .args(["/C", "start", "", &direct_file.to_string_lossy()])
+                        .status()
                 } else {
                     Command::new("xdg-open").arg(&direct_file).status()
                 };
             }
-            match fs::write(&p, contents) {
-                Ok(_) => ok(format!(
-                    "Artifact successfully published locally to: {} (and created directly in workspace at: {})",
-                    p.display(),
-                    direct_file.display()
-                )),
-                Err(e) => err(format!("cannot write artifact: {e}")),
-            }
+            ok(format!(
+                "Artifact successfully published locally to: {} (and created directly in workspace at: {}){}",
+                p.display(),
+                direct_file.display(),
+                warning.map(|w| format!("\n{w}")).unwrap_or_default()
+            ))
         }
         "finish" => Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
@@ -2898,7 +3750,21 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 err("exit_plan requires plan or non-empty steps")
             }
         }
-        other => err(format!("unknown tool: {other}")),
+        other => {
+            // List the real tool surface and suggest the nearest name so a
+            // cheap model can self-correct instead of retrying blind.
+            let names: Vec<&'static str> = defs(true).iter().map(|d| d.name).collect();
+            let nearest = names
+                .iter()
+                .min_by_key(|n| levenshtein(&other.to_ascii_lowercase(), &n.to_ascii_lowercase()))
+                .copied();
+            let mut msg = format!("unknown tool: {other}.");
+            if let Some(n) = nearest {
+                msg.push_str(&format!(" Did you mean `{n}`?"));
+            }
+            msg.push_str(&format!(" Valid tools: {}", names.join(", ")));
+            err(msg)
+        }
     }
 }
 
@@ -3123,26 +3989,41 @@ mod tests {
 
     #[test]
     fn defs_for_small_context_keeps_core_tools_and_drops_bulk() {
-        let compact = defs_for_context(false, 8192)
+        // 32k is the top of the compact range: all realistic local models get
+        // the trimmed surface; larger remote contexts keep the full set.
+        let compact = defs_for_context(false, 32_768)
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();
-        let full = defs_for_context(false, 32768)
+        let full = defs_for_context(false, 200_000)
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();
+        assert_eq!(
+            compact,
+            defs_for_context(false, 8192)
+                .into_iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>(),
+            "everything at or below the threshold gets the same compact set"
+        );
+        // One canonical tool per capability.
         for name in [
             "read_file",
             "write_file",
+            "edit_file",
+            "run_command",
+            "find_files",
             "grep_files",
+            "list_dir",
+            "finish",
+            "question",
             "Artifact",
-            "start_server",
-            "wait_for_url",
-            "open_browser",
             "python_tool",
         ] {
             assert!(compact.contains(&name), "{name} should stay in compact set");
         }
+        // Bulk tools and pure aliases are dropped for small/local models.
         for name in [
             "mcp_call",
             "kb_query",
@@ -3150,6 +4031,12 @@ mod tests {
             "verify",
             "text_editor_20250124",
             "AskUserQuestion",
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "publish_artifact",
+            "start_server",
         ] {
             assert!(
                 !compact.contains(&name),
@@ -3160,6 +4047,12 @@ mod tests {
                 "{name} should remain available normally"
             );
         }
+        // Small models degrade with big catalogs; keep the surface tight.
+        assert!(
+            compact.len() <= 12,
+            "compact set has {} defs",
+            compact.len()
+        );
         assert!(compact.len() < full.len());
     }
 
@@ -3750,7 +4643,7 @@ print("hello " + data.get("name", "world"))
         let contents = fs::read_to_string(d.join("test.txt")).unwrap();
         assert!(contents.contains("line2-replaced"));
 
-        // 5. Insert text
+        // 5. Insert text (standard semantics: AFTER line `insert_line`)
         let r = run(
             "str_replace_editor",
             &json!({"command": "insert", "path": "test.txt", "insert_line": 2, "new_str": "inserted-line"}),
@@ -3759,7 +4652,7 @@ print("hello " + data.get("name", "world"))
         assert!(!r.is_error);
         let contents = fs::read_to_string(d.join("test.txt")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines[1], "inserted-line");
+        assert_eq!(lines[2], "inserted-line");
 
         // 6. Undo edit
         let r = run(
@@ -3885,5 +4778,781 @@ print("hello " + data.get("name", "world"))
             .content
             .contains("not found in settings.json mcp_servers"));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // A complete-enough HTML app body (>300 chars, no placeholders) that new
+    // artifact tests can extend with the pattern under test.
+    fn html_app(extra: &str) -> String {
+        format!(
+            "<!doctype html><html><head><style>body{{margin:0;font:16px sans-serif;background:#fafafa;color:#222}}main{{max-width:640px;margin:2rem auto;padding:1rem}}</style></head><body><main><h1>App</h1><div id='root'></div></main><script>const root=document.getElementById('root');function render(items){{root.textContent=items.join(', ')}}render(['a','b','c']);{extra}</script></body></html>"
+        )
+    }
+
+    // ── artifact validation (placeholders, sniffing, script src) ────────────
+    #[test]
+    fn artifact_accepts_spread_loading_and_todo_apps() {
+        let d = tempdir();
+        // JS spread syntax, a "Loading..." string, and todo-app vocabulary are
+        // all legal content and must not be rejected as placeholders.
+        let body = html_app(
+            "function log(...args){console.log(...args)}document.title='Loading...';const todos=['todo one','todo two'];render(todos);",
+        );
+        let r = run(
+            "Artifact",
+            &json!({"title": "Todo App", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_rejects_comment_anchored_todo_with_snippet() {
+        let d = tempdir();
+        let body = html_app("// TODO: implement the save handler");
+        let r = run(
+            "Artifact",
+            &json!({"title": "Notes App", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(r.is_error);
+        // The rejection must quote the rule and the offending snippet.
+        assert!(r.content.contains("// todo"), "{}", r.content);
+        assert!(
+            r.content.contains("implement the save handler"),
+            "{}",
+            r.content
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_without_type_sniffs_markdown_and_skips_html_rules() {
+        let d = tempdir();
+        // Short markdown with no `type` used to default to HTML rules and get
+        // rejected as "too small".
+        let r = run(
+            "Artifact",
+            &json!({"title": "Todo Plan", "contents": "# Todo App Plan\n\n- model\n- view\n"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains(".md"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_rejects_local_script_src_even_with_https_elsewhere() {
+        let d = tempdir();
+        // The old check waved through `<script src="app.js">` whenever
+        // "https://" appeared anywhere in the document.
+        let body = html_app("fetch('https://api.example.com/data');")
+            .replace("</body>", "<script src=\"app.js\"></script></body>");
+        let r = run(
+            "Artifact",
+            &json!({"title": "Dashboard", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(r.is_error);
+        assert!(r.content.contains("app.js"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_allows_external_script_src() {
+        let d = tempdir();
+        let body = html_app("").replace(
+            "</body>",
+            "<script src=\"https://cdn.example.com/lib.js\"></script></body>",
+        );
+        let r = run(
+            "Artifact",
+            &json!({"title": "Widget", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_game_heuristic_warns_instead_of_rejecting() {
+        let d = tempdir();
+        // A "game" title without canvas/requestAnimationFrame publishes with a
+        // warning rather than being rejected (DOM/text games are legitimate).
+        let body = html_app("document.addEventListener('keydown',e=>render([e.key]));");
+        let r = run(
+            "Artifact",
+            &json!({"title": "Word Game", "contents": body, "type": "html"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("warning"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn artifact_small_html_rejection_states_threshold() {
+        let d = tempdir();
+        let r = run(
+            "Artifact",
+            &json!({"title": "tiny", "contents": "<!doctype html><p>x</p>", "type": "html"}),
+            &d,
+        );
+        assert!(r.is_error);
+        assert!(r.content.contains("too small"));
+        assert!(r.content.contains("300"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mark_artifact_opened_only_first_time() {
+        assert!(mark_artifact_opened("unique-open-test-name"));
+        assert!(!mark_artifact_opened("unique-open-test-name"));
+    }
+
+    // ── head+tail truncation ────────────────────────────────────────────────
+    #[test]
+    fn truncate_head_tail_preserves_exit_marker() {
+        let mut s = String::from("START-OF-OUTPUT\n");
+        s.push_str(&"x".repeat(40 * 1024));
+        s.push_str("\nfinal failure line\n[exit 42]");
+        let out = truncate_head_tail(s, MAX_OUT);
+        assert!(out.starts_with("START-OF-OUTPUT"));
+        assert!(out.contains("bytes omitted"));
+        assert!(out.ends_with("[exit 42]"), "tail must survive");
+        assert!(out.contains("final failure line"));
+    }
+
+    #[test]
+    fn truncate_head_tail_short_input_unchanged() {
+        assert_eq!(truncate_head_tail("abc".into(), 16), "abc");
+    }
+
+    #[test]
+    fn truncate_read_marker_names_totals_and_line_ranges() {
+        let s = "line\n".repeat(30 * 1024); // 150 KB
+        let total_bytes = s.len();
+        let out = truncate_read(s, MAX_READ);
+        assert!(out.contains("start_line"));
+        assert!(out.contains(&format!("{total_bytes} bytes")));
+        assert!(out.contains("lines total"));
+    }
+
+    #[test]
+    fn clip_line_marks_cut() {
+        let long = "y".repeat(600);
+        let out = clip_line(&long, MAX_MATCH_LINE);
+        assert!(out.contains("[line truncated]"));
+        assert!(out.len() < long.len());
+        assert_eq!(clip_line("short", MAX_MATCH_LINE), "short");
+    }
+
+    // ── command timeouts ────────────────────────────────────────────────────
+    #[test]
+    fn command_outcome_reports_timeout_actionably() {
+        let cap = CommandCapture {
+            stdout: "partial output".into(),
+            stderr: String::new(),
+            code: None,
+            timed_out: true,
+        };
+        let o = command_outcome(cap, COMMAND_TIMEOUT);
+        assert!(o.is_error);
+        assert!(o.content.contains("partial output"));
+        assert!(o.content.contains("timed out after 120s"));
+        assert!(o.content.contains("start_server"));
+    }
+
+    #[test]
+    fn command_outcome_appends_exit_marker() {
+        let cap = CommandCapture {
+            stdout: "z".repeat(40 * 1024),
+            stderr: String::new(),
+            code: Some(3),
+            timed_out: false,
+        };
+        let o = command_outcome(cap, COMMAND_TIMEOUT);
+        assert!(o.is_error);
+        assert!(o.content.ends_with("[exit 3]"));
+        assert!(o.content.contains("bytes omitted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_hanging_command_and_keeps_partial_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo started; exec sleep 30"]);
+        let start = std::time::Instant::now();
+        let cap = run_with_timeout(cmd, None, Duration::from_millis(300)).unwrap();
+        assert!(cap.timed_out);
+        assert!(cap.stdout.contains("started"), "{}", cap.stdout);
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    // ── readonly command classification ─────────────────────────────────────
+    #[test]
+    fn readonly_command_rejects_shell_composition_bypass() {
+        for c in [
+            "cat x; rm -rf ~",
+            "ls && rm -rf /",
+            "grep foo f || rm f",
+            "cat f | sh",
+            "cat f > out",
+            "sort < f",
+            "echo `rm x`",
+            "cat $(mktemp)",
+        ] {
+            assert!(!is_readonly_command(c), "{c} must not be readonly");
+        }
+    }
+
+    #[test]
+    fn readonly_command_excludes_mutating_lookalikes() {
+        for c in [
+            "sed -i s/a/b/ f.txt",
+            "sed s/a/b/ f.txt",
+            "find . -delete",
+            "find . -name '*.log' -exec rm {} +",
+            "git clean -fd",
+            "git branch -D main",
+            "git branch -m old new",
+            "git tag v1.0",
+            "git push origin main",
+            "xargs rm",
+            "tee out.txt",
+        ] {
+            assert!(!is_readonly_command(c), "{c} must not be readonly");
+        }
+    }
+
+    #[test]
+    fn readonly_command_allows_genuine_reads() {
+        for c in [
+            "grep -rn pattern src",
+            "rg pattern",
+            "cat README.md",
+            "ls -la",
+            "find . -name '*.rs'",
+            "git status",
+            "git log --oneline -5",
+            "git diff HEAD~1",
+            "git show abc123",
+            "git blame src/main.rs",
+            "git remote -v",
+            "git branch",
+        ] {
+            assert!(is_readonly_command(c), "{c} should be readonly");
+        }
+    }
+
+    // ── catastrophic additions ──────────────────────────────────────────────
+    #[test]
+    fn catastrophic_home_star_and_dot_targets() {
+        for c in [
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -fr ~",
+            "rm -rf *",
+            "rm -rf .",
+            "rm -rf ..",
+            "rm -r -f /",
+            "rm --recursive --force /",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+    }
+
+    #[test]
+    fn catastrophic_still_allows_scoped_rm() {
+        for c in ["rm -rf ./build", "rm -rf build", "rm -r tmp"] {
+            assert!(!catastrophic(c), "{c} should be allowed");
+        }
+    }
+
+    // ── cwd confinement ─────────────────────────────────────────────────────
+    #[test]
+    fn out_of_cwd_mutation_flags_writes_not_reads() {
+        let cwd = Path::new("/proj/work");
+        assert!(out_of_cwd_mutation(
+            "write_file",
+            &json!({"path": "/etc/cron.d/evil", "content": "x"}),
+            cwd
+        )
+        .is_some());
+        assert!(out_of_cwd_mutation(
+            "write_file",
+            &json!({"path": "src/main.rs", "content": "x"}),
+            cwd
+        )
+        .is_none());
+        assert!(out_of_cwd_mutation("read_file", &json!({"path": "/etc/passwd"}), cwd).is_none());
+        assert!(out_of_cwd_mutation(
+            "move_path",
+            &json!({"from": "a.txt", "to": "/tmp-elsewhere/b.txt"}),
+            cwd
+        )
+        .is_some());
+        assert!(out_of_cwd_mutation(
+            "str_replace_editor",
+            &json!({"command": "view", "path": "/etc/hosts"}),
+            cwd
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn run_refuses_out_of_cwd_write() {
+        let d = tempdir();
+        let outside = std::env::temp_dir().join("bwn-outside-target.txt");
+        let _ = fs::remove_file(&outside);
+        let r = run(
+            "write_file",
+            &json!({"path": outside.to_string_lossy(), "content": "x"}),
+            &d,
+        );
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("outside the working directory"));
+        assert!(!outside.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn escapes_cwd_handles_symlinked_tmp_prefix() {
+        // /tmp is a symlink to /private/tmp on macOS; canonicalizing only the
+        // base used to misclassify in-cwd targets as escaping.
+        assert!(!escapes_cwd(Path::new("/tmp/x/f.txt"), Path::new("/tmp/x")));
+        assert!(escapes_cwd(
+            Path::new("/private/etc/hosts"),
+            Path::new("/tmp/x")
+        ));
+    }
+
+    // ── write safety ────────────────────────────────────────────────────────
+    #[test]
+    fn run_write_missing_content_errors_without_writing() {
+        let d = tempdir();
+        let r = run("write_file", &json!({"path": "f.txt"}), &d);
+        assert!(r.is_error);
+        assert!(r.content.contains("missing required param `content`"));
+        assert!(r.content.contains("NOT written"));
+        assert!(!d.join("f.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_write_refuses_emptying_nonempty_file() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.txt", "content": "important data"}),
+            &d,
+        );
+        let r = run("write_file", &json!({"path": "f.txt", "content": ""}), &d);
+        assert!(r.is_error);
+        assert!(r.content.contains("refusing to overwrite"), "{}", r.content);
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "important data"
+        );
+        // Explicit empty content on a NEW file is still fine.
+        let ok_new = run(
+            "write_file",
+            &json!({"path": "empty.txt", "content": ""}),
+            &d,
+        );
+        assert!(!ok_new.is_error, "{}", ok_new.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn editor_create_missing_file_text_errors() {
+        let d = tempdir();
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "create", "path": "f.txt"}),
+            &d,
+        );
+        assert!(r.is_error);
+        assert!(r.content.contains("missing required param `file_text`"));
+        assert!(!d.join("f.txt").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── insert semantics ────────────────────────────────────────────────────
+    #[test]
+    fn editor_insert_line_zero_inserts_at_top_without_panic() {
+        let d = tempdir();
+        run(
+            "str_replace_editor",
+            &json!({"command": "create", "path": "f.txt", "file_text": "a\nb\n"}),
+            &d,
+        );
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "insert", "path": "f.txt", "insert_line": 0, "new_str": "top"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(fs::read_to_string(d.join("f.txt")).unwrap(), "top\na\nb\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn editor_insert_preserves_crlf() {
+        let d = tempdir();
+        run(
+            "str_replace_editor",
+            &json!({"command": "create", "path": "f.txt", "file_text": "a\r\nb\r\n"}),
+            &d,
+        );
+        let r = run(
+            "str_replace_editor",
+            &json!({"command": "insert", "path": "f.txt", "insert_line": 1, "new_str": "mid"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "a\r\nmid\r\nb\r\n"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── edit feedback ───────────────────────────────────────────────────────
+    #[test]
+    fn run_edit_not_found_reports_closest_line_hint() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": "fn main() {\n    let x = 1;\n}\n"}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.rs", "old": "\tlet x = 1;", "new": "\tlet x = 2;"}),
+            &d,
+        );
+        assert!(e.is_error);
+        assert!(e.content.contains("line 2"), "{}", e.content);
+        assert!(e.content.contains("re-read"), "{}", e.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_not_unique_reports_count() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.txt", "content": "x y x y x"}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.txt", "old": "x", "new": "z"}),
+            &d,
+        );
+        assert!(e.is_error);
+        assert!(e.content.contains("3 times"), "{}", e.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── tiered lenient edit apply ───────────────────────────────────────────
+    #[test]
+    fn run_edit_lenient_rstrip_tier_applies() {
+        let d = tempdir();
+        // The file carries trailing whitespace the model's copy lacks.
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": "fn main() {   \n    let x = 1;\t\n}\n"}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({
+                "path": "f.rs",
+                "old": "fn main() {\n    let x = 1;\n}",
+                "new": "fn main() {\n    let x = 2;\n}"
+            }),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+        assert!(e.content.contains("whitespace tolerance"), "{}", e.content);
+        assert_eq!(
+            fs::read_to_string(d.join("f.rs")).unwrap(),
+            "fn main() {\n    let x = 2;\n}\n"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_lenient_indent_shift_applies_and_reindents() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": "mod m {\n    fn f() {\n        one();\n    }\n}\n"}),
+            &d,
+        );
+        // The model re-sent the block dedented by four spaces; the edit must
+        // apply and the replacement must land at the file's real depth.
+        let e = run(
+            "edit_file",
+            &json!({
+                "path": "f.rs",
+                "old": "fn f() {\n    one();\n}",
+                "new": "fn f() {\n    two();\n}"
+            }),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+        assert!(e.content.contains("whitespace tolerance"), "{}", e.content);
+        assert_eq!(
+            fs::read_to_string(d.join("f.rs")).unwrap(),
+            "mod m {\n    fn f() {\n        two();\n    }\n}\n"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_lenient_over_indented_old_strips_replacement() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": "a();\nb();\nc();\n"}),
+            &d,
+        );
+        // The model's copy is deeper than the file; the delta is stripped
+        // from the replacement on the way back in.
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.rs", "old": "    b();\n    c();", "new": "    d();"}),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+        assert_eq!(fs::read_to_string(d.join("f.rs")).unwrap(), "a();\nd();\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_lenient_non_unique_match_still_errors() {
+        let d = tempdir();
+        // Two regions match after trailing-whitespace trim — too ambiguous.
+        let content = "a();   \nb();\na();\t\nb();\n";
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": content}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.rs", "old": "a();\nb();", "new": "c();"}),
+            &d,
+        );
+        assert!(e.is_error, "{}", e.content);
+        assert!(e.content.contains("not found"), "{}", e.content);
+        assert_eq!(fs::read_to_string(d.join("f.rs")).unwrap(), content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_lenient_absent_text_still_errors_with_hint() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": "fn main() {}\n"}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.rs", "old": "fn missing()\nnowhere();", "new": "x"}),
+            &d,
+        );
+        assert!(e.is_error, "{}", e.content);
+        assert!(e.content.contains("not found"), "{}", e.content);
+        assert!(e.content.contains("re-read"), "{}", e.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_edit_lenient_ignores_tab_for_space_swap() {
+        let d = tempdir();
+        // A tab-for-space substitution is not a uniform indent shift; it must
+        // stay diagnostic-only rather than auto-apply.
+        let content = "fn main() {\n    let x = 1;\n}\n";
+        run(
+            "write_file",
+            &json!({"path": "f.rs", "content": content}),
+            &d,
+        );
+        let e = run(
+            "edit_file",
+            &json!({"path": "f.rs", "old": "fn main() {\n\tlet x = 1;\n}", "new": "y"}),
+            &d,
+        );
+        assert!(e.is_error, "{}", e.content);
+        assert_eq!(fs::read_to_string(d.join("f.rs")).unwrap(), content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn multi_edit_lenient_match_applies_with_note() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.txt", "content": "alpha   \nbeta\ngamma\n"}),
+            &d,
+        );
+        let e = run(
+            "multi_edit",
+            &json!({"path": "f.txt", "edits": [
+                {"old": "alpha\nbeta", "new": "ALPHA\nBETA"},
+                {"old": "gamma", "new": "GAMMA"},
+            ]}),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+        assert!(e.content.contains("2 replacements"), "{}", e.content);
+        assert!(
+            e.content.contains("1 matched with whitespace tolerance"),
+            "{}",
+            e.content
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("f.txt")).unwrap(),
+            "ALPHA\nBETA\nGAMMA\n"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn str_replace_lenient_indent_shift_applies() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.py", "content": "class A:\n    def f(self):\n        return 1\n"}),
+            &d,
+        );
+        let e = run(
+            "str_replace_editor",
+            &json!({
+                "command": "str_replace",
+                "path": "f.py",
+                "old_str": "def f(self):\n    return 1",
+                "new_str": "def f(self):\n    return 2"
+            }),
+            &d,
+        );
+        assert!(!e.is_error, "{}", e.content);
+        assert!(e.content.contains("whitespace tolerance"), "{}", e.content);
+        assert_eq!(
+            fs::read_to_string(d.join("f.py")).unwrap(),
+            "class A:\n    def f(self):\n        return 2\n"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn multi_edit_failure_names_edit_index() {
+        let d = tempdir();
+        run(
+            "write_file",
+            &json!({"path": "f.txt", "content": "alpha\nbeta\ngamma\n"}),
+            &d,
+        );
+        let e = run(
+            "multi_edit",
+            &json!({"path": "f.txt", "edits": [
+                {"old": "alpha", "new": "ALPHA"},
+                {"old": "missing", "new": "x"},
+            ]}),
+            &d,
+        );
+        assert!(e.is_error);
+        assert!(e.content.contains("edit #2 of 2"), "{}", e.content);
+        assert!(e.content.contains("earlier edits"), "{}", e.content);
+        // Nothing was written: edit #1 must not have been applied.
+        assert!(fs::read_to_string(d.join("f.txt"))
+            .unwrap()
+            .contains("alpha"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── unknown tool ────────────────────────────────────────────────────────
+    #[test]
+    fn unknown_tool_suggests_nearest_and_lists_valid() {
+        let d = tempdir();
+        let r = run("red_file", &json!({}), &d);
+        assert!(r.is_error);
+        assert!(
+            r.content.contains("Did you mean `read_file`?"),
+            "{}",
+            r.content
+        );
+        assert!(r.content.contains("Valid tools:"), "{}", r.content);
+        assert!(r.content.contains("write_file"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── grep output caps ────────────────────────────────────────────────────
+    #[test]
+    fn grep_caps_long_lines_and_reports_hidden_matches() {
+        let d = tempdir();
+        let long_line = format!("needle {}", "z".repeat(700));
+        let many = ["needle here"; 12].join("\n");
+        run(
+            "write_file",
+            &json!({"path": "long.txt", "content": long_line}),
+            &d,
+        );
+        let clipped = run("grep_files", &json!({"pattern": "needle", "max": 500}), &d);
+        assert!(
+            clipped.content.contains("[line truncated]"),
+            "{}",
+            clipped.content
+        );
+        run(
+            "write_file",
+            &json!({"path": "many.txt", "content": many}),
+            &d,
+        );
+        let capped = run("grep_files", &json!({"pattern": "needle", "max": 5}), &d);
+        assert!(
+            capped.content.contains("13 matches, showing 5"),
+            "{}",
+            capped.content
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── read error kinds ────────────────────────────────────────────────────
+    #[test]
+    fn read_binary_file_suggests_extractor() {
+        let d = tempdir();
+        fs::write(d.join("bin.dat"), [0xffu8, 0xfe, 0x00, 0x9f, 0x11]).unwrap();
+        let r = run("read_file", &json!({"path": "bin.dat"}), &d);
+        assert!(r.is_error);
+        assert!(r.content.contains("binary"), "{}", r.content);
+        assert!(r.content.contains("run_command"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_missing_file_keeps_recovery_text() {
+        let d = tempdir();
+        let r = run("read_file", &json!({"path": "nope.txt"}), &d);
+        assert!(r.is_error);
+        assert!(r.content.contains("do not invent another path"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── kb timestamps ───────────────────────────────────────────────────────
+    #[test]
+    fn iso8601_known_values() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        assert_eq!(iso8601_utc(951_868_800), "2000-03-01T00:00:00Z"); // leap-year boundary
+        let now = iso8601_utc_now();
+        assert_ne!(now, "2026-07-06T00:00:00Z".to_string());
+        assert!(now.ends_with('Z') && now.contains('T'));
     }
 }

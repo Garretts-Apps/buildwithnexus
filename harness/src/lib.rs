@@ -193,18 +193,49 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
             preset.env_key
         ));
     }
-    let context_tokens = match preset.id {
+    let mut context_tokens = match preset.id {
         "anthropic" => 200_000,
         _ if preset.local => 8_192,
         _ => 128_000,
     };
-    Ok(Provider {
-        protocol: preset.protocol,
+    // An explicit settings override wins over presets and detection alike.
+    if let Some(n) = s.context_tokens {
+        context_tokens = n as usize;
+    }
+    // Backward compatibility: an explicit base_url pointing at the OpenAI-compat
+    // surface (`…/v1`) keeps the OpenAI protocol — configs saved before the
+    // native Ollama path existed (and users deliberately targeting a /v1
+    // proxy) must not switch wire formats. Native is for root URLs only.
+    let mut protocol = preset.protocol;
+    if protocol == config::Protocol::OllamaNative
+        && s.base_url
+            .as_deref()
+            .is_some_and(|u| u.trim_end_matches('/').ends_with("/v1"))
+    {
+        protocol = config::Protocol::OpenAi;
+    }
+    let mut provider = Provider {
+        protocol,
         base_url,
         model,
         api_key,
         context_tokens,
-    })
+        temperature: s.temperature,
+        max_tokens: s.max_tokens,
+        ollama_ctx: std::sync::OnceLock::new(),
+    };
+    if provider.protocol == config::Protocol::OllamaNative {
+        if let Some(n) = s.context_tokens {
+            // Pre-seed the probe cache: the native path uses the override as
+            // num_ctx without ever querying /api/show.
+            let _ = provider.ollama_ctx.set(Some(n));
+        } else if let Some(n) = provider::ollama_ctx(&provider) {
+            // Detected window replaces the hardcoded 8k local default so
+            // compaction thresholds match what the model can actually hold.
+            provider.context_tokens = n as usize;
+        }
+    }
+    Ok(provider)
 }
 
 fn headless(
@@ -920,10 +951,19 @@ fn repl(
             continue;
         }
 
-        // Mode suggestion: hint once per unique suggestion, but stay quiet for
-        // greetings and ordinary questions that should answer in any mode.
+        // Mode routing: auto-switch out of BRAINSTORM when the task clearly
+        // demands real work (chat mode can't fulfill "build X"); elsewhere only
+        // hint, and stay quiet for greetings and ordinary questions.
         if should_answer_conversationally(t, &mode) {
             last_suggested_mode = None;
+        } else if let Some(new_mode) = auto_switch_mode(t, &mode) {
+            mode = new_mode;
+            last_suggested_mode = None;
+            tui::line(&tui::dim(&format!(
+                "  auto-switched to {} for this task — /mode to switch back",
+                mode_label(&mode)
+            )));
+            tui::show_mode_change(mode_label(&mode));
         } else {
             suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
         }
@@ -1000,16 +1040,23 @@ fn mode_label(mode: &Mode) -> &'static str {
     }
 }
 
+// Auto-switch when the task phrasing clearly demands a different mode.
+// Conservative matrix: only ever escalates out of BRAINSTORM — a chat mode
+// can't fulfill a build/plan request. A deliberate PLAN gate is never bypassed
+// silently; build-shaped tasks there still get the tip below.
+fn auto_switch_mode(task: &str, current: &Mode) -> Option<Mode> {
+    let target = classify(task);
+    match (&target, current) {
+        (Mode::Build, Mode::Brainstorm) | (Mode::Plan, Mode::Brainstorm) => Some(target),
+        _ => None,
+    }
+}
+
 // Suggest switching modes when the task phrasing strongly implies a different mode.
 // Suppresses the tip if it was already shown for this mode combo in the current session.
 fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
     let suggested = classify(task);
-    let mismatch = matches!(
-        (&suggested, current),
-        (Mode::Build, Mode::Brainstorm)
-            | (Mode::Plan, Mode::Brainstorm)
-            | (Mode::Build, Mode::Plan)
-    );
+    let mismatch = matches!((&suggested, current), (Mode::Build, Mode::Plan));
     if mismatch {
         let sug_label = mode_label(&suggested);
         if *last_suggested != Some(sug_label) {
@@ -3109,6 +3156,23 @@ mod tests {
     #[test]
     fn classify_is_case_insensitive() {
         assert!(matches!(classify("DESIGN the system"), Mode::Plan));
+    }
+
+    #[test]
+    fn auto_switch_escalates_out_of_brainstorm_only() {
+        // A build request in chat mode must actually build, not chat.
+        assert!(matches!(
+            auto_switch_mode("build me a snake game", &Mode::Brainstorm),
+            Some(Mode::Build)
+        ));
+        assert!(matches!(
+            auto_switch_mode("plan the migration to sqlite", &Mode::Brainstorm),
+            Some(Mode::Plan)
+        ));
+        // A deliberate PLAN gate is never silently bypassed.
+        assert!(auto_switch_mode("fix the parser bug", &Mode::Plan).is_none());
+        // Matching mode: nothing to do.
+        assert!(auto_switch_mode("fix the parser bug", &Mode::Build).is_none());
     }
 
     #[test]

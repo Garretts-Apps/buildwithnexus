@@ -365,6 +365,10 @@ impl KnowledgeBase {
     }
 
     /// Generates a structured Markdown context summary for injection into LLM prompts.
+    ///
+    /// Selection and ordering are deterministic (curated descriptions first,
+    /// then by name) so the injected block is byte-stable across processes and
+    /// keeps provider prompt-cache prefixes warm.
     pub fn generate_context_summary(&self, relevant_ids: &[String]) -> String {
         if relevant_ids.is_empty() && self.entities.is_empty() {
             return "No structured project knowledge available.".to_string();
@@ -372,7 +376,19 @@ impl KnowledgeBase {
 
         let mut out = String::from("### Structured Project Knowledge\n\n");
         let ids: Vec<&String> = if relevant_ids.is_empty() {
-            self.entities.keys().take(20).collect()
+            // HashMap iteration order is randomized per instance, which would
+            // inject a different symbol sample into every system prompt and
+            // break prompt-cache byte stability. Sort so the sampled subset
+            // (and its order) is identical run to run, preferring entities
+            // with real descriptions over auto-extracted placeholder noise.
+            let mut all: Vec<&Entity> = self.entities.values().collect();
+            all.sort_by(|a, b| {
+                has_curated_description(b)
+                    .cmp(&has_curated_description(a))
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            all.into_iter().take(20).map(|e| &e.id).collect()
         } else {
             relevant_ids.iter().collect()
         };
@@ -401,9 +417,40 @@ impl KnowledgeBase {
     }
 }
 
+/// True when an entity carries a curated description rather than the
+/// auto-extracted "Extracted symbol from ..." placeholder produced by
+/// indexing, so context summaries surface real knowledge first.
+fn has_curated_description(e: &Entity) -> bool {
+    e.description
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty() && !d.starts_with("Extracted symbol from"))
+}
+
+/// Current UTC time as an ISO 8601 string (e.g. "2026-07-06T08:00:00Z"),
+/// derived from the system clock without pulling in a date-time crate.
 pub fn chrono_now_iso() -> String {
-    // Simple ISO 8601 UTC string without pulling in chrono crate if avoidable
-    "2026-07-06T08:00:00Z".to_string()
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    iso_from_epoch(secs)
+}
+
+// Civil-from-days conversion (Howard Hinnant's algorithm); exact for the whole
+// unix era, so no leap-year edge cases to worry about.
+fn iso_from_epoch(secs: u64) -> String {
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (h, min, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
 #[cfg(test)]
@@ -429,5 +476,71 @@ mod tests {
         assert_eq!(kb.find_by_type(EntityType::Function).len(), 1);
         assert!(kb.remove_entity("function:test_fn").is_some());
         assert_eq!(kb.get_entity("function:test_fn"), None);
+    }
+
+    #[test]
+    fn test_generate_context_summary_is_deterministic_and_prefers_descriptions() {
+        fn entity(id: &str, name: &str, desc: Option<&str>) -> Entity {
+            Entity {
+                id: id.to_string(),
+                entity_type: EntityType::Function,
+                name: name.to_string(),
+                path: Some("src/lib.rs".to_string()),
+                description: desc.map(|d| d.to_string()),
+                metadata: Value::Null,
+                relationships: vec![],
+                last_updated: "2026-07-06T08:00:00Z".to_string(),
+            }
+        }
+        let items = [
+            (
+                "function:zeta",
+                "zeta",
+                Some("Extracted symbol from src/lib.rs"),
+            ),
+            ("function:mid", "mid", None),
+            ("function:alpha", "alpha", Some("Parses config files")),
+            (
+                "function:beta",
+                "beta",
+                Some("Extracted symbol from src/lib.rs"),
+            ),
+        ];
+        // Two knowledge bases with the same contents but opposite insertion
+        // order: separate HashMap instances hash differently, so this fails
+        // whenever selection leans on map iteration order.
+        let mut kb1 = KnowledgeBase::default();
+        for (id, name, desc) in items {
+            kb1.add_entity(entity(id, name, desc));
+        }
+        let mut kb2 = KnowledgeBase::default();
+        for (id, name, desc) in items.into_iter().rev() {
+            kb2.add_entity(entity(id, name, desc));
+        }
+        let s1 = kb1.generate_context_summary(&[]);
+        assert_eq!(s1, kb1.generate_context_summary(&[]));
+        assert_eq!(s1, kb2.generate_context_summary(&[]));
+        // The curated description sorts ahead of auto-extracted placeholders.
+        let alpha = s1.find("**alpha**").expect("alpha listed");
+        let beta = s1.find("**beta**").expect("beta listed");
+        assert!(alpha < beta, "curated entity should be listed first:\n{s1}");
+    }
+
+    #[test]
+    fn test_iso_from_epoch_known_values() {
+        assert_eq!(iso_from_epoch(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_from_epoch(1_735_689_600), "2025-01-01T00:00:00Z");
+        // Leap day, with a non-zero time-of-day component.
+        assert_eq!(iso_from_epoch(1_709_209_530), "2024-02-29T12:25:30Z");
+    }
+
+    #[test]
+    fn test_chrono_now_iso_is_clock_derived() {
+        let now = chrono_now_iso();
+        assert_eq!(now.len(), 20);
+        assert!(now.ends_with('Z'));
+        // Sanity: the year comes from the system clock, not a constant.
+        let year: i32 = now[..4].parse().unwrap();
+        assert!(year >= 2024);
     }
 }

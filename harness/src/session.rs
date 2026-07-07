@@ -80,24 +80,52 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
         msgs: msgs.to_vec(),
     };
     if let Ok(text) = serde_json::to_string(&s) {
-        let _ = std::fs::write(file(id), text);
+        // Write-then-rename so a crash mid-save never truncates the previous
+        // session file. list() only picks up `.json` files, so the temp file
+        // is invisible even if a crash leaves it behind.
+        let path = file(id);
+        let tmp = dir().join(format!("{id}.json.tmp"));
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+// A session file that exists but fails to parse is data the user thinks is
+// saved — surface it instead of silently dropping it from /resume listings.
+fn parse_session(path: &Path, text: &str) -> Option<Session> {
+    match serde_json::from_str(text) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "warning: skipping corrupt session file {}: {e}",
+                path.display()
+            );
+            None
+        }
     }
 }
 
 /// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
+/// Warns on stderr if the file exists but cannot be parsed.
 pub fn load(id: &str) -> Option<Session> {
-    let text = std::fs::read_to_string(file(id)).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = file(id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    parse_session(&path, &text)
 }
 
 /// Lists all persisted sessions, ordered newest-first by last update timestamp.
+/// Corrupt session files are skipped with a warning on stderr.
 pub fn list() -> Vec<Session> {
     let mut v: Vec<Session> = match std::fs::read_dir(dir()) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-            .filter_map(|t| serde_json::from_str::<Session>(&t).ok())
+            .filter_map(|e| {
+                let path = e.path();
+                let text = std::fs::read_to_string(&path).ok()?;
+                parse_session(&path, &text)
+            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -167,6 +195,47 @@ mod tests {
             // updated_ms ties are possible; assert both present, newest-id first-ish.
             assert!(ls.iter().any(|s| s.title == "first"));
             assert!(ls.iter().any(|s| s.title == "second"));
+        });
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file_and_result_is_loadable() {
+        with_home(|| {
+            save(
+                "0000000000000009",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("atomic".into())],
+            );
+            assert!(load("0000000000000009").is_some());
+            assert!(!dir().join("0000000000000009.json.tmp").exists());
+        });
+    }
+
+    #[test]
+    fn list_skips_corrupt_session_files_but_keeps_valid_ones() {
+        with_home(|| {
+            save(
+                "0000000000000001",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("ok".into())],
+            );
+            std::fs::write(dir().join("corrupt.json"), "{not valid json").unwrap();
+            let ls = list();
+            assert_eq!(ls.len(), 1);
+            assert_eq!(ls[0].title, "ok");
+            // Corrupt file must still be on disk (skipped, not deleted).
+            assert!(dir().join("corrupt.json").exists());
+        });
+    }
+
+    #[test]
+    fn load_returns_none_for_corrupt_file() {
+        with_home(|| {
+            let _ = std::fs::create_dir_all(dir());
+            std::fs::write(dir().join("0000000000000042.json"), "garbage").unwrap();
+            assert!(load("0000000000000042").is_none());
         });
     }
 }

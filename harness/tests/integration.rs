@@ -284,20 +284,26 @@ fn catastrophic_command_auto_denies() {
 }
 
 #[test]
-fn repeated_identical_tool_results_stop_the_loop() {
+fn repeated_identical_tool_errors_stop_the_loop() {
     let home = tmp("home");
     let cwd = tmp("proj");
-    // Two identical calls with identical output should stop through the loop
-    // guard instead of burning the whole iteration budget.
+    // Repeated *identical errors* are loop evidence: the guard nudges once, then
+    // stops the run honestly rather than burning the whole iteration budget.
+    // (Identical *successful* results are tolerated — legitimate re-reads — so
+    // the loop trigger is a repeated failing call, here reading a missing file.)
+    let miss = json!({"path": "does-not-exist.txt"});
     let script = vec![
-        tool_call("c1", "list_dir", json!({"path": "."})),
-        tool_call("c2", "list_dir", json!({"path": "."})),
+        tool_call("c1", "read_file", miss.clone()),
+        tool_call("c2", "read_file", miss.clone()),
+        tool_call("c3", "read_file", miss.clone()),
+        tool_call("c4", "read_file", miss.clone()),
     ];
     let port = serve(script);
     write_config(&home, "ollama", "auto", port);
 
     let r = run(&home, &cwd, "loop forever");
-    assert!(r.success, "stderr: {}", r.stderr);
+    // A stopped loop is surfaced as a failure with an honest summary.
+    assert!(!r.success, "a stopped loop should not report success");
     assert!(r.has_event("assistant"));
     assert!(r.text_of("assistant").contains("repeated tool loop"));
 }
