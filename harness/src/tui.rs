@@ -1074,39 +1074,89 @@ fn format_links(s: &str) -> String {
     out
 }
 
-fn format_italics(s: &str) -> String {
-    if !s.contains('*') {
-        return s.to_string();
+// Flush the pending plain-text run to `out`, wrapping it in the styles active
+// when it was collected. Italic is applied inside bold so both can nest.
+fn flush_styled_run(out: &mut String, buf: &mut String, bold_on: bool, italic_on: bool) {
+    if buf.is_empty() {
+        return;
     }
-    let mut out = String::with_capacity(s.len() + 16);
-    let mut is_italic = false;
-    for (i, part) in s.split('*').enumerate() {
-        if i > 0 && is_italic {
-            out.push_str(&italic(part));
-        } else {
-            out.push_str(part);
-        }
-        is_italic = !is_italic;
+    let mut s = std::mem::take(buf);
+    if italic_on {
+        s = italic(&s);
     }
-    out
+    if bold_on {
+        s = bold(&s);
+    }
+    out.push_str(&s);
 }
 
+// Render inline Markdown (`` `code` ``, `**bold**`, `*italic*`) into ANSI in a
+// single left-to-right pass. A marker only opens a style when a matching closer
+// exists ahead and it isn't followed by whitespace, so an unmatched `` ` ``,
+// `**`, or `*` — including arithmetic like `5 * 3` — stays literal instead of
+// styling the rest of the line. Links are resolved first by `format_links`.
 fn format_inline_md(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 32);
-    for (i, part) in text.split('`').enumerate() {
-        if i % 2 == 1 {
-            out.push_str(&yellow(part));
-        } else {
-            let with_links = format_links(part);
-            for (j, bpart) in with_links.split("**").enumerate() {
-                if j % 2 == 1 {
-                    out.push_str(&bold(bpart));
-                } else {
-                    out.push_str(&format_italics(bpart));
-                }
+    let linked = format_links(text);
+    let chars: Vec<char> = linked.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(linked.len() + 32);
+    let mut buf = String::new();
+    let (mut bold_on, mut italic_on) = (false, false);
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '`' {
+            // Code span: style only if there's a closing backtick ahead.
+            if let Some(rel) = chars[i + 1..].iter().position(|&x| x == '`') {
+                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
+                let code: String = chars[i + 1..i + 1 + rel].iter().collect();
+                out.push_str(&yellow(&code));
+                i += rel + 2;
+                continue;
             }
+            buf.push('`');
+            i += 1;
+            continue;
         }
+        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
+            let toggles = if bold_on {
+                i > 0 && !chars[i - 1].is_whitespace()
+            } else {
+                i + 2 < n
+                    && !chars[i + 2].is_whitespace()
+                    && chars[i + 2..]
+                        .windows(2)
+                        .any(|w| w[0] == '*' && w[1] == '*')
+            };
+            if toggles {
+                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
+                bold_on = !bold_on;
+            } else {
+                buf.push('*');
+                buf.push('*');
+            }
+            i += 2;
+            continue;
+        }
+        if c == '*' {
+            let toggles = if italic_on {
+                i > 0 && !chars[i - 1].is_whitespace()
+            } else {
+                i + 1 < n && !chars[i + 1].is_whitespace() && chars[i + 1..].contains(&'*')
+            };
+            if toggles {
+                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
+                italic_on = !italic_on;
+            } else {
+                buf.push('*');
+            }
+            i += 1;
+            continue;
+        }
+        buf.push(c);
+        i += 1;
     }
+    flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
     out
 }
 
@@ -3589,6 +3639,25 @@ mod tests {
         assert_eq!(super::end_word(&b, 0), 4);
         assert_eq!(super::end_word(&b, 4), 10);
         assert_eq!(super::end_word(&b, 10), 14);
+    }
+
+    #[test]
+    fn inline_md_unbalanced_markers_stay_literal() {
+        // A single `*` (arithmetic), a lone backtick, and an unmatched `**`
+        // must not style the rest of the line — they render verbatim.
+        assert_eq!(format_inline_md("5 * 3 = 15"), "5 * 3 = 15");
+        assert_eq!(format_inline_md("call `foo now"), "call `foo now");
+        assert_eq!(format_inline_md("a ** b"), "a ** b");
+    }
+
+    #[test]
+    fn inline_md_balanced_markers_consume_delimiters() {
+        // Balanced emphasis/code: the markers are consumed and the inner text
+        // preserved (checked after stripping ANSI, so this holds in any color
+        // mode).
+        assert_eq!(plain(&format_inline_md("a *word* b")), "a word b");
+        assert_eq!(plain(&format_inline_md("a **bold** c")), "a bold c");
+        assert_eq!(plain(&format_inline_md("use `code` here")), "use code here");
     }
 
     #[test]

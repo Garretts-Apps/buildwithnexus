@@ -1490,14 +1490,8 @@ fn strip_html(html: &str) -> String {
         i += 1;
     }
 
-    // Collapse whitespace and decode common HTML entities.
-    let decoded = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&nbsp;", " ")
-        .replace("&#39;", "'");
+    // Collapse whitespace and decode HTML entities (named + numeric).
+    let decoded = decode_html_entities(&out);
 
     let mut result = String::new();
     let mut prev_ws = true;
@@ -1513,6 +1507,205 @@ fn strip_html(html: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+// One parsed web-search result.
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+// Percent-decode a URL-encoded string (also treats `+` as space). Invalid
+// escapes are left as-is. Bytes are reassembled as UTF-8 lossily.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Resolve a single entity body (the text between `&` and `;`) to its character:
+// the common named entities plus decimal (`#8217`) and hex (`#x2019`) numeric
+// character references. Returns None for anything unrecognized.
+fn entity_char(ent: &str) -> Option<char> {
+    match ent {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "mdash" => Some('—'),
+        "ndash" => Some('–'),
+        "hellip" => Some('…'),
+        "rsquo" => Some('’'),
+        "lsquo" => Some('‘'),
+        "rdquo" => Some('”'),
+        "ldquo" => Some('“'),
+        _ => {
+            let num = ent.strip_prefix('#')?;
+            let code = match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
+// Decode HTML entities in a single left-to-right pass — named entities and
+// decimal/hex numeric character references. Single-pass so `&amp;lt;` decodes to
+// the literal `&lt;` (not `<`), and an unrecognized `&…;` is left untouched.
+fn decode_html_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // `&` and `;` are ASCII, so `semi` is a valid char boundary; the ≤12
+        // bound keeps a lone `&` in prose from swallowing a distant `;`.
+        if let Some(semi) = tail.find(';') {
+            if semi <= 12 {
+                if let Some(ch) = entity_char(&tail[1..semi]) {
+                    out.push(ch);
+                    rest = &tail[semi + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push('&');
+        rest = &tail[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+// Read attribute `attr` from the tag that opens at byte index `tag_start`,
+// scanning only within that tag (up to its closing `>`).
+fn tag_attr(html: &str, tag_start: usize, attr: &str) -> Option<String> {
+    let end = html[tag_start..].find('>').map(|e| tag_start + e)?;
+    let seg = &html[tag_start..end];
+    let key = format!("{attr}=");
+    let after = &seg[seg.find(&key)? + key.len()..];
+    let quote = after.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let rest = &after[1..];
+        rest.find(quote).map(|c| rest[..c].to_string())
+    } else {
+        let endv = after.find(char::is_whitespace).unwrap_or(after.len());
+        Some(after[..endv].to_string())
+    }
+}
+
+// DuckDuckGo Lite wraps result links in a redirect: `//duckduckgo.com/l/?uddg=
+// <percent-encoded-target>&rut=…`. Recover the real destination; fall back to
+// normalizing a protocol-relative href.
+fn ddg_real_url(href: &str) -> String {
+    let href = href.replace("&amp;", "&");
+    if let Some(p) = href.find("uddg=") {
+        let rest = &href[p + "uddg=".len()..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        return percent_decode(&rest[..end]);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("https://{stripped}");
+    }
+    href.to_string()
+}
+
+// Parse DuckDuckGo Lite result rows into structured hits. Returns empty if the
+// markup doesn't match (the caller then falls back to a stripped-text blob).
+fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
+    let mut titles: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = html[i..].find("<a ") {
+        let tag_start = i + rel;
+        let Some(gt) = html[tag_start..].find('>').map(|e| tag_start + e) else {
+            break;
+        };
+        if html[tag_start..gt].contains("result-link") {
+            let url = ddg_real_url(&tag_attr(html, tag_start, "href").unwrap_or_default());
+            let after = &html[gt + 1..];
+            if let Some(close) = after.to_lowercase().find("</a") {
+                let title = decode_html_entities(&strip_html(&after[..close]))
+                    .trim()
+                    .to_string();
+                if !title.is_empty() {
+                    titles.push((title, url));
+                }
+            }
+        }
+        i = gt + 1;
+    }
+
+    let mut snippets: Vec<String> = Vec::new();
+    let mut j = 0;
+    while let Some(rel) = html[j..].find("result-snippet") {
+        let pos = j + rel;
+        if let Some(gt) = html[pos..].find('>') {
+            let start = pos + gt + 1;
+            if let Some(lt) = html[start..].find('<') {
+                snippets.push(
+                    decode_html_entities(&strip_html(&html[start..start + lt]))
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+        j = pos + "result-snippet".len();
+    }
+
+    titles
+        .into_iter()
+        .enumerate()
+        .map(|(k, (title, url))| SearchHit {
+            title,
+            url,
+            snippet: snippets.get(k).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+// Render parsed hits as compact, numbered `title / url / snippet` blocks that a
+// small model can read, capped at `max` results.
+fn format_search_hits(hits: &[SearchHit], max: usize) -> String {
+    let mut out = String::new();
+    for (n, h) in hits.iter().take(max).enumerate() {
+        out.push_str(&format!("{}. {}\n", n + 1, h.title));
+        if !h.url.is_empty() {
+            out.push_str(&format!("   {}\n", h.url));
+        }
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", h.snippet));
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 // Commands so destructive they require confirmation in every mode.
@@ -1861,13 +2054,170 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn docx_paragraph(text: &str, style: Option<&str>) -> String {
-    let style = style
+    let ppr = style
         .map(|s| format!("<w:pPr><w:pStyle w:val=\"{s}\"/></w:pPr>"))
         .unwrap_or_default();
-    format!(
-        "<w:p>{style}<w:r><w:t>{}</w:t></w:r></w:p>",
+    format!("<w:p>{ppr}{}</w:p>", docx_runs(text))
+}
+
+// Emit one Word run for `text` with the active inline formatting. Empty text
+// produces nothing (an all-empty paragraph is still valid OOXML).
+fn docx_push_run(out: &mut String, text: &str, bold: bool, italic: bool, code: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let mut rpr = String::new();
+    if bold {
+        rpr.push_str("<w:b/>");
+    }
+    if italic {
+        rpr.push_str("<w:i/>");
+    }
+    if code {
+        rpr.push_str("<w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:cs=\"Consolas\"/>");
+    }
+    if !rpr.is_empty() {
+        rpr = format!("<w:rPr>{rpr}</w:rPr>");
+    }
+    out.push_str("<w:r>");
+    out.push_str(&rpr);
+    out.push_str(&format!(
+        "<w:t xml:space=\"preserve\">{}</w:t></w:r>",
         xml_escape(text)
-    )
+    ));
+}
+
+// Light-markdown inline formatting → Word runs: `**bold**`, `*italic*`, and
+// `` `code` `` (verbatim). Emphasis markers only toggle when they flank
+// non-space text, so arithmetic like `5 * 3` and glob patterns stay literal;
+// underscores are deliberately left alone so `snake_case` isn't italicized.
+fn docx_runs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::new();
+    let mut buf = String::new();
+    let (mut bold, mut italic, mut code) = (false, false, false);
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        // Inside a code span everything is literal until the closing backtick.
+        if code {
+            if c == '`' {
+                docx_push_run(&mut out, &buf, bold, italic, code);
+                buf.clear();
+                code = false;
+            } else {
+                buf.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '`' => {
+                docx_push_run(&mut out, &buf, bold, italic, code);
+                buf.clear();
+                code = true;
+                i += 1;
+            }
+            '*' if i + 1 < n && chars[i + 1] == '*' => {
+                // Opening `**` must precede non-space; closing must follow it.
+                let flanks = if bold {
+                    i > 0 && !chars[i - 1].is_whitespace()
+                } else {
+                    i + 2 < n && !chars[i + 2].is_whitespace()
+                };
+                if flanks {
+                    docx_push_run(&mut out, &buf, bold, italic, code);
+                    buf.clear();
+                    bold = !bold;
+                } else {
+                    buf.push('*');
+                    buf.push('*');
+                }
+                i += 2;
+            }
+            '*' => {
+                let flanks = if italic {
+                    i > 0 && !chars[i - 1].is_whitespace()
+                } else {
+                    i + 1 < n && !chars[i + 1].is_whitespace()
+                };
+                if flanks {
+                    docx_push_run(&mut out, &buf, bold, italic, code);
+                    buf.clear();
+                    italic = !italic;
+                } else {
+                    buf.push('*');
+                }
+                i += 1;
+            }
+            _ => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    docx_push_run(&mut out, &buf, bold, italic, code);
+    out
+}
+
+// Split a markdown table line into trimmed cells, dropping the outer pipes.
+fn parse_table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+// A markdown table row: trimmed, starts with `|`, and has at least two pipes.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.matches('|').count() >= 2
+}
+
+// The `|---|:--:|` alignment row: every cell is only dashes/colons.
+fn is_table_separator(line: &str) -> bool {
+    let cells = parse_table_cells(line);
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+// One table cell. Header cells are a single bold run; body cells get full
+// inline markdown formatting.
+fn docx_table_cell(text: &str, header: bool) -> String {
+    let runs = if header {
+        let mut s = String::new();
+        docx_push_run(&mut s, text, true, false, false);
+        s
+    } else {
+        docx_runs(text)
+    };
+    format!("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr><w:p>{runs}</w:p></w:tc>")
+}
+
+// A bordered Word table. The first row is treated as the (bold) header.
+fn docx_table(rows: &[Vec<String>]) -> String {
+    let mut out = String::from(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
+<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+</w:tblBorders></w:tblPr>",
+    );
+    for (r, row) in rows.iter().enumerate() {
+        out.push_str("<w:tr>");
+        for cell in row {
+            out.push_str(&docx_table_cell(cell, r == 0));
+        }
+        out.push_str("</w:tr>");
+    }
+    out.push_str("</w:tbl>");
+    out
 }
 
 fn docx_document(title: &str, body: &str) -> String {
@@ -1875,8 +2225,25 @@ fn docx_document(title: &str, body: &str) -> String {
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
     );
     out.push_str(&docx_paragraph(title, Some("Title")));
-    for line in body.lines() {
-        let trimmed = line.trim();
+    let lines: Vec<&str> = body.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        // A run of consecutive `|`-delimited rows becomes one Word table; the
+        // alignment separator row is dropped and the first row is the header.
+        if is_table_row(lines[idx]) {
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            while idx < lines.len() && is_table_row(lines[idx]) {
+                if !is_table_separator(lines[idx]) {
+                    rows.push(parse_table_cells(lines[idx]));
+                }
+                idx += 1;
+            }
+            if !rows.is_empty() {
+                out.push_str(&docx_table(&rows));
+            }
+            continue;
+        }
+        let trimmed = lines[idx].trim();
         if trimmed.is_empty() {
             out.push_str("<w:p/>");
         } else if let Some(h) = trimmed.strip_prefix("### ") {
@@ -1890,6 +2257,7 @@ fn docx_document(title: &str, body: &str) -> String {
         } else {
             out.push_str(&docx_paragraph(trimmed, None));
         }
+        idx += 1;
     }
     out.push_str(r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>"#);
     out
@@ -2983,7 +3351,20 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
-                    Ok(html) => ok(truncate(strip_html(&html), MAX_OUT)),
+                    Ok(html) => {
+                        let hits = parse_ddg_lite(&html);
+                        if hits.is_empty() {
+                            // Markup didn't match — fall back to the raw text so
+                            // the model still gets something.
+                            ok(truncate(strip_html(&html), MAX_OUT))
+                        } else {
+                            let body = format_search_hits(&hits, 10);
+                            ok(truncate(
+                                format!("{} results for \"{query}\":\n\n{body}", hits.len()),
+                                MAX_OUT,
+                            ))
+                        }
+                    }
                     Err(e) => err(format!("search response error: {e}")),
                 },
                 Err(e) => err(format!("web search failed: {e}")),
@@ -3801,6 +4182,178 @@ fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::E
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── web search parsing ──────────────────────────────────────────────────
+    const DDG_LITE_SAMPLE: &str = r#"<html><body><form>search</form><table>
+      <tr><td>1.&nbsp;</td><td>
+        <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&amp;rut=abc" class='result-link'>Rust std docs</a>
+      </td></tr>
+      <tr><td>&nbsp;</td><td class='result-snippet'>The Rust Standard Library &amp; API reference.</td></tr>
+      <tr><td>2.&nbsp;</td><td>
+        <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fcrates.io%2F&amp;rut=def" class='result-link'>crates.io</a>
+      </td></tr>
+      <tr><td>&nbsp;</td><td class='result-snippet'>The Rust package registry.</td></tr>
+    </table></body></html>"#;
+
+    #[test]
+    fn percent_decode_handles_escapes_and_plus() {
+        assert_eq!(percent_decode("a%2Fb%20c+d"), "a/b c d");
+        // A malformed trailing escape is left literal, not dropped.
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn decode_html_entities_single_pass_no_double_decode() {
+        // Single pass: &amp; becomes a literal & and the following "lt;" is left
+        // alone, so this must not collapse to "<".
+        assert_eq!(decode_html_entities("a &amp;lt; b"), "a &lt; b");
+        assert_eq!(
+            decode_html_entities("x &lt;y&gt; &quot;z&quot;"),
+            "x <y> \"z\""
+        );
+    }
+
+    #[test]
+    fn decode_html_entities_resolves_numeric_and_typographic() {
+        // Decimal and hex numeric references for a curly apostrophe.
+        assert_eq!(decode_html_entities("it&#8217;s"), "it’s");
+        assert_eq!(decode_html_entities("it&#x2019;s"), "it’s");
+        // Common typographic named entities.
+        assert_eq!(decode_html_entities("a &mdash; b &hellip;"), "a — b …");
+    }
+
+    #[test]
+    fn decode_html_entities_leaves_unknown_and_bare_amp_literal() {
+        assert_eq!(decode_html_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_html_entities("&notreal;"), "&notreal;");
+        // A `&` with no nearby `;` is untouched.
+        assert_eq!(
+            decode_html_entities("cats & dogs everywhere"),
+            "cats & dogs everywhere"
+        );
+    }
+
+    #[test]
+    fn ddg_real_url_recovers_target_from_redirect() {
+        assert_eq!(
+            ddg_real_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=z"),
+            "https://example.com/a"
+        );
+        assert_eq!(ddg_real_url("//example.com/x"), "https://example.com/x");
+    }
+
+    #[test]
+    fn parse_ddg_lite_extracts_structured_hits() {
+        let hits = parse_ddg_lite(DDG_LITE_SAMPLE);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust std docs");
+        assert_eq!(hits[0].url, "https://doc.rust-lang.org/std/");
+        assert_eq!(
+            hits[0].snippet,
+            "The Rust Standard Library & API reference."
+        );
+        assert_eq!(hits[1].title, "crates.io");
+        assert_eq!(hits[1].url, "https://crates.io/");
+    }
+
+    #[test]
+    fn parse_ddg_lite_returns_empty_on_unrelated_html() {
+        assert!(parse_ddg_lite("<html><body>no results here</body></html>").is_empty());
+    }
+
+    #[test]
+    fn format_search_hits_numbers_and_caps() {
+        let hits = parse_ddg_lite(DDG_LITE_SAMPLE);
+        let out = format_search_hits(&hits, 1);
+        assert!(out.starts_with("1. Rust std docs"));
+        assert!(out.contains("https://doc.rust-lang.org/std/"));
+        // Capped at 1 — the second hit must not appear.
+        assert!(!out.contains("crates.io"));
+    }
+
+    // ── docx tables ─────────────────────────────────────────────────────────
+    #[test]
+    fn table_row_and_separator_detection() {
+        assert!(is_table_row("| a | b |"));
+        assert!(is_table_row("|a|b|"));
+        assert!(!is_table_row("a | b")); // no leading pipe
+        assert!(!is_table_row("- bullet"));
+        assert!(is_table_separator("| --- | :---: |"));
+        assert!(!is_table_separator("| a | b |"));
+    }
+
+    #[test]
+    fn parse_table_cells_drops_outer_pipes_and_trims() {
+        assert_eq!(parse_table_cells("|  a | b  |c|"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn docx_document_renders_markdown_table() {
+        let body = "Intro line.\n| Name | Price |\n| --- | --- |\n| Glazed | $1.50 |\n| Old Fashioned | $2.00 |\n\nOutro.";
+        let doc = docx_document("Menu", body);
+        // A real table with a header row is emitted.
+        assert!(doc.contains("<w:tbl>"));
+        assert_eq!(doc.matches("<w:tr>").count(), 3); // header + 2 body rows
+                                                      // Header cells are bold; the separator row is gone.
+        assert!(doc.contains("<w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">Name</w:t>"));
+        assert!(!doc.contains("---"));
+        // Surrounding prose still renders as paragraphs.
+        assert!(doc.contains(">Intro line.</w:t>"));
+        assert!(doc.contains(">Outro.</w:t>"));
+    }
+
+    #[test]
+    fn docx_document_without_table_is_unchanged_shape() {
+        let doc = docx_document("T", "# Head\n- item\nplain");
+        assert!(!doc.contains("<w:tbl>"));
+        assert!(doc.contains(">• item</w:t>"));
+    }
+
+    // ── docx inline formatting ──────────────────────────────────────────────
+    #[test]
+    fn docx_runs_renders_bold_italic_and_code() {
+        let out = docx_runs("plain **bold** and *italic* and `code` end");
+        // Bold run carries <w:b/>, italic <w:i/>, code the monospace font.
+        assert!(out.contains("<w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">bold</w:t>"));
+        assert!(out.contains("<w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">italic</w:t>"));
+        assert!(out.contains("w:ascii=\"Consolas\""));
+        assert!(out.contains(">code</w:t>"));
+        // The markers themselves are consumed, not emitted as literal text.
+        assert!(!out.contains('*'));
+        assert!(!out.contains('`'));
+    }
+
+    #[test]
+    fn docx_runs_leaves_arithmetic_and_snake_case_literal() {
+        // Spaced `*` is not emphasis; `_` never toggles italic.
+        let out = docx_runs("compute 5 * 3 for my_var_name");
+        assert!(!out.contains("<w:i/>"));
+        assert!(!out.contains("<w:b/>"));
+        assert!(out.contains("5 * 3 for my_var_name"));
+    }
+
+    #[test]
+    fn docx_runs_code_span_is_verbatim() {
+        // Emphasis markers inside a code span stay literal.
+        let out = docx_runs("call `a*b` now");
+        assert!(out.contains(">a*b</w:t>"));
+        assert!(!out.contains("<w:i/>"));
+    }
+
+    #[test]
+    fn docx_runs_escapes_xml_in_runs() {
+        let out = docx_runs("**a < b & c**");
+        assert!(out.contains("a &lt; b &amp; c"));
+        assert!(out.contains("<w:b/>"));
+    }
+
+    #[test]
+    fn docx_runs_unmatched_marker_stays_literal() {
+        // A lone trailing `**` with nothing after it must not open emphasis.
+        let out = docx_runs("trailing **");
+        assert!(!out.contains("<w:b/>"));
+        assert!(out.contains("trailing **"));
+    }
 
     // ── truncate ────────────────────────────────────────────────────────────
     #[test]

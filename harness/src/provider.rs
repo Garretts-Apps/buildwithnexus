@@ -531,7 +531,7 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
     }
     let stop_reason = v["stop_reason"].as_str().map(normalize_stop_reason);
     Ok(Reply {
-        text,
+        text: strip_think(&text),
         calls,
         stop_reason,
     })
@@ -729,9 +729,35 @@ fn openai_request_at(
     (req, body)
 }
 
+// Remove `<think>…</think>` reasoning blocks that local reasoning models
+// (DeepSeek-R1 distills, Qwen thinking variants) emit inline in `content` on
+// the non-streaming path. Handles multiple blocks and an unclosed `<think>`
+// (drops the trailing leaked chain-of-thought). Text without think tags is
+// returned untouched. The streaming path already routes these to on_thinking.
+fn strip_think(text: &str) -> String {
+    if !text.contains("<think>") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        match after.find("</think>") {
+            Some(end) => rest = &after[end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
 fn openai_parse(v: Value) -> Result<Reply, String> {
     let msg = &v["choices"][0]["message"];
-    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let text = strip_think(msg["content"].as_str().unwrap_or_default());
     let mut calls = Vec::new();
     if let Some(tcs) = msg["tool_calls"].as_array() {
         for tc in tcs {
@@ -756,14 +782,38 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
     })
 }
 
+// If `s` ends with a non-empty *proper* prefix of `tag` (e.g. "a<thi" for
+// "<think>"), split so the prefix can be held until the next chunk completes it.
+// Returns (emit, hold). No trailing partial → (s, "").
+fn split_trailing_partial<'a>(s: &'a str, tag: &str) -> (&'a str, &'a str) {
+    let max = (tag.len() - 1).min(s.len());
+    for k in (1..=max).rev() {
+        if s.is_char_boundary(s.len() - k) && s.as_bytes().ends_with(&tag.as_bytes()[..k]) {
+            return (&s[..s.len() - k], &s[s.len() - k..]);
+        }
+    }
+    (s, "")
+}
+
+// Route streamed OpenAI/Ollama `content` deltas: `<think>…</think>` spans go to
+// `on_thinking`, everything else to `text`/`on_text`. `carry` holds a `<think>`
+// or `</think>` tag that was split across chunk boundaries (routine with
+// token-by-token local streaming) so the partial marker isn't leaked as output.
 fn route_openai_content(
     chunk: &str,
     in_think: &mut bool,
+    carry: &mut String,
     text: &mut String,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) {
-    let mut rest = chunk;
+    let combined = if carry.is_empty() {
+        chunk.to_string()
+    } else {
+        format!("{carry}{chunk}")
+    };
+    carry.clear();
+    let mut rest = combined.as_str();
     loop {
         if *in_think {
             if let Some(end) = rest.find("</think>") {
@@ -777,9 +827,12 @@ fn route_openai_content(
                     break;
                 }
             } else {
-                if !rest.is_empty() {
-                    on_thinking(rest);
+                // Hold a possible partial `</think>` at the tail for next chunk.
+                let (emit, hold) = split_trailing_partial(rest, "</think>");
+                if !emit.is_empty() {
+                    on_thinking(emit);
                 }
+                *carry = hold.to_string();
                 break;
             }
         } else if let Some(start) = rest.find("<think>") {
@@ -794,12 +847,30 @@ fn route_openai_content(
                 break;
             }
         } else {
-            if !rest.is_empty() {
-                text.push_str(rest);
-                on_text(rest);
+            // Hold a possible partial `<think>` at the tail for the next chunk.
+            let (emit, hold) = split_trailing_partial(rest, "<think>");
+            if !emit.is_empty() {
+                text.push_str(emit);
+                on_text(emit);
             }
+            *carry = hold.to_string();
             break;
         }
+    }
+}
+
+// Flush a leftover `carry` at stream end: if we're not mid-think it was ordinary
+// text that merely resembled a tag prefix, so surface it; mid-think residue
+// (a dangling `</think>` prefix with no answer after) is dropped.
+fn flush_think_carry(
+    carry: &str,
+    in_think: bool,
+    text: &mut String,
+    on_text: &mut dyn FnMut(&str),
+) {
+    if !in_think && !carry.is_empty() {
+        text.push_str(carry);
+        on_text(carry);
     }
 }
 
@@ -810,6 +881,7 @@ fn openai_stream(
 ) -> Result<Reply, String> {
     let mut text = String::new();
     let mut in_think = false;
+    let mut think_carry = String::new();
     let mut stop_reason: Option<String> = None;
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
@@ -832,7 +904,14 @@ fn openai_stream(
             on_thinking(r);
         }
         if let Some(t) = delta["content"].as_str() {
-            route_openai_content(t, &mut in_think, &mut text, on_text, on_thinking);
+            route_openai_content(
+                t,
+                &mut in_think,
+                &mut think_carry,
+                &mut text,
+                on_text,
+                on_thinking,
+            );
         }
         if let Some(tcs) = delta["tool_calls"].as_array() {
             for tc in tcs {
@@ -858,6 +937,7 @@ fn openai_stream(
         }
         false
     })?;
+    flush_think_carry(&think_carry, in_think, &mut text, on_text);
     let calls = pending
         .into_iter()
         .filter(|e| !e.1.is_empty())
@@ -1084,7 +1164,7 @@ fn ollama_call(i: usize, tc: &Value) -> ToolCall {
 
 fn ollama_parse(v: Value) -> Result<Reply, String> {
     let msg = &v["message"];
-    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let text = strip_think(msg["content"].as_str().unwrap_or_default());
     let mut calls = Vec::new();
     if let Some(tcs) = msg["tool_calls"].as_array() {
         for tc in tcs {
@@ -1139,6 +1219,7 @@ fn ollama_stream(
 ) -> Result<Reply, String> {
     let mut text = String::new();
     let mut in_think = false;
+    let mut think_carry = String::new();
     let mut stop_reason: Option<String> = None;
     let mut stream_err: Option<String> = None;
     let mut calls: Vec<ToolCall> = Vec::new();
@@ -1161,7 +1242,14 @@ fn ollama_stream(
         }
         if let Some(t) = msg["content"].as_str() {
             if !t.is_empty() {
-                route_openai_content(t, &mut in_think, &mut text, on_text, on_thinking);
+                route_openai_content(
+                    t,
+                    &mut in_think,
+                    &mut think_carry,
+                    &mut text,
+                    on_text,
+                    on_thinking,
+                );
             }
         }
         // Unlike OpenAI's fragmented deltas, each streamed tool call arrives
@@ -1180,6 +1268,7 @@ fn ollama_stream(
     if let Some(e) = stream_err {
         return Err(e);
     }
+    flush_think_carry(&think_carry, in_think, &mut text, on_text);
     Ok(Reply {
         text,
         calls,
@@ -1519,6 +1608,75 @@ mod tests {
     }
 
     #[test]
+    fn split_trailing_partial_holds_tag_prefix() {
+        assert_eq!(
+            split_trailing_partial("hello <thi", "<think>"),
+            ("hello ", "<thi")
+        );
+        assert_eq!(
+            split_trailing_partial("reason</thi", "</think>"),
+            ("reason", "</thi")
+        );
+        // No trailing partial → nothing held.
+        assert_eq!(
+            split_trailing_partial("plain text", "<think>"),
+            ("plain text", "")
+        );
+        // A complete tag ends with `>`, not a tag prefix, so nothing is held —
+        // the caller's find() handles complete tags first.
+        assert_eq!(
+            split_trailing_partial("a<think>", "<think>"),
+            ("a<think>", "")
+        );
+    }
+
+    #[test]
+    fn openai_stream_handles_think_open_tag_split_across_chunks() {
+        // "<think>" is split as "<thi" | "nk>".
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hello <thi\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"nk>reason</think>done\"}}]}\n\
+                   data: [DONE]\n";
+        let mut text_out = String::new();
+        let mut think_out = String::new();
+        openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| text_out.push_str(t),
+            &mut |t| think_out.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(text_out, "hello done");
+        assert_eq!(think_out, "reason");
+    }
+
+    #[test]
+    fn openai_stream_handles_think_close_tag_split_across_chunks() {
+        // "</think>" is split as "</thi" | "nk>".
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>reason</thi\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"nk>done\"}}]}\n\
+                   data: [DONE]\n";
+        let mut text_out = String::new();
+        let mut think_out = String::new();
+        openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |t| text_out.push_str(t),
+            &mut |t| think_out.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(text_out, "done");
+        assert_eq!(think_out, "reason");
+    }
+
+    #[test]
+    fn openai_stream_flushes_false_partial_at_stream_end() {
+        // Content that merely ends with a tag-prefix and then stops must not be
+        // swallowed — it wasn't a real tag.
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"answer<thi\"}}]}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.text, "answer<thi");
+    }
+
+    #[test]
     fn openai_stream_accumulates_text_and_stops_on_done() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\
                    data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\
@@ -1742,6 +1900,40 @@ mod tests {
         ]}}]});
         let r = openai_parse(v).unwrap();
         assert_eq!(r.calls[0].input, json!({}));
+    }
+
+    // ── think-tag stripping ─────────────────────────────────────────────────
+    #[test]
+    fn strip_think_removes_blocks_and_keeps_answer() {
+        assert_eq!(
+            strip_think("<think>let me reason</think>The answer is 42."),
+            "The answer is 42."
+        );
+        // Multiple blocks, with real content between them.
+        assert_eq!(strip_think("<think>a</think>X<think>b</think>Y"), "XY");
+        // No tags → untouched.
+        assert_eq!(strip_think("plain answer"), "plain answer");
+    }
+
+    #[test]
+    fn strip_think_drops_unclosed_reasoning() {
+        // An unterminated <think> means the model never emitted a final answer;
+        // the leaked reasoning must not become the answer.
+        assert_eq!(strip_think("intro <think>reasoning with no close"), "intro");
+    }
+
+    #[test]
+    fn openai_parse_strips_think_from_content() {
+        let v = json!({"choices": [{"message": {"content": "<think>plan</think>done"}}]});
+        let r = openai_parse(v).unwrap();
+        assert_eq!(r.text, "done");
+    }
+
+    #[test]
+    fn ollama_parse_strips_think_from_content() {
+        let v = json!({"message": {"content": "<think>hmm</think>result"}, "done_reason": "stop"});
+        let r = ollama_parse(v).unwrap();
+        assert_eq!(r.text, "result");
     }
 
     // ── stop_reason ─────────────────────────────────────────────────────────
