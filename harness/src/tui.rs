@@ -3313,4 +3313,34 @@ mod tests {
         assert_eq!(super::end_word(&b, 4), 10);
         assert_eq!(super::end_word(&b, 10), 14);
     }
+
+    #[test]
+    fn test_markdown_rendering_formatting() {
+        let md = super::render_md_line("# Hello **world** *italic* `code`");
+        let p = plain(&md);
+        assert!(p.contains("Hello"), "{p}");
+        assert!(p.contains("world"), "{p}");
+        assert!(p.contains("italic"), "{p}");
+        assert!(p.contains("code"), "{p}");
+
+        let num_list = super::render_md_line("1. First item");
+        let p_num = plain(&num_list);
+        assert!(p_num.contains("1."), "{p_num}");
+        assert!(p_num.contains("First item"), "{p_num}");
+
+        let quote = super::render_md_line("> A blockquote");
+        let p_quote = plain(&quote);
+        assert!(p_quote.contains("│"), "{p_quote}");
+        assert!(p_quote.contains("A blockquote"), "{p_quote}");
+
+        let link = super::render_md_line("Click [Google](https://google.com) now");
+        let p_link = plain(&link);
+        assert!(p_link.contains("Google"), "{p_link}");
+        assert!(p_link.contains("(https://google.com)"), "{p_link}");
+
+        let bullet = super::render_md_line("- Bullet item");
+        let p_bullet = plain(&bullet);
+        assert!(p_bullet.contains("•"), "{p_bullet}");
+        assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
+    }
 }
