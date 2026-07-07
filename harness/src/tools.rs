@@ -2120,13 +2120,89 @@ fn docx_runs(text: &str) -> String {
     out
 }
 
+// Split a markdown table line into trimmed cells, dropping the outer pipes.
+fn parse_table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+// A markdown table row: trimmed, starts with `|`, and has at least two pipes.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.matches('|').count() >= 2
+}
+
+// The `|---|:--:|` alignment row: every cell is only dashes/colons.
+fn is_table_separator(line: &str) -> bool {
+    let cells = parse_table_cells(line);
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+// One table cell. Header cells are a single bold run; body cells get full
+// inline markdown formatting.
+fn docx_table_cell(text: &str, header: bool) -> String {
+    let runs = if header {
+        let mut s = String::new();
+        docx_push_run(&mut s, text, true, false, false);
+        s
+    } else {
+        docx_runs(text)
+    };
+    format!("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr><w:p>{runs}</w:p></w:tc>")
+}
+
+// A bordered Word table. The first row is treated as the (bold) header.
+fn docx_table(rows: &[Vec<String>]) -> String {
+    let mut out = String::from(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
+<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
+</w:tblBorders></w:tblPr>",
+    );
+    for (r, row) in rows.iter().enumerate() {
+        out.push_str("<w:tr>");
+        for cell in row {
+            out.push_str(&docx_table_cell(cell, r == 0));
+        }
+        out.push_str("</w:tr>");
+    }
+    out.push_str("</w:tbl>");
+    out
+}
+
 fn docx_document(title: &str, body: &str) -> String {
     let mut out = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#,
     );
     out.push_str(&docx_paragraph(title, Some("Title")));
-    for line in body.lines() {
-        let trimmed = line.trim();
+    let lines: Vec<&str> = body.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        // A run of consecutive `|`-delimited rows becomes one Word table; the
+        // alignment separator row is dropped and the first row is the header.
+        if is_table_row(lines[idx]) {
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            while idx < lines.len() && is_table_row(lines[idx]) {
+                if !is_table_separator(lines[idx]) {
+                    rows.push(parse_table_cells(lines[idx]));
+                }
+                idx += 1;
+            }
+            if !rows.is_empty() {
+                out.push_str(&docx_table(&rows));
+            }
+            continue;
+        }
+        let trimmed = lines[idx].trim();
         if trimmed.is_empty() {
             out.push_str("<w:p/>");
         } else if let Some(h) = trimmed.strip_prefix("### ") {
@@ -2140,6 +2216,7 @@ fn docx_document(title: &str, body: &str) -> String {
         } else {
             out.push_str(&docx_paragraph(trimmed, None));
         }
+        idx += 1;
     }
     out.push_str(r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr></w:body></w:document>"#);
     out
@@ -4126,6 +4203,44 @@ mod tests {
         assert!(out.contains("https://doc.rust-lang.org/std/"));
         // Capped at 1 — the second hit must not appear.
         assert!(!out.contains("crates.io"));
+    }
+
+    // ── docx tables ─────────────────────────────────────────────────────────
+    #[test]
+    fn table_row_and_separator_detection() {
+        assert!(is_table_row("| a | b |"));
+        assert!(is_table_row("|a|b|"));
+        assert!(!is_table_row("a | b")); // no leading pipe
+        assert!(!is_table_row("- bullet"));
+        assert!(is_table_separator("| --- | :---: |"));
+        assert!(!is_table_separator("| a | b |"));
+    }
+
+    #[test]
+    fn parse_table_cells_drops_outer_pipes_and_trims() {
+        assert_eq!(parse_table_cells("|  a | b  |c|"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn docx_document_renders_markdown_table() {
+        let body = "Intro line.\n| Name | Price |\n| --- | --- |\n| Glazed | $1.50 |\n| Old Fashioned | $2.00 |\n\nOutro.";
+        let doc = docx_document("Menu", body);
+        // A real table with a header row is emitted.
+        assert!(doc.contains("<w:tbl>"));
+        assert_eq!(doc.matches("<w:tr>").count(), 3); // header + 2 body rows
+                                                      // Header cells are bold; the separator row is gone.
+        assert!(doc.contains("<w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">Name</w:t>"));
+        assert!(!doc.contains("---"));
+        // Surrounding prose still renders as paragraphs.
+        assert!(doc.contains(">Intro line.</w:t>"));
+        assert!(doc.contains(">Outro.</w:t>"));
+    }
+
+    #[test]
+    fn docx_document_without_table_is_unchanged_shape() {
+        let doc = docx_document("T", "# Head\n- item\nplain");
+        assert!(!doc.contains("<w:tbl>"));
+        assert!(doc.contains(">• item</w:t>"));
     }
 
     // ── docx inline formatting ──────────────────────────────────────────────
