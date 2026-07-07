@@ -3,7 +3,7 @@
 // stream. No network, no live model — every response is scripted, so the agent
 // loop, permission gate, hooks, and subagent recursion are exercised
 // deterministically. Edge cases (invalid tool args, out-of-cwd reads, sensitive
-// paths, catastrophic commands, the iteration cap, the HTTPS guard) get a
+// paths, catastrophic commands, repeated tool loops, the HTTPS guard) get a
 // scenario each.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,7 +40,10 @@ fn serve(script: Vec<String>) -> u16 {
             let Ok(mut stream) = stream else { continue };
             let method = read_request(&mut stream);
             let body = if method == "POST" {
-                let b = script.get(served).cloned().unwrap_or_else(|| finish("auto"));
+                let b = script
+                    .get(served)
+                    .cloned()
+                    .unwrap_or_else(|| finish("auto"));
                 served += 1;
                 b
             } else {
@@ -94,7 +97,8 @@ fn tool_call(id: &str, name: &str, args: Value) -> String {
     json!({"choices": [{"message": {"content": "", "tool_calls": [
         {"id": id, "type": "function",
          "function": {"name": name, "arguments": args.to_string()}}
-    ]}}]}).to_string()
+    ]}}]})
+    .to_string()
 }
 
 // A tool call whose arguments are deliberately not valid JSON.
@@ -102,7 +106,8 @@ fn tool_call_raw_args(id: &str, name: &str, raw_args: &str) -> String {
     json!({"choices": [{"message": {"content": "", "tool_calls": [
         {"id": id, "type": "function",
          "function": {"name": name, "arguments": raw_args}}
-    ]}}]}).to_string()
+    ]}}]})
+    .to_string()
 }
 
 fn finish(summary: &str) -> String {
@@ -135,7 +140,11 @@ impl Run {
     }
     // Every event of a type, concatenated, for substring assertions on reasons.
     fn text_of(&self, ty: &str) -> String {
-        self.events.iter().filter(|e| e["type"] == ty).map(|e| e.to_string()).collect()
+        self.events
+            .iter()
+            .filter(|e| e["type"] == ty)
+            .map(|e| e.to_string())
+            .collect()
     }
 }
 
@@ -167,14 +176,21 @@ fn executes_tool_then_finishes() {
     let home = tmp("home");
     let cwd = tmp("proj");
     let port = serve(vec![
-        tool_call("c1", "write_file", json!({"path": "out.txt", "content": "hello world"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "out.txt", "content": "hello world"}),
+        ),
         finish("wrote the file"),
     ]);
     write_config(&home, "ollama", "auto", port);
 
     let r = run(&home, &cwd, "create a file");
     assert!(r.success, "stderr: {}", r.stderr);
-    assert_eq!(std::fs::read_to_string(cwd.join("out.txt")).unwrap(), "hello world");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("out.txt")).unwrap(),
+        "hello world"
+    );
     assert_eq!(r.find("finish").unwrap()["summary"], "wrote the file");
     assert!(r.has_event("tool_call"));
     assert!(r.has_event("tool_result"));
@@ -210,7 +226,10 @@ fn readonly_allows_out_of_cwd_read() {
     write_config(&home, "ollama", "readonly", port);
 
     let r = run(&home, &cwd, "read a system file");
-    assert!(!r.has_event("tool_denied"), "reads outside cwd should be allowed in readonly mode");
+    assert!(
+        !r.has_event("tool_denied"),
+        "reads outside cwd should be allowed in readonly mode"
+    );
 }
 
 #[test]
@@ -218,7 +237,11 @@ fn readonly_blocks_mutation() {
     let home = tmp("home");
     let cwd = tmp("proj");
     let port = serve(vec![
-        tool_call("c1", "write_file", json!({"path": "x.txt", "content": "nope"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "x.txt", "content": "nope"}),
+        ),
         finish("done"),
     ]);
     write_config(&home, "ollama", "readonly", port);
@@ -261,19 +284,22 @@ fn catastrophic_command_auto_denies() {
 }
 
 #[test]
-fn reaches_iteration_cap_and_exits_nonzero() {
+fn repeated_identical_tool_results_stop_the_loop() {
     let home = tmp("home");
     let cwd = tmp("proj");
-    // 30 non-finishing tool calls → the loop hits MAX_ITERS and errors out.
-    let script: Vec<String> = (0..30)
-        .map(|_| tool_call("c", "list_dir", json!({"path": "."})))
-        .collect();
+    // Two identical calls with identical output should stop through the loop
+    // guard instead of burning the whole iteration budget.
+    let script = vec![
+        tool_call("c1", "list_dir", json!({"path": "."})),
+        tool_call("c2", "list_dir", json!({"path": "."})),
+    ];
     let port = serve(script);
     write_config(&home, "ollama", "auto", port);
 
     let r = run(&home, &cwd, "loop forever");
-    assert!(!r.success, "expected non-zero exit at the iteration cap");
-    assert!(r.stderr.contains("step limit") || r.stderr.contains("limit"), "stderr: {}", r.stderr);
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(r.has_event("assistant"));
+    assert!(r.text_of("assistant").contains("repeated tool loop"));
 }
 
 #[test]
@@ -316,7 +342,11 @@ fn home_pre_tool_use_hook_can_deny() {
     });
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
     let port = serve(vec![
-        tool_call("c1", "write_file", json!({"path": "out.txt", "content": "x"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "out.txt", "content": "x"}),
+        ),
         finish("done"),
     ]);
     write_config(&home, "ollama", "auto", port);
@@ -333,8 +363,8 @@ fn spawn_subagent_recurses_and_returns() {
     // Parent delegates; subagent finishes; parent then finishes.
     let port = serve(vec![
         tool_call("c1", "spawn_subagent", json!({"task": "do the subtask"})),
-        finish("subagent done"),  // depth-1 loop
-        finish("parent done"),    // depth-0 loop, after the subagent returns
+        finish("subagent done"), // depth-1 loop
+        finish("parent done"),   // depth-0 loop, after the subagent returns
     ]);
     write_config(&home, "ollama", "auto", port);
 

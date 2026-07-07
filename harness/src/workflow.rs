@@ -9,7 +9,10 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,9 +89,9 @@ pub fn kind_label(kind: &WorkflowKind) -> String {
 
 pub fn status_label(s: &WorkflowStatus) -> &'static str {
     match s {
-        WorkflowStatus::Pending  => "pending",
-        WorkflowStatus::Running  => "running",
-        WorkflowStatus::Done     => "done",
+        WorkflowStatus::Pending => "pending",
+        WorkflowStatus::Running => "running",
+        WorkflowStatus::Done => "done",
         WorkflowStatus::Failed(_) => "failed",
         WorkflowStatus::Cancelled => "cancelled",
     }
@@ -122,10 +125,9 @@ pub fn enqueue(task: &str, kind: WorkflowKind) -> usize {
 /// Cancel a workflow by ID. Kills the subprocess if running.
 pub fn cancel(id: usize) -> bool {
     let mut m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(a) = &mut m.active {
-        if a.id == id {
+    if m.active.as_ref().is_some_and(|a| a.id == id) {
+        if let Some(mut a) = m.active.take() {
             let _ = a.child.kill();
-            let a = m.active.take().unwrap();
             drop(a.child);
         }
     }
@@ -153,32 +155,46 @@ pub struct WorkflowSnapshot {
 pub fn snapshots() -> Vec<WorkflowSnapshot> {
     let m = manager().lock().unwrap_or_else(|e| e.into_inner());
     let now = now_ms();
-    m.workflows.iter().map(|w| {
-        let elapsed_secs = w.started_ms.map(|s| (now - s) / 1000);
-        WorkflowSnapshot {
-            id: w.id,
-            task: w.task.chars().take(60).collect(),
-            kind_str: kind_label(&w.kind),
-            status_str: status_label(&w.status).to_string(),
-            iteration: w.iteration,
-            elapsed_secs,
-            output_lines: w.output.len(),
-        }
-    }).collect()
+    m.workflows
+        .iter()
+        .map(|w| {
+            let elapsed_secs = w.started_ms.map(|s| (now - s) / 1000);
+            WorkflowSnapshot {
+                id: w.id,
+                task: w.task.chars().take(60).collect(),
+                kind_str: kind_label(&w.kind),
+                status_str: status_label(&w.status).to_string(),
+                iteration: w.iteration,
+                elapsed_secs,
+                output_lines: w.output.len(),
+            }
+        })
+        .collect()
 }
 
 /// Returns the buffered output for a workflow (for inspect panel).
 pub fn output(id: usize) -> Vec<String> {
     let m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    m.workflows.iter().find(|w| w.id == id).map(|w| w.output.clone()).unwrap_or_default()
+    m.workflows
+        .iter()
+        .find(|w| w.id == id)
+        .map(|w| w.output.clone())
+        .unwrap_or_default()
 }
 
 /// Clear completed/cancelled workflows older than the last N kept.
 pub fn prune(keep: usize) {
     let mut m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    let done: Vec<usize> = m.workflows.iter()
+    let done: Vec<usize> = m
+        .workflows
+        .iter()
         .enumerate()
-        .filter(|(_, w)| matches!(w.status, WorkflowStatus::Done | WorkflowStatus::Failed(_) | WorkflowStatus::Cancelled))
+        .filter(|(_, w)| {
+            matches!(
+                w.status,
+                WorkflowStatus::Done | WorkflowStatus::Failed(_) | WorkflowStatus::Cancelled
+            )
+        })
         .map(|(i, _)| i)
         .collect();
     if done.len() > keep {
@@ -202,10 +218,16 @@ pub fn tick() -> Option<String> {
         let finished = a.child.try_wait().ok().and_then(|s| s);
         if let Some(exit) = finished {
             let id = a.id;
-            let buf_lines = a.output_buf.lock().ok().map(|b| b.clone()).unwrap_or_default();
+            let buf_lines = a
+                .output_buf
+                .lock()
+                .ok()
+                .map(|b| b.clone())
+                .unwrap_or_default();
             let ok = exit.success();
-            let a = m.active.take().unwrap();
-            drop(a.child);
+            if let Some(a) = m.active.take() {
+                drop(a.child);
+            }
 
             if let Some(wf) = m.workflows.iter_mut().find(|w| w.id == id) {
                 wf.output.extend(buf_lines);
@@ -232,7 +254,9 @@ pub fn tick() -> Option<String> {
     // If nothing is running, try to start the next due workflow.
     if m.active.is_none() {
         let due_idx = m.workflows.iter().position(|w| {
-            if !matches!(w.status, WorkflowStatus::Pending) { return false; }
+            if !matches!(w.status, WorkflowStatus::Pending) {
+                return false;
+            }
             match &w.kind {
                 WorkflowKind::Scheduled { fire_at_ms } => *fire_at_ms <= now,
                 WorkflowKind::Loop { .. } => w.next_fire_ms.map(|f| f <= now).unwrap_or(true),
@@ -243,7 +267,7 @@ pub fn tick() -> Option<String> {
         if let Some(idx) = due_idx {
             if let Ok(bin) = std::env::current_exe() {
                 let task = m.workflows[idx].task.clone();
-                let id   = m.workflows[idx].id;
+                let id = m.workflows[idx].id;
                 let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
                 let buf2 = buf.clone();
                 let child_res = Command::new(&bin)
@@ -280,7 +304,11 @@ pub fn tick() -> Option<String> {
                     m.workflows[idx].status = WorkflowStatus::Running;
                     m.workflows[idx].started_ms = Some(now);
                     m.workflows[idx].iteration += 1;
-                    m.active = Some(ActiveProcess { id, child, output_buf: buf.clone() });
+                    m.active = Some(ActiveProcess {
+                        id,
+                        child,
+                        output_buf: buf.clone(),
+                    });
                 } else {
                     m.workflows[idx].status = WorkflowStatus::Failed("failed to spawn".to_string());
                 }
@@ -294,7 +322,10 @@ pub fn tick() -> Option<String> {
 /// How many workflows are currently pending or running.
 pub fn active_count() -> usize {
     let m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    m.workflows.iter().filter(|w| matches!(w.status, WorkflowStatus::Pending | WorkflowStatus::Running)).count()
+    m.workflows
+        .iter()
+        .filter(|w| matches!(w.status, WorkflowStatus::Pending | WorkflowStatus::Running))
+        .count()
 }
 
 /// Parse a delay string like "5s", "2m", "1h" → milliseconds from now.
@@ -304,9 +335,15 @@ pub fn parse_delay(s: &str) -> Option<u64> {
     if let Some(n) = s.strip_suffix('s') {
         n.trim().parse::<u64>().ok().map(|v| now_ms() + v * 1000)
     } else if let Some(n) = s.strip_suffix('m') {
-        n.trim().parse::<u64>().ok().map(|v| now_ms() + v * 60 * 1000)
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|v| now_ms() + v * 60 * 1000)
     } else if let Some(n) = s.strip_suffix('h') {
-        n.trim().parse::<u64>().ok().map(|v| now_ms() + v * 3600 * 1000)
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|v| now_ms() + v * 3600 * 1000)
     } else {
         // bare number interpreted as seconds
         s.parse::<u64>().ok().map(|v| now_ms() + v * 1000)
@@ -381,6 +418,9 @@ mod tests {
 
     #[test]
     fn kind_label_loop() {
-        assert_eq!(kind_label(&WorkflowKind::Loop { interval_secs: 60 }), "loop 60s");
+        assert_eq!(
+            kind_label(&WorkflowKind::Loop { interval_secs: 60 }),
+            "loop 60s"
+        );
     }
 }

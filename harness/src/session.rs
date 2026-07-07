@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::provider::Msg;
 
+/// Represents a persisted user conversation session.
+///
+/// Sessions are stored as JSON files in `~/.buildwithnexus/sessions/<id>.json`
+/// and can be resumed across runs via `/resume` or `--continue`.
 #[derive(Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -23,14 +27,19 @@ pub struct Session {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn dir() -> PathBuf {
     config::home().join("sessions")
 }
 
-// Monotonic-ish id from the wall clock (ms), zero-padded so lexical == temporal.
+/// Generates a new zero-padded 16-character session ID based on wall-clock milliseconds.
+///
+/// Zero-padding ensures that lexical sorting of session IDs matches temporal order.
 pub fn new_id() -> String {
     format!("{:016}", now_ms())
 }
@@ -52,8 +61,9 @@ fn title_of(msgs: &[Msg]) -> String {
     "(untitled)".to_string()
 }
 
-// Create or update the session for `id` from the current transcript. Preserves
-// the original created time across updates. No-op for an empty transcript.
+/// Creates or updates a persisted session file for `id` from the provided transcript.
+///
+/// Preserves the original creation timestamp across updates. A no-op if `msgs` is empty.
 pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
     if msgs.is_empty() {
         return;
@@ -74,12 +84,13 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
     }
 }
 
+/// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
 pub fn load(id: &str) -> Option<Session> {
     let text = std::fs::read_to_string(file(id)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-// All sessions, newest first.
+/// Lists all persisted sessions, ordered newest-first by last update timestamp.
 pub fn list() -> Vec<Session> {
     let mut v: Vec<Session> = match std::fs::read_dir(dir()) {
         Ok(rd) => rd
@@ -94,6 +105,7 @@ pub fn list() -> Vec<Session> {
     v
 }
 
+/// Returns the most recently updated session, or `None` if no sessions exist.
 pub fn latest() -> Option<Session> {
     list().into_iter().next()
 }
@@ -105,7 +117,9 @@ mod tests {
     fn with_home<T>(f: impl FnOnce() -> T) -> T {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Serialize against config tests too — they share NEXUS_HOME.
-        let _g = crate::config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         let home = std::env::temp_dir().join(format!("bwn-sess-{}-{id}", std::process::id()));
@@ -120,7 +134,10 @@ mod tests {
     #[test]
     fn save_load_roundtrip_and_title() {
         with_home(|| {
-            let msgs = vec![Msg::System("sys".into()), Msg::User("fix the parser bug".into())];
+            let msgs = vec![
+                Msg::System("sys".into()),
+                Msg::User("fix the parser bug".into()),
+            ];
             save("0000000000000001", Path::new("/proj"), "gpt-4o", &msgs);
             let s = load("0000000000000001").expect("session loads");
             assert_eq!(s.title, "fix the parser bug");
@@ -132,8 +149,18 @@ mod tests {
     #[test]
     fn list_orders_newest_first_and_empty_is_noop() {
         with_home(|| {
-            save("0000000000000001", Path::new("/p"), "m", &[Msg::User("first".into())]);
-            save("0000000000000002", Path::new("/p"), "m", &[Msg::User("second".into())]);
+            save(
+                "0000000000000001",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("first".into())],
+            );
+            save(
+                "0000000000000002",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("second".into())],
+            );
             save("0000000000000003", Path::new("/p"), "m", &[]); // empty: skipped
             let ls = list();
             assert_eq!(ls.len(), 2);

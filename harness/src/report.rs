@@ -35,7 +35,7 @@ pub fn assistant(text: &str) {
         return;
     }
     match mode() {
-        Mode::Human => tui::line(text),
+        Mode::Human => tui::line(&tui::render_md(text)),
         Mode::Json => emit(json!({"type": "assistant", "text": text})),
     }
 }
@@ -61,20 +61,38 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     if name == "finish" {
         return;
     }
-    // A role-colored header line (icon + what it's about to do), opencode-style.
+    // A role-colored header line (icon + what it's about to do).
     let (icon, head) = match name {
-        "read_file" | "list_dir" | "find_files" | "grep_files" => ("◇", tui::cyan(preview)),
-        "write_file" | "edit_file" => ("◆", tui::yellow(preview)),
-        "run_command" => ("»", tui::blue(preview)),
-        "spawn_subagent" => ("⊞", tui::accent(preview)),
+        "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
+        | "grep" | "grep_files" | "webfetch" | "websearch" | "fetch_url" | "web_search"
+        | "headless_browser" | "list_servers" | "read_server_log" | "wait_for_url"
+        | "list_python_tools" => ("◈", tui::cyan(preview)),
+        "write" | "write_file" | "edit" | "edit_file" | "patch" | "apply_patch" => {
+            ("✦", tui::yellow(preview))
+        }
+        "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
+            ("⚡", tui::blue(preview))
+        }
+        "open_browser" => ("↗", tui::accent(preview)),
+        "task" | "spawn_subagent" => ("❖", tui::accent(preview)),
+        "question" => ("?", tui::yellow(preview)),
         _ => ("•", tui::dim(preview)),
     };
-    tui::line(&format!("  {} {}", tui::dim(icon), head));
+    tui::line(&format!("  {} {}", tui::accent(icon), head));
 
     // Inline colored diff for edits — see the change before/at the moment it lands.
     let body = match name {
-        "edit_file" => Some(tui::diff(input["old"].as_str().unwrap_or(""), input["new"].as_str().unwrap_or(""))),
-        "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
+        "edit" | "edit_file" => Some(tui::diff(
+            input["old"]
+                .as_str()
+                .or_else(|| input["oldString"].as_str())
+                .unwrap_or(""),
+            input["new"]
+                .as_str()
+                .or_else(|| input["newString"].as_str())
+                .unwrap_or(""),
+        )),
+        "write" | "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
         _ => None,
     };
     if let Some(body) = body {
@@ -108,7 +126,9 @@ fn clip_tail(s: &str, max: usize) -> Vec<String> {
 
 pub fn tool_result(name: &str, content: &str, is_error: bool) {
     if mode() == Mode::Json {
-        emit(json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}));
+        emit(
+            json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}),
+        );
         return;
     }
     // Human mode previously showed nothing here — the user couldn't see command
@@ -120,14 +140,18 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         return;
     }
     match name {
-        "run_command" => {
+        "bash" | "run_command" | "python_tool" => {
             for l in clip_tail(content, 12) {
                 tui::line(&tui::dim(&format!("    {l}")));
             }
         }
-        "read_file" | "list_dir" | "find_files" | "grep_files" => {
+        "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
+        | "grep" | "grep_files" | "list_python_tools" => {
             let n = content.lines().count();
-            tui::line(&tui::dim(&format!("    ↳ {n} line{}", if n == 1 { "" } else { "s" })));
+            tui::line(&tui::dim(&format!(
+                "    ↳ {n} line{}",
+                if n == 1 { "" } else { "s" }
+            )));
         }
         // write_file / edit_file / finish: the call header (+ diff) already said it.
         _ => {}

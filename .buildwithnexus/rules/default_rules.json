@@ -1,0 +1,175 @@
+{
+  "version": "1.0.0",
+  "description": "Default engineering rules for the buildwithnexus harness. These rules enforce operational constraints on code changes, decisions, and recommendations.",
+  "rules": [
+    {
+      "id": "bug_fix_requires_regression_test",
+      "description": "Bug fixes must include a regression test that covers the fixed behavior",
+      "severity": "medium",
+      "applies_when": [
+        { "task_type_is": "bug_fix" }
+      ],
+      "requires": [
+        "failing_test_before_fix",
+        "passing_test_after_fix"
+      ],
+      "message": "Bug fix does not include a regression test. A fix without a test is incomplete — the same bug can recur silently.",
+      "enabled": true
+    },
+    {
+      "id": "public_api_contract_change",
+      "description": "Changes to public APIs require caller analysis and a changelog entry",
+      "severity": "high",
+      "applies_when": [
+        { "change_touches": "public_api" }
+      ],
+      "requires": [
+        "caller_search",
+        "changelog_entry",
+        "compatibility_assessment"
+      ],
+      "message": "Public API contract changed without verifying all callers. Search for all consumers before modifying a public interface.",
+      "enabled": true
+    },
+    {
+      "id": "destructive_database_migration",
+      "description": "Destructive database migrations require rollback and backup plans",
+      "severity": "critical",
+      "applies_when": [
+        { "migration_type": "destructive" }
+      ],
+      "requires": [
+        "rollback_plan",
+        "backup_plan",
+        "approval"
+      ],
+      "message": "Destructive database migration proposed without a rollback plan. Data loss is high severity — provide a rollback strategy before proceeding.",
+      "enabled": true
+    },
+    {
+      "id": "new_dependency_review",
+      "description": "Adding new dependencies requires license, vulnerability, and maintenance review",
+      "severity": "medium",
+      "applies_when": [
+        { "dependency_added": true }
+      ],
+      "requires": [
+        "license_check",
+        "vulnerability_check",
+        "maintenance_check",
+        "size_impact_review"
+      ],
+      "message": "New dependency added without review. Check license compatibility, known vulnerabilities, maintenance status, and bundle size impact.",
+      "enabled": true
+    },
+    {
+      "id": "auth_change_requires_security_review",
+      "description": "Changes touching authentication or authorization require security review",
+      "severity": "high",
+      "applies_when": [
+        { "change_touches": "auth" }
+      ],
+      "requires": [
+        "security_review"
+      ],
+      "message": "Authentication/authorization code changed without security review. Auth changes are high-risk and must be reviewed for vulnerabilities.",
+      "enabled": true
+    },
+    {
+      "id": "no_secrets_in_logs",
+      "description": "Changes to logging code must not expose secrets or credentials",
+      "severity": "critical",
+      "applies_when": [
+        { "change_touches": "logging" }
+      ],
+      "requires": [
+        "secret_scan"
+      ],
+      "message": "Logging code changed — verify no secrets, API keys, tokens, or PII are being logged. Secret exposure is a critical security issue.",
+      "enabled": true
+    },
+    {
+      "id": "feature_flag_for_critical_path",
+      "description": "Changes to critical-path services should use feature flags for safe rollout",
+      "severity": "medium",
+      "applies_when": [
+        { "change_touches": "critical_path" }
+      ],
+      "requires": [
+        "feature_flag",
+        "staged_rollout_plan"
+      ],
+      "message": "Critical-path code changed without a feature flag. Consider gating behind a flag for safe, reversible rollout.",
+      "enabled": true
+    },
+    {
+      "id": "test_coverage_for_new_code",
+      "description": "New source files should have corresponding test coverage",
+      "severity": "low",
+      "applies_when": [
+        { "task_type_is": "feature" }
+      ],
+      "requires": [
+        "tests_for_new_files"
+      ],
+      "message": "New code files added without corresponding tests. Add unit tests for new modules to prevent regression.",
+      "enabled": true
+    },
+    {
+      "id": "no_broad_rewrites_for_bug_fixes",
+      "description": "Bug fixes should be narrow patches, not broad rewrites",
+      "severity": "medium",
+      "applies_when": [
+        { "task_type_is": "bug_fix" },
+        { "file_matches": "**/*" }
+      ],
+      "requires": [
+        "minimal_diff"
+      ],
+      "message": "Bug fix touches many files. Prefer narrow, targeted patches that fix the specific issue without unnecessary refactoring.",
+      "enabled": true
+    },
+    {
+      "id": "validation_preservation",
+      "description": "Do not weaken input validation to fix parsing or processing bugs",
+      "severity": "high",
+      "applies_when": [
+        { "change_touches": "validation" }
+      ],
+      "requires": [
+        "validation_not_weakened"
+      ],
+      "message": "Input validation appears weakened. Do not remove or relax validation constraints to work around bugs — fix the root cause instead.",
+      "enabled": true
+    },
+    {
+      "id": "decision_requires_evidence",
+      "description": "Decision support recommendations must be backed by retrieved evidence",
+      "severity": "high",
+      "applies_when": [
+        { "task_type_is": "decision_support" }
+      ],
+      "requires": [
+        "evidence_gathered",
+        "tradeoffs_documented",
+        "assumptions_stated",
+        "confidence_assessed"
+      ],
+      "message": "Decision recommendation made without sufficient evidence. Retrieve and cite specific code, docs, tests, and metrics before recommending.",
+      "enabled": true
+    },
+    {
+      "id": "stale_data_lowers_confidence",
+      "description": "Recommendations based on potentially stale data should have reduced confidence",
+      "severity": "info",
+      "applies_when": [
+        { "custom": ["data_freshness", { "older_than_days": 30 }] }
+      ],
+      "requires": [
+        "data_freshness_check"
+      ],
+      "message": "Some evidence may be stale (older than 30 days). Confidence should be reduced and the user should be notified.",
+      "enabled": true
+    }
+  ]
+}

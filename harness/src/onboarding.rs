@@ -8,7 +8,11 @@ pub fn run() -> Option<Settings> {
     config::scaffold_home();
     tui::clear();
     tui::line(&tui::accent("  buildwithnexus"));
-    tui::line(&tui::dim("  a hilariously fast, agentic AI CLI — remote or local models"));
+    tui::line(&tui::dim(
+        "  a hilariously fast, agentic AI CLI — remote or local models",
+    ));
+    tui::line("");
+    crate::check_and_offer_install_dependencies(true);
 
     // Warn the user if the home dir landed on a Windows mount — they should
     // set NEXUS_HOME to a native Linux path (e.g. ~/. buildwithnexus in WSL).
@@ -17,12 +21,18 @@ pub fn run() -> Option<Settings> {
         let h = home.to_string_lossy();
         if h.starts_with("/mnt/") {
             tui::line("");
-            tui::line(&tui::yellow("  ⚠ WSL2: home directory is on a Windows mount."));
+            tui::line(&tui::yellow(
+                "  ⚠ WSL2: home directory is on a Windows mount.",
+            ));
             tui::line(&tui::dim(&format!("    {}", h)));
-            tui::line(&tui::dim("    Set NEXUS_HOME to a Linux path to avoid cross-OS I/O:"));
+            tui::line(&tui::dim(
+                "    Set NEXUS_HOME to a Linux path to avoid cross-OS I/O:",
+            ));
             tui::line(&tui::dim("    export NEXUS_HOME=$HOME/.buildwithnexus"));
         } else {
-            tui::line(&tui::dim("  (WSL2 detected — Windows drive mounts are guarded)"));
+            tui::line(&tui::dim(
+                "  (WSL2 detected — Windows drive mounts are guarded)",
+            ));
         }
     }
     tui::line("");
@@ -34,7 +44,9 @@ pub fn run() -> Option<Settings> {
     let ollama_models = provider::ollama_models(default_ollama_url);
     tui::line(&tui::accent("  Local model check"));
     if ollama_models.is_empty() {
-        tui::line(&tui::dim("  Ollama is reachable only after it is installed, running, and has a model pulled."));
+        tui::line(&tui::dim(
+            "  Ollama is reachable only after it is installed, running, and has a model pulled.",
+        ));
     } else {
         tui::line(&tui::green(&format!(
             "  found Ollama with {} model{}",
@@ -47,15 +59,30 @@ pub fn run() -> Option<Settings> {
     tui::line("");
 
     if !ollama_models.is_empty() {
-        tui::line(&format!("  {}  {:<26} {}", tui::bold("0"), "Ollama", tui::green("recommended local")));
+        tui::line(&format!(
+            "  {}  {:<26} {}",
+            tui::bold("0"),
+            "Ollama",
+            tui::green("recommended local")
+        ));
     }
     tui::line(&tui::dim("  Local"));
     for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| p.local) {
-        tui::line(&format!("  {}  {:<26} {}", tui::bold(&(i + 1).to_string()), p.label, tui::green("local")));
+        tui::line(&format!(
+            "  {}  {:<26} {}",
+            tui::bold(&(i + 1).to_string()),
+            p.label,
+            tui::green("local")
+        ));
     }
     tui::line(&tui::dim("  Remote"));
     for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| !p.local) {
-        tui::line(&format!("  {}  {:<26} {}", tui::bold(&(i + 1).to_string()), p.label, tui::blue("remote")));
+        tui::line(&format!(
+            "  {}  {:<26} {}",
+            tui::bold(&(i + 1).to_string()),
+            p.label,
+            tui::blue("remote")
+        ));
     }
     tui::line("");
 
@@ -70,7 +97,10 @@ pub fn run() -> Option<Settings> {
                 break &PRESETS[n - 1];
             }
         }
-        if let Some(p) = PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(ans) || p.label.eq_ignore_ascii_case(ans)) {
+        if let Some(p) = PRESETS
+            .iter()
+            .find(|p| p.id.eq_ignore_ascii_case(ans) || p.label.eq_ignore_ascii_case(ans))
+        {
             break p;
         }
         tui::line(&tui::red("  enter a number or provider name from the list"));
@@ -90,7 +120,9 @@ pub fn run() -> Option<Settings> {
     // prompt offers real choices: Ollama's API for Ollama, GGUF files on disk
     // for llama.cpp / LM Studio.
     let detected: Vec<String> = if pick.local {
-        let found = if pick.id == "ollama" && base_url.as_deref().unwrap_or(pick.base_url) == default_ollama_url {
+        let found = if pick.id == "ollama"
+            && base_url.as_deref().unwrap_or(pick.base_url) == default_ollama_url
+        {
             ollama_models.clone()
         } else if pick.id == "ollama" {
             provider::ollama_models(base_url.as_deref().unwrap_or(pick.base_url))
@@ -101,13 +133,22 @@ pub fn run() -> Option<Settings> {
         if found.is_empty() {
             tui::line(&tui::yellow("  no local models detected."));
             tui::line(&tui::dim("    • Ollama: run  ollama pull qwen2.5:3b"));
-            tui::line(&tui::dim(&format!("    • llama.cpp / LM Studio: drop a .gguf into {}", local::models_dir().display())));
-            tui::line(&tui::dim("      (or your LM Studio models folder), then start the server"));
+            tui::line(&tui::dim(&format!(
+                "    • llama.cpp / LM Studio: drop a .gguf into {}",
+                local::models_dir().display()
+            )));
+            tui::line(&tui::dim(
+                "      (or your LM Studio models folder), then start the server",
+            ));
             tui::line(&tui::dim("    you can also just type a model name below, then re-run init once it's available"));
             if pick.id == "ollama" {
                 let pull = tui::ask("  pull qwen2.5:3b now? [y/N]: ").unwrap_or_default();
                 if matches!(pull.trim(), "y" | "Y" | "yes" | "YES") {
-                    let out = crate::tools::run("run_command", &serde_json::json!({"command": "ollama pull qwen2.5:3b"}), std::path::Path::new("."));
+                    let out = crate::tools::run(
+                        "run_command",
+                        &serde_json::json!({"command": "ollama pull qwen2.5:3b"}),
+                        std::path::Path::new("."),
+                    );
                     for line in out.content.lines() {
                         tui::line(&tui::dim(&format!("    {line}")));
                     }
@@ -127,20 +168,31 @@ pub fn run() -> Option<Settings> {
     // Key, only if the provider needs one and we don't already have it.
     if !pick.env_key.is_empty() && config::load_key(pick.env_key).is_none() {
         tui::line("");
-        tui::line(&tui::dim(&format!("  {} needs an API key (stored 0600 in ~/.buildwithnexus/.env.keys)", pick.label)));
+        tui::line(&tui::dim(&format!(
+            "  {} needs an API key (stored 0600 in ~/.buildwithnexus/.env.keys)",
+            pick.label
+        )));
         let key = tui::ask(&format!("  {}: ", pick.env_key))?;
         if !key.trim().is_empty() {
             config::save_key(pick.env_key, key.trim());
         }
     } else if !pick.env_key.is_empty() {
-        let shown = config::load_key(pick.env_key).map(|k| config::mask(&k)).unwrap_or_default();
-        tui::line(&tui::green(&format!("  ✓ {} already set ({})", pick.env_key, shown)));
+        let shown = config::load_key(pick.env_key)
+            .map(|k| config::mask(&k))
+            .unwrap_or_default();
+        tui::line(&tui::green(&format!(
+            "  ✓ {} already set ({})",
+            pick.env_key, shown
+        )));
     }
 
     // Model: pick a detected one by number (or name), else type/accept the default.
     let model = if !detected.is_empty() {
         let def = &detected[0];
-        match tui::ask(&format!("  model # or name [{def}]: ")).as_deref().map(str::trim) {
+        match tui::ask(&format!("  model # or name [{def}]: "))
+            .as_deref()
+            .map(str::trim)
+        {
             None | Some("") => def.clone(),
             Some(s) => match s.parse::<usize>() {
                 Ok(n) if n >= 1 && n <= detected.len() => detected[n - 1].clone(),
@@ -156,9 +208,20 @@ pub fn run() -> Option<Settings> {
 
     tui::line("");
     tui::line("  Tool permissions:");
-    tui::line(&format!("    {}  ask before every file write / command  {}", tui::bold("1"), tui::dim("(recommended)")));
-    tui::line(&format!("    {}  auto-approve everything                {}", tui::bold("2"), tui::dim("(yolo)")));
-    tui::line(&format!("    {}  read-only — never modify anything", tui::bold("3")));
+    tui::line(&format!(
+        "    {}  ask before every file write / command  {}",
+        tui::bold("1"),
+        tui::dim("(recommended)")
+    ));
+    tui::line(&format!(
+        "    {}  auto-approve everything                {}",
+        tui::bold("2"),
+        tui::dim("(yolo)")
+    ));
+    tui::line(&format!(
+        "    {}  read-only — never modify anything",
+        tui::bold("3")
+    ));
     let permission = match tui::ask("  choice [1]: ").as_deref().map(str::trim) {
         Some("2") => "auto",
         Some("3") => "readonly",
@@ -166,7 +229,14 @@ pub fn run() -> Option<Settings> {
     }
     .to_string();
 
-    let settings = Settings { provider: pick.id.to_string(), model, permission, base_url, allowed_commands: Vec::new() };
+    let settings = Settings {
+        provider: pick.id.to_string(),
+        model,
+        permission,
+        base_url,
+        allowed_commands: Vec::new(),
+        ..Default::default()
+    };
     config::save_settings(&settings);
     tui::line("");
     tui::line(&tui::green("  ✓ ready"));

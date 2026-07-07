@@ -5,13 +5,17 @@ pub mod agent;
 pub mod checkpoint;
 pub mod config;
 pub mod hooks;
+pub mod knowledge;
 pub mod local;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
+pub mod rules;
 pub mod session;
 pub mod tools;
+pub mod trace;
 pub mod tui;
+pub mod verifier;
 pub mod workflow;
 
 use std::io::IsTerminal;
@@ -27,8 +31,10 @@ const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
 
 #[derive(Default, Clone)]
 struct CliOptions {
+    provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    prompt: Option<String>,
 }
 
 fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
@@ -36,7 +42,11 @@ fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
     let mut rest = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
-        if let Some(v) = arg.strip_prefix("--model=") {
+        if let Some(v) = arg.strip_prefix("--provider=") {
+            opts.provider = Some(v.to_string());
+        } else if arg == "--provider" {
+            opts.provider = it.next();
+        } else if let Some(v) = arg.strip_prefix("--model=") {
             opts.model = Some(v.to_string());
         } else if arg == "--model" {
             opts.model = it.next();
@@ -46,6 +56,10 @@ fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
             opts.permission_mode = Some(v.to_string());
         } else if arg == "--permission-mode" || arg == "--permission" {
             opts.permission_mode = it.next();
+        } else if let Some(v) = arg.strip_prefix("--prompt=") {
+            opts.prompt = Some(v.to_string());
+        } else if arg == "--prompt" {
+            opts.prompt = it.next();
         } else {
             rest.push(arg);
         }
@@ -64,7 +78,7 @@ pub fn run() {
     let rest = || args[1..].join(" ");
 
     match cmd {
-        "" => interactive(None, opts),
+        "" => interactive(opts.prompt.clone(), opts),
         "init" | "da-init" | "setup" => {
             onboarding::run();
         }
@@ -74,8 +88,14 @@ pub fn run() {
                 println!("  {:<12} {:<26} {}", p.id, p.label, tag);
             }
         }
-        "run" | "build" | "-p" | "--print" => headless(&opts, |p, perm, cwd| agent::run_build(p, perm, "engineer", &rest(), &cwd)),
-        "plan" => headless(&opts, |p, perm, cwd| agent::run_plan(p, perm, &rest(), &cwd)),
+        "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
+            headless(&opts, |p, perm, cwd| {
+                agent::run_build(p, perm, "engineer", &rest(), &cwd)
+            })
+        }
+        "plan" => headless(&opts, |p, perm, cwd| {
+            agent::run_plan(p, perm, &rest(), &cwd)
+        }),
         "brainstorm" => headless(&opts, |p, perm, cwd| {
             agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
         }),
@@ -85,22 +105,34 @@ pub fn run() {
                 println!("  {}  {:<48}  {}", s.id, title, s.cwd);
             }
         }
-        "continue" | "-c" | "--continue" => headless(&opts, |p, perm, cwd| match session::latest() {
-            Some(s) => agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id),
-            None => Err("no sessions to continue".into()),
-        }),
+        "continue" | "-c" | "--continue" => {
+            headless(&opts, |p, perm, cwd| match session::latest() {
+                Some(s) => {
+                    agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id)
+                }
+                None => Err("no sessions to continue".into()),
+            })
+        }
         "resume" | "-r" | "--resume" => {
             let id = args.get(1).cloned().unwrap_or_default();
-            let task = if args.len() > 2 { args[2..].join(" ") } else { String::new() };
+            let task = if args.len() > 2 {
+                args[2..].join(" ")
+            } else {
+                String::new()
+            };
             headless(&opts, |p, perm, cwd| match session::load(&id) {
-                Some(s) => agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id),
+                Some(s) => {
+                    agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id)
+                }
                 None => Err(format!("no session '{id}'")),
             })
         }
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
-        _ if !args.is_empty() => interactive(Some(args.join(" ")), opts),
+        _ if !args.is_empty() => {
+            interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts)
+        }
         other => {
             eprintln!("unknown command: {other}\n");
             usage();
@@ -110,20 +142,31 @@ pub fn run() {
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
-    let settings = match config::load_settings() {
+    let mut settings = match config::load_settings() {
         Some(s) => s,
         None => onboarding::run().ok_or("setup cancelled")?,
     };
+    if let Some(p) = &opts.provider {
+        settings.provider = p.clone();
+    }
     let mut provider = build_provider(&settings)?;
     if let Some(model) = &opts.model {
         provider.model = model.clone();
     }
-    let perm_name = opts.permission_mode.as_deref().unwrap_or(&settings.permission);
+    let perm_name = opts
+        .permission_mode
+        .as_deref()
+        .unwrap_or(&settings.permission);
     Ok((provider, agent::permission(perm_name)))
 }
 
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
-    let preset = config::preset(&s.provider).ok_or_else(|| format!("unknown provider '{}'; run `buildwithnexus init`", s.provider))?;
+    let preset = config::preset(&s.provider).ok_or_else(|| {
+        format!(
+            "unknown provider '{}'; run `buildwithnexus init`",
+            s.provider
+        )
+    })?;
     let base_url = match &s.base_url {
         Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
             return Err(format!(
@@ -134,30 +177,97 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
         Some(u) => u.clone(),
         None => preset.base_url.to_string(),
     };
-    let model = if s.model.is_empty() { preset.default_model.to_string() } else { s.model.clone() };
-    let api_key = if preset.env_key.is_empty() { None } else { config::load_key(preset.env_key) };
+    let model = if s.model.is_empty() {
+        preset.default_model.to_string()
+    } else {
+        s.model.clone()
+    };
+    let api_key = if preset.env_key.is_empty() {
+        None
+    } else {
+        config::load_key(preset.env_key)
+    };
     if !preset.env_key.is_empty() && api_key.is_none() {
-        return Err(format!("{} not set; run `buildwithnexus init`", preset.env_key));
+        return Err(format!(
+            "{} not set; run `buildwithnexus init`",
+            preset.env_key
+        ));
     }
     let context_tokens = match preset.id {
         "anthropic" => 200_000,
         _ if preset.local => 8_192,
         _ => 128_000,
     };
-    Ok(Provider { protocol: preset.protocol, base_url, api_key, model, context_tokens })
+    Ok(Provider {
+        protocol: preset.protocol,
+        base_url,
+        model,
+        api_key,
+        context_tokens,
+    })
 }
 
-fn headless(opts: &CliOptions, f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>) {
+fn headless(
+    opts: &CliOptions,
+    f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>,
+) {
     let (provider, perm) = match provider_or_onboard(opts) {
         Ok(v) => v,
-        Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{}", tui::red(&e));
+            std::process::exit(1);
+        }
     };
     provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
     hooks::notify("SessionStart", &cwd);
+
+    if !report::is_json() {
+        println!(
+            "{}",
+            tui::bold(&format!(
+                "╭── buildwithnexus headless [v{}] ──────────────────────────────────╮",
+                crate::VERSION
+            ))
+        );
+        println!(
+            "│ Provider: {:<24} Model: {:<30} │",
+            provider.protocol, provider.model
+        );
+        println!("│ Working Dir: {:<58} │", cwd.display());
+        println!("│ Mode: High-Quality Non-Interactive Operational Execution               │");
+        println!("╰───────────────────────────────────────────────────────────────────────╯");
+        println!();
+        check_and_offer_install_dependencies(false);
+    }
+
+    let start_time = std::time::Instant::now();
     let r = f(&provider, perm, cwd.clone());
+    let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
+
+    if !report::is_json() {
+        println!();
+        if r.is_ok() {
+            println!(
+                "{}",
+                tui::green(&format!(
+                    "✓ Headless execution completed successfully in {:.2?}.",
+                    elapsed
+                ))
+            );
+        } else {
+            println!(
+                "{}",
+                tui::red(&format!(
+                    "✗ Headless execution failed after {:.2?}.",
+                    elapsed
+                ))
+            );
+        }
+    }
+
     if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
         std::process::exit(1);
@@ -174,7 +284,10 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     }
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
-        Err(e) => { eprintln!("{}", tui::red(&e)); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{}", tui::red(&e));
+            std::process::exit(1);
+        }
     };
     provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -192,8 +305,15 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
-fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw: bool, initial_prompt: Option<String>) -> Result<(), String> {
+fn repl(
+    mut provider: Provider,
+    mut perm: Permission,
+    cwd: &std::path::Path,
+    raw: bool,
+    initial_prompt: Option<String>,
+) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
+    tui::set_permission_mode(permission_label(&perm));
 
     // Show the full-screen header banner.
     let mode_name = "BUILD"; // default starting mode
@@ -203,10 +323,14 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         mode_name,
         &cwd.display().to_string(),
     );
-    tui::line(&tui::dim("  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode"));
+    tui::line(&tui::dim(
+        "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
+    ));
+    check_and_offer_install_dependencies(false);
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();
+    trace::set_session(&sid);
     let mut mode = Mode::Build;
     let mut last_suggested_mode: Option<&'static str> = None;
     // /btw: extra context injected into the next task without interrupting.
@@ -224,16 +348,29 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         // Show workflow activity badge if any are pending/running.
         let active = workflow::active_count();
         if active > 0 {
-            tui::line(&tui::dim(&format!("  ⟳ {} workflow{} in queue — /workflows to manage", active, if active == 1 { "" } else { "s" })));
+            tui::line(&tui::dim(&format!(
+                "  ⟳ {} workflow{} in queue — /workflows to manage",
+                active,
+                if active == 1 { "" } else { "s" }
+            )));
         }
 
-        let task = if let Some(prompted) = pending_prompt.take() {
+        let mut task = if let Some(prompted) = pending_prompt.take() {
             tui::line("");
-            tui::line(&format!("{} {} {}", tui::mode_badge(mode_label(&mode)), tui::accent("›"), prompted));
+            tui::line(&format!(
+                "{} {} {}",
+                tui::mode_badge(mode_label(&mode)),
+                tui::accent("›"),
+                prompted
+            ));
             prompted
         } else {
             tui::line("");
-            let prompt = format!("{} {} ", tui::mode_badge(mode_label(&mode)), tui::accent("›"));
+            let prompt = format!(
+                "{} {} ",
+                tui::mode_badge(mode_label(&mode)),
+                tui::accent("›")
+            );
             match tui::ask_task(&prompt) {
                 None => return Ok(()),
                 Some(tui::InputEvent::CycleMode) => {
@@ -245,7 +382,7 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                 Some(tui::InputEvent::Text(t)) => t,
             }
         };
-        let t = task.trim();
+        let mut t = task.trim();
         if t.is_empty() {
             continue;
         }
@@ -265,10 +402,24 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         // /mode with an inline argument, e.g. `/mode build`, `/mode 1`.
         if let Some(mode_arg) = t.strip_prefix("/mode ") {
             match mode_arg.trim() {
-                "1" | "plan"       => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
-                "2" | "build"      => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
-                "3" | "brainstorm" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
-                other => tui::line(&tui::red(&format!("  unknown mode '{other}' — try: plan, build, brainstorm"))),
+                "1" | "plan" => {
+                    mode = Mode::Plan;
+                    last_suggested_mode = None;
+                    tui::show_mode_change("PLAN");
+                }
+                "2" | "build" => {
+                    mode = Mode::Build;
+                    last_suggested_mode = None;
+                    tui::show_mode_change("BUILD");
+                }
+                "3" | "brainstorm" => {
+                    mode = Mode::Brainstorm;
+                    last_suggested_mode = None;
+                    tui::show_mode_change("BRAINSTORM");
+                }
+                other => tui::line(&tui::red(&format!(
+                    "  unknown mode '{other}' — try: plan, build, brainstorm"
+                ))),
             }
             continue;
         }
@@ -276,11 +427,24 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         // /permissions with an inline argument, e.g. `/permissions auto`.
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
             match perm_arg.trim() {
-                "ask" | "1"      => apply_permission(&mut perm, "ask"),
-                "auto" | "2"     => apply_permission(&mut perm, "auto"),
+                "ask" | "1" => apply_permission(&mut perm, "ask"),
+                "auto" | "2" => apply_permission(&mut perm, "auto"),
                 "readonly" | "3" => apply_permission(&mut perm, "readonly"),
-                other => tui::line(&tui::red(&format!("  unknown permission '{other}' — try: ask, auto, readonly"))),
+                other => tui::line(&tui::red(&format!(
+                    "  unknown permission '{other}' — try: ask, auto, readonly"
+                ))),
             }
+            continue;
+        }
+
+        // /mouse or /scroll on|off — wheel transcript scrolling is on by
+        // default; off restores terminal-native text selection.
+        if let Some(mouse_arg) = t.strip_prefix("/mouse ") {
+            handle_mouse(Some(mouse_arg.trim()));
+            continue;
+        }
+        if let Some(mouse_arg) = t.strip_prefix("/scroll ") {
+            handle_mouse(Some(mouse_arg.trim()));
             continue;
         }
 
@@ -305,12 +469,23 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             let delay_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
             if task.is_empty() {
-                tui::line(&tui::red("  usage: /schedule <delay> <task>  e.g. /schedule 5m cargo test"));
+                tui::line(&tui::red(
+                    "  usage: /schedule <delay> <task>  e.g. /schedule 5m cargo test",
+                ));
             } else if let Some(fire_at) = workflow::parse_delay(delay_str) {
-                let id = workflow::enqueue(task, workflow::WorkflowKind::Scheduled { fire_at_ms: fire_at });
-                tui::line(&tui::green(&format!("  ✓ scheduled workflow #{id}: {task}")));
+                let id = workflow::enqueue(
+                    task,
+                    workflow::WorkflowKind::Scheduled {
+                        fire_at_ms: fire_at,
+                    },
+                );
+                tui::line(&tui::green(&format!(
+                    "  ✓ scheduled workflow #{id}: {task}"
+                )));
             } else {
-                tui::line(&tui::red(&format!("  invalid delay '{delay_str}' — try: 30s, 5m, 1h")));
+                tui::line(&tui::red(&format!(
+                    "  invalid delay '{delay_str}' — try: 30s, 5m, 1h"
+                )));
             }
             continue;
         }
@@ -322,12 +497,23 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             let interval_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
             if task.is_empty() {
-                tui::line(&tui::red("  usage: /loop <interval> <task>  e.g. /loop 30m cargo test"));
+                tui::line(&tui::red(
+                    "  usage: /loop <interval> <task>  e.g. /loop 30m cargo test",
+                ));
             } else if let Some(secs) = workflow::parse_interval_secs(interval_str) {
-                let id = workflow::enqueue(task, workflow::WorkflowKind::Loop { interval_secs: secs });
-                tui::line(&tui::green(&format!("  ✓ loop workflow #{id} every {secs}s: {task}")));
+                let id = workflow::enqueue(
+                    task,
+                    workflow::WorkflowKind::Loop {
+                        interval_secs: secs,
+                    },
+                );
+                tui::line(&tui::green(&format!(
+                    "  ✓ loop workflow #{id} every {secs}s: {task}"
+                )));
             } else {
-                tui::line(&tui::red(&format!("  invalid interval '{interval_str}' — try: 30s, 5m, 1h")));
+                tui::line(&tui::red(&format!(
+                    "  invalid interval '{interval_str}' — try: 30s, 5m, 1h"
+                )));
             }
             continue;
         }
@@ -336,10 +522,14 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         if let Some(ctx) = t.strip_prefix("/btw ") {
             let ctx = ctx.trim();
             if ctx.is_empty() {
-                tui::line(&tui::red("  usage: /btw <context>  e.g. /btw also update the tests"));
+                tui::line(&tui::red(
+                    "  usage: /btw <context>  e.g. /btw also update the tests",
+                ));
             } else {
                 btw_ctx = Some(ctx.to_string());
-                tui::line(&tui::dim(&format!("  ⚑ context queued for next turn: {ctx}")));
+                tui::line(&tui::dim(&format!(
+                    "  ⚑ context queued for next turn: {ctx}"
+                )));
             }
             continue;
         }
@@ -354,7 +544,15 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         }
         if let Some(task) = t.strip_prefix("/build ") {
             tui::line("");
-            if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task.trim(), cwd, &mut transcript, &sid) {
+            if let Err(e) = agent::run_build_session(
+                &provider,
+                perm,
+                "engineer",
+                task.trim(),
+                cwd,
+                &mut transcript,
+                &sid,
+            ) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
             tui::bell();
@@ -371,15 +569,28 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
 
         match t {
             "/exit" | "/quit" | "exit" => return Ok(()),
-            "/clear" => { tui::clear(); continue; }
+            "/clear" => {
+                transcript.clear();
+                sid = session::new_id();
+                trace::set_session(&sid);
+                tui::clear();
+                tui::line(&tui::dim("  ✓ context cleared — fresh session"));
+                continue;
+            }
             "/new" => {
                 transcript.clear();
                 sid = session::new_id();
+                trace::set_session(&sid);
                 tui::line(&tui::dim("  started a fresh session"));
                 continue;
             }
             "/resume" => {
                 handle_resume(&mut transcript, &mut sid);
+                trace::set_session(&sid);
+                continue;
+            }
+            "/trace" => {
+                trace::render_list(30);
                 continue;
             }
             "/help" => {
@@ -410,7 +621,15 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                     format!("Review the current git diff focusing on: {}. Run `git diff HEAD` and `git diff --staged` to see the changes.", focus.trim())
                 };
                 tui::line("");
-                if let Err(e) = agent::run_build_session(&provider, perm, "researcher", &task, cwd, &mut transcript, &sid) {
+                if let Err(e) = agent::run_build_session(
+                    &provider,
+                    perm,
+                    "researcher",
+                    &task,
+                    cwd,
+                    &mut transcript,
+                    &sid,
+                ) {
                     tui::line(&tui::red(&format!("  {e}")));
                 }
                 tui::bell();
@@ -419,7 +638,15 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             "/commit" => {
                 let task = "Generate a conventional git commit message for the staged changes. Run `git diff --staged` to see what's staged. Then run `git commit -m \"<message>\"` with the generated message. If nothing is staged, remind the user to `git add` files first.";
                 tui::line("");
-                if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task, cwd, &mut transcript, &sid) {
+                if let Err(e) = agent::run_build_session(
+                    &provider,
+                    perm,
+                    "engineer",
+                    task,
+                    cwd,
+                    &mut transcript,
+                    &sid,
+                ) {
                     tui::line(&tui::red(&format!("  {e}")));
                 }
                 tui::bell();
@@ -427,10 +654,20 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             }
             "/pr" => {
                 tui::line(&tui::accent("  /pr — AI pull request"));
-                tui::line(&tui::dim("  Generates a PR title and description from your branch diff."));
+                tui::line(&tui::dim(
+                    "  Generates a PR title and description from your branch diff.",
+                ));
                 let task = "Generate a pull request title and description for the current branch. Run `git log main..HEAD --oneline` and `git diff main...HEAD` (or use origin/main if main isn't local) to understand the changes. Then use `gh pr create` (if gh is available) or just print the title and description so the user can paste it.";
                 tui::line("");
-                if let Err(e) = agent::run_build_session(&provider, perm, "engineer", task, cwd, &mut transcript, &sid) {
+                if let Err(e) = agent::run_build_session(
+                    &provider,
+                    perm,
+                    "engineer",
+                    task,
+                    cwd,
+                    &mut transcript,
+                    &sid,
+                ) {
                     tui::line(&tui::red(&format!("  {e}")));
                 }
                 tui::bell();
@@ -461,28 +698,62 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                 continue;
             }
             "/undo" | "/rewind" => {
-                handle_undo(cwd);
+                handle_undo(cwd, "");
+                continue;
+            }
+            "/grill-me" | "/align" | "/interview" => {
+                handle_align(cwd);
+                continue;
+            }
+            "/teamwork" | "/teamwork-preview" | "/swarm" => {
+                handle_teamwork();
                 continue;
             }
             "/mode" => {
-                tui::line(&format!("  Current mode: {}", tui::mode_badge(mode_label(&mode))));
-                tui::line(&tui::dim("  Tab-complete: /mode plan|build|brainstorm  ·  Shift+Tab to cycle"));
+                tui::line(&format!(
+                    "  Current mode: {}",
+                    tui::mode_badge(mode_label(&mode))
+                ));
+                tui::line(&tui::dim(
+                    "  Tab-complete: /mode plan|build|brainstorm  ·  Shift+Tab to cycle",
+                ));
                 tui::line("");
                 tui::line(&format!("    {}  {}", tui::bold("1"), "plan"));
                 tui::line(&format!("    {}  {}", tui::bold("2"), "build"));
                 tui::line(&format!("    {}  {}", tui::bold("3"), "brainstorm"));
                 tui::line("");
-                let pick = tui::ask("  switch to [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
+                let pick =
+                    tui::ask("  switch to [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
                 match pick.trim() {
-                    "1" | "plan"       => { mode = Mode::Plan;       last_suggested_mode = None; tui::show_mode_change("PLAN"); }
-                    "2" | "build"      => { mode = Mode::Build;      last_suggested_mode = None; tui::show_mode_change("BUILD"); }
-                    "3" | "brainstorm" => { mode = Mode::Brainstorm; last_suggested_mode = None; tui::show_mode_change("BRAINSTORM"); }
+                    "1" | "plan" => {
+                        mode = Mode::Plan;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("PLAN");
+                    }
+                    "2" | "build" => {
+                        mode = Mode::Build;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("BUILD");
+                    }
+                    "3" | "brainstorm" => {
+                        mode = Mode::Brainstorm;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("BRAINSTORM");
+                    }
                     _ => {}
                 }
                 continue;
             }
             "/permissions" => {
                 handle_permissions(&mut perm);
+                continue;
+            }
+            "/mouse" => {
+                handle_mouse(None);
+                continue;
+            }
+            "/scroll" => {
+                handle_mouse(None);
                 continue;
             }
             "/config" => {
@@ -497,7 +768,77 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                 handle_skills();
                 continue;
             }
+            "/tools" => {
+                handle_tools();
+                continue;
+            }
+            "/mcp" => {
+                handle_mcp();
+                continue;
+            }
+            "/vim" => {
+                let current = tui::toggle_vim_mode();
+                tui::line(&format!(
+                    "  Vim modal editing mode is now {}",
+                    if current {
+                        tui::green("ENABLED [Normal/Insert]")
+                    } else {
+                        tui::yellow("DISABLED [Standard Emacs/Readline]")
+                    }
+                ));
+                continue;
+            }
+            "/local" => {
+                handle_local(&mut provider);
+                continue;
+            }
+            "/rules" => {
+                handle_rules(cwd);
+                continue;
+            }
+            "/kb" | "/index" => {
+                handle_kb_index(cwd);
+                continue;
+            }
+            "/verify" | "/audit" => {
+                handle_verify_audit(cwd);
+                continue;
+            }
             _ => {}
+        }
+
+        if let Some(arg) = t.strip_prefix("/voice") {
+            if let Some(voice_text) = handle_voice(arg) {
+                if !voice_text.trim().is_empty() {
+                    tui::line(&format!(
+                        "  {} {}",
+                        tui::green("✓ Voice input transcribed:"),
+                        tui::bold(&voice_text)
+                    ));
+                    task = voice_text;
+                    t = task.trim();
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
+        if let Some(arg) = t
+            .strip_prefix("/undo ")
+            .or_else(|| t.strip_prefix("/rewind "))
+        {
+            handle_undo(cwd, arg);
+            continue;
+        }
+
+        if let Some(id) = t.strip_prefix("/trace ") {
+            match id.trim().parse::<u64>() {
+                Ok(id) => trace::render_detail(id),
+                Err(_) => tui::line(&tui::red("  usage: /trace <id>")),
+            }
+            continue;
         }
 
         // Check for custom user-defined slash commands.
@@ -517,7 +858,9 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                     let tool_input = serde_json::json!({"command": shell_cmd});
                     // UX-002: script-based custom commands must pass through the
                     // permission gate and PreToolUse hooks just like any run_command.
-                    if let hooks::PreDecision::Deny(r) = hooks::pre_tool_use("run_command", &tool_input, cwd) {
+                    if let hooks::PreDecision::Deny(r) =
+                        hooks::pre_tool_use("run_command", &tool_input, cwd)
+                    {
                         tui::line(&tui::red(&format!("  blocked by hook: {r}")));
                         tui::bell();
                         continue;
@@ -533,10 +876,23 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                     }
                 } else {
                     // Inject the skill content as context and run in BUILD mode.
-                    let user_input = if cmd_args.is_empty() { t.to_string() } else { format!("{t} {cmd_args}") };
-                    let task_with_context = format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
+                    let user_input = if cmd_args.is_empty() {
+                        t.to_string()
+                    } else {
+                        format!("{t} {cmd_args}")
+                    };
+                    let task_with_context =
+                        format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
                     tui::line("");
-                    if let Err(e) = agent::run_build_session(&provider, perm, "engineer", &task_with_context, cwd, &mut transcript, &sid) {
+                    if let Err(e) = agent::run_build_session(
+                        &provider,
+                        perm,
+                        "engineer",
+                        &task_with_context,
+                        cwd,
+                        &mut transcript,
+                        &sid,
+                    ) {
                         tui::line(&tui::red(&format!("  {e}")));
                     }
                 }
@@ -545,7 +901,9 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             }
             // UX-001: unknown slash command — show error instead of falling through to AI.
             if !cmd_name.is_empty() {
-                tui::line(&tui::red(&format!("  unknown command /{cmd_name} — /help for all commands")));
+                tui::line(&tui::red(&format!(
+                    "  unknown command /{cmd_name} — /help for all commands"
+                )));
                 continue;
             }
         }
@@ -562,8 +920,13 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
             continue;
         }
 
-        // Mode suggestion: hint once per unique suggestion (don't repeat if user stays in mode).
-        suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
+        // Mode suggestion: hint once per unique suggestion, but stay quiet for
+        // greetings and ordinary questions that should answer in any mode.
+        if should_answer_conversationally(t, &mode) {
+            last_suggested_mode = None;
+        } else {
+            suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
+        }
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
@@ -571,7 +934,10 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         let (clean_task, image_data) = extract_attachments(t, cwd);
         let n_images = image_data.len();
         if n_images > 0 {
-            transcript.push(Msg::UserImages { text: clean_task.clone(), images: image_data });
+            transcript.push(Msg::UserImages {
+                text: clean_task.clone(),
+                images: image_data,
+            });
             tui::line(&tui::dim(&format!("  attached {n_images} image(s)")));
         }
 
@@ -584,11 +950,21 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
         let t = effective_task.as_str();
 
         tui::line("");
-        let r = match &mode {
-            Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
-            Mode::Build => agent::run_build_session(&provider, perm, "engineer", t, cwd, &mut transcript, &sid),
-            Mode::Brainstorm => {
-                match agent::run_brainstorm(&provider, perm, cwd, t) {
+        let r = if should_answer_conversationally(t, &mode) {
+            agent::run_chat_turn(&provider, perm, cwd, t)
+        } else {
+            match &mode {
+                Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
+                Mode::Build => agent::run_build_session(
+                    &provider,
+                    perm,
+                    "engineer",
+                    t,
+                    cwd,
+                    &mut transcript,
+                    &sid,
+                ),
+                Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
                     Err(e) => Err(e),
                     Ok(None) => Ok(()),
                     Ok(Some(agent::ModeHint::Build)) => {
@@ -606,7 +982,7 @@ fn repl(mut provider: Provider, mut perm: Permission, cwd: &std::path::Path, raw
                         tui::show_mode_change(mode_label(&mode));
                         Ok(())
                     }
-                }
+                },
             }
         };
         if let Err(e) = r {
@@ -628,19 +1004,95 @@ fn mode_label(mode: &Mode) -> &'static str {
 // Suppresses the tip if it was already shown for this mode combo in the current session.
 fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
     let suggested = classify(task);
-    let mismatch = matches!((&suggested, current),
-        (Mode::Build, Mode::Brainstorm) |
-        (Mode::Plan, Mode::Brainstorm) |
-        (Mode::Build, Mode::Plan));
+    let mismatch = matches!(
+        (&suggested, current),
+        (Mode::Build, Mode::Brainstorm)
+            | (Mode::Plan, Mode::Brainstorm)
+            | (Mode::Build, Mode::Plan)
+    );
     if mismatch {
         let sug_label = mode_label(&suggested);
         if *last_suggested != Some(sug_label) {
-            tui::line(&tui::dim(&format!("  tip: this looks like a {} task — Shift+Tab or /mode to switch", sug_label)));
+            tui::line(&tui::dim(&format!(
+                "  tip: this looks like a {} task — Shift+Tab or /mode to switch",
+                sug_label
+            )));
             *last_suggested = Some(sug_label);
         }
     } else {
         *last_suggested = None;
     }
+}
+
+fn should_answer_conversationally(task: &str, current: &Mode) -> bool {
+    if matches!(current, Mode::Brainstorm) {
+        return false;
+    }
+
+    if is_simple_conversation(task) {
+        return true;
+    }
+
+    matches!(classify(task), Mode::Brainstorm) && !looks_like_action_request(task)
+}
+
+fn is_simple_conversation(task: &str) -> bool {
+    let normalized = task
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "yo"
+            | "sup"
+            | "thanks"
+            | "thank you"
+            | "ok"
+            | "okay"
+            | "cool"
+            | "nice"
+            | "what can you do"
+            | "what can you do?"
+            | "who are you"
+            | "who are you?"
+            | "help"
+    )
+}
+
+fn looks_like_action_request(task: &str) -> bool {
+    let l = task.to_ascii_lowercase();
+    let action_words = [
+        "build",
+        "create",
+        "add",
+        "fix",
+        "implement",
+        "write",
+        "refactor",
+        "run",
+        "make",
+        "edit",
+        "change",
+        "update",
+        "delete",
+        "remove",
+        "start",
+        "launch",
+        "open",
+        "find",
+        "search",
+        "read",
+        "inspect",
+        "list",
+    ];
+    action_words.iter().any(|word| {
+        l == *word
+            || l.starts_with(&format!("{word} "))
+            || l.contains(&format!(" {word} "))
+            || l.contains(&format!(" {word} me "))
+    })
 }
 
 fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
@@ -651,10 +1103,16 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
     }
     tui::line(&tui::dim("  recent sessions:"));
     for (i, s) in sessions.iter().take(15).enumerate() {
-        tui::line(&format!("  {}  {}", tui::bold(&(i + 1).to_string()), s.title));
+        tui::line(&format!(
+            "  {}  {}",
+            tui::bold(&(i + 1).to_string()),
+            s.title
+        ));
     }
     let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
-        .as_deref().map(str::trim).and_then(|x| x.parse::<usize>().ok());
+        .as_deref()
+        .map(str::trim)
+        .and_then(|x| x.parse::<usize>().ok());
     if let Some(n) = pick {
         if n >= 1 && n <= sessions.len().min(15) {
             let s = sessions.swap_remove(n - 1);
@@ -667,9 +1125,15 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
 
 fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
     tui::line(&tui::accent("  /config — AI-assisted configuration"));
-    tui::line(&tui::dim("  Tell me what to configure (hooks, memory, custom commands, settings…)"));
-    tui::line(&tui::dim("  Examples: 'add a hook to log every command run'"));
-    tui::line(&tui::dim("            'remember I prefer TypeScript over JavaScript'"));
+    tui::line(&tui::dim(
+        "  Tell me what to configure (hooks, memory, custom commands, settings…)",
+    ));
+    tui::line(&tui::dim(
+        "  Examples: 'add a hook to log every command run'",
+    ));
+    tui::line(&tui::dim(
+        "            'remember I prefer TypeScript over JavaScript'",
+    ));
     tui::line(&tui::dim("            'create a /deploy slash command'"));
     tui::line("");
 
@@ -678,7 +1142,9 @@ fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
         Some(s) => s,
     };
     let t = input.trim();
-    if t.is_empty() { return; }
+    if t.is_empty() {
+        return;
+    }
 
     // Show current config context to the model.
     let home_dir = config::home();
@@ -709,7 +1175,13 @@ fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
     }
 }
 
-fn handle_memory(provider: &Provider, perm: Permission, cwd: &std::path::Path, transcript: &mut Vec<provider::Msg>, sid: &str) {
+fn handle_memory(
+    provider: &Provider,
+    perm: Permission,
+    cwd: &std::path::Path,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
     tui::line(&tui::accent("  /memory — session memory"));
     match config::load_memory() {
         None => tui::line(&tui::dim("  (no memory saved yet)")),
@@ -721,7 +1193,9 @@ fn handle_memory(provider: &Provider, perm: Permission, cwd: &std::path::Path, t
         }
     }
     tui::line("");
-    tui::line(&tui::dim("  [a] add entry  [c] clear  [e] edit via AI  [Enter] dismiss"));
+    tui::line(&tui::dim(
+        "  [a] add entry  [c] clear  [e] edit via AI  [Enter] dismiss",
+    ));
     let pick = tui::ask(&tui::dim("  action › ")).unwrap_or_default();
     match pick.trim() {
         "a" => {
@@ -739,7 +1213,9 @@ fn handle_memory(provider: &Provider, perm: Permission, cwd: &std::path::Path, t
         "e" => {
             let task = "Review and clean up the memory.md file at ~/.buildwithnexus/memory.md. \
                 Remove duplicates, organize by topic, and keep it concise.";
-            if let Err(e) = agent::run_build_session(provider, perm, "engineer", task, cwd, transcript, sid) {
+            if let Err(e) =
+                agent::run_build_session(provider, perm, "engineer", task, cwd, transcript, sid)
+            {
                 tui::line(&tui::red(&format!("  {e}")));
             }
         }
@@ -748,46 +1224,539 @@ fn handle_memory(provider: &Provider, perm: Permission, cwd: &std::path::Path, t
 }
 
 fn handle_skills() {
-    tui::line(&tui::accent("  /skills — available skills"));
     let skills = config::load_skills();
     if skills.is_empty() {
         tui::line(&tui::dim("  No skills found."));
-        tui::line(&tui::dim(&format!("  Add .md files to {}/skills/", config::home().display())));
-    } else {
-        for (name, content) in &skills {
-            let preview: String = content.lines().next().unwrap_or("").chars().take(60).collect();
-            tui::line(&format!("  {}  {}", tui::bold(&format!("/{name}")), tui::dim(&preview)));
+        tui::line(&tui::dim(&format!(
+            "  Add .md files to {}/skills/",
+            config::home().display()
+        )));
+        return;
+    }
+    let mut items: Vec<(String, String)> = skills
+        .into_iter()
+        .map(|(name, content)| (format!("/{name}"), content))
+        .collect();
+    for cmd in config::load_custom_commands()
+        .into_iter()
+        .filter(|c| c.script.is_some())
+    {
+        items.push((
+            format!("/{}", cmd.name),
+            "[script command] runs through the run_command permission gate and hooks.".to_string(),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    tui::browse_items("skills", &items);
+}
+
+fn handle_tools() {
+    let mut items: Vec<(String, String)> = tools::defs(true)
+        .into_iter()
+        .map(|d| {
+            let schema =
+                serde_json::to_string_pretty(&d.schema).unwrap_or_else(|_| d.schema.to_string());
+            (
+                d.name.to_string(),
+                format!("{}\n\nSchema:\n{schema}", d.description),
+            )
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    tui::browse_items("tools", &items);
+}
+
+fn handle_mcp() {
+    let mut items = Vec::new();
+    if let Some(s) = config::load_settings() {
+        for (name, val) in &s.mcp_servers {
+            let desc = serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
+            items.push((name.clone(), format!("MCP Server Configuration:\n{desc}")));
         }
     }
-    // Also show custom commands.
-    let cmds = config::load_custom_commands();
-    if !cmds.is_empty() {
-        tui::line(&tui::dim("  Custom commands:"));
-        for cmd in &cmds {
-            tui::line(&format!("  {}  {}", tui::bold(&format!("/{}", cmd.name)), tui::dim(if cmd.script.is_some() { "[script]" } else { "[context]" })));
-        }
+    if items.is_empty() {
+        tui::line(&tui::dim(
+            "  No MCP servers configured in settings.json (mcp_servers).",
+        ));
+        tui::line(&tui::dim(
+            "  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`.",
+        ));
+        return;
     }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    tui::browse_items("mcp servers", &items);
 }
 
 fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
-    config::load_custom_commands().into_iter().find(|c| c.name == name)
+    config::load_custom_commands()
+        .into_iter()
+        .find(|c| c.name == name)
 }
 
 fn handle_model(provider: &mut Provider) {
-    tui::line(&tui::accent("  /model — model hot-swap"));
-    tui::line(&format!("  Current: {}", tui::bold(&provider.model)));
-    tui::line(&tui::dim("  Tip: /model <name>  e.g. /model claude-opus-4-5"));
+    tui::line(&tui::accent(
+        "  /model — interactive model selection & hot-swap",
+    ));
+    tui::line(&format!(
+        "  Current active model: {}",
+        tui::bold(&provider.model)
+    ));
     tui::line("");
-    let pick = tui::ask("  new model (Enter to keep): ").unwrap_or_default();
+
+    let mut options: Vec<(String, String)> = Vec::new();
+
+    // 1. Scan for local GGUF models
+    let mut gguf_found = false;
+    for name in crate::local::scan_gguf() {
+        if !gguf_found {
+            tui::line(&tui::bold("  [Local GGUF Models Found]"));
+            gguf_found = true;
+        }
+        let model_id = format!("local/{}", name);
+        options.push((model_id.clone(), "Local GGUF Model".to_string()));
+    }
+    if !gguf_found {
+        tui::line(&tui::dim(
+            "  [No local GGUF models found in ~/.buildwithnexus/models or scanned dirs]",
+        ));
+    }
+
+    tui::line("");
+    tui::line(&tui::bold("  [Standard Cloud & Server Presets]"));
+    let presets = [
+        (
+            "claude-3-7-sonnet",
+            "Anthropic Claude 3.7 Sonnet (Reasoning)",
+        ),
+        (
+            "claude-3-5-sonnet",
+            "Anthropic Claude 3.5 Sonnet (Balanced)",
+        ),
+        ("claude-3-haiku", "Anthropic Claude 3 Haiku (Fast/Light)"),
+        ("gpt-4o", "OpenAI GPT-4o (Multimodal Flagship)"),
+        ("gpt-4o-mini", "OpenAI GPT-4o Mini (Fast/Economic)"),
+        ("gemini-2.5-pro", "Google Gemini 2.5 Pro (Long Context)"),
+        (
+            "gemini-2.5-flash",
+            "Google Gemini 2.5 Flash (Fast/High Volume)",
+        ),
+        ("ollama/llama3", "Local Ollama Llama 3"),
+        ("ollama/qwen2.5-coder", "Local Ollama Qwen 2.5 Coder"),
+    ];
+    for (id, desc) in presets {
+        options.push((id.to_string(), desc.to_string()));
+    }
+
+    for (idx, (id, desc)) in options.iter().enumerate() {
+        let num = format!("{:>2}", idx + 1);
+        tui::line(&format!(
+            "  {} {} — {}",
+            tui::accent(&num),
+            tui::bold(id),
+            tui::dim(desc)
+        ));
+    }
+    tui::line("");
+    tui::line(&tui::dim(
+        "  Tip: Type a number (e.g. `1`), a model name, or press Enter to keep current.",
+    ));
+
+    let pick = tui::ask("  Select model: ").unwrap_or_default();
     let pick = pick.trim();
     if !pick.is_empty() {
-        provider.model = pick.to_string();
+        let chosen = if let Ok(idx) = pick.parse::<usize>() {
+            if idx > 0 && idx <= options.len() {
+                options[idx - 1].0.clone()
+            } else {
+                tui::line(&tui::red(&format!(
+                    "  ✗ number {idx} out of range (1-{}), keeping current model",
+                    options.len()
+                )));
+                return;
+            }
+        } else {
+            pick.to_string()
+        };
+        provider.model = chosen.clone();
         if let Some(mut s) = config::load_settings() {
-            s.model = pick.to_string();
+            s.model = chosen.clone();
             config::save_settings(&s);
         }
-        tui::line(&tui::green(&format!("  ✓ model → {pick}")));
+        tui::line(&tui::green(&format!(
+            "  ✓ active model hot-swapped → {chosen}"
+        )));
     }
+}
+
+fn handle_voice(arg: &str) -> Option<String> {
+    tui::line(&tui::accent("  /voice — audio transcription & voice input"));
+    tui::line("  Supported backends: whisper-cpp, whisper-cli, openai-whisper, local models");
+    let audio_path = if arg.trim().is_empty() {
+        tui::line(&tui::dim(
+            "  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or pass `/voice <path>`",
+        ));
+        tui::ask("  path to audio file (or press Enter to check local microphone/whisper): ")
+            .unwrap_or_default()
+    } else {
+        arg.trim().to_string()
+    };
+    if audio_path.trim().is_empty() {
+        let has_whisper = std::process::Command::new("whisper-cpp")
+            .arg("--help")
+            .output()
+            .is_ok()
+            || std::process::Command::new("whisper-cli")
+                .arg("--help")
+                .output()
+                .is_ok()
+            || std::process::Command::new("whisper")
+                .arg("--help")
+                .output()
+                .is_ok();
+        if has_whisper {
+            tui::line(&tui::green(
+                "  Local whisper binary detected! Ready for voice-to-text transcription.",
+            ));
+            tui::line(&tui::dim(
+                "  To transcribe and run a prompt, use `/voice <path_to_audio_file>`",
+            ));
+        } else {
+            tui::line(&tui::yellow("  No local whisper binary found in PATH."));
+            tui::line(&tui::dim("  To enable offline zero-latency voice input, install `whisper-cpp` or `openai-whisper`."));
+        }
+        None
+    } else {
+        let path = audio_path.trim();
+        if std::path::Path::new(path).exists() {
+            tui::line(&format!("  Transcribing audio from {}...", tui::bold(path)));
+            let bins = ["whisper-cpp", "whisper-cli", "whisper"];
+            for bin in bins {
+                if let Ok(_o) = std::process::Command::new(bin)
+                    .args(["-f", path, "-otxt"])
+                    .output()
+                {
+                    tui::line(&tui::green(&format!("  Transcription complete via {bin}!")));
+                    let txt_path = format!("{path}.txt");
+                    if let Ok(txt) = std::fs::read_to_string(&txt_path) {
+                        let _ = std::fs::remove_file(&txt_path);
+                        return Some(txt.trim().to_string());
+                    }
+                    if let Ok(txt) = std::fs::read_to_string(
+                        path.replace(".wav", ".txt").replace(".mp3", ".txt"),
+                    ) {
+                        return Some(txt.trim().to_string());
+                    }
+                }
+            }
+            tui::line(&tui::yellow("  Could not transcribe: please ensure `whisper-cpp`, `whisper-cli`, or `whisper` is installed and the audio format is supported."));
+            None
+        } else {
+            tui::line(&tui::red(&format!("  File not found: {path}")));
+            None
+        }
+    }
+}
+
+fn handle_local(_provider: &mut Provider) {
+    tui::line(&tui::accent(
+        "  /local — local model management & inference optimization",
+    ));
+    tui::line("  Scanning local servers and model directories...");
+    let mut servers = Vec::new();
+    if let Ok(o) = std::process::Command::new("curl")
+        .args(["-s", "http://localhost:11434/api/tags"])
+        .output()
+    {
+        if o.status.success() {
+            servers.push("Ollama (port 11434 - ACTIVE)");
+        }
+    }
+    if let Ok(o) = std::process::Command::new("curl")
+        .args(["-s", "http://localhost:8080/v1/models"])
+        .output()
+    {
+        if o.status.success() {
+            servers.push("llama.cpp / vLLM (port 8080 - ACTIVE)");
+        }
+    }
+    if servers.is_empty() {
+        tui::line(&tui::dim("  No running local model servers detected on port 11434 (Ollama) or 8080 (llama.cpp/vLLM)."));
+    } else {
+        for s in servers {
+            tui::line(&format!("  • {}", tui::green(s)));
+        }
+    }
+    let ggufs = crate::local::scan_gguf();
+    if !ggufs.is_empty() {
+        tui::line("  Local GGUF models found:");
+        for m in ggufs {
+            tui::line(&format!("    - {}", tui::bold(&m)));
+        }
+    }
+    tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
+}
+
+fn handle_rules(cwd: &std::path::Path) {
+    tui::line(&tui::accent(
+        "  /rules — active engineering constraints & business logic rules",
+    ));
+    let mut engine = crate::rules::RuleEngine::load_defaults();
+    let rules_dir = cwd.join(".buildwithnexus").join("rules");
+    if let Ok(rd) = std::fs::read_dir(&rules_dir) {
+        for e in rd.flatten() {
+            if let Ok(loaded) =
+                crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
+            {
+                for r in loaded.rules {
+                    engine.add_rule(r);
+                }
+            }
+        }
+    }
+    tui::line(&format!(
+        "  {} active rules loaded for workspace:",
+        tui::bold(&engine.rules.len().to_string())
+    ));
+    for r in &engine.rules {
+        let sev_badge = match r.severity {
+            crate::rules::Severity::Critical => tui::red("CRITICAL"),
+            crate::rules::Severity::High => tui::red("HIGH"),
+            crate::rules::Severity::Medium => tui::yellow("MEDIUM"),
+            crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
+        };
+        tui::line(&format!(
+            "  [{sev_badge}] {} — {}",
+            tui::bold(&r.id),
+            r.description
+        ));
+    }
+    tui::line(&tui::dim("  Tip: Add custom JSON/YAML rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt"));
+}
+
+fn handle_kb_index(cwd: &std::path::Path) {
+    tui::line(&tui::accent(
+        "  /kb (/index) — project structured knowledge base & symbol indexing",
+    ));
+    let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+    tui::line(&format!(
+        "  Current knowledge base contains {} entities.",
+        tui::bold(&kb.entities.len().to_string())
+    ));
+
+    tui::line("  Scanning workspace for source files and extracting symbols...");
+    let mut count = 0;
+    let mut dirs_to_visit = vec![cwd.to_path_buf()];
+    while let Some(dir) = dirs_to_visit.pop() {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.')
+                    || name == "target"
+                    || name == "node_modules"
+                    || name == "vendor"
+                    || name == "dist"
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs_to_visit.push(path);
+                } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
+                        let rel_path = path
+                            .strip_prefix(cwd)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            for line in content.lines() {
+                                let trimmed = line.trim();
+                                let mut entity_type = None;
+                                let mut sym_name = None;
+                                if ext == "rs" {
+                                    if trimmed.starts_with("fn ")
+                                        || trimmed.starts_with("pub fn ")
+                                        || trimmed.starts_with("async fn ")
+                                        || trimmed.starts_with("pub async fn ")
+                                    {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(idx) = trimmed.find("fn ") {
+                                            let rest = &trimmed[idx + 3..];
+                                            if let Some(paren) = rest.find('(') {
+                                                sym_name = Some(rest[..paren].trim().to_string());
+                                            }
+                                        }
+                                    } else if trimmed.starts_with("struct ")
+                                        || trimmed.starts_with("pub struct ")
+                                    {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("struct ") {
+                                            let rest = &trimmed[idx + 7..];
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part
+                                                    .trim_matches(|c| {
+                                                        c == '{' || c == '(' || c == ';'
+                                                    })
+                                                    .to_string(),
+                                            );
+                                        }
+                                    } else if trimmed.starts_with("enum ")
+                                        || trimmed.starts_with("pub enum ")
+                                    {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("enum ") {
+                                            let rest = &trimmed[idx + 5..];
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part
+                                                    .trim_matches(|c| {
+                                                        c == '{' || c == '(' || c == ';'
+                                                    })
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                } else if ext == "py" {
+                                    if let Some(rest) = trimmed.strip_prefix("def ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(paren) = rest.find('(') {
+                                            sym_name = Some(rest[..paren].trim().to_string());
+                                        }
+                                    } else if let Some(rest) = trimmed.strip_prefix("class ") {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(paren) = rest.find(['(', ':']) {
+                                            sym_name = Some(rest[..paren].trim().to_string());
+                                        }
+                                    }
+                                } else if matches!(ext, "js" | "ts") {
+                                    if trimmed.starts_with("function ")
+                                        || trimmed.starts_with("export function ")
+                                    {
+                                        entity_type = Some(crate::knowledge::EntityType::Function);
+                                        if let Some(idx) = trimmed.find("function ") {
+                                            let rest = &trimmed[idx + 9..];
+                                            if let Some(paren) = rest.find('(') {
+                                                sym_name = Some(rest[..paren].trim().to_string());
+                                            }
+                                        }
+                                    } else if trimmed.starts_with("class ")
+                                        || trimmed.starts_with("export class ")
+                                    {
+                                        entity_type = Some(crate::knowledge::EntityType::Class);
+                                        if let Some(idx) = trimmed.find("class ") {
+                                            let rest = &trimmed[idx + 6..];
+                                            let name_part =
+                                                rest.split_whitespace().next().unwrap_or("");
+                                            sym_name = Some(
+                                                name_part.trim_matches(|c| c == '{').to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                if let (Some(et), Some(sn)) = (entity_type, sym_name) {
+                                    if !sn.is_empty()
+                                        && sn
+                                            .chars()
+                                            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                                    {
+                                        let id = format!("{sn}@{rel_path}");
+                                        kb.add_entity(crate::knowledge::Entity {
+                                            id,
+                                            entity_type: et,
+                                            name: sn,
+                                            path: Some(rel_path.clone()),
+                                            description: Some(format!(
+                                                "Extracted symbol from {rel_path}"
+                                            )),
+                                            metadata: serde_json::json!({"auto_indexed": true}),
+                                            relationships: vec![],
+                                            last_updated: crate::knowledge::chrono_now_iso(),
+                                        });
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Err(e) = kb.save() {
+        tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
+    } else {
+        tui::line(&tui::green(&format!("  ✓ Successfully scanned workspace and indexed {count} symbols into `.buildwithnexus/knowledge/entities.json`!")));
+        tui::line(&tui::dim("  Tip: Use `@kb:<name>` or `@symbol:<name>` in your prompts to inject symbol definitions."));
+    }
+}
+
+fn handle_verify_audit(cwd: &std::path::Path) {
+    tui::line(&tui::accent(
+        "  /verify (/audit) — running operational judgment verifier on workspace",
+    ));
+
+    let mut changed_files = Vec::new();
+    if let Ok(o) = std::process::Command::new("git")
+        .args(["status", "-s"])
+        .current_dir(cwd)
+        .output()
+    {
+        if o.status.success() {
+            let out = String::from_utf8_lossy(&o.stdout);
+            for line in out.lines() {
+                if line.len() > 3 {
+                    let path = line[3..].trim().to_string();
+                    changed_files.push(path);
+                }
+            }
+        }
+    }
+    if changed_files.is_empty() {
+        tui::line(&tui::dim("  No modified git files detected. Running verifier against recent files in workspace..."));
+        if let Ok(rd) = std::fs::read_dir(cwd) {
+            for e in rd.flatten() {
+                if let Some(s) = e.path().to_str() {
+                    if !s.contains(".git") && !s.contains("target") && !s.contains("node_modules") {
+                        changed_files.push(e.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
+    let ctx = crate::verifier::VerificationContext {
+        task_description: "Interactive workspace verification and operational audit".to_string(),
+        task_type: Some(crate::rules::TaskType::CodeReview),
+        changed_files: changed_files.clone(),
+        tool_calls: vec![],
+        evidence_gathered: vec![],
+        tests_added: vec![],
+        dependencies_changed: vec![],
+        git_diff: None,
+    };
+
+    let report = verifier.verify(&ctx);
+    let report_str = crate::verifier::Verifier::format_report(&report);
+    for line in report_str.lines() {
+        if line.starts_with("=== ") {
+            tui::line(&tui::bold(line));
+        } else if line.contains("PASSED") {
+            tui::line(&tui::green(line));
+        } else if line.contains("WARNING") || line.contains("MEDIUM") {
+            tui::line(&tui::yellow(line));
+        } else if line.contains("FAILED") || line.contains("CRITICAL") || line.contains("HIGH") {
+            tui::line(&tui::red(line));
+        } else {
+            tui::line(line);
+        }
+    }
+    tui::line(&tui::dim(
+        "  Tip: Use `@rules:<id>` or `/rules` to inspect specific constraints.",
+    ));
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -799,31 +1768,55 @@ fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
     let taken = std::mem::take(transcript);
     *transcript = agent::compact_msgs(provider, taken);
     let after = transcript.len();
-    tui::line(&tui::green(&format!("  ✓ compacted: {before} → {after} messages")));
+    tui::line(&tui::green(&format!(
+        "  ✓ compacted: {before} → {after} messages"
+    )));
 }
 
 fn handle_workflows() {
     let snaps = workflow::snapshots();
     if snaps.is_empty() {
-        tui::line(&tui::dim("  no workflows yet — /schedule or /loop to create one"));
+        tui::line(&tui::dim(
+            "  no workflows yet — /schedule or /loop to create one",
+        ));
         return;
     }
     tui::line(&tui::accent("  /workflows — background task manager"));
-    tui::line(&tui::dim("  ──────────────────────────────────────────────────────────────"));
+    tui::line(&tui::dim(
+        "  ──────────────────────────────────────────────────────────────",
+    ));
     for s in &snaps {
         let status_color = match s.status_str.as_str() {
             "running" => tui::blue(&s.status_str),
-            "done"    => tui::green(&s.status_str),
-            "failed"  => tui::red(&s.status_str),
-            _         => tui::dim(&s.status_str),
+            "done" => tui::green(&s.status_str),
+            "failed" => tui::red(&s.status_str),
+            _ => tui::dim(&s.status_str),
         };
-        let elapsed = s.elapsed_secs.map(|e| format!(" [{e}s]")).unwrap_or_default();
-        let iter_label = if s.iteration > 1 { format!(" ×{}", s.iteration) } else { String::new() };
-        tui::line(&format!("  #{:<3}  {}{}  [{}]  {}{}",
-            s.id, status_color, elapsed, s.kind_str, tui::dim(&s.task), iter_label));
+        let elapsed = s
+            .elapsed_secs
+            .map(|e| format!(" [{e}s]"))
+            .unwrap_or_default();
+        let iter_label = if s.iteration > 1 {
+            format!(" ×{}", s.iteration)
+        } else {
+            String::new()
+        };
+        tui::line(&format!(
+            "  #{:<3}  {}{}  [{}]  {}{}",
+            s.id,
+            status_color,
+            elapsed,
+            s.kind_str,
+            tui::dim(&s.task),
+            iter_label
+        ));
     }
-    tui::line(&tui::dim("  ──────────────────────────────────────────────────────────────"));
-    tui::line(&tui::dim("  c<id> cancel  ·  i<id> inspect output  ·  Enter dismiss"));
+    tui::line(&tui::dim(
+        "  ──────────────────────────────────────────────────────────────",
+    ));
+    tui::line(&tui::dim(
+        "  c<id> cancel  ·  i<id> inspect output  ·  Enter dismiss",
+    ));
     let action = tui::ask("  action: ").unwrap_or_default();
     let action = action.trim();
     if let Some(rest) = action.strip_prefix('c') {
@@ -831,21 +1824,28 @@ fn handle_workflows() {
             if workflow::cancel(id) {
                 tui::line(&tui::yellow(&format!("  cancelled workflow #{id}")));
             } else {
-                tui::line(&tui::dim(&format!("  workflow #{id} not found or already finished")));
+                tui::line(&tui::dim(&format!(
+                    "  workflow #{id} not found or already finished"
+                )));
             }
         }
     } else if let Some(rest) = action.strip_prefix('i') {
         if let Ok(id) = rest.trim().parse::<usize>() {
             let lines = workflow::output(id);
             if lines.is_empty() {
-                tui::line(&tui::dim(&format!("  no output captured for workflow #{id}")));
+                tui::line(&tui::dim(&format!(
+                    "  no output captured for workflow #{id}"
+                )));
             } else {
                 tui::line(&tui::accent(&format!("  workflow #{id} output:")));
                 for l in lines.iter().take(100) {
                     tui::line(&format!("    {}", tui::dim(l)));
                 }
                 if lines.len() > 100 {
-                    tui::line(&tui::dim(&format!("  … ({} more lines)", lines.len() - 100)));
+                    tui::line(&tui::dim(&format!(
+                        "  … ({} more lines)",
+                        lines.len() - 100
+                    )));
                 }
             }
         }
@@ -859,8 +1859,13 @@ fn detect_mode_switch(t: &str) -> Option<Mode> {
     let l = l.trim_end_matches(['!', '.', '?']).trim();
 
     let verb_prefixes: &[&str] = &[
-        "switch to ", "switch mode to ", "change to ", "change mode to ",
-        "go to ", "set mode to ", "set mode ",
+        "switch to ",
+        "switch mode to ",
+        "change to ",
+        "change mode to ",
+        "go to ",
+        "set mode to ",
+        "set mode ",
     ];
     for prefix in verb_prefixes {
         if let Some(rest) = l.strip_prefix(prefix) {
@@ -903,13 +1908,21 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
     let l = l.trim_end_matches(['!', '.', '?']).trim();
 
     let verb_prefixes: &[&str] = &[
-        "switch to ", "change to ", "change permission to ", "set permission to ",
-        "set permission ", "use ",
+        "switch to ",
+        "change to ",
+        "change permission to ",
+        "set permission to ",
+        "set permission ",
+        "use ",
     ];
     for prefix in verb_prefixes {
         if let Some(rest) = l.strip_prefix(prefix) {
-            let rest = rest.trim().trim_end_matches("mode").trim()
-                           .trim_end_matches("permission").trim();
+            let rest = rest
+                .trim()
+                .trim_end_matches("mode")
+                .trim()
+                .trim_end_matches("permission")
+                .trim();
             match rest {
                 "ask" | "confirm" => return Some("ask"),
                 "auto" | "yolo" | "approve all" => return Some("auto"),
@@ -937,37 +1950,103 @@ fn apply_permission(perm: &mut Permission, ps: &str) {
         settings.permission = ps.to_string();
         config::save_settings(&settings);
     }
+    tui::set_permission_mode(permission_label(perm));
     tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
 }
 
-fn handle_permissions(perm: &mut Permission) {
-    let current = match perm {
-        Permission::Ask      => "ask",
-        Permission::Auto     => "auto",
+fn permission_label(perm: &Permission) -> &'static str {
+    match perm {
+        Permission::Ask => "ask",
+        Permission::Auto => "auto",
         Permission::ReadOnly => "readonly",
-    };
+    }
+}
+
+fn handle_permissions(perm: &mut Permission) {
+    let current = permission_label(perm);
     tui::line(&tui::accent("  /permissions — tool permission mode"));
     tui::line(&format!("  Current: {}", tui::bold(current)));
     tui::line(&tui::dim("  Tab-complete: /permissions ask|auto|readonly"));
     tui::line("");
-    tui::line(&format!("    {}  {} — confirm before each file write or command  {}",
-        tui::bold("1"), tui::bold("ask"), tui::dim("(recommended)")));
-    tui::line(&format!("    {}  {} — auto-approve all actions                   {}",
-        tui::bold("2"), tui::bold("auto"), tui::dim("(yolo)")));
-    tui::line(&format!("    {}  {} — never write files or run commands",
-        tui::bold("3"), tui::bold("readonly")));
+    tui::line(&format!(
+        "    {}  {} — confirm before each file write or command  {}",
+        tui::bold("1"),
+        tui::bold("ask"),
+        tui::dim("(recommended)")
+    ));
+    tui::line(&format!(
+        "    {}  {} — auto-approve all actions                   {}",
+        tui::bold("2"),
+        tui::bold("auto"),
+        tui::dim("(yolo)")
+    ));
+    tui::line(&format!(
+        "    {}  {} — never write files or run commands",
+        tui::bold("3"),
+        tui::bold("readonly")
+    ));
     tui::line("");
     let pick = tui::ask("  choice [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
     match pick.trim() {
-        "1" | "ask"      => apply_permission(perm, "ask"),
-        "2" | "auto"     => apply_permission(perm, "auto"),
+        "1" | "ask" => apply_permission(perm, "ask"),
+        "2" | "auto" => apply_permission(perm, "auto"),
         "3" | "readonly" => apply_permission(perm, "readonly"),
         _ => {}
     }
 }
 
+fn handle_mouse(arg: Option<&str>) {
+    let cmd = arg.unwrap_or("").trim();
+    match cmd {
+        "on" | "enable" => {
+            tui::set_mouse_capture(true);
+            tui::line(&tui::green(
+                "  ✓ mouse: on — wheel scroll and drag-to-copy are enabled",
+            ));
+        }
+        "off" | "disable" => {
+            tui::set_mouse_capture(false);
+            tui::line(&tui::green(
+                "  ✓ mouse: off — terminal-native selection restored; use PgUp/PgDn to scroll",
+            ));
+        }
+        "" | "toggle" => {
+            let new_state = !tui::mouse_capture_enabled();
+            tui::set_mouse_capture(new_state);
+            if new_state {
+                tui::line(&tui::green(
+                    "  ✓ mouse: on — wheel scroll and drag-to-copy are enabled",
+                ));
+            } else {
+                tui::line(&tui::green(
+                    "  ✓ mouse: off — terminal-native selection restored; use PgUp/PgDn to scroll",
+                ));
+            }
+        }
+        "status" => {
+            let state = if tui::mouse_capture_enabled() {
+                "on"
+            } else {
+                "off"
+            };
+            tui::line(&tui::accent("  /mouse — mouse wheel scrolling"));
+            tui::line(&format!("  Current: {}", tui::bold(state)));
+            tui::line(&tui::dim(
+                "  Default is on: wheel scrolls transcript and drag copies selected transcript text. /mouse off restores terminal-native selection.",
+            ));
+        }
+        other => tui::line(&tui::red(&format!(
+            "  unknown mouse setting '{other}' — try: on, off, toggle, status"
+        ))),
+    }
+}
+
 fn handle_diff(cwd: &std::path::Path) {
-    let out = tools::run("run_command", &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}), cwd);
+    let out = tools::run(
+        "run_command",
+        &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}),
+        cwd,
+    );
     for line in out.content.lines() {
         tui::line(&tui::dim(&format!("  {line}")));
     }
@@ -979,7 +2058,13 @@ fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
         .map(|m| match m {
             provider::Msg::System(s) | provider::Msg::User(s) => s.len(),
             provider::Msg::UserImages { text, images } => text.len() + images.len() * 1024,
-            provider::Msg::Assistant { text, calls } => text.len() + calls.iter().map(|c| c.input.to_string().len()).sum::<usize>(),
+            provider::Msg::Assistant { text, calls } => {
+                text.len()
+                    + calls
+                        .iter()
+                        .map(|c| c.input.to_string().len())
+                        .sum::<usize>()
+            }
             provider::Msg::Tool(results) => results.iter().map(|r| r.content.len()).sum(),
         })
         .sum();
@@ -989,7 +2074,10 @@ fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
 fn handle_context(transcript: &[provider::Msg], total: usize) {
     let used = msg_token_estimate(transcript);
     tui::context_meter(used, total);
-    tui::line(&tui::dim(&format!("  {} messages in session", transcript.len())));
+    tui::line(&tui::dim(&format!(
+        "  {} messages in session",
+        transcript.len()
+    )));
 }
 
 fn handle_checkpoints(cwd: &std::path::Path) {
@@ -999,15 +2087,142 @@ fn handle_checkpoints(cwd: &std::path::Path) {
         return;
     }
     for cp in items.iter().take(10) {
-        tui::line(&format!("  {}  {}  {}", tui::bold(&cp.id), cp.action, cp.path.display()));
+        tui::line(&format!(
+            "  {}  {}  {}",
+            tui::bold(&cp.id),
+            cp.action,
+            cp.path.display()
+        ));
     }
 }
 
-fn handle_undo(cwd: &std::path::Path) {
-    match checkpoint::undo_latest(cwd) {
-        Ok(cp) => tui::line(&tui::green(&format!("  restored {}", cp.path.display()))),
-        Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+fn handle_undo(cwd: &std::path::Path, arg: &str) {
+    let arg = arg.trim();
+    if arg == "git" {
+        match checkpoint::git_rollback(cwd) {
+            Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
+            Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
+        }
+    } else if arg == "all" || arg == "session" {
+        let since = checkpoint::now_ms().saturating_sub(24 * 3600 * 1000);
+        match checkpoint::undo_all_since(cwd, since) {
+            Ok(cps) => {
+                tui::line(&tui::green(&format!(
+                    "  ✓ restored {} files across session:",
+                    cps.len()
+                )));
+                for c in cps {
+                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                }
+            }
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else if !arg.is_empty() {
+        match checkpoint::undo_by_id(cwd, arg) {
+            Ok(cp) => tui::line(&tui::green(&format!(
+                "  ✓ restored checkpoint {} ({})",
+                cp.id,
+                cp.path.display()
+            ))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else {
+        match checkpoint::undo_latest(cwd) {
+            Ok(cp) => tui::line(&tui::green(&format!(
+                "  ✓ restored latest {}",
+                cp.path.display()
+            ))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
     }
+}
+
+fn handle_align(cwd: &std::path::Path) {
+    tui::line(&tui::accent(
+        "  /grill-me — Interactive Operational Alignment & Decision Grill",
+    ));
+    tui::line("  We will conduct an operational alignment review before proceeding with complex modifications.");
+
+    let q1 = tui::ask("  1. What is the primary operational risk? [1: Regression | 2: Data Loss | 3: Performance | 4: Security]: ").unwrap_or_default();
+    let risk_label = match q1.trim() {
+        "2" => "Data Loss",
+        "3" => "Performance Degradation",
+        "4" => "Security Vulnerability",
+        _ => "System Regression",
+    };
+
+    let q2 = tui::ask("  2. What is the reversibility of this change? [1: Easy (flag/config) | 2: Moderate (revert) | 3: Hard (db/contract) | 4: Irreversible]: ").unwrap_or_default();
+    let rev_label = match q2.trim() {
+        "1" => "Easy (Feature Flag / Config)",
+        "3" => "Hard (Database Migration / API Contract)",
+        "4" => "Irreversible",
+        _ => "Moderate (Code Revert)",
+    };
+
+    let q3 = tui::ask("  3. What is the target confidence threshold? [1: High (>90%) | 2: Medium (>75%) | 3: Exploratory]: ").unwrap_or_default();
+    let conf_label = match q3.trim() {
+        "1" => "High (>90%)",
+        "3" => "Exploratory / Prototype",
+        _ => "Medium (>75%)",
+    };
+
+    tui::line(&tui::green("  ✓ Operational alignment recorded!"));
+    tui::line(&format!("    • Primary Risk: {}", tui::bold(risk_label)));
+    tui::line(&format!("    • Reversibility: {}", tui::bold(rev_label)));
+    tui::line(&format!(
+        "    • Confidence Threshold: {}",
+        tui::bold(conf_label)
+    ));
+
+    let mut kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+    let id = format!("dec-{}", crate::checkpoint::now_ms());
+    let entity = crate::knowledge::Entity {
+        id: id.clone(),
+        entity_type: crate::knowledge::EntityType::ArchitectureDecision,
+        name: format!("Operational Alignment ({})", risk_label),
+        path: None,
+        description: Some(format!(
+            "Risk: {}, Reversibility: {}, Confidence: {}",
+            risk_label, rev_label, conf_label
+        )),
+        metadata: serde_json::json!({
+            "risk": risk_label,
+            "reversibility": rev_label,
+            "confidence_target": conf_label,
+            "timestamp": crate::checkpoint::now_ms()
+        }),
+        relationships: vec![],
+        last_updated: "now".to_string(),
+    };
+    kb.add_entity(entity);
+    let _ = kb.save();
+    tui::line(&tui::dim(
+        "  Decision recorded into structured knowledge base (.buildwithnexus/knowledge/).",
+    ));
+}
+
+fn handle_teamwork() {
+    tui::line(&tui::accent(
+        "  /teamwork-preview — Autonomous Multi-Agent Swarm Preview",
+    ));
+    tui::line("  When executing complex projects, buildwithnexus orchestrates specialized subagent teams:");
+    tui::line(&format!(
+        "    • {} — Explores documentation, code graphs, and symbol trees",
+        tui::bold("Researcher Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Analyzes logs, stack traces, and test regressions",
+        tui::bold("Debugger Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Edits code files, runs migrations, and applies patches",
+        tui::bold("Code Writer Subagent")
+    ));
+    tui::line(&format!(
+        "    • {} — Checks engineering rules, static analysis, and confidence",
+        tui::bold("Verifier Subagent")
+    ));
+    tui::line(&tui::dim("  Tip: Use `invoke_subagent` in your custom rules/workflows to dispatch tasks to this team."));
 }
 
 fn handle_agents() {
@@ -1032,49 +2247,214 @@ fn handle_doctor_tui() {
         None => tui::line(&tui::yellow("  settings: not configured")),
     }
     tui::line(&format!("  home: {}", config::home().display()));
-    tui::line(&format!("  rust: {}", std::process::Command::new("rustc").arg("--version").output().ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "not found".to_string())));
+    tui::line(&format!(
+        "  rust: {}",
+        std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "not found".to_string())
+    ));
 }
 
 fn print_help() {
     tui::line(&tui::accent("  buildwithnexus commands"));
-    tui::line(&tui::dim("  ─────────────────────────────────────────────────────────────"));
-    tui::line(&format!("  {}  cycle modes (PLAN → BUILD → BRAINSTORM)", tui::bold("Shift+Tab")));
-    tui::line(&format!("  {}         show/switch mode  {}", tui::bold("/mode"), tui::dim("[plan|build|brainstorm]")));
-    tui::line(&format!("  {}   show/switch tool permissions  {}", tui::bold("/permissions"), tui::dim("[ask|auto|readonly]")));
-    tui::line(&tui::dim("               or just say: \"switch to build mode\" / \"use readonly\""));
-    tui::line(&format!("  {}        hot-swap the AI model mid-session", tui::bold("/model")));
-    tui::line(&format!("  {}      compact context  {}", tui::bold("/compact"), tui::dim("(free up token budget)")));
-    tui::line(&format!("  {}          show current context usage", tui::bold("/context")));
-    tui::line(&format!("  {}             show current git diff summary", tui::bold("/diff")));
-    tui::line(&format!("  {}       AI code review of staged git diff", tui::bold("/review")));
-    tui::line(&format!("  {}       AI-drafted conventional commit message", tui::bold("/commit")));
-    tui::line(&format!("  {}           AI-drafted PR title + description", tui::bold("/pr")));
-    tui::line(&format!("  {}    schedule a one-shot workflow  {}", tui::bold("/schedule"), tui::dim("<delay> <task>")));
-    tui::line(&format!("  {}         start a repeating workflow  {}", tui::bold("/loop"), tui::dim("<interval> <task>")));
-    tui::line(&format!("  {}   list and manage background workflows  {}", tui::bold("/workflows"), tui::dim("(/tasks)")));
-    tui::line(&format!("  {}          inject context into next agent turn  {}", tui::bold("/btw"), tui::dim("<context>")));
-    tui::line(&format!("  {}       configure hooks, memory, commands via AI", tui::bold("/config")));
-    tui::line(&format!("  {}       view/edit session memory", tui::bold("/memory")));
-    tui::line(&format!("  {}       list available skills and custom commands", tui::bold("/skills")));
-    tui::line(&format!("  {}       show loaded Agents.md context", tui::bold("/agents")));
-    tui::line(&format!("  {}  list edit checkpoints", tui::bold("/checkpoints")));
-    tui::line(&format!("  {}         restore latest checkpoint  {}", tui::bold("/undo"), tui::dim("(/rewind)")));
+    tui::line(&tui::dim(
+        "  ─────────────────────────────────────────────────────────────",
+    ));
+    tui::line(&format!(
+        "  {}  cycle modes (PLAN → BUILD → BRAINSTORM)",
+        tui::bold("Shift+Tab")
+    ));
+    tui::line(&format!(
+        "  {}         show/switch mode  {}",
+        tui::bold("/mode"),
+        tui::dim("[plan|build|brainstorm]")
+    ));
+    tui::line(&format!(
+        "  {}   show/switch tool permissions  {}",
+        tui::bold("/permissions"),
+        tui::dim("[ask|auto|readonly]")
+    ));
+    tui::line(&format!(
+        "  {}         mouse wheel scrolling  {}",
+        tui::bold("/mouse"),
+        tui::dim("[on|off]  on by default; /scroll is an alias")
+    ));
+    tui::line(&format!(
+        "  {}        scroll transcript",
+        tui::bold("PgUp/PgDn · Alt+↑/↓")
+    ));
+    tui::line(&tui::dim(
+        "               or just say: \"switch to build mode\" / \"use readonly\"",
+    ));
+    tui::line(&format!(
+        "  {}        hot-swap the AI model mid-session",
+        tui::bold("/model")
+    ));
+    tui::line(&format!(
+        "  {}        switch to local GGUF or Ollama models",
+        tui::bold("/local")
+    ));
+    tui::line(&format!(
+        "  {}      compact context  {}",
+        tui::bold("/compact"),
+        tui::dim("(free up token budget)")
+    ));
+    tui::line(&format!(
+        "  {}          show current context usage",
+        tui::bold("/context")
+    ));
+    tui::line(&format!(
+        "  {}             show current git diff summary",
+        tui::bold("/diff")
+    ));
+    tui::line(&format!(
+        "  {}       AI code review of staged git diff",
+        tui::bold("/review")
+    ));
+    tui::line(&format!(
+        "  {}       AI-drafted conventional commit message",
+        tui::bold("/commit")
+    ));
+    tui::line(&format!(
+        "  {}           AI-drafted PR title + description",
+        tui::bold("/pr")
+    ));
+    tui::line(&format!(
+        "  {}    schedule a one-shot workflow  {}",
+        tui::bold("/schedule"),
+        tui::dim("<delay> <task>")
+    ));
+    tui::line(&format!(
+        "  {}         start a repeating workflow  {}",
+        tui::bold("/loop"),
+        tui::dim("<interval> <task>")
+    ));
+    tui::line(&format!(
+        "  {}   list and manage background workflows  {}",
+        tui::bold("/workflows"),
+        tui::dim("(/tasks)")
+    ));
+    tui::line(&format!(
+        "  {}          inject context into next agent turn  {}",
+        tui::bold("/btw"),
+        tui::dim("<context>")
+    ));
+    tui::line(&format!(
+        "  {}        transcribe voice input from audio file  {}",
+        tui::bold("/voice"),
+        tui::dim("<file>")
+    ));
+    tui::line(&format!(
+        "  {}       configure hooks, memory, commands via AI",
+        tui::bold("/config")
+    ));
+    tui::line(&format!(
+        "  {}       view/edit session memory",
+        tui::bold("/memory")
+    ));
+    tui::line(&format!(
+        "  {}       list available skills and custom commands",
+        tui::bold("/skills")
+    ));
+    tui::line(&format!(
+        "  {}        browse callable tools",
+        tui::bold("/tools")
+    ));
+    tui::line(&format!(
+        "  {}        inspect engineering rules and violations",
+        tui::bold("/rules")
+    ));
+    tui::line(&format!(
+        "  {}           query or index project knowledge base  {}",
+        tui::bold("/kb"),
+        tui::dim("(/index)")
+    ));
+    tui::line(&format!(
+        "  {}       verify codebase against rules and tests  {}",
+        tui::bold("/verify"),
+        tui::dim("(/audit)")
+    ));
+    tui::line(&format!(
+        "  {}          inspect configured enterprise MCP servers",
+        tui::bold("/mcp")
+    ));
+    tui::line(&format!(
+        "  {}        inspect hooks, tools, skills, and subagents",
+        tui::bold("/trace")
+    ));
+    tui::line(&format!(
+        "  {}       show loaded Agents.md context",
+        tui::bold("/agents")
+    ));
+    tui::line(&format!(
+        "  {}  list edit checkpoints",
+        tui::bold("/checkpoints")
+    ));
+    tui::line(&format!(
+        "  {}         restore checkpoint (<git|all|id>)",
+        tui::bold("/undo")
+    ));
+    tui::line(&format!(
+        "  {}     interactive operational alignment & decision grill",
+        tui::bold("/grill-me")
+    ));
+    tui::line(&format!(
+        "  {}     autonomous multi-agent swarm preview",
+        tui::bold("/teamwork")
+    ));
     tui::line(&format!("  {}       diagnose setup", tui::bold("/doctor")));
-    tui::line(&format!("  {}          start a fresh session", tui::bold("/new")));
-    tui::line(&format!("  {}      pick a saved session to resume", tui::bold("/resume")));
-    tui::line(&format!("  {}         run setup (keys, providers, local models)", tui::bold("/init")));
-    tui::line(&format!("  {}        clear the screen", tui::bold("/clear")));
+    tui::line(&format!(
+        "  {}          start a fresh session",
+        tui::bold("/new")
+    ));
+    tui::line(&format!(
+        "  {}      pick a saved session to resume",
+        tui::bold("/resume")
+    ));
+    tui::line(&format!(
+        "  {}         run setup (keys, providers, local models)",
+        tui::bold("/init")
+    ));
+    tui::line(&format!(
+        "  {}        clear the screen",
+        tui::bold("/clear")
+    ));
     tui::line(&format!("  {}         exit", tui::bold("/exit")));
-    tui::line(&tui::dim("  ─────────────────────────────────────────────────────────────"));
+    tui::line(&tui::dim(
+        "  ─────────────────────────────────────────────────────────────",
+    ));
     tui::line(&tui::dim("  !<cmd>   run a shell command directly"));
-    tui::line(&tui::dim("  @<path>  Tab-complete a file path into your message"));
-    tui::line(&tui::dim("  Tab      autocomplete /commands and their sub-args"));
-    tui::line(&tui::dim("  ←→ ^A ^E  move · ^W ^U ^K kill · ^Y yank · ↑↓ history"));
-    tui::line(&tui::dim("  ^G open in $EDITOR · ^R reverse search · \\ + Enter = newline"));
-    tui::line(&tui::dim("  Tools active in all modes: read_file, run_command, grep, etc."));
+    tui::line(&tui::dim(
+        "  @<tool>  tab-complete operational tools (@diff, @status, @rules, @kb:, @symbol:, @url:)",
+    ));
+    tui::line(&format!(
+        "  {}          toggle Vim modal editing mode (Normal/Insert)",
+        tui::bold("/vim")
+    ));
+    tui::line(&format!(
+        "  {}        audio transcription & offline voice input",
+        tui::bold("/voice")
+    ));
+    tui::line(&format!(
+        "  {}        local model server & GGUF management",
+        tui::bold("/local")
+    ));
+    tui::line(&tui::dim(
+        "  Tab      autocomplete /commands and their sub-args",
+    ));
+    tui::line(&tui::dim(
+        "  ←→ ^A ^E  move · ^W ^U ^K kill · ^Y yank · ↑↓ history",
+    ));
+    tui::line(&tui::dim(
+        "  ^G open in $EDITOR · ^R reverse search · \\ + Enter = newline",
+    ));
+    tui::line(&tui::dim(
+        "  Tools active in all modes: read_file, run_command, grep, etc.",
+    ));
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
@@ -1103,12 +2483,149 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
     let mut images: Vec<(String, String)> = Vec::new();
     let mut clean = String::new();
     let mut text_attachments = Vec::new();
-    for word in task.split_whitespace() {
-        if let Some(raw_path) = word.strip_prefix('@') {
+    let words: Vec<String> = shlex::split(task)
+        .unwrap_or_else(|| task.split_whitespace().map(|s| s.to_string()).collect());
+    for word_str in &words {
+        let word = word_str.as_str();
+        let is_at = word.starts_with('@');
+        let clean_word = word.trim_matches(|c| {
+            c == '\'' || c == '"' || c == ',' || c == ';' || c == '(' || c == ')' || c == '`'
+        });
+        let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
+        let is_img = image_exts.contains(&ext.as_str());
+        if !is_at && !is_img {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(word);
+            continue;
+        }
+        if let Some(raw_path) = if is_at {
+            word.strip_prefix('@')
+        } else {
+            Some(clean_word)
+        } {
+            if raw_path == "diff" || raw_path == "git:diff" {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["diff", "HEAD"])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    let diff_text = String::from_utf8_lossy(&o.stdout);
+                    if !diff_text.trim().is_empty() {
+                        text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str("[git diff HEAD]");
+                        continue;
+                    }
+                }
+            } else if raw_path == "status" || raw_path == "git:status" {
+                if let Ok(o) = std::process::Command::new("git")
+                    .args(["status", "-s"])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    let stat_text = String::from_utf8_lossy(&o.stdout);
+                    if !stat_text.trim().is_empty() {
+                        text_attachments.push(format!("[git status]\n{}", stat_text));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str("[git status]");
+                        continue;
+                    }
+                }
+            } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
+                let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+                let res = kb.search(kb_query);
+                if !res.is_empty() {
+                    let summary = res
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
+                                e.name,
+                                e.entity_type,
+                                e.description.as_deref().unwrap_or(""),
+                                e.path
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n---\n");
+                    text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
+                    if !clean.is_empty() {
+                        clean.push(' ');
+                    }
+                    clean.push_str(&format!("[kb: {}]", kb_query));
+                    continue;
+                }
+            } else if raw_path == "rules" || raw_path.starts_with("rule:") {
+                let engine = crate::rules::RuleEngine::load_defaults();
+                let rules_summary = engine
+                    .rules
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "Rule [{}]: {} (Severity: {})",
+                            r.id, r.description, r.severity
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
+                if !clean.is_empty() {
+                    clean.push(' ');
+                }
+                clean.push_str("[active rules]");
+                continue;
+            } else if let Some(url) = raw_path
+                .strip_prefix("url:")
+                .or_else(|| raw_path.strip_prefix("web:"))
+            {
+                if let Ok(o) = std::process::Command::new("curl")
+                    .args(["-sL", "--max-time", "5", url])
+                    .output()
+                {
+                    let web_text = String::from_utf8_lossy(&o.stdout);
+                    if !web_text.trim().is_empty() {
+                        let snippet: String = web_text.chars().take(8000).collect();
+                        text_attachments.push(format!("[web: {}]\n{}", url, snippet));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str(&format!("[web: {}]", url));
+                        continue;
+                    }
+                }
+            } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
+                if let Ok(o) = std::process::Command::new("grep")
+                    .args(["-rnI", sym_query, "."])
+                    .current_dir(cwd)
+                    .output()
+                {
+                    let sym_text = String::from_utf8_lossy(&o.stdout);
+                    if !sym_text.trim().is_empty() {
+                        let snippet: String =
+                            sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
+                        text_attachments
+                            .push(format!("[symbol search: {}]\n{}", sym_query, snippet));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str(&format!("[symbol: {}]", sym_query));
+                        continue;
+                    }
+                }
+            }
             let (raw_path, range) = split_attachment_range(raw_path);
             let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
             let p = if let Some(rest) = raw_path.strip_prefix("~/") {
-                std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf()).join(rest)
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| cwd.to_path_buf())
+                    .join(rest)
             } else if raw_path.starts_with('/') {
                 PathBuf::from(raw_path)
             } else {
@@ -1120,24 +2637,33 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
                     if f.read_to_end(&mut buf).is_ok() {
                         let media_type = match ext.as_str() {
                             "jpg" | "jpeg" => "image/jpeg",
-                            "gif"          => "image/gif",
-                            "webp"         => "image/webp",
-                            _              => "image/png",
+                            "gif" => "image/gif",
+                            "webp" => "image/webp",
+                            _ => "image/png",
                         };
                         images.push((media_type.to_string(), base64_encode(&buf)));
-                        if !clean.is_empty() { clean.push(' '); }
-                        clean.push_str(&format!("[image: {}]", p.file_name().unwrap_or_default().to_string_lossy()));
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str(&format!(
+                            "[image: {}]",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        ));
                         continue;
                     }
                 }
             } else if let Some(text) = read_text_attachment(&p, range) {
                 text_attachments.push(format!("[file: {}]\n{}", p.display(), text));
-                if !clean.is_empty() { clean.push(' '); }
+                if !clean.is_empty() {
+                    clean.push(' ');
+                }
                 clean.push_str(&format!("[file: {}]", p.display()));
                 continue;
             }
         }
-        if !clean.is_empty() { clean.push(' '); }
+        if !clean.is_empty() {
+            clean.push(' ');
+        }
         clean.push_str(word);
     }
     if !text_attachments.is_empty() {
@@ -1171,14 +2697,20 @@ fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -
     let Some((start, end)) = range else {
         return Some(text);
     };
-    Some(text.lines()
-        .enumerate()
-        .filter_map(|(i, line)| {
-            let line_no = i + 1;
-            if line_no >= start && line_no <= end { Some(line) } else { None }
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+    Some(
+        text.lines()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let line_no = i + 1;
+                if line_no >= start && line_no <= end {
+                    Some(line)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -1186,12 +2718,28 @@ fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         out.push(ALPHA[b0 >> 2] as char);
         out.push(ALPHA[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { ALPHA[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHA[b2 & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHA[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHA[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1200,16 +2748,50 @@ fn base64_encode(data: &[u8]) -> String {
 pub fn classify(task: &str) -> Mode {
     let l = task.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| l.contains(*w));
-    if has(&["what should", "what if", "ideas for", "what do you think", "why would", "why is", "why does", "how about", "what are the options", "advice on", "suggest", "tradeoffs"]) {
+    if has(&[
+        "what should",
+        "what if",
+        "ideas for",
+        "what do you think",
+        "why would",
+        "why is",
+        "why does",
+        "how about",
+        "what are the options",
+        "advice on",
+        "suggest",
+        "tradeoffs",
+    ]) {
         return Mode::Brainstorm;
     }
-    if has(&["plan", "design", "architect", "break down", "roadmap", "scope"]) {
+    if has(&[
+        "plan",
+        "design",
+        "architect",
+        "break down",
+        "roadmap",
+        "scope",
+    ]) {
         return Mode::Plan;
     }
-    if has(&["build", "create", "add", "fix", "implement", "write", "refactor", "run", "make"]) {
+    if has(&[
+        "build",
+        "create",
+        "add",
+        "fix",
+        "implement",
+        "write",
+        "refactor",
+        "run",
+        "make",
+    ]) {
         return Mode::Build;
     }
-    if task.split_whitespace().count() > 8 { Mode::Plan } else { Mode::Build }
+    if task.split_whitespace().count() > 8 {
+        Mode::Plan
+    } else {
+        Mode::Build
+    }
 }
 
 fn usage() {
@@ -1232,6 +2814,7 @@ fn usage() {
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
          \x20 /context               show current context usage\n\
@@ -1245,7 +2828,9 @@ fn usage() {
          \x20 /btw <context>         inject context into next agent turn\n\
          \x20 /config                configure hooks, memory, commands via AI\n\
          \x20 /memory                view and edit session memory\n\
-         \x20 /skills                list available skills and custom commands\n\
+         \x20 /skills                browse available skills and custom commands\n\
+         \x20 /tools                 browse callable tools\n\
+         \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
          \x20 /agents /checkpoints /undo /doctor\n\
          \x20 /help /clear /new /resume /init /exit\n\
          \x20 !<cmd>                 run shell command directly\n\
@@ -1262,35 +2847,49 @@ fn run_doctor() {
     match config::load_settings() {
         None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
         Some(s) => {
-            println!("  ✓ settings       provider={} model={} permission={}",
-                s.provider, if s.model.is_empty() { "(default)" } else { &s.model }, s.permission);
+            println!(
+                "  ✓ settings       provider={} model={} permission={}",
+                s.provider,
+                if s.model.is_empty() {
+                    "(default)"
+                } else {
+                    &s.model
+                },
+                s.permission
+            );
         }
     }
 
     // API key
-    for preset in config::PRESETS.iter().filter(|p| !p.env_key.is_empty() && !p.local) {
+    for preset in config::PRESETS
+        .iter()
+        .filter(|p| !p.env_key.is_empty() && !p.local)
+    {
         match config::load_key(preset.env_key) {
             Some(_) => println!("  ✓ {}  set", preset.env_key),
-            None    => println!("  ✗ {}  not set (needed for {})", preset.env_key, preset.label),
+            None => println!(
+                "  ✗ {}  not set (needed for {})",
+                preset.env_key, preset.label
+            ),
         }
     }
 
     // Memory
     match config::load_memory() {
-        None    => println!("  ·  memory.md     (empty)"),
+        None => println!("  ·  memory.md     (empty)"),
         Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
     }
 
     // External tools
     let tools_to_check = [
-        ("git",    "version control"),
-        ("cargo",  "Rust build tool"),
-        ("node",   "Node.js runtime"),
-        ("npm",    "Node package manager"),
-        ("python3","Python runtime"),
-        ("gh",     "GitHub CLI (optional)"),
+        ("git", "version control"),
+        ("cargo", "Rust build tool"),
+        ("node", "Node.js runtime"),
+        ("npm", "Node package manager"),
+        ("python3", "Python runtime"),
+        ("gh", "GitHub CLI (optional)"),
         ("docker", "Docker (optional)"),
-        ("rg",     "ripgrep (fast search, optional)"),
+        ("rg", "ripgrep (fast search, optional)"),
     ];
     for (bin, label) in &tools_to_check {
         let found = std::process::Command::new("which")
@@ -1302,11 +2901,35 @@ fn run_doctor() {
         println!("  {glyph} {bin:<12} {label}");
     }
 
+    if crate::tools::is_wsl() {
+        println!();
+        println!("  ✓ WSL2 runtime     detected");
+        let home = config::home();
+        if crate::tools::is_wsl_windows_mount(&home) {
+            println!(
+                "  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).",
+                home.display()
+            );
+            println!("                     Set NEXUS_HOME to a Linux path (~/.buildwithnexus) for 10x faster I/O.");
+        } else {
+            println!("  ✓ WSL2 filesystem  native Linux filesystem detected (optimal I/O speed)");
+        }
+    }
+
     // Connectivity (quick HEAD to detect outbound network)
     println!();
     println!("  checking connectivity...");
     let reachable = std::process::Command::new("curl")
-        .args(["-sS", "--max-time", "5", "-o", "/dev/null", "-w", "%{http_code}", "https://api.anthropic.com"])
+        .args([
+            "-sS",
+            "--max-time",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "https://api.anthropic.com",
+        ])
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -1319,7 +2942,125 @@ fn run_doctor() {
     }
 
     println!();
+    check_and_offer_install_dependencies(true);
+    println!();
     println!("  Run `buildwithnexus init` to fix any missing configuration.");
+}
+
+pub fn check_and_offer_install_dependencies(interactive: bool) {
+    let tools_to_check = [
+        ("git", "git", "git", "Version control & workspace tracking"),
+        (
+            "rg",
+            "ripgrep",
+            "ripgrep",
+            "High-speed regex/pattern file searching",
+        ),
+        ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
+        ("npm", "node", "npm", "Node package manager"),
+        (
+            "python3",
+            "python",
+            "python3",
+            "Python runtime & data scripting",
+        ),
+    ];
+
+    let mut missing = Vec::new();
+    for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
+        let found = std::process::Command::new("which")
+            .arg(bin)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
+        }
+    }
+
+    if missing.is_empty() {
+        if interactive {
+            tui::line(&tui::green(
+                "  ✓ All required OOTB dependencies (git, rg, node, npm, python3) are installed!",
+            ));
+        }
+        return;
+    }
+
+    tui::line(&tui::yellow(&format!(
+        "  ⚠ Missing {} OOTB development tool(s):",
+        missing.len()
+    )));
+    for (bin, _, _, desc) in &missing {
+        tui::line(&format!("    • {} — {}", tui::bold(bin), desc));
+    }
+
+    if !interactive {
+        tui::line(&tui::dim("  Tip: Run `buildwithnexus init` or `buildwithnexus doctor` to auto-install missing dependencies."));
+        return;
+    }
+
+    let brew_available = std::process::Command::new("which")
+        .arg("brew")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let apt_available = std::process::Command::new("which")
+        .arg("apt-get")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    for (bin, brew_pkg, apt_pkg, desc) in missing {
+        let ask_msg = format!(
+            "  Would you like to install '{}' ({}) now? [Y/n]: ",
+            bin, desc
+        );
+        let ans = match tui::ask(&ask_msg) {
+            Some(a) => a.trim().to_lowercase(),
+            None => break,
+        };
+        if ans == "n" || ans == "no" {
+            tui::line(&tui::dim(&format!("    Skipped installing {bin}.")));
+            continue;
+        }
+
+        if brew_available {
+            tui::line(&tui::accent(&format!(
+                "    Running `brew install {brew_pkg}`..."
+            )));
+            let res = std::process::Command::new("brew")
+                .args(["install", brew_pkg])
+                .status();
+            match res {
+                Ok(s) if s.success() => {
+                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
+                }
+                _ => tui::line(&tui::red(&format!(
+                    "    ✗ Failed to install {brew_pkg} via Homebrew."
+                ))),
+            }
+        } else if apt_available {
+            tui::line(&tui::accent(&format!(
+                "    Running `sudo apt-get install -y {apt_pkg}`..."
+            )));
+            let res = std::process::Command::new("sudo")
+                .args(["apt-get", "install", "-y", apt_pkg])
+                .status();
+            match res {
+                Ok(s) if s.success() => {
+                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
+                }
+                _ => tui::line(&tui::red(&format!(
+                    "    ✗ Failed to install {apt_pkg} via apt-get."
+                ))),
+            }
+        } else {
+            tui::line(&tui::yellow(&format!(
+                "    Neither Homebrew nor apt-get found. Please install '{bin}' manually."
+            )));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1328,8 +3069,14 @@ mod tests {
 
     #[test]
     fn classify_brainstorm_phrases() {
-        assert!(matches!(classify("what should I name this?"), Mode::Brainstorm));
-        assert!(matches!(classify("any ideas for the API?"), Mode::Brainstorm));
+        assert!(matches!(
+            classify("what should I name this?"),
+            Mode::Brainstorm
+        ));
+        assert!(matches!(
+            classify("any ideas for the API?"),
+            Mode::Brainstorm
+        ));
         assert!(matches!(classify("why is this slow"), Mode::Brainstorm));
     }
 
@@ -1366,6 +3113,35 @@ mod tests {
     }
 
     #[test]
+    fn conversational_turns_bypass_plan_and_build_dispatch() {
+        assert!(should_answer_conversationally("hello", &Mode::Build));
+        assert!(should_answer_conversationally(
+            "what can you do?",
+            &Mode::Plan
+        ));
+        assert!(should_answer_conversationally(
+            "why is this slow?",
+            &Mode::Build
+        ));
+    }
+
+    #[test]
+    fn action_turns_stay_in_active_dispatch() {
+        assert!(!should_answer_conversationally(
+            "build me a canvas game",
+            &Mode::Build
+        ));
+        assert!(!should_answer_conversationally(
+            "find a folder named nexus",
+            &Mode::Build
+        ));
+        assert!(!should_answer_conversationally(
+            "read my projects file and tell me what repos I have",
+            &Mode::Plan
+        ));
+    }
+
+    #[test]
     fn mode_cycles_correctly() {
         assert!(matches!(Mode::Plan.next(), Mode::Build));
         assert!(matches!(Mode::Build.next(), Mode::Brainstorm));
@@ -1374,19 +3150,43 @@ mod tests {
 
     #[test]
     fn detect_mode_switch_verb_prefixes() {
-        assert!(matches!(detect_mode_switch("switch to plan mode"), Some(Mode::Plan)));
-        assert!(matches!(detect_mode_switch("change to build"), Some(Mode::Build)));
-        assert!(matches!(detect_mode_switch("go to brainstorm"), Some(Mode::Brainstorm)));
-        assert!(matches!(detect_mode_switch("set mode to planning"), Some(Mode::Plan)));
-        assert!(matches!(detect_mode_switch("use build mode"), Some(Mode::Build)));
-        assert!(matches!(detect_mode_switch("use brainstorm mode"), Some(Mode::Brainstorm)));
+        assert!(matches!(
+            detect_mode_switch("switch to plan mode"),
+            Some(Mode::Plan)
+        ));
+        assert!(matches!(
+            detect_mode_switch("change to build"),
+            Some(Mode::Build)
+        ));
+        assert!(matches!(
+            detect_mode_switch("go to brainstorm"),
+            Some(Mode::Brainstorm)
+        ));
+        assert!(matches!(
+            detect_mode_switch("set mode to planning"),
+            Some(Mode::Plan)
+        ));
+        assert!(matches!(
+            detect_mode_switch("use build mode"),
+            Some(Mode::Build)
+        ));
+        assert!(matches!(
+            detect_mode_switch("use brainstorm mode"),
+            Some(Mode::Brainstorm)
+        ));
     }
 
     #[test]
     fn detect_mode_switch_bare_short_form() {
         assert!(matches!(detect_mode_switch("plan mode"), Some(Mode::Plan)));
-        assert!(matches!(detect_mode_switch("build mode"), Some(Mode::Build)));
-        assert!(matches!(detect_mode_switch("brainstorm mode"), Some(Mode::Brainstorm)));
+        assert!(matches!(
+            detect_mode_switch("build mode"),
+            Some(Mode::Build)
+        ));
+        assert!(matches!(
+            detect_mode_switch("brainstorm mode"),
+            Some(Mode::Brainstorm)
+        ));
         assert!(matches!(detect_mode_switch("planning"), Some(Mode::Plan)));
     }
 
@@ -1400,10 +3200,19 @@ mod tests {
 
     #[test]
     fn detect_permission_switch_verb_prefixes() {
-        assert_eq!(detect_permission_switch("switch to readonly"), Some("readonly"));
+        assert_eq!(
+            detect_permission_switch("switch to readonly"),
+            Some("readonly")
+        );
         assert_eq!(detect_permission_switch("change to auto"), Some("auto"));
-        assert_eq!(detect_permission_switch("set permission to ask"), Some("ask"));
-        assert_eq!(detect_permission_switch("use readonly mode"), Some("readonly"));
+        assert_eq!(
+            detect_permission_switch("set permission to ask"),
+            Some("ask")
+        );
+        assert_eq!(
+            detect_permission_switch("use readonly mode"),
+            Some("readonly")
+        );
     }
 
     #[test]
@@ -1422,9 +3231,18 @@ mod tests {
 
     #[test]
     fn attachment_range_parsing() {
-        assert_eq!(split_attachment_range("src/lib.rs:10-12"), ("src/lib.rs", Some((10, 12))));
-        assert_eq!(split_attachment_range("src/lib.rs:5"), ("src/lib.rs", Some((5, 5))));
-        assert_eq!(split_attachment_range("src/lib.rs:nope"), ("src/lib.rs:nope", None));
+        assert_eq!(
+            split_attachment_range("src/lib.rs:10-12"),
+            ("src/lib.rs", Some((10, 12)))
+        );
+        assert_eq!(
+            split_attachment_range("src/lib.rs:5"),
+            ("src/lib.rs", Some((5, 5)))
+        );
+        assert_eq!(
+            split_attachment_range("src/lib.rs:nope"),
+            ("src/lib.rs:nope", None)
+        );
     }
 
     #[test]
@@ -1444,9 +3262,14 @@ mod tests {
 
     #[test]
     fn build_provider_rejects_http_for_keyed_preset() {
-        let s = Settings { provider: "openai".into(), model: String::new(),
-            permission: "ask".into(), base_url: Some("http://insecure.local/v1".into()),
-            allowed_commands: Vec::new() };
+        let s = Settings {
+            provider: "openai".into(),
+            model: String::new(),
+            permission: "ask".into(),
+            base_url: Some("http://insecure.local/v1".into()),
+            allowed_commands: Vec::new(),
+            ..Default::default()
+        };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("non-HTTPS")),
             Ok(_) => panic!("expected http base_url to be rejected"),
@@ -1455,8 +3278,14 @@ mod tests {
 
     #[test]
     fn build_provider_unknown_provider() {
-        let s = Settings { provider: "does-not-exist".into(), model: String::new(),
-            permission: "ask".into(), base_url: None, allowed_commands: Vec::new() };
+        let s = Settings {
+            provider: "does-not-exist".into(),
+            model: String::new(),
+            permission: "ask".into(),
+            base_url: None,
+            allowed_commands: Vec::new(),
+            ..Default::default()
+        };
         match build_provider(&s) {
             Err(e) => assert!(e.contains("unknown provider")),
             Ok(_) => panic!("expected unknown provider error"),
@@ -1465,9 +3294,14 @@ mod tests {
 
     #[test]
     fn build_provider_local_preset_allows_http() {
-        let s = Settings { provider: "ollama".into(), model: String::new(),
-            permission: "ask".into(), base_url: Some("http://localhost:11434/v1".into()),
-            allowed_commands: Vec::new() };
+        let s = Settings {
+            provider: "ollama".into(),
+            model: String::new(),
+            permission: "ask".into(),
+            base_url: Some("http://localhost:11434/v1".into()),
+            allowed_commands: Vec::new(),
+            ..Default::default()
+        };
         match build_provider(&s) {
             Ok(p) => {
                 assert!(p.api_key.is_none());
@@ -1475,5 +3309,49 @@ mod tests {
             }
             Err(e) => panic!("local http should build: {e}"),
         }
+    }
+
+    #[test]
+    fn test_handle_voice_missing_file_returns_none() {
+        let res = super::handle_voice("/nonexistent/audio/path.wav");
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_handle_kb_index_and_rules() {
+        let dir = std::env::temp_dir().join(format!("bwn-kb-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test_code.rs");
+        std::fs::write(
+            &file_path,
+            "pub fn authenticate_user() {}\npub struct SessionData {}",
+        )
+        .unwrap();
+        super::handle_kb_index(&dir);
+
+        let kb = crate::knowledge::KnowledgeBase::new(&dir.to_string_lossy());
+        assert!(!kb.entities.is_empty());
+        assert!(kb.entities.values().any(|e| e.name == "authenticate_user"));
+        assert!(kb.entities.values().any(|e| e.name == "SessionData"));
+
+        super::handle_rules(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_handle_verify_audit() {
+        let dir = std::env::temp_dir().join(format!("bwn-verify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test_file.rs");
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        super::handle_verify_audit(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_check_and_offer_install_dependencies() {
+        super::check_and_offer_install_dependencies(false);
     }
 }

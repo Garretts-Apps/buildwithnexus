@@ -78,6 +78,7 @@ Inside the interactive session:
 /config                   configure hooks, memory, and commands via AI
 /memory                   view and edit session memory
 /skills                   list skills and custom commands
+/trace                    inspect hooks, tools, skills, and subagents
 ```
 
 ## Permissions

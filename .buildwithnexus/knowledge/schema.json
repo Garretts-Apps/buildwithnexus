@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BuildWithNexus Knowledge Base Schema",
+  "description": "Schema for the local project knowledge base. Entities represent software components, their relationships, and judgment metadata.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "project": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "repository": { "type": "string" },
+        "primary_language": { "type": "string" },
+        "indexed_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name"]
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for this entity (e.g., 'svc:ingestion', 'mod:auth', 'fn:sanitizeFilename')"
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "function", "class", "module", "package", "service",
+              "endpoint", "database_table", "migration", "test",
+              "build_artifact", "dependency", "configuration",
+              "environment_variable", "secret", "permission",
+              "interface", "contract", "architecture_decision"
+            ]
+          },
+          "name": { "type": "string" },
+          "path": {
+            "type": "string",
+            "description": "File path relative to the repository root"
+          },
+          "description": { "type": "string" },
+          "metadata": {
+            "type": "object",
+            "description": "Flexible key-value metadata specific to the entity type",
+            "additionalProperties": true
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "target_id": { "type": "string" },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "depends_on", "owns", "calls", "implements",
+                    "contains", "tests", "deploys", "configures",
+                    "documents", "extends", "overrides", "produces",
+                    "consumes"
+                  ]
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "required": ["target_id", "relation"]
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Searchable tags (e.g., 'critical_path', 'auth', 'public_api')"
+          },
+          "last_updated": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": ["id", "entity_type", "name"]
+      }
+    },
+    "architecture_decisions": {
+      "type": "array",
+      "description": "Architecture Decision Records (ADRs) indexed for retrieval",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["proposed", "accepted", "deprecated", "superseded"]
+          },
+          "date": { "type": "string", "format": "date" },
+          "context": { "type": "string" },
+          "decision": { "type": "string" },
+          "consequences": { "type": "string" },
+          "related_entities": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["id", "title", "status", "decision"]
+      }
+    },
+    "business_rules": {
+      "type": "array",
+      "description": "Domain-specific business rules that constrain decisions",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "domain": { "type": "string" },
+          "applies_to": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "constraints": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["id", "description"]
+      }
+    },
+    "judgment_context": {
+      "type": "object",
+      "description": "Project-level judgment metadata for decision support",
+      "properties": {
+        "critical_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Entity IDs on the critical path (higher blast radius)"
+        },
+        "security_boundaries": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Entity IDs that define security boundaries"
+        },
+        "scaling_bottlenecks": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Entity IDs with known scaling constraints"
+        },
+        "tech_debt": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "entity_id": { "type": "string" },
+              "description": { "type": "string" },
+              "severity": { "type": "string", "enum": ["low", "medium", "high"] }
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": ["version", "entities"]
+}
