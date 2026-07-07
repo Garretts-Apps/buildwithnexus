@@ -125,7 +125,7 @@ pub fn enqueue(task: &str, kind: WorkflowKind) -> usize {
 /// Cancel a workflow by ID. Kills the subprocess if running.
 pub fn cancel(id: usize) -> bool {
     let mut m = manager().lock().unwrap_or_else(|e| e.into_inner());
-    if m.active.as_ref().map_or(false, |a| a.id == id) {
+    if m.active.as_ref().is_some_and(|a| a.id == id) {
         if let Some(mut a) = m.active.take() {
             let _ = a.child.kill();
             drop(a.child);

@@ -35,7 +35,7 @@ pub fn assistant(text: &str) {
         return;
     }
     match mode() {
-        Mode::Human => tui::line(text),
+        Mode::Human => tui::line(&tui::render_md(text)),
         Mode::Json => emit(json!({"type": "assistant", "text": text})),
     }
 }

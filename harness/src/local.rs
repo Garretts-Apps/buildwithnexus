@@ -21,6 +21,8 @@ fn gguf_dirs() -> Vec<PathBuf> {
         dirs.push(h.join(".cache/lm-studio/models"));
         dirs.push(h.join(".lmstudio/models"));
         dirs.push(h.join(".local/share/models"));
+        dirs.push(h.join(".cache/huggingface/hub"));
+        dirs.push(h.join(".buildwithnexus/models"));
     }
     dirs
 }
@@ -38,7 +40,7 @@ pub fn scan_gguf() -> Vec<String> {
 }
 
 fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<String>) {
-    if depth > 3 {
+    if depth > 6 {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {

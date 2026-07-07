@@ -303,56 +303,26 @@ pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<To
 fn compact_tool(name: &str) -> bool {
     matches!(
         name,
-        "bash"
+        "read_file"
+            | "write_file"
+            | "edit_file"
+            | "run_command"
+            | "find_files"
+            | "grep_files"
+            | "list_dir"
+            | "finish"
+            | "question"
+            | "Artifact"
+            | "publish_artifact"
+            | "start_server"
+            | "stop_server"
+            | "wait_for_url"
+            | "open_browser"
+            | "python_tool"
             | "read"
             | "write"
             | "edit"
-            | "patch"
-            | "glob"
-            | "grep"
-            | "list"
-            | "webfetch"
-            | "todowrite"
-            | "todoread"
-            | "skill"
-            | "question"
-            | "str_replace_editor"
-            | "Artifact"
-            | "publish_artifact"
-            | "list_python_tools"
-            | "python_tool"
-            | "read_file"
-            | "read_many_files"
-            | "list_dir"
-            | "list_tree"
-            | "file_info"
-            | "find_paths"
-            | "find_files"
-            | "grep_files"
-            | "write_file"
-            | "edit_file"
-            | "multi_edit"
-            | "apply_patch"
-            | "create_dir"
-            | "move_path"
-            | "remove_path"
-            | "run_command"
-            | "todo_write"
-            | "todo_read"
-            | "create_docx"
-            | "finish"
-            | "save_memory"
-            | "fetch_url"
-            | "start_server"
-            | "list_servers"
-            | "stop_server"
-            | "read_server_log"
-            | "wait_for_url"
-            | "open_browser"
-            | "list_skills"
-            | "load_skill"
-            | "task"
-            | "spawn_subagent"
+            | "bash"
     )
 }
 
@@ -1753,6 +1723,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .clamp(1_000, MAX_READ as u64) as usize;
             let mut sections = Vec::new();
             for path in paths.iter().filter_map(|v| v.as_str()) {
+                if path.trim().is_empty() {
+                    sections.push("--- [empty path] ---\n[error] path cannot be empty".to_string());
+                    continue;
+                }
                 let p = resolve(cwd, path);
                 match fs::read_to_string(&p) {
                     Ok(c) => sections.push(format!(
@@ -1997,7 +1971,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
             if old.is_empty() {
-                return err("`old` text not found in file");
+                return err("`old` text cannot be empty");
             }
             // One pass to locate, a partial pass to confirm uniqueness — instead
             // of matches().count() (materializes all) plus a separate replace.
@@ -2242,7 +2216,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let encoded = url_encode(query);
             let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
             match http_get_with_retry(
-                ureq::get(&search_url).set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+                ureq::get(&search_url)
+                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => ok(truncate(strip_html(&html), MAX_OUT)),
@@ -2792,7 +2767,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 "undo_edit" => {
                     let p = resolve(cwd, path);
                     let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                    let is_match = guard.as_ref().map_or(false, |(bp, _)| *bp == p);
+                    let is_match = guard.as_ref().is_some_and(|(bp, _)| *bp == p);
                     if !is_match {
                         if let Some((backup_path, _)) = &*guard {
                             return err(format!(
@@ -2806,7 +2781,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     }
                     if let Some((_, old_content)) = guard.take() {
                         match fs::write(&p, &old_content) {
-                            Ok(_) => ok(format!("successfully reverted the last edit to {}", p.display())),
+                            Ok(_) => ok(format!(
+                                "successfully reverted the last edit to {}",
+                                p.display()
+                            )),
                             Err(e) => {
                                 *guard = Some((p.clone(), old_content));
                                 err(format!("cannot write {}: {e}", p.display()))
@@ -2847,10 +2825,27 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .unwrap_or(0);
             let filename = format!("{}_{timestamp}.{ext}", safe_title);
             let p = dir.join(&filename);
+            let clean_name = if (safe_title.is_empty() || safe_title == "_" || safe_title.eq_ignore_ascii_case("artifact") || safe_title.eq_ignore_ascii_case("index")) && ext == "html" {
+                "index".to_string()
+            } else {
+                safe_title.to_lowercase()
+            };
+            let direct_file = cwd.join(format!("{clean_name}.{ext}"));
+            let _ = fs::write(&direct_file, contents);
+            if ext == "html" {
+                let _ = if cfg!(target_os = "macos") {
+                    Command::new("open").arg(&direct_file).status()
+                } else if cfg!(windows) {
+                    Command::new("cmd").args(["/C", "start", "", &direct_file.to_string_lossy()]).status()
+                } else {
+                    Command::new("xdg-open").arg(&direct_file).status()
+                };
+            }
             match fs::write(&p, contents) {
                 Ok(_) => ok(format!(
-                    "Artifact successfully published locally to: {}",
-                    p.display()
+                    "Artifact successfully published locally to: {} (and created directly in workspace at: {})",
+                    p.display(),
+                    direct_file.display()
                 )),
                 Err(e) => err(format!("cannot write artifact: {e}")),
             }
@@ -2887,7 +2882,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
 
 // Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
-fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, ureq::Error> {
+fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::Error>> {
     let mut attempts = 0;
     let max_attempts = 4;
     let mut delay_ms = 500;
@@ -2897,7 +2892,9 @@ fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, ureq::Error
         let req_clone = req.clone();
         match req_clone.call() {
             Ok(resp) => return Ok(resp),
-            Err(ureq::Error::Status(code, _resp)) if (code == 429 || (500..=504).contains(&code)) && attempts < max_attempts => {
+            Err(ureq::Error::Status(code, _resp))
+                if (code == 429 || (500..=504).contains(&code)) && attempts < max_attempts =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;
                 continue;
@@ -2907,7 +2904,7 @@ fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, ureq::Error
                 delay_ms *= 2;
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(Box::new(e)),
         }
     }
 }
@@ -3493,8 +3490,22 @@ mod tests {
         let d = tempdir();
         assert!(run("read_file", &json!({"path": ""}), &d).is_error);
         assert!(run("write_file", &json!({"path": "", "content": "abc"}), &d).is_error);
-        assert!(run("edit_file", &json!({"path": "", "old": "a", "new": "b"}), &d).is_error);
-        assert!(run("multi_edit", &json!({"path": "", "edits": [{"old": "a", "new": "b"}]}), &d).is_error);
+        assert!(
+            run(
+                "edit_file",
+                &json!({"path": "", "old": "a", "new": "b"}),
+                &d
+            )
+            .is_error
+        );
+        assert!(
+            run(
+                "multi_edit",
+                &json!({"path": "", "edits": [{"old": "a", "new": "b"}]}),
+                &d
+            )
+            .is_error
+        );
         assert!(run("multi_edit", &json!({"path": "f.txt", "edits": []}), &d).is_error);
         assert!(run("create_dir", &json!({"path": ""}), &d).is_error);
         assert!(run("move_path", &json!({"from": "", "to": "b"}), &d).is_error);

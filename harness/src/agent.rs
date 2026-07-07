@@ -152,8 +152,10 @@ fn truncate_tool_results(msgs: Vec<Msg>) -> Vec<Msg> {
                         if r.content.len() > MAX_RESULT_CHARS {
                             let truncated: String =
                                 r.content.chars().take(MAX_RESULT_CHARS).collect();
-                            r.content =
-                                format!("{truncated}\n…(truncated, {} chars total)", r.content.len());
+                            r.content = format!(
+                                "{truncated}\n…(truncated, {} chars total)",
+                                r.content.len()
+                            );
                         }
                         r
                     })
@@ -528,6 +530,170 @@ fn request_reply(
     Ok(r)
 }
 
+static TEXT_TOOL_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_text: &str) -> Reply {
+    if !reply.calls.is_empty() {
+        return reply;
+    }
+    let Some(calls) = parse_text_tool_calls(&reply.text, defs) else {
+        return reply;
+    };
+    if is_casual_turn(user_text)
+        && calls
+            .iter()
+            .any(|call| tools::is_mutating_call(&call.name, &call.input))
+    {
+        if !report::is_json() {
+            report::notice("  recovery: ignored unrelated tool JSON for casual input");
+        }
+        trace::record_visible(
+            "tool_input_repaired",
+            "ignored casual-turn tool JSON",
+            serde_json::json!({"calls": calls.iter().map(|c| &c.name).collect::<Vec<_>>()}),
+        );
+        reply.text = "Hi. I am here and ready. Tell me what you want to build, inspect, or change."
+            .to_string();
+        reply.calls.clear();
+        if !report::is_json() {
+            report::assistant(&reply.text);
+        }
+        return reply;
+    }
+    if !report::is_json() {
+        report::notice(&format!(
+            "  recovery: parsed {} tool call{} from model JSON",
+            calls.len(),
+            if calls.len() == 1 { "" } else { "s" }
+        ));
+    }
+    trace::record_visible(
+        "tool_input_repaired",
+        "parsed text JSON tool call",
+        serde_json::json!({"calls": calls.iter().map(|c| &c.name).collect::<Vec<_>>()}),
+    );
+    reply.text.clear();
+    reply.calls = calls;
+    reply
+}
+
+fn is_casual_turn(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "yo"
+            | "sup"
+            | "thanks"
+            | "thank you"
+            | "ok"
+            | "okay"
+            | "cool"
+            | "nice"
+    )
+}
+
+fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<provider::ToolCall>> {
+    let candidate = extract_json_tool_candidate(text)?;
+    let value = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
+    let names = defs.iter().map(|d| d.name).collect::<HashSet<_>>();
+    let mut calls = Vec::new();
+    collect_text_tool_calls(&value, &names, &mut calls);
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn extract_json_tool_candidate(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return Some(trimmed);
+    }
+    let rest = trimmed.strip_prefix("```")?;
+    let fence_end = rest.find('\n')?;
+    let lang = rest[..fence_end].trim().to_ascii_lowercase();
+    if !lang.is_empty() && lang != "json" {
+        return None;
+    }
+    let body = &rest[fence_end + 1..];
+    let close = body.rfind("```")?;
+    let after = body[close + 3..].trim();
+    if !after.is_empty() {
+        return None;
+    }
+    Some(body[..close].trim())
+}
+
+fn collect_text_tool_calls(
+    value: &serde_json::Value,
+    allowed: &HashSet<&'static str>,
+    out: &mut Vec<provider::ToolCall>,
+) {
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_text_tool_calls(item, allowed, out);
+        }
+        return;
+    }
+    let Some(obj) = value.as_object() else {
+        return;
+    };
+    if let Some(items) = obj.get("tool_calls").and_then(|v| v.as_array()) {
+        for item in items {
+            collect_text_tool_calls(item, allowed, out);
+        }
+        return;
+    }
+    if let Some(items) = obj.get("calls").and_then(|v| v.as_array()) {
+        for item in items {
+            collect_text_tool_calls(item, allowed, out);
+        }
+        return;
+    }
+    if let Some(function) = obj.get("function").and_then(|v| v.as_object()) {
+        let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if !allowed.contains(name) {
+            return;
+        }
+        let input = function
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        out.push(text_tool_call(name, input));
+        return;
+    }
+    let Some(name) = obj
+        .get("name")
+        .or_else(|| obj.get("tool_name"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    if !allowed.contains(name) {
+        return;
+    }
+    let input = obj
+        .get("arguments")
+        .or_else(|| obj.get("input"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    out.push(text_tool_call(name, input));
+}
+
+fn text_tool_call(name: &str, input: serde_json::Value) -> provider::ToolCall {
+    let id = TEXT_TOOL_SEQ.fetch_add(1, Ordering::Relaxed);
+    provider::ToolCall {
+        id: format!("text-tool-{id}"),
+        name: name.to_string(),
+        input,
+    }
+}
+
 fn answer_question(input: &serde_json::Value) -> (String, bool) {
     let question = if let Some(qs) = input["questions"].as_array() {
         let mut acc = Vec::new();
@@ -630,7 +796,7 @@ Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
 BUILD mode means execute: for any concrete build/fix/create/change request, inspect the project and make the needed edits instead of replying with a capability statement. \
-For simple browser games, canvas demos, landing pages, prototypes, and static visual apps, build an actual runnable artifact. Prefer a single self-contained HTML file via Artifact/publish_artifact unless the user explicitly asks for a framework. \
+For simple browser games, canvas demos, landing pages, prototypes, and static visual apps, build an actual runnable artifact. Prefer a single self-contained HTML file via Artifact/publish_artifact unless the user explicitly asks for a framework. NEVER search GitHub, git clone external repositories, or look for existing games online when asked to build a game, app, or prototype from scratch. You MUST write the code yourself from scratch. When asked to build or create something, YOU MUST IMMEDIATELY CALL TOOLS to create the files on disk (e.g. write_file, edit_file, run_command). DO NOT output markdown instructions, step-by-step tutorials, or code blocks in chat telling the user how to build it! YOU are the builder — execute the tool calls to build it yourself directly. \
 For local web apps that require a dev server, use start_server, wait_for_url, inspect read_server_log if readiness fails, then open_browser when useful. \
 If a path or file is missing, use discovery tools before asking the user. \
 DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
@@ -1149,6 +1315,7 @@ fn build_inner(
                 return Err(e);
             }
         };
+        let reply = normalize_text_tool_calls(reply, &defs, &task_for_recovery);
         let elapsed = start_instant.elapsed().as_secs_f64();
         let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
         if !report::is_json() {
@@ -2077,6 +2244,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         maybe_compact(p, &mut msgs);
         let start_instant = std::time::Instant::now();
         let reply = request_reply(p, &msgs, &defs, "planning")?;
+        let reply = normalize_text_tool_calls(reply, &defs, task);
         let elapsed = start_instant.elapsed().as_secs_f64();
         let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
         if !report::is_json() {
@@ -2338,8 +2506,21 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         .map(|(i, s)| format!("{}. {}", i + 1, s))
         .collect::<Vec<_>>()
         .join("\n");
-    let full = format!("{task}\n\nFollow this approved plan:\n{plan}");
+    let full = approved_plan_build_task(task, &plan);
     run_build(p, perm, "engineer", &full, cwd)
+}
+
+fn approved_plan_build_task(task: &str, plan: &str) -> String {
+    format!(
+        "{task}\n\nFollow this approved plan:\n{plan}\n\n\
+        BUILD EXECUTION DIRECTIVE:\n\
+        - The user already approved this plan. Do not re-plan, ask to proceed, or answer with a plan.\n\
+        - Execute the approved steps now using tools.\n\
+        - If the task requires files/artifacts, create or edit them on disk instead of pasting code in chat.\n\
+        - If the task requires a server or browser check, use start_server, wait_for_url, read_server_log, and open_browser where appropriate.\n\
+        - Run focused verification when possible.\n\
+        - Finish with the finish tool once the approved plan has been executed."
+    )
 }
 
 // ── BRAINSTORM mode ───────────────────────────────────────────────────────────
@@ -2382,6 +2563,7 @@ pub fn run_brainstorm(
             tui::line("");
             let start_instant = std::time::Instant::now();
             let reply = request_reply(p, &msgs, &defs, "thinking")?;
+            let reply = normalize_text_tool_calls(reply, &defs, &question);
             let elapsed = start_instant.elapsed().as_secs_f64();
             let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
             if !report::is_json() {
@@ -2568,6 +2750,150 @@ pub fn run_brainstorm(
     }
 }
 
+pub fn run_chat_turn(
+    p: &Provider,
+    perm: Permission,
+    cwd: &Path,
+    question: &str,
+) -> Result<(), String> {
+    let prefix = context_prefix(cwd, p.context_tokens);
+    let sys = format!(
+        "{prefix}You are buildwithnexus in a coding terminal. Answer the user's current message naturally and concisely. \
+        If the user asks a normal conversational question or greeting, answer in plain text and do not call tools. \
+        If answering well requires inspecting the workspace or environment, use tools, then summarize the result. \
+        Do not emit JSON unless a tool call is actually required by the tool protocol."
+    );
+
+    let defs = tools::defs_for_context(false, p.context_tokens);
+    let mut msgs: Vec<Msg> = vec![Msg::System(sys), Msg::User(question.to_string())];
+    let mut loop_guard = ToolLoopGuard::default();
+
+    for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
+        maybe_compact(p, &mut msgs);
+        let start_instant = std::time::Instant::now();
+        let reply = request_reply(p, &msgs, &defs, "thinking")?;
+        let reply = normalize_text_tool_calls(reply, &defs, question);
+        let elapsed = start_instant.elapsed().as_secs_f64();
+        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
+        if !report::is_json() {
+            tui::inference_telemetry(gen_toks.max(10), elapsed);
+        }
+
+        if reply.calls.is_empty() {
+            if !reply.text.trim().is_empty() && !report::is_json() {
+                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            }
+            return Ok(());
+        }
+
+        let mut results = Vec::new();
+        let mut loop_summary: Option<String> = None;
+        for call in &reply.calls {
+            if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                let msg = format!(
+                    "tool arguments were not valid JSON: {}",
+                    raw.chars().take(200).collect::<String>()
+                );
+                report::tool_denied(&msg);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &msg,
+                    true,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: msg,
+                    is_error: true,
+                });
+                continue;
+            }
+
+            let call_input = tool_input_for_execution(
+                &call.name,
+                &call.input,
+                cwd,
+                "chat",
+                tool_round,
+                question,
+            );
+            report::tool_call(
+                &call.name,
+                &tools::preview(&call.name, &call_input),
+                &call_input,
+            );
+            trace_tool_call(&call.name, &call_input, "chat", tool_round);
+
+            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
+                PreDecision::Deny(r) => Some(r),
+                PreDecision::Allow => None,
+                PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
+            };
+            if let Some(reason) = reason {
+                report::tool_denied(&reason);
+                trace::record_visible(
+                    "tool_denied",
+                    format!("{} denied", call.name),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "chat", "depth": tool_round}),
+                );
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &reason,
+                    true,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: reason,
+                    is_error: true,
+                });
+                continue;
+            }
+
+            let out = tools::run(&call.name, &call_input, cwd);
+            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            report::tool_result(&call.name, &out.content, out.is_error);
+            trace_tool_result(&call.name, &out.content, out.is_error, "chat", tool_round);
+            note_loop_result(
+                &mut loop_guard,
+                &call.name,
+                &call_input,
+                &out.content,
+                out.is_error,
+                &mut loop_summary,
+            );
+            results.push(ToolResult {
+                id: call.id.clone(),
+                content: out.content,
+                is_error: out.is_error,
+            });
+        }
+
+        msgs.push(Msg::Assistant {
+            text: assistant_tool_turn_text(reply.text, &reply.calls),
+            calls: reply.calls,
+        });
+        msgs.push(Msg::Tool(results));
+        if !report::is_json() {
+            tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            tui::poll_typeahead();
+        }
+        if let Some(loop_msg) = loop_summary {
+            report::assistant(&loop_msg);
+            return Ok(());
+        }
+    }
+
+    report::assistant(&format!(
+        "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
+    ));
+    Ok(())
+}
+
 fn trace_tool_call(name: &str, input: &serde_json::Value, phase: &str, depth: usize) {
     trace::record_visible(
         "tool_call",
@@ -2614,6 +2940,33 @@ mod tests {
         assert!(role("researcher").system.contains("research"));
         assert!(role("engineer").system.contains("software engineer"));
         assert!(role("ceo").system.contains("software engineer"));
+    }
+
+    #[test]
+    fn text_json_tool_call_is_parsed_from_fenced_block() {
+        let defs = tools::defs_for_context(true, 128_000);
+        let reply = Reply {
+            text: "```json\n{\"name\":\"start_server\",\"arguments\":{\"command\":\"npm start\",\"cwd\":\"/tmp/app\",\"port\":3000}}\n```".to_string(),
+            calls: vec![],
+        };
+        let normalized = normalize_text_tool_calls(reply, &defs, "build the app");
+        assert_eq!(normalized.text, "");
+        assert_eq!(normalized.calls.len(), 1);
+        assert_eq!(normalized.calls[0].name, "start_server");
+        assert_eq!(normalized.calls[0].input["command"], "npm start");
+    }
+
+    #[test]
+    fn casual_text_json_mutating_tool_call_is_ignored() {
+        let defs = tools::defs_for_context(true, 128_000);
+        let reply = Reply {
+            text: "```json\n{\"name\":\"start_server\",\"arguments\":{\"command\":\"npm start\",\"port\":3000}}\n```".to_string(),
+            calls: vec![],
+        };
+        let normalized = normalize_text_tool_calls(reply, &defs, "hello");
+        assert!(normalized.calls.is_empty());
+        assert!(normalized.text.contains("ready"));
+        assert!(!normalized.text.contains("start_server"));
     }
 
     #[test]
@@ -2688,6 +3041,31 @@ mod tests {
         assert!(!plan.is_error, "{}", plan.content);
         assert!(plan.content.contains("Create scratch/exitplan-smoke.txt"));
         assert!(!plan.content.contains("Implement the requested change"));
+    }
+
+    #[test]
+    fn approved_plan_handoff_is_execution_directive() {
+        let full = approved_plan_build_task(
+            "build me a canvas game",
+            "1. Create a single HTML artifact.\n2. Verify it opens.",
+        );
+        assert!(full.contains("Follow this approved plan:"));
+        assert!(full.contains("BUILD EXECUTION DIRECTIVE"));
+        assert!(full.contains("Do not re-plan"));
+        assert!(full.contains("Execute the approved steps now using tools"));
+        assert!(full.contains("finish tool"));
+    }
+
+    #[test]
+    fn recovery_task_text_strips_approved_plan_directive() {
+        let full = approved_plan_build_task(
+            "create scratch/exitplan-smoke.txt containing exit plan smoke",
+            "1. Write the file.",
+        );
+        assert_eq!(
+            recovery_task_text(&full),
+            "create scratch/exitplan-smoke.txt containing exit plan smoke"
+        );
     }
 
     #[test]

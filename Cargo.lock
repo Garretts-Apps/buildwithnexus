@@ -55,6 +55,7 @@ dependencies = [
  "crossterm",
  "serde",
  "serde_json",
+ "shlex",
  "ureq",
 ]
 

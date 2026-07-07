@@ -920,8 +920,13 @@ fn repl(
             continue;
         }
 
-        // Mode suggestion: hint once per unique suggestion (don't repeat if user stays in mode).
-        suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
+        // Mode suggestion: hint once per unique suggestion, but stay quiet for
+        // greetings and ordinary questions that should answer in any mode.
+        if should_answer_conversationally(t, &mode) {
+            last_suggested_mode = None;
+        } else {
+            suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
+        }
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
@@ -945,30 +950,40 @@ fn repl(
         let t = effective_task.as_str();
 
         tui::line("");
-        let r = match &mode {
-            Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
-            Mode::Build => {
-                agent::run_build_session(&provider, perm, "engineer", t, cwd, &mut transcript, &sid)
+        let r = if should_answer_conversationally(t, &mode) {
+            agent::run_chat_turn(&provider, perm, cwd, t)
+        } else {
+            match &mode {
+                Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
+                Mode::Build => agent::run_build_session(
+                    &provider,
+                    perm,
+                    "engineer",
+                    t,
+                    cwd,
+                    &mut transcript,
+                    &sid,
+                ),
+                Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
+                    Err(e) => Err(e),
+                    Ok(None) => Ok(()),
+                    Ok(Some(agent::ModeHint::Build)) => {
+                        mode = Mode::Build;
+                        tui::show_mode_change("BUILD");
+                        Ok(())
+                    }
+                    Ok(Some(agent::ModeHint::Plan)) => {
+                        mode = Mode::Plan;
+                        tui::show_mode_change("PLAN");
+                        Ok(())
+                    }
+                    Ok(Some(agent::ModeHint::CycleMode)) => {
+                        mode = mode.next();
+                        tui::show_mode_change(mode_label(&mode));
+                        Ok(())
+                    }
+                },
             }
-            Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
-                Err(e) => Err(e),
-                Ok(None) => Ok(()),
-                Ok(Some(agent::ModeHint::Build)) => {
-                    mode = Mode::Build;
-                    tui::show_mode_change("BUILD");
-                    Ok(())
-                }
-                Ok(Some(agent::ModeHint::Plan)) => {
-                    mode = Mode::Plan;
-                    tui::show_mode_change("PLAN");
-                    Ok(())
-                }
-                Ok(Some(agent::ModeHint::CycleMode)) => {
-                    mode = mode.next();
-                    tui::show_mode_change(mode_label(&mode));
-                    Ok(())
-                }
-            },
         };
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {e}")));
@@ -1007,6 +1022,77 @@ fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Opt
     } else {
         *last_suggested = None;
     }
+}
+
+fn should_answer_conversationally(task: &str, current: &Mode) -> bool {
+    if matches!(current, Mode::Brainstorm) {
+        return false;
+    }
+
+    if is_simple_conversation(task) {
+        return true;
+    }
+
+    matches!(classify(task), Mode::Brainstorm) && !looks_like_action_request(task)
+}
+
+fn is_simple_conversation(task: &str) -> bool {
+    let normalized = task
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi" | "hello"
+            | "hey"
+            | "yo"
+            | "sup"
+            | "thanks"
+            | "thank you"
+            | "ok"
+            | "okay"
+            | "cool"
+            | "nice"
+            | "what can you do"
+            | "what can you do?"
+            | "who are you"
+            | "who are you?"
+            | "help"
+    )
+}
+
+fn looks_like_action_request(task: &str) -> bool {
+    let l = task.to_ascii_lowercase();
+    let action_words = [
+        "build",
+        "create",
+        "add",
+        "fix",
+        "implement",
+        "write",
+        "refactor",
+        "run",
+        "make",
+        "edit",
+        "change",
+        "update",
+        "delete",
+        "remove",
+        "start",
+        "launch",
+        "open",
+        "find",
+        "search",
+        "read",
+        "inspect",
+        "list",
+    ];
+    action_words.iter().any(|word| {
+        l == *word
+            || l.starts_with(&format!("{word} "))
+            || l.contains(&format!(" {word} "))
+            || l.contains(&format!(" {word} me "))
+    })
 }
 
 fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
@@ -1208,48 +1294,52 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
 }
 
 fn handle_model(provider: &mut Provider) {
-    tui::line(&tui::accent("  /model — interactive model selection & hot-swap"));
-    tui::line(&format!("  Current active model: {}", tui::bold(&provider.model)));
+    tui::line(&tui::accent(
+        "  /model — interactive model selection & hot-swap",
+    ));
+    tui::line(&format!(
+        "  Current active model: {}",
+        tui::bold(&provider.model)
+    ));
     tui::line("");
 
     let mut options: Vec<(String, String)> = Vec::new();
 
     // 1. Scan for local GGUF models
     let mut gguf_found = false;
-    let scan_dirs = [
-        config::home().join("models"),
-        PathBuf::from(".buildwithnexus/models"),
-        PathBuf::from("models"),
-    ];
-    for dir in &scan_dirs {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".gguf") {
-                    if !gguf_found {
-                        tui::line(&tui::bold("  [Local GGUF Models Found]"));
-                        gguf_found = true;
-                    }
-                    let model_id = format!("local/{}", name);
-                    options.push((model_id.clone(), format!("GGUF in {}", dir.display())));
-                }
-            }
+    for name in crate::local::scan_gguf() {
+        if !gguf_found {
+            tui::line(&tui::bold("  [Local GGUF Models Found]"));
+            gguf_found = true;
         }
+        let model_id = format!("local/{}", name);
+        options.push((model_id.clone(), "Local GGUF Model".to_string()));
     }
     if !gguf_found {
-        tui::line(&tui::dim("  [No local GGUF models found in ~/.buildwithnexus/models or ./models]"));
+        tui::line(&tui::dim(
+            "  [No local GGUF models found in ~/.buildwithnexus/models or scanned dirs]",
+        ));
     }
 
     tui::line("");
     tui::line(&tui::bold("  [Standard Cloud & Server Presets]"));
     let presets = [
-        ("claude-3-7-sonnet", "Anthropic Claude 3.7 Sonnet (Reasoning)"),
-        ("claude-3-5-sonnet", "Anthropic Claude 3.5 Sonnet (Balanced)"),
+        (
+            "claude-3-7-sonnet",
+            "Anthropic Claude 3.7 Sonnet (Reasoning)",
+        ),
+        (
+            "claude-3-5-sonnet",
+            "Anthropic Claude 3.5 Sonnet (Balanced)",
+        ),
         ("claude-3-haiku", "Anthropic Claude 3 Haiku (Fast/Light)"),
         ("gpt-4o", "OpenAI GPT-4o (Multimodal Flagship)"),
         ("gpt-4o-mini", "OpenAI GPT-4o Mini (Fast/Economic)"),
         ("gemini-2.5-pro", "Google Gemini 2.5 Pro (Long Context)"),
-        ("gemini-2.5-flash", "Google Gemini 2.5 Flash (Fast/High Volume)"),
+        (
+            "gemini-2.5-flash",
+            "Google Gemini 2.5 Flash (Fast/High Volume)",
+        ),
         ("ollama/llama3", "Local Ollama Llama 3"),
         ("ollama/qwen2.5-coder", "Local Ollama Qwen 2.5 Coder"),
     ];
@@ -1259,10 +1349,17 @@ fn handle_model(provider: &mut Provider) {
 
     for (idx, (id, desc)) in options.iter().enumerate() {
         let num = format!("{:>2}", idx + 1);
-        tui::line(&format!("  {} {} — {}", tui::accent(&num), tui::bold(id), tui::dim(desc)));
+        tui::line(&format!(
+            "  {} {} — {}",
+            tui::accent(&num),
+            tui::bold(id),
+            tui::dim(desc)
+        ));
     }
     tui::line("");
-    tui::line(&tui::dim("  Tip: Type a number (e.g. `1`), a model name, or press Enter to keep current."));
+    tui::line(&tui::dim(
+        "  Tip: Type a number (e.g. `1`), a model name, or press Enter to keep current.",
+    ));
 
     let pick = tui::ask("  Select model: ").unwrap_or_default();
     let pick = pick.trim();
@@ -1271,7 +1368,11 @@ fn handle_model(provider: &mut Provider) {
             if idx > 0 && idx <= options.len() {
                 options[idx - 1].0.clone()
             } else {
-                pick.to_string()
+                tui::line(&tui::red(&format!(
+                    "  ✗ number {idx} out of range (1-{}), keeping current model",
+                    options.len()
+                )));
+                return;
             }
         } else {
             pick.to_string()
@@ -1281,7 +1382,9 @@ fn handle_model(provider: &mut Provider) {
             s.model = chosen.clone();
             config::save_settings(&s);
         }
-        tui::line(&tui::green(&format!("  ✓ active model hot-swapped → {chosen}")));
+        tui::line(&tui::green(&format!(
+            "  ✓ active model hot-swapped → {chosen}"
+        )));
     }
 }
 
@@ -1383,21 +1486,11 @@ fn handle_local(_provider: &mut Provider) {
             tui::line(&format!("  • {}", tui::green(s)));
         }
     }
-    let models_dir = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".buildwithnexus/models"))
-        .unwrap_or_else(|| PathBuf::from(".buildwithnexus/models"));
-    if let Ok(rd) = std::fs::read_dir(&models_dir) {
-        let ggufs: Vec<String> = rd
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".gguf"))
-            .collect();
-        if !ggufs.is_empty() {
-            tui::line(&format!("  Local GGUF models in {}:", models_dir.display()));
-            for m in ggufs {
-                tui::line(&format!("    - {}", tui::bold(&m)));
-            }
+    let ggufs = crate::local::scan_gguf();
+    if !ggufs.is_empty() {
+        tui::line("  Local GGUF models found:");
+        for m in ggufs {
+            tui::line(&format!("    - {}", tui::bold(&m)));
         }
     }
     tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
@@ -2390,8 +2483,28 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
     let mut images: Vec<(String, String)> = Vec::new();
     let mut clean = String::new();
     let mut text_attachments = Vec::new();
-    for word in task.split_whitespace() {
-        if let Some(raw_path) = word.strip_prefix('@') {
+    let words: Vec<String> = shlex::split(task)
+        .unwrap_or_else(|| task.split_whitespace().map(|s| s.to_string()).collect());
+    for word_str in &words {
+        let word = word_str.as_str();
+        let is_at = word.starts_with('@');
+        let clean_word = word.trim_matches(|c| {
+            c == '\'' || c == '"' || c == ',' || c == ';' || c == '(' || c == ')' || c == '`'
+        });
+        let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
+        let is_img = image_exts.contains(&ext.as_str());
+        if !is_at && !is_img {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(word);
+            continue;
+        }
+        if let Some(raw_path) = if is_at {
+            word.strip_prefix('@')
+        } else {
+            Some(clean_word)
+        } {
             if raw_path == "diff" || raw_path == "git:diff" {
                 if let Ok(o) = std::process::Command::new("git")
                     .args(["diff", "HEAD"])
@@ -2841,7 +2954,7 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
             "rg",
             "ripgrep",
             "ripgrep",
-            "High-speed semantic file searching",
+            "High-speed regex/pattern file searching",
         ),
         ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
         ("npm", "node", "npm", "Node package manager"),
@@ -2997,6 +3110,35 @@ mod tests {
     #[test]
     fn classify_is_case_insensitive() {
         assert!(matches!(classify("DESIGN the system"), Mode::Plan));
+    }
+
+    #[test]
+    fn conversational_turns_bypass_plan_and_build_dispatch() {
+        assert!(should_answer_conversationally("hello", &Mode::Build));
+        assert!(should_answer_conversationally(
+            "what can you do?",
+            &Mode::Plan
+        ));
+        assert!(should_answer_conversationally(
+            "why is this slow?",
+            &Mode::Build
+        ));
+    }
+
+    #[test]
+    fn action_turns_stay_in_active_dispatch() {
+        assert!(!should_answer_conversationally(
+            "build me a canvas game",
+            &Mode::Build
+        ));
+        assert!(!should_answer_conversationally(
+            "find a folder named nexus",
+            &Mode::Build
+        ));
+        assert!(!should_answer_conversationally(
+            "read my projects file and tell me what repos I have",
+            &Mode::Plan
+        ));
     }
 
     #[test]

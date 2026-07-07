@@ -135,10 +135,22 @@ fn no_color() -> bool {
 }
 
 fn truecolor() -> bool {
-    matches!(
-        std::env::var("COLORTERM").ok().as_deref(),
-        Some("truecolor") | Some("24bit")
-    )
+    if no_color() {
+        return false;
+    }
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        if ct == "truecolor" || ct == "24bit" {
+            return true;
+        }
+        if ct == "256color" || ct == "no" || ct == "0" {
+            return false;
+        }
+    }
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term == "linux" || term == "vt100" || term == "dumb" {
+        return false;
+    }
+    true
 }
 
 fn cube(c: u8) -> u32 {
@@ -181,19 +193,45 @@ fn theme_bg() -> String {
     }
 }
 
+fn reset_all() -> String {
+    if no_color() {
+        String::new()
+    } else if ALT_SCREEN.load(Ordering::Relaxed) {
+        format!("\x1b[0m\x1b[{}m", sgr_fg(TEXT))
+    } else {
+        "\x1b[0m".to_string()
+    }
+}
+
+fn reset_fg() -> String {
+    if no_color() {
+        String::new()
+    } else if ALT_SCREEN.load(Ordering::Relaxed) {
+        format!("\x1b[{}m", sgr_fg(TEXT))
+    } else {
+        "\x1b[39m".to_string()
+    }
+}
+
 fn paint(c: Rgb, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    format!("\x1b[{}m{s}\x1b[39m", sgr_fg(c))
+    format!("\x1b[{}m{s}{}", sgr_fg(c), reset_fg())
 }
 
 fn attr(code: &str, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    let reset = if code == "1" { "22" } else { "0" };
-    format!("\x1b[{code}m{s}\x1b[{reset}m")
+    let reset = if code == "1" {
+        "\x1b[22m".to_string()
+    } else if ALT_SCREEN.load(Ordering::Relaxed) {
+        format!("\x1b[0m\x1b[{}m", sgr_fg(TEXT))
+    } else {
+        "\x1b[0m".to_string()
+    };
+    format!("\x1b[{code}m{s}{reset}")
 }
 
 pub fn bold(s: &str) -> String {
@@ -234,7 +272,7 @@ pub fn mode_badge(mode: &str) -> String {
     if no_color() {
         format!("[{label}]")
     } else {
-        format!("\x1b[{}m[{label}]\x1b[0m", sgr_fg(color))
+        format!("\x1b[{}m[{label}]{}", sgr_fg(color), reset_all())
     }
 }
 
@@ -313,6 +351,7 @@ pub fn added_preview(content: &str) -> String {
 enum StreamState {
     Normal,
     InCode { lang: String, lines: Vec<String> },
+    MaybeJson { lines: Vec<String> },
 }
 
 pub struct StreamRenderer {
@@ -363,6 +402,9 @@ impl StreamRenderer {
                 None => break,
             }
         }
+        if end {
+            self.finish_state();
+        }
     }
 
     fn process_line(&mut self, text: &str) {
@@ -371,38 +413,92 @@ impl StreamRenderer {
         match state {
             StreamState::Normal => {
                 if let Some(rest) = text.strip_prefix("```") {
-                    // Opening fence — draw box header and enter code mode.
+                    // Buffer fenced code until the close. Local models sometimes
+                    // emit tool-call JSON as a code block; rendering only after
+                    // classification keeps protocol artifacts out of the transcript.
                     let lang = rest.trim().to_string();
-                    let header = self.box_header(&lang);
-                    line(&header);
                     self.state = StreamState::InCode {
                         lang,
                         lines: Vec::new(),
                     };
+                } else if starts_like_top_level_json(text) {
+                    let lines = vec![text.to_string()];
+                    self.state = StreamState::MaybeJson { lines };
+                    self.try_flush_maybe_json(false);
                 } else {
-                    // Regular text: preserve blank lines; no extra prefix (matches
-                    // the existing non-code streaming style).
-                    line(text);
+                    // Regular text: preserve blank lines; render markdown formatting
+                    line(&render_md_line(text));
                     self.state = StreamState::Normal;
                 }
             }
             StreamState::InCode { lang, mut lines } => {
                 if text.trim_end_matches('\r') == "```" {
-                    // Closing fence — draw footer, then copy to clipboard.
-                    line(&self.box_footer());
                     let code = lines.join("\n");
-                    osc52_copy(&code);
-                    line(&dim("  ✓ ⎘ copied to clipboard"));
+                    if !is_tool_call_json_block(&lang, &code) {
+                        self.render_code_block(&lang, &lines);
+                        osc52_copy(&code);
+                        line(&dim("  ✓ ⎘ copied to clipboard"));
+                    }
                     self.state = StreamState::Normal;
-                    let _ = lang;
                 } else {
-                    // Code line — prefix with a dim vertical bar.
-                    let row = format!("  {} {text}", dim("│"));
-                    line(&row);
                     lines.push(text.to_string());
                     self.state = StreamState::InCode { lang, lines };
                 }
             }
+            StreamState::MaybeJson { mut lines } => {
+                lines.push(text.to_string());
+                self.state = StreamState::MaybeJson { lines };
+                self.try_flush_maybe_json(false);
+            }
+        }
+    }
+
+    fn finish_state(&mut self) {
+        let state = std::mem::replace(&mut self.state, StreamState::Normal);
+        match state {
+            StreamState::Normal => {}
+            StreamState::InCode { lang, lines } => {
+                let code = lines.join("\n");
+                if !is_tool_call_json_block(&lang, &code) {
+                    self.render_code_block(&lang, &lines);
+                    osc52_copy(&code);
+                    line(&dim("  ✓ ⎘ copied to clipboard"));
+                }
+            }
+            StreamState::MaybeJson { lines } => {
+                self.state = StreamState::MaybeJson { lines };
+                self.try_flush_maybe_json(true);
+            }
+        }
+    }
+
+    fn try_flush_maybe_json(&mut self, force: bool) {
+        let state = std::mem::replace(&mut self.state, StreamState::Normal);
+        let StreamState::MaybeJson { lines } = state else {
+            self.state = state;
+            return;
+        };
+        let joined = lines.join("\n");
+        match serde_json::from_str::<serde_json::Value>(joined.trim()) {
+            Ok(value) => {
+                if !json_value_looks_like_tool_call(&value) {
+                    self.render_plain_lines(&lines);
+                }
+                self.state = StreamState::Normal;
+            }
+            Err(_) if force || maybe_json_buffer_is_too_large(&lines) => {
+                self.render_plain_lines(&lines);
+                self.state = StreamState::Normal;
+            }
+            Err(_) => {
+                self.state = StreamState::MaybeJson { lines };
+            }
+        }
+    }
+
+    fn render_plain_lines(&self, lines: &[String]) {
+        for text in lines {
+            line(&render_md_line(text));
         }
     }
 
@@ -412,16 +508,68 @@ impl StreamRenderer {
         } else {
             format!("  ╭─ ⟨ {} ⟩ ", lang)
         };
-        let used = prefix.chars().count();
+        let used = str_width(&prefix);
         let dashes = self.w.saturating_sub(used).max(1);
         format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
     }
 
     fn box_footer(&self) -> String {
         let prefix = "  ╰";
-        let dashes = self.w.saturating_sub(prefix.chars().count()).max(1);
+        let dashes = self.w.saturating_sub(str_width(prefix)).max(1);
         format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
     }
+
+    fn render_code_block(&self, lang: &str, lines: &[String]) {
+        line(&self.box_header(lang));
+        for text in lines {
+            line(&format!("  {} {text}", dim("│")));
+        }
+        line(&self.box_footer());
+    }
+}
+
+fn starts_like_top_level_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn maybe_json_buffer_is_too_large(lines: &[String]) -> bool {
+    lines.len() > 80 || lines.iter().map(|line| line.len()).sum::<usize>() > 32 * 1024
+}
+
+fn is_tool_call_json_block(lang: &str, code: &str) -> bool {
+    let lang = lang.trim().to_ascii_lowercase();
+    if !lang.is_empty() && lang != "json" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(code.trim()) else {
+        return false;
+    };
+    json_value_looks_like_tool_call(&value)
+}
+
+fn json_value_looks_like_tool_call(value: &serde_json::Value) -> bool {
+    if let Some(items) = value.as_array() {
+        return !items.is_empty() && items.iter().all(json_value_looks_like_tool_call);
+    }
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| items.iter().any(json_value_looks_like_tool_call))
+    {
+        return true;
+    }
+    let has_name = obj.get("name").and_then(|v| v.as_str()).is_some()
+        || obj.get("tool_name").and_then(|v| v.as_str()).is_some();
+    let has_args = obj.get("arguments").is_some() || obj.get("input").is_some();
+    let openai_function = obj
+        .get("function")
+        .and_then(|v| v.as_object())
+        .is_some_and(|f| f.get("name").and_then(|v| v.as_str()).is_some());
+    (has_name && has_args) || openai_function
 }
 
 // Copy text to the terminal clipboard via the OSC 52 escape sequence.
@@ -615,11 +763,6 @@ pub fn render_queued_composer() {
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    if poll(Duration::ZERO).unwrap_or(false) {
-        return;
-    }
-    let mut out = io::stdout();
-    let _ = execute!(out, SavePosition);
     if let Ok(ta) = typeahead().lock() {
         let mut scroll = 0usize;
         render_composer(
@@ -629,7 +772,6 @@ pub fn render_queued_composer() {
             &mut scroll,
         );
     }
-    let _ = execute!(out, RestorePosition);
 }
 
 fn take_typeahead() -> (Vec<char>, usize) {
@@ -665,6 +807,99 @@ fn footer_row() -> u16 {
     term_size().1.saturating_sub(1)
 }
 
+pub fn char_width(c: char) -> usize {
+    let u = c as u32;
+    if (0x0300..=0x036F).contains(&u)
+        || (0x1AB0..=0x1AFF).contains(&u)
+        || (0x20D0..=0x20FF).contains(&u)
+        || (0xFE00..=0xFE0F).contains(&u)
+        || u == 0x200B
+        || u == 0x200C
+        || u == 0x200D
+    {
+        return 0;
+    }
+    if (0x1100..=0x115F).contains(&u)
+        || (0x2329..=0x232A).contains(&u)
+        || (0x2E80..=0x303E).contains(&u)
+        || (0x3040..=0xA4CF).contains(&u)
+        || (0xAC00..=0xD7A3).contains(&u)
+        || (0xF900..=0xFAFF).contains(&u)
+        || (0xFE10..=0xFE19).contains(&u)
+        || (0xFE30..=0xFE6F).contains(&u)
+        || (0xFF01..=0xFF60).contains(&u)
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x1F000..=0x1FAFF).contains(&u)
+        || (0x2600..=0x27BF).contains(&u)
+        || (0x20000..=0x2FA1F).contains(&u)
+        || (0x30000..=0x3134F).contains(&u)
+    {
+        return 2;
+    }
+    1
+}
+
+pub fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+pub fn render_md_line(s: &str) -> String {
+    if no_color() {
+        return s.to_string();
+    }
+    let trimmed = s.trim_start();
+    let indent = &s[..s.len().saturating_sub(trimmed.len())];
+    if let Some(header) = trimmed.strip_prefix("### ") {
+        return format!("{}{}", indent, bold(&blue(header)));
+    }
+    if let Some(header) = trimmed.strip_prefix("## ") {
+        return format!("{}{}", indent, bold(&cyan(header)));
+    }
+    if let Some(header) = trimmed.strip_prefix("# ") {
+        return format!("{}{}", indent, bold(&accent(header)));
+    }
+    let (is_bullet, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("* ") {
+        (true, r)
+    } else {
+        (false, trimmed)
+    };
+
+    let mut out = String::new();
+    let parts: Vec<&str> = rest.split("**").collect();
+    for (i, part) in parts.iter().enumerate() {
+        let piece = if i % 2 == 1 {
+            bold(part)
+        } else {
+            let mut cp_out = String::new();
+            let code_parts: Vec<&str> = part.split('`').collect();
+            for (j, cpart) in code_parts.iter().enumerate() {
+                if j % 2 == 1 {
+                    cp_out.push_str(&yellow(cpart));
+                } else {
+                    cp_out.push_str(cpart);
+                }
+            }
+            cp_out
+        };
+        out.push_str(&piece);
+    }
+
+    if is_bullet {
+        format!("{}  {} {}", indent, dim("•"), out)
+    } else {
+        format!("{}{}", indent, out)
+    }
+}
+
+pub fn render_md(text: &str) -> String {
+    text.lines()
+        .map(render_md_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -683,7 +918,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn prompt_width(prompt: &str) -> u16 {
-    strip_ansi(prompt).chars().count().min(u16::MAX as usize) as u16
+    str_width(&strip_ansi(prompt)).min(u16::MAX as usize) as u16
 }
 
 fn set_output_region() {
@@ -981,10 +1216,15 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     let (width, _) = term_size();
     let pwidth = prompt_width(prompt);
     let avail = width.saturating_sub(pwidth).max(8) as usize;
-    let (s, col) = viewport(cursor, avail, *scroll);
+    let (s, _col) = viewport(cursor, avail, *scroll);
     *scroll = s;
     let end = (s + avail).min(buf.len());
     let shown: String = buf[s..end].iter().collect();
+    let col_width = buf[s..cursor.min(buf.len())]
+        .iter()
+        .copied()
+        .map(char_width)
+        .sum::<usize>();
     let mut out = io::stdout();
     let _ = queue!(
         out,
@@ -995,7 +1235,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     queue_footer(&mut out);
     let _ = queue!(
         out,
-        MoveTo(pwidth.saturating_add(col as u16), composer_row())
+        MoveTo(pwidth.saturating_add(col_width as u16), composer_row())
     );
     let _ = out.flush();
 }
@@ -1088,7 +1328,12 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         w,
     ));
     // Mode row
-    line(&clip_ansi_line(
+    line(&banner_mode_row(mode, w));
+    line(&accent(&bot_bar));
+}
+
+fn banner_mode_row(mode: &str, width: usize) -> String {
+    clip_ansi_line(
         &format!(
             "  Mode: {}    {}  {}  {}",
             mode_badge(mode),
@@ -1096,13 +1341,32 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
             dim("·"),
             dim("[/help] commands"),
         ),
-        w,
-    ));
-    line(&accent(&bot_bar));
+        width,
+    )
+}
+
+fn refresh_banner_mode(mode: &str) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let width = term_size().0 as usize;
+    let row = banner_mode_row(mode, width);
+    let Ok(mut lines) = transcript().lock() else {
+        return;
+    };
+    for line in lines.iter_mut() {
+        let plain = strip_ansi(line);
+        if plain.contains("Mode:") && plain.contains("Shift+Tab") {
+            *line = row;
+            break;
+        }
+    }
 }
 
 // Refresh the mode indicator line in-place after a mode change (no full clear).
 pub fn show_mode_change(mode: &str) {
+    refresh_banner_mode(mode);
+    render_output();
     line(&format!(
         "  {} mode → {}",
         dim("⟳ switching"),
@@ -1577,19 +1841,21 @@ fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
 }
 
 fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
-    if poll(Duration::ZERO).unwrap_or(false) {
-        return;
-    }
     if ALT_SCREEN.load(Ordering::Relaxed) {
         render_composer(prompt, buf, cursor, scroll);
         return;
     }
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
     let avail = width.saturating_sub(start.0).max(8) as usize;
-    let (s, col) = viewport(cursor, avail, *scroll);
+    let (s, _col) = viewport(cursor, avail, *scroll);
     *scroll = s;
     let end = (s + avail).min(buf.len());
     let shown: String = buf[s..end].iter().collect();
+    let col_width = buf[s..cursor.min(buf.len())]
+        .iter()
+        .copied()
+        .map(char_width)
+        .sum::<usize>();
     let mut out = io::stdout();
     let _ = queue!(
         out,
@@ -1597,7 +1863,10 @@ fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: 
         Clear(ClearType::UntilNewLine)
     );
     let _ = write!(out, "{shown}");
-    let _ = queue!(out, MoveTo(start.0.saturating_add(col as u16), start.1));
+    let _ = queue!(
+        out,
+        MoveTo(start.0.saturating_add(col_width as u16), start.1)
+    );
     let _ = out.flush();
 }
 
@@ -2713,6 +2982,46 @@ mod tests {
         assert_eq!(selection_range_for(many, 1, 10), Some((4, 10)));
         assert_eq!(selection_range_for(many, 2, 10), Some((0, 10)));
         assert_eq!(selection_range_for(many, 3, 10), Some((0, 3)));
+    }
+
+    #[test]
+    fn json_tool_call_blocks_are_classified_as_protocol_artifacts() {
+        let tool_json = r#"{
+  "name": "start_server",
+  "arguments": {
+    "command": "npm start",
+    "port": 3000
+  }
+}"#;
+        assert!(is_tool_call_json_block("json", tool_json));
+        assert!(!is_tool_call_json_block(
+            "json",
+            r#"{"message":"ordinary data"}"#
+        ));
+        assert!(!is_tool_call_json_block("rust", tool_json));
+    }
+
+    #[test]
+    fn raw_json_tool_calls_are_classified_as_protocol_artifacts() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"tool_calls":[{"function":{"name":"write_file","arguments":"{\"path\":\"x\"}"}}]}"#,
+        )
+        .unwrap();
+        assert!(json_value_looks_like_tool_call(&value));
+        assert!(starts_like_top_level_json(
+            "  {\"name\":\"read_file\",\"arguments\":{}}"
+        ));
+        assert!(!starts_like_top_level_json(
+            "Here is JSON: {\"name\":\"read_file\"}"
+        ));
+    }
+
+    #[test]
+    fn maybe_json_buffer_has_safety_cap() {
+        let lines = vec!["{".to_string(); 81];
+        assert!(maybe_json_buffer_is_too_large(&lines));
+        let lines = vec!["{".to_string(), "\"message\":\"ordinary\"".to_string()];
+        assert!(!maybe_json_buffer_is_too_large(&lines));
     }
 
     #[test]

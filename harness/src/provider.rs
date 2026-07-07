@@ -224,7 +224,16 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
             Ok(resp) => return Ok(resp),
             Err(ureq::Error::Status(code, resp)) => {
                 let detail = resp.into_string().unwrap_or_default();
-                let is_transient = code == 429 || (500..=504).contains(&code);
+                let detail_lower = detail.to_lowercase();
+                let is_unsupported = code == 400
+                    || code == 404
+                    || code == 422
+                    || code == 501
+                    || detail_lower.contains("image")
+                    || detail_lower.contains("multimodal")
+                    || detail_lower.contains("vision")
+                    || detail_lower.contains("not supported");
+                let is_transient = !is_unsupported && (code == 429 || (500..=504).contains(&code));
                 if is_transient && attempts < max_attempts {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     delay_ms *= 2;

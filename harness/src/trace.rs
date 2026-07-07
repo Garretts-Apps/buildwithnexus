@@ -80,13 +80,23 @@ pub fn record_visible(kind: &str, title: impl Into<String>, detail: Value) -> u6
     let title = title.into();
     let id = record(kind, title.clone(), detail);
     if !report::is_json() && id > 0 {
-        tui::line(&format!(
-            "  {} {} #{} {}",
-            tui::dim("trace"),
-            tui::accent(kind),
-            id,
-            tui::dim(&title)
-        ));
+        let silent_kinds = [
+            "agents",
+            "memory",
+            "skills",
+            "rules",
+            "knowledge",
+            "hooks",
+            "skill",
+        ];
+        if !silent_kinds.contains(&kind) {
+            tui::line(&format!(
+                "  {} {} {}",
+                tui::dim("•"),
+                tui::accent(kind),
+                tui::dim(&title)
+            ));
+        }
     }
     id
 }
