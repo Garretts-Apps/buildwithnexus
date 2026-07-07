@@ -4,6 +4,27 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3] - 2026-07-07
+
+Small-model BUILD reliability, from a real qwen2.5-coder-1.5b session that
+looped instead of building a page.
+
+### Fixed
+- **Small models no longer stall on the clarifying-question tool.** The
+  `question` tool is dropped from the compact (local/small-model) tool set — a
+  1.5B model was re-asking "use a framework?" endlessly instead of building. It
+  now acts on sensible defaults; larger models and PLAN mode keep the tool.
+- **Question answers now echo what you type.** The answer prompt was a
+  multi-line string, which mis-positioned the alt-screen composer cursor and
+  hid typed input. The question prints on its own line and the answer is read
+  with a single-line prompt.
+- **HTML artifacts that link a local stylesheet are rejected** with an
+  actionable message (name the file, inline the CSS), mirroring the existing
+  local-`<script src>` check; the too-small message now explicitly demands a
+  single self-contained file with no external links.
+
+[0.11.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.11.3
+
 ## [0.11.2] - 2026-07-07
 
 Document generation, web-content quality, TUI, and small-model streaming
