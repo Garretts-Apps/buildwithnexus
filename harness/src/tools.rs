@@ -1490,14 +1490,8 @@ fn strip_html(html: &str) -> String {
         i += 1;
     }
 
-    // Collapse whitespace and decode common HTML entities.
-    let decoded = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&nbsp;", " ")
-        .replace("&#39;", "'");
+    // Collapse whitespace and decode HTML entities (named + numeric).
+    let decoded = decode_html_entities(&out);
 
     let mut result = String::new();
     let mut prev_ws = true;
@@ -1552,16 +1546,63 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// Decode the common named/numeric HTML entities that appear in result titles
-// and snippets. `&amp;` is resolved last so `&amp;lt;` doesn't collapse to `<`.
-fn decode_entities(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
+// Resolve a single entity body (the text between `&` and `;`) to its character:
+// the common named entities plus decimal (`#8217`) and hex (`#x2019`) numeric
+// character references. Returns None for anything unrecognized.
+fn entity_char(ent: &str) -> Option<char> {
+    match ent {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "mdash" => Some('—'),
+        "ndash" => Some('–'),
+        "hellip" => Some('…'),
+        "rsquo" => Some('’'),
+        "lsquo" => Some('‘'),
+        "rdquo" => Some('”'),
+        "ldquo" => Some('“'),
+        _ => {
+            let num = ent.strip_prefix('#')?;
+            let code = match num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
+// Decode HTML entities in a single left-to-right pass — named entities and
+// decimal/hex numeric character references. Single-pass so `&amp;lt;` decodes to
+// the literal `&lt;` (not `<`), and an unrecognized `&…;` is left untouched.
+fn decode_html_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // `&` and `;` are ASCII, so `semi` is a valid char boundary; the ≤12
+        // bound keeps a lone `&` in prose from swallowing a distant `;`.
+        if let Some(semi) = tail.find(';') {
+            if semi <= 12 {
+                if let Some(ch) = entity_char(&tail[1..semi]) {
+                    out.push(ch);
+                    rest = &tail[semi + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push('&');
+        rest = &tail[1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // Read attribute `attr` from the tag that opens at byte index `tag_start`,
@@ -1611,7 +1652,7 @@ fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
             let url = ddg_real_url(&tag_attr(html, tag_start, "href").unwrap_or_default());
             let after = &html[gt + 1..];
             if let Some(close) = after.to_lowercase().find("</a") {
-                let title = decode_entities(&strip_html(&after[..close]))
+                let title = decode_html_entities(&strip_html(&after[..close]))
                     .trim()
                     .to_string();
                 if !title.is_empty() {
@@ -1630,7 +1671,7 @@ fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
             let start = pos + gt + 1;
             if let Some(lt) = html[start..].find('<') {
                 snippets.push(
-                    decode_entities(&strip_html(&html[start..start + lt]))
+                    decode_html_entities(&strip_html(&html[start..start + lt]))
                         .trim()
                         .to_string(),
                 );
@@ -4162,9 +4203,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_entities_resolves_amp_last() {
-        assert_eq!(decode_entities("a &amp;lt; b"), "a &lt; b");
-        assert_eq!(decode_entities("x &lt;y&gt; &quot;z&quot;"), "x <y> \"z\"");
+    fn decode_html_entities_single_pass_no_double_decode() {
+        // Single pass: &amp; becomes a literal & and the following "lt;" is left
+        // alone, so this must not collapse to "<".
+        assert_eq!(decode_html_entities("a &amp;lt; b"), "a &lt; b");
+        assert_eq!(
+            decode_html_entities("x &lt;y&gt; &quot;z&quot;"),
+            "x <y> \"z\""
+        );
+    }
+
+    #[test]
+    fn decode_html_entities_resolves_numeric_and_typographic() {
+        // Decimal and hex numeric references for a curly apostrophe.
+        assert_eq!(decode_html_entities("it&#8217;s"), "it’s");
+        assert_eq!(decode_html_entities("it&#x2019;s"), "it’s");
+        // Common typographic named entities.
+        assert_eq!(decode_html_entities("a &mdash; b &hellip;"), "a — b …");
+    }
+
+    #[test]
+    fn decode_html_entities_leaves_unknown_and_bare_amp_literal() {
+        assert_eq!(decode_html_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_html_entities("&notreal;"), "&notreal;");
+        // A `&` with no nearby `;` is untouched.
+        assert_eq!(
+            decode_html_entities("cats & dogs everywhere"),
+            "cats & dogs everywhere"
+        );
     }
 
     #[test]
