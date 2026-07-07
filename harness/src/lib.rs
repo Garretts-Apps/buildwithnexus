@@ -2295,7 +2295,7 @@ fn print_help() {
         tui::bold("/model")
     ));
     tui::line(&format!(
-        "  {}        switch to local GGUF or Ollama models",
+        "  {}        local model server & GGUF/Ollama management",
         tui::bold("/local")
     ));
     tui::line(&format!(
@@ -2344,9 +2344,9 @@ fn print_help() {
         tui::dim("<context>")
     ));
     tui::line(&format!(
-        "  {}        transcribe voice input from audio file  {}",
+        "  {}        audio transcription & offline voice input  {}",
         tui::bold("/voice"),
-        tui::dim("<file>")
+        tui::dim("([<file>])")
     ));
     tui::line(&format!(
         "  {}       configure hooks, memory, commands via AI",
@@ -2395,18 +2395,25 @@ fn print_help() {
         tui::bold("/checkpoints")
     ));
     tui::line(&format!(
-        "  {}         restore checkpoint (<git|all|id>)",
-        tui::bold("/undo")
+        "  {}         restore checkpoint (<git|all|id>)  {}",
+        tui::bold("/undo"),
+        tui::dim("(/rewind)")
     ));
     tui::line(&format!(
-        "  {}     interactive operational alignment & decision grill",
-        tui::bold("/grill-me")
+        "  {}     interactive operational alignment  {}",
+        tui::bold("/grill-me"),
+        tui::dim("(/align · /interview)")
     ));
     tui::line(&format!(
-        "  {}     autonomous multi-agent swarm preview",
-        tui::bold("/teamwork")
+        "  {}     autonomous multi-agent swarm preview  {}",
+        tui::bold("/teamwork"),
+        tui::dim("(/swarm)")
     ));
-    tui::line(&format!("  {}       diagnose setup", tui::bold("/doctor")));
+    tui::line(&format!(
+        "  {}       diagnose setup  {}",
+        tui::bold("/doctor"),
+        tui::dim("(/debug)")
+    ));
     tui::line(&format!(
         "  {}          start a fresh session",
         tui::bold("/new")
@@ -2434,14 +2441,6 @@ fn print_help() {
     tui::line(&format!(
         "  {}          toggle Vim modal editing mode (Normal/Insert)",
         tui::bold("/vim")
-    ));
-    tui::line(&format!(
-        "  {}        audio transcription & offline voice input",
-        tui::bold("/voice")
-    ));
-    tui::line(&format!(
-        "  {}        local model server & GGUF management",
-        tui::bold("/local")
     ));
     tui::line(&tui::dim(
         "  Tab      autocomplete /commands and their sub-args",

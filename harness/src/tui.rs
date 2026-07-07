@@ -1220,7 +1220,6 @@ fn render_output() {
         let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
         if let Some(line) = visible_lines.get(start + row) {
             let plain = strip_ansi(line);
-            plain_rows.push(plain.clone());
             if let Some(sel) = sel {
                 if let Some(range) = selection_range_for(sel, row as u16, plain.chars().count()) {
                     let _ = write!(
@@ -1234,6 +1233,7 @@ fn render_output() {
             } else {
                 let _ = write!(out, "{line}");
             }
+            plain_rows.push(plain);
         } else {
             plain_rows.push(String::new());
         }
@@ -2599,7 +2599,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('y') if ctrl => {
-                for c in kill.clone().chars() {
+                for c in kill.chars() {
                     buf.insert(cursor, c);
                     cursor += 1;
                 }
@@ -2630,7 +2630,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             out,
                             "{}{}",
                             dim(&format!("(reverse-i-search)`{query}`: ")),
-                            m.clone().unwrap_or_default()
+                            m.as_deref().unwrap_or("")
                         );
                         let _ = out.flush();
                     }
