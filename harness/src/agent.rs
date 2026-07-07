@@ -681,7 +681,15 @@ fn collect_text_tool_calls(
         .get("arguments")
         .or_else(|| obj.get("input"))
         .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
+        .unwrap_or_else(|| {
+            let mut map = serde_json::Map::new();
+            for (k, v) in obj {
+                if k != "name" && k != "tool_name" && k != "type" && k != "id" {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::Value::Object(map)
+        });
     out.push(text_tool_call(name, input));
 }
 

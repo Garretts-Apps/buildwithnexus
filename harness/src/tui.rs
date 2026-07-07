@@ -224,18 +224,29 @@ fn attr(code: &str, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    let reset = if code == "1" {
-        "\x1b[22m".to_string()
-    } else if ALT_SCREEN.load(Ordering::Relaxed) {
-        format!("\x1b[0m\x1b[{}m", sgr_fg(TEXT))
-    } else {
-        "\x1b[0m".to_string()
+    let reset = match code {
+        "1" => "\x1b[22m".to_string(),
+        "3" => "\x1b[23m".to_string(),
+        "4" => "\x1b[24m".to_string(),
+        _ => {
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                format!("\x1b[0m\x1b[{}m", sgr_fg(TEXT))
+            } else {
+                "\x1b[0m".to_string()
+            }
+        }
     };
     format!("\x1b[{code}m{s}{reset}")
 }
 
 pub fn bold(s: &str) -> String {
     attr("1", s)
+}
+pub fn italic(s: &str) -> String {
+    attr("3", s)
+}
+pub fn underline(s: &str) -> String {
+    attr("4", s)
 }
 pub fn dim(s: &str) -> String {
     paint(MUTED, s)
@@ -564,7 +575,9 @@ fn json_value_looks_like_tool_call(value: &serde_json::Value) -> bool {
     }
     let has_name = obj.get("name").and_then(|v| v.as_str()).is_some()
         || obj.get("tool_name").and_then(|v| v.as_str()).is_some();
-    let has_args = obj.get("arguments").is_some() || obj.get("input").is_some();
+    let has_args = obj.get("arguments").is_some()
+        || obj.get("input").is_some()
+        || obj.keys().any(|k| k != "name" && k != "tool_name" && k != "type" && k != "id");
     let openai_function = obj
         .get("function")
         .and_then(|v| v.as_object())
@@ -652,6 +665,11 @@ fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
     })
 }
 
+fn message_queue() -> &'static std::sync::Mutex<Vec<String>> {
+    static MQ: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    MQ.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
 /// Non-blocking drain of pending key events during agent processing.
 /// Buffers printable input; Ctrl+C clears the buffer and signals an interrupt.
 pub fn poll_typeahead() {
@@ -700,6 +718,65 @@ pub fn poll_typeahead() {
                     Err(_) => continue,
                 };
                 match k.code {
+                    KeyCode::Enter => {
+                        let text: String = ta.buf.iter().collect();
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            if let Ok(mut mq) = message_queue().lock() {
+                                mq.push(trimmed.to_string());
+                            }
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            drop(ta);
+                            render_output();
+                            clear_composer();
+                            render_footer();
+                            render_queued_composer();
+                        }
+                        continue;
+                    }
+                    KeyCode::Up if !alt => {
+                        if ta.buf.is_empty() {
+                            if let Ok(mut mq) = message_queue().lock() {
+                                if let Some(last) = mq.pop() {
+                                    ta.buf = last.chars().collect();
+                                    ta.cursor = ta.buf.len();
+                                    drop(ta);
+                                    render_output();
+                                    clear_composer();
+                                    render_footer();
+                                    render_queued_composer();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    KeyCode::Char('q') if ctrl => {
+                        if let Ok(mut mq) = message_queue().lock() {
+                            if let Some(last) = mq.pop() {
+                                ta.buf = last.chars().collect();
+                                ta.cursor = ta.buf.len();
+                                drop(ta);
+                                render_output();
+                                clear_composer();
+                                render_footer();
+                                render_queued_composer();
+                            }
+                        }
+                        continue;
+                    }
+                    KeyCode::Char('x') if ctrl => {
+                        if let Ok(mut mq) = message_queue().lock() {
+                            if mq.pop().is_some() {
+                                drop(ta);
+                                render_output();
+                                clear_composer();
+                                render_footer();
+                                render_queued_composer();
+                            }
+                        }
+                        continue;
+                    }
                     KeyCode::Char('c') if ctrl => {
                         TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
                         ta.buf.clear();
@@ -764,6 +841,28 @@ pub fn render_queued_composer() {
         return;
     }
     if let Ok(ta) = typeahead().lock() {
+        if let Ok(mq) = message_queue().lock() {
+            let mut out = io::stdout();
+            let c_row = composer_row();
+            let q_len = mq.len() as u16;
+            for (i, msg) in mq.iter().enumerate() {
+                let row = c_row.saturating_sub(q_len).saturating_add(i as u16);
+                let _ = queue!(
+                    out,
+                    MoveTo(0, row),
+                    Clear(ClearType::CurrentLine)
+                );
+                let _ = write!(
+                    out,
+                    "  {} {} {} {}",
+                    dim("├─"),
+                    dim("queued:"),
+                    bold(msg),
+                    dim("(Ctrl+Q edit, Ctrl+X rm)")
+                );
+            }
+            let _ = out.flush();
+        }
         let mut scroll = 0usize;
         render_composer(
             &format!("{} {} ", dim("queued"), accent("›")),
@@ -791,16 +890,21 @@ fn term_size() -> (u16, u16) {
 }
 
 fn reserved_rows() -> u16 {
+    let q_len = message_queue().lock().map(|q| q.len()).unwrap_or(0) as u16;
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        2
+        2 + q_len
     } else {
-        1
+        1 + q_len
     }
 }
 
 fn composer_row() -> u16 {
     let (_, h) = term_size();
-    h.saturating_sub(reserved_rows()).min(h.saturating_sub(1))
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        h.saturating_sub(2).min(h.saturating_sub(1))
+    } else {
+        h.saturating_sub(1)
+    }
 }
 
 fn footer_row() -> u16 {
@@ -843,6 +947,65 @@ pub fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+fn format_links(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('[') {
+        if let Some(mid) = rest[start..].find("](") {
+            let mid_abs = start + mid;
+            if let Some(end) = rest[mid_abs..].find(')') {
+                let end_abs = mid_abs + end;
+                out.push_str(&rest[..start]);
+                let label = &rest[start + 1..mid_abs];
+                let url = &rest[mid_abs + 2..end_abs];
+                out.push_str(&format!("{} {}", underline(&cyan(label)), dim(&format!("({url})"))));
+                rest = &rest[end_abs + 1..];
+                continue;
+            }
+        }
+        out.push_str(&rest[..start + 1]);
+        rest = &rest[start + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn format_italics(s: &str) -> String {
+    let mut out = String::new();
+    let parts: Vec<&str> = s.split('*').collect();
+    for (i, part) in parts.iter().enumerate() {
+        if i % 2 == 1 && parts.len() > 1 {
+            out.push_str(&italic(part));
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
+}
+
+fn format_inline_md(text: &str) -> String {
+    let mut out = String::new();
+    let code_parts: Vec<&str> = text.split('`').collect();
+    for (i, part) in code_parts.iter().enumerate() {
+        if i % 2 == 1 {
+            out.push_str(&yellow(part));
+        } else {
+            let with_links = format_links(part);
+            let mut bold_out = String::new();
+            let bold_parts: Vec<&str> = with_links.split("**").collect();
+            for (j, bpart) in bold_parts.iter().enumerate() {
+                if j % 2 == 1 {
+                    bold_out.push_str(&bold(bpart));
+                } else {
+                    bold_out.push_str(&format_italics(bpart));
+                }
+            }
+            out.push_str(&bold_out);
+        }
+    }
+    out
+}
+
 pub fn render_md_line(s: &str) -> String {
     if no_color() {
         return s.to_string();
@@ -850,46 +1013,38 @@ pub fn render_md_line(s: &str) -> String {
     let trimmed = s.trim_start();
     let indent = &s[..s.len().saturating_sub(trimmed.len())];
     if let Some(header) = trimmed.strip_prefix("### ") {
-        return format!("{}{}", indent, bold(&blue(header)));
+        return format!("{}{}", indent, bold(&blue(&format_inline_md(header))));
     }
     if let Some(header) = trimmed.strip_prefix("## ") {
-        return format!("{}{}", indent, bold(&cyan(header)));
+        return format!("{}{}", indent, bold(&cyan(&format_inline_md(header))));
     }
     if let Some(header) = trimmed.strip_prefix("# ") {
-        return format!("{}{}", indent, bold(&accent(header)));
+        return format!("{}{}", indent, bold(&accent(&format_inline_md(header))));
     }
-    let (is_bullet, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
-        (true, r)
+    if let Some(quote) = trimmed.strip_prefix("> ") {
+        return format!("{}  {} {}", indent, dim("│"), italic(&dim(&format_inline_md(quote))));
+    }
+    let (prefix_span, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
+        (Some(dim("•")), r)
     } else if let Some(r) = trimmed.strip_prefix("* ") {
-        (true, r)
+        (Some(dim("•")), r)
+    } else if let Some(idx) = trimmed.find(". ") {
+        if idx > 0 && idx <= 3 && trimmed[..idx].chars().all(|c| c.is_ascii_digit()) {
+            let num_str = &trimmed[..idx + 1];
+            (Some(bold(&cyan(num_str))), &trimmed[idx + 2..])
+        } else {
+            (None, trimmed)
+        }
     } else {
-        (false, trimmed)
+        (None, trimmed)
     };
 
-    let mut out = String::new();
-    let parts: Vec<&str> = rest.split("**").collect();
-    for (i, part) in parts.iter().enumerate() {
-        let piece = if i % 2 == 1 {
-            bold(part)
-        } else {
-            let mut cp_out = String::new();
-            let code_parts: Vec<&str> = part.split('`').collect();
-            for (j, cpart) in code_parts.iter().enumerate() {
-                if j % 2 == 1 {
-                    cp_out.push_str(&yellow(cpart));
-                } else {
-                    cp_out.push_str(cpart);
-                }
-            }
-            cp_out
-        };
-        out.push_str(&piece);
-    }
+    let formatted_rest = format_inline_md(rest);
 
-    if is_bullet {
-        format!("{}  {} {}", indent, dim("•"), out)
+    if let Some(pref) = prefix_span {
+        format!("{}  {} {}", indent, pref, formatted_rest)
     } else {
-        format!("{}{}", indent, out)
+        format!("{}{}", indent, formatted_rest)
     }
 }
 
@@ -1061,6 +1216,7 @@ fn render_output() {
         *rows = plain_rows;
     }
     let _ = out.flush();
+    render_queued_composer();
 }
 
 fn scroll_output(delta: isize) {
@@ -1773,6 +1929,14 @@ pub fn ask(prompt: &str) -> Option<String> {
 // submits. Shift+Tab returns CycleMode without submitting.
 // Pre-fills the first line with any keystrokes typed during agent processing.
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
+    if let Ok(mut mq) = message_queue().lock() {
+        if !mq.is_empty() {
+            let msg = mq.remove(0);
+            push_history(&msg);
+            echo_submitted(prompt, &msg);
+            return Some(InputEvent::Text(msg));
+        }
+    }
     if !is_raw() {
         return ask(prompt).map(InputEvent::Text);
     }
