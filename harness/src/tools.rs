@@ -1861,13 +1861,111 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn docx_paragraph(text: &str, style: Option<&str>) -> String {
-    let style = style
+    let ppr = style
         .map(|s| format!("<w:pPr><w:pStyle w:val=\"{s}\"/></w:pPr>"))
         .unwrap_or_default();
-    format!(
-        "<w:p>{style}<w:r><w:t>{}</w:t></w:r></w:p>",
+    format!("<w:p>{ppr}{}</w:p>", docx_runs(text))
+}
+
+// Emit one Word run for `text` with the active inline formatting. Empty text
+// produces nothing (an all-empty paragraph is still valid OOXML).
+fn docx_push_run(out: &mut String, text: &str, bold: bool, italic: bool, code: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let mut rpr = String::new();
+    if bold {
+        rpr.push_str("<w:b/>");
+    }
+    if italic {
+        rpr.push_str("<w:i/>");
+    }
+    if code {
+        rpr.push_str("<w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\" w:cs=\"Consolas\"/>");
+    }
+    if !rpr.is_empty() {
+        rpr = format!("<w:rPr>{rpr}</w:rPr>");
+    }
+    out.push_str("<w:r>");
+    out.push_str(&rpr);
+    out.push_str(&format!(
+        "<w:t xml:space=\"preserve\">{}</w:t></w:r>",
         xml_escape(text)
-    )
+    ));
+}
+
+// Light-markdown inline formatting → Word runs: `**bold**`, `*italic*`, and
+// `` `code` `` (verbatim). Emphasis markers only toggle when they flank
+// non-space text, so arithmetic like `5 * 3` and glob patterns stay literal;
+// underscores are deliberately left alone so `snake_case` isn't italicized.
+fn docx_runs(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::new();
+    let mut buf = String::new();
+    let (mut bold, mut italic, mut code) = (false, false, false);
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        // Inside a code span everything is literal until the closing backtick.
+        if code {
+            if c == '`' {
+                docx_push_run(&mut out, &buf, bold, italic, code);
+                buf.clear();
+                code = false;
+            } else {
+                buf.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '`' => {
+                docx_push_run(&mut out, &buf, bold, italic, code);
+                buf.clear();
+                code = true;
+                i += 1;
+            }
+            '*' if i + 1 < n && chars[i + 1] == '*' => {
+                // Opening `**` must precede non-space; closing must follow it.
+                let flanks = if bold {
+                    i > 0 && !chars[i - 1].is_whitespace()
+                } else {
+                    i + 2 < n && !chars[i + 2].is_whitespace()
+                };
+                if flanks {
+                    docx_push_run(&mut out, &buf, bold, italic, code);
+                    buf.clear();
+                    bold = !bold;
+                } else {
+                    buf.push('*');
+                    buf.push('*');
+                }
+                i += 2;
+            }
+            '*' => {
+                let flanks = if italic {
+                    i > 0 && !chars[i - 1].is_whitespace()
+                } else {
+                    i + 1 < n && !chars[i + 1].is_whitespace()
+                };
+                if flanks {
+                    docx_push_run(&mut out, &buf, bold, italic, code);
+                    buf.clear();
+                    italic = !italic;
+                } else {
+                    buf.push('*');
+                }
+                i += 1;
+            }
+            _ => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+    docx_push_run(&mut out, &buf, bold, italic, code);
+    out
 }
 
 fn docx_document(title: &str, body: &str) -> String {
@@ -3801,6 +3899,52 @@ fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::E
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── docx inline formatting ──────────────────────────────────────────────
+    #[test]
+    fn docx_runs_renders_bold_italic_and_code() {
+        let out = docx_runs("plain **bold** and *italic* and `code` end");
+        // Bold run carries <w:b/>, italic <w:i/>, code the monospace font.
+        assert!(out.contains("<w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">bold</w:t>"));
+        assert!(out.contains("<w:rPr><w:i/></w:rPr><w:t xml:space=\"preserve\">italic</w:t>"));
+        assert!(out.contains("w:ascii=\"Consolas\""));
+        assert!(out.contains(">code</w:t>"));
+        // The markers themselves are consumed, not emitted as literal text.
+        assert!(!out.contains('*'));
+        assert!(!out.contains('`'));
+    }
+
+    #[test]
+    fn docx_runs_leaves_arithmetic_and_snake_case_literal() {
+        // Spaced `*` is not emphasis; `_` never toggles italic.
+        let out = docx_runs("compute 5 * 3 for my_var_name");
+        assert!(!out.contains("<w:i/>"));
+        assert!(!out.contains("<w:b/>"));
+        assert!(out.contains("5 * 3 for my_var_name"));
+    }
+
+    #[test]
+    fn docx_runs_code_span_is_verbatim() {
+        // Emphasis markers inside a code span stay literal.
+        let out = docx_runs("call `a*b` now");
+        assert!(out.contains(">a*b</w:t>"));
+        assert!(!out.contains("<w:i/>"));
+    }
+
+    #[test]
+    fn docx_runs_escapes_xml_in_runs() {
+        let out = docx_runs("**a < b & c**");
+        assert!(out.contains("a &lt; b &amp; c"));
+        assert!(out.contains("<w:b/>"));
+    }
+
+    #[test]
+    fn docx_runs_unmatched_marker_stays_literal() {
+        // A lone trailing `**` with nothing after it must not open emphasis.
+        let out = docx_runs("trailing **");
+        assert!(!out.contains("<w:b/>"));
+        assert!(out.contains("trailing **"));
+    }
 
     // ── truncate ────────────────────────────────────────────────────────────
     #[test]
