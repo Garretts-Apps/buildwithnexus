@@ -81,15 +81,42 @@ jobs:
             echo "tag=v${v}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Pull the matching version section out of CHANGELOG.md for the release
+      # body. Falls back to a generic line if the section is missing so the
+      # release step never fails on a docs gap.
+      - name: Extract release notes
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          out="RELEASE_NOTES.md"
+          # Print lines from the matching "## [version]" header up to the next
+          # top-level "## " header (exclusive).
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {grab=1; next}
+            grab && /^## / {grab=0}
+            grab {print}
+          ' CHANGELOG.md > "$out"
+          if [ ! -s "$out" ]; then
+            echo "Release $TAG. See CHANGELOG.md for details." > "$out"
+          fi
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
 
       # Creates the tag + release on workflow_dispatch; on a tag push it just
-      # attaches assets to the existing release.
+      # attaches assets to the existing release. The CHANGELOG section becomes
+      # the release body, with GitHub's auto-generated commit/PR notes appended.
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
+          append_body: true
+          generate_release_notes: true
           files: buildwithnexus-${{ matrix.target }}*

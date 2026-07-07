@@ -21,9 +21,29 @@ use crate::tui;
 const MAX_ITERS: usize = 30;
 const MAX_DEPTH: usize = 3;
 const KEEP_RECENT: usize = 6;
-const MAX_IDENTICAL_TOOL_RESULTS: usize = 2;
+const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
 const MAX_PLAN_TOOL_ROUNDS: usize = 10;
 const MAX_CHAT_TOOL_ROUNDS: usize = 12;
+// How many times a turn truncated at the output-token limit is asked to continue.
+const MAX_TOKEN_LIMIT_CONTINUATIONS: usize = 2;
+// How many verifier Blocked/Failed verdicts the model is asked to address.
+const MAX_VERIFIER_FIX_ROUNDS: usize = 2;
+// How many act-don't-explain nudges an imperative BUILD task gets when the
+// model answers with instructions instead of doing the work.
+const MAX_ACT_NUDGES: usize = 2;
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character —
+/// byte-offset slicing (`&s[..max]`) panics on emoji/CJK at the boundary.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 // ── context compaction ────────────────────────────────────────────────────────
 fn estimate_tokens(msgs: &[Msg]) -> usize {
@@ -52,8 +72,36 @@ fn compaction_split(msgs: &[Msg]) -> (usize, usize) {
         .iter()
         .take_while(|m| matches!(m, Msg::System(_)))
         .count();
-    let tail_start = msgs.len().saturating_sub(KEEP_RECENT).max(sys_end);
+    let mut tail_start = msgs.len().saturating_sub(KEEP_RECENT).max(sys_end);
+    // Never sever a tool_use/tool_result pair: a tail that starts with
+    // Msg::Tool has orphaned results (API 400). Advance until the tail begins
+    // at a safe boundary — a user turn or an assistant turn (an assistant turn
+    // with calls keeps its Msg::Tool inside the tail).
+    while tail_start < msgs.len()
+        && !matches!(
+            msgs[tail_start],
+            Msg::User(_) | Msg::UserImages { .. } | Msg::Assistant { .. }
+        )
+    {
+        tail_start += 1;
+    }
     (sys_end, tail_start)
+}
+
+// The first real user message is the task; a prior compaction pins it after an
+// "[Original task]" marker, so re-compactions keep the verbatim text.
+const ORIGINAL_TASK_MARKER: &str = "[Original task]\n";
+
+fn original_task_text(msgs: &[Msg]) -> Option<String> {
+    for m in msgs {
+        if let Msg::User(t) | Msg::UserImages { text: t, .. } = m {
+            if let Some(idx) = t.find(ORIGINAL_TASK_MARKER) {
+                return Some(t[idx + ORIGINAL_TASK_MARKER.len()..].to_string());
+            }
+            return Some(t.clone());
+        }
+    }
+    None
 }
 
 fn structural_summary(middle: &[Msg]) -> String {
@@ -121,20 +169,27 @@ fn render_msgs(msgs: &[Msg]) -> String {
 
 fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
     let (sys_end, tail_start) = compaction_split(&msgs);
-    // Even if there's nothing to summarize, truncate bloated tool results
-    let msgs = truncate_tool_results(msgs);
     if tail_start <= sys_end {
         return msgs;
     }
+    let task = original_task_text(&msgs);
     let mut it = msgs.into_iter();
     let system: Vec<Msg> = it.by_ref().take(sys_end).collect();
-    let middle: Vec<Msg> = it.by_ref().take(tail_start - sys_end).collect();
+    // Clip bloated tool results only in the middle being summarized — the
+    // recent tail keeps its full content so the model retains recent context.
+    let middle: Vec<Msg> = truncate_tool_results(it.by_ref().take(tail_start - sys_end).collect());
     let tail: Vec<Msg> = it.collect();
     let summary = summarize(&middle);
     let mut v = system;
-    v.push(Msg::User(format!(
-        "[Summary of earlier conversation, compacted to save context]\n{summary}"
-    )));
+    let mut body =
+        format!("[Summary of earlier conversation, compacted to save context]\n{summary}");
+    // Pin the original task verbatim so it survives any number of compactions.
+    if let Some(task) = task {
+        body.push_str("\n\n");
+        body.push_str(ORIGINAL_TASK_MARKER);
+        body.push_str(&task);
+    }
+    v.push(Msg::User(body));
     v.extend(tail);
     v
 }
@@ -208,8 +263,16 @@ struct ToolLoopGuard {
 
 struct ToolLoopRecord {
     content: String,
-    is_error: bool,
     count: usize,
+    nudged: bool,
+}
+
+// What the guard wants the caller to do about a detected loop.
+enum LoopSignal {
+    /// First trigger: steer the model with a corrective user turn and continue.
+    Nudge(String),
+    /// The loop repeated even after a nudge: stop the run and say so honestly.
+    Stop(String),
 }
 
 impl ToolLoopGuard {
@@ -219,28 +282,45 @@ impl ToolLoopGuard {
         input: &serde_json::Value,
         content: &str,
         is_error: bool,
-    ) -> Option<String> {
+    ) -> Option<LoopSignal> {
         let key = format!(
             "{name}:{}",
             serde_json::to_string(input).unwrap_or_default()
         );
+        // Identical successful, non-empty results are legitimate (e.g. re-reading
+        // a file after edits elsewhere) — only repeated errors and repeated
+        // no-op/empty results count as loop evidence.
+        if !is_error && !content.trim().is_empty() {
+            self.seen.remove(&key);
+            return None;
+        }
         let rec = self.seen.entry(key).or_insert_with(|| ToolLoopRecord {
             content: String::new(),
-            is_error,
             count: 0,
+            nudged: false,
         });
-        if rec.content == content && rec.is_error == is_error {
+        if rec.content == content {
             rec.count += 1;
         } else {
             rec.content = content.to_string();
-            rec.is_error = is_error;
             rec.count = 1;
+            rec.nudged = false;
         }
-        if rec.count >= MAX_IDENTICAL_TOOL_RESULTS {
-            Some(repeated_tool_summary(name, input, content, is_error))
-        } else {
-            None
+        if rec.count < MAX_IDENTICAL_TOOL_RESULTS {
+            return None;
         }
+        if !rec.nudged {
+            rec.nudged = true;
+            let preview = tools::preview(name, input);
+            return Some(LoopSignal::Nudge(format!(
+                "You already ran `{preview}` {} times and got the same result — \
+                 take a different action instead of repeating the same call.",
+                rec.count
+            )));
+        }
+        Some(LoopSignal::Stop(repeated_tool_summary(
+            name, input, content, is_error,
+        )))
     }
 }
 
@@ -276,14 +356,22 @@ fn note_loop_result(
     input: &serde_json::Value,
     content: &str,
     is_error: bool,
-    summary: &mut Option<String>,
+    nudge: &mut Option<String>,
+    stop: &mut Option<String>,
 ) {
-    if summary.is_some() {
+    if stop.is_some() {
         return;
     }
-    if let Some(loop_msg) = guard.note(name, input, content, is_error) {
-        report::assistant(&loop_msg);
-        *summary = Some(loop_msg);
+    match guard.note(name, input, content, is_error) {
+        Some(LoopSignal::Nudge(msg)) => {
+            report::notice("  ⟳ repeated tool result — nudging the model to change course");
+            *nudge = Some(msg);
+        }
+        Some(LoopSignal::Stop(msg)) => {
+            report::assistant(&msg);
+            *stop = Some(msg);
+        }
+        None => {}
     }
 }
 
@@ -355,7 +443,6 @@ fn repair_placeholder_tool_input(
 fn repair_write_file_input(input: &serde_json::Value, task: &str) -> Option<serde_json::Value> {
     let requested = auto_create_file_input(task)?;
     let requested_path = requested["path"].as_str().unwrap_or("");
-    let requested_content = requested["content"].as_str().unwrap_or("");
     let path = input
         .get("path")
         .or_else(|| input.get("filePath"))
@@ -366,11 +453,41 @@ fn repair_write_file_input(input: &serde_json::Value, task: &str) -> Option<serd
         .or_else(|| input.get("contents"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let should_repair = path.trim().is_empty()
+    let path_broken = path.trim().is_empty()
         || matches!(path.trim(), "~" | "." | "/" | "./")
-        || is_placeholder_path(path)
-        || (path == requested_path && content != requested_content);
-    should_repair.then_some(requested)
+        || is_placeholder_path(path);
+    // NEVER override non-empty plausible model content — only repair when the
+    // model wrote nothing usable (empty or an obvious placeholder).
+    if is_placeholder_content(content) {
+        return Some(requested);
+    }
+    if path_broken {
+        // The model's content is fine; only the destination path is broken.
+        let mut repaired = input.clone();
+        let key = if input.get("path").is_none() && input.get("filePath").is_some() {
+            "filePath"
+        } else {
+            "path"
+        };
+        repaired[key] = serde_json::Value::String(requested_path.to_string());
+        return Some(repaired);
+    }
+    None
+}
+
+/// True when write_file content is empty or an obvious stand-in the model left
+/// for "fill this in later" — real content, however different from the task
+/// text, must never be overwritten.
+fn is_placeholder_content(content: &str) -> bool {
+    let t = content.trim();
+    if t.is_empty() {
+        return true;
+    }
+    matches!(t, "..." | "…" | "TODO" | "todo" | "TBD" | "tbd")
+        || matches!(t, "<content>" | "{content}" | "(content)" | "<contents>")
+        || t.eq_ignore_ascii_case("your content here")
+        || t.eq_ignore_ascii_case("placeholder")
+        || t.eq_ignore_ascii_case("file content goes here")
 }
 
 fn should_repair_filesystem_root(path: &str, task: &str) -> bool {
@@ -530,6 +647,12 @@ fn request_reply(
     Ok(r)
 }
 
+// Normalized stop reason from the provider: "max_tokens" means the output was
+// cut off mid-generation, so both the text and any tool call may be incomplete.
+fn reply_truncated_at_token_limit(reply: &Reply) -> bool {
+    reply.stop_reason.as_deref() == Some("max_tokens")
+}
+
 static TEXT_TOOL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_text: &str) -> Reply {
@@ -582,19 +705,9 @@ fn is_casual_turn(text: &str) -> bool {
         .trim()
         .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
         .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "hi" | "hello"
-            | "hey"
-            | "yo"
-            | "sup"
-            | "thanks"
-            | "thank you"
-            | "ok"
-            | "okay"
-            | "cool"
-            | "nice"
-    )
+    // Only pure greetings: acknowledgements like "ok"/"thanks" are often valid
+    // "yes, proceed" turns and must not have their tool calls discarded.
+    matches!(normalized.as_str(), "hi" | "hello" | "hey")
 }
 
 fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<provider::ToolCall>> {
@@ -804,7 +917,7 @@ Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
 BUILD mode means execute: for any concrete build/fix/create/change request, inspect the project and make the needed edits instead of replying with a capability statement. \
-For simple browser games, canvas demos, landing pages, prototypes, and static visual apps, build an actual runnable artifact. Prefer a single self-contained HTML file via Artifact/publish_artifact unless the user explicitly asks for a framework. NEVER search GitHub, git clone external repositories, or look for existing games online when asked to build a game, app, or prototype from scratch. You MUST write the code yourself from scratch. When asked to build or create something, YOU MUST IMMEDIATELY CALL TOOLS to create the files on disk (e.g. write_file, edit_file, run_command). DO NOT output markdown instructions, step-by-step tutorials, or code blocks in chat telling the user how to build it! YOU are the builder — execute the tool calls to build it yourself directly. \
+When asked to build or create something, call tools to create the files on disk (write_file, edit_file, run_command) instead of pasting instructions or code blocks in chat — you are the builder. \
 For local web apps that require a dev server, use start_server, wait_for_url, inspect read_server_log if readiness fails, then open_browser when useful. \
 If a path or file is missing, use discovery tools before asking the user. \
 DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
@@ -820,6 +933,21 @@ Use run_command with grep/find/jq/awk/sed/git/curl/which before reaching for new
 over installing an alternative.",
     };
     Role { system }
+}
+
+// Web-artifact guidance is only relevant when the task actually asks to build
+// one — injecting it into every prompt biased the model toward canvas games.
+fn artifact_guidance(task: &str) -> Option<String> {
+    (static_artifact_requested(task) || canvas_game_requested(task)).then(|| {
+        "[Web artifact task]\n\
+         Build an actual runnable artifact: one complete self-contained HTML file via \
+         Artifact/publish_artifact with all CSS and JavaScript inline, unless the user \
+         explicitly asks for a framework. Include controls, restart/error states, responsive \
+         sizing, and touch/mobile support when useful; then open_browser if possible. \
+         Write the code yourself from scratch — never search GitHub or clone external \
+         repositories for the game/app. Never paste the HTML as plain markdown; call the tool."
+            .to_string()
+    })
 }
 
 // Build the system prompt prefix from memory and skills/agents files.
@@ -869,7 +997,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
     if let Some(mem) = config::load_memory() {
         // Memory is user-important; always include but truncate for small ctx
         let mem_text = if compact && mem.len() > 300 {
-            format!("{}…", &mem[..300])
+            format!("{}…", truncate_at_char_boundary(&mem, 300))
         } else {
             mem
         };
@@ -883,7 +1011,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         );
         // For small contexts, truncate Agents.md to avoid blowing the budget
         let agents_text = if compact && agents.len() > 500 {
-            format!("{}…", &agents[..500])
+            format!("{}…", truncate_at_char_boundary(&agents, 500))
         } else {
             agents
         };
@@ -892,33 +1020,13 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
 
     // Skip rules, knowledge, hooks, and skill descriptions for small contexts
     if !compact {
-        // Inject active rules for operational judgment
-        let mut engine = crate::rules::RuleEngine::load_defaults();
-        let rules_dir = config::home().join("rules");
-        if let Ok(rd) = std::fs::read_dir(&rules_dir) {
-            for e in rd.flatten() {
-                if let Ok(loaded) =
-                    crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
-                {
-                    for r in loaded.rules {
-                        engine.add_rule(r);
-                    }
-                }
-            }
-        }
-        let mut rules_summary = String::from("The following engineering constraints and business logic rules MUST be strictly enforced for operational judgment:\n");
-        for r in &engine.rules {
-            if r.enabled {
-                rules_summary.push_str(&format!(
-                    "• [{}] {} — {}\n",
-                    r.severity, r.id, r.description
-                ));
-            }
-        }
-        parts.push(format!(
-            "[Operational Judgment — Engineering Constraints & Rules]\n{}",
-            rules_summary.trim()
-        ));
+        // A separate verifier pass enforces the engineering rules — a 2-line
+        // pointer is enough; injecting the full rule list bloated every prompt.
+        parts.push(
+            "[Operational rules]\nProject engineering rules are enforced by a separate \
+             verifier pass after you finish.\nViolations are reported back to you to address."
+                .to_string(),
+        );
 
         // Inject structured knowledge base if present
         let kb = crate::knowledge::KnowledgeBase::new(".");
@@ -953,15 +1061,13 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
 }
 
 fn tool_manifest() -> String {
+    // Role guidance (no-placeholders, build-immediately, artifact rules) lives
+    // in role()/artifact_guidance() — this section only lists what's built in.
     "[Built-in tools — always available, no install needed]\n\
 Aliases are supported: bash/read/write/edit/patch/glob/grep/list/task/todowrite/todoread/webfetch/websearch/skill/question. \
 Use built-ins before installing anything. Use list_tree/find_paths/grep_files before guessing paths; use find_paths kind=`dir` for folders. \
-Use start_server/list_servers/wait_for_url/read_server_log/stop_server for long-running local dev servers, and open_browser for local URLs or generated HTML.\n\n\
-[CRITICAL TOOL DISCIPLINE]\n\
-• For generated/edited code, HTML, or file contents, call write_file/edit_file/Artifact; never paste code as plain markdown.\n\
-• For canvas games, browser games, standalone demos, landing pages, and small web apps: publish a complete runnable static HTML artifact with embedded CSS/JS unless a framework is explicitly requested. Include controls, restart/error states, responsive sizing, and touch/mobile support when useful; then open_browser if possible.\n\
-• When tasked to build, create, or write code/applications/games, build them locally from scratch. NEVER search the web or attempt to fetch non-existent repositories or URLs from GitHub or the internet unless the user explicitly provides a URL or asks to download from external sources.\n\
-• No placeholders. No asking for theme/layout/permission when a reasonable default works. Build immediately."
+Use start_server/list_servers/wait_for_url/read_server_log/stop_server for long-running local dev servers, and open_browser for local URLs or generated HTML. \
+For generated/edited code, HTML, or file contents, call write_file/edit_file/Artifact; never paste code as plain markdown."
         .to_string()
 }
 
@@ -1258,13 +1364,16 @@ pub fn run_build_session(
     sid: &str,
 ) -> Result<(), String> {
     hooks::notify("SessionStart", cwd);
-    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript).map(|_| ());
+    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript, Some(sid)).map(|_| ());
     hooks::notify("SessionEnd", cwd);
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
 }
 
+// `sid` is Some for the top-level session (per-round transcript saves) and
+// None for subagents, whose transcripts live inside the parent's results.
+#[allow(clippy::too_many_arguments)]
 fn build_inner(
     p: &Provider,
     perm: Permission,
@@ -1273,6 +1382,7 @@ fn build_inner(
     cwd: &Path,
     depth: usize,
     msgs: &mut Vec<Msg>,
+    sid: Option<&str>,
 ) -> Result<String, String> {
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
@@ -1289,8 +1399,15 @@ fn build_inner(
         tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
     };
     if msgs.is_empty() {
-        let prefix = context_prefix(cwd, p.context_tokens);
-        let sys = format!("{prefix}{}", role(role_id).system);
+        // Role identity and the current-mode contract come FIRST; the
+        // environment/tool-manifest/skills/memory sections follow.
+        let mut sys = String::from(role(role_id).system);
+        if let Some(guidance) = artifact_guidance(&task_for_recovery) {
+            sys.push_str("\n\n");
+            sys.push_str(&guidance);
+        }
+        sys.push_str("\n\n");
+        sys.push_str(&context_prefix(cwd, p.context_tokens));
         msgs.push(Msg::System(sys));
     }
     // If the caller already pushed a UserImages message (multimodal input), use its
@@ -1305,6 +1422,18 @@ fn build_inner(
     let mut loop_guard = ToolLoopGuard::default();
     let mut artifact_error_count = 0usize;
     let mut static_artifact_recovery_count = 0usize;
+    let mut empty_reply_retried = false;
+    let mut token_limit_continuations = 0usize;
+    let mut forced_compact_retry = false;
+    let mut verifier_fix_rounds = 0usize;
+    // Act-don't-explain tracking: whether any call reached dispatch, whether a
+    // mutating tool actually executed, and how many nudges were spent.
+    let mut act_nudges = 0usize;
+    let mut any_tool_ran = false;
+    let mut mutating_tool_ran = false;
+    // Executed calls and touched files, collected for the verifier pass.
+    let mut tool_records: Vec<crate::verifier::ToolCallRecord> = Vec::new();
+    let mut changed_files: Vec<String> = Vec::new();
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -1319,6 +1448,18 @@ fn build_inner(
         let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
             Ok(r) => r,
             Err(e) => {
+                // A context-overflow rejection is recoverable: force-compact the
+                // transcript and retry once instead of dying.
+                let lower = e.to_ascii_lowercase();
+                if !forced_compact_retry
+                    && (lower.contains("prompt is too long") || lower.contains("context length"))
+                {
+                    forced_compact_retry = true;
+                    report::notice("  ⟳ context overflow — force-compacting and retrying…");
+                    let taken = std::mem::take(msgs);
+                    *msgs = compact_with(taken, |middle| model_summary(p, middle));
+                    continue;
+                }
                 hooks::notify("OnError", cwd);
                 return Err(e);
             }
@@ -1330,10 +1471,89 @@ fn build_inner(
             tui::inference_telemetry(gen_toks.max(10), elapsed);
         }
         hooks::notify("PostResponse", cwd);
+        // Output truncated at the token limit: the reply (and any tool call in
+        // it) may be incomplete — ask the model to continue instead of acting
+        // on or returning a cut-off result. Bounded to avoid loops.
+        if reply_truncated_at_token_limit(&reply)
+            && token_limit_continuations < MAX_TOKEN_LIMIT_CONTINUATIONS
+        {
+            token_limit_continuations += 1;
+            report::notice(
+                "  ⚠ output truncated at the token limit — asking the model to continue",
+            );
+            let follow_up = if reply.calls.is_empty() {
+                "Your answer was cut off at the token limit — continue from where you stopped."
+            } else {
+                "Your response hit the output token limit mid tool call, so the call was \
+                 discarded. Re-issue the complete tool call with smaller content — e.g. split \
+                 large writes into multiple write_file/edit_file calls — and continue."
+            };
+            // Drop the possibly-truncated calls so no dangling tool_use block
+            // reaches the API; keep the text (when present) for continuity —
+            // an empty assistant turn would serialize to an empty content array.
+            if !reply.text.trim().is_empty() {
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
+            }
+            msgs.push(Msg::User(follow_up.to_string()));
+            continue;
+        }
         if reply.calls.is_empty() {
+            // One empty response is retried before ending the run; a second
+            // empty response ends it.
+            if reply.text.trim().is_empty() {
+                // No assistant turn is recorded here: an empty assistant
+                // message would serialize to an empty content array (API 400).
+                if !empty_reply_retried {
+                    empty_reply_retried = true;
+                    report::notice("model returned no output — asking it to continue");
+                    msgs.push(Msg::User(
+                        "You returned no output. Continue the task: call a tool or state your final answer."
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                report::notice("model returned no output");
+                return Ok(reply.text);
+            }
+            // Imperative task answered with how-to prose instead of tool
+            // calls: tell the model to act, bounded per task. Never fires
+            // once a mutating tool has run (that prose is a real summary).
+            if should_nudge_to_act(
+                &task_for_recovery,
+                &reply.text,
+                any_tool_ran,
+                mutating_tool_ran,
+                act_nudges,
+            ) {
+                act_nudges += 1;
+                report::notice("  ⟳ model explained instead of acting — nudging it to use tools");
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
+                msgs.push(Msg::User(
+                    "Do not explain how to do it — actually do it now. Use your tools \
+                     (write_file/edit_file/run_command) to make the changes. Begin immediately \
+                     with your first tool call."
+                        .to_string(),
+                ));
+                continue;
+            }
             if let Some(input) = auto_create_file_input(&task_for_recovery) {
+                // Record this harness recovery in the transcript so saved and
+                // resumed sessions aren't missing turns.
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
                 if let Some(reason) = gate(perm, "write_file", &input, cwd) {
                     report::tool_denied(&reason);
+                    msgs.push(Msg::User(format!(
+                        "[harness] write_file recovery blocked: {reason}"
+                    )));
                     return Err(reason);
                 }
                 report::tool_call("write_file", &tools::preview("write_file", &input), &input);
@@ -1343,65 +1563,50 @@ fn build_inner(
                 report::tool_result("write_file", &out.content, out.is_error);
                 trace_tool_result("write_file", &out.content, out.is_error, "build", depth);
                 if out.is_error {
+                    msgs.push(Msg::User(format!(
+                        "[harness] write_file recovery failed: {}",
+                        out.content
+                    )));
                     return Err(out.content);
                 }
+                msgs.push(Msg::User(format!(
+                    "[harness] completed the explicit file creation with write_file: {}",
+                    out.content
+                )));
                 return Ok(format!(
                     "{}\n\nCompleted the explicit file creation task after the model returned prose without tool calls.",
                     out.content
                 ));
             }
             if let Some(input) = auto_static_artifact_input(&task_for_recovery, &reply.text) {
+                msgs.push(Msg::Assistant {
+                    text: reply.text.clone(),
+                    calls: vec![],
+                });
                 report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
                 trace_tool_call("Artifact", &input, "build", depth);
                 let out = tools::run("Artifact", &input, cwd);
                 report::tool_result("Artifact", &out.content, out.is_error);
                 trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
                 if out.is_error {
-                    if canvas_game_requested(&task_for_recovery) {
-                        let fallback = fallback_canvas_game_input(&task_for_recovery);
-                        report::tool_call(
-                            "Artifact",
-                            &tools::preview("Artifact", &fallback),
-                            &fallback,
-                        );
-                        trace_tool_call("Artifact", &fallback, "build", depth);
-                        let fallback_out = tools::run("Artifact", &fallback, cwd);
-                        report::tool_result(
-                            "Artifact",
-                            &fallback_out.content,
-                            fallback_out.is_error,
-                        );
-                        trace_tool_result(
-                            "Artifact",
-                            &fallback_out.content,
-                            fallback_out.is_error,
-                            "build",
-                            depth,
-                        );
-                        if !fallback_out.is_error {
-                            return Ok(format!(
-                                "{}\n\nThe model produced incomplete canvas HTML, so buildwithnexus published a complete self-contained fallback canvas game.",
-                                fallback_out.content
-                            ));
-                        }
-                        return Err(fallback_out.content);
+                    // Tell the model exactly why the artifact was rejected and
+                    // let it fix and re-publish; fail honestly once bounded
+                    // recovery attempts run out.
+                    if artifact_error_count < 2 {
+                        artifact_error_count += 1;
+                        msgs.push(Msg::User(format!(
+                            "The HTML artifact you wrote in plain text was rejected: {}. \
+                             Fix that problem and re-publish: call Artifact/publish_artifact with one \
+                             complete self-contained HTML file. Do not answer with markdown code.",
+                            out.content
+                        )));
+                        continue;
                     }
-                    msgs.push(Msg::Assistant {
-                        text: reply.text.clone(),
-                        calls: vec![],
-                    });
-                    msgs.push(Msg::User(format!(
-                        "The HTML artifact you wrote in plain text was rejected: {}. \
-                         Rewrite it as one complete self-contained HTML artifact and call Artifact/publish_artifact. \
-                         Do not answer with markdown code.",
+                    return Err(format!(
+                        "artifact publishing failed after {artifact_error_count} recovery attempts; last rejection: {}",
                         out.content
-                    )));
-                    continue;
+                    ));
                 }
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
                 return Ok(out.content);
             }
             if static_artifact_requested(&task_for_recovery) {
@@ -1409,42 +1614,19 @@ fn build_inner(
                     text: reply.text.clone(),
                     calls: vec![],
                 });
-                if static_artifact_recovery_count == 0 {
+                if static_artifact_recovery_count < 2 {
                     static_artifact_recovery_count += 1;
                     msgs.push(Msg::User(static_artifact_recovery_prompt(
                         &task_for_recovery,
                     )));
                     continue;
                 }
-                if canvas_game_requested(&task_for_recovery) {
-                    let fallback = fallback_canvas_game_input(&task_for_recovery);
-                    report::tool_call(
-                        "Artifact",
-                        &tools::preview("Artifact", &fallback),
-                        &fallback,
-                    );
-                    trace_tool_call("Artifact", &fallback, "build", depth);
-                    let fallback_out = tools::run("Artifact", &fallback, cwd);
-                    report::tool_result("Artifact", &fallback_out.content, fallback_out.is_error);
-                    trace_tool_result(
-                        "Artifact",
-                        &fallback_out.content,
-                        fallback_out.is_error,
-                        "build",
-                        depth,
-                    );
-                    if !fallback_out.is_error {
-                        return Ok(format!(
-                            "{}\n\nThe model did not produce a runnable canvas artifact after being asked to proceed with reasonable defaults, so buildwithnexus published a complete self-contained fallback canvas game.",
-                            fallback_out.content
-                        ));
-                    }
-                    return Err(fallback_out.content);
-                }
-                return Ok(reply.text);
-            }
-            if reply.text.trim().is_empty() {
-                report::notice("model returned no output");
+                // No fabricated fallback artifact: report the failure honestly.
+                return Err(format!(
+                    "the model did not produce a runnable web artifact after \
+                     {static_artifact_recovery_count} recovery prompts; its last response was:\n{}",
+                    reply.text
+                ));
             }
             msgs.push(Msg::Assistant {
                 text: reply.text.clone(),
@@ -1455,12 +1637,12 @@ fn build_inner(
 
         let mut results = Vec::new();
         let mut summary: Option<String> = None;
+        let mut loop_nudge: Option<String> = None;
+        let mut loop_stop: Option<String> = None;
+        let mut artifact_recovery: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                let msg = format!(
-                    "tool arguments were not valid JSON: {}",
-                    raw.chars().take(200).collect::<String>()
-                );
+                let msg = invalid_args_feedback(&call.name, raw, &defs);
                 report::tool_denied(&msg);
                 note_loop_result(
                     &mut loop_guard,
@@ -1468,7 +1650,8 @@ fn build_inner(
                     &call.input,
                     &msg,
                     true,
-                    &mut summary,
+                    &mut loop_nudge,
+                    &mut loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -1485,56 +1668,7 @@ fn build_inner(
                 depth,
                 &task_for_recovery,
             );
-            if matches!(call.name.as_str(), "bash" | "run_command") {
-                if let Some(fallback) = auto_create_file_input(&task_for_recovery) {
-                    report::notice(
-                        "  recovery: using write_file for explicit file creation instead of shell",
-                    );
-                    if let Some(reason) = gate(perm, "write_file", &fallback, cwd) {
-                        report::tool_denied(&reason);
-                        results.push(ToolResult {
-                            id: call.id.clone(),
-                            content: reason,
-                            is_error: true,
-                        });
-                        continue;
-                    }
-                    report::tool_call(
-                        "write_file",
-                        &tools::preview("write_file", &fallback),
-                        &fallback,
-                    );
-                    trace_tool_call("write_file", &fallback, "build", depth);
-                    let fallback_out = tools::run("write_file", &fallback, cwd);
-                    hooks::post_tool_use(
-                        "write_file",
-                        &fallback,
-                        &fallback_out.content,
-                        fallback_out.is_error,
-                        cwd,
-                    );
-                    report::tool_result("write_file", &fallback_out.content, fallback_out.is_error);
-                    trace_tool_result(
-                        "write_file",
-                        &fallback_out.content,
-                        fallback_out.is_error,
-                        "build",
-                        depth,
-                    );
-                    results.push(ToolResult {
-                        id: call.id.clone(),
-                        content: fallback_out.content.clone(),
-                        is_error: fallback_out.is_error,
-                    });
-                    if !fallback_out.is_error {
-                        summary = Some(format!(
-                            "{}\n\nCompleted the explicit file creation task with write_file.",
-                            fallback_out.content
-                        ));
-                    }
-                    continue;
-                }
-            }
+            any_tool_ran = true;
             report::tool_call(
                 &call.name,
                 &tools::preview(&call.name, &call_input),
@@ -1552,7 +1686,8 @@ fn build_inner(
                     &call_input,
                     &answer,
                     is_error,
-                    &mut summary,
+                    &mut loop_nudge,
+                    &mut loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -1580,7 +1715,8 @@ fn build_inner(
                     &call_input,
                     &reason,
                     true,
-                    &mut summary,
+                    &mut loop_nudge,
+                    &mut loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -1609,7 +1745,8 @@ fn build_inner(
                         &call_input,
                         &msg,
                         true,
-                        &mut summary,
+                        &mut loop_nudge,
+                        &mut loop_stop,
                     );
                     results.push(ToolResult {
                         id: call.id.clone(),
@@ -1621,13 +1758,15 @@ fn build_inner(
             }
 
             if matches!(call.name.as_str(), "task" | "spawn_subagent") {
-                let out = spawn_subagent(p, perm, &call_input, cwd, depth);
-                report::tool_result(&call.name, &out, false);
-                trace_tool_result(&call.name, &out, false, "build", depth);
+                // A subagent can mutate the workspace — count it as action.
+                mutating_tool_ran = true;
+                let (out, is_error) = spawn_subagent(p, perm, &call_input, cwd, depth);
+                report::tool_result(&call.name, &out, is_error);
+                trace_tool_result(&call.name, &out, is_error, "build", depth);
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: out,
-                    is_error: false,
+                    is_error,
                 });
                 continue;
             }
@@ -1647,6 +1786,9 @@ fn build_inner(
                 }
             }
 
+            if tools::is_mutating_call(&call.name, &call_input) {
+                mutating_tool_ran = true;
+            }
             let out = tools::run(&call.name, &call_input, cwd);
             hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
             if out.is_error {
@@ -1654,62 +1796,44 @@ fn build_inner(
             }
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
-            if matches!(call.name.as_str(), "bash" | "run_command")
-                && out.is_error
-                && out.content.contains("No such file or directory")
-            {
-                if let Some(fallback) = auto_create_file_input(&task_for_recovery) {
-                    report::tool_call(
-                        "write_file",
-                        &tools::preview("write_file", &fallback),
-                        &fallback,
-                    );
-                    trace_tool_call("write_file", &fallback, "build", depth);
-                    let fallback_out = tools::run("write_file", &fallback, cwd);
-                    report::tool_result("write_file", &fallback_out.content, fallback_out.is_error);
-                    trace_tool_result(
-                        "write_file",
-                        &fallback_out.content,
-                        fallback_out.is_error,
-                        "build",
-                        depth,
-                    );
-                    if !fallback_out.is_error {
-                        summary = Some(format!(
-                            "{}\n\nRecovered from a failed shell redirect by writing the requested file directly.",
-                            fallback_out.content
-                        ));
+            // Feed the verifier real data: every executed call, and the files
+            // touched by successful write/edit tools.
+            tool_records.push(crate::verifier::ToolCallRecord {
+                tool_name: call.name.clone(),
+                args_summary: tools::preview(&call.name, &call_input),
+                result_preview: out.content.chars().take(200).collect(),
+                timestamp: String::new(),
+            });
+            if !out.is_error {
+                if let Some(pb) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
+                    let path = pb.display().to_string();
+                    if !changed_files.contains(&path) {
+                        changed_files.push(path);
                     }
                 }
             }
             if matches!(call.name.as_str(), "Artifact" | "publish_artifact")
                 && out.is_error
-                && canvas_game_requested(&task_for_recovery)
+                && (static_artifact_requested(&task_for_recovery)
+                    || canvas_game_requested(&task_for_recovery))
             {
+                // No fabricated fallback artifact: tell the model exactly why
+                // publishing was rejected and ask it to fix and re-publish;
+                // fail honestly after bounded recovery attempts.
                 artifact_error_count += 1;
-                if artifact_error_count >= 1 {
-                    let fallback = fallback_canvas_game_input(&task_for_recovery);
-                    report::tool_call(
-                        "Artifact",
-                        &tools::preview("Artifact", &fallback),
-                        &fallback,
-                    );
-                    trace_tool_call("Artifact", &fallback, "build", depth);
-                    let fallback_out = tools::run("Artifact", &fallback, cwd);
-                    report::tool_result("Artifact", &fallback_out.content, fallback_out.is_error);
-                    trace_tool_result(
-                        "Artifact",
-                        &fallback_out.content,
-                        fallback_out.is_error,
-                        "build",
-                        depth,
-                    );
-                    if !fallback_out.is_error {
-                        summary = Some(format!(
-                            "{}\n\nThe model repeatedly produced incomplete canvas HTML, so buildwithnexus published a complete self-contained fallback canvas game.",
-                            fallback_out.content
-                        ));
-                    }
+                if artifact_error_count <= 2 {
+                    artifact_recovery = Some(format!(
+                        "Your artifact was rejected: {}. Fix that exact problem and call \
+                         Artifact/publish_artifact again with one complete self-contained HTML file \
+                         (all CSS/JS inline). Do not answer with markdown code.",
+                        out.content
+                    ));
+                } else {
+                    loop_stop = Some(format!(
+                        "artifact publishing failed after {artifact_error_count} attempts; \
+                         last rejection: {}",
+                        out.content
+                    ));
                 }
             }
             if out.finished {
@@ -1722,7 +1846,8 @@ fn build_inner(
                     &call_input,
                     &out.content,
                     out.is_error,
-                    &mut summary,
+                    &mut loop_nudge,
+                    &mut loop_stop,
                 );
             }
             results.push(ToolResult {
@@ -1737,6 +1862,11 @@ fn build_inner(
             calls: reply.calls,
         });
         msgs.push(Msg::Tool(results));
+        // Persist the transcript after every tool round so a crash or kill
+        // doesn't lose the session (save is cheap and swallows I/O errors).
+        if let Some(sid) = sid {
+            crate::session::save(sid, cwd, &p.model, msgs);
+        }
         if !report::is_json() {
             tui::context_meter(estimate_tokens(msgs), p.context_tokens);
             tui::poll_typeahead();
@@ -1746,30 +1876,67 @@ fn build_inner(
                 let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
                 let ctx = crate::verifier::VerificationContext {
                     task_description: task.to_string(),
-                    task_type: None,
-                    changed_files: vec![],
-                    tool_calls: vec![],
-                    evidence_gathered: vec![],
-                    tests_added: vec![],
-                    dependencies_changed: vec![],
-                    git_diff: None,
+                    changed_files: changed_files.clone(),
+                    tool_calls: tool_records.clone(),
+                    ..Default::default()
                 };
                 let rep = verifier.verify(&ctx);
-                if matches!(
-                    rep.status,
-                    crate::verifier::VerificationStatus::PassedWithWarnings
-                        | crate::verifier::VerificationStatus::Blocked
-                        | crate::verifier::VerificationStatus::Failed
-                ) {
-                    report::notice(&format!("  [Verification: {}]", rep.status));
-                    if !rep.rule_violations.is_empty() {
-                        report::notice(&crate::rules::RuleEngine::format_violations(
-                            &rep.rule_violations,
+                match rep.status {
+                    crate::verifier::VerificationStatus::Blocked
+                    | crate::verifier::VerificationStatus::Failed
+                        if verifier_fix_rounds < MAX_VERIFIER_FIX_ROUNDS =>
+                    {
+                        // Give the model a chance to address the violations
+                        // before finishing.
+                        verifier_fix_rounds += 1;
+                        let violations =
+                            crate::rules::RuleEngine::format_violations(&rep.rule_violations);
+                        report::notice(&format!(
+                            "  [Verification: {} — asking the model to address violations]",
+                            rep.status
+                        ));
+                        report::notice(&violations);
+                        msgs.push(Msg::User(format!(
+                            "Verification of your finished work returned `{}` with these rule \
+                             violations:\n{violations}\nAddress them, then call finish again.",
+                            rep.status
+                        )));
+                        continue;
+                    }
+                    crate::verifier::VerificationStatus::Blocked
+                    | crate::verifier::VerificationStatus::Failed => {
+                        // Fix rounds exhausted: finish anyway with an honest note.
+                        let violations =
+                            crate::rules::RuleEngine::format_violations(&rep.rule_violations);
+                        report::notice(&format!("  [Verification: {}]", rep.status));
+                        return Ok(format!(
+                            "{s}\n\n[verification note] The verifier still reports `{}` after \
+                             {verifier_fix_rounds} fix attempts:\n{violations}",
+                            rep.status
                         ));
                     }
+                    crate::verifier::VerificationStatus::PassedWithWarnings => {
+                        report::notice(&format!("  [Verification: {}]", rep.status));
+                        if !rep.rule_violations.is_empty() {
+                            report::notice(&crate::rules::RuleEngine::format_violations(
+                                &rep.rule_violations,
+                            ));
+                        }
+                    }
+                    crate::verifier::VerificationStatus::Passed => {}
                 }
             }
             return Ok(s);
+        }
+        if let Some(stop_msg) = loop_stop {
+            // A stopped loop (or exhausted artifact recovery) is not success —
+            // surface it as a failure with the honest summary.
+            return Err(stop_msg);
+        }
+        if let Some(recovery) = artifact_recovery {
+            msgs.push(Msg::User(recovery));
+        } else if let Some(nudge) = loop_nudge {
+            msgs.push(Msg::User(nudge));
         }
     }
     Err(format!(
@@ -1777,17 +1944,46 @@ fn build_inner(
     ))
 }
 
+// Feedback for a tool call whose arguments failed to parse: name the tool,
+// show the parse error and the schema's required params, and demand a re-send.
+fn invalid_args_feedback(name: &str, raw: &str, defs: &[tools::ToolDef]) -> String {
+    let parse_err = match serde_json::from_str::<serde_json::Value>(raw) {
+        Err(e) => e.to_string(),
+        Ok(_) => "arguments did not match the expected object shape".to_string(),
+    };
+    let required = defs
+        .iter()
+        .find(|d| d.name == name)
+        .and_then(|d| d.schema.get("required"))
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(none)".to_string());
+    format!(
+        "Tool `{name}` arguments were not valid JSON ({parse_err}): {}. \
+         Required params: {required}. Re-send the complete corrected call.",
+        raw.chars().take(200).collect::<String>()
+    )
+}
+
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+// Returns the subagent's result and whether it failed — failures must reach
+// the parent model as is_error so it can react instead of trusting bad output.
 fn spawn_subagent(
     p: &Provider,
     perm: Permission,
     input: &serde_json::Value,
     cwd: &Path,
     depth: usize,
-) -> String {
+) -> (String, bool) {
     if depth + 1 >= MAX_DEPTH {
-        return "subagent depth limit reached".into();
+        return ("subagent depth limit reached".into(), true);
     }
     let task = input["task"]
         .as_str()
@@ -1795,7 +1991,7 @@ fn spawn_subagent(
         .unwrap_or("")
         .trim();
     if task.is_empty() {
-        return "spawn_subagent requires a task".into();
+        return ("spawn_subagent requires a task".into(), true);
     }
     let role = input["role"].as_str().unwrap_or("engineer");
     let isolate = input["isolate"].as_bool().unwrap_or(false);
@@ -1828,8 +2024,11 @@ fn spawn_subagent(
         }),
     );
     let mut child: Vec<Msg> = Vec::new();
-    let result = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child)
-        .unwrap_or_else(|e| format!("subagent error: {e}"));
+    let (result, is_error) =
+        match build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child, None) {
+            Ok(r) => (r, false),
+            Err(e) => (format!("subagent error: {e}"), true),
+        };
     trace::record_visible(
         "subagent_done",
         format!("{role}: {}", trace::preview(task, 80)),
@@ -1839,10 +2038,11 @@ fn spawn_subagent(
             "isolate": isolate,
             "cwd": run_cwd.to_string_lossy(),
             "result": result,
+            "is_error": is_error,
             "depth": depth + 1,
         }),
     );
-    format!("{note}{result}")
+    (format!("{note}{result}"), is_error)
 }
 
 fn make_worktree(cwd: &Path) -> Option<PathBuf> {
@@ -2080,7 +2280,31 @@ fn recovery_task_text(task: &str) -> String {
         .to_string()
 }
 
+// A build/create verb must co-occur with the artifact noun so that "fix the
+// collision bug in my game" or "explain how this website works" don't trigger
+// artifact-recovery flows.
+fn task_has_build_verb(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+        matches!(
+            word,
+            "build"
+                | "create"
+                | "make"
+                | "write"
+                | "generate"
+                | "develop"
+                | "implement"
+                | "code"
+                | "publish"
+        )
+    })
+}
+
 fn static_artifact_requested(task: &str) -> bool {
+    if !task_has_build_verb(task) {
+        return false;
+    }
     let lower = task.to_lowercase();
     [
         "canvas game",
@@ -2159,79 +2383,102 @@ fn extract_html_title(html: &str) -> Option<String> {
 }
 
 fn canvas_game_requested(task: &str) -> bool {
+    if !task_has_build_verb(task) {
+        return false;
+    }
     let lower = task.to_lowercase();
     lower.contains("canvas game") || lower.contains("browser game") || lower.contains("game")
 }
 
-fn fallback_canvas_game_input(task: &str) -> serde_json::Value {
-    let title = if task.to_lowercase().contains("orbit") {
-        "Orbit Dodge"
-    } else {
-        "Canvas Dodge"
-    };
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<style>
-html,body{{margin:0;height:100%;overflow:hidden;background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}}
-#wrap{{position:fixed;inset:0;display:grid;place-items:center;background:radial-gradient(circle at 50% 35%,#1f2937,#030712 70%)}}
-canvas{{width:min(94vw,860px);height:min(72vh,560px);background:#050816;border:1px solid #334155;box-shadow:0 24px 80px #0008}}
-#hud{{position:fixed;left:18px;right:18px;top:14px;display:flex;justify-content:space-between;gap:16px;font-weight:700;text-shadow:0 2px 8px #000}}
-#help{{position:fixed;left:18px;right:18px;bottom:14px;text-align:center;color:#9ca3af;font-size:14px}}
-#pad{{position:fixed;right:18px;bottom:56px;display:grid;grid-template-columns:48px 48px 48px;gap:8px}}
-button{{background:#1f2937cc;color:#e5e7eb;border:1px solid #475569;border-radius:8px;min-height:44px;font:inherit}}
-@media (pointer:fine){{#pad{{display:none}}}}
-</style>
-</head>
-<body>
-<div id="wrap"><canvas id="game" width="860" height="560"></canvas></div>
-<div id="hud"><span id="score">Score 0</span><span id="state">Move to start</span></div>
-<div id="help">WASD/Arrows move · Space/P pause · R restart · Dodge the orbiting sparks</div>
-<div id="pad"><span></span><button data-k="ArrowUp">↑</button><span></span><button data-k="ArrowLeft">←</button><button data-k=" ">Ⅱ</button><button data-k="ArrowRight">→</button><span></span><button data-k="ArrowDown">↓</button><span></span></div>
-<script>
-const c=document.getElementById('game'),x=c.getContext('2d'),scoreEl=document.getElementById('score'),stateEl=document.getElementById('state');
-const keys=new Set();let player,orbs,score,best=0,over=false,paused=false,last=0;
-function reset(){{player={{x:c.width/2,y:c.height/2,r:11,vx:0,vy:0}};orbs=[];score=0;over=false;paused=false;last=0;stateEl.textContent='Survive';for(let i=0;i<7;i++)orbs.push({{a:i*.9,d:70+i*34,s:.7+i*.08,r:8+i%3}});}}
-function key(k,on){{if(on)keys.add(k);else keys.delete(k);if(k==='r'||k==='R')reset();if(k===' '||k==='p'||k==='P')paused=!paused;}}
-addEventListener('keydown',e=>{{key(e.key,true);if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key))e.preventDefault();}});
-addEventListener('keyup',e=>key(e.key,false));
-document.querySelectorAll('button').forEach(b=>{{b.onpointerdown=e=>{{b.setPointerCapture(e.pointerId);key(b.dataset.k,true)}};b.onpointerup=e=>key(b.dataset.k,false);}});
-function step(t){{requestAnimationFrame(step);let dt=Math.min(.033,(t-last)/1000||0);last=t;if(paused){{draw();stateEl.textContent='Paused';return}}if(over){{draw();stateEl.textContent='Game over · R to restart';return}}
-let ax=(keys.has('ArrowRight')||keys.has('d')||keys.has('D'))-(keys.has('ArrowLeft')||keys.has('a')||keys.has('A'));
-let ay=(keys.has('ArrowDown')||keys.has('s')||keys.has('S'))-(keys.has('ArrowUp')||keys.has('w')||keys.has('W'));
-player.vx=(player.vx+ax*900*dt)*.86;player.vy=(player.vy+ay*900*dt)*.86;player.x=Math.max(player.r,Math.min(c.width-player.r,player.x+player.vx*dt));player.y=Math.max(player.r,Math.min(c.height-player.r,player.y+player.vy*dt));
-score+=dt*10;best=Math.max(best,score);scoreEl.textContent=`Score ${{score|0}} · Best ${{best|0}}`;
-for(const o of orbs){{o.a+=o.s*dt;let ox=c.width/2+Math.cos(o.a)*o.d,oy=c.height/2+Math.sin(o.a*1.35)*o.d;if(Math.hypot(player.x-ox,player.y-oy)<player.r+o.r)over=true;}}
-draw();}}
-function draw(){{x.clearRect(0,0,c.width,c.height);x.fillStyle='#111827';x.fillRect(0,0,c.width,c.height);x.strokeStyle='#1f9cf0';x.globalAlpha=.18;for(let r=70;r<330;r+=34){{x.beginPath();x.ellipse(c.width/2,c.height/2,r,r*.72,0,0,7);x.stroke();}}x.globalAlpha=1;for(const o of orbs){{let ox=c.width/2+Math.cos(o.a)*o.d,oy=c.height/2+Math.sin(o.a*1.35)*o.d;x.fillStyle='#f97316';x.beginPath();x.arc(ox,oy,o.r,0,7);x.fill();}}x.fillStyle=over?'#ef4444':'#22c55e';x.beginPath();x.arc(player.x,player.y,player.r,0,7);x.fill();}}
-reset();requestAnimationFrame(step);
-</script>
-</body>
-</html>"#
-    );
-    serde_json::json!({
-        "title": title,
-        "contents": html,
-        "type": "html",
-    })
+// An imperative task tells the agent to do work, not answer a question —
+// prose-only replies to these get the act-don't-explain nudge. Reuses the
+// build-verb classifier plus change-verbs like add/fix; question-style tasks
+// ("how do I build…?") want an answer and are excluded.
+fn task_is_imperative(task: &str) -> bool {
+    let lower = task.trim().to_lowercase();
+    if lower.ends_with('?')
+        || [
+            "how ", "what ", "why ", "when ", "where ", "who ", "which ", "should ", "could ",
+            "can ", "is ", "are ", "does ", "do ", "explain ",
+        ]
+        .iter()
+        .any(|q| lower.starts_with(q))
+    {
+        return false;
+    }
+    task_has_build_verb(task)
+        || lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+            matches!(
+                word,
+                "add"
+                    | "fix"
+                    | "refactor"
+                    | "update"
+                    | "install"
+                    | "convert"
+                    | "remove"
+                    | "rename"
+                    | "delete"
+                    | "change"
+                    | "setup"
+            )
+        })
+}
+
+// Fix 14 decision: nudge the model to act instead of explaining. Fires only
+// for imperative tasks, only before any mutating tool has run this session,
+// and only while the per-task cap has not been reached. A prose reply with no
+// tool activity at all, or one that reads as how-to instructions, is treated
+// as explaining rather than doing.
+fn should_nudge_to_act(
+    task: &str,
+    reply_text: &str,
+    any_tool_ran: bool,
+    mutating_tool_ran: bool,
+    nudges_so_far: usize,
+) -> bool {
+    if nudges_so_far >= MAX_ACT_NUDGES || mutating_tool_ran || !task_is_imperative(task) {
+        return false;
+    }
+    !any_tool_ran || reads_as_instructions(reply_text)
+}
+
+// True when a reply reads as instructions/explanation for the USER to follow
+// ("here's how", "you should…") rather than a summary of completed work.
+// Kept conservative: callers must also check that no mutating tool ran.
+fn reads_as_instructions(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "you can",
+        "you should",
+        "you could",
+        "you'll need to",
+        "you will need to",
+        "here's how",
+        "here is how",
+        "steps:",
+        "step 1",
+        "first,",
+        "follow these steps",
+        "to do this",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 // ── PLAN mode ─────────────────────────────────────────────────────────────────
 // The planning phase now has tools available so the model can inspect the
 // codebase while breaking down the task. Execution still runs through BUILD.
 pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
+    // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
-        "{prefix}You are a planning engineer with full access to the codebase. \
+        "You are a planning engineer with full access to the codebase. \
         Use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect the project as needed. \
         Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
         When ready, call exit_plan or ExitPlanMode with a concise numbered implementation plan. \
         The plan must be concrete, actionable, and at most 8 steps. \
-        Do not include code fences, shell snippets, intro text, or outro text."
+        Do not include code fences, shell snippets, intro text, or outro text.\n\n{prefix}"
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
@@ -2296,12 +2543,10 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         // Execute tool calls during the planning phase.
         let mut results = Vec::new();
         let mut loop_summary: Option<String> = None;
+        let mut loop_nudge: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                let msg = format!(
-                    "tool arguments were not valid JSON: {}",
-                    raw.chars().take(200).collect::<String>()
-                );
+                let msg = invalid_args_feedback(&call.name, raw, &defs);
                 report::tool_denied(&msg);
                 note_loop_result(
                     &mut loop_guard,
@@ -2309,6 +2554,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     &call.input,
                     &msg,
                     true,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2380,6 +2626,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     &call_input,
                     &answer,
                     is_error,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2406,6 +2653,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     &call_input,
                     &reason,
                     true,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2438,6 +2686,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 &call_input,
                 &out.content,
                 out.is_error,
+                &mut loop_nudge,
                 &mut loop_summary,
             );
             results.push(ToolResult {
@@ -2462,6 +2711,9 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 continue;
             }
             return Err(loop_msg);
+        }
+        if let Some(nudge) = loop_nudge {
+            msgs.push(Msg::User(nudge));
         }
     };
 
@@ -2542,13 +2794,14 @@ pub fn run_brainstorm(
     cwd: &Path,
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
+    // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
-    let sys = format!("{prefix}You are a sharp, concise thought partner with full access to the codebase and the internet. \
+    let sys = format!("You are a sharp, concise thought partner with full access to the codebase and the internet. \
         Use tools freely to look things up, read files, grep for patterns, or run commands — \
         whatever helps the conversation. \
         When you think the user is ready to stop discussing and start building or planning, \
         end your response with the exact token [SUGGEST:BUILD] or [SUGGEST:PLAN] on its own line. \
-        Otherwise just respond naturally. No fluff.");
+        Otherwise just respond naturally. No fluff.\n\n{prefix}");
 
     let defs = tools::defs_for_context(false, p.context_tokens);
     let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
@@ -2592,12 +2845,10 @@ pub fn run_brainstorm(
             // Execute tool calls inline.
             let mut results = Vec::new();
             let mut loop_summary: Option<String> = None;
+            let mut loop_nudge: Option<String> = None;
             for call in &reply.calls {
                 if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                    let msg = format!(
-                        "tool arguments were not valid JSON: {}",
-                        raw.chars().take(200).collect::<String>()
-                    );
+                    let msg = invalid_args_feedback(&call.name, raw, &defs);
                     report::tool_denied(&msg);
                     note_loop_result(
                         &mut loop_guard,
@@ -2605,6 +2856,7 @@ pub fn run_brainstorm(
                         &call.input,
                         &msg,
                         true,
+                        &mut loop_nudge,
                         &mut loop_summary,
                     );
                     results.push(ToolResult {
@@ -2638,6 +2890,7 @@ pub fn run_brainstorm(
                         &call_input,
                         &answer,
                         is_error,
+                        &mut loop_nudge,
                         &mut loop_summary,
                     );
                     results.push(ToolResult {
@@ -2664,6 +2917,7 @@ pub fn run_brainstorm(
                         &call_input,
                         &reason,
                         true,
+                        &mut loop_nudge,
                         &mut loop_summary,
                     );
                     results.push(ToolResult {
@@ -2697,6 +2951,7 @@ pub fn run_brainstorm(
                     &call_input,
                     &out.content,
                     out.is_error,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2716,6 +2971,9 @@ pub fn run_brainstorm(
             }
             if let Some(loop_msg) = loop_summary {
                 break loop_msg;
+            }
+            if let Some(nudge) = loop_nudge {
+                msgs.push(Msg::User(nudge));
             }
         };
 
@@ -2764,12 +3022,13 @@ pub fn run_chat_turn(
     cwd: &Path,
     question: &str,
 ) -> Result<(), String> {
+    // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
-        "{prefix}You are buildwithnexus in a coding terminal. Answer the user's current message naturally and concisely. \
+        "You are buildwithnexus in a coding terminal. Answer the user's current message naturally and concisely. \
         If the user asks a normal conversational question or greeting, answer in plain text and do not call tools. \
         If answering well requires inspecting the workspace or environment, use tools, then summarize the result. \
-        Do not emit JSON unless a tool call is actually required by the tool protocol."
+        Do not emit JSON unless a tool call is actually required by the tool protocol.\n\n{prefix}"
     );
 
     let defs = tools::defs_for_context(false, p.context_tokens);
@@ -2796,12 +3055,10 @@ pub fn run_chat_turn(
 
         let mut results = Vec::new();
         let mut loop_summary: Option<String> = None;
+        let mut loop_nudge: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                let msg = format!(
-                    "tool arguments were not valid JSON: {}",
-                    raw.chars().take(200).collect::<String>()
-                );
+                let msg = invalid_args_feedback(&call.name, raw, &defs);
                 report::tool_denied(&msg);
                 note_loop_result(
                     &mut loop_guard,
@@ -2809,6 +3066,7 @@ pub fn run_chat_turn(
                     &call.input,
                     &msg,
                     true,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2852,6 +3110,7 @@ pub fn run_chat_turn(
                     &call_input,
                     &reason,
                     true,
+                    &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
@@ -2872,6 +3131,7 @@ pub fn run_chat_turn(
                 &call_input,
                 &out.content,
                 out.is_error,
+                &mut loop_nudge,
                 &mut loop_summary,
             );
             results.push(ToolResult {
@@ -2893,6 +3153,9 @@ pub fn run_chat_turn(
         if let Some(loop_msg) = loop_summary {
             report::assistant(&loop_msg);
             return Ok(());
+        }
+        if let Some(nudge) = loop_nudge {
+            msgs.push(Msg::User(nudge));
         }
     }
 
@@ -2955,7 +3218,7 @@ mod tests {
         let defs = tools::defs_for_context(true, 128_000);
         let reply = Reply {
             text: "```json\n{\"name\":\"start_server\",\"arguments\":{\"command\":\"npm start\",\"cwd\":\"/tmp/app\",\"port\":3000}}\n```".to_string(),
-            calls: vec![],
+            ..Default::default()
         };
         let normalized = normalize_text_tool_calls(reply, &defs, "build the app");
         assert_eq!(normalized.text, "");
@@ -2969,7 +3232,7 @@ mod tests {
         let defs = tools::defs_for_context(true, 128_000);
         let reply = Reply {
             text: "```json\n{\"name\":\"start_server\",\"arguments\":{\"command\":\"npm start\",\"port\":3000}}\n```".to_string(),
-            calls: vec![],
+            ..Default::default()
         };
         let normalized = normalize_text_tool_calls(reply, &defs, "hello");
         assert!(normalized.calls.is_empty());
@@ -3097,7 +3360,9 @@ mod tests {
     }
 
     #[test]
-    fn write_file_placeholder_path_is_repaired_from_create_task() {
+    fn write_file_placeholder_path_is_repaired_but_content_is_kept() {
+        // A broken destination path is repaired from the task, but the model's
+        // non-empty content is preserved — never replaced with the task text.
         let repaired = repair_placeholder_tool_input(
             "write_file",
             &json!({"path": "~", "content": "exit plan smoke\n- Create scratch/exitplan-smoke.txt"}),
@@ -3106,20 +3371,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repaired["path"], "scratch/exitplan-smoke.txt");
-        assert_eq!(repaired["content"], "exit plan smoke");
+        assert_eq!(
+            repaired["content"],
+            "exit plan smoke\n- Create scratch/exitplan-smoke.txt"
+        );
     }
 
     #[test]
-    fn write_file_plan_contaminated_content_is_repaired_from_create_task() {
-        let repaired = repair_placeholder_tool_input(
+    fn write_file_nonempty_content_is_never_overridden() {
+        // Path matches the task but content differs: real model output must
+        // pass through untouched (no repair at all).
+        assert!(repair_placeholder_tool_input(
             "write",
             &json!({"path": "scratch/exitplan-smoke.txt", "content": "exit plan smoke\n\n1. Create scratch/exitplan-smoke.txt"}),
             Path::new("/tmp/example-project"),
             "create scratch/exitplan-smoke.txt containing exit plan smoke",
         )
+        .is_none());
+    }
+
+    #[test]
+    fn write_file_empty_or_placeholder_content_is_repaired() {
+        let task = "create scratch/exitplan-smoke.txt containing exit plan smoke";
+        let cwd = Path::new("/tmp/example-project");
+        let empty = repair_placeholder_tool_input(
+            "write_file",
+            &json!({"path": "scratch/exitplan-smoke.txt", "content": ""}),
+            cwd,
+            task,
+        )
         .unwrap();
-        assert_eq!(repaired["path"], "scratch/exitplan-smoke.txt");
-        assert_eq!(repaired["content"], "exit plan smoke");
+        assert_eq!(empty["content"], "exit plan smoke");
+        let todo = repair_placeholder_tool_input(
+            "write_file",
+            &json!({"path": "scratch/exitplan-smoke.txt", "content": "TODO"}),
+            cwd,
+            task,
+        )
+        .unwrap();
+        assert_eq!(todo["content"], "exit plan smoke");
+        assert_eq!(todo["path"], "scratch/exitplan-smoke.txt");
     }
 
     #[test]
@@ -3297,13 +3588,8 @@ mod tests {
     #[test]
     fn gate_ask_allows_default_allowed_commands() {
         let cwd = Path::new("/proj");
-        // git, cargo, npm are in the default allowed_commands list
-        for cmd in &[
-            "git status",
-            "cargo test",
-            "npm install",
-            "git commit -m 'x'",
-        ] {
+        // Only read-only binaries remain in the default allowed_commands list.
+        for cmd in &["ls -la", "cat foo.txt", "grep -r pattern ."] {
             let r = gate(
                 Permission::Ask,
                 "run_command",
@@ -3311,6 +3597,19 @@ mod tests {
                 cwd,
             );
             assert!(r.is_none(), "expected {cmd} to be auto-allowed in Ask mode");
+        }
+        // Mutating binaries now require confirmation (denied in a non-terminal).
+        for cmd in &["npm install", "git commit -m 'x'"] {
+            let r = gate(
+                Permission::Ask,
+                "run_command",
+                &json!({"command": cmd}),
+                cwd,
+            );
+            assert!(
+                r.is_some(),
+                "expected {cmd} to require confirmation in Ask mode"
+            );
         }
     }
 
@@ -3380,5 +3679,261 @@ mod tests {
         assert!(!super::is_session_allowed_tool("custom_test_tool"));
         super::add_session_allowed_tool("custom_test_tool");
         assert!(super::is_session_allowed_tool("custom_test_tool"));
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_multibyte() {
+        let s = "ab🚀cd"; // the emoji occupies bytes 2..6
+        assert_eq!(truncate_at_char_boundary(s, 3), "ab");
+        assert_eq!(truncate_at_char_boundary(s, 6), "ab🚀");
+        assert_eq!(truncate_at_char_boundary(s, 100), s);
+        let cjk = "日本語テキスト"; // 3 bytes per char
+        let t = truncate_at_char_boundary(cjk, 7);
+        assert_eq!(t, "日本");
+        assert!(cjk.starts_with(t));
+    }
+
+    #[test]
+    fn compaction_split_never_starts_tail_on_tool_result() {
+        // Layout puts the naive tail boundary on a Msg::Tool; the split must
+        // advance past it so no tool_result is orphaned from its tool_use.
+        let mut msgs = vec![Msg::System("s".into()), Msg::User("task".into())];
+        for i in 0..3 {
+            msgs.push(Msg::Assistant {
+                text: format!("a{i}"),
+                calls: vec![],
+            });
+            msgs.push(Msg::Tool(vec![crate::provider::ToolResult {
+                id: format!("{i}"),
+                content: "r".into(),
+                is_error: false,
+            }]));
+        }
+        msgs.push(Msg::User("follow-up".into()));
+        // len = 9 → naive tail_start = 3, which is a Msg::Tool.
+        assert!(matches!(msgs[3], Msg::Tool(_)));
+        let (sys_end, tail_start) = compaction_split(&msgs);
+        assert_eq!(sys_end, 1);
+        assert_eq!(tail_start, 4);
+        assert!(matches!(msgs[tail_start], Msg::Assistant { .. }));
+    }
+
+    #[test]
+    fn compaction_pins_original_task_verbatim() {
+        let task = "build the 🚀 thing";
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User(task.into())];
+        for i in 0..10 {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(msgs, |_| "SUMMARY".into());
+        let Msg::User(summary) = &out[1] else {
+            panic!("expected summary user message");
+        };
+        assert!(summary.contains(&format!("[Original task]\n{task}")));
+        // A second compaction re-extracts the same verbatim task text.
+        let mut again = out;
+        for i in 0..10 {
+            again.push(Msg::User(format!("v{i}")));
+        }
+        let out2 = compact_with(again, |_| "SUMMARY2".into());
+        let Msg::User(summary2) = &out2[1] else {
+            panic!("expected summary user message");
+        };
+        assert!(summary2.contains(&format!("[Original task]\n{task}")));
+    }
+
+    #[test]
+    fn compaction_keeps_recent_tail_tool_results_intact() {
+        let long = "x".repeat(2000);
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User("task".into())];
+        for i in 0..8 {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        msgs.push(Msg::Assistant {
+            text: "a".into(),
+            calls: vec![],
+        });
+        msgs.push(Msg::Tool(vec![crate::provider::ToolResult {
+            id: "1".into(),
+            content: long.clone(),
+            is_error: false,
+        }]));
+        let out = compact_with(msgs, |_| "S".into());
+        let Some(Msg::Tool(results)) = out.last() else {
+            panic!("expected tool results in the tail");
+        };
+        assert_eq!(results[0].content, long, "tail results must not be clipped");
+    }
+
+    #[test]
+    fn loop_guard_ignores_repeated_successful_results() {
+        let mut guard = ToolLoopGuard::default();
+        let input = json!({"path": "src/main.rs"});
+        for _ in 0..10 {
+            assert!(guard
+                .note("read_file", &input, "fn main() {}", false)
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn loop_guard_nudges_then_stops_on_repeated_errors() {
+        let mut guard = ToolLoopGuard::default();
+        let input = json!({"path": "missing.txt"});
+        assert!(guard
+            .note("read_file", &input, "no such file", true)
+            .is_none());
+        assert!(guard
+            .note("read_file", &input, "no such file", true)
+            .is_none());
+        let third = guard.note("read_file", &input, "no such file", true);
+        assert!(matches!(third, Some(LoopSignal::Nudge(_))));
+        // The same error repeating after the nudge stops the run.
+        let fourth = guard.note("read_file", &input, "no such file", true);
+        assert!(matches!(fourth, Some(LoopSignal::Stop(_))));
+    }
+
+    #[test]
+    fn loop_guard_resets_when_result_changes() {
+        let mut guard = ToolLoopGuard::default();
+        let input = json!({"path": "f"});
+        assert!(guard.note("read_file", &input, "err A", true).is_none());
+        assert!(guard.note("read_file", &input, "err A", true).is_none());
+        // A different result resets the counter — no trigger on the next call.
+        assert!(guard.note("read_file", &input, "err B", true).is_none());
+        assert!(guard.note("read_file", &input, "err B", true).is_none());
+    }
+
+    #[test]
+    fn max_tokens_stop_reason_is_detected() {
+        let truncated = Reply {
+            stop_reason: Some("max_tokens".into()),
+            ..Default::default()
+        };
+        assert!(reply_truncated_at_token_limit(&truncated));
+        let done = Reply {
+            stop_reason: Some("end_turn".into()),
+            ..Default::default()
+        };
+        assert!(!reply_truncated_at_token_limit(&done));
+        assert!(!reply_truncated_at_token_limit(&Reply::default()));
+    }
+
+    #[test]
+    fn artifact_classifiers_require_build_verb() {
+        assert!(canvas_game_requested("build me a canvas game"));
+        assert!(canvas_game_requested("make a browser game about space"));
+        assert!(!canvas_game_requested("fix the collision bug in my game"));
+        assert!(static_artifact_requested(
+            "create a landing page for my startup"
+        ));
+        assert!(!static_artifact_requested("explain how this website works"));
+        assert!(!static_artifact_requested("why is the landing page slow?"));
+    }
+
+    #[test]
+    fn casual_turn_detection_only_matches_pure_greetings() {
+        assert!(is_casual_turn("hi"));
+        assert!(is_casual_turn("Hello!"));
+        assert!(is_casual_turn("hey"));
+        // Acknowledgements can be valid "yes, proceed" turns.
+        assert!(!is_casual_turn("ok"));
+        assert!(!is_casual_turn("okay"));
+        assert!(!is_casual_turn("thanks"));
+        assert!(!is_casual_turn("yes, proceed"));
+    }
+
+    #[test]
+    fn placeholder_content_detection_is_conservative() {
+        assert!(is_placeholder_content(""));
+        assert!(is_placeholder_content("  \n"));
+        assert!(is_placeholder_content("TODO"));
+        assert!(is_placeholder_content("<content>"));
+        assert!(!is_placeholder_content("hello world"));
+        assert!(!is_placeholder_content("TODO: fix the parser later"));
+    }
+
+    #[test]
+    fn invalid_args_feedback_names_tool_error_and_required_params() {
+        let defs = tools::defs_for_context(true, 128_000);
+        let msg = invalid_args_feedback("write_file", "{not json", &defs);
+        assert!(msg.contains("write_file"));
+        assert!(msg.contains("Required params:"));
+        assert!(msg.ends_with("Re-send the complete corrected call."));
+    }
+
+    #[test]
+    fn instructional_prose_classifier_is_conservative() {
+        assert!(reads_as_instructions("First, you should create the file."));
+        assert!(reads_as_instructions(
+            "Here's how to build it. Steps:\n1. Create index.html\n2. Add a canvas"
+        ));
+        assert!(reads_as_instructions("To do this, you can run npm init."));
+        // Completed-work summaries must not read as instructions.
+        assert!(!reads_as_instructions(
+            "I created index.html with the game and published the artifact."
+        ));
+        assert!(!reads_as_instructions(
+            "Done — the collision bug is fixed and verified with the test suite."
+        ));
+    }
+
+    #[test]
+    fn act_nudge_fires_on_instructional_prose_for_imperative_task() {
+        let prose = "Here's how you can build it:\nSteps:\n1. Create index.html\n2. Add a canvas";
+        // Imperative task + how-to prose + no prior mutation → nudge.
+        assert!(should_nudge_to_act(
+            "build me a todo app",
+            prose,
+            false,
+            false,
+            0
+        ));
+        assert!(should_nudge_to_act(
+            "fix the collision bug in my game",
+            prose,
+            false,
+            false,
+            0
+        ));
+        // The same prose after a mutating tool ran is a real summary → no nudge.
+        assert!(!should_nudge_to_act(
+            "build me a todo app",
+            prose,
+            true,
+            true,
+            0
+        ));
+        // Question-style tasks want an answer, not action → no nudge.
+        assert!(!should_nudge_to_act(
+            "how do I build a todo app?",
+            prose,
+            false,
+            false,
+            0
+        ));
+        assert!(!should_nudge_to_act(
+            "what does this repo do",
+            prose,
+            false,
+            false,
+            0
+        ));
+        // Read-only exploration followed by a plain answer (no markers) → no nudge.
+        assert!(!should_nudge_to_act(
+            "build me a todo app",
+            "The repo already contains a complete todo app in src/.",
+            true,
+            false,
+            0
+        ));
+        // The per-task cap is respected.
+        assert!(!should_nudge_to_act(
+            "build me a todo app",
+            prose,
+            false,
+            false,
+            MAX_ACT_NUDGES
+        ));
     }
 }

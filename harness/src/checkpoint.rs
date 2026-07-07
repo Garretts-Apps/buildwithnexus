@@ -19,6 +19,16 @@ pub struct Checkpoint {
     pub created_ms: u128,
     pub existed: bool,
     pub content: String,
+    /// False when the original contents could not be captured (file too large
+    /// or not valid UTF-8). Restore refuses to overwrite such files rather than
+    /// clobbering them with an empty string. Defaults to true so checkpoint
+    /// files written before this field existed keep restoring as before.
+    #[serde(default = "default_snapshotted")]
+    pub snapshotted: bool,
+}
+
+fn default_snapshotted() -> bool {
+    true
 }
 
 #[cfg(not(test))]
@@ -51,13 +61,18 @@ fn sanitize_id_part(s: &str) -> String {
 /// Stores the previous contents (or empty if the file did not exist) in `.buildwithnexus/checkpoints`.
 pub fn record(cwd: &Path, path: &Path, action: &str) {
     let existed = path.exists();
-    let content = if existed {
+    // Capture the previous contents. Oversized or non-UTF-8 files cannot be
+    // snapshotted; mark them so restore never overwrites them with nothing.
+    let (content, snapshotted) = if existed {
         match fs::metadata(path) {
-            Ok(m) if m.len() <= MAX_SNAPSHOT_BYTES => fs::read_to_string(path).unwrap_or_default(),
-            _ => String::new(),
+            Ok(m) if m.len() <= MAX_SNAPSHOT_BYTES => match fs::read_to_string(path) {
+                Ok(c) => (c, true),
+                Err(_) => (String::new(), false),
+            },
+            _ => (String::new(), false),
         }
     } else {
-        String::new()
+        (String::new(), true)
     };
     let created_ms = now_ms();
     let id = format!("{}-{}", created_ms, sanitize_id_part(action));
@@ -69,6 +84,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         created_ms,
         existed,
         content,
+        snapshotted,
     };
     let checkpoint_dir = dir(cwd);
     let _ = fs::create_dir_all(&checkpoint_dir);
@@ -94,6 +110,12 @@ pub fn list(cwd: &Path) -> Vec<Checkpoint> {
 
 fn restore_one(cp: &Checkpoint) -> Result<(), String> {
     if cp.existed {
+        if !cp.snapshotted {
+            return Err(format!(
+                "cannot restore {}: original contents were not snapshotted (file was too large or not valid UTF-8); refusing to overwrite",
+                cp.path.display()
+            ));
+        }
         if let Some(parent) = cp.path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -197,5 +219,77 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "initial content");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_binary_file_is_not_snapshotted_and_restore_refuses() {
+        let d = std::env::temp_dir().join(format!("bwn-cp-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let file_path = d.join("blob.bin");
+        // Invalid UTF-8: read_to_string fails, so the content cannot be captured.
+        fs::write(&file_path, [0xFF, 0xFE, 0x00, 0x9F]).unwrap();
+
+        record(&d, &file_path, "edit_file");
+        fs::write(&file_path, b"overwritten").unwrap();
+
+        let cps = list(&d);
+        assert!(!cps.is_empty());
+        assert!(!cps[0].snapshotted);
+        assert!(cps[0].content.is_empty());
+
+        let res = undo_by_id(&d, &cps[0].id);
+        assert!(res.is_err(), "restore must refuse un-snapshotted content");
+        assert!(res.unwrap_err().contains("not snapshotted"));
+        // The real file must be untouched and the checkpoint not consumed.
+        assert_eq!(fs::read(&file_path).unwrap(), b"overwritten");
+        assert!(!list(&d).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_oversized_file_is_not_snapshotted() {
+        let d = std::env::temp_dir().join(format!("bwn-cp-big-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let file_path = d.join("big.txt");
+        fs::write(&file_path, vec![b'a'; MAX_SNAPSHOT_BYTES as usize + 1]).unwrap();
+
+        record(&d, &file_path, "edit_file");
+
+        let cps = list(&d);
+        assert!(!cps.is_empty());
+        assert!(!cps[0].snapshotted);
+        assert!(cps[0].content.is_empty());
+        assert!(restore_one(&cps[0]).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_missing_file_checkpoint_still_restores_by_deletion() {
+        let d = std::env::temp_dir().join(format!("bwn-cp-new-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let file_path = d.join("created.txt");
+
+        record(&d, &file_path, "write_file"); // file does not exist yet
+        fs::write(&file_path, "new content").unwrap();
+
+        let cps = list(&d);
+        assert!(cps[0].snapshotted); // nothing to capture, but state is complete
+        assert!(undo_by_id(&d, &cps[0].id).is_ok());
+        assert!(!file_path.exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_pre_snapshotted_checkpoint_json_defaults_to_restorable() {
+        // Checkpoint files written before the `snapshotted` field existed must
+        // deserialize as restorable (serde default keeps old behavior).
+        let j = r#"{"id":"1-edit","cwd":"/x","path":"/x/f","action":"edit",
+                    "created_ms":1,"existed":true,"content":"hi"}"#;
+        let cp: Checkpoint = serde_json::from_str(j).unwrap();
+        assert!(cp.snapshotted);
+        assert_eq!(cp.content, "hi");
     }
 }

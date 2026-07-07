@@ -10,10 +10,13 @@
 // Scripts in ~/.buildwithnexus/hooks/<Event>/*.{sh,py} are auto-discovered
 // without requiring settings.json entries.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -35,11 +38,22 @@ enum HookCmd {
     Script(PathBuf), // auto-detected interpreter by extension
 }
 
+// Watchdog defaults: a hung hook would otherwise freeze the single-threaded
+// TUI forever. Overridable per hook via a `"timeout"` (seconds) settings field.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
+// Distinct nonzero codes for hooks that never produced a real exit status, so
+// a deny-capable hook that could not run is never mistaken for "exit 0, allow".
+// (2 is reserved: it means "deny" to PreToolUse/UserPromptSubmit.)
+const HOOK_TIMEOUT_CODE: i32 = 124; // matches timeout(1) convention
+const HOOK_SPAWN_FAILED_CODE: i32 = 126;
+const HOOK_SIGNAL_CODE: i32 = 128; // terminated by a signal
+
 struct Hook {
     event: String,
     matcher: String,
     cmd: HookCmd,
     source: Source,
+    timeout: Duration,
 }
 
 struct Hooks {
@@ -103,6 +117,7 @@ pub fn init(cwd: &Path, interactive: bool) {
                 matcher: "*".to_string(),
                 cmd: HookCmd::Script(script),
                 source: Source::Home,
+                timeout: Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS),
             });
         }
     }
@@ -140,11 +155,17 @@ fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
                         _ => None,
                     };
                     if let Some(cmd) = cmd {
+                        // Optional per-hook `"timeout"` in seconds (Claude Code compatible).
+                        let timeout = h["timeout"]
+                            .as_u64()
+                            .filter(|&t| t > 0)
+                            .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
                         out.push(Hook {
                             event: event.clone(),
                             matcher: matcher.clone(),
                             cmd,
                             source,
+                            timeout: Duration::from_secs(timeout),
                         });
                     }
                 }
@@ -158,7 +179,7 @@ fn matches(matcher: &str, tool: &str) -> bool {
     m.is_empty() || m == "*" || m.split('|').any(|p| p.trim() == tool)
 }
 
-fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String)> {
+fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String, Duration)> {
     let Some(h) = HOOKS.get() else {
         return Vec::new();
     };
@@ -166,7 +187,7 @@ fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String
         .iter()
         .filter(|hk| hk.event == event)
         .filter(|hk| tool.is_none_or(|t| matches(&hk.matcher, t)))
-        .map(|hk| (hk.cmd.clone(), hk.source, hk.matcher.clone()))
+        .map(|hk| (hk.cmd.clone(), hk.source, hk.matcher.clone(), hk.timeout))
         .collect()
 }
 
@@ -272,14 +293,19 @@ fn interpreter_for(path: &Path) -> (&'static str, Vec<&'static str>) {
     }
 }
 
-fn run_hook_cmd(cmd: &HookCmd, payload: &Value, cwd: &Path) -> (i32, String, String) {
+fn run_hook_cmd(
+    cmd: &HookCmd,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+) -> (i32, String, String) {
     match cmd {
-        HookCmd::Shell(s) => run_shell(s, payload, cwd),
-        HookCmd::Script(path) => run_script(path, payload, cwd),
+        HookCmd::Shell(s) => run_shell(s, payload, cwd, timeout),
+        HookCmd::Script(path) => run_script(path, payload, cwd, timeout),
     }
 }
 
-fn run_shell(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
+fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> (i32, String, String) {
     let mut c = if cfg!(windows) {
         let mut x = Command::new("cmd");
         x.args(["/C", cmd]);
@@ -289,12 +315,21 @@ fn run_shell(cmd: &str, payload: &Value, cwd: &Path) -> (i32, String, String) {
         x.args(["-c", cmd]);
         x
     };
-    run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+    run_child(
+        c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
+        payload,
+        timeout,
+    )
 }
 
-fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String) {
+fn run_script(
+    path: &Path,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+) -> (i32, String, String) {
     if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
-        return run_rust_hook(path, payload, cwd);
+        return run_rust_hook(path, payload, cwd, timeout);
     }
     let (interp, interp_args) = interpreter_for(path);
     let mut c = Command::new(interp);
@@ -302,10 +337,19 @@ fn run_script(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String)
         c.arg(a);
     }
     c.arg(path);
-    run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+    run_child(
+        c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
+        payload,
+        timeout,
+    )
 }
 
-fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, String) {
+fn run_rust_hook(
+    path: &Path,
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+) -> (i32, String, String) {
     if Command::new("rust-script")
         .arg("--version")
         .stdout(Stdio::null())
@@ -315,7 +359,11 @@ fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, Stri
     {
         let mut c = Command::new("rust-script");
         c.arg(path);
-        return run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload);
+        return run_child(
+            c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
+            payload,
+            timeout,
+        );
     }
     let temp_dir = std::env::temp_dir().join("bwn_rust_hooks");
     let _ = std::fs::create_dir_all(&temp_dir);
@@ -333,7 +381,11 @@ fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, Stri
     match compile_status {
         Ok(s) if s.success() => {
             let mut c = Command::new(&bin_path);
-            run_child(c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd), payload)
+            run_child(
+                c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
+                payload,
+                timeout,
+            )
         }
         Ok(s) => (
             s.code().unwrap_or(1),
@@ -344,34 +396,141 @@ fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path) -> (i32, String, Stri
     }
 }
 
-fn run_child(c: &mut Command, payload: &Value) -> (i32, String, String) {
+// Loud, unmissable warning for hooks that failed to run at all — a
+// deny-capable hook that silently never fires would bypass its policy.
+fn hook_warn(msg: &str) {
+    if report::is_json() {
+        eprintln!("[hook] warning: {msg}");
+    } else {
+        tui::line(&tui::yellow(&format!("  [hook] ⚠ {msg}")));
+    }
+}
+
+// Drain a pipe on its own thread and deliver the bytes over a channel. A
+// channel (rather than a JoinHandle) lets the collector bound how long it waits:
+// when a timed-out hook leaves a grandchild holding the pipe open, `read_to_end`
+// never returns, and joining the thread would block for the grandchild's full
+// lifetime. The orphaned thread ends on its own when the pipe finally closes.
+// Human-readable hook timeout: whole seconds when ≥1s, else milliseconds, so a
+// sub-second deadline doesn't render as a confusing "0s".
+fn fmt_duration(d: Duration) -> String {
+    if d.as_secs() >= 1 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+fn drain_pipe<R: Read + Send + 'static>(r: Option<R>) -> Option<mpsc::Receiver<Vec<u8>>> {
+    r.map(|mut pipe| {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        rx
+    })
+}
+
+// Collect drained bytes, waiting at most `grace`. On the normal path the child
+// has already exited (pipes at EOF), so the thread has sent and this returns at
+// once; on the timeout path it caps the wait instead of blocking on a surviving
+// grandchild.
+fn join_pipe(rx: Option<mpsc::Receiver<Vec<u8>>>, grace: Duration) -> String {
+    rx.and_then(|rx| rx.recv_timeout(grace).ok())
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, String, String) {
+    let label = c.get_program().to_string_lossy().into_owned();
     c.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
-            if !report::is_json() {
-                tui::line(&tui::dim(&format!("  [hook] spawn failed: {e}")));
-            }
-            return (0, String::new(), String::new());
+            hook_warn(&format!(
+                "hook `{label}` failed to launch ({e}) — it did NOT run"
+            ));
+            return (
+                HOOK_SPAWN_FAILED_CODE,
+                String::new(),
+                format!("hook spawn failed: {e}"),
+            );
         }
     };
-    if let Some(mut sin) = child.stdin.take() {
-        let _ = sin.write_all(payload.to_string().as_bytes());
-    }
-    match child.wait_with_output() {
-        Ok(o) => (
-            o.status.code().unwrap_or(0),
-            String::from_utf8_lossy(&o.stdout).into_owned(),
-            String::from_utf8_lossy(&o.stderr).into_owned(),
-        ),
-        Err(e) => {
-            if !report::is_json() {
-                tui::line(&tui::dim(&format!("  [hook] wait failed: {e}")));
+    // Feed stdin and drain both output pipes on threads so a hook that never
+    // reads its input (or floods a pipe) can't wedge the single-threaded TUI.
+    let stdin_h = child.stdin.take().map(|mut sin| {
+        let body = payload.to_string();
+        thread::spawn(move || {
+            let _ = sin.write_all(body.as_bytes());
+        })
+    });
+    let stdout_h = drain_pipe(child.stdout.take());
+    let stderr_h = drain_pipe(child.stderr.take());
+
+    // Watchdog: poll for exit; kill the hook when the deadline passes.
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(25));
             }
-            (0, String::new(), String::new())
+            Err(e) => {
+                hook_warn(&format!("hook `{label}` wait failed ({e})"));
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
+    };
+    if let Some(h) = stdin_h {
+        let _ = h.join();
+    }
+    // On a clean exit the pipes are already at EOF so this returns immediately;
+    // after a timeout it caps how long we wait on a possibly-orphaned pipe.
+    let grace = if timed_out {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(5)
+    };
+    let stdout = join_pipe(stdout_h, grace);
+    let stderr = join_pipe(stderr_h, grace);
+    match status {
+        Some(st) => match st.code() {
+            Some(code) => (code, stdout, stderr),
+            None => {
+                // Signal-killed: never report exit 0 for a hook that died.
+                hook_warn(&format!("hook `{label}` was killed by a signal"));
+                (HOOK_SIGNAL_CODE, stdout, stderr)
+            }
+        },
+        None if timed_out => {
+            let dur = fmt_duration(timeout);
+            hook_warn(&format!(
+                "hook `{label}` timed out after {dur} and was killed"
+            ));
+            (
+                HOOK_TIMEOUT_CODE,
+                stdout,
+                format!("{stderr}\nhook timed out after {dur}")
+                    .trim()
+                    .to_string(),
+            )
+        }
+        // try_wait failed (already warned): report as a launch/run failure.
+        None => (HOOK_SPAWN_FAILED_CODE, stdout, stderr),
     }
 }
 
@@ -387,7 +546,7 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
         "hook_event_name": "PreToolUse", "session_id": std::process::id(),
         "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
     });
-    for (cmd, source, matcher) in commands_for("PreToolUse", Some(tool)) {
+    for (cmd, source, matcher, timeout) in commands_for("PreToolUse", Some(tool)) {
         if !report::is_json() {
             tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
         }
@@ -403,7 +562,7 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd);
+        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
             format!("PreToolUse:{tool} exit {code}"),
@@ -454,7 +613,7 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
         "tool_response": {"content": response, "is_error": is_error},
         "cwd": cwd.to_string_lossy()
     });
-    for (cmd, source, matcher) in cmds {
+    for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
             format!("PostToolUse:{tool} {}", cmd_label(&cmd)),
@@ -467,7 +626,7 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd);
+        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
             format!("PostToolUse:{tool} exit {code}"),
@@ -491,7 +650,7 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
         "prompt": prompt, "cwd": cwd.to_string_lossy()
     });
     let mut ctx = String::new();
-    for (cmd, source, matcher) in commands_for("UserPromptSubmit", None) {
+    for (cmd, source, matcher, timeout) in commands_for("UserPromptSubmit", None) {
         trace::record_visible(
             "hook",
             format!("UserPromptSubmit {}", cmd_label(&cmd)),
@@ -503,7 +662,7 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd);
+        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
             format!("UserPromptSubmit exit {code}"),
@@ -526,11 +685,26 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
             });
         }
         if !stdout.trim().is_empty() {
-            ctx.push_str(stdout.trim());
+            ctx.push_str(&cap_hook_context(stdout.trim()));
             ctx.push('\n');
         }
     }
     Ok(ctx)
+}
+
+// Hook stdout is injected into the model prompt; an unbounded hook could blow
+// the context window. Cap each hook's contribution with a visible marker.
+const MAX_HOOK_CONTEXT_BYTES: usize = 16 * 1024;
+
+fn cap_hook_context(s: &str) -> String {
+    if s.len() <= MAX_HOOK_CONTEXT_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_HOOK_CONTEXT_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[hook output truncated at 16KB]", &s[..end])
 }
 
 pub fn list_active() -> Vec<String> {
@@ -553,7 +727,7 @@ pub fn notify(event: &str, cwd: &Path) {
         return;
     }
     let payload = json!({"hook_event_name": event, "session_id": std::process::id(), "cwd": cwd.to_string_lossy()});
-    for (cmd, source, matcher) in cmds {
+    for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
             format!("{event} {}", cmd_label(&cmd)),
@@ -565,7 +739,7 @@ pub fn notify(event: &str, cwd: &Path) {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd);
+        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
             format!("{event} exit {code}"),
@@ -698,6 +872,86 @@ mod tests {
         parse_into("{}", Source::Home, &mut out);
         parse_into(r#"{"hooks": "wrong type"}"#, Source::Home, &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_into_reads_timeout_field_with_default() {
+        let text = r#"{
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [
+                        {"type":"command","command":"slow","timeout": 3},
+                        {"type":"command","command":"default"}
+                    ]}
+                ]
+            }
+        }"#;
+        let mut out = Vec::new();
+        parse_into(text, Source::Home, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].timeout, Duration::from_secs(3));
+        assert_eq!(
+            out[1].timeout,
+            Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn run_child_spawn_failure_returns_distinct_nonzero_code() {
+        let mut c = Command::new("/definitely/not/a/real/binary-bwn-test");
+        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(1));
+        assert_eq!(code, HOOK_SPAWN_FAILED_CODE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("spawn failed"), "{stderr}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_child_kills_hung_hook_after_timeout() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let (code, _stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_millis(300));
+        assert_eq!(code, HOOK_TIMEOUT_CODE);
+        assert!(stderr.contains("timed out"), "{stderr}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "watchdog must not wait for the full sleep"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_child_signal_death_is_not_exit_zero() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "kill -9 $$"]);
+        let (code, _stdout, _stderr) = run_child(&mut c, &json!({}), Duration::from_secs(5));
+        assert_eq!(code, HOOK_SIGNAL_CODE);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_child_captures_output_within_timeout() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "echo out; echo err >&2; exit 7"]);
+        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(5));
+        assert_eq!(code, 7);
+        assert_eq!(stdout.trim(), "out");
+        assert_eq!(stderr.trim(), "err");
+    }
+
+    #[test]
+    fn cap_hook_context_truncates_with_marker() {
+        let small = "hello";
+        assert_eq!(cap_hook_context(small), "hello");
+        let big = "x".repeat(MAX_HOOK_CONTEXT_BYTES + 100);
+        let capped = cap_hook_context(&big);
+        assert!(capped.len() < big.len());
+        assert!(capped.ends_with("[hook output truncated at 16KB]"));
+        // Truncation must respect char boundaries for multi-byte input.
+        let wide = "é".repeat(MAX_HOOK_CONTEXT_BYTES); // 2 bytes each
+        let capped_wide = cap_hook_context(&wide);
+        assert!(capped_wide.ends_with("[hook output truncated at 16KB]"));
     }
 
     #[test]

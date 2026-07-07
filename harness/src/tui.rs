@@ -350,11 +350,15 @@ pub fn added_preview(content: &str) -> String {
     }
 }
 
-// ── streaming code-block renderer ────────────────────────────────────────────
-// Feeds line-by-line through assistant streaming output. Triple-backtick fenced
-// code blocks are rendered with a box border, and each block is automatically
-// copied to the clipboard via OSC 52 (supported by iTerm2, kitty, Alacritty,
-// WezTerm, macOS Terminal 2.12+, and most modern terminals).
+// ── streaming markdown / code-block renderer ─────────────────────────────────
+// Feeds line-by-line through assistant streaming output. The open line is
+// buffered until its newline arrives, then rendered through the markdown
+// pipeline before being committed to the transcript; in the alt-screen TUI the
+// raw in-progress line is echoed live and swapped for the rendered form on
+// commit. Triple-backtick fenced code blocks are rendered with a box border
+// (fence markers never shown raw), and each block is automatically copied to
+// the clipboard via OSC 52 (supported by iTerm2, kitty, Alacritty, WezTerm,
+// macOS Terminal 2.12+, and most modern terminals).
 //
 // Usage: create one per assistant turn, call push() for each streamed chunk,
 // call flush() after streaming ends.
@@ -369,6 +373,13 @@ pub struct StreamRenderer {
     pending: String,
     state: StreamState,
     w: usize, // terminal width cap for box drawing
+    // Byte length of the `pending` prefix already echoed raw to the open
+    // transcript line (alt-screen only; see echo_partial()).
+    shown: usize,
+    // Committed lines land here instead of the live transcript under test,
+    // so chunk-split behaviour is assertable without a terminal.
+    #[cfg(test)]
+    sink: Vec<String>,
 }
 
 impl Default for StreamRenderer {
@@ -384,7 +395,18 @@ impl StreamRenderer {
             pending: String::new(),
             state: StreamState::Normal,
             w,
+            shown: 0,
+            #[cfg(test)]
+            sink: Vec::new(),
         }
+    }
+
+    // Commit one already-rendered line to the transcript.
+    fn emit(&mut self, s: &str) {
+        #[cfg(test)]
+        self.sink.push(s.to_string());
+        #[cfg(not(test))]
+        line(s);
     }
 
     pub fn push(&mut self, chunk: &str) {
@@ -403,11 +425,15 @@ impl StreamRenderer {
                 Some(nl) => {
                     let line_text = self.pending[..nl].to_string();
                     self.pending = self.pending[nl + 1..].to_string();
-                    self.process_line(&line_text);
+                    // Any echoed raw prefix belongs to this line; the next
+                    // line starts un-echoed.
+                    let had_partial = std::mem::take(&mut self.shown) > 0;
+                    self.process_line(&line_text, had_partial);
                 }
                 None if end && !self.pending.is_empty() => {
                     let last = std::mem::take(&mut self.pending);
-                    self.process_line(&last);
+                    let had_partial = std::mem::take(&mut self.shown) > 0;
+                    self.process_line(&last, had_partial);
                     break;
                 }
                 None => break,
@@ -415,15 +441,41 @@ impl StreamRenderer {
         }
         if end {
             self.finish_state();
+        } else {
+            self.echo_partial();
         }
     }
 
-    fn process_line(&mut self, text: &str) {
+    // Echo the not-yet-terminated tail of the current line raw so streaming
+    // stays visibly live between newlines. Alt-screen only: the transcript
+    // tracks the open line there (OPEN_STREAM_LINE), so the raw text can be
+    // replaced by the rendered line once the newline arrives. Lines that may
+    // still classify as fence openers or protocol JSON are held back — they
+    // may never be shown at all.
+    fn echo_partial(&mut self) {
+        if !ALT_SCREEN.load(Ordering::Relaxed) || !matches!(self.state, StreamState::Normal) {
+            return;
+        }
+        let head = self.pending.trim_start();
+        if head.starts_with('`') || head.starts_with('{') || head.starts_with('[') {
+            return;
+        }
+        if self.pending.len() > self.shown {
+            write_stream(&self.pending[self.shown..]);
+            self.shown = self.pending.len();
+        }
+    }
+
+    fn process_line(&mut self, text: &str, had_partial: bool) {
         // Pull out the current state so we can unconditionally assign self.state below.
         let state = std::mem::replace(&mut self.state, StreamState::Normal);
         match state {
             StreamState::Normal => {
                 if let Some(rest) = text.strip_prefix("```") {
+                    // Fence markers are chrome — pull back any echoed raw prefix.
+                    if had_partial {
+                        retract_stream_line();
+                    }
                     // Buffer fenced code until the close. Local models sometimes
                     // emit tool-call JSON as a code block; rendering only after
                     // classification keeps protocol artifacts out of the transcript.
@@ -433,12 +485,22 @@ impl StreamRenderer {
                         lines: Vec::new(),
                     };
                 } else if starts_like_top_level_json(text) {
+                    if had_partial {
+                        retract_stream_line();
+                    }
                     let lines = vec![text.to_string()];
                     self.state = StreamState::MaybeJson { lines };
                     self.try_flush_maybe_json(false);
                 } else {
-                    // Regular text: preserve blank lines; render markdown formatting
-                    line(&render_md_line(text));
+                    // Regular text: preserve blank lines; render markdown
+                    // formatting. If the raw partial was echoed live, swap it
+                    // for the rendered form instead of appending a duplicate.
+                    let rendered = render_md_line(text);
+                    if had_partial {
+                        commit_stream_line(&rendered);
+                    } else {
+                        self.emit(&rendered);
+                    }
                     self.state = StreamState::Normal;
                 }
             }
@@ -448,7 +510,8 @@ impl StreamRenderer {
                     if !is_tool_call_json_block(&lang, &code) {
                         self.render_code_block(&lang, &lines);
                         osc52_copy(&code);
-                        line(&dim("  ✓ ⎘ copied to clipboard"));
+                        let notice = dim("  ✓ ⎘ copied to clipboard");
+                        self.emit(&notice);
                     }
                     self.state = StreamState::Normal;
                 } else {
@@ -473,7 +536,8 @@ impl StreamRenderer {
                 if !is_tool_call_json_block(&lang, &code) {
                     self.render_code_block(&lang, &lines);
                     osc52_copy(&code);
-                    line(&dim("  ✓ ⎘ copied to clipboard"));
+                    let notice = dim("  ✓ ⎘ copied to clipboard");
+                    self.emit(&notice);
                 }
             }
             StreamState::MaybeJson { lines } => {
@@ -507,36 +571,45 @@ impl StreamRenderer {
         }
     }
 
-    fn render_plain_lines(&self, lines: &[String]) {
+    fn render_plain_lines(&mut self, lines: &[String]) {
         for text in lines {
-            line(&render_md_line(text));
+            let rendered = render_md_line(text);
+            self.emit(&rendered);
         }
     }
 
-    fn box_header(&self, lang: &str) -> String {
-        let prefix = if lang.is_empty() {
-            "  ╭─".to_string()
-        } else {
-            format!("  ╭─ ⟨ {} ⟩ ", lang)
-        };
-        let used = str_width(&prefix);
-        let dashes = self.w.saturating_sub(used).max(1);
-        format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
-    }
-
-    fn box_footer(&self) -> String {
-        let prefix = "  ╰";
-        let dashes = self.w.saturating_sub(str_width(prefix)).max(1);
-        format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
-    }
-
-    fn render_code_block(&self, lang: &str, lines: &[String]) {
-        line(&self.box_header(lang));
+    fn render_code_block(&mut self, lang: &str, lines: &[String]) {
+        let header = code_box_header(lang, self.w);
+        self.emit(&header);
         for text in lines {
-            line(&format!("  {} {text}", dim("│")));
+            let row = code_box_line(text);
+            self.emit(&row);
         }
-        line(&self.box_footer());
+        let footer = code_box_footer(self.w);
+        self.emit(&footer);
     }
+}
+
+// Bordered code-block chrome, shared by the streaming renderer and render_md().
+fn code_box_header(lang: &str, w: usize) -> String {
+    let prefix = if lang.is_empty() {
+        "  ╭─".to_string()
+    } else {
+        format!("  ╭─ ⟨ {lang} ⟩ ")
+    };
+    let used = str_width(&prefix);
+    let dashes = w.saturating_sub(used).max(1);
+    format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
+}
+
+fn code_box_footer(w: usize) -> String {
+    let prefix = "  ╰";
+    let dashes = w.saturating_sub(str_width(prefix)).max(1);
+    format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
+}
+
+fn code_box_line(text: &str) -> String {
+    format!("  {} {text}", dim("│"))
 }
 
 fn starts_like_top_level_json(text: &str) -> bool {
@@ -544,8 +617,11 @@ fn starts_like_top_level_json(text: &str) -> bool {
     trimmed.starts_with('{') || trimmed.starts_with('[')
 }
 
+// Keep the JSON lookahead short: holding many lines makes streaming look
+// frozen and then dump all at once. Past ~5 lines / 2KB, give up and flush
+// the buffered text as plain output.
 fn maybe_json_buffer_is_too_large(lines: &[String]) -> bool {
-    lines.len() > 80 || lines.iter().map(|line| line.len()).sum::<usize>() > 32 * 1024
+    lines.len() > 5 || lines.iter().map(|line| line.len()).sum::<usize>() > 2 * 1024
 }
 
 fn is_tool_call_json_block(lang: &str, code: &str) -> bool {
@@ -577,7 +653,9 @@ fn json_value_looks_like_tool_call(value: &serde_json::Value) -> bool {
         || obj.get("tool_name").and_then(|v| v.as_str()).is_some();
     let has_args = obj.get("arguments").is_some()
         || obj.get("input").is_some()
-        || obj.keys().any(|k| k != "name" && k != "tool_name" && k != "type" && k != "id");
+        || obj
+            .keys()
+            .any(|k| k != "name" && k != "tool_name" && k != "type" && k != "id");
     let openai_function = obj
         .get("function")
         .and_then(|v| v.as_object())
@@ -653,6 +731,9 @@ fn b64_encode(data: &[u8]) -> String {
 struct TypeAheadState {
     buf: Vec<char>,
     cursor: usize,
+    // True while `buf` holds a message pulled out of the queue via Ctrl+Q, so
+    // Esc can return it to the queue instead of destroying it.
+    from_queue: bool,
 }
 
 fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
@@ -661,6 +742,7 @@ fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
         std::sync::Mutex::new(TypeAheadState {
             buf: Vec::new(),
             cursor: 0,
+            from_queue: false,
         })
     })
 }
@@ -727,6 +809,10 @@ pub fn poll_typeahead() {
                             }
                             ta.buf.clear();
                             ta.cursor = 0;
+                            ta.from_queue = false;
+                            // Drop the guard before rendering: render_output /
+                            // render_queued_composer re-lock typeahead and the
+                            // message queue, and std Mutex is not reentrant.
                             drop(ta);
                             render_output();
                             clear_composer();
@@ -735,45 +821,40 @@ pub fn poll_typeahead() {
                         }
                         continue;
                     }
+                    // Plain Up is intentionally a no-op for the queue: queue
+                    // editing is Ctrl+Q (as the queued-row hint says), so a
+                    // stray Up can't destructively pop the newest message.
                     KeyCode::Up if !alt => {
-                        if ta.buf.is_empty() {
-                            if let Ok(mut mq) = message_queue().lock() {
-                                if let Some(last) = mq.pop() {
-                                    ta.buf = last.chars().collect();
-                                    ta.cursor = ta.buf.len();
-                                    drop(ta);
-                                    render_output();
-                                    clear_composer();
-                                    render_footer();
-                                    render_queued_composer();
-                                }
-                            }
-                        }
                         continue;
                     }
                     KeyCode::Char('q') if ctrl => {
-                        if let Ok(mut mq) = message_queue().lock() {
-                            if let Some(last) = mq.pop() {
-                                ta.buf = last.chars().collect();
-                                ta.cursor = ta.buf.len();
-                                drop(ta);
-                                render_output();
-                                clear_composer();
-                                render_footer();
-                                render_queued_composer();
-                            }
+                        // Pop under a short-lived lock, then render with no
+                        // guards held (see deadlock note on Enter above).
+                        let popped = message_queue().lock().ok().and_then(|mut mq| mq.pop());
+                        if let Some(last) = popped {
+                            ta.buf = last.chars().collect();
+                            ta.cursor = ta.buf.len();
+                            ta.from_queue = true;
+                            drop(ta);
+                            render_output();
+                            clear_composer();
+                            render_footer();
+                            render_queued_composer();
                         }
                         continue;
                     }
                     KeyCode::Char('x') if ctrl => {
-                        if let Ok(mut mq) = message_queue().lock() {
-                            if mq.pop().is_some() {
-                                drop(ta);
-                                render_output();
-                                clear_composer();
-                                render_footer();
-                                render_queued_composer();
-                            }
+                        let removed = message_queue()
+                            .lock()
+                            .ok()
+                            .and_then(|mut mq| mq.pop())
+                            .is_some();
+                        if removed {
+                            drop(ta);
+                            render_output();
+                            clear_composer();
+                            render_footer();
+                            render_queued_composer();
                         }
                         continue;
                     }
@@ -781,6 +862,7 @@ pub fn poll_typeahead() {
                         TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
                         ta.buf.clear();
                         ta.cursor = 0;
+                        ta.from_queue = false;
                     }
                     KeyCode::Char('u') if ctrl => {
                         let d = ta.cursor;
@@ -788,8 +870,26 @@ pub fn poll_typeahead() {
                         ta.cursor = 0;
                     }
                     KeyCode::Esc => {
+                        // If the buffer holds a message dequeued via Ctrl+Q,
+                        // Esc returns it to the queue instead of discarding it.
+                        if ta.from_queue && !ta.buf.is_empty() {
+                            let msg: String = ta.buf.iter().collect();
+                            if let Ok(mut mq) = message_queue().lock() {
+                                mq.push(msg);
+                            }
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            ta.from_queue = false;
+                            drop(ta);
+                            render_output();
+                            clear_composer();
+                            render_footer();
+                            render_queued_composer();
+                            continue;
+                        }
                         ta.buf.clear();
                         ta.cursor = 0;
+                        ta.from_queue = false;
                     }
                     KeyCode::Backspace if !ctrl => {
                         if ta.cursor > 0 {
@@ -847,11 +947,7 @@ pub fn render_queued_composer() {
             let q_len = mq.len() as u16;
             for (i, msg) in mq.iter().enumerate() {
                 let row = c_row.saturating_sub(q_len).saturating_add(i as u16);
-                let _ = queue!(
-                    out,
-                    MoveTo(0, row),
-                    Clear(ClearType::CurrentLine)
-                );
+                let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
                 let _ = write!(
                     out,
                     "  {} {} {} {}",
@@ -878,6 +974,7 @@ fn take_typeahead() -> (Vec<char>, usize) {
         Ok(mut ta) => {
             let buf = std::mem::take(&mut ta.buf);
             let cur = std::mem::replace(&mut ta.cursor, 0);
+            ta.from_queue = false;
             (buf, cur)
         }
         Err(_) => (Vec::new(), 0),
@@ -948,7 +1045,10 @@ pub fn str_width(s: &str) -> usize {
 }
 
 fn format_links(s: &str) -> String {
-    let mut out = String::new();
+    if !s.contains('[') || !s.contains("](") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 32);
     let mut rest = s;
     while let Some(start) = rest.find('[') {
         if let Some(mid) = rest[start..].find("](") {
@@ -958,7 +1058,11 @@ fn format_links(s: &str) -> String {
                 out.push_str(&rest[..start]);
                 let label = &rest[start + 1..mid_abs];
                 let url = &rest[mid_abs + 2..end_abs];
-                out.push_str(&format!("{} {}", underline(&cyan(label)), dim(&format!("({url})"))));
+                out.push_str(&format!(
+                    "{} {}",
+                    underline(&cyan(label)),
+                    dim(&format!("({url})"))
+                ));
                 rest = &rest[end_abs + 1..];
                 continue;
             }
@@ -971,41 +1075,56 @@ fn format_links(s: &str) -> String {
 }
 
 fn format_italics(s: &str) -> String {
-    let mut out = String::new();
-    let parts: Vec<&str> = s.split('*').collect();
-    for (i, part) in parts.iter().enumerate() {
-        if i % 2 == 1 && parts.len() > 1 {
+    if !s.contains('*') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut is_italic = false;
+    for (i, part) in s.split('*').enumerate() {
+        if i > 0 && is_italic {
             out.push_str(&italic(part));
         } else {
             out.push_str(part);
         }
+        is_italic = !is_italic;
     }
     out
 }
 
 fn format_inline_md(text: &str) -> String {
-    let mut out = String::new();
-    let code_parts: Vec<&str> = text.split('`').collect();
-    for (i, part) in code_parts.iter().enumerate() {
+    let mut out = String::with_capacity(text.len() + 32);
+    for (i, part) in text.split('`').enumerate() {
         if i % 2 == 1 {
             out.push_str(&yellow(part));
         } else {
             let with_links = format_links(part);
-            let mut bold_out = String::new();
-            let bold_parts: Vec<&str> = with_links.split("**").collect();
-            for (j, bpart) in bold_parts.iter().enumerate() {
+            for (j, bpart) in with_links.split("**").enumerate() {
                 if j % 2 == 1 {
-                    bold_out.push_str(&bold(bpart));
+                    out.push_str(&bold(bpart));
                 } else {
-                    bold_out.push_str(&format_italics(bpart));
+                    out.push_str(&format_italics(bpart));
                 }
             }
-            out.push_str(&bold_out);
         }
     }
     out
 }
 
+/// Renders a single line of Markdown into ANSI SGR terminal escape sequences.
+///
+/// This function parses and styles block-level constructs at the start of the line:
+/// - Headers (`# `, `## `, `### `): Formatted in bold accent, cyan, and blue respectively.
+/// - Blockquotes (`> `): Rendered with a dimmed vertical accent bar (`│`) and italicized text.
+/// - Unordered lists (`- `, `* `): Rendered with a dimmed bullet point (`•`).
+/// - Numbered lists (`1. `, `2. `): Formatted with bold cyan numbers.
+///
+/// It also processes inline formatting across the line:
+/// - Inline code spans (`` `code` ``): Highlighted in yellow.
+/// - Bold text (`**text**`): Styled with ANSI bold (`\x1b[1m`).
+/// - Italic text (`*text*`): Styled with ANSI italic (`\x1b[3m`).
+/// - Hyperlinks (`[label](url)`): Formatted with an underlined cyan label and dimmed URL.
+///
+/// If color is disabled via `NO_COLOR`, this returns the original unformatted line.
 pub fn render_md_line(s: &str) -> String {
     if no_color() {
         return s.to_string();
@@ -1022,7 +1141,12 @@ pub fn render_md_line(s: &str) -> String {
         return format!("{}{}", indent, bold(&accent(&format_inline_md(header))));
     }
     if let Some(quote) = trimmed.strip_prefix("> ") {
-        return format!("{}  {} {}", indent, dim("│"), italic(&dim(&format_inline_md(quote))));
+        return format!(
+            "{}  {} {}",
+            indent,
+            dim("│"),
+            italic(&dim(&format_inline_md(quote)))
+        );
     }
     let (prefix_span, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
         (Some(dim("•")), r)
@@ -1048,11 +1172,45 @@ pub fn render_md_line(s: &str) -> String {
     }
 }
 
+/// Renders a multiline Markdown document into formatted ANSI terminal output.
+///
+/// Runs the same fence state machine as [`StreamRenderer`]: lines between
+/// triple-backtick fences are drawn inside a bordered code block (with the
+/// language label on the top border) and the fence markers themselves are
+/// never shown raw. All other lines go through [`render_md_line`], so
+/// headings, lists, quotes, links and inline styles render consistently
+/// whether text arrives streamed or as a complete reply.
 pub fn render_md(text: &str) -> String {
-    text.lines()
-        .map(render_md_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let w = term_size().0 as usize;
+    let mut out: Vec<String> = Vec::new();
+    // Some(lang) while inside a fenced code block.
+    let mut fence: Option<String> = None;
+    for l in text.lines() {
+        match fence {
+            Some(_) => {
+                if l.trim() == "```" {
+                    out.push(code_box_footer(w));
+                    fence = None;
+                } else {
+                    out.push(code_box_line(l));
+                }
+            }
+            None => {
+                if let Some(rest) = l.trim_start().strip_prefix("```") {
+                    let lang = rest.trim().to_string();
+                    out.push(code_box_header(&lang, w));
+                    fence = Some(lang);
+                } else {
+                    out.push(render_md_line(l));
+                }
+            }
+        }
+    }
+    // Unclosed fence: close the border so the block doesn't bleed on.
+    if fence.is_some() {
+        out.push(code_box_footer(w));
+    }
+    out.join("\n")
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -1194,7 +1352,6 @@ fn render_output() {
         let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
         if let Some(line) = visible_lines.get(start + row) {
             let plain = strip_ansi(line);
-            plain_rows.push(plain.clone());
             if let Some(sel) = sel {
                 if let Some(range) = selection_range_for(sel, row as u16, plain.chars().count()) {
                     let _ = write!(
@@ -1208,6 +1365,7 @@ fn render_output() {
             } else {
                 let _ = write!(out, "{line}");
             }
+            plain_rows.push(plain);
         } else {
             plain_rows.push(String::new());
         }
@@ -1590,6 +1748,7 @@ pub fn inference_telemetry(tokens_generated: usize, elapsed_secs: f64) {
 pub fn enter_alt(raw: bool) {
     if raw {
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        invalidate_stream_line();
         if let Ok(mut lines) = transcript().lock() {
             lines.clear();
         }
@@ -1645,6 +1804,7 @@ pub fn leave_alt() {
 pub fn clear() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        invalidate_stream_line();
         if let Ok(mut lines) = transcript().lock() {
             lines.clear();
         }
@@ -1747,6 +1907,8 @@ fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail
     let _ = out.flush();
 }
 
+// Clip to at most `max_cols` display columns (not chars): emoji/CJK count as
+// their char_width() so a width-2 char is never split across the boundary.
 fn clip_ansi_line(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
@@ -1765,15 +1927,18 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
             }
             continue;
         }
-        if visible >= max_cols {
+        let w = char_width(c);
+        if visible + w > max_cols {
             break;
         }
         out.push(c);
-        visible += 1;
+        visible += w;
     }
     out
 }
 
+// Wrap into rows of at most `max_cols` display columns; width-aware like
+// clip_ansi_line so the alt-screen row math holds for emoji/CJK lines.
 fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
     if max_cols == 0 {
         return vec![String::new()];
@@ -1796,19 +1961,76 @@ fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
             }
             continue;
         }
-        if visible >= max_cols {
+        let w = char_width(c);
+        // `visible > 0` guard: a width-2 char on a 1-column terminal still
+        // gets a row of its own instead of an infinite run of empty rows.
+        if visible + w > max_cols && visible > 0 {
             out.push(std::mem::take(&mut current));
             visible = 0;
         }
         current.push(c);
-        visible += 1;
+        visible += w;
     }
     out.push(current);
     out
 }
 
+// Transcript index of the line currently receiving streamed text, or
+// usize::MAX when no stream line is open. line() (and transcript clears)
+// invalidate it so interleaved notices (trace records, hook lines) never get
+// streamed text welded onto them.
+static OPEN_STREAM_LINE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn invalidate_stream_line() {
+    OPEN_STREAM_LINE.store(usize::MAX, Ordering::Relaxed);
+}
+
+// Replace the open streamed line with its rendered form and close it. Falls
+// back to appending a fresh line when no stream line is open (start of turn,
+// or a notice landed mid-stream and invalidated the index).
+fn commit_stream_line(rendered: &str) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        line(rendered);
+        return;
+    }
+    let mut replaced = false;
+    if let Ok(mut lines) = transcript().lock() {
+        let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
+        if let Some(l) = lines.get_mut(open) {
+            *l = rendered.to_string();
+            replaced = true;
+        }
+    }
+    // Lock released above: render_output() re-locks the transcript.
+    invalidate_stream_line();
+    if replaced {
+        render_output();
+        clear_composer();
+    } else {
+        line(rendered);
+    }
+}
+
+// Remove the open streamed line entirely (an echoed raw partial that turned
+// out to be chrome — a code fence or protocol JSON — and must not be shown).
+fn retract_stream_line() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut lines) = transcript().lock() {
+        let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
+        if open < lines.len() {
+            lines.remove(open);
+        }
+    }
+    invalidate_stream_line();
+    render_output();
+    clear_composer();
+}
+
 pub fn line(s: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
+        invalidate_stream_line();
         if let Ok(mut lines) = transcript().lock() {
             for part in s.replace('\r', "").split('\n') {
                 lines.push(part.to_string());
@@ -1832,23 +2054,37 @@ pub fn line(s: &str) {
 pub fn write_stream(chunk: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         if let Ok(mut lines) = transcript().lock() {
-            if lines.is_empty() {
-                lines.push(String::new());
-            }
             let normalized = chunk.replace('\r', "");
             let mut parts = normalized.split('\n');
             if let Some(first) = parts.next() {
-                if let Some(last) = lines.last_mut() {
-                    last.push_str(first);
+                // Append to the tracked open stream line only; if none is
+                // open (start of stream, or a line() intervened) start fresh.
+                let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
+                match lines.get_mut(open) {
+                    Some(open_line) => open_line.push_str(first),
+                    None => {
+                        lines.push(first.to_string());
+                        OPEN_STREAM_LINE.store(lines.len() - 1, Ordering::Relaxed);
+                    }
                 }
             }
             for part in parts {
                 lines.push(part.to_string());
+                OPEN_STREAM_LINE.store(lines.len() - 1, Ordering::Relaxed);
             }
             const MAX_LINES: usize = 2_000;
             if lines.len() > MAX_LINES {
                 let extra = lines.len() - MAX_LINES;
                 lines.drain(0..extra);
+                // Keep the open-line index in step with the drained prefix.
+                let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
+                if open != usize::MAX {
+                    if open >= extra {
+                        OPEN_STREAM_LINE.store(open - extra, Ordering::Relaxed);
+                    } else {
+                        invalidate_stream_line();
+                    }
+                }
             }
         }
         render_output();
@@ -1929,13 +2165,16 @@ pub fn ask(prompt: &str) -> Option<String> {
 // submits. Shift+Tab returns CycleMode without submitting.
 // Pre-fills the first line with any keystrokes typed during agent processing.
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
-    if let Ok(mut mq) = message_queue().lock() {
-        if !mq.is_empty() {
-            let msg = mq.remove(0);
-            push_history(&msg);
-            echo_submitted(prompt, &msg);
-            return Some(InputEvent::Text(msg));
-        }
+    // Take the message out inside a tight block: echo_submitted → line →
+    // render_output re-locks the queue, and std Mutex is not reentrant.
+    let queued = message_queue()
+        .lock()
+        .ok()
+        .and_then(|mut mq| (!mq.is_empty()).then(|| mq.remove(0)));
+    if let Some(msg) = queued {
+        push_history(&msg);
+        echo_submitted(prompt, &msg);
+        return Some(InputEvent::Text(msg));
     }
     if !is_raw() {
         return ask(prompt).map(InputEvent::Text);
@@ -2573,7 +2812,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Char('y') if ctrl => {
-                for c in kill.clone().chars() {
+                for c in kill.chars() {
                     buf.insert(cursor, c);
                     cursor += 1;
                 }
@@ -2604,7 +2843,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             out,
                             "{}{}",
                             dim(&format!("(reverse-i-search)`{query}`: ")),
-                            m.clone().unwrap_or_default()
+                            m.as_deref().unwrap_or("")
                         );
                         let _ = out.flush();
                     }
@@ -2891,10 +3130,13 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
-                let cont = cursor > 0 && buf[cursor - 1] == '\\';
+                // Only a TRAILING backslash at end-of-line continues to the
+                // next line; a backslash left of the cursor mid-line (e.g. in
+                // a Windows path) must not trigger continuation.
+                let cont = buf.last() == Some(&'\\');
                 if cont {
-                    buf.remove(cursor - 1);
-                    cursor -= 1;
+                    buf.pop();
+                    cursor = cursor.min(buf.len());
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                 }
                 let text: String = buf.iter().collect();
@@ -3181,11 +3423,46 @@ mod tests {
     }
 
     #[test]
-    fn maybe_json_buffer_has_safety_cap() {
-        let lines = vec!["{".to_string(); 81];
+    fn maybe_json_buffer_has_short_lookahead_cap() {
+        // Line cap: past 5 buffered lines the lookahead gives up and flushes.
+        let lines = vec!["{".to_string(); 6];
+        assert!(maybe_json_buffer_is_too_large(&lines));
+        let lines = vec!["{".to_string(); 5];
+        assert!(!maybe_json_buffer_is_too_large(&lines));
+        // Byte cap: a single line over 2KB also flushes.
+        let lines = vec!["x".repeat(2 * 1024 + 1)];
         assert!(maybe_json_buffer_is_too_large(&lines));
         let lines = vec!["{".to_string(), "\"message\":\"ordinary\"".to_string()];
         assert!(!maybe_json_buffer_is_too_large(&lines));
+    }
+
+    #[test]
+    fn clip_ansi_line_counts_display_columns_not_chars() {
+        // ASCII: unchanged behavior.
+        assert_eq!(clip_ansi_line("abcdef", 4), "abcd");
+        // CJK chars are 2 columns wide each.
+        assert_eq!(clip_ansi_line("ab你cd", 4), "ab你");
+        // A width-2 char is never split across the boundary.
+        assert_eq!(clip_ansi_line("ab你cd", 3), "ab");
+        assert_eq!(clip_ansi_line("你好世界", 5), "你好");
+        // ANSI escapes cost zero columns.
+        assert_eq!(plain(&clip_ansi_line("\x1b[31m你好\x1b[0m", 2)), "你");
+        assert_eq!(clip_ansi_line("abc", 0), "");
+    }
+
+    #[test]
+    fn wrap_ansi_line_is_width_aware() {
+        // ASCII: unchanged behavior.
+        assert_eq!(wrap_ansi_line("abcd", 2), vec!["ab", "cd"]);
+        // Four CJK chars = 8 columns → two rows of 2 chars at width 4.
+        assert_eq!(wrap_ansi_line("你好世界", 4), vec!["你好", "世界"]);
+        // Odd width: the next width-2 char wraps whole instead of splitting.
+        assert_eq!(wrap_ansi_line("你好世界", 5), vec!["你好", "世界"]);
+        assert_eq!(wrap_ansi_line("a你b", 2), vec!["a", "你", "b"]);
+        // Degenerate width still terminates (one over-wide char per row).
+        assert_eq!(wrap_ansi_line("你好", 1), vec!["你", "好"]);
+        assert_eq!(wrap_ansi_line("", 4), vec![""]);
+        assert_eq!(wrap_ansi_line("abc", 0), vec![""]);
     }
 
     #[test]
@@ -3312,5 +3589,117 @@ mod tests {
         assert_eq!(super::end_word(&b, 0), 4);
         assert_eq!(super::end_word(&b, 4), 10);
         assert_eq!(super::end_word(&b, 10), 14);
+    }
+
+    #[test]
+    fn render_md_draws_fenced_code_blocks() {
+        let doc = "before\n```rust\nlet x = 1;\n```\nafter";
+        let out = plain(&render_md(doc));
+        assert!(out.contains("rust"), "{out}");
+        assert!(out.contains("│ let x = 1;"), "{out}");
+        assert!(out.contains("╭") && out.contains("╰"), "{out}");
+        assert!(!out.contains("```"), "{out}");
+        assert!(out.contains("before") && out.contains("after"), "{out}");
+    }
+
+    #[test]
+    fn render_md_closes_unterminated_fence() {
+        let out = plain(&render_md("```py\nprint(1)"));
+        assert!(out.contains("py"), "{out}");
+        assert!(out.contains("│ print(1)"), "{out}");
+        assert!(out.contains("╰"), "{out}");
+        assert!(!out.contains("```"), "{out}");
+    }
+
+    #[test]
+    fn render_md_without_fences_matches_per_line_rendering() {
+        let doc = "# Head\n- item\nplain";
+        let expected: Vec<String> = doc.lines().map(render_md_line).collect();
+        assert_eq!(render_md(doc), expected.join("\n"));
+    }
+
+    #[test]
+    fn stream_renderer_fence_has_label_and_no_raw_backticks() {
+        let mut r = StreamRenderer::new();
+        r.push("```python\nx = 1\ny = 2\n```\nafter\n");
+        r.flush();
+        let joined = plain(&r.sink.join("\n"));
+        assert!(joined.contains("python"), "{joined}");
+        assert!(
+            joined.contains("│ x = 1") && joined.contains("│ y = 2"),
+            "{joined}"
+        );
+        assert!(joined.contains("╭") && joined.contains("╰"), "{joined}");
+        assert!(!joined.contains("```"), "{joined}");
+        assert!(joined.contains("after"), "{joined}");
+    }
+
+    #[test]
+    fn stream_renderer_commits_rendered_lines_at_any_chunk_split() {
+        let doc = "# Title\nplain **bold** text\n```rs\nfn main() {}\n```\ntail\n";
+        // Whole-document reference run.
+        let mut whole = StreamRenderer::new();
+        whole.push(doc);
+        whole.flush();
+        // Split at every char boundary; the committed transcript must not
+        // depend on where the stream chunks happened to land.
+        for cut in 1..doc.len() {
+            if !doc.is_char_boundary(cut) {
+                continue;
+            }
+            let mut split = StreamRenderer::new();
+            split.push(&doc[..cut]);
+            split.push(&doc[cut..]);
+            split.flush();
+            assert_eq!(split.sink, whole.sink, "split at byte {cut}");
+        }
+        let joined = plain(&whole.sink.join("\n"));
+        assert!(
+            joined.contains("Title") && !joined.contains("# Title"),
+            "{joined}"
+        );
+        assert!(joined.contains("│ fn main() {}"), "{joined}");
+        assert!(!joined.contains("```"), "{joined}");
+        assert!(!joined.contains("**"), "{joined}");
+    }
+
+    #[test]
+    fn stream_renderer_flushes_partial_last_line_rendered() {
+        let mut r = StreamRenderer::new();
+        r.push("**no trailing newline**");
+        r.flush();
+        let joined = plain(&r.sink.join("\n"));
+        assert!(joined.contains("no trailing newline"), "{joined}");
+        assert!(!joined.contains("**"), "{joined}");
+    }
+
+    #[test]
+    fn test_markdown_rendering_formatting() {
+        let md = super::render_md_line("# Hello **world** *italic* `code`");
+        let p = plain(&md);
+        assert!(p.contains("Hello"), "{p}");
+        assert!(p.contains("world"), "{p}");
+        assert!(p.contains("italic"), "{p}");
+        assert!(p.contains("code"), "{p}");
+
+        let num_list = super::render_md_line("1. First item");
+        let p_num = plain(&num_list);
+        assert!(p_num.contains("1."), "{p_num}");
+        assert!(p_num.contains("First item"), "{p_num}");
+
+        let quote = super::render_md_line("> A blockquote");
+        let p_quote = plain(&quote);
+        assert!(p_quote.contains("│"), "{p_quote}");
+        assert!(p_quote.contains("A blockquote"), "{p_quote}");
+
+        let link = super::render_md_line("Click [Google](https://google.com) now");
+        let p_link = plain(&link);
+        assert!(p_link.contains("Google"), "{p_link}");
+        assert!(p_link.contains("(https://google.com)"), "{p_link}");
+
+        let bullet = super::render_md_line("- Bullet item");
+        let p_bullet = plain(&bullet);
+        assert!(p_bullet.contains("•"), "{p_bullet}");
+        assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
     }
 }

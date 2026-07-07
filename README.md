@@ -5,8 +5,8 @@
 
 A hilariously fast, **agentic AI CLI harness** — written in Rust. Remote models
 via API key, or local models on your machine. It plans, edits files, and runs
-commands, asking before each change. One static binary, four dependencies, no
-runtime to babysit.
+commands, asking before each change. One static binary, five direct
+dependencies, no runtime to babysit.
 
 ```bash
 npm install -g buildwithnexus
@@ -128,8 +128,9 @@ also carry build-provenance attestations (`gh attestation verify`).
 
 - Default permission is **ask** — every file write, edit, and command is
   confirmed. `auto` ("yolo") and `readonly` are opt-in.
-- File tools are confined to the working directory; reads outside it, and of
-  sensitive paths (the key store, `~/.ssh`, `.env`, `*.pem`), require
+- Mutating file tools (write/edit/patch) are confined to the working directory —
+  writes outside it require explicit confirmation. Reads are unconfined, but
+  sensitive paths (the key store, `~/.ssh`, `.env`, `*.pem`) require
   confirmation even in `auto`. Catastrophic commands (`rm -rf /`, `mkfs`, …) too.
 - API keys are never sent to a non-HTTPS endpoint, and key-like tokens are
   redacted from surfaced errors.

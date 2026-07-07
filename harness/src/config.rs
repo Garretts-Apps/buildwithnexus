@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 pub enum Protocol {
     Anthropic,
     OpenAi,
+    /// Ollama's native /api/chat endpoint. Unlike the OpenAI-compat /v1
+    /// endpoint it accepts `options.num_ctx` — without it Ollama silently
+    /// truncates prompts to the server-default window — and lets us reset
+    /// `repeat_penalty` (Ollama's 1.1 default corrupts tool-call JSON).
+    OllamaNative,
 }
 
 impl std::fmt::Display for Protocol {
@@ -18,6 +23,7 @@ impl std::fmt::Display for Protocol {
         match self {
             Protocol::Anthropic => write!(f, "Anthropic"),
             Protocol::OpenAi => write!(f, "OpenAI"),
+            Protocol::OllamaNative => write!(f, "Ollama"),
         }
     }
 }
@@ -81,8 +87,10 @@ pub const PRESETS: &[Preset] = &[
     Preset {
         id: "ollama",
         label: "Ollama (local)",
-        protocol: Protocol::OpenAi,
-        base_url: "http://localhost:11434/v1",
+        protocol: Protocol::OllamaNative,
+        // Host root, not …/v1: the native API lives at /api/chat. The
+        // provider falls back to {base}/v1 OpenAI-compat on older servers.
+        base_url: "http://localhost:11434",
         env_key: "",
         default_model: "llama3.2",
         local: true,
@@ -120,6 +128,19 @@ pub struct Settings {
     pub effort: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Sampling temperature override; None → per-protocol default (0.2 on
+    /// OpenAI-style APIs; Anthropic uses the server default).
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Response token cap override; None → per-protocol default (4096 on
+    /// OpenAI-style APIs, 8192 on Anthropic).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Context-window override in tokens; None → per-provider default. On
+    /// the Ollama preset this also sets `options.num_ctx` directly and
+    /// skips /api/show detection.
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
     /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
@@ -141,6 +162,9 @@ impl Default for Settings {
             permission: "ask".into(),
             effort: "low".into(),
             base_url: None,
+            temperature: None,
+            max_tokens: None,
+            context_tokens: None,
             allowed_commands: Vec::new(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
@@ -148,12 +172,14 @@ impl Default for Settings {
     }
 }
 
+// Only unambiguously read-only binaries auto-approve in Ask mode by default.
+// Anything that can mutate files, run arbitrary code, or reach the network
+// (git, npm, curl, docker, patch, …) must prompt; users who want more can add
+// their own entries via `allowed_commands` in settings.
 fn default_allowed_commands() -> Vec<String> {
     [
-        "git", "cargo", "npm", "npx", "node", "python3", "pip3", "make", "cmake", "bun", "deno",
-        "rg", "grep", "find", "ls", "cat", "curl", "wget", "jq", "gh", "rustc", "go", "ruby",
-        "java", "yarn", "pnpm", "docker", "kubectl", "sed", "awk", "sort", "uniq", "wc", "head",
-        "tail", "diff", "patch", "tar", "zip", "unzip", "rsync", "mvn", "gradle",
+        "ls", "cat", "head", "tail", "grep", "rg", "pwd", "echo", "which", "wc", "du", "df",
+        "sort", "uniq", "diff",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -792,8 +818,9 @@ mod tests {
     #[test]
     fn preset_lookup() {
         assert!(preset("anthropic").unwrap().protocol == Protocol::Anthropic);
-        assert!(preset("ollama").unwrap().protocol == Protocol::OpenAi);
+        assert!(preset("ollama").unwrap().protocol == Protocol::OllamaNative);
         assert!(preset("ollama").unwrap().local);
+        assert!(preset("lmstudio").unwrap().protocol == Protocol::OpenAi);
         assert!(preset("nonexistent").is_none());
     }
 
@@ -856,6 +883,19 @@ mod tests {
             serde_json::from_str(r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#)
                 .unwrap();
         assert!(s.base_url.is_none());
+        // Newer knobs default to None on old settings files.
+        assert!(s.context_tokens.is_none());
+    }
+
+    #[test]
+    fn settings_context_tokens_roundtrip() {
+        let s = Settings {
+            context_tokens: Some(16_384),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.context_tokens, Some(16_384));
     }
 
     #[test]

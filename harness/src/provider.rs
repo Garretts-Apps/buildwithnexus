@@ -1,6 +1,8 @@
-// The model wire layer. One enum, two `match` arms — Anthropic Messages and the
-// OpenAI /chat/completions shape (which also covers Ollama, llama.cpp, LM Studio,
-// OpenRouter, Groq, and Hugging Face). No trait objects: the call site matches.
+// The model wire layer. One enum, three `match` arms — Anthropic Messages, the
+// OpenAI /chat/completions shape (llama.cpp, LM Studio, OpenRouter, Groq, and
+// Hugging Face), and Ollama's native /api/chat (which alone accepts num_ctx —
+// the OpenAI-compat endpoint silently truncates prompts to the server default).
+// No trait objects: the call site matches.
 //
 // Each protocol has a body builder + a request builder, shared by the blocking
 // `complete()` and the streaming `stream()` so there's exactly one place that
@@ -21,12 +23,19 @@ pub struct Provider {
     pub api_key: Option<String>,
     pub model: String,
     pub context_tokens: usize, // model context window, for compaction thresholds
+    pub temperature: Option<f64>, // sampling temperature; None → per-protocol default
+    pub max_tokens: Option<u32>, // response token cap; None → per-protocol default
+    /// Ollama native only: cached /api/show probe result, filled once per
+    /// session. `Some(n)` is the chosen `options.num_ctx`; `None` means the
+    /// probe failed (older server) and requests fall back to the OpenAI-compat
+    /// /v1 endpoint. A settings `context_tokens` override pre-seeds this cache.
+    pub ollama_ctx: std::sync::OnceLock<Option<u32>>,
 }
 
 // Neutral conversation. The provider translates this into each vendor's shape;
 // the rest of the program never sees vendor JSON. Serializable + cloneable so a
 // transcript can be persisted to a session file and restored on resume.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -54,9 +63,15 @@ pub enum Msg {
     },
     Tool(Vec<ToolResult>),
 }
+#[derive(Debug, Default)]
 pub struct Reply {
     pub text: String,
     pub calls: Vec<ToolCall>,
+    /// Why the model stopped, normalized across protocols: "max_tokens"
+    /// (OpenAI "length" and Ollama done_reason "length" map here), "end_turn",
+    /// "tool_use" (OpenAI "tool_calls" maps here), "refusal", "stop", or None
+    /// when the server didn't report one.
+    pub stop_reason: Option<String>,
 }
 
 // One process-wide agent so the TLS connection is pooled and kept alive across
@@ -82,6 +97,7 @@ pub fn prewarm(p: &Provider) {
     let url = match p.protocol {
         Protocol::Anthropic => url(p, "/v1/models"),
         Protocol::OpenAi => url(p, "/models"),
+        Protocol::OllamaNative => format!("{}/api/tags", ollama_root(&p.base_url)),
     };
     let key = p.api_key.clone();
     let proto = p.protocol;
@@ -113,10 +129,10 @@ pub mod bench {
         super::cache_last_message(m)
     }
     pub fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
-        super::anthropic_body(model, msgs, tools)
+        super::anthropic_body(model, msgs, tools, None)
     }
     pub fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
-        super::openai_body(model, msgs, tools)
+        super::openai_body(model, msgs, tools, None, None)
     }
     pub fn openai_stream(
         reader: impl Read,
@@ -127,11 +143,17 @@ pub mod bench {
     }
 }
 
+// Ollama's native API lives at the host root; tolerate both a bare host base
+// (the current preset) and an OpenAI-style …/v1 base (older settings files,
+// custom base_url overrides) by trimming a trailing /v1.
+fn ollama_root(base_url: &str) -> &str {
+    base_url.trim_end_matches('/').trim_end_matches("/v1")
+}
+
 // Installed models reported by a running Ollama (GET /api/tags). Empty on any
-// failure (not running, wrong host, …). `base_url` is the OpenAI-style base
-// (…/v1); Ollama's native API lives at the host root, so /v1 is trimmed.
+// failure (not running, wrong host, …).
 pub fn ollama_models(base_url: &str) -> Vec<String> {
-    let root = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let root = ollama_root(base_url);
     let resp = match agent()
         .get(&format!("{root}/api/tags"))
         .timeout(Duration::from_secs(2))
@@ -200,6 +222,36 @@ fn request(
                 openai_parse(send(req, body)?)
             }
         }
+        Protocol::OllamaNative => {
+            // The native path exists to set options.num_ctx (unavailable on
+            // the OpenAI-compat endpoint, which silently truncates prompts)
+            // and to neutralize the repeat_penalty=1.1 default. A failed
+            // /api/show probe means an older server: fall back to the
+            // {root}/v1 OpenAI-compat endpoint used before, with a one-time
+            // heads-up about the context limitation.
+            match ollama_ctx(p) {
+                Some(num_ctx) => {
+                    let (req, mut body) = ollama_request(p, msgs, tools, num_ctx);
+                    if streaming {
+                        body["stream"] = json!(true);
+                        ollama_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
+                    } else {
+                        ollama_parse(send(req, body)?)
+                    }
+                }
+                None => {
+                    warn_ollama_fallback();
+                    let base = format!("{}/v1", ollama_root(&p.base_url));
+                    let (req, mut body) = openai_request_at(p, &base, msgs, tools);
+                    if streaming {
+                        body["stream"] = json!(true);
+                        openai_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
+                    } else {
+                        openai_parse(send(req, body)?)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -212,7 +264,7 @@ fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
 
 fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
     let mut attempts = 0;
-    let max_attempts = 4;
+    let max_attempts = 5;
     let mut delay_ms = 500;
 
     loop {
@@ -223,20 +275,17 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
         match req_clone.send_json(body_clone) {
             Ok(resp) => return Ok(resp),
             Err(ureq::Error::Status(code, resp)) => {
+                // The status code alone decides retryability — the body is
+                // never consulted, so an error message that happens to mention
+                // "image" or "not supported" can't turn a transient 429/5xx
+                // into a permanent failure.
+                let is_transient = is_transient_status(code);
+                let server_wait = retry_after_ms(resp.header("retry-after"));
                 let detail = resp.into_string().unwrap_or_default();
-                let detail_lower = detail.to_lowercase();
-                let is_unsupported = code == 400
-                    || code == 404
-                    || code == 422
-                    || code == 501
-                    || detail_lower.contains("image")
-                    || detail_lower.contains("multimodal")
-                    || detail_lower.contains("vision")
-                    || detail_lower.contains("not supported");
-                let is_transient = !is_unsupported && (code == 429 || (500..=504).contains(&code));
                 if is_transient && attempts < max_attempts {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    delay_ms *= 2;
+                    let wait = server_wait.unwrap_or(delay_ms);
+                    std::thread::sleep(Duration::from_millis(wait));
+                    delay_ms = (delay_ms * 2).min(10_000);
                     continue;
                 }
                 return Err(format!(
@@ -246,14 +295,28 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
             }
             Err(e) => {
                 if attempts < max_attempts {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    delay_ms *= 2;
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    delay_ms = (delay_ms * 2).min(10_000);
                     continue;
                 }
                 return Err(format!("connection failed: {}", redact(&e.to_string())));
             }
         }
     }
+}
+
+// Retryable status codes: rate limits (429), Anthropic's overloaded (529), and
+// transient 5xx. 501 Not Implemented is a permanent capability gap, not a blip.
+fn is_transient_status(code: u16) -> bool {
+    code == 429 || code == 529 || ((500..=504).contains(&code) && code != 501)
+}
+
+// Retry-After header (delta-seconds form) in milliseconds, capped at 60s. The
+// HTTP-date form doesn't parse as an integer; callers fall back to backoff.
+fn retry_after_ms(header: Option<&str>) -> Option<u64> {
+    header
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|s| s.min(60) * 1000)
 }
 
 // Defense-in-depth: blank out anything that looks like an API key/token before
@@ -281,6 +344,18 @@ fn redact(s: &str) -> String {
         .collect()
 }
 
+// Map vendor finish/stop reasons onto one shared vocabulary so the agent loop
+// can branch without knowing which protocol produced the reply: OpenAI's
+// "length" becomes "max_tokens" and "tool_calls" becomes "tool_use"; everything
+// else ("end_turn", "stop", "refusal", …) passes through unchanged.
+fn normalize_stop_reason(raw: &str) -> String {
+    match raw {
+        "length" => "max_tokens".to_string(),
+        "tool_calls" => "tool_use".to_string(),
+        other => other.to_string(),
+    }
+}
+
 // OpenAI tool-call arguments arrive as a JSON *string*; mark unparseable ones so
 // the agent can tell the model instead of silently running with empty fields.
 fn parse_args(args: &str) -> Value {
@@ -293,7 +368,10 @@ fn parse_args(args: &str) -> Value {
 // Iterate `data:` payloads of an SSE stream, handing each JSON value to `f`.
 // `f` returns true to stop early (e.g. on [DONE]). Takes any reader so the
 // streaming parsers are unit-testable against an in-memory byte slice.
-fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
+// A transport error mid-stream is surfaced as Err rather than treated as a
+// clean end — otherwise a dropped connection silently truncates the reply.
+// Natural EOF (or a terminal event before one) is still success.
+fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<(), String> {
     // Reuse one buffer across lines instead of allocating a String per line.
     let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
@@ -301,7 +379,8 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => return Ok(()),
+            Err(e) => return Err(format!("stream read failed: {}", redact(&e.to_string()))),
             Ok(_) => {
                 if last_poll.elapsed() >= Duration::from_millis(50) {
                     crate::tui::poll_typeahead();
@@ -309,7 +388,7 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
                 }
                 if let Some(payload) = line.strip_prefix("data:") {
                     if f(payload.trim()) {
-                        break;
+                        return Ok(());
                     }
                 }
             }
@@ -321,7 +400,7 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) {
 // Pure request-body builder, split out from the HTTP wiring so the JSON shape
 // (system caching, tool schema mapping, tool_use/tool_result, the last-message
 // cache breakpoint) is unit-testable without constructing a `ureq::Request`.
-fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
+fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Option<u32>) -> Value {
     let mut system = String::new();
     let mut messages: Vec<Value> = Vec::new();
     for m in msgs {
@@ -379,7 +458,11 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
     // prior turns from cache — much lower time-to-first-token on multi-step tasks.
     cache_last_message(&mut messages);
 
-    let mut body = json!({"model": model, "max_tokens": 4096, "messages": messages});
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_tokens.unwrap_or(8192),
+        "messages": messages
+    });
     if !system.is_empty() {
         body["system"] =
             json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
@@ -400,7 +483,7 @@ fn anthropic_request(
     msgs: &[Msg],
     tools: &[ToolDef],
 ) -> Result<(ureq::Request, Value), String> {
-    let body = anthropic_body(&p.model, msgs, tools);
+    let body = anthropic_body(&p.model, msgs, tools, p.max_tokens);
     let key = p
         .api_key
         .as_deref()
@@ -446,7 +529,12 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
             }
         }
     }
-    Ok(Reply { text, calls })
+    let stop_reason = v["stop_reason"].as_str().map(normalize_stop_reason);
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
 }
 
 fn anthropic_stream(
@@ -455,6 +543,8 @@ fn anthropic_stream(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     let mut text = String::new();
+    let mut stop_reason: Option<String> = None;
+    let mut stream_err: Option<String> = None;
     // index → (id, name, accumulated input JSON)
     let mut pending: Vec<(usize, String, String, String)> = Vec::new();
     for_each_sse(reader, |data| {
@@ -497,25 +587,58 @@ fn anthropic_stream(
                     _ => {}
                 }
             }
+            Some("message_delta") => {
+                // Final metadata for the turn — carries the stop reason.
+                if let Some(r) = v["delta"]["stop_reason"].as_str() {
+                    stop_reason = Some(normalize_stop_reason(r));
+                }
+            }
+            Some("error") => {
+                // Mid-stream server error (e.g. overloaded) — surface it so the
+                // caller can retry or report instead of returning a truncated reply.
+                stream_err = Some(format!(
+                    "stream error: {}",
+                    redact(&v["error"].to_string())
+                        .chars()
+                        .take(400)
+                        .collect::<String>()
+                ));
+                return true;
+            }
             Some("message_stop") => return true,
             _ => {}
         }
         false
-    });
+    })?;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    // Same INVALID_ARGS flagging as the OpenAI path: a truncated tool call must
+    // reach the agent loop as malformed, not silently execute with empty input.
     let calls = pending
         .into_iter()
         .map(|(_, id, name, args)| ToolCall {
             id,
             name,
-            input: serde_json::from_str(&args).unwrap_or_else(|_| json!({})),
+            input: parse_args(&args),
         })
         .collect();
-    Ok(Reply { text, calls })
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
 }
 
 // ── OpenAI-compatible /chat/completions ─────────────────────────────────────
 // Pure body builder (see `anthropic_body` for the rationale).
-fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
+fn openai_body(
+    model: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+) -> Value {
     let mut messages: Vec<Value> = Vec::new();
     let mut system = String::new();
     for m in msgs {
@@ -568,7 +691,12 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
         }
     }
 
-    let mut body = json!({"model": model, "messages": messages});
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature.unwrap_or(0.2),
+        "max_tokens": max_tokens.unwrap_or(4096)
+    });
     if !tools.is_empty() {
         body["tools"] =
             json!(tools.iter().map(|t| json!({
@@ -580,9 +708,20 @@ fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
 }
 
 fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
-    let body = openai_body(&p.model, msgs, tools);
+    openai_request_at(p, &p.base_url, msgs, tools)
+}
+
+// Same request against an explicit base URL — the Ollama fallback path targets
+// {host}/v1 while the provider's base_url is the bare host root.
+fn openai_request_at(
+    p: &Provider,
+    base: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+) -> (ureq::Request, Value) {
+    let body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
     let mut req = agent()
-        .post(&url(p, "/chat/completions"))
+        .post(&format!("{}/chat/completions", base.trim_end_matches('/')))
         .set("content-type", "application/json");
     if let Some(key) = &p.api_key {
         req = req.set("authorization", &format!("Bearer {key}"));
@@ -607,7 +746,14 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
             });
         }
     }
-    Ok(Reply { text, calls })
+    let stop_reason = v["choices"][0]["finish_reason"]
+        .as_str()
+        .map(normalize_stop_reason);
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
 }
 
 fn route_openai_content(
@@ -664,6 +810,7 @@ fn openai_stream(
 ) -> Result<Reply, String> {
     let mut text = String::new();
     let mut in_think = false;
+    let mut stop_reason: Option<String> = None;
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
     for_each_sse(reader, |data| {
@@ -673,6 +820,10 @@ fn openai_stream(
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
+        // finish_reason rides on the last content-bearing chunk (or one after).
+        if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
+            stop_reason = Some(normalize_stop_reason(r));
+        }
         let delta = &v["choices"][0]["delta"];
         if let Some(r) = delta["reasoning_content"]
             .as_str()
@@ -706,7 +857,7 @@ fn openai_stream(
             }
         }
         false
-    });
+    })?;
     let calls = pending
         .into_iter()
         .filter(|e| !e.1.is_empty())
@@ -716,7 +867,324 @@ fn openai_stream(
             input: parse_args(&args),
         })
         .collect();
-    Ok(Reply { text, calls })
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
+}
+
+// ── Ollama native /api/chat ─────────────────────────────────────────────────
+// Used by the "ollama" preset. Two things the OpenAI-compat /v1 endpoint
+// cannot express: options.num_ctx (without it Ollama silently truncates the
+// prompt to the server-default window) and repeat_penalty=1.0 (the 1.1
+// default corrupts tool-call JSON and code output).
+
+// Hard cap on the requested window: larger allocations trade tokens/s and
+// VRAM for headroom most local machines don't have.
+const OLLAMA_CTX_CAP: u64 = 32_768;
+// Assumed window when /api/show doesn't reveal the model max.
+const OLLAMA_CTX_FLOOR: u32 = 8_192;
+
+// Model max context from an /api/show response. The model_info key is
+// architecture-prefixed ("llama.context_length", "qwen2.context_length", …),
+// so scan for the ".context_length" suffix rather than guessing the arch.
+fn show_context_length(v: &Value) -> Option<u64> {
+    v["model_info"]
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, val)| val.as_u64())
+}
+
+// A Modelfile `num_ctx`, if the model was created with one. /api/show's
+// "parameters" field is a flat text blob, one "key value" pair per line.
+fn show_num_ctx(v: &Value) -> Option<u64> {
+    for line in v["parameters"].as_str()?.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("num_ctx") {
+            return parts.next().and_then(|n| n.parse().ok());
+        }
+    }
+    None
+}
+
+// Choose the num_ctx to request: an explicit Modelfile num_ctx wins (the user
+// tuned it), else the model max capped at 32k, else the 8k floor when the max
+// is unknown. Never exceeds a known model max.
+fn ollama_pick_ctx(model_max: Option<u64>, modelfile_ctx: Option<u64>) -> u32 {
+    let picked = match (modelfile_ctx, model_max) {
+        (Some(n), Some(max)) => n.min(max),
+        (Some(n), None) => n,
+        (None, Some(max)) => max.min(OLLAMA_CTX_CAP),
+        (None, None) => u64::from(OLLAMA_CTX_FLOOR),
+    };
+    u32::try_from(picked).unwrap_or(u32::MAX)
+}
+
+// Cached /api/show probe — queried once per Provider (the OnceLock). Returns
+// the chosen num_ctx, or None when the probe failed (server down, or an
+// Ollama old enough to lack /api/show); callers then use the OpenAI-compat
+// fallback. lib.rs pre-seeds the cache when settings override the context.
+pub fn ollama_ctx(p: &Provider) -> Option<u32> {
+    *p.ollama_ctx.get_or_init(|| {
+        let v: Value = agent()
+            .post(&format!("{}/api/show", ollama_root(&p.base_url)))
+            .timeout(Duration::from_secs(3))
+            .send_json(json!({"model": p.model}))
+            .ok()?
+            .into_json()
+            .ok()?;
+        Some(ollama_pick_ctx(show_context_length(&v), show_num_ctx(&v)))
+    })
+}
+
+// One-line heads-up, once per process, when falling back to /v1: without
+// num_ctx the server may silently truncate long prompts.
+fn warn_ollama_fallback() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        crate::report::notice(
+            "ollama: /api/show unavailable; using the OpenAI-compat endpoint (long prompts may be truncated to the server-default context window)",
+        );
+    });
+}
+
+// Pure body builder (see `anthropic_body` for the rationale). Message roles
+// mirror the OpenAI shape, but tool-call arguments are JSON *objects*, images
+// are a bare base64 array on the user message, and sampling knobs nest under
+// "options". "stream" defaults to true server-side, so it's always explicit.
+fn ollama_body(
+    model: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    num_ctx: u32,
+) -> Value {
+    let mut messages: Vec<Value> = Vec::new();
+    let mut system = String::new();
+    for m in msgs {
+        if let Msg::System(s) = m {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(s);
+        }
+    }
+    if !system.is_empty() {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    // Ollama tool-call messages carry no ids on the wire, so tool results are
+    // threaded by name instead: map call ids to names while walking the
+    // transcript, then stamp tool_name on each result.
+    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for m in msgs {
+        match m {
+            Msg::System(_) => {}
+            Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::UserImages { text, images } => {
+                // Raw base64 strings; the server sniffs the media type.
+                let imgs: Vec<&str> = images.iter().map(|(_, data)| data.as_str()).collect();
+                messages.push(json!({"role": "user", "content": text, "images": imgs}));
+            }
+            Msg::Assistant { text, calls } => {
+                let mut msg = json!({"role": "assistant", "content": text});
+                if !calls.is_empty() {
+                    msg["tool_calls"] = json!(calls
+                        .iter()
+                        .map(|c| {
+                            // arguments is an object here, not OpenAI's string.
+                            json!({"function": {"name": c.name, "arguments": c.input}})
+                        })
+                        .collect::<Vec<_>>());
+                    for c in calls {
+                        call_names.insert(&c.id, &c.name);
+                    }
+                }
+                messages.push(msg);
+            }
+            Msg::Tool(results) => {
+                for r in results {
+                    let mut msg = json!({"role": "tool", "content": r.content});
+                    if let Some(name) = call_names.get(r.id.as_str()) {
+                        msg["tool_name"] = json!(name);
+                    }
+                    messages.push(msg);
+                }
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        "options": {
+            // The reason the native path exists — see the section comment.
+            "num_ctx": num_ctx,
+            "temperature": temperature.unwrap_or(0.2),
+            // Ollama's 1.1 default penalizes the repetition inherent in JSON
+            // and code; 1.0 disables it.
+            "repeat_penalty": 1.0,
+            "num_predict": max_tokens.unwrap_or(4096),
+        }
+    });
+    if !tools.is_empty() {
+        // Same schema wrapper as the OpenAI shape.
+        body["tools"] =
+            json!(tools.iter().map(|t| json!({
+            "type": "function",
+            "function": {"name": t.name, "description": t.description, "parameters": t.schema}
+        })).collect::<Vec<_>>());
+    }
+    body
+}
+
+fn ollama_request(
+    p: &Provider,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    num_ctx: u32,
+) -> (ureq::Request, Value) {
+    let body = ollama_body(&p.model, msgs, tools, p.temperature, p.max_tokens, num_ctx);
+    // Local server: no auth header.
+    let req = agent()
+        .post(&format!("{}/api/chat", ollama_root(&p.base_url)))
+        .set("content-type", "application/json");
+    (req, body)
+}
+
+// Native Ollama sends tool-call arguments as an object; tolerate the string
+// form some proxies emit by running it through the same INVALID_ARGS guard.
+fn ollama_call_args(args: &Value) -> Value {
+    match args {
+        Value::String(s) => parse_args(s),
+        Value::Null => json!({}),
+        other => other.clone(),
+    }
+}
+
+// Ollama assigns no tool-call ids; synthesize one from the call's position so
+// results can be threaded back through the transcript.
+fn ollama_call(i: usize, tc: &Value) -> ToolCall {
+    let id = match tc["id"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => format!("ollama-call-{i}"),
+    };
+    ToolCall {
+        id,
+        name: tc["function"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        input: ollama_call_args(&tc["function"]["arguments"]),
+    }
+}
+
+fn ollama_parse(v: Value) -> Result<Reply, String> {
+    let msg = &v["message"];
+    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let mut calls = Vec::new();
+    if let Some(tcs) = msg["tool_calls"].as_array() {
+        for tc in tcs {
+            calls.push(ollama_call(calls.len(), tc));
+        }
+    }
+    // done_reason "length" normalizes to "max_tokens" like OpenAI's "length".
+    let stop_reason = v["done_reason"].as_str().map(normalize_stop_reason);
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
+}
+
+// Iterate an NDJSON stream (one JSON object per line — Ollama's native
+// streaming format, not SSE), handing each parsed value to `f`; `f` returns
+// true to stop (the "done": true line). Same transport contract as
+// `for_each_sse`: a mid-stream read error is Err, natural EOF is success.
+fn for_each_ndjson(reader: impl Read, mut f: impl FnMut(&Value) -> bool) -> Result<(), String> {
+    let mut reader = BufReader::with_capacity(32 * 1024, reader);
+    let mut line = String::new();
+    let mut last_poll = Instant::now();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(()),
+            Err(e) => return Err(format!("stream read failed: {}", redact(&e.to_string()))),
+            Ok(_) => {
+                if last_poll.elapsed() >= Duration::from_millis(50) {
+                    crate::tui::poll_typeahead();
+                    last_poll = Instant::now();
+                }
+                let payload = line.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                    if f(&v) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ollama_stream(
+    reader: impl Read,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    let mut text = String::new();
+    let mut in_think = false;
+    let mut stop_reason: Option<String> = None;
+    let mut stream_err: Option<String> = None;
+    let mut calls: Vec<ToolCall> = Vec::new();
+    for_each_ndjson(reader, |v| {
+        // A mid-stream server error rides on an "error" field.
+        if let Some(e) = v["error"].as_str() {
+            stream_err = Some(format!(
+                "stream error: {}",
+                redact(e).chars().take(400).collect::<String>()
+            ));
+            return true;
+        }
+        let msg = &v["message"];
+        if let Some(t) = msg["thinking"].as_str() {
+            // Native thinking field (thinking-capable models); models without
+            // it inline <think> tags in content, handled below.
+            if !t.is_empty() {
+                on_thinking(t);
+            }
+        }
+        if let Some(t) = msg["content"].as_str() {
+            if !t.is_empty() {
+                route_openai_content(t, &mut in_think, &mut text, on_text, on_thinking);
+            }
+        }
+        // Unlike OpenAI's fragmented deltas, each streamed tool call arrives
+        // whole (arguments already a complete object) — append directly.
+        if let Some(tcs) = msg["tool_calls"].as_array() {
+            for tc in tcs {
+                calls.push(ollama_call(calls.len(), tc));
+            }
+        }
+        if v["done"].as_bool() == Some(true) {
+            stop_reason = v["done_reason"].as_str().map(normalize_stop_reason);
+            return true;
+        }
+        false
+    })?;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    Ok(Reply {
+        text,
+        calls,
+        stop_reason,
+    })
 }
 
 #[cfg(test)]
@@ -795,6 +1263,31 @@ mod tests {
         assert_eq!(v[crate::tools::INVALID_ARGS], json!(r#"{"a":"#));
     }
 
+    // ── retry classification ────────────────────────────────────────────────
+    #[test]
+    fn transient_status_covers_rate_limits_and_5xx() {
+        for code in [429, 500, 502, 503, 504, 529] {
+            assert!(is_transient_status(code), "{code} should be transient");
+        }
+    }
+
+    #[test]
+    fn non_transient_status_includes_client_errors_and_501() {
+        for code in [400, 401, 403, 404, 422, 501] {
+            assert!(!is_transient_status(code), "{code} should not retry");
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_caps_at_60s() {
+        assert_eq!(retry_after_ms(Some("2")), Some(2_000));
+        assert_eq!(retry_after_ms(Some(" 30 ")), Some(30_000));
+        assert_eq!(retry_after_ms(Some("300")), Some(60_000));
+        // HTTP-date form and garbage fall back to exponential backoff.
+        assert_eq!(retry_after_ms(Some("Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(retry_after_ms(None), None);
+    }
+
     // ── cache_last_message ──────────────────────────────────────────────────
     #[test]
     fn cache_last_message_empty_is_noop() {
@@ -843,15 +1336,25 @@ mod tests {
             Msg::System("two".into()),
             Msg::User("hello".into()),
         ];
-        let b = anthropic_body("m", &msgs, &[]);
+        let b = anthropic_body("m", &msgs, &[], None);
         assert_eq!(b["system"][0]["text"], "one\n\ntwo");
         assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(b["max_tokens"], 4096);
+        assert_eq!(b["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn anthropic_body_max_tokens_default_and_override() {
+        let msgs = vec![Msg::User("hi".into())];
+        assert_eq!(anthropic_body("m", &msgs, &[], None)["max_tokens"], 8192);
+        assert_eq!(
+            anthropic_body("m", &msgs, &[], Some(1234))["max_tokens"],
+            1234
+        );
     }
 
     #[test]
     fn anthropic_body_no_system_no_tools_keys() {
-        let b = anthropic_body("m", &[Msg::User("hi".into())], &[]);
+        let b = anthropic_body("m", &[Msg::User("hi".into())], &[], None);
         assert!(b.get("system").is_none());
         assert!(b.get("tools").is_none());
     }
@@ -862,7 +1365,7 @@ mod tests {
             text: "thinking".into(),
             calls: vec![tc("t1", "read_file", json!({"path": "a"}))],
         }];
-        let b = anthropic_body("m", &msgs, &[]);
+        let b = anthropic_body("m", &msgs, &[], None);
         let content = &b["messages"][0]["content"];
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[1]["type"], "tool_use");
@@ -876,7 +1379,7 @@ mod tests {
             text: String::new(),
             calls: vec![tc("t1", "x", json!({}))],
         }];
-        let b = anthropic_body("m", &msgs, &[]);
+        let b = anthropic_body("m", &msgs, &[], None);
         assert_eq!(b["messages"][0]["content"][0]["type"], "tool_use");
     }
 
@@ -887,7 +1390,7 @@ mod tests {
             content: "ok".into(),
             is_error: false,
         }])];
-        let b = anthropic_body("m", &msgs, &[]);
+        let b = anthropic_body("m", &msgs, &[], None);
         let block = &b["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "t1");
@@ -897,7 +1400,7 @@ mod tests {
     #[test]
     fn anthropic_body_maps_tool_schemas() {
         let tools = crate::tools::defs(false);
-        let b = anthropic_body("m", &[Msg::User("hi".into())], &tools);
+        let b = anthropic_body("m", &[Msg::User("hi".into())], &tools, None);
         assert!(b["tools"].as_array().unwrap().len() == tools.len());
         assert!(b["tools"][0].get("input_schema").is_some());
     }
@@ -906,7 +1409,7 @@ mod tests {
     #[test]
     fn openai_body_roles() {
         let msgs = vec![Msg::System("sys".into()), Msg::User("u".into())];
-        let b = openai_body("m", &msgs, &[]);
+        let b = openai_body("m", &msgs, &[], None, None);
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["role"], "user");
     }
@@ -917,7 +1420,7 @@ mod tests {
             text: "x".into(),
             calls: vec![tc("c1", "run_command", json!({"cmd": "ls"}))],
         }];
-        let b = openai_body("m", &msgs, &[]);
+        let b = openai_body("m", &msgs, &[], None, None);
         let call = &b["messages"][0]["tool_calls"][0];
         assert_eq!(call["function"]["name"], "run_command");
         // arguments must be a JSON *string*, per the OpenAI shape.
@@ -942,16 +1445,30 @@ mod tests {
                 is_error: true,
             },
         ])];
-        let b = openai_body("m", &msgs, &[]);
+        let b = openai_body("m", &msgs, &[], None, None);
         assert_eq!(b["messages"].as_array().unwrap().len(), 2);
         assert_eq!(b["messages"][0]["role"], "tool");
         assert_eq!(b["messages"][1]["tool_call_id"], "b");
     }
 
     #[test]
+    fn openai_body_sets_temperature_and_max_tokens_defaults() {
+        let b = openai_body("m", &[Msg::User("hi".into())], &[], None, None);
+        assert_eq!(b["temperature"], 0.2);
+        assert_eq!(b["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn openai_body_honors_temperature_and_max_tokens_overrides() {
+        let b = openai_body("m", &[Msg::User("hi".into())], &[], Some(0.7), Some(512));
+        assert_eq!(b["temperature"], 0.7);
+        assert_eq!(b["max_tokens"], 512);
+    }
+
+    #[test]
     fn openai_body_tool_schema_wraps_function() {
         let tools = crate::tools::defs(false);
-        let b = openai_body("m", &[Msg::User("hi".into())], &tools);
+        let b = openai_body("m", &[Msg::User("hi".into())], &tools, None, None);
         assert_eq!(b["tools"][0]["type"], "function");
         assert!(b["tools"][0]["function"].get("parameters").is_some());
     }
@@ -1095,12 +1612,87 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_stream_bad_input_json_falls_back_to_empty_object() {
+    fn anthropic_stream_bad_input_json_is_flagged_invalid() {
+        // A truncated/malformed streamed tool call must surface as INVALID_ARGS
+        // so the agent loop reports it to the model instead of executing the
+        // tool with a silently-empty input.
         let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"x\"}}\n\
                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{not\"}}\n\
                    data: {\"type\":\"message_stop\"}\n";
         let r = drain_anthropic(sse);
-        assert_eq!(r.calls[0].input, json!({}));
+        assert_eq!(r.calls[0].input[crate::tools::INVALID_ARGS], json!("{not"));
+    }
+
+    #[test]
+    fn anthropic_stream_captures_stop_reason_from_message_delta() {
+        let sse = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(r.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn anthropic_stream_error_event_is_err() {
+        let sse = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\
+                   data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n";
+        let r = anthropic_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("stream error"), "got: {err}");
+        assert!(err.contains("Overloaded"), "got: {err}");
+    }
+
+    // Yields its buffered bytes, then fails instead of reporting EOF —
+    // simulates a connection dropped mid-stream.
+    struct BrokenPipe(Cursor<Vec<u8>>);
+    impl Read for BrokenPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection reset",
+                )),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_read_error_before_terminal_event_is_err() {
+        // No message_stop / [DONE] — the transport dies first.
+        let a = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n";
+        let r = anthropic_stream(
+            BrokenPipe(Cursor::new(a.as_bytes().to_vec())),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert!(r.unwrap_err().contains("stream read failed"));
+
+        let o = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n";
+        let r = openai_stream(
+            BrokenPipe(Cursor::new(o.as_bytes().to_vec())),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert!(r.unwrap_err().contains("stream read failed"));
+    }
+
+    #[test]
+    fn stream_read_error_after_terminal_event_is_ok() {
+        // The terminal event stops reading before the transport failure is seen.
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\
+                   data: [DONE]\n";
+        let r = openai_stream(
+            BrokenPipe(Cursor::new(sse.as_bytes().to_vec())),
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(r.text, "Hi");
     }
 
     #[test]
@@ -1150,5 +1742,333 @@ mod tests {
         ]}}]});
         let r = openai_parse(v).unwrap();
         assert_eq!(r.calls[0].input, json!({}));
+    }
+
+    // ── stop_reason ─────────────────────────────────────────────────────────
+    #[test]
+    fn anthropic_parse_captures_stop_reason() {
+        let v = json!({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"});
+        let r = anthropic_parse(v).unwrap();
+        assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
+        // Absent → None, never fabricated.
+        let r = anthropic_parse(json!({"content": []})).unwrap();
+        assert_eq!(r.stop_reason, None);
+    }
+
+    #[test]
+    fn openai_parse_normalizes_finish_reason() {
+        let with = |reason: &str| json!({"choices": [{"message": {"content": "x"}, "finish_reason": reason}]});
+        assert_eq!(
+            openai_parse(with("length")).unwrap().stop_reason.as_deref(),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            openai_parse(with("tool_calls"))
+                .unwrap()
+                .stop_reason
+                .as_deref(),
+            Some("tool_use")
+        );
+        assert_eq!(
+            openai_parse(with("stop")).unwrap().stop_reason.as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn openai_stream_captures_finish_reason() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.text, "Hi");
+        assert_eq!(r.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    // ── ollama_root ─────────────────────────────────────────────────────────
+    #[test]
+    fn ollama_root_trims_v1_and_slashes() {
+        assert_eq!(
+            ollama_root("http://localhost:11434"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root("http://localhost:11434/"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root("http://localhost:11434/v1"),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            ollama_root("http://localhost:11434/v1/"),
+            "http://localhost:11434"
+        );
+    }
+
+    // ── ollama_body ─────────────────────────────────────────────────────────
+    #[test]
+    fn ollama_body_sets_options_and_stream_off() {
+        let b = ollama_body("m", &[Msg::User("hi".into())], &[], None, None, 16_384);
+        assert_eq!(b["stream"], false);
+        assert_eq!(b["options"]["num_ctx"], 16_384);
+        assert_eq!(b["options"]["repeat_penalty"], 1.0);
+        assert_eq!(b["options"]["temperature"], 0.2);
+        assert_eq!(b["options"]["num_predict"], 4096);
+        // Sampling knobs live under "options", never at the top level.
+        assert!(b.get("temperature").is_none());
+        assert!(b.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn ollama_body_honors_temperature_and_max_tokens_overrides() {
+        let b = ollama_body(
+            "m",
+            &[Msg::User("hi".into())],
+            &[],
+            Some(0.7),
+            Some(512),
+            8_192,
+        );
+        assert_eq!(b["options"]["temperature"], 0.7);
+        assert_eq!(b["options"]["num_predict"], 512);
+    }
+
+    #[test]
+    fn ollama_body_merges_system_and_maps_roles() {
+        let msgs = vec![
+            Msg::System("one".into()),
+            Msg::System("two".into()),
+            Msg::User("u".into()),
+        ];
+        let b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        assert_eq!(b["messages"][0]["role"], "system");
+        assert_eq!(b["messages"][0]["content"], "one\n\ntwo");
+        assert_eq!(b["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn ollama_body_assistant_tool_call_args_are_objects() {
+        let msgs = vec![Msg::Assistant {
+            text: "x".into(),
+            calls: vec![tc("c1", "run_command", json!({"cmd": "ls"}))],
+        }];
+        let b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        let call = &b["messages"][0]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "run_command");
+        // arguments must be a JSON *object*, unlike the OpenAI string form.
+        assert_eq!(call["function"]["arguments"], json!({"cmd": "ls"}));
+    }
+
+    #[test]
+    fn ollama_body_tool_results_carry_tool_name_when_resolvable() {
+        let msgs = vec![
+            Msg::Assistant {
+                text: String::new(),
+                calls: vec![tc("c1", "read_file", json!({"path": "a"}))],
+            },
+            Msg::Tool(vec![
+                ToolResult {
+                    id: "c1".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                },
+                ToolResult {
+                    id: "unknown".into(),
+                    content: "?".into(),
+                    is_error: true,
+                },
+            ]),
+        ];
+        let b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        let first = &b["messages"][1];
+        assert_eq!(first["role"], "tool");
+        assert_eq!(first["content"], "ok");
+        assert_eq!(first["tool_name"], "read_file");
+        // Unresolvable id → no fabricated tool_name.
+        assert!(b["messages"][2].get("tool_name").is_none());
+    }
+
+    #[test]
+    fn ollama_body_images_are_bare_base64_array() {
+        let msgs = vec![Msg::UserImages {
+            text: "what is this".into(),
+            images: vec![("image/png".into(), "aGk=".into())],
+        }];
+        let b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        let msg = &b["messages"][0];
+        assert_eq!(msg["content"], "what is this");
+        assert_eq!(msg["images"], json!(["aGk="]));
+    }
+
+    #[test]
+    fn ollama_body_tool_schema_wraps_function() {
+        let tools = crate::tools::defs(false);
+        let b = ollama_body("m", &[Msg::User("hi".into())], &tools, None, None, 8_192);
+        assert_eq!(b["tools"][0]["type"], "function");
+        assert!(b["tools"][0]["function"].get("parameters").is_some());
+        // No tools → no key.
+        let b = ollama_body("m", &[Msg::User("hi".into())], &[], None, None, 8_192);
+        assert!(b.get("tools").is_none());
+    }
+
+    // ── ollama_stream ───────────────────────────────────────────────────────
+    fn drain_ollama(ndjson: &str) -> Reply {
+        let mut out = String::new();
+        ollama_stream(
+            Cursor::new(ndjson.as_bytes().to_vec()),
+            &mut |t| out.push_str(t),
+            &mut |_| {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ollama_stream_accumulates_content_and_stops_on_done() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"lo\"},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"AFTER\"},\"done\":false}\n";
+        let r = drain_ollama(ndjson);
+        assert_eq!(r.text, "Hello");
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn ollama_stream_maps_length_done_reason_to_max_tokens() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"length\"}\n";
+        let r = drain_ollama(ndjson);
+        assert_eq!(r.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn ollama_stream_collects_whole_tool_calls_with_object_args() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}}]},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"list_dir\",\"arguments\":{}}}]},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let r = drain_ollama(ndjson);
+        assert_eq!(r.calls.len(), 2);
+        assert_eq!(r.calls[0].name, "read_file");
+        assert_eq!(r.calls[0].input, json!({"path": "a"}));
+        // Synthesized, position-stable ids (Ollama sends none).
+        assert_eq!(r.calls[0].id, "ollama-call-0");
+        assert_eq!(r.calls[1].id, "ollama-call-1");
+    }
+
+    #[test]
+    fn ollama_stream_string_args_go_through_invalid_args_guard() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":\"{bad\"}}]},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let r = drain_ollama(ndjson);
+        assert_eq!(r.calls[0].input[crate::tools::INVALID_ARGS], json!("{bad"));
+    }
+
+    #[test]
+    fn ollama_stream_routes_thinking_field_and_think_tags() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"hmm \"},\"done\":false}\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"<think>deep</think>Hi\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let mut text_out = String::new();
+        let mut think_out = String::new();
+        ollama_stream(
+            Cursor::new(ndjson.as_bytes().to_vec()),
+            &mut |t| text_out.push_str(t),
+            &mut |t| think_out.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(text_out, "Hi");
+        assert_eq!(think_out, "hmm deep");
+    }
+
+    #[test]
+    fn ollama_stream_error_line_is_err() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"par\"},\"done\":false}\n\
+                      {\"error\":\"model runner has unexpectedly stopped\"}\n";
+        let r = ollama_stream(
+            Cursor::new(ndjson.as_bytes().to_vec()),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        let err = r.unwrap_err();
+        assert!(err.contains("stream error"), "got: {err}");
+        assert!(err.contains("unexpectedly stopped"), "got: {err}");
+    }
+
+    #[test]
+    fn ollama_stream_read_error_before_done_is_err() {
+        let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n";
+        let r = ollama_stream(
+            BrokenPipe(Cursor::new(ndjson.as_bytes().to_vec())),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert!(r.unwrap_err().contains("stream read failed"));
+    }
+
+    #[test]
+    fn ollama_stream_ignores_blank_and_malformed_lines() {
+        let ndjson = "\n\
+                      not-json\n\
+                      {\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+        let r = drain_ollama(ndjson);
+        assert_eq!(r.text, "ok");
+    }
+
+    // ── ollama_parse (non-stream) ───────────────────────────────────────────
+    #[test]
+    fn ollama_parse_extracts_text_calls_and_done_reason() {
+        let v = json!({
+            "message": {
+                "role": "assistant",
+                "content": "hello",
+                "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "a"}}}]
+            },
+            "done": true,
+            "done_reason": "length"
+        });
+        let r = ollama_parse(v).unwrap();
+        assert_eq!(r.text, "hello");
+        assert_eq!(r.calls[0].name, "read_file");
+        assert_eq!(r.calls[0].input, json!({"path": "a"}));
+        assert_eq!(r.stop_reason.as_deref(), Some("max_tokens"));
+        // Absent done_reason → None, never fabricated.
+        let r = ollama_parse(json!({"message": {"content": "x"}})).unwrap();
+        assert_eq!(r.stop_reason, None);
+    }
+
+    // ── /api/show parsing + num_ctx sizing ──────────────────────────────────
+    #[test]
+    fn show_context_length_finds_arch_prefixed_key() {
+        let v = json!({"model_info": {
+            "general.architecture": "qwen2",
+            "qwen2.embedding_length": 5120,
+            "qwen2.context_length": 131_072
+        }});
+        assert_eq!(show_context_length(&v), Some(131_072));
+        // No matching key or no model_info → None.
+        assert_eq!(show_context_length(&json!({"model_info": {"x": 1}})), None);
+        assert_eq!(show_context_length(&json!({})), None);
+    }
+
+    #[test]
+    fn show_num_ctx_parses_parameters_blob() {
+        let v = json!({"parameters": "stop    \"<|im_end|>\"\nnum_ctx    16384\ntemperature 0.7"});
+        assert_eq!(show_num_ctx(&v), Some(16_384));
+        assert_eq!(show_num_ctx(&json!({"parameters": "stop \"x\""})), None);
+        assert_eq!(show_num_ctx(&json!({})), None);
+    }
+
+    #[test]
+    fn ollama_pick_ctx_caps_floors_and_honors_modelfile() {
+        // Known model max: capped at 32k.
+        assert_eq!(ollama_pick_ctx(Some(131_072), None), 32_768);
+        // Small model max wins over the cap.
+        assert_eq!(ollama_pick_ctx(Some(16_384), None), 16_384);
+        // Unknown max → 8k floor.
+        assert_eq!(ollama_pick_ctx(None, None), 8_192);
+        // Modelfile num_ctx wins (the user tuned it), even past the cap…
+        assert_eq!(ollama_pick_ctx(Some(131_072), Some(65_536)), 65_536);
+        assert_eq!(ollama_pick_ctx(None, Some(4_096)), 4_096);
+        // …but never exceeds a known model max.
+        assert_eq!(ollama_pick_ctx(Some(8_192), Some(65_536)), 8_192);
     }
 }

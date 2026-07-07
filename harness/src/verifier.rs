@@ -171,8 +171,12 @@ impl Verifier {
         let rule_violations = self.rule_engine.evaluate(&eval_ctx);
 
         // 3. Check tests and static analysis
-        let tests_status =
-            self.check_tests(&ctx.changed_files, &ctx.tests_added, eval_ctx.tests_run);
+        let tests_status = self.check_tests(
+            &ctx.changed_files,
+            &ctx.tests_added,
+            eval_ctx.tests_run,
+            &ctx.tool_calls,
+        );
         let static_analysis_status = self.run_static_analysis(&ctx.changed_files);
 
         // 4. Determine missing evidence
@@ -201,7 +205,7 @@ impl Verifier {
             files_changed: ctx.changed_files.clone(),
             tests_status,
             static_analysis_status,
-            timestamp: "2026-07-06T08:00:00Z".to_string(),
+            timestamp: crate::knowledge::chrono_now_iso(),
         };
 
         report.confidence = self.compute_confidence(&report);
@@ -246,17 +250,28 @@ impl Verifier {
         score.clamp(0.0, 1.0)
     }
 
-    /// Checks test status based on changed files and tool history.
+    /// Checks test status based on changed files and tool history. Pass/fail
+    /// counts are only reported when a recognizable test-runner summary appears
+    /// in the captured tool output — they are never synthesized from the mere
+    /// fact that a shell command ran.
     pub fn check_tests(
         &self,
         _changed_files: &[String],
         tests_added: &[String],
         tests_run: bool,
+        tool_calls: &[ToolCallRecord],
     ) -> TestsStatus {
+        let counts = tool_calls
+            .iter()
+            .find_map(|c| parse_test_counts(&c.result_preview));
+        let (tests_passed, tests_failed) = match counts {
+            Some((p, f)) => (Some(p), Some(f)),
+            None => (None, None),
+        };
         TestsStatus {
             tests_run,
-            tests_passed: if tests_run { Some(1) } else { None },
-            tests_failed: if tests_run { Some(0) } else { None },
+            tests_passed,
+            tests_failed,
             tests_added: tests_added.to_vec(),
             coverage_delta: None,
         }
@@ -352,6 +367,28 @@ impl Verifier {
     }
 }
 
+/// Extracts `(passed, failed)` from real test-runner output, e.g. cargo's
+/// "test result: ok. 5 passed; 1 failed; ..." or pytest's "5 passed". Returns
+/// None when no summary with an explicit passed-count is present. A missing
+/// "failed" marker alongside an explicit passed-count (pytest omits it when
+/// everything passes) reads as zero failures.
+fn parse_test_counts(output: &str) -> Option<(u32, u32)> {
+    let passed = count_before(output, " passed")?;
+    let failed = count_before(output, " failed").unwrap_or(0);
+    Some((passed, failed))
+}
+
+/// The integer immediately preceding `marker` in `text`, if any.
+fn count_before(text: &str, marker: &str) -> Option<u32> {
+    let prefix = &text[..text.find(marker)?];
+    let digits: Vec<char> = prefix
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.iter().rev().collect::<String>().parse::<u32>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +408,52 @@ mod tests {
             .iter()
             .any(|v| v.rule_id == "bug_fix_requires_regression_test"));
         assert!(report.confidence < 1.0);
+        // Timestamp comes from the system clock, formatted as ISO 8601 UTC.
+        assert_eq!(report.timestamp.len(), 20);
+        assert!(report.timestamp.ends_with('Z'));
+    }
+
+    fn bash_call(preview: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            tool_name: "bash".to_string(),
+            args_summary: "cargo test".to_string(),
+            result_preview: preview.to_string(),
+            timestamp: String::new(),
+        }
+    }
+
+    #[test]
+    fn check_tests_never_fabricates_counts() {
+        let verifier = Verifier::new("/tmp");
+        // A bash call ran, but its output carries no test summary — counts
+        // must stay unknown rather than being invented.
+        let calls = vec![bash_call("Compiling harness v0.1.0\nFinished dev")];
+        let status = verifier.check_tests(&[], &[], true, &calls);
+        assert!(status.tests_run);
+        assert_eq!(status.tests_passed, None);
+        assert_eq!(status.tests_failed, None);
+    }
+
+    #[test]
+    fn check_tests_parses_cargo_summary() {
+        let verifier = Verifier::new("/tmp");
+        let calls = vec![bash_call(
+            "test result: ok. 12 passed; 1 failed; 0 ignored; 0 measured",
+        )];
+        let status = verifier.check_tests(&[], &[], true, &calls);
+        assert_eq!(status.tests_passed, Some(12));
+        assert_eq!(status.tests_failed, Some(1));
+    }
+
+    #[test]
+    fn parse_test_counts_handles_pytest_and_prose() {
+        // pytest omits "failed" when everything passes.
+        assert_eq!(
+            parse_test_counts("===== 7 passed in 0.42s ====="),
+            Some((7, 0))
+        );
+        // Prose mentioning "passed" without a count is not a summary.
+        assert_eq!(parse_test_counts("all checks passed"), None);
+        assert_eq!(parse_test_counts(""), None);
     }
 }

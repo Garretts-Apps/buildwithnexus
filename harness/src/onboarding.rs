@@ -90,7 +90,11 @@ pub fn run() -> Option<Settings> {
         let ans = tui::ask("  provider number or name: ")?;
         let ans = ans.trim();
         if ans == "0" && !ollama_models.is_empty() {
-            break PRESETS.iter().find(|p| p.id == "ollama").unwrap();
+            if let Some(ollama_preset) = PRESETS.iter().find(|p| p.id == "ollama") {
+                break ollama_preset;
+            }
+            tui::line(&tui::red("  ollama preset is not configured in PRESETS"));
+            continue;
         }
         if let Ok(n) = ans.parse::<usize>() {
             if n >= 1 && n <= PRESETS.len() {
