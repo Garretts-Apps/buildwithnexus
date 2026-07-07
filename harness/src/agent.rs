@@ -866,6 +866,17 @@ fn text_tool_call(name: &str, input: serde_json::Value) -> provider::ToolCall {
     }
 }
 
+// The single-line composer prompt for reading a question answer. Kept on one
+// line (no `\n`) so the alt-screen composer positions the cursor correctly and
+// echoes typed input; the question text itself is printed separately above.
+fn answer_input_prompt(default: &str) -> String {
+    if default.is_empty() {
+        "  Answer: ".to_string()
+    } else {
+        format!("  Answer {}: ", tui::dim(&format!("[{default}]")))
+    }
+}
+
 fn answer_question(input: &serde_json::Value) -> (String, bool) {
     let question = if let Some(qs) = input["questions"].as_array() {
         let mut acc = Vec::new();
@@ -915,21 +926,16 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
         );
     }
     let default = input["default"].as_str().unwrap_or("").trim();
-    let prompt = if default.is_empty() {
-        format!(
-            "  {} {}\n  Answer: ",
-            tui::yellow("?"),
-            tui::bold(&full_prompt)
-        )
-    } else {
-        format!(
-            "  {} {}\n  Answer {} ",
-            tui::yellow("?"),
-            tui::bold(&full_prompt),
-            tui::dim(&format!("[{default}]"))
-        )
-    };
-    let ans = tui::ask(&prompt).unwrap_or_default();
+    // Render the question on its own transcript line, then read the answer with
+    // a SINGLE-LINE composer prompt. A multi-line prompt string mis-positions
+    // the alt-screen composer cursor (prompt_width counts across the newline),
+    // which hides what the user types.
+    tui::line(&format!(
+        "  {} {}",
+        tui::yellow("?"),
+        tui::bold(&full_prompt)
+    ));
+    let ans = tui::ask(&answer_input_prompt(default)).unwrap_or_default();
     let out = if ans.trim().is_empty() && !default.is_empty() {
         default.to_string()
     } else {
@@ -3243,6 +3249,18 @@ pub enum ModeHint {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn answer_input_prompt_is_single_line() {
+        // Must never contain a newline — a multi-line prompt breaks the
+        // alt-screen composer's cursor positioning and hides typed input.
+        let p = answer_input_prompt("");
+        assert!(!p.contains('\n'));
+        assert!(p.contains("Answer"));
+        let d = answer_input_prompt("yes");
+        assert!(!d.contains('\n'));
+        assert!(d.contains("yes"));
+    }
 
     #[test]
     fn permission_parsing() {
