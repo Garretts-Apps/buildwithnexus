@@ -78,7 +78,10 @@ function buildFromSource() {
   const r = spawnSync('cargo', args, { stdio: 'inherit' });
   if (r.status !== 0) return false;
   fs.mkdirSync(path.join(ROOT, 'bin'), { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext()), installedBinary());
+  const rootTarget = path.join(ROOT, 'target', 'release', 'buildwithnexus' + ext());
+  const harnessTarget = path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext());
+  const built = fs.existsSync(rootTarget) ? rootTarget : harnessTarget;
+  fs.copyFileSync(built, installedBinary());
   try { fs.chmodSync(installedBinary(), 0o755); } catch {}
   return true;
 }

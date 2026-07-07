@@ -26,6 +26,8 @@ function installedBinary() {
 }
 
 function devBinary() {
+  const rootTarget = path.join(ROOT, 'target', 'release', 'buildwithnexus' + ext());
+  if (fs.existsSync(rootTarget)) return rootTarget;
   return path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext());
 }
 
