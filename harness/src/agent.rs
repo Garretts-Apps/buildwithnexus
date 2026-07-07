@@ -711,12 +711,288 @@ fn is_casual_turn(text: &str) -> bool {
 }
 
 fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<provider::ToolCall>> {
-    let candidate = extract_json_tool_candidate(text)?;
-    let value = serde_json::from_str::<serde_json::Value>(candidate).ok()?;
     let names = defs.iter().map(|d| d.name).collect::<HashSet<_>>();
-    let mut calls = Vec::new();
-    collect_text_tool_calls(&value, &names, &mut calls);
-    (!calls.is_empty()).then_some(calls)
+    if let Some(candidate) = extract_json_tool_candidate(text) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            let mut calls = Vec::new();
+            collect_text_tool_calls(&value, &names, &mut calls);
+            if !calls.is_empty() {
+                return Some(calls);
+            }
+        }
+    }
+    // Fall back to Gemma's `tool_code` Python-call format.
+    parse_tool_code_call(text, &names)
+}
+
+// Positional argument names for the tools small models most often call, so a
+// Gemma call like `write_file("/p", """…""")` maps arg 0→path, arg 1→content.
+fn positional_params(name: &str) -> &'static [&'static str] {
+    match name {
+        "write_file" | "write" => &["path", "content"],
+        "read_file" | "read" => &["path"],
+        "edit_file" | "edit" => &["path", "old", "new"],
+        "run_command" | "bash" => &["command"],
+        "Artifact" | "publish_artifact" => &["contents"],
+        "list_dir" | "list" => &["path"],
+        "find_files" | "glob" => &["pattern"],
+        "grep_files" | "grep" => &["pattern"],
+        "finish" => &["summary"],
+        "python_tool" => &["code"],
+        "create_docx" => &["path", "title", "body"],
+        _ => &[],
+    }
+}
+
+// Gemma emits tool calls as a ```tool_code fenced Python function call, e.g.
+//   write_file("/p/index.html", """<!doctype html>…""")
+//   Artifact(contents="""…""")
+// sometimes wrapped in `print(...)`. Native tool_calls / JSON never match, so
+// the call is otherwise treated as prose. Parse the first known-tool call.
+fn parse_tool_code_call(
+    text: &str,
+    allowed: &HashSet<&'static str>,
+) -> Option<Vec<provider::ToolCall>> {
+    let scope = tool_code_scope(text);
+    let (name, after) = find_tool_call(scope, allowed)?;
+    let inside = balanced_parens(after)?;
+    let args = parse_python_args(inside);
+    let input = tool_code_args_to_input(name, args);
+    Some(vec![text_tool_call(name, input)])
+}
+
+// The region to scan: inside a ```tool_code fence when present, else the whole
+// text (Gemma sometimes omits the fence).
+fn tool_code_scope(text: &str) -> &str {
+    if let Some(pos) = text.find("```tool_code") {
+        let after = &text[pos + "```tool_code".len()..];
+        let end = after.find("```").unwrap_or(after.len());
+        &after[..end]
+    } else {
+        text
+    }
+}
+
+// Find the earliest occurrence of a known tool name immediately followed by
+// `(` (skipping any `print(` wrapper, which isn't a known tool). Returns the
+// name and the slice just after the opening paren.
+fn find_tool_call<'a>(
+    scope: &'a str,
+    allowed: &HashSet<&'static str>,
+) -> Option<(&'static str, &'a str)> {
+    let bytes = scope.as_bytes();
+    let mut best: Option<(usize, &'static str, usize)> = None;
+    for &name in allowed.iter() {
+        let mut from = 0;
+        while let Some(rel) = scope[from..].find(name) {
+            let at = from + rel;
+            // Must be a whole identifier (not a substring of a longer name).
+            let before_ok = at == 0 || !is_ident_byte(bytes[at - 1]);
+            let after_idx = at + name.len();
+            let mut j = after_idx;
+            while j < bytes.len() && bytes[j] == b' ' {
+                j += 1;
+            }
+            if before_ok && j < bytes.len() && bytes[j] == b'(' {
+                if best.map(|(p, _, _)| at < p).unwrap_or(true) {
+                    best = Some((at, name, j + 1));
+                }
+                break;
+            }
+            from = at + name.len();
+        }
+    }
+    best.map(|(_, name, paren)| (name, &scope[paren..]))
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+// Given the slice just after an opening `(`, return the argument text up to the
+// matching `)`, tracking string literals (triple/single/double) and nesting.
+fn balanced_parens(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut depth = 1i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip string literals whole so commas/parens inside don't count.
+        if let Some(consumed) = string_literal_len(&s[i..]) {
+            i += consumed;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[..i]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+// If `s` starts with a Python string literal, return its byte length (including
+// delimiters). Handles triple `"""`/`'''` (raw) and single `"`/`'` (with `\`
+// escapes). None if `s` doesn't start with a quote.
+fn string_literal_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    for q in ["\"\"\"", "'''"] {
+        if let Some(rest) = s.strip_prefix(q) {
+            let close = rest.find(q)?;
+            return Some(q.len() + close + q.len());
+        }
+    }
+    let quote = *b.first()?;
+    if quote == b'"' || quote == b'\'' {
+        let mut i = 1;
+        while i < b.len() {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == quote {
+                return Some(i + 1);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+// Split a Python argument list at top-level commas, then classify each as
+// keyword (`name=value`) or positional, with the value parsed to a JSON value.
+fn parse_python_args(inside: &str) -> Vec<(Option<String>, serde_json::Value)> {
+    let bytes = inside.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let (mut start, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(consumed) = string_literal_len(&inside[i..]) {
+            i += consumed;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                if let Some(inner) = balanced_parens(&inside[i + 1..]) {
+                    i += 1 + inner.len();
+                }
+            }
+            b',' => {
+                parts.push(&inside[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < inside.len() {
+        parts.push(&inside[start..]);
+    }
+    parts
+        .into_iter()
+        .filter_map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            // Keyword only if the `=` precedes any string literal.
+            if let Some(eq) = kw_eq_pos(p) {
+                let key = p[..eq].trim();
+                if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Some((Some(key.to_string()), parse_py_value(p[eq + 1..].trim())));
+                }
+            }
+            Some((None, parse_py_value(p)))
+        })
+        .collect()
+}
+
+// Position of a top-level `=` (keyword separator) before any string literal,
+// or None. `==`/`!=`/`>=`/`<=` are not keyword separators.
+fn kw_eq_pos(p: &str) -> Option<usize> {
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if string_literal_len(&p[i..]).is_some() {
+            return None; // hit a string before any '='
+        }
+        if b[i] == b'=' {
+            let prev = if i > 0 { b[i - 1] } else { b' ' };
+            let next = b.get(i + 1).copied().unwrap_or(b' ');
+            if prev != b'!' && prev != b'<' && prev != b'>' && next != b'=' {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+// Parse a Python literal value into JSON: triple/single/double-quoted strings,
+// booleans, and numbers; anything else becomes a raw string.
+fn parse_py_value(expr: &str) -> serde_json::Value {
+    let e = expr.trim();
+    for q in ["\"\"\"", "'''"] {
+        if let Some(rest) = e.strip_prefix(q) {
+            if let Some(end) = rest.rfind(q) {
+                return serde_json::Value::String(rest[..end].to_string());
+            }
+        }
+    }
+    if (e.starts_with('"') && e.ends_with('"') && e.len() >= 2)
+        || (e.starts_with('\'') && e.ends_with('\'') && e.len() >= 2)
+    {
+        let inner = &e[1..e.len() - 1];
+        // Unescape the common sequences for single-quoted strings.
+        let unescaped = inner
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\\\", "\\");
+        return serde_json::Value::String(unescaped);
+    }
+    match e {
+        "True" | "true" => return serde_json::Value::Bool(true),
+        "False" | "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(n) = e.parse::<i64>() {
+        return serde_json::Value::from(n);
+    }
+    if let Ok(f) = e.parse::<f64>() {
+        return serde_json::Value::from(f);
+    }
+    serde_json::Value::String(e.to_string())
+}
+
+// Build the tool input object: keyword args by name, positional args mapped
+// through the tool's positional signature.
+fn tool_code_args_to_input(
+    name: &str,
+    args: Vec<(Option<String>, serde_json::Value)>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let params = positional_params(name);
+    let mut pos = 0;
+    for (key, val) in args {
+        match key {
+            Some(k) => {
+                map.insert(k, val);
+            }
+            None => {
+                if let Some(pname) = params.get(pos) {
+                    map.insert((*pname).to_string(), val);
+                }
+                pos += 1;
+            }
+        }
+    }
+    serde_json::Value::Object(map)
 }
 
 fn extract_json_tool_candidate(text: &str) -> Option<&str> {
@@ -3344,6 +3620,65 @@ mod tests {
         );
         assert_eq!(b.calls.len(), 1);
         assert_eq!(b.calls[0].input["path"], "b.txt");
+    }
+
+    #[test]
+    fn gemma_tool_code_write_file_positional_triple_quoted() {
+        // The exact shape captured from gemma-2-2b-it: a ```tool_code fence with
+        // a Python call, positional args, and triple-quoted HTML containing
+        // commas, parens, and braces.
+        let defs = tools::defs_for_context(true, 8192);
+        let text = "```tool_code\nwrite_file(\"/p/index.html\", \"\"\"<!doctype html>\\n<canvas id=\"c\"></canvas>\\n<script>const a={x:1}; f(a,b);</script>\"\"\")\n```";
+        let r = normalize_text_tool_calls(
+            Reply {
+                text: text.to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "build a canvas game",
+        );
+        assert_eq!(r.calls.len(), 1, "text: {}", r.text);
+        assert_eq!(r.calls[0].name, "write_file");
+        assert_eq!(r.calls[0].input["path"], "/p/index.html");
+        let content = r.calls[0].input["content"].as_str().unwrap();
+        assert!(content.contains("<canvas"), "{content}");
+        assert!(content.contains("f(a,b)"), "{content}");
+    }
+
+    #[test]
+    fn gemma_tool_code_keyword_and_print_wrapper() {
+        let defs = tools::defs_for_context(true, 8192);
+        // Keyword arg + a print(...) wrapper Gemma sometimes adds.
+        let text =
+            "```tool_code\nprint(Artifact(title=\"Game\", contents=\"\"\"<html>ok</html>\"\"\"))\n```";
+        let r = normalize_text_tool_calls(
+            Reply {
+                text: text.to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "build it",
+        );
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].name, "Artifact");
+        assert_eq!(r.calls[0].input["title"], "Game");
+        assert_eq!(r.calls[0].input["contents"], "<html>ok</html>");
+    }
+
+    #[test]
+    fn python_value_and_arg_parsing_helpers() {
+        assert_eq!(parse_py_value("\"\"\"hi, there\"\"\""), json!("hi, there"));
+        assert_eq!(parse_py_value("'x'"), json!("x"));
+        assert_eq!(parse_py_value("42"), json!(42));
+        assert_eq!(parse_py_value("true"), json!(true));
+        // A single top-level comma inside a triple-quoted string is not a split.
+        let args = parse_python_args("\"a\", \"\"\"b, c\"\"\"");
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].1, json!("a"));
+        assert_eq!(args[1].1, json!("b, c"));
+        // kw_eq only fires before a string literal, not on `==` in content.
+        assert!(kw_eq_pos("contents=\"x\"").is_some());
+        assert!(kw_eq_pos("\"a == b\"").is_none());
     }
 
     #[test]
