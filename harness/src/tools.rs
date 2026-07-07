@@ -529,9 +529,19 @@ pub fn preview(name: &str, input: &Value) -> String {
 }
 
 fn path_arg(input: &Value) -> Option<&str> {
-    input["path"]
+    let s = input["path"]
         .as_str()
         .or_else(|| input["filePath"].as_str())
+        .or_else(|| input["file"].as_str())
+        .or_else(|| input["target_file"].as_str())
+        .or_else(|| input["targetFile"].as_str())
+        .or_else(|| input["path_to_file"].as_str())?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn task_arg(input: &Value) -> Option<&str> {
@@ -628,10 +638,18 @@ pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathB
 }
 
 fn root_arg(input: &Value) -> &str {
-    input["root"]
+    let s = input["root"]
         .as_str()
         .or_else(|| input["path"].as_str())
+        .or_else(|| input["dir"].as_str())
+        .or_else(|| input["directory"].as_str())
         .unwrap_or(".")
+        .trim();
+    if s.is_empty() {
+        "."
+    } else {
+        s
+    }
 }
 
 fn now_ms() -> u128 {
@@ -1764,7 +1782,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "list_tree" => {
-            let root = resolve(cwd, input["path"].as_str().unwrap_or("."));
+            let root = resolve(cwd, path_arg(input).unwrap_or("."));
             let max_depth = input["max_depth"].as_u64().unwrap_or(3).clamp(1, 8) as usize;
             let max_entries = input["max_entries"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
             let mut entries = Vec::new();
@@ -1776,7 +1794,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "file_info" => {
-            let p_str = input["path"].as_str().unwrap_or("").trim();
+            let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
             }
@@ -1847,7 +1865,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "find_files" => {
-            let root = resolve(cwd, input["root"].as_str().unwrap_or("."));
+            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -1988,7 +2006,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "multi_edit" => {
-            let p_str = input["path"].as_str().unwrap_or("").trim();
+            let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
             }
@@ -2057,7 +2075,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "create_dir" => {
-            let p_str = input["path"].as_str().unwrap_or("").trim();
+            let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
             }
@@ -2089,7 +2107,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "remove_path" => {
-            let p_str = input["path"].as_str().unwrap_or("").trim();
+            let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
             }
@@ -2179,7 +2197,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             Err(_) => err("todo store unavailable"),
         },
         "create_docx" => {
-            let p = resolve(cwd, input["path"].as_str().unwrap_or(""));
+            let p_str = path_arg(input).unwrap_or("");
+            if p_str.is_empty() {
+                return err("path argument is required and cannot be empty");
+            }
+            let p = resolve(cwd, p_str);
             if p.extension().and_then(|e| e.to_str()) != Some("docx") {
                 return err("path must end with .docx");
             }
@@ -3518,6 +3540,12 @@ mod tests {
         assert!(run("headless_browser", &json!({"url": ""}), &d).is_error);
         assert!(run("kb_query", &json!({"query": ""}), &d).is_error);
         assert!(run("kb_record", &json!({"name": ""}), &d).is_error);
+        assert!(run("file_info", &json!({"path": ""}), &d).is_error);
+        assert!(run("file_info", &json!({"filePath": "   "}), &d).is_error);
+        assert!(run("create_docx", &json!({"path": ""}), &d).is_error);
+        assert!(run("create_docx", &json!({"filePath": "   "}), &d).is_error);
+        assert!(!run("list_tree", &json!({"filePath": "."}), &d).is_error);
+        assert!(!run("find_files", &json!({"dir": ".", "pattern": "*"}), &d).is_error);
         let _ = fs::remove_dir_all(&d);
     }
 
