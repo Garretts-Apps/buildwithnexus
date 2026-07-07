@@ -1515,6 +1515,158 @@ fn strip_html(html: &str) -> String {
     result.trim().to_string()
 }
 
+// One parsed web-search result.
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+// Percent-decode a URL-encoded string (also treats `+` as space). Invalid
+// escapes are left as-is. Bytes are reassembled as UTF-8 lossily.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Decode the common named/numeric HTML entities that appear in result titles
+// and snippets. `&amp;` is resolved last so `&amp;lt;` doesn't collapse to `<`.
+fn decode_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+// Read attribute `attr` from the tag that opens at byte index `tag_start`,
+// scanning only within that tag (up to its closing `>`).
+fn tag_attr(html: &str, tag_start: usize, attr: &str) -> Option<String> {
+    let end = html[tag_start..].find('>').map(|e| tag_start + e)?;
+    let seg = &html[tag_start..end];
+    let key = format!("{attr}=");
+    let after = &seg[seg.find(&key)? + key.len()..];
+    let quote = after.chars().next()?;
+    if quote == '"' || quote == '\'' {
+        let rest = &after[1..];
+        rest.find(quote).map(|c| rest[..c].to_string())
+    } else {
+        let endv = after.find(char::is_whitespace).unwrap_or(after.len());
+        Some(after[..endv].to_string())
+    }
+}
+
+// DuckDuckGo Lite wraps result links in a redirect: `//duckduckgo.com/l/?uddg=
+// <percent-encoded-target>&rut=…`. Recover the real destination; fall back to
+// normalizing a protocol-relative href.
+fn ddg_real_url(href: &str) -> String {
+    let href = href.replace("&amp;", "&");
+    if let Some(p) = href.find("uddg=") {
+        let rest = &href[p + "uddg=".len()..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        return percent_decode(&rest[..end]);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("https://{stripped}");
+    }
+    href.to_string()
+}
+
+// Parse DuckDuckGo Lite result rows into structured hits. Returns empty if the
+// markup doesn't match (the caller then falls back to a stripped-text blob).
+fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
+    let mut titles: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = html[i..].find("<a ") {
+        let tag_start = i + rel;
+        let Some(gt) = html[tag_start..].find('>').map(|e| tag_start + e) else {
+            break;
+        };
+        if html[tag_start..gt].contains("result-link") {
+            let url = ddg_real_url(&tag_attr(html, tag_start, "href").unwrap_or_default());
+            let after = &html[gt + 1..];
+            if let Some(close) = after.to_lowercase().find("</a") {
+                let title = decode_entities(&strip_html(&after[..close]))
+                    .trim()
+                    .to_string();
+                if !title.is_empty() {
+                    titles.push((title, url));
+                }
+            }
+        }
+        i = gt + 1;
+    }
+
+    let mut snippets: Vec<String> = Vec::new();
+    let mut j = 0;
+    while let Some(rel) = html[j..].find("result-snippet") {
+        let pos = j + rel;
+        if let Some(gt) = html[pos..].find('>') {
+            let start = pos + gt + 1;
+            if let Some(lt) = html[start..].find('<') {
+                snippets.push(
+                    decode_entities(&strip_html(&html[start..start + lt]))
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+        j = pos + "result-snippet".len();
+    }
+
+    titles
+        .into_iter()
+        .enumerate()
+        .map(|(k, (title, url))| SearchHit {
+            title,
+            url,
+            snippet: snippets.get(k).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+// Render parsed hits as compact, numbered `title / url / snippet` blocks that a
+// small model can read, capped at `max` results.
+fn format_search_hits(hits: &[SearchHit], max: usize) -> String {
+    let mut out = String::new();
+    for (n, h) in hits.iter().take(max).enumerate() {
+        out.push_str(&format!("{}. {}\n", n + 1, h.title));
+        if !h.url.is_empty() {
+            out.push_str(&format!("   {}\n", h.url));
+        }
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", h.snippet));
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
 // Commands so destructive they require confirmation in every mode.
 pub fn catastrophic(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
@@ -3081,7 +3233,20 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
-                    Ok(html) => ok(truncate(strip_html(&html), MAX_OUT)),
+                    Ok(html) => {
+                        let hits = parse_ddg_lite(&html);
+                        if hits.is_empty() {
+                            // Markup didn't match — fall back to the raw text so
+                            // the model still gets something.
+                            ok(truncate(strip_html(&html), MAX_OUT))
+                        } else {
+                            let body = format_search_hits(&hits, 10);
+                            ok(truncate(
+                                format!("{} results for \"{query}\":\n\n{body}", hits.len()),
+                                MAX_OUT,
+                            ))
+                        }
+                    }
                     Err(e) => err(format!("search response error: {e}")),
                 },
                 Err(e) => err(format!("web search failed: {e}")),
@@ -3899,6 +4064,69 @@ fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::E
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── web search parsing ──────────────────────────────────────────────────
+    const DDG_LITE_SAMPLE: &str = r#"<html><body><form>search</form><table>
+      <tr><td>1.&nbsp;</td><td>
+        <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdoc.rust-lang.org%2Fstd%2F&amp;rut=abc" class='result-link'>Rust std docs</a>
+      </td></tr>
+      <tr><td>&nbsp;</td><td class='result-snippet'>The Rust Standard Library &amp; API reference.</td></tr>
+      <tr><td>2.&nbsp;</td><td>
+        <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fcrates.io%2F&amp;rut=def" class='result-link'>crates.io</a>
+      </td></tr>
+      <tr><td>&nbsp;</td><td class='result-snippet'>The Rust package registry.</td></tr>
+    </table></body></html>"#;
+
+    #[test]
+    fn percent_decode_handles_escapes_and_plus() {
+        assert_eq!(percent_decode("a%2Fb%20c+d"), "a/b c d");
+        // A malformed trailing escape is left literal, not dropped.
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn decode_entities_resolves_amp_last() {
+        assert_eq!(decode_entities("a &amp;lt; b"), "a &lt; b");
+        assert_eq!(decode_entities("x &lt;y&gt; &quot;z&quot;"), "x <y> \"z\"");
+    }
+
+    #[test]
+    fn ddg_real_url_recovers_target_from_redirect() {
+        assert_eq!(
+            ddg_real_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa&amp;rut=z"),
+            "https://example.com/a"
+        );
+        assert_eq!(ddg_real_url("//example.com/x"), "https://example.com/x");
+    }
+
+    #[test]
+    fn parse_ddg_lite_extracts_structured_hits() {
+        let hits = parse_ddg_lite(DDG_LITE_SAMPLE);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "Rust std docs");
+        assert_eq!(hits[0].url, "https://doc.rust-lang.org/std/");
+        assert_eq!(
+            hits[0].snippet,
+            "The Rust Standard Library & API reference."
+        );
+        assert_eq!(hits[1].title, "crates.io");
+        assert_eq!(hits[1].url, "https://crates.io/");
+    }
+
+    #[test]
+    fn parse_ddg_lite_returns_empty_on_unrelated_html() {
+        assert!(parse_ddg_lite("<html><body>no results here</body></html>").is_empty());
+    }
+
+    #[test]
+    fn format_search_hits_numbers_and_caps() {
+        let hits = parse_ddg_lite(DDG_LITE_SAMPLE);
+        let out = format_search_hits(&hits, 1);
+        assert!(out.starts_with("1. Rust std docs"));
+        assert!(out.contains("https://doc.rust-lang.org/std/"));
+        // Capped at 1 — the second hit must not appear.
+        assert!(!out.contains("crates.io"));
+    }
 
     // ── docx inline formatting ──────────────────────────────────────────────
     #[test]
