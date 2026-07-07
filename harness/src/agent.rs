@@ -721,22 +721,73 @@ fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<prov
 
 fn extract_json_tool_candidate(text: &str) -> Option<&str> {
     let trimmed = text.trim();
+    // Whole-text JSON (the strict, original case).
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
         return Some(trimmed);
     }
-    let rest = trimmed.strip_prefix("```")?;
-    let fence_end = rest.find('\n')?;
-    let lang = rest[..fence_end].trim().to_ascii_lowercase();
-    if !lang.is_empty() && lang != "json" {
-        return None;
+    // A fenced ```json block that is the entire message.
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        if let Some(fence_end) = rest.find('\n') {
+            let lang = rest[..fence_end].trim().to_ascii_lowercase();
+            if lang.is_empty() || lang == "json" {
+                let body = &rest[fence_end + 1..];
+                if let Some(close) = body.rfind("```") {
+                    if body[close + 3..].trim().is_empty() {
+                        return Some(body[..close].trim());
+                    }
+                }
+            }
+        }
     }
-    let body = &rest[fence_end + 1..];
-    let close = body.rfind("```")?;
-    let after = body[close + 3..].trim();
-    if !after.is_empty() {
-        return None;
+    // XML-tagged tool calls. Small local coders (notably Qwen2.5-Coder on
+    // llama.cpp/Ollama) emit calls as `<tools>{…}</tools>` or
+    // `<tool_call>{…}</tool_call>` text in `content` instead of native
+    // tool_calls. Pull the first balanced JSON object out of the tagged region.
+    for tag in ["<tools>", "<tool_call>", "<function_call>", "<function>"] {
+        if let Some(pos) = text.find(tag) {
+            if let Some(json) = balanced_json_object(&text[pos + tag.len()..]) {
+                return Some(json);
+            }
+        }
     }
-    Some(body[..close].trim())
+    // A bare object embedded in prose (a leading sentence, then the JSON).
+    balanced_json_object(text)
+}
+
+// Return the first balanced `{…}` slice, tracking string state so braces inside
+// JSON string values (e.g. CSS `{ }` inside an HTML `content` field) don't end
+// the object early. None if there's no `{` or it never closes (truncated output).
+fn balanced_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn collect_text_tool_calls(
@@ -3225,6 +3276,67 @@ mod tests {
         assert_eq!(normalized.calls.len(), 1);
         assert_eq!(normalized.calls[0].name, "start_server");
         assert_eq!(normalized.calls[0].input["command"], "npm start");
+    }
+
+    #[test]
+    fn qwen_tools_tagged_call_with_css_braces_is_parsed() {
+        // The real failure from an end-to-end run against qwen2.5-coder-1.5b on
+        // llama.cpp: the model emits its call as `<tools>{…}</tools>` text with
+        // an HTML `content` field whose CSS contains `{ }`. The balanced-object
+        // scanner must not stop at the first CSS brace.
+        let defs = tools::defs_for_context(true, 128_000);
+        let reply = Reply {
+            text: "<tools>{\"name\":\"write_file\",\"arguments\":{\"path\":\"index.html\",\"content\":\"<style>body { color: #ff6faa; } .hero { padding: 2rem; }</style>\"}}</tools>".to_string(),
+            ..Default::default()
+        };
+        let normalized = normalize_text_tool_calls(reply, &defs, "build a donut shop site");
+        assert_eq!(normalized.calls.len(), 1, "text: unparsed");
+        assert_eq!(normalized.calls[0].name, "write_file");
+        assert_eq!(normalized.calls[0].input["path"], "index.html");
+        assert!(normalized.calls[0].input["content"]
+            .as_str()
+            .unwrap()
+            .contains("#ff6faa"));
+    }
+
+    #[test]
+    fn tool_call_tagged_and_embedded_json_variants_parse() {
+        let defs = tools::defs_for_context(true, 128_000);
+        // Hermes/Qwen `<tool_call>` wrapper.
+        let a = normalize_text_tool_calls(
+            Reply {
+                text: "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>"
+                    .to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "read it",
+        );
+        assert_eq!(a.calls.len(), 1);
+        assert_eq!(a.calls[0].name, "read_file");
+        // A leading sentence, then a bare JSON object.
+        let b = normalize_text_tool_calls(
+            Reply {
+                text: "Sure, I'll do that now. {\"name\":\"read_file\",\"arguments\":{\"path\":\"b.txt\"}}"
+                    .to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "read it",
+        );
+        assert_eq!(b.calls.len(), 1);
+        assert_eq!(b.calls[0].input["path"], "b.txt");
+    }
+
+    #[test]
+    fn balanced_json_object_respects_strings_and_truncation() {
+        assert_eq!(
+            balanced_json_object("x {\"a\":\"}{\"} y"),
+            Some("{\"a\":\"}{\"}")
+        );
+        // Unterminated object (truncated at the token limit) yields nothing.
+        assert_eq!(balanced_json_object("{\"a\": {\"b\": 1"), None);
+        assert_eq!(balanced_json_object("no braces here"), None);
     }
 
     #[test]
