@@ -147,6 +147,8 @@ jobs:
       # create them via a granular token, then add the trusted publishers.
       - name: Publish platform binary packages
         if: steps.published.outputs.already == 'false'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
           V=$(node -p "require('./package.json').version")
@@ -172,9 +174,32 @@ jobs:
             [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
             chmod +x "npm/${p}/bin/buildwithnexus${ext}"
             node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-            (cd "npm/${p}" && npm publish --access public --provenance) \
-              || echo "::warning::publish of buildwithnexus-${p} failed — configure its npm Trusted Publisher (see comment above)"
+            # OIDC first; brand-new packages can't use trusted publishing yet,
+            # so fall back to NPM_TOKEN (granular token that may create new
+            # packages) when it's configured. Revoke the token once all five
+            # exist and have Trusted Publishers attached.
+            if ! (cd "npm/${p}" && npm publish --access public --provenance); then
+              if [ -n "${NPM_TOKEN}" ]; then
+                echo "OIDC publish failed for buildwithnexus-${p} — retrying with NPM_TOKEN"
+                (cd "npm/${p}" && NODE_AUTH_TOKEN="${NPM_TOKEN}" npm publish --access public --provenance \
+                  --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
+                  || echo "::warning::token publish of buildwithnexus-${p} also failed"
+              else
+                echo "::warning::publish of buildwithnexus-${p} failed and no NPM_TOKEN fallback is set"
+              fi
+            fi
           done
+          # FAIL CLOSED: the main package's optionalDependencies point at these
+          # exact versions — publishing it while any platform package is
+          # missing would ship installs with no binary at all.
+          missing=0
+          for p in "${!T[@]}"; do
+            if ! npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
+              echo "::error::buildwithnexus-${p}@${V} is not on the registry — aborting main publish"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
           # Pin the main package's optionalDependencies to this exact version.
           node -e "const fs=require('fs'),j=require('./package.json');for(const k of Object.keys(j.optionalDependencies||{}))j.optionalDependencies[k]='${V}';fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')"
 
