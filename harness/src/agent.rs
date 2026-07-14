@@ -2233,10 +2233,7 @@ fn build_inner(
                         // Fix rounds exhausted: finish anyway with an honest note.
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
-                        report::notice(&format!(
-                            "  ⚠ verification {}",
-                            rep.status.label()
-                        ));
+                        report::notice(&format!("  ⚠ verification {}", rep.status.label()));
                         return Ok(format!(
                             "{s}\n\n[verification note] The verifier still reports `{}` after \
                              {verifier_fix_rounds} fix attempts:\n{violations}",
@@ -2244,15 +2241,10 @@ fn build_inner(
                         ));
                     }
                     crate::verifier::VerificationStatus::PassedWithWarnings => {
-                        report::notice(&format!(
-                            "  ⚠ verification {}",
-                            rep.status.label()
-                        ));
+                        report::notice(&format!("  ⚠ verification {}", rep.status.label()));
                         if !rep.rule_violations.is_empty() {
                             tui::line(&tui::render_md(
-                                &crate::rules::RuleEngine::format_violations(
-                                    &rep.rule_violations,
-                                ),
+                                &crate::rules::RuleEngine::format_violations(&rep.rule_violations),
                             ));
                         }
                     }

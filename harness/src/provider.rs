@@ -404,7 +404,11 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
                     let wait = server_wait.unwrap_or(delay_ms);
                     // Say what's happening — a silent 10s backoff reads as a
                     // frozen UI.
-                    let why = if code == 429 { "rate-limited" } else { "server busy" };
+                    let why = if code == 429 {
+                        "rate-limited"
+                    } else {
+                        "server busy"
+                    };
                     crate::report::info(&format!(
                         "  ⟳ {why} (HTTP {code}) — retrying in {:.1}s ({attempts}/{})",
                         wait as f64 / 1000.0,

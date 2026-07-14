@@ -546,7 +546,6 @@ fn lcs_ops<'a>(o: &[&'a str], n: &[&'a str]) -> Vec<(char, &'a str)> {
     ops
 }
 
-
 pub fn tool_denied(reason: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::red(&format!("  ✗ {reason}"))),

@@ -273,8 +273,8 @@ fn headless(
         println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
         println!();
         // Off the critical path: five `which` probes cost real startup latency,
-    // and with interactive=false this only prints when something is missing.
-    std::thread::spawn(|| check_and_offer_install_dependencies(false));
+        // and with interactive=false this only prints when something is missing.
+        std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
     let start_time = std::time::Instant::now();
@@ -1508,9 +1508,7 @@ fn handle_voice(arg: &str) -> Option<String> {
 }
 
 fn handle_local(_provider: &mut Provider) {
-    tui::line(&tui::accent(
-        "  local models",
-    ));
+    tui::line(&tui::accent("  local models"));
     tui::line(&tui::dim("  scanning local servers and model directories…"));
     let mut servers = Vec::new();
     if let Ok(o) = std::process::Command::new("curl")
@@ -1593,7 +1591,9 @@ fn handle_kb_index(cwd: &std::path::Path) {
         tui::bold(&kb.entities.len().to_string())
     ));
 
-    tui::line(&tui::dim("  scanning workspace for source files and symbols…"));
+    tui::line(&tui::dim(
+        "  scanning workspace for source files and symbols…",
+    ));
     let mut count = 0;
     let mut dirs_to_visit = vec![cwd.to_path_buf()];
     while let Some(dir) = dirs_to_visit.pop() {
@@ -1739,12 +1739,16 @@ fn handle_kb_index(cwd: &std::path::Path) {
         tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
     } else {
         tui::line(&tui::green(&format!("  ✓ indexed {count} symbols")));
-        tui::line(&tui::dim("  tip: @kb:<name> or @symbol:<name> injects symbol definitions into prompts"));
+        tui::line(&tui::dim(
+            "  tip: @kb:<name> or @symbol:<name> injects symbol definitions into prompts",
+        ));
     }
 }
 
 fn handle_verify_audit(cwd: &std::path::Path) {
-    tui::line(&tui::accent("  verifying workspace against rules and tests"));
+    tui::line(&tui::accent(
+        "  verifying workspace against rules and tests",
+    ));
 
     let mut changed_files = Vec::new();
     if let Ok(o) = std::process::Command::new("git")
@@ -2173,9 +2177,7 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
 }
 
 fn handle_align(cwd: &std::path::Path) {
-    tui::line(&tui::accent(
-        "  alignment interview",
-    ));
+    tui::line(&tui::accent("  alignment interview"));
     tui::line(&tui::dim(
         "  a short alignment review before proceeding with complex changes",
     ));
@@ -2239,9 +2241,7 @@ fn handle_align(cwd: &std::path::Path) {
 }
 
 fn handle_teamwork() {
-    tui::line(&tui::accent(
-        "  teamwork — multi-agent swarm preview",
-    ));
+    tui::line(&tui::accent("  teamwork — multi-agent swarm preview"));
     tui::line(&tui::dim(
         "  for complex projects, buildwithnexus orchestrates specialized subagent teams:",
     ));
@@ -2312,7 +2312,11 @@ fn print_help() {
             &[
                 ("Shift+Tab", "", "cycle PLAN → BUILD → BRAINSTORM"),
                 ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
-                ("/permissions", "[ask|auto|readonly]", "tool permission level"),
+                (
+                    "/permissions",
+                    "[ask|auto|readonly]",
+                    "tool permission level",
+                ),
                 ("/model", "[name]", "hot-swap the AI model mid-session"),
                 ("/local", "", "local model server & GGUF/Ollama management"),
             ],
@@ -2349,7 +2353,11 @@ fn print_help() {
                 ("/tools", "", "browse callable tools"),
                 ("/rules", "", "inspect engineering rules and violations"),
                 ("/kb", "(/index)", "query or index project knowledge base"),
-                ("/verify", "(/audit)", "verify codebase against rules and tests"),
+                (
+                    "/verify",
+                    "(/audit)",
+                    "verify codebase against rules and tests",
+                ),
                 ("/agents", "", "show loaded Agents.md context"),
                 ("/mcp", "", "inspect configured MCP servers"),
                 ("/trace", "", "inspect hooks, tools, skills, subagents"),
@@ -2706,7 +2714,6 @@ fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -
             .join("\n"),
     )
 }
-
 
 // Suggest a mode from the task phrasing (used for the "tip" hint, not a gate).
 pub fn classify(task: &str) -> Mode {

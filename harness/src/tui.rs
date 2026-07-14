@@ -1516,7 +1516,11 @@ fn queue_composer_box(out: &mut io::Stdout) {
     let w = width as usize;
     let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
     let bottom = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
-    let _ = queue!(out, MoveTo(0, composer_top()), Clear(ClearType::CurrentLine));
+    let _ = queue!(
+        out,
+        MoveTo(0, composer_top()),
+        Clear(ClearType::CurrentLine)
+    );
     let _ = write!(out, "{}", dim(&top));
     let _ = queue!(
         out,
@@ -1524,7 +1528,11 @@ fn queue_composer_box(out: &mut io::Stdout) {
         Clear(ClearType::CurrentLine)
     );
     let _ = write!(out, "{}", dim(&bottom));
-    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = queue!(
+        out,
+        MoveTo(0, composer_row()),
+        Clear(ClearType::CurrentLine)
+    );
     let _ = write!(out, "{} ", dim("│"));
 }
 
@@ -1749,7 +1757,10 @@ static LAST_STREAM_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 
 fn monotonic_ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 fn render_output_throttled() {
@@ -2978,8 +2989,7 @@ fn popup_candidates(buf: &[char], cursor: usize) -> Vec<String> {
     if token.is_empty() {
         return Vec::new();
     }
-    let interesting =
-        token.starts_with('/') || token.starts_with('@') || buf.first() == Some(&'/');
+    let interesting = token.starts_with('/') || token.starts_with('@') || buf.first() == Some(&'/');
     if !interesting {
         return Vec::new();
     }
@@ -3031,7 +3041,13 @@ fn render_suggestions(sug: &[String], sel: usize) {
             String::new()
         };
         let entry = if idx == sel {
-            format!("  {} {}  {}{}", accent("›"), bold(&padded), dim(desc), counter)
+            format!(
+                "  {} {}  {}{}",
+                accent("›"),
+                bold(&padded),
+                dim(desc),
+                counter
+            )
         } else {
             format!("    {padded}  {}", dim(desc))
         };
@@ -3505,8 +3521,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                             );
                             queue_composer_right_border(&mut out);
                         } else {
-                            let _ =
-                                queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
+                            let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
                             let _ = write!(
                                 out,
                                 "{}{}",
@@ -4224,9 +4239,9 @@ mod tests {
         let line = "let total_rows = t.wrapped.len();";
         // Inside an identifier → the whole identifier.
         assert_eq!(word_span_at(line, 6), Some((4, 13))); // total_rows
-        // On punctuation → the symbol run, not neighbours.
+                                                          // On punctuation → the symbol run, not neighbours.
         assert_eq!(word_span_at(line, 15), Some((15, 15))); // '='
-        // On whitespace → nothing.
+                                                            // On whitespace → nothing.
         assert_eq!(word_span_at(line, 3), None);
         // Out of range → nothing.
         assert_eq!(word_span_at(line, 999), None);
@@ -4456,11 +4471,7 @@ mod tests {
     // from scratch — for pushes, appends, in-place edits, removals, front
     // drains, and resizes.
     fn assert_cache_coherent(t: &Transcript) {
-        let expect: Vec<Vec<String>> = t
-            .lines
-            .iter()
-            .map(|l| wrap_ansi_line(l, t.width))
-            .collect();
+        let expect: Vec<Vec<String>> = t.lines.iter().map(|l| wrap_ansi_line(l, t.width)).collect();
         assert_eq!(t.wrapped, expect);
     }
 
@@ -4503,14 +4514,8 @@ mod tests {
         assert_eq!(total, flat.len());
         for start in [0usize, 1, 5, total.saturating_sub(3), total] {
             for count in [0usize, 1, 4, total] {
-                let got: Vec<String> =
-                    t.rows_range(start, count).into_iter().cloned().collect();
-                let want: Vec<String> = flat
-                    .iter()
-                    .skip(start)
-                    .take(count)
-                    .cloned()
-                    .collect();
+                let got: Vec<String> = t.rows_range(start, count).into_iter().cloned().collect();
+                let want: Vec<String> = flat.iter().skip(start).take(count).cloned().collect();
                 assert_eq!(got, want, "start={start} count={count}");
             }
         }
@@ -4589,4 +4594,3 @@ mod tests {
         assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
     }
 }
-

@@ -67,7 +67,9 @@ fn model_name_has_vision_hint(m: &str) -> bool {
 
 // ── video parsing (ffmpeg / ffprobe) ─────────────────────────────────────────
 
-pub const VIDEO_EXTS: &[&str] = &["mp4", "mov", "webm", "mkv", "avi", "m4v", "gifv", "mpg", "mpeg"];
+pub const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "webm", "mkv", "avi", "m4v", "gifv", "mpg", "mpeg",
+];
 pub const MAX_VIDEO_FRAMES: usize = 8;
 
 pub struct VideoAttachment {
@@ -161,11 +163,8 @@ pub fn attach_video(path: &Path) -> Option<VideoAttachment> {
         return None;
     }
     let probe = ffprobe(path)?;
-    let dir = std::env::temp_dir().join(format!(
-        "bwn-frames-{}-{}",
-        std::process::id(),
-        temp_seq()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("bwn-frames-{}-{}", std::process::id(), temp_seq()));
     std::fs::create_dir_all(&dir).ok()?;
     // Evenly sample across the whole clip. For very short clips the fps
     // filter simply yields fewer frames, which is fine.
@@ -231,7 +230,10 @@ pub fn clipboard_image_to_temp() -> Option<PathBuf> {
     if have_quick("wl-paste") {
         if let Ok(t) = Command::new("wl-paste").arg("--list-types").output() {
             if String::from_utf8_lossy(&t.stdout).contains("image/") {
-                if let Ok(o) = Command::new("wl-paste").args(["--type", "image/png"]).output() {
+                if let Ok(o) = Command::new("wl-paste")
+                    .args(["--type", "image/png"])
+                    .output()
+                {
                     if o.status.success() && !o.stdout.is_empty() {
                         std::fs::write(&dest, &o.stdout).ok()?;
                         return Some(dest);
@@ -360,8 +362,16 @@ pub fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
         out.push(B64_ALPHA[b0 >> 2] as char);
         out.push(B64_ALPHA[((b0 & 3) << 4) | (b1 >> 4)] as char);
         out.push(if chunk.len() > 1 {
