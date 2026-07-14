@@ -1,45 +1,29 @@
 #!/usr/bin/env node
 'use strict';
-// Thin launcher: hand off to the native Rust binary with stdio inherited so the
-// alternate-screen TUI works exactly as if it were invoked directly.
-//
-// Auto-update: at most once a day a detached background process checks npm and
-// silently installs a newer version (opt out: BWN_NO_AUTO_UPDATE=1). The only
-// launcher-side cost is one small JSON read + at most one fork — startup never
-// waits on the network.
-const { spawn, spawnSync } = require('child_process');
-const path = require('path');
-const { existing } = require('../scripts/resolve-binary.js');
-
-function maybeAutoUpdate() {
-  if (process.env.BWN_NO_AUTO_UPDATE === '1') return;
-  try {
-    const { readState, writeState } = require('../scripts/auto-update.js');
-    const state = readState();
-    // One-line notice for an update that landed in the background.
-    if (state.updatedTo && state.updatedTo !== state.noticeShownFor) {
-      process.stderr.write(`\x1b[2mbuildwithnexus updated to v${state.updatedTo} — restart to use it\x1b[0m\n`);
-      writeState({ noticeShownFor: state.updatedTo });
-    }
-    const DAY = 24 * 60 * 60 * 1000;
-    if (Date.now() - (state.lastCheck || 0) < DAY) return;
-    const child = spawn(
-      process.execPath,
-      [path.join(__dirname, '..', 'scripts', 'auto-update.js')],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.unref();
-  } catch { /* the updater must never break the launcher */ }
-}
-
-maybeAutoUpdate();
+// Thin launcher: resolve the platform binary and hand off with stdio inherited
+// so the alternate-screen TUI works exactly as if it were invoked directly.
+// Deliberately boring — no install scripts, no network, no dynamic code. The
+// binary itself handles update checks.
+const { spawnSync } = require('child_process');
+const { existing, platformPackage, target } = require('../scripts/resolve-binary.js');
 
 const bin = existing();
 if (!bin) {
+  const pkg = platformPackage();
+  const t = target();
   process.stderr.write(
     'buildwithnexus: native binary not found.\n' +
-    '  Reinstall the package, or build it locally with Rust (https://rustup.rs):\n' +
-    '    npm explore buildwithnexus -- npm run build\n'
+    (pkg
+      ? `  The platform package "${pkg}" is missing — it installs as an optionalDependency,\n` +
+        '  so re-install without --omit=optional / --no-optional:\n' +
+        '    npm install -g buildwithnexus\n'
+      : `  No prebuilt binary exists for this platform (${process.platform} ${process.arch}).\n`) +
+    (t
+      ? '  Or build from source and point BWN_BIN at the result:\n' +
+        '    git clone https://github.com/Garretts-Apps/buildwithnexus\n' +
+        '    cargo build --release --manifest-path buildwithnexus/harness/Cargo.toml\n'
+      : '') +
+    '  Docs: https://buildwithnexus.dev/docs/install\n'
   );
   process.exit(1);
 }

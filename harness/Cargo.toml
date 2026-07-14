@@ -1,14 +1,24 @@
 [package]
 name = "buildwithnexus"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
-description = "A hilariously fast agentic AI CLI harness — remote or local models, full TUI with modes, memory, skills, hooks, and image input"
+description = "A hilariously fast agentic AI coding CLI — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
 license = "MIT"
-repository = "https://github.com/garretts-apps/buildwithnexus"
+repository = "https://github.com/Garretts-Apps/buildwithnexus"
+homepage = "https://buildwithnexus.dev"
+readme = "../README.md"
+keywords = ["ai", "agent", "cli", "tui", "llm"]
+categories = ["command-line-utilities", "development-tools"]
 default-run = "buildwithnexus"
 
+# `cargo install buildwithnexus` installs BOTH binaries: the full name and
+# the short `bwn` alias (same entry point).
 [[bin]]
 name = "buildwithnexus"
+path = "src/main.rs"
+
+[[bin]]
+name = "bwn"
 path = "src/main.rs"
 
 [dependencies]

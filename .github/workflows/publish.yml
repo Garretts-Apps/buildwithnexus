@@ -1,14 +1,15 @@
 name: Publish to npm
 
-# The published package is a thin, zero-dependency wrapper: `postinstall`
-# fetches the SHA-256-verified prebuilt binary for the user's platform from the
-# GitHub Release, falling back to a cargo build. So publishing is just
-# `npm publish` of the wrapper — no bundle step.
+# The published package is a thin, zero-dependency, script-free wrapper: the
+# FIRST RUN fetches the SHA-256-verified prebuilt binary for the user's
+# platform from the GitHub Release (no npm install scripts — keeps
+# supply-chain scanners green). So publishing is just `npm publish` of the
+# wrapper — no bundle step.
 #
 # Sequencing: publishing is chained off the `release` workflow's COMPLETION, not
 # the raw `v*` tag. release.yml builds and attaches the per-platform binaries on
 # the tag; only once that whole workflow succeeds do we publish to npm — so a
-# user never installs a version whose binaries aren't up yet (the postinstall
+# user never installs a version whose binaries aren't up yet (the first-run
 # fast path). workflow_dispatch stays for manual/emergency publishes.
 on:
   workflow_run:
@@ -20,7 +21,7 @@ on:
         # Default 'none': publish the version already on main, whose release
         # binaries exist. A bump here can't push a tag (OIDC-only, no PAT), so
         # release.yml never builds binaries for the bumped version — leaving
-        # postinstall with a 404 fast path. Bump via a PR to main instead.
+        # the first-run download with a 404. Bump via a PR to main instead.
         description: "Version bump — keep 'none' to publish the current version (recommended)"
         required: true
         default: "none"
@@ -107,7 +108,7 @@ jobs:
             echo "::warning::Could not push bump+tag to main. Publishing to npm anyway."
           fi
 
-      # Guard the install path: a syntax error in the wrapper or postinstall
+      # Guard the launch path: a syntax error in the wrapper or bootstrap
       # would break `npm install` for every user. Cheap to check, expensive to miss.
       - name: Syntax-check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
@@ -132,6 +133,51 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Platform binary packages (buildwithnexus-<os>-<cpu>): download each
+      # release asset, verify its SHA-256 against the published checksum, and
+      # publish it as its own package. The main package selects the right one
+      # at install time via optionalDependencies — so the main tarball needs
+      # no install scripts and no network code at all.
+      #
+      # FIRST-TIME SETUP: each platform package needs its own npm Trusted
+      # Publisher entry (same repo/workflow) at
+      #   https://www.npmjs.com/package/buildwithnexus-<platform>/access
+      # A brand-new package can't use OIDC before it exists — publish each
+      # once manually (npm publish --access public from npm/<platform>) or
+      # create them via a granular token, then add the trusted publishers.
+      - name: Publish platform binary packages
+        if: steps.published.outputs.already == 'false'
+        run: |
+          set -e
+          V=$(node -p "require('./package.json').version")
+          declare -A T=(
+            [linux-x64]=x86_64-unknown-linux-gnu
+            [linux-arm64]=aarch64-unknown-linux-gnu
+            [darwin-x64]=x86_64-apple-darwin
+            [darwin-arm64]=aarch64-apple-darwin
+            [win32-x64]=x86_64-pc-windows-msvc
+          )
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${V}"
+          for p in "${!T[@]}"; do
+            t=${T[$p]}; ext=""; [[ "$t" == *windows* ]] && ext=".exe"
+            if npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
+              echo "buildwithnexus-${p}@${V} already published — skipping."
+              continue
+            fi
+            mkdir -p "npm/${p}/bin"
+            curl -fsSL -o "npm/${p}/bin/buildwithnexus${ext}" "${BASE}/buildwithnexus-${t}${ext}"
+            curl -fsSL -o /tmp/expected.sha256 "${BASE}/buildwithnexus-${t}${ext}.sha256"
+            expected=$(cut -d' ' -f1 /tmp/expected.sha256)
+            got=$(sha256sum "npm/${p}/bin/buildwithnexus${ext}" | cut -d' ' -f1)
+            [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
+            chmod +x "npm/${p}/bin/buildwithnexus${ext}"
+            node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+            (cd "npm/${p}" && npm publish --access public --provenance) \
+              || echo "::warning::publish of buildwithnexus-${p} failed — configure its npm Trusted Publisher (see comment above)"
+          done
+          # Pin the main package's optionalDependencies to this exact version.
+          node -e "const fs=require('fs'),j=require('./package.json');for(const k of Object.keys(j.optionalDependencies||{}))j.optionalDependencies[k]='${V}';fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')"
+
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
       #   1. Trusted Publisher configured on npmjs.com for the
@@ -149,6 +195,40 @@ jobs:
       - name: Publish to npm (OIDC Trusted Publisher + provenance)
         if: steps.published.outputs.already == 'false'
         run: npm publish --access public --provenance
+
+      # crates.io: `cargo install buildwithnexus` (both binaries) and
+      # `cargo install bwn` (alias crate). Requires a CARGO_REGISTRY_TOKEN
+      # repo secret (create at https://crates.io/settings/tokens with
+      # publish-new + publish-update scope). Skips with a warning when the
+      # secret is absent. bwn depends on the just-published buildwithnexus,
+      # so it retries while the index propagates.
+      - name: Install Rust for crates.io publish
+        if: steps.published.outputs.already == 'false'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        if: steps.published.outputs.already == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish (npm publish is unaffected)."
+            exit 0
+          fi
+          set -e
+          V=$(node -p "require('./package.json').version")
+          if cargo info "buildwithnexus@${V}" >/dev/null 2>&1; then
+            echo "buildwithnexus ${V} already on crates.io — skipping."
+          else
+            cargo publish -p buildwithnexus --locked
+          fi
+          # bwn depends on the crate above; wait out index propagation.
+          for i in 1 2 3 4 5; do
+            if cargo publish -p bwn --locked; then exit 0; fi
+            echo "bwn publish attempt ${i} failed (index propagation?) — retrying in 30s"
+            sleep 30
+          done
+          echo "::warning::bwn alias crate did not publish — run 'cargo publish -p bwn' manually."
 
       - name: Summary
         if: always()

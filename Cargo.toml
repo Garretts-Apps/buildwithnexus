@@ -1,5 +1,5 @@
 [workspace]
-members = ["harness"]
+members = ["harness", "bwn"]
 resolver = "2"
 
 [profile.release]

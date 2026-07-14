@@ -1,0 +1,24 @@
+{
+  "name": "buildwithnexus-win32-x64",
+  "version": "0.12.1",
+  "description": "buildwithnexus prebuilt binary for win32 x64 (x86_64-pc-windows-msvc). Install the 'buildwithnexus' package instead of this one.",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Garretts-Apps/buildwithnexus.git"
+  },
+  "homepage": "https://buildwithnexus.dev",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
