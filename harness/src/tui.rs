@@ -2439,7 +2439,14 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/quit",
 ];
 
+// Cached: the autocomplete popup consults this on every keystroke, and the
+// skill/command set doesn't change within a session.
 fn load_slash_commands() -> Vec<String> {
+    static CMDS: OnceLock<Vec<String>> = OnceLock::new();
+    CMDS.get_or_init(load_slash_commands_uncached).clone()
+}
+
+fn load_slash_commands_uncached() -> Vec<String> {
     let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
     for (name, _) in crate::config::bundled_skills() {
         let cmd = format!("/{name}");
@@ -2488,6 +2495,137 @@ fn common_prefix(items: &[String]) -> String {
         prefix.truncate(n);
     }
     prefix.into_iter().collect()
+}
+
+// ── live autocomplete popup ──────────────────────────────────────────────────
+// As-you-type suggestions drawn just above the composer (alt-screen only):
+// slash commands with one-line descriptions, sub-arguments, and @path
+// mentions. ↑/↓ move the highlight, Tab/Enter accept, Esc dismisses.
+
+const POPUP_MAX_ROWS: usize = 8;
+
+// One-line description shown next to each built-in command in the popup.
+// User-defined commands and skills get an empty description.
+fn slash_command_desc(cmd: &str) -> &'static str {
+    match cmd {
+        "/help" => "show all commands and keys",
+        "/clear" => "clear the screen",
+        "/new" => "start a fresh session",
+        "/resume" => "pick a saved session to resume",
+        "/init" => "reconfigure provider, model, and key",
+        "/plan" => "switch to PLAN mode",
+        "/build" => "switch to BUILD mode",
+        "/brainstorm" => "switch to BRAINSTORM mode",
+        "/doctor" | "/debug" => "diagnose setup and connectivity",
+        "/mode" => "show or switch mode",
+        "/model" => "hot-swap the AI model",
+        "/permissions" => "tool permission level (ask/auto/readonly)",
+        "/effort" => "set reasoning effort",
+        "/mcp" => "manage MCP servers",
+        "/plugin" => "manage plugins",
+        "/marketplace" => "browse the plugin marketplace",
+        "/scroll" => "wheel scrolling on/off",
+        "/mouse" => "mouse capture on/off",
+        "/compact" => "compress context to free token budget",
+        "/review" => "AI code review of staged git diff",
+        "/commit" => "AI-drafted conventional commit message",
+        "/pr" => "AI-drafted PR title + description",
+        "/diff" => "show current git diff summary",
+        "/context" => "show context window usage",
+        "/schedule" => "one-shot scheduled workflow",
+        "/loop" => "repeating scheduled workflow",
+        "/workflows" => "list and manage background workflows",
+        "/tasks" => "list and manage background tasks",
+        "/btw" => "inject context into the next agent turn",
+        "/config" => "configure hooks, memory, commands via AI",
+        "/memory" => "view and edit session memory",
+        "/skills" => "list skills and custom commands",
+        "/tools" => "browse callable tools",
+        "/trace" => "inspect hooks, tools, skills, subagents",
+        "/agents" => "manage subagents",
+        "/checkpoints" => "list edit checkpoints",
+        "/undo" | "/rewind" => "revert to an edit checkpoint",
+        "/vim" => "toggle vim editing mode",
+        "/voice" => "voice input",
+        "/local" => "manage local models",
+        "/rules" => "manage project rules",
+        "/kb" | "/index" => "query or index project knowledge base",
+        "/verify" | "/audit" => "verify recent changes",
+        "/grill-me" => "operational alignment interview",
+        "/teamwork" => "multi-agent swarm preview",
+        "/exit" | "/quit" => "exit the session",
+        _ => "",
+    }
+}
+
+// Candidates for the popup at the current cursor position. Only "interesting"
+// tokens trigger it (slash commands, their sub-arguments, and @mentions) so
+// ordinary prose never spawns a popup.
+fn popup_candidates(buf: &[char], cursor: usize) -> Vec<String> {
+    let (tok_start, token) = token_at(buf, cursor);
+    if token.is_empty() {
+        return Vec::new();
+    }
+    let interesting =
+        token.starts_with('/') || token.starts_with('@') || buf.first() == Some(&'/');
+    if !interesting {
+        return Vec::new();
+    }
+    completions(buf, tok_start, &token)
+}
+
+// Scroll window over the candidate list: (first_index, rows_shown), keeping
+// the selection visible.
+fn popup_window(sel: usize, len: usize, max: usize) -> (usize, usize) {
+    let show = len.min(max);
+    if show == 0 {
+        return (0, 0);
+    }
+    let first = sel.saturating_sub(show - 1).min(len - show);
+    (first, show)
+}
+
+// Draw the popup over the bottom rows of the output region. Cursor position
+// is saved/restored so the composer caret stays put; the caller repaints the
+// transcript (render_output) once the popup shrinks or closes.
+fn render_suggestions(sug: &[String], sel: usize) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let (width, _) = term_size();
+    let (first, show) = popup_window(sel, sug.len(), POPUP_MAX_ROWS);
+    if show == 0 {
+        return;
+    }
+    let pad = sug[first..first + show]
+        .iter()
+        .map(|c| str_width(c))
+        .max()
+        .unwrap_or(0);
+    let mut out = io::stdout();
+    let _ = execute!(out, SavePosition);
+    let base = composer_row().saturating_sub(show as u16);
+    for i in 0..show {
+        let idx = first + i;
+        let row = base + i as u16;
+        let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+        let cand = &sug[idx];
+        let padded = format!("{cand:<pad$}");
+        let desc = slash_command_desc(cand);
+        let counter = if sug.len() > show && idx == sel {
+            dim(&format!(" ({}/{})", sel + 1, sug.len()))
+        } else {
+            String::new()
+        };
+        let entry = if idx == sel {
+            format!("  {} {}  {}{}", accent("›"), bold(&padded), dim(desc), counter)
+        } else {
+            format!("    {padded}  {}", dim(desc))
+        };
+        let _ = write!(out, "{}", clip_ansi_line(&entry, width as usize));
+    }
+    let _ = execute!(out, RestorePosition);
+    let _ = out.flush();
 }
 
 fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
@@ -2689,6 +2827,12 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     if is_vim_mode() {
         VIM_STATE_VAL.store(0, Ordering::Relaxed);
     }
+    // Live autocomplete popup state (alt-screen only).
+    let mut sug: Vec<String> = Vec::new();
+    let mut sug_idx = 0usize;
+    let mut sug_rows = 0usize; // rows currently drawn over the output region
+    let mut sug_suppressed = false; // Esc hides the popup until the buffer changes
+    let mut sug_dismissed_at: Vec<char> = Vec::new();
 
     macro_rules! reline {
         () => {{
@@ -2704,6 +2848,34 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     }
 
     loop {
+        // Refresh the autocomplete popup against the current buffer. Runs
+        // before the blocking read so the popup tracks every edit (including
+        // prefilled text on the first pass).
+        if ALT_SCREEN.load(Ordering::Relaxed) {
+            if sug_suppressed && buf != sug_dismissed_at {
+                sug_suppressed = false;
+            }
+            let cands = if sug_suppressed {
+                Vec::new()
+            } else {
+                popup_candidates(&buf, cursor)
+            };
+            if cands != sug {
+                sug = cands;
+                sug_idx = 0;
+            }
+            let show = sug.len().min(POPUP_MAX_ROWS);
+            if show < sug_rows {
+                // Popup shrank or closed: repaint the transcript rows it
+                // covered, then restore the composer it clobbers.
+                render_output();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            if !sug.is_empty() {
+                render_suggestions(&sug, sug_idx);
+            }
+            sug_rows = show;
+        }
         let ev = match read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
             Ok(Event::Paste(s)) => {
@@ -3148,6 +3320,14 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Up => {
+                if !sug.is_empty() {
+                    sug_idx = if sug_idx == 0 {
+                        sug.len() - 1
+                    } else {
+                        sug_idx - 1
+                    };
+                    continue; // loop top re-renders the popup
+                }
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
                         let idx = match hist_idx {
@@ -3163,6 +3343,10 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Down => {
+                if !sug.is_empty() {
+                    sug_idx = (sug_idx + 1) % sug.len();
+                    continue; // loop top re-renders the popup
+                }
                 if let Ok(h) = history().lock() {
                     match hist_idx {
                         Some(i) if i + 1 < h.len() => {
@@ -3180,6 +3364,28 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
+                // Accept the highlighted autocomplete entry first: a
+                // line-start /command submits immediately; any other token
+                // (sub-argument, @path) is inserted and editing continues.
+                if !sug.is_empty() {
+                    let cand = sug[sug_idx].clone();
+                    let (tok_start, token) = token_at(&buf, cursor);
+                    let is_cmd = token.starts_with('/')
+                        && buf[..tok_start].iter().all(|c| c.is_whitespace());
+                    let new: Vec<char> = cand.chars().collect();
+                    buf.splice(tok_start..cursor, new.iter().copied());
+                    cursor = tok_start + new.len();
+                    if !is_cmd {
+                        if !cand.ends_with('/') && !cand.ends_with(':') {
+                            buf.insert(cursor, ' ');
+                            cursor += 1;
+                        }
+                        redraw(prompt, start, &buf, cursor, &mut scroll);
+                        continue;
+                    }
+                    // Fall through to submit; echo_submitted repaints the
+                    // rows the popup covered.
+                }
                 // Only a TRAILING backslash at end-of-line continues to the
                 // next line; a backslash left of the cursor mid-line (e.g. in
                 // a Windows path) must not trigger continuation.
@@ -3196,6 +3402,19 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 return Some(RawLine::Submit(text, cont));
             }
             KeyCode::Tab => {
+                if !sug.is_empty() {
+                    let cand = sug[sug_idx].clone();
+                    let (tok_start, _) = token_at(&buf, cursor);
+                    let new: Vec<char> = cand.chars().collect();
+                    buf.splice(tok_start..cursor, new.iter().copied());
+                    cursor = tok_start + new.len();
+                    if !cand.ends_with('/') && !cand.ends_with(':') {
+                        buf.insert(cursor, ' ');
+                        cursor += 1;
+                    }
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                    continue;
+                }
                 let (tok_start, token) = token_at(&buf, cursor);
                 let cands = completions(&buf, tok_start, &token);
                 if cands.len() == 1 {
@@ -3226,6 +3445,13 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
             }
             KeyCode::Esc => {
+                if !sug.is_empty() {
+                    // Dismiss the popup only; it stays hidden until the
+                    // buffer changes again.
+                    sug_suppressed = true;
+                    sug_dismissed_at = buf.clone();
+                    continue; // loop top clears the popup rows
+                }
                 if is_vim_mode() && vim_state != VimState::Normal {
                     vim_state = VimState::Normal;
                     cursor = cursor.saturating_sub(1);
@@ -3740,6 +3966,49 @@ mod tests {
         let joined = plain(&r.sink.join("\n"));
         assert!(joined.contains("no trailing newline"), "{joined}");
         assert!(!joined.contains("**"), "{joined}");
+    }
+
+    #[test]
+    fn popup_window_keeps_selection_visible() {
+        // Fewer candidates than the cap: show everything from the top.
+        assert_eq!(popup_window(0, 3, 8), (0, 3));
+        assert_eq!(popup_window(2, 3, 8), (0, 3));
+        // More candidates than the cap: window follows the selection.
+        assert_eq!(popup_window(0, 20, 8), (0, 8));
+        assert_eq!(popup_window(7, 20, 8), (0, 8));
+        assert_eq!(popup_window(10, 20, 8), (3, 8));
+        assert_eq!(popup_window(19, 20, 8), (12, 8));
+        // Empty list.
+        assert_eq!(popup_window(0, 0, 8), (0, 0));
+    }
+
+    #[test]
+    fn every_builtin_slash_command_has_a_description() {
+        for cmd in SLASH_COMMANDS_BASE {
+            assert!(
+                !slash_command_desc(cmd).is_empty(),
+                "missing popup description for {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_candidates_only_for_interesting_tokens() {
+        // Ordinary prose never spawns a popup.
+        let prose: Vec<char> = "fix the bug".chars().collect();
+        assert!(popup_candidates(&prose, prose.len()).is_empty());
+        // A line-start slash token does.
+        let cmd: Vec<char> = "/re".chars().collect();
+        assert!(popup_candidates(&cmd, cmd.len()).contains(&"/resume".to_string()));
+        // Sub-arguments of a slash command do.
+        let sub: Vec<char> = "/mode pl".chars().collect();
+        assert_eq!(popup_candidates(&sub, sub.len()), vec!["plan".to_string()]);
+        // A slash mid-message does not.
+        let mid: Vec<char> = "see /etc".chars().collect();
+        assert!(popup_candidates(&mid, mid.len()).is_empty());
+        // Empty token: nothing to suggest.
+        let blank: Vec<char> = "/help ".chars().collect();
+        assert!(popup_candidates(&blank, blank.len()).is_empty());
     }
 
     #[test]
