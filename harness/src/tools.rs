@@ -2738,10 +2738,8 @@ fn uniform_indent_shift(
                 // whitespace prefix.
                 let (deeper, prefix) = if let Some(p) = f.strip_suffix(o) {
                     (true, p)
-                } else if let Some(p) = o.strip_suffix(f) {
-                    (false, p)
                 } else {
-                    return None;
+                    (false, o.strip_suffix(f)?)
                 };
                 if prefix.is_empty() || !prefix.chars().all(char::is_whitespace) {
                     return None;
