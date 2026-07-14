@@ -243,6 +243,12 @@ const INFO: Rgb = Rgb(0x7d, 0xcf, 0xff);
 const MODE_PLAN: Rgb = Rgb(0x9e, 0xce, 0x6a);
 const MODE_BUILD: Rgb = Rgb(0x7a, 0xa2, 0xf7);
 const MODE_BSTORM: Rgb = Rgb(0xe0, 0xaf, 0x68);
+// Diff row tints (Tokyo Night DiffAdd/DiffDelete family): whole added/removed
+// rows get a subtle background; the changed word span gets a stronger one.
+const DIFF_ADD_BG: Rgb = Rgb(0x1e, 0x31, 0x26);
+const DIFF_DEL_BG: Rgb = Rgb(0x37, 0x22, 0x2c);
+const DIFF_ADD_EMPH_BG: Rgb = Rgb(0x2c, 0x4d, 0x38);
+const DIFF_DEL_EMPH_BG: Rgb = Rgb(0x5a, 0x2e, 0x40);
 
 fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
@@ -407,67 +413,50 @@ pub fn mode_badge(mode: &str) -> String {
     }
 }
 
-// ── inline diff ────────────────────────────────────────────────────────────
-pub fn diff(old: &str, new: &str) -> String {
-    const CTX: usize = 2;
-    const MAX: usize = 60;
-    let o: Vec<&str> = old.lines().collect();
-    let n: Vec<&str> = new.lines().collect();
+// ── diff paint helpers ───────────────────────────────────────────────────────
+// Used by report's diff renderer: background-tinted spans in the GitHub /
+// opencode style. The bg is restored to the theme background (alt-screen) or
+// terminal default afterwards, mirroring reset_fg()'s approach.
 
-    let mut head = 0;
-    while head < o.len() && head < n.len() && o[head] == n[head] {
-        head += 1;
+fn reset_bg() -> String {
+    if no_color() {
+        String::new()
+    } else if ALT_SCREEN.load(Ordering::Relaxed) {
+        format!("\x1b[{}m", sgr_bg(BACKGROUND))
+    } else {
+        "\x1b[49m".to_string()
     }
-    let mut tail = 0;
-    while tail < o.len() - head.min(o.len())
-        && tail < n.len() - head.min(n.len())
-        && o[o.len() - 1 - tail] == n[n.len() - 1 - tail]
-    {
-        tail += 1;
-    }
-
-    let ctx_start = head.saturating_sub(CTX);
-    let mut out: Vec<String> = Vec::new();
-    for line in &o[ctx_start..head] {
-        out.push(dim(&format!("  {line}")));
-    }
-    for line in &o[head..o.len() - tail] {
-        out.push(paint(ERROR, &format!("- {line}")));
-    }
-    for line in &n[head..n.len() - tail] {
-        out.push(paint(SUCCESS, &format!("+ {line}")));
-    }
-    let ctx_end = (o.len() - tail + CTX).min(o.len());
-    for line in &o[o.len() - tail..ctx_end] {
-        out.push(dim(&format!("  {line}")));
-    }
-    if out.len() > MAX {
-        let shown = out[..MAX].join("\n");
-        return format!(
-            "{shown}\n{}",
-            dim(&format!("  …(+{} more lines)", out.len() - MAX))
-        );
-    }
-    out.join("\n")
 }
 
-pub fn added_preview(content: &str) -> String {
-    const MAX: usize = 40;
-    let lines: Vec<&str> = content.lines().collect();
-    let shown: Vec<String> = lines
-        .iter()
-        .take(MAX)
-        .map(|l| paint(SUCCESS, &format!("+ {l}")))
-        .collect();
-    if lines.len() > MAX {
-        format!(
-            "{}\n{}",
-            shown.join("\n"),
-            dim(&format!("  …(+{} more lines)", lines.len() - MAX))
-        )
-    } else {
-        shown.join("\n")
+fn on_bg(bg: Rgb, fg: Rgb, s: &str) -> String {
+    if no_color() {
+        return s.to_string();
     }
+    format!(
+        "\x1b[{};{}m{s}{}{}",
+        sgr_bg(bg),
+        sgr_fg(fg),
+        reset_bg(),
+        reset_fg()
+    )
+}
+
+pub fn diff_add_span(s: &str) -> String {
+    on_bg(DIFF_ADD_BG, SUCCESS, s)
+}
+pub fn diff_add_emph_span(s: &str) -> String {
+    on_bg(DIFF_ADD_EMPH_BG, TEXT, s)
+}
+pub fn diff_del_span(s: &str) -> String {
+    on_bg(DIFF_DEL_BG, ERROR, s)
+}
+pub fn diff_del_emph_span(s: &str) -> String {
+    on_bg(DIFF_DEL_EMPH_BG, TEXT, s)
+}
+
+// Terminal width for layout done outside this module (diff gutters).
+pub fn term_width() -> usize {
+    term_size().0 as usize
 }
 
 // ── streaming markdown / code-block renderer ─────────────────────────────────
@@ -3807,50 +3796,6 @@ mod tests {
         assert_eq!(cube(255), 5);
         assert_eq!(cube(135), 2);
         assert_eq!(cube(94), 1);
-    }
-
-    #[test]
-    fn diff_marks_changed_middle_with_context() {
-        let old = "a\nb\nc\nd\ne";
-        let new = "a\nb\nX\nd\ne";
-        let d = plain(&diff(old, new));
-        assert!(d.contains("- c"), "{d}");
-        assert!(d.contains("+ X"), "{d}");
-        assert!(d.contains("  b") && d.contains("  d"), "{d}");
-        assert!(!d.contains("- a") && !d.contains("+ e"), "{d}");
-    }
-
-    #[test]
-    fn diff_pure_addition() {
-        let d = plain(&diff("a\nb", "a\nb\nc"));
-        assert!(d.contains("+ c"), "{d}");
-        assert!(!d.contains("- "), "{d}");
-    }
-
-    #[test]
-    fn diff_pure_removal() {
-        let d = plain(&diff("a\nb\nc", "a\nc"));
-        assert!(d.contains("- b"), "{d}");
-    }
-
-    #[test]
-    fn diff_identical_has_no_markers() {
-        let d = plain(&diff("a\nb", "a\nb"));
-        assert!(!d.contains("- ") && !d.contains("+ "), "{d}");
-    }
-
-    #[test]
-    fn diff_empty_old_is_all_additions() {
-        let d = plain(&diff("", "x\ny"));
-        assert!(d.contains("+ x") && d.contains("+ y"), "{d}");
-    }
-
-    #[test]
-    fn added_preview_clips_long_content() {
-        let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let p = plain(&added_preview(&content));
-        assert!(p.contains("+ line 0"));
-        assert!(p.contains("more lines"));
     }
 
     #[test]
