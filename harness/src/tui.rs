@@ -5,7 +5,7 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -73,9 +73,123 @@ struct Selection {
     focus: SelectPos,
 }
 
-fn transcript() -> &'static Mutex<Vec<String>> {
-    static LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-    LINES.get_or_init(|| Mutex::new(Vec::new()))
+// Transcript with an incremental word-wrap cache. Wrapping every line on
+// every repaint is O(total chars) of ANSI parsing per streamed chunk /
+// keystroke / scroll tick — the single biggest source of TUI lag on long
+// sessions. Instead each line is wrapped once when it lands (or when it
+// mutates), and a resize rewraps everything exactly once.
+struct Transcript {
+    lines: Vec<String>,
+    wrapped: Vec<Vec<String>>, // parallel to `lines`, wrapped at `width`
+    width: usize,              // 0 = not yet sized
+}
+
+impl Transcript {
+    const fn new() -> Self {
+        Transcript {
+            lines: Vec::new(),
+            wrapped: Vec::new(),
+            width: 0,
+        }
+    }
+
+    fn cur_width(&mut self) -> usize {
+        if self.width == 0 {
+            self.width = term_size().0 as usize;
+        }
+        self.width
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn push(&mut self, s: String) {
+        let w = self.cur_width();
+        self.wrapped.push(wrap_ansi_line(&s, w));
+        self.lines.push(s);
+    }
+
+    fn set(&mut self, i: usize, s: String) {
+        if i >= self.lines.len() {
+            return;
+        }
+        let w = self.cur_width();
+        self.wrapped[i] = wrap_ansi_line(&s, w);
+        self.lines[i] = s;
+    }
+
+    // Append to line `i`, re-wrapping only that line. False when `i` is out
+    // of range (no open stream line).
+    fn append_to(&mut self, i: usize, chunk: &str) -> bool {
+        if i >= self.lines.len() {
+            return false;
+        }
+        self.lines[i].push_str(chunk);
+        let w = self.cur_width();
+        self.wrapped[i] = wrap_ansi_line(&self.lines[i], w);
+        true
+    }
+
+    fn remove(&mut self, i: usize) {
+        if i < self.lines.len() {
+            self.lines.remove(i);
+            self.wrapped.remove(i);
+        }
+    }
+
+    fn drain_front(&mut self, n: usize) {
+        let n = n.min(self.lines.len());
+        self.lines.drain(0..n);
+        self.wrapped.drain(0..n);
+    }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.wrapped.clear();
+    }
+
+    // Rewrap everything if the terminal width changed (resize only).
+    fn ensure_width(&mut self, w: usize) {
+        if w != self.width {
+            self.width = w;
+            self.wrapped = self.lines.iter().map(|l| wrap_ansi_line(l, w)).collect();
+        }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.wrapped.iter().map(|w| w.len()).sum()
+    }
+
+    // The visible window: `count` wrapped rows starting at row `start`,
+    // without materializing the full flattened transcript.
+    fn rows_range(&self, start: usize, count: usize) -> Vec<&String> {
+        let mut out = Vec::with_capacity(count);
+        let mut skipped = 0usize;
+        for w in &self.wrapped {
+            if out.len() >= count {
+                break;
+            }
+            if skipped + w.len() <= start {
+                skipped += w.len();
+                continue;
+            }
+            let begin = start.saturating_sub(skipped);
+            for row in &w[begin..] {
+                out.push(row);
+                if out.len() >= count {
+                    break;
+                }
+            }
+            skipped += w.len();
+        }
+        out
+    }
+}
+
+fn transcript() -> &'static Mutex<Transcript> {
+    static LINES: OnceLock<Mutex<Transcript>> = OnceLock::new();
+    LINES.get_or_init(|| Mutex::new(Transcript::new()))
 }
 
 fn footer_text() -> &'static Mutex<String> {
@@ -585,14 +699,13 @@ impl StreamRenderer {
     }
 
     fn render_code_block(&mut self, lang: &str, lines: &[String]) {
-        let header = code_box_header(lang, self.w);
-        self.emit(&header);
-        for text in lines {
-            let row = code_box_line(text);
-            self.emit(&row);
-        }
-        let footer = code_box_footer(self.w);
-        self.emit(&footer);
+        // One emit for the whole block: line() splits on '\n', and a single
+        // call means one repaint instead of one per code row.
+        let mut rows = Vec::with_capacity(lines.len() + 2);
+        rows.push(code_box_header(lang, self.w));
+        rows.extend(lines.iter().map(|text| code_box_line(text)));
+        rows.push(code_box_footer(self.w));
+        self.emit(&rows.join("\n"));
     }
 }
 
@@ -1430,25 +1543,24 @@ fn render_output() {
     let (width, height) = term_size();
     let width = width as usize;
     let rows = height.saturating_sub(reserved_rows()) as usize;
-    let Ok(lines) = transcript().lock() else {
+    let Ok(mut t) = transcript().lock() else {
         return;
     };
-    let mut visible_lines = Vec::new();
-    for line in lines.iter() {
-        visible_lines.extend(wrap_ansi_line(line, width));
-    }
-    let max_offset = visible_lines.len().saturating_sub(rows);
+    t.ensure_width(width);
+    let total = t.total_rows();
+    let max_offset = total.saturating_sub(rows);
     let offset = SCROLL_OFFSET.load(Ordering::Relaxed).min(max_offset);
     if offset != SCROLL_OFFSET.load(Ordering::Relaxed) {
         SCROLL_OFFSET.store(offset, Ordering::Relaxed);
     }
-    let start = visible_lines.len().saturating_sub(rows + offset);
+    let start = total.saturating_sub(rows + offset);
+    let visible = t.rows_range(start, rows);
     let mut out = io::stdout();
     let sel = selection().lock().ok().and_then(|g| *g);
     let mut plain_rows = Vec::with_capacity(rows);
     for row in 0..rows {
         let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
-        if let Some(line) = visible_lines.get(start + row) {
+        if let Some(line) = visible.get(row) {
             let plain = strip_ansi(line);
             if let Some(sel) = sel {
                 if let Some(range) = selection_range_for(sel, row as u16, plain.chars().count()) {
@@ -1468,11 +1580,37 @@ fn render_output() {
             plain_rows.push(String::new());
         }
     }
+    drop(t);
     if let Ok(mut rows) = visible_rows().lock() {
         *rows = plain_rows;
     }
     let _ = out.flush();
     render_queued_composer();
+}
+
+// ── streaming frame coalescing ───────────────────────────────────────────────
+// Streamed token chunks can arrive hundreds of times per second; painting the
+// screen for each one wastes CPU and looks like flicker, not speed. Cap
+// streaming repaints at ~60fps. Correctness doesn't depend on any single
+// frame: render_output() is a stateless full repaint, and the unthrottled
+// paths (line(), commit_stream_line(), assistant_end) always paint the final
+// state.
+const FRAME_MS: u64 = 16;
+static LAST_STREAM_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+
+fn monotonic_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn render_output_throttled() {
+    let now = monotonic_ms();
+    let last = LAST_STREAM_FRAME_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= FRAME_MS || last == 0 {
+        LAST_STREAM_FRAME_MS.store(now.max(1), Ordering::Relaxed);
+        render_output();
+        clear_composer();
+    }
 }
 
 fn scroll_output(delta: isize) {
@@ -1764,17 +1902,17 @@ fn refresh_banner_mode(mode: &str) {
     }
     let width = term_size().0 as usize;
     let row = banner_mode_row(mode, width);
-    let Ok(mut lines) = transcript().lock() else {
+    let Ok(mut t) = transcript().lock() else {
         return;
     };
-    for line in lines.iter_mut() {
-        let plain = strip_ansi(line);
-        // "Shift+Tab cycle" is unique to the banner's mode row (the REPL
-        // hint line says "Shift+Tab to change mode").
-        if plain.contains("Shift+Tab cycle") {
-            *line = row;
-            break;
-        }
+    // "Shift+Tab cycle" is unique to the banner's mode row (the REPL hint
+    // line says "Shift+Tab to change mode").
+    let idx = t
+        .lines
+        .iter()
+        .position(|l| strip_ansi(l).contains("Shift+Tab cycle"));
+    if let Some(i) = idx {
+        t.set(i, row);
     }
 }
 
@@ -1825,8 +1963,8 @@ pub fn enter_alt(raw: bool) {
     if raw {
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
         invalidate_stream_line();
-        if let Ok(mut lines) = transcript().lock() {
-            lines.clear();
+        if let Ok(mut t) = transcript().lock() {
+            t.clear();
         }
         let mut out = io::stdout();
         // Some terminals preserve the user's current scrollback viewport when
@@ -1881,8 +2019,8 @@ pub fn clear() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
         invalidate_stream_line();
-        if let Ok(mut lines) = transcript().lock() {
-            lines.clear();
+        if let Ok(mut t) = transcript().lock() {
+            t.clear();
         }
         let _ = write!(io::stdout(), "{}", theme_bg());
         let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
@@ -2070,10 +2208,10 @@ fn commit_stream_line(rendered: &str) {
         return;
     }
     let mut replaced = false;
-    if let Ok(mut lines) = transcript().lock() {
+    if let Ok(mut t) = transcript().lock() {
         let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-        if let Some(l) = lines.get_mut(open) {
-            *l = rendered.to_string();
+        if open < t.len() {
+            t.set(open, rendered.to_string());
             replaced = true;
         }
     }
@@ -2093,11 +2231,9 @@ fn retract_stream_line() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut lines) = transcript().lock() {
+    if let Ok(mut t) = transcript().lock() {
         let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-        if open < lines.len() {
-            lines.remove(open);
-        }
+        t.remove(open);
     }
     invalidate_stream_line();
     render_output();
@@ -2107,14 +2243,14 @@ fn retract_stream_line() {
 pub fn line(s: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         invalidate_stream_line();
-        if let Ok(mut lines) = transcript().lock() {
+        if let Ok(mut t) = transcript().lock() {
             for part in s.replace('\r', "").split('\n') {
-                lines.push(part.to_string());
+                t.push(part.to_string());
             }
             const MAX_LINES: usize = 2_000;
-            if lines.len() > MAX_LINES {
-                let extra = lines.len() - MAX_LINES;
-                lines.drain(0..extra);
+            if t.len() > MAX_LINES {
+                let extra = t.len() - MAX_LINES;
+                t.drain_front(extra);
             }
         }
         render_output();
@@ -2129,29 +2265,26 @@ pub fn line(s: &str) {
 
 pub fn write_stream(chunk: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        if let Ok(mut lines) = transcript().lock() {
+        if let Ok(mut t) = transcript().lock() {
             let normalized = chunk.replace('\r', "");
             let mut parts = normalized.split('\n');
             if let Some(first) = parts.next() {
                 // Append to the tracked open stream line only; if none is
                 // open (start of stream, or a line() intervened) start fresh.
                 let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-                match lines.get_mut(open) {
-                    Some(open_line) => open_line.push_str(first),
-                    None => {
-                        lines.push(first.to_string());
-                        OPEN_STREAM_LINE.store(lines.len() - 1, Ordering::Relaxed);
-                    }
+                if !t.append_to(open, first) {
+                    t.push(first.to_string());
+                    OPEN_STREAM_LINE.store(t.len() - 1, Ordering::Relaxed);
                 }
             }
             for part in parts {
-                lines.push(part.to_string());
-                OPEN_STREAM_LINE.store(lines.len() - 1, Ordering::Relaxed);
+                t.push(part.to_string());
+                OPEN_STREAM_LINE.store(t.len() - 1, Ordering::Relaxed);
             }
             const MAX_LINES: usize = 2_000;
-            if lines.len() > MAX_LINES {
-                let extra = lines.len() - MAX_LINES;
-                lines.drain(0..extra);
+            if t.len() > MAX_LINES {
+                let extra = t.len() - MAX_LINES;
+                t.drain_front(extra);
                 // Keep the open-line index in step with the drained prefix.
                 let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
                 if open != usize::MAX {
@@ -2163,8 +2296,11 @@ pub fn write_stream(chunk: &str) {
                 }
             }
         }
-        render_output();
-        clear_composer();
+        // Streaming repaints are frame-coalesced (~60fps): the transcript
+        // state above is always current, so a skipped frame just means the
+        // next one paints more at once. Unthrottled paths (line, commit)
+        // guarantee the final state always lands on screen.
+        render_output_throttled();
     } else if is_raw() && chunk.contains('\n') {
         print!("{}", chunk.replace('\n', "\r\n"));
     } else {
@@ -3970,6 +4106,70 @@ mod tests {
         assert!(!joined.contains("**"), "{joined}");
     }
 
+    // The incremental wrap cache must always agree with wrapping every line
+    // from scratch — for pushes, appends, in-place edits, removals, front
+    // drains, and resizes.
+    fn assert_cache_coherent(t: &Transcript) {
+        let expect: Vec<Vec<String>> = t
+            .lines
+            .iter()
+            .map(|l| wrap_ansi_line(l, t.width))
+            .collect();
+        assert_eq!(t.wrapped, expect);
+    }
+
+    #[test]
+    fn transcript_cache_tracks_mutations() {
+        let mut t = Transcript::new();
+        t.ensure_width(10);
+        t.push("short".to_string());
+        t.push("a line that definitely wraps at ten cols".to_string());
+        assert_cache_coherent(&t);
+        assert!(t.append_to(0, " and more appended text"));
+        assert!(!t.append_to(99, "nope"));
+        assert_cache_coherent(&t);
+        t.set(1, "replaced".to_string());
+        assert_cache_coherent(&t);
+        t.push("third".to_string());
+        t.remove(0);
+        assert_cache_coherent(&t);
+        t.drain_front(1);
+        assert_cache_coherent(&t);
+        t.ensure_width(4); // resize rewraps everything
+        assert_cache_coherent(&t);
+        assert_eq!(
+            t.total_rows(),
+            t.wrapped.iter().map(|w| w.len()).sum::<usize>()
+        );
+        t.clear();
+        assert_eq!(t.total_rows(), 0);
+    }
+
+    #[test]
+    fn transcript_rows_range_matches_flattened_window() {
+        let mut t = Transcript::new();
+        t.ensure_width(6);
+        for i in 0..10 {
+            t.push(format!("line {i} with extra width to wrap"));
+        }
+        let flat: Vec<String> = t.wrapped.iter().flatten().cloned().collect();
+        let total = t.total_rows();
+        assert_eq!(total, flat.len());
+        for start in [0usize, 1, 5, total.saturating_sub(3), total] {
+            for count in [0usize, 1, 4, total] {
+                let got: Vec<String> =
+                    t.rows_range(start, count).into_iter().cloned().collect();
+                let want: Vec<String> = flat
+                    .iter()
+                    .skip(start)
+                    .take(count)
+                    .cloned()
+                    .collect();
+                assert_eq!(got, want, "start={start} count={count}");
+            }
+        }
+    }
+
     #[test]
     fn popup_window_keeps_selection_visible() {
         // Fewer candidates than the cap: show everything from the top.
@@ -4043,3 +4243,4 @@ mod tests {
         assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
     }
 }
+

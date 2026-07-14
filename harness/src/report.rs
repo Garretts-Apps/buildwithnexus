@@ -109,9 +109,10 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         _ => None,
     };
     if let Some(body) = body {
-        for l in body.lines() {
-            tui::line(&format!("    {l}"));
-        }
+        // One tui::line call for the whole body: line() splits on '\n'
+        // itself, and batching means one repaint instead of one per row.
+        let indented: Vec<String> = body.lines().map(|l| format!("    {l}")).collect();
+        tui::line(&indented.join("\n"));
     }
 }
 
@@ -147,15 +148,21 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
     // Human mode previously showed nothing here — the user couldn't see command
     // output or errors. Surface results compactly, indented under the call.
     if is_error {
-        for l in clip_head(content, 12) {
-            tui::line(&tui::red(&format!("    {l}")));
-        }
+        let rows: Vec<String> = clip_head(content, 12)
+            .into_iter()
+            .map(|l| tui::red(&format!("    {l}")))
+            .collect();
+        tui::line(&rows.join("\n"));
         return;
     }
     match name {
         "bash" | "run_command" | "python_tool" => {
-            for l in clip_tail(content, 12) {
-                tui::line(&tui::dim(&format!("    {l}")));
+            let rows: Vec<String> = clip_tail(content, 12)
+                .into_iter()
+                .map(|l| tui::dim(&format!("    {l}")))
+                .collect();
+            if !rows.is_empty() {
+                tui::line(&rows.join("\n"));
             }
         }
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
@@ -204,15 +211,22 @@ pub fn diff(path: &str, old: &str, new: &str) {
         tui::bold(&format!("{verb} {path}")),
         tui::dim(&stat)
     ));
-    for l in &body {
-        let painted = if l.starts_with('+') {
-            tui::green(l)
-        } else if l.starts_with('-') {
-            tui::red(l)
-        } else {
-            tui::dim(l)
-        };
-        tui::line(&format!("    {painted}"));
+    // Single batched line() call → one repaint for the whole diff body.
+    let rows: Vec<String> = body
+        .iter()
+        .map(|l| {
+            let painted = if l.starts_with('+') {
+                tui::green(l)
+            } else if l.starts_with('-') {
+                tui::red(l)
+            } else {
+                tui::dim(l)
+            };
+            format!("    {painted}")
+        })
+        .collect();
+    if !rows.is_empty() {
+        tui::line(&rows.join("\n"));
     }
 }
 
