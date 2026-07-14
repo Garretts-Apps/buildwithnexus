@@ -1,7 +1,7 @@
 {
   "name": "buildwithnexus",
-  "version": "0.11.4",
-  "description": "A hilariously fast, agentic AI CLI harness in Rust — remote (API key) or local models, full-screen TUI with sessions, plan/build/brainstorm modes, and hooks",
+  "version": "0.12.0",
+  "description": "A hilariously fast, agentic AI CLI in Rust \u2014 full-screen TUI with live autocomplete, GitHub-grade diffs, clickable files/links, multimodal input (paste images, ffmpeg-parsed video), remote (API key) or local models, plan/build/brainstorm modes, hooks, and background auto-updates",
   "bin": {
     "buildwithnexus": "bin/buildwithnexus.js",
     "bwn": "bin/buildwithnexus.js"
@@ -9,6 +9,7 @@
   "files": [
     "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
+    "scripts/auto-update.js",
     "scripts/postinstall.js",
     "harness/Cargo.toml",
     "harness/Cargo.lock",
@@ -36,7 +37,12 @@
     "anthropic",
     "openai",
     "ollama",
-    "local-llm"
+    "local-llm",
+    "multimodal",
+    "ffmpeg",
+    "terminal-ui",
+    "claude",
+    "developer-tools"
   ],
   "author": "Garrett Eaglin",
   "license": "MIT",

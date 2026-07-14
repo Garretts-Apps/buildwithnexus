@@ -402,6 +402,18 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
                 let detail = resp.into_string().unwrap_or_default();
                 if is_transient && attempts < max_attempts {
                     let wait = server_wait.unwrap_or(delay_ms);
+                    // Say what's happening — a silent 10s backoff reads as a
+                    // frozen UI.
+                    let why = if code == 429 {
+                        "rate-limited"
+                    } else {
+                        "server busy"
+                    };
+                    crate::report::info(&format!(
+                        "  ⟳ {why} (HTTP {code}) — retrying in {:.1}s ({attempts}/{})",
+                        wait as f64 / 1000.0,
+                        max_attempts - 1
+                    ));
                     std::thread::sleep(Duration::from_millis(wait));
                     delay_ms = (delay_ms * 2).min(10_000);
                     continue;
@@ -413,6 +425,11 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
             }
             Err(e) => {
                 if attempts < max_attempts {
+                    crate::report::info(&format!(
+                        "  ⟳ connection error — retrying in {:.1}s ({attempts}/{})",
+                        delay_ms as f64 / 1000.0,
+                        max_attempts - 1
+                    ));
                     std::thread::sleep(Duration::from_millis(delay_ms));
                     delay_ms = (delay_ms * 2).min(10_000);
                     continue;
@@ -1143,7 +1160,7 @@ fn warn_ollama_fallback() {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         crate::report::notice(
-            "ollama: /api/show unavailable; using the OpenAI-compat endpoint (long prompts may be truncated to the server-default context window)",
+            "  ⚠ ollama: /api/show unavailable — using the OpenAI-compat endpoint (long prompts may be truncated to the server-default context window)",
         );
     });
 }

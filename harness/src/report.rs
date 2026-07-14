@@ -93,9 +93,11 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     };
     tui::line(&format!("  {} {}", tui::accent(icon), head));
 
-    // Inline colored diff for edits — see the change before/at the moment it lands.
+    // Inline diff for edits/writes — the user sees exactly what will change
+    // before approving it, rendered by the same clean renderer as applied
+    // diffs (gutter, tinted rows, word-level emphasis).
     let body = match name {
-        "edit" | "edit_file" => Some(tui::diff(
+        "edit" | "edit_file" => Some(render_diff_block(
             input["old"]
                 .as_str()
                 .or_else(|| input["oldString"].as_str())
@@ -105,12 +107,16 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
                 .or_else(|| input["newString"].as_str())
                 .unwrap_or(""),
         )),
-        "write" | "write_file" => Some(tui::added_preview(input["content"].as_str().unwrap_or(""))),
+        "write" | "write_file" => Some(render_diff_block(
+            "",
+            input["content"].as_str().unwrap_or(""),
+        )),
         _ => None,
     };
     if let Some(body) = body {
-        for l in body.lines() {
-            tui::line(&format!("    {l}"));
+        if !body.is_empty() {
+            // One tui::line call for the whole body → one repaint.
+            tui::line(&body);
         }
     }
 }
@@ -147,15 +153,21 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
     // Human mode previously showed nothing here — the user couldn't see command
     // output or errors. Surface results compactly, indented under the call.
     if is_error {
-        for l in clip_head(content, 12) {
-            tui::line(&tui::red(&format!("    {l}")));
-        }
+        let rows: Vec<String> = clip_head(content, 12)
+            .into_iter()
+            .map(|l| tui::red(&format!("    {l}")))
+            .collect();
+        tui::line(&rows.join("\n"));
         return;
     }
     match name {
         "bash" | "run_command" | "python_tool" => {
-            for l in clip_tail(content, 12) {
-                tui::line(&tui::dim(&format!("    {l}")));
+            let rows: Vec<String> = clip_tail(content, 12)
+                .into_iter()
+                .map(|l| tui::dim(&format!("    {l}")))
+                .collect();
+            if !rows.is_empty() {
+                tui::line(&rows.join("\n"));
             }
         }
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
@@ -188,59 +200,289 @@ const LCS_MAX_CELLS: usize = 250_000;
 /// In JSON mode emits `{"type":"diff","path":…,"added":N,"removed":M}`
 /// instead. Call from the edit/write tool paths right after the change lands.
 pub fn diff(path: &str, old: &str, new: &str) {
-    let (body, added, removed) = diff_body(old, new);
+    let (rows, added, removed) = diff_rows(old, new);
     if mode() == Mode::Json {
         emit(json!({"type": "diff", "path": path, "added": added, "removed": removed}));
         return;
     }
     let (verb, stat) = if old.is_empty() {
-        ("write", format!("(+{added})"))
+        ("write", format!("+{added}"))
     } else {
-        ("edit", format!("(+{added} -{removed})"))
+        ("edit", format!("+{added} -{removed}"))
     };
+    // The path is an OSC 8 file:// link — click opens the file in the OS
+    // default app on supporting terminals.
     tui::line(&format!(
-        "  {} {} {}",
+        "  {} {}  {}",
         tui::accent("⏺"),
-        tui::bold(&format!("{verb} {path}")),
+        tui::file_link(path, &tui::bold(&format!("{verb} {path}"))),
         tui::dim(&stat)
     ));
-    for l in &body {
-        let painted = if l.starts_with('+') {
-            tui::green(l)
-        } else if l.starts_with('-') {
-            tui::red(l)
-        } else {
-            tui::dim(l)
-        };
-        tui::line(&format!("    {painted}"));
+    let body = paint_diff_rows(&rows);
+    if !body.is_empty() {
+        // Single batched line() call → one repaint for the whole diff body.
+        tui::line(&body);
     }
 }
 
-// Plain (uncolored) diff body lines plus total added/removed counts. Kept
-// pure so the hunk grouping and caps are unit-testable.
-fn diff_body(old: &str, new: &str) -> (Vec<String>, usize, usize) {
+/// Renders a standalone diff body (no header) for inline previews — the
+/// edit/write tool announcements share the exact visual language of applied
+/// diffs.
+pub fn render_diff_block(old: &str, new: &str) -> String {
+    let (rows, _, _) = diff_rows(old, new);
+    paint_diff_rows(&rows)
+}
+
+// ── structured diff rows ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum DiffRowKind {
+    Ctx,
+    Del,
+    Add,
+    Gap, // elided stretch or "+N more" trailer
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DiffRow {
+    kind: DiffRowKind,
+    old_no: Option<usize>,
+    new_no: Option<usize>,
+    text: String,
+    // Byte range of the changed span for word-level emphasis (Del/Add rows
+    // that form a replacement pair).
+    emph: Option<(usize, usize)>,
+}
+
+impl DiffRow {
+    fn gap(text: String) -> Self {
+        DiffRow {
+            kind: DiffRowKind::Gap,
+            old_no: None,
+            new_no: None,
+            text,
+            emph: None,
+        }
+    }
+}
+
+// Structured diff rows plus total added/removed counts. Kept pure so hunk
+// grouping, numbering, caps, and word-level emphasis are unit-testable.
+fn diff_rows(old: &str, new: &str) -> (Vec<DiffRow>, usize, usize) {
     if old.is_empty() {
-        // Brand-new file: show the head as additions, no LCS needed.
+        // Brand-new file: the head as additions, no LCS needed.
         let lines: Vec<&str> = new.lines().collect();
-        let mut body: Vec<String> = lines
+        let mut rows: Vec<DiffRow> = lines
             .iter()
             .take(NEW_FILE_MAX_LINES)
-            .map(|l| format!("+ {l}"))
+            .enumerate()
+            .map(|(i, l)| DiffRow {
+                kind: DiffRowKind::Add,
+                old_no: None,
+                new_no: Some(i + 1),
+                text: l.to_string(),
+                emph: None,
+            })
             .collect();
         if lines.len() > NEW_FILE_MAX_LINES {
-            body.push(format!(
-                "… (+{} more lines)",
+            rows.push(DiffRow::gap(format!(
+                "+{} more lines",
                 lines.len() - NEW_FILE_MAX_LINES
-            ));
+            )));
         }
-        return (body, lines.len(), 0);
+        return (rows, lines.len(), 0);
     }
     let o: Vec<&str> = old.lines().collect();
     let n: Vec<&str> = new.lines().collect();
     let ops = diff_ops(&o, &n);
     let added = ops.iter().filter(|(k, _)| *k == '+').count();
     let removed = ops.iter().filter(|(k, _)| *k == '-').count();
-    (hunk_lines(&ops), added, removed)
+    (hunk_rows(&ops), added, removed)
+}
+
+// Group ops into hunks (changed lines + DIFF_CTX context each side, elided
+// stretches as Gap rows, capped at DIFF_MAX_LINES), tracking line numbers on
+// both sides and marking word-level emphasis on replacement pairs.
+fn hunk_rows(ops: &[(char, &str)]) -> Vec<DiffRow> {
+    let mut show = vec![false; ops.len()];
+    for (i, (kind, _)) in ops.iter().enumerate() {
+        if *kind != '=' {
+            let from = i.saturating_sub(DIFF_CTX);
+            let to = (i + DIFF_CTX + 1).min(ops.len());
+            show[from..to].fill(true);
+        }
+    }
+    let mut rows = Vec::new();
+    let (mut old_no, mut new_no) = (0usize, 0usize);
+    let mut last_shown: Option<usize> = None;
+    for (i, (kind, text)) in ops.iter().enumerate() {
+        // Numbers advance whether or not the row is shown.
+        match kind {
+            '-' => old_no += 1,
+            '+' => new_no += 1,
+            _ => {
+                old_no += 1;
+                new_no += 1;
+            }
+        }
+        if !show[i] {
+            continue;
+        }
+        if last_shown.is_some_and(|prev| i > prev + 1) {
+            rows.push(DiffRow::gap("⋯".to_string()));
+        }
+        let (kind, o, n) = match kind {
+            '-' => (DiffRowKind::Del, Some(old_no), None),
+            '+' => (DiffRowKind::Add, None, Some(new_no)),
+            _ => (DiffRowKind::Ctx, Some(old_no), Some(new_no)),
+        };
+        rows.push(DiffRow {
+            kind,
+            old_no: o,
+            new_no: n,
+            text: text.to_string(),
+            emph: None,
+        });
+        last_shown = Some(i);
+    }
+    mark_replacement_emphasis(&mut rows);
+    if rows.len() > DIFF_MAX_LINES {
+        let extra = rows.len() - DIFF_MAX_LINES;
+        rows.truncate(DIFF_MAX_LINES);
+        rows.push(DiffRow::gap(format!("+{extra} more lines")));
+    }
+    rows
+}
+
+// Word-level emphasis: pair the i-th Del with the i-th Add of each adjacent
+// Del-run/Add-run block (a replacement) and mark the changed byte span when
+// the lines share enough prefix+suffix to make the highlight meaningful.
+fn mark_replacement_emphasis(rows: &mut [DiffRow]) {
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].kind != DiffRowKind::Del {
+            i += 1;
+            continue;
+        }
+        let del_start = i;
+        while i < rows.len() && rows[i].kind == DiffRowKind::Del {
+            i += 1;
+        }
+        let add_start = i;
+        while i < rows.len() && rows[i].kind == DiffRowKind::Add {
+            i += 1;
+        }
+        let pairs = (add_start - del_start).min(i - add_start);
+        for k in 0..pairs {
+            let (d, a) = (del_start + k, add_start + k);
+            if let Some((de, ae)) = char_emphasis(&rows[d].text, &rows[a].text) {
+                rows[d].emph = Some(de);
+                rows[a].emph = Some(ae);
+            }
+        }
+    }
+}
+
+// Changed byte span between two similar lines: trim the common prefix and
+// suffix (char-boundary safe) and return the differing middles. None when
+// the lines share too little for a span highlight to help (< 30% common).
+fn char_emphasis(old: &str, new: &str) -> Option<((usize, usize), (usize, usize))> {
+    let prefix: usize = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    let suffix: usize = old[prefix..]
+        .chars()
+        .rev()
+        .zip(new[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum();
+    let shorter = old.len().min(new.len());
+    if shorter == 0 || (prefix + suffix) * 10 < shorter * 3 {
+        return None;
+    }
+    let o_end = (old.len() - suffix).max(prefix);
+    let n_end = (new.len() - suffix).max(prefix);
+    Some(((prefix, o_end), (prefix, n_end)))
+}
+
+// ── painting ─────────────────────────────────────────────────────────────────
+
+// Paint structured rows into the final block: dual line-number gutter,
+// background-tinted add/del rows padded to the terminal edge, word-level
+// emphasis spans, dim context, centered gap markers.
+fn paint_diff_rows(rows: &[DiffRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let max_no = rows
+        .iter()
+        .flat_map(|r| [r.old_no.unwrap_or(0), r.new_no.unwrap_or(0)])
+        .max()
+        .unwrap_or(0);
+    let w = max_no.max(1).to_string().len();
+    let width = tui::term_width();
+    // "  {old:>w} {new:>w} │ " before content.
+    let gutter_cols = 2 + w + 1 + w + 3;
+    let content_cols = width.saturating_sub(gutter_cols).max(8);
+
+    let fmt_no = |n: Option<usize>| match n {
+        Some(n) => format!("{n:>w$}"),
+        None => " ".repeat(w),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        match r.kind {
+            DiffRowKind::Gap => {
+                out.push(tui::dim(&format!("  {:>pad$}", r.text, pad = w * 2 + 2)));
+            }
+            DiffRowKind::Ctx => {
+                out.push(format!(
+                    "  {} {} {}",
+                    tui::dim(&fmt_no(r.old_no)),
+                    tui::dim(&fmt_no(r.new_no)),
+                    tui::dim(&format!("│   {}", r.text)),
+                ));
+            }
+            DiffRowKind::Del | DiffRowKind::Add => {
+                let is_del = r.kind == DiffRowKind::Del;
+                let sign = if is_del { "- " } else { "+ " };
+                let pad_len = content_cols
+                    .saturating_sub(2 + tui::str_width(&r.text))
+                    .min(width);
+                let pad = " ".repeat(pad_len);
+                let span: fn(&str) -> String = if is_del {
+                    tui::diff_del_span
+                } else {
+                    tui::diff_add_span
+                };
+                let emph_span: fn(&str) -> String = if is_del {
+                    tui::diff_del_emph_span
+                } else {
+                    tui::diff_add_emph_span
+                };
+                let body = match r.emph {
+                    Some((s, e)) if s < e && e <= r.text.len() => format!(
+                        "{}{}{}",
+                        span(&format!("{sign}{}", &r.text[..s])),
+                        emph_span(&r.text[s..e]),
+                        span(&format!("{}{pad}", &r.text[e..]))
+                    ),
+                    _ => span(&format!("{sign}{}{pad}", r.text)),
+                };
+                out.push(format!(
+                    "  {} {} {}{body}",
+                    tui::dim(&fmt_no(r.old_no)),
+                    tui::dim(&fmt_no(r.new_no)),
+                    tui::dim("│ "),
+                ));
+            }
+        }
+    }
+    out.join("\n")
 }
 
 // Line-level diff ops: ('=', l) kept, ('-', l) removed, ('+', l) added. The
@@ -304,46 +546,9 @@ fn lcs_ops<'a>(o: &[&'a str], n: &[&'a str]) -> Vec<(char, &'a str)> {
     ops
 }
 
-// Group ops into hunks: changed lines plus up to DIFF_CTX kept lines of
-// context on each side, elided stretches marked with a lone "…", the whole
-// body capped at DIFF_MAX_LINES with a "+N more" trailer.
-fn hunk_lines(ops: &[(char, &str)]) -> Vec<String> {
-    let mut show = vec![false; ops.len()];
-    for (i, (kind, _)) in ops.iter().enumerate() {
-        if *kind != '=' {
-            let from = i.saturating_sub(DIFF_CTX);
-            let to = (i + DIFF_CTX + 1).min(ops.len());
-            show[from..to].fill(true);
-        }
-    }
-    let mut out = Vec::new();
-    let mut last_shown: Option<usize> = None;
-    for (i, (kind, text)) in ops.iter().enumerate() {
-        if !show[i] {
-            continue;
-        }
-        if last_shown.is_some_and(|prev| i > prev + 1) {
-            out.push("…".to_string());
-        }
-        let prefix = match kind {
-            '-' => "- ",
-            '+' => "+ ",
-            _ => "  ",
-        };
-        out.push(format!("{prefix}{text}"));
-        last_shown = Some(i);
-    }
-    if out.len() > DIFF_MAX_LINES {
-        let extra = out.len() - DIFF_MAX_LINES;
-        out.truncate(DIFF_MAX_LINES);
-        out.push(format!("… (+{extra} more lines)"));
-    }
-    out
-}
-
 pub fn tool_denied(reason: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::dim(&format!("  ✗ {reason}"))),
+        Mode::Human => tui::line(&tui::red(&format!("  ✗ {reason}"))),
         Mode::Json => emit(json!({"type": "tool_denied", "reason": reason})),
     }
 }
@@ -352,7 +557,8 @@ pub fn finish(summary: &str) {
     match mode() {
         Mode::Human => {
             tui::line("");
-            tui::line(&tui::green(&format!("✨ {summary}")));
+            tui::line(&tui::green(&format!("  ✓ {}", tui::bold("done"))));
+            tui::line(&tui::render_md(summary));
         }
         Mode::Json => emit(json!({"type": "finish", "summary": summary})),
     }
@@ -360,14 +566,24 @@ pub fn finish(summary: &str) {
 
 pub fn error(msg: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!("  {msg}"))),
+        Mode::Human => tui::line(&tui::red(&format!("  ✗ {msg}"))),
         Mode::Json => emit(json!({"type": "error", "message": msg})),
     }
 }
 
+// Warnings: things the user should notice (truncation, fallbacks, retries).
 pub fn notice(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::yellow(msg)),
+        Mode::Json => emit(json!({"type": "notice", "message": msg})),
+    }
+}
+
+// Informational chrome (progress, sub-steps): dim, so it never competes with
+// warnings for attention.
+pub fn info(msg: &str) {
+    match mode() {
+        Mode::Human => tui::line(&tui::dim(msg)),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }
@@ -412,59 +628,131 @@ mod tests {
         assert_eq!(clipped[3], "7");
     }
 
-    #[test]
-    fn diff_body_small_edit_has_expected_lines_and_counts() {
-        let old = "a\nb\nc\nd\ne\nf\ng";
-        let new = "a\nb\nc\nX\ne\nf\ng";
-        let (body, added, removed) = diff_body(old, new);
-        assert_eq!((added, removed), (1, 1));
-        assert!(body.contains(&"- d".to_string()), "{body:?}");
-        assert!(body.contains(&"+ X".to_string()), "{body:?}");
-        // Two context lines each side; untouched far lines are elided.
-        assert!(body.contains(&"  b".to_string()), "{body:?}");
-        assert!(body.contains(&"  e".to_string()), "{body:?}");
-        assert!(!body.contains(&"  a".to_string()), "{body:?}");
-        assert!(!body.contains(&"  g".to_string()), "{body:?}");
+    fn texts(rows: &[DiffRow], kind: DiffRowKind) -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| r.text.clone())
+            .collect()
     }
 
     #[test]
-    fn diff_body_separates_distant_hunks() {
+    fn diff_rows_small_edit_numbers_and_counts() {
+        let old = "a\nb\nc\nd\ne\nf\ng";
+        let new = "a\nb\nc\nX\ne\nf\ng";
+        let (rows, added, removed) = diff_rows(old, new);
+        assert_eq!((added, removed), (1, 1));
+        let del: Vec<&DiffRow> = rows.iter().filter(|r| r.kind == DiffRowKind::Del).collect();
+        let add: Vec<&DiffRow> = rows.iter().filter(|r| r.kind == DiffRowKind::Add).collect();
+        assert_eq!(del[0].text, "d");
+        assert_eq!(del[0].old_no, Some(4));
+        assert_eq!(del[0].new_no, None);
+        assert_eq!(add[0].text, "X");
+        assert_eq!(add[0].new_no, Some(4));
+        // Two context lines each side; far lines are elided.
+        let ctx = texts(&rows, DiffRowKind::Ctx);
+        assert!(ctx.contains(&"b".to_string()) && ctx.contains(&"e".to_string()));
+        assert!(!ctx.contains(&"a".to_string()) && !ctx.contains(&"g".to_string()));
+        // Context rows carry both line numbers.
+        let b = rows.iter().find(|r| r.text == "b").unwrap();
+        assert_eq!((b.old_no, b.new_no), (Some(2), Some(2)));
+    }
+
+    #[test]
+    fn diff_rows_separates_distant_hunks_with_gap() {
         let old: String = (0..20).map(|i| format!("line{i}\n")).collect();
         let new = old
             .replace("line3\n", "changed3\n")
             .replace("line15\n", "changed15\n");
-        let (body, added, removed) = diff_body(&old, &new);
+        let (rows, added, removed) = diff_rows(&old, &new);
         assert_eq!((added, removed), (2, 2));
-        assert!(body.contains(&"…".to_string()), "{body:?}");
-        assert!(body.contains(&"- line3".to_string()), "{body:?}");
-        assert!(body.contains(&"+ changed15".to_string()), "{body:?}");
+        assert!(rows.iter().any(|r| r.kind == DiffRowKind::Gap), "{rows:?}");
+        assert!(texts(&rows, DiffRowKind::Del).contains(&"line3".to_string()));
+        assert!(texts(&rows, DiffRowKind::Add).contains(&"changed15".to_string()));
     }
 
     #[test]
-    fn diff_body_new_file_previews_first_lines() {
+    fn diff_rows_new_file_previews_head_with_numbers() {
         let content: String = (0..30).map(|i| format!("line{i}\n")).collect();
-        let (body, added, removed) = diff_body("", &content);
+        let (rows, added, removed) = diff_rows("", &content);
         assert_eq!((added, removed), (30, 0));
-        assert_eq!(body.len(), NEW_FILE_MAX_LINES + 1);
-        assert_eq!(body[0], "+ line0");
-        assert!(body.last().unwrap().contains("+10 more"), "{body:?}");
+        assert_eq!(rows.len(), NEW_FILE_MAX_LINES + 1);
+        assert_eq!(rows[0].text, "line0");
+        assert_eq!(rows[0].new_no, Some(1));
+        assert!(rows.last().unwrap().text.contains("more lines"));
     }
 
     #[test]
-    fn diff_body_caps_total_lines() {
+    fn diff_rows_caps_total_rows() {
         let old: String = (0..200).map(|i| format!("old{i}\n")).collect();
         let new: String = (0..200).map(|i| format!("new{i}\n")).collect();
-        let (body, added, removed) = diff_body(&old, &new);
+        let (rows, added, removed) = diff_rows(&old, &new);
         assert_eq!((added, removed), (200, 200));
-        assert_eq!(body.len(), DIFF_MAX_LINES + 1);
-        assert!(body.last().unwrap().contains("more lines"), "{body:?}");
+        assert_eq!(rows.len(), DIFF_MAX_LINES + 1);
+        assert!(rows.last().unwrap().text.contains("more lines"));
     }
 
     #[test]
-    fn diff_body_identical_is_empty() {
-        let (body, added, removed) = diff_body("a\nb", "a\nb");
-        assert!(body.is_empty(), "{body:?}");
+    fn diff_rows_identical_is_empty() {
+        let (rows, added, removed) = diff_rows("a\nb", "a\nb");
+        assert!(rows.is_empty(), "{rows:?}");
         assert_eq!((added, removed), (0, 0));
+    }
+
+    #[test]
+    fn replacement_pairs_get_word_level_emphasis() {
+        let (rows, _, _) = diff_rows("let x = 1;\n", "let x = 42;\n");
+        let del = rows.iter().find(|r| r.kind == DiffRowKind::Del).unwrap();
+        let add = rows.iter().find(|r| r.kind == DiffRowKind::Add).unwrap();
+        // The changed span covers just the value, not the whole line.
+        let (ds, de) = del.emph.expect("del emphasis");
+        let (as_, ae) = add.emph.expect("add emphasis");
+        assert_eq!(&del.text[ds..de], "1");
+        assert_eq!(&add.text[as_..ae], "42");
+        // Completely different lines get no span highlight.
+        let (rows, _, _) = diff_rows("aaaa\n", "zzzzzz\n");
+        assert!(rows
+            .iter()
+            .filter(|r| r.kind != DiffRowKind::Gap)
+            .all(|r| r.emph.is_none()));
+    }
+
+    #[test]
+    fn char_emphasis_is_char_boundary_safe() {
+        // Multibyte chars at the edit boundary must not split UTF-8.
+        let e = char_emphasis("héllo wörld", "héllo wörms");
+        if let Some(((s, ee), _)) = e {
+            assert!("héllo wörld".is_char_boundary(s));
+            assert!("héllo wörld".is_char_boundary(ee));
+        }
+        assert!(char_emphasis("", "").is_none());
+    }
+
+    #[test]
+    fn paint_diff_rows_shows_gutter_signs_and_padding() {
+        let (rows, _, _) = diff_rows("a\nb\nc", "a\nX\nc");
+        let painted = paint_diff_rows(&rows);
+        let plain: String = {
+            // cheap ANSI strip for assertions
+            let mut out = String::new();
+            let mut it = painted.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for d in it.by_ref() {
+                        if d.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert!(plain.contains("- b"), "{plain}");
+        assert!(plain.contains("+ X"), "{plain}");
+        assert!(plain.contains('│'), "{plain}");
+        assert!(plain.contains('1') && plain.contains('3'), "{plain}");
+        assert_eq!(paint_diff_rows(&[]), "");
     }
 
     #[test]
