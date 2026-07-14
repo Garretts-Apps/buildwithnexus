@@ -59,11 +59,6 @@ fn main() {
     report::finish("Fixed the off-by-one in `page_bounds` — `end` no longer trims the final row; all 6 pagination tests pass.");
 
     // Block on the real composer so the input box renders live.
-    loop {
-        match tui::ask_task(&format!("{} ", tui::accent("›"))) {
-            None => break,
-            Some(_) => {}
-        }
-    }
+    while tui::ask_task(&format!("{} ", tui::accent("›"))).is_some() {}
     tui::leave_alt();
 }

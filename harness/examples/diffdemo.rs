@@ -5,5 +5,5 @@
 fn main() {
     let old = "fn greet(name: &str) {\n    println!(\"Hello, {}!\", name);\n    let count = 1;\n    for _ in 0..count {\n        wave();\n    }\n}\n\nfn wave() {}\n";
     let new = "fn greet(name: &str) {\n    println!(\"Hello, {}!\", name);\n    let count = 3;\n    for _ in 0..count {\n        wave();\n    }\n    celebrate();\n}\n\nfn wave() {}\n";
-    print!("{}\n", buildwithnexus::report::render_diff_block(old, new));
+    println!("{}", buildwithnexus::report::render_diff_block(old, new));
 }

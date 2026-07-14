@@ -71,6 +71,9 @@ struct SelectPos {
 struct Selection {
     anchor: SelectPos,
     focus: SelectPos,
+    // True for word/line selections made by double/triple click: the
+    // mouse-up at the same cell must not collapse them back to one cell.
+    sticky: bool,
 }
 
 // Transcript with an incremental word-wrap cache. Wrapping every line on
@@ -995,6 +998,13 @@ pub fn poll_typeahead() {
                             render_queued_composer();
                             continue;
                         }
+                        if ta.buf.is_empty() {
+                            // Esc with nothing typed interrupts the agent —
+                            // any queued prompts auto-send at the next
+                            // prompt, so Esc = "stop and move on".
+                            TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
+                        }
+                        // Esc with a draft clears the draft only.
                         ta.buf.clear();
                         ta.cursor = 0;
                         ta.from_queue = false;
@@ -1549,7 +1559,7 @@ fn queue_footer(out: &mut io::Stdout) {
         } else {
             String::new()
         };
-        let text = if offset > 0 {
+        let mut text = if offset > 0 {
             format!(
                 "{}{} {}",
                 vim_badge,
@@ -1559,6 +1569,9 @@ fn queue_footer(out: &mut io::Stdout) {
         } else {
             format!("{}{}", vim_badge, footer.as_str())
         };
+        if let Some(fl) = active_flash() {
+            text = format!("{text}  {}", accent(&fl));
+        }
         let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
     }
 }
@@ -1570,6 +1583,86 @@ fn render_footer() {
     let mut out = io::stdout();
     queue_footer(&mut out);
     let _ = out.flush();
+}
+
+// ── footer flash ─────────────────────────────────────────────────────────────
+// Transient feedback ("⎘ copied 42 chars") appended to the footer for ~2s —
+// visible confirmation without polluting the transcript.
+static FLASH_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn flash_text() -> &'static Mutex<String> {
+    static FLASH: OnceLock<Mutex<String>> = OnceLock::new();
+    FLASH.get_or_init(|| Mutex::new(String::new()))
+}
+
+pub fn flash_footer(msg: &str) {
+    if let Ok(mut f) = flash_text().lock() {
+        *f = msg.to_string();
+    }
+    FLASH_UNTIL_MS.store(monotonic_ms() + 2_000, Ordering::Relaxed);
+    render_footer();
+}
+
+fn active_flash() -> Option<String> {
+    if monotonic_ms() >= FLASH_UNTIL_MS.load(Ordering::Relaxed) {
+        return None;
+    }
+    flash_text()
+        .lock()
+        .ok()
+        .map(|f| f.clone())
+        .filter(|f| !f.is_empty())
+}
+
+// ── cursor shape & visibility ────────────────────────────────────────────────
+// DECSCUSR shapes + OSC 12 cursor color. The prompt gets a blinking accent
+// bar; vim NORMAL a steady block, VISUAL a steady underline. The cursor is
+// hidden while the agent works (it otherwise flickers across the screen with
+// every repaint) and restored at every prompt and on exit/panic.
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum CursorShape {
+    Bar,
+    Block,
+    Underline,
+}
+
+pub fn set_cursor_shape(shape: CursorShape) {
+    if !is_raw() {
+        return;
+    }
+    let n = match shape {
+        CursorShape::Bar => 5,       // blinking bar
+        CursorShape::Block => 2,     // steady block
+        CursorShape::Underline => 4, // steady underline
+    };
+    print!("\x1b[{n} q");
+    flush();
+}
+
+fn cursor_color_accent() {
+    if no_color() {
+        return;
+    }
+    print!("\x1b]12;#bb9af7\x07");
+    flush();
+}
+
+fn cursor_reset_style() {
+    print!("\x1b[0 q\x1b]112\x07");
+    flush();
+}
+
+pub fn cursor_hide() {
+    if ALT_SCREEN.load(Ordering::Relaxed) {
+        print!("\x1b[?25l");
+        flush();
+    }
+}
+
+pub fn cursor_show() {
+    print!("\x1b[?25h");
+    flush();
 }
 
 pub fn set_permission_mode(mode: &str) {
@@ -1607,6 +1700,10 @@ fn render_output() {
     let start = total.saturating_sub(rows + offset);
     let visible = t.rows_range(start, rows);
     let mut out = io::stdout();
+    // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
+    // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
+    // — zero tearing/flicker. Ignored elsewhere.
+    let _ = write!(out, "\x1b[?2026h");
     let sel = selection().lock().ok().and_then(|g| *g);
     let mut plain_rows = Vec::with_capacity(rows);
     for row in 0..rows {
@@ -1635,6 +1732,7 @@ fn render_output() {
     if let Ok(mut rows) = visible_rows().lock() {
         *rows = plain_rows;
     }
+    let _ = write!(out, "\x1b[?2026l");
     let _ = out.flush();
     render_queued_composer();
 }
@@ -1699,16 +1797,104 @@ fn in_output_region(row: u16) -> bool {
     ALT_SCREEN.load(Ordering::Relaxed) && row < composer_top()
 }
 
+// Multi-click detection: (last click ms, row, col, count). Two clicks on the
+// same cell within 400ms select the word, three the whole line.
+static LAST_CLICK: Mutex<(u64, u16, u16, u8)> = Mutex::new((0, 0, 0, 0));
+
+fn click_count(row: u16, col: u16) -> u8 {
+    let now = monotonic_ms();
+    let mut guard = match LAST_CLICK.lock() {
+        Ok(g) => g,
+        Err(_) => return 1,
+    };
+    let (t, r, c, n) = *guard;
+    let count = if now.saturating_sub(t) <= 400 && r == row && c == col {
+        (n % 3) + 1
+    } else {
+        1
+    };
+    *guard = (now, row, col, count);
+    count
+}
+
+// Word span (code-friendly: [A-Za-z0-9_], else a non-space run) around `col`
+// in the plain text of the visible row. None when the cell is blank.
+fn word_span_at(line: &str, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let c = *chars.get(col)?;
+    if c.is_whitespace() {
+        return None;
+    }
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let class = if ident(c) { 0 } else { 1 };
+    let same = |ch: char| {
+        if class == 0 {
+            ident(ch)
+        } else {
+            !ch.is_whitespace() && !ident(ch)
+        }
+    };
+    let mut start = col;
+    while start > 0 && same(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < chars.len() && same(chars[end + 1]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 fn selection_start(row: u16, col: u16) {
     if !in_output_region(row) {
         return;
     }
-    let pos = SelectPos { row, col };
+    let clicks = click_count(row, col);
+    let new_sel = match clicks {
+        // Double click: select the word under the cursor.
+        2 => {
+            let span = visible_rows()
+                .lock()
+                .ok()
+                .and_then(|rows| rows.get(row as usize).cloned())
+                .and_then(|line| word_span_at(&line, col as usize));
+            match span {
+                Some((s, e)) => Selection {
+                    anchor: SelectPos { row, col: s as u16 },
+                    focus: SelectPos { row, col: e as u16 },
+                    sticky: true,
+                },
+                None => Selection {
+                    anchor: SelectPos { row, col },
+                    focus: SelectPos { row, col },
+                    sticky: false,
+                },
+            }
+        }
+        // Triple click: select the whole visible line.
+        3 => {
+            let len = visible_rows()
+                .lock()
+                .ok()
+                .and_then(|rows| rows.get(row as usize).map(|l| l.chars().count()))
+                .unwrap_or(0);
+            Selection {
+                anchor: SelectPos { row, col: 0 },
+                focus: SelectPos {
+                    row,
+                    col: len.saturating_sub(1) as u16,
+                },
+                sticky: true,
+            }
+        }
+        _ => Selection {
+            anchor: SelectPos { row, col },
+            focus: SelectPos { row, col },
+            sticky: false,
+        },
+    };
     if let Ok(mut sel) = selection().lock() {
-        *sel = Some(Selection {
-            anchor: pos,
-            focus: pos,
-        });
+        *sel = Some(new_sel);
     }
     render_output();
     render_queued_composer();
@@ -1721,6 +1907,7 @@ fn selection_drag(row: u16, col: u16) {
     if let Ok(mut sel) = selection().lock() {
         if let Some(s) = sel.as_mut() {
             s.focus = SelectPos { row, col };
+            s.sticky = false;
         }
     }
     render_output();
@@ -1731,7 +1918,10 @@ fn selection_finish(row: u16, col: u16) {
     if in_output_region(row) {
         if let Ok(mut sel) = selection().lock() {
             if let Some(s) = sel.as_mut() {
-                s.focus = SelectPos { row, col };
+                // A word/line selection stays put on the release click.
+                if !s.sticky {
+                    s.focus = SelectPos { row, col };
+                }
             }
         }
     }
@@ -1742,6 +1932,8 @@ fn selection_finish(row: u16, col: u16) {
     render_output();
     if let Some(text) = copied.filter(|s| !s.trim().is_empty()) {
         osc52_copy(&text);
+        let n = text.chars().count();
+        flash_footer(&format!("⎘ copied {n} chars"));
     }
     render_queued_composer();
 }
@@ -1776,12 +1968,15 @@ fn selection_range_for(sel: Selection, row: u16, line_len: usize) -> Option<(usi
     (to > from).then_some((from, to))
 }
 
-fn inverse(s: &str) -> String {
+// Theme selection tint (Tokyo Night visual-select) — far gentler than
+// inverse video, which flashed harsh white blocks over the transcript.
+const SELECTION_BG: Rgb = Rgb(0x28, 0x34, 0x57);
+
+fn selection_span(s: &str) -> String {
     if no_color() {
-        s.to_string()
-    } else {
-        format!("\x1b[7m{s}\x1b[27m")
+        return format!("\x1b[7m{s}\x1b[27m");
     }
+    on_bg(SELECTION_BG, TEXT, s)
 }
 
 fn selected_line(line: &str, range: (usize, usize)) -> String {
@@ -1790,7 +1985,7 @@ fn selected_line(line: &str, range: (usize, usize)) -> String {
     let before: String = chars.iter().take(from).collect();
     let mid: String = chars.iter().skip(from).take(to - from).collect();
     let after: String = chars.iter().skip(to).collect();
-    format!("{before}{}{after}", inverse(&mid))
+    format!("{before}{}{after}", selection_span(&mid))
 }
 
 fn selected_text() -> Option<String> {
@@ -2045,10 +2240,15 @@ pub fn enter_alt(raw: bool) {
         RAW.store(true, Ordering::Relaxed);
         let _ = execute!(io::stdout(), EnableBracketedPaste);
         set_mouse_capture(true);
+        // Accent-colored blinking bar cursor for the composer.
+        cursor_color_accent();
+        set_cursor_shape(CursorShape::Bar);
     }
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         reset_output_region();
+        cursor_reset_style();
+        cursor_show();
         let _ = write!(io::stdout(), "\x1b[0m");
         let _ = execute!(
             io::stdout(),
@@ -2066,6 +2266,10 @@ pub fn enter_alt(raw: bool) {
 pub fn leave_alt() {
     clear_composer();
     reset_output_region();
+    if RAW.load(Ordering::Relaxed) {
+        cursor_reset_style();
+        cursor_show();
+    }
     if RAW.swap(false, Ordering::Relaxed) {
         let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         MOUSE_CAPTURED.store(false, Ordering::Relaxed);
@@ -2928,6 +3132,17 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     out
 }
 
+// ↑/↓ history recall: nearest entry matching `prefix` (fish/zsh style —
+// type "car", ↑ cycles only "car…" entries). `from=None` starts at the ends.
+fn hist_match(h: &[String], prefix: &str, from: Option<usize>, back: bool) -> Option<usize> {
+    let hit = |i: &usize| prefix.is_empty() || h[*i].starts_with(prefix);
+    if back {
+        (0..from.unwrap_or(h.len())).rev().find(hit)
+    } else {
+        (from.map(|i| i + 1).unwrap_or(h.len())..h.len()).find(hit)
+    }
+}
+
 fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
     if query.is_empty() {
         return None;
@@ -3000,6 +3215,10 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     let mut scroll = 0usize;
     redraw(prompt, start, &buf, cursor, &mut scroll);
     let mut hist_idx: Option<usize> = None;
+    // ↑ stashes the in-progress draft (and its prefix filter); ↓ past the
+    // newest matching entry restores the draft instead of clearing the line.
+    let mut hist_draft: Vec<char> = Vec::new();
+    let mut hist_prefix = String::new();
     let mut kill = String::new();
     let mut vim_state = if is_vim_mode() {
         VimState::Normal
@@ -3010,6 +3229,15 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     if is_vim_mode() {
         VIM_STATE_VAL.store(0, Ordering::Relaxed);
     }
+    // Cursor: visible again (the working spinner hides it), shaped for the
+    // editing mode — accent bar for insert, block for vim NORMAL.
+    cursor_show();
+    let mut cur_shape = if is_vim_mode() && vim_state == VimState::Normal {
+        CursorShape::Block
+    } else {
+        CursorShape::Bar
+    };
+    set_cursor_shape(cur_shape);
     // Live autocomplete popup state (alt-screen only).
     let mut sug: Vec<String> = Vec::new();
     let mut sug_idx = 0usize;
@@ -3520,6 +3748,15 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                 }
             }
+            // Ctrl/Alt + arrows jump by word (matching Alt+B/F).
+            KeyCode::Left if ctrl || alt => {
+                cursor = prev_word(&buf, cursor);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
+            KeyCode::Right if ctrl || alt => {
+                cursor = next_word(&buf, cursor);
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             KeyCode::Left => {
                 cursor = cursor.saturating_sub(1);
                 redraw(prompt, start, &buf, cursor, &mut scroll);
@@ -3549,14 +3786,16 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
-                        let idx = match hist_idx {
-                            None => h.len() - 1,
-                            Some(0) => 0,
-                            Some(i) => i - 1,
-                        };
-                        hist_idx = Some(idx);
-                        buf = h[idx].chars().collect();
-                        cursor = buf.len();
+                        if hist_idx.is_none() {
+                            // First ↑: stash the draft and filter recall by it.
+                            hist_draft = buf.clone();
+                            hist_prefix = buf.iter().collect();
+                        }
+                        if let Some(idx) = hist_match(&h, &hist_prefix, hist_idx, true) {
+                            hist_idx = Some(idx);
+                            buf = h[idx].chars().collect();
+                            cursor = buf.len();
+                        }
                     }
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
@@ -3567,16 +3806,20 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     continue; // loop top re-renders the popup
                 }
                 if let Ok(h) = history().lock() {
-                    match hist_idx {
-                        Some(i) if i + 1 < h.len() => {
-                            hist_idx = Some(i + 1);
-                            buf = h[i + 1].chars().collect();
-                            cursor = buf.len();
-                        }
-                        _ => {
-                            hist_idx = None;
-                            buf.clear();
-                            cursor = 0;
+                    if let Some(cur) = hist_idx {
+                        match hist_match(&h, &hist_prefix, Some(cur), false) {
+                            Some(idx) => {
+                                hist_idx = Some(idx);
+                                buf = h[idx].chars().collect();
+                                cursor = buf.len();
+                            }
+                            None => {
+                                // Past the newest entry: the draft comes back
+                                // instead of a destroyed line.
+                                hist_idx = None;
+                                buf = hist_draft.clone();
+                                cursor = buf.len();
+                            }
                         }
                     }
                 }
@@ -3691,6 +3934,21 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
             };
             VIM_STATE_VAL.store(val, Ordering::Relaxed);
         }
+        // Cursor shape tracks the editing mode: accent bar for insert,
+        // steady block for vim NORMAL, underline for VISUAL.
+        let want = if !is_vim_mode() {
+            CursorShape::Bar
+        } else {
+            match vim_state {
+                VimState::Insert => CursorShape::Bar,
+                VimState::Normal => CursorShape::Block,
+                VimState::Visual(_) => CursorShape::Underline,
+            }
+        };
+        if want != cur_shape {
+            cur_shape = want;
+            set_cursor_shape(want);
+        }
     }
 }
 
@@ -3701,6 +3959,9 @@ pub struct Spinner {
 }
 
 pub fn spinner_start(label: &str) -> Spinner {
+    // The agent is working: hide the cursor so it doesn't flicker across the
+    // screen with every streamed repaint. Shown again in spinner_stop.
+    cursor_hide();
     let running = Arc::new(AtomicBool::new(true));
     let r2 = running.clone();
     let label = label.to_string();
@@ -3760,6 +4021,7 @@ pub fn spinner_stop(mut s: Spinner) {
         print!("\r\x1b[2K");
         flush();
     }
+    cursor_show();
 }
 
 pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
@@ -3830,6 +4092,7 @@ mod tests {
         let one = Selection {
             anchor: SelectPos { row: 2, col: 3 },
             focus: SelectPos { row: 2, col: 7 },
+            sticky: false,
         };
         assert_eq!(selection_range_for(one, 2, 20), Some((3, 8)));
         assert_eq!(selection_range_for(one, 1, 20), None);
@@ -3837,6 +4100,7 @@ mod tests {
         let many = Selection {
             anchor: SelectPos { row: 1, col: 4 },
             focus: SelectPos { row: 3, col: 2 },
+            sticky: false,
         };
         assert_eq!(selection_range_for(many, 1, 10), Some((4, 10)));
         assert_eq!(selection_range_for(many, 2, 10), Some((0, 10)));
@@ -3935,6 +4199,37 @@ mod tests {
         assert_eq!(wrap_ansi_line("你好", 1), vec!["你", "好"]);
         assert_eq!(wrap_ansi_line("", 4), vec![""]);
         assert_eq!(wrap_ansi_line("abc", 0), vec![""]);
+    }
+
+    #[test]
+    fn hist_match_filters_by_prefix_and_scans_both_ways() {
+        let h: Vec<String> = ["cargo test", "git push", "cargo bench", "ls"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Backward from the end, unfiltered → newest entry.
+        assert_eq!(hist_match(&h, "", None, true), Some(3));
+        // Prefix filter: ↑ from a "cargo" draft skips "ls" and "git push".
+        assert_eq!(hist_match(&h, "cargo", None, true), Some(2));
+        assert_eq!(hist_match(&h, "cargo", Some(2), true), Some(0));
+        assert_eq!(hist_match(&h, "cargo", Some(0), true), None);
+        // Forward again (↓): back toward newer matches, then off the end.
+        assert_eq!(hist_match(&h, "cargo", Some(0), false), Some(2));
+        assert_eq!(hist_match(&h, "cargo", Some(2), false), None);
+        assert_eq!(hist_match(&h, "zzz", None, true), None);
+    }
+
+    #[test]
+    fn word_span_at_selects_identifiers_and_symbol_runs() {
+        let line = "let total_rows = t.wrapped.len();";
+        // Inside an identifier → the whole identifier.
+        assert_eq!(word_span_at(line, 6), Some((4, 13))); // total_rows
+        // On punctuation → the symbol run, not neighbours.
+        assert_eq!(word_span_at(line, 15), Some((15, 15))); // '='
+        // On whitespace → nothing.
+        assert_eq!(word_span_at(line, 3), None);
+        // Out of range → nothing.
+        assert_eq!(word_span_at(line, 999), None);
     }
 
     #[test]
