@@ -4,6 +4,20 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-07-14
+
+### Fixed
+- **Bundle analyzers work now.** Added a `browser` field pointing at a
+  dependency-free stub entry (`index.browser.js`) — tools like bundlephobia
+  that webpack-bundle the package no longer fail on `child_process` and the
+  platform binary packages the Node entry resolves. The stub exposes
+  `{ version }` and throws clearly if the CLI surface is called in a browser.
+- Publish workflow: the crates.io "already published" check queried the local
+  workspace instead of the registry (`cargo info` resolves workspace members
+  locally), silently skipping real publishes. It now asks the sparse index.
+
+[0.12.2]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.2
+
 ## [0.12.1] - 2026-07-14
 
 Supply-chain hardening: the npm install is now inert and auditable at a glance.

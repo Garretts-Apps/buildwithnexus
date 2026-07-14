@@ -1,6 +1,6 @@
 {
   "name": "buildwithnexus",
-  "version": "0.12.1",
+  "version": "0.12.2",
   "description": "A hilariously fast, agentic AI CLI in Rust \u2014 full-screen TUI with live autocomplete, GitHub-grade diffs, clickable files/links, multimodal input (paste images, ffmpeg-parsed video), remote (API key) or local models, plan/build/brainstorm modes, hooks, and background auto-updates",
   "main": "index.js",
   "bin": {
@@ -9,6 +9,7 @@
   },
   "files": [
     "index.js",
+    "index.browser.js",
     "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
     "scripts/bootstrap.js",
@@ -57,10 +58,11 @@
     "provenance": true
   },
   "optionalDependencies": {
-    "buildwithnexus-linux-x64": "0.12.1",
-    "buildwithnexus-linux-arm64": "0.12.1",
-    "buildwithnexus-darwin-x64": "0.12.1",
-    "buildwithnexus-darwin-arm64": "0.12.1",
-    "buildwithnexus-win32-x64": "0.12.1"
-  }
+    "buildwithnexus-linux-x64": "0.12.2",
+    "buildwithnexus-linux-arm64": "0.12.2",
+    "buildwithnexus-darwin-x64": "0.12.2",
+    "buildwithnexus-darwin-arm64": "0.12.2",
+    "buildwithnexus-win32-x64": "0.12.2"
+  },
+  "browser": "./index.browser.js"
 }
