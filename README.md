@@ -3,10 +3,13 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-A hilariously fast, **agentic AI CLI harness** — written in Rust. Remote models
-via API key, or local models on your machine. It plans, edits files, and runs
+A hilariously fast, **agentic AI CLI** — written in Rust. Remote models via
+API key, or local models on your machine. It plans, edits files, and runs
 commands, asking before each change. One static binary, five direct
-dependencies, no runtime to babysit.
+dependencies, no runtime to babysit — and a terminal UI built to feel
+instant: incremental rendering with atomic frames, live autocomplete,
+GitHub-grade diffs, clickable files and links, and multimodal input straight
+from your clipboard.
 
 ```bash
 npm install -g buildwithnexus
@@ -14,6 +17,31 @@ buildwithnexus
 ```
 
 The first launch walks you through choosing a model. Then describe a task.
+Once installed, buildwithnexus keeps itself current: a background check
+updates the npm package at most once a day (set `BWN_NO_AUTO_UPDATE=1` to
+opt out).
+
+## The TUI
+
+- **Instant startup, never a black frame** — chrome paints before anything
+  else; dependency probes and connection warming run off the critical path.
+- **Fast rendering** — each transcript line is wrapped once, repaints are
+  frame-coalesced (~60fps) and wrapped in synchronized-output brackets, so
+  streaming is smooth on kitty/iTerm2/WezTerm/Alacritty with zero tearing.
+- **Live autocomplete** — type `/` for a command popup with descriptions;
+  `@` completes files, `kb:` symbols. ↑/↓ navigate, Tab/Enter accept.
+- **Clean diffs** — line-number gutters, background-tinted rows, word-level
+  change highlighting, hunk elision. Same renderer for previews and applied
+  changes.
+- **Clickable everything** — file paths and links are OSC 8 hyperlinks: click
+  a path in an edit header and it opens in your OS default app.
+- **Multimodal input** — `Ctrl+V` pastes clipboard screenshots; `@clip.mp4`
+  runs ffmpeg to sample frames + metadata for vision models (text-only models
+  get a clear "not multimodal" notice instead of silent drops).
+- **Claude-Code-grade ergonomics** — `Esc` interrupts the agent; messages
+  typed while it works queue and auto-send; ↑ history is prefix-filtered and
+  never destroys your draft; double-click selects a word, triple-click a
+  line, and every copy confirms itself in the footer.
 
 ## Why
 

@@ -4,6 +4,69 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-07-14
+
+The Ferrari release: a full UI/UX overhaul — instant, multimodal, and clean.
+
+### Added
+- **Live slash-command autocomplete.** Typing `/` (or `@`, or a sub-argument)
+  opens a popup above the composer with one-line descriptions for all built-in
+  commands; ↑/↓ navigate, Tab/Enter accept, Esc dismisses. Removed the ghost
+  commands (`/effort`, `/plugin`, `/marketplace`) that autocomplete offered but
+  no handler implemented.
+- **True multimodal input.** `Ctrl+V` pastes clipboard images (Wayland/X11/
+  macOS/WSL) as attachments; `@clip.mp4` (and other containers) is parsed with
+  ffmpeg/ffprobe into up to 8 evenly-sampled frames plus a metadata block.
+  Both are gated on a per-model vision-capability check — text-only models get
+  an explicit notice instead of silently dropped images.
+- **Clickable files and links (OSC 8).** Markdown links and `⏺ edit/write`
+  headers are terminal hyperlinks: click a path to open the file in the OS
+  default app. The ANSI scanners learned OSC strings so links cost zero
+  display columns.
+- **npm auto-update.** A detached background process checks the registry at
+  most once a day and silently installs newer versions; the next launch prints
+  a one-line notice. Opt out with `BWN_NO_AUTO_UPDATE=1`. Startup never waits
+  on the network.
+- **Esc interrupts the agent** (with queued prompts auto-sending next turn),
+  double-click word / triple-click line selection with a soft theme highlight
+  and a "⎘ copied" footer flash, prefix-filtered ↑ history that preserves the
+  in-progress draft, Ctrl/Alt+←→ word jumps, and mode-aware cursor shapes
+  (accent bar / vim block / visual underline) hidden while the agent works.
+
+### Changed
+- **GitHub-grade diffs.** One renderer for edit previews, write previews, and
+  applied changes: dual line-number gutter, background-tinted rows, word-level
+  change emphasis on replacement pairs, hunk elision, and a 40-row cap.
+  `NO_COLOR` keeps signed `- / +` text.
+- **Bordered composer box** (opencode-style) with the spinner inside showing
+  elapsed seconds and an interrupt hint; minimal banner (gradient wordmark +
+  aligned model/cwd/mode rows) replacing the emoji-heavy boxed header.
+- **Grouped, auto-aligned `/help`**, rendered markdown for `/verify`, rule
+  violations, `/agents`, and `/memory` (no more raw `##`/`**`), human-readable
+  verification statuses, and a consistent `✓ / ✗ / ⚠ / ⟳` message vocabulary.
+- Removed fabricated telemetry: the hardcoded `est. cost` figure and the
+  tok/s badge derived from character counts are gone; the context meter shows
+  only real used/total tokens.
+
+### Fixed
+- Tool denials rendered dim-grey (now red); failed background workflows were
+  announced in success-green; a raw `eprintln!` corrupted the alt-screen
+  during `/resume`; HTTP retries were silent for up to 10s (now a visible
+  `⟳ retrying` line); tool previews and the permission prompt could smear a
+  multi-line command across the screen (capped at 80 cols, prompt legend on
+  its own line).
+
+### Performance
+- **~215× faster streaming renders.** The renderer re-wrapped the entire
+  transcript on every streamed chunk/keystroke/scroll; now each line wraps
+  once (incremental cache), repaints are coalesced to ~60fps and applied as
+  atomic frames (DEC 2026), and multi-line blocks (diffs, code, command
+  output) paint in one repaint instead of one per row.
+- Instant startup: dependency probes moved off the critical path; the screen
+  paints chrome immediately so there is never a black frame.
+
+[0.12.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.0
+
 ## [0.11.4] - 2026-07-07
 
 Gemma local-model support, from a real gemma-2-2b-it session on llama.cpp.
