@@ -273,12 +273,18 @@ pub fn text(s: &str) -> String {
     paint(TEXT, s)
 }
 
-// Mode-colored badge: PLAN (green), BUILD (cyan), BRAINSTORM (amber).
+// Full-width dim horizontal rule (2-space indent, spans the terminal).
+pub fn rule() -> String {
+    let w = term_size().0 as usize;
+    dim(&format!("  {}", "─".repeat(w.saturating_sub(4))))
+}
+
+// Mode-colored badge: PLAN (green), BUILD (blue), BRAINSTORM (amber).
 pub fn mode_badge(mode: &str) -> String {
     let (label, color) = match mode {
-        "PLAN" => ("⚡ PLAN", MODE_PLAN),
-        "BRAINSTORM" => ("💡 BRAINSTORM", MODE_BSTORM),
-        _ => ("🚀 BUILD", MODE_BUILD),
+        "PLAN" => ("PLAN", MODE_PLAN),
+        "BRAINSTORM" => ("BRAINSTORM", MODE_BSTORM),
+        _ => ("BUILD", MODE_BUILD),
     };
     if no_color() {
         format!("[{label}]")
@@ -1800,39 +1806,14 @@ pub fn context_meter(used: usize, total: usize) {
     } else {
         green(&bar)
     };
-    let est_cost = (used as f64 / 1000.0) * 0.003;
     line(&format!(
         "  {} [{}] {}",
-        dim("telemetry"),
+        dim("context"),
         colored,
         dim(&format!(
-            "{pct}% sat  ·  {}k / {}k tokens  ·  est. cost: ${:.4}",
+            "{pct}% · {}k / {}k tokens",
             used / 1_000,
             total / 1_000,
-            est_cost
-        )),
-    ));
-}
-
-pub fn inference_telemetry(tokens_generated: usize, elapsed_secs: f64) {
-    if elapsed_secs <= 0.0 || tokens_generated == 0 {
-        return;
-    }
-    let tok_per_sec = tokens_generated as f64 / elapsed_secs;
-    let speed_badge = if tok_per_sec >= 40.0 {
-        green(&format!("{:.1} tok/s", tok_per_sec))
-    } else if tok_per_sec >= 15.0 {
-        yellow(&format!("{:.1} tok/s", tok_per_sec))
-    } else {
-        red(&format!("{:.1} tok/s", tok_per_sec))
-    };
-    line(&format!(
-        "  {} [{}] {}",
-        dim("inference"),
-        speed_badge,
-        dim(&format!(
-            "~{} tokens generated in {:.2}s",
-            tokens_generated, elapsed_secs
         )),
     ));
 }
@@ -2444,10 +2425,7 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/mode",
     "/model",
     "/permissions",
-    "/effort",
     "/mcp",
-    "/plugin",
-    "/marketplace",
     "/scroll",
     "/mouse",
     "/compact",
@@ -2565,10 +2543,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/mode" => "show or switch mode",
         "/model" => "hot-swap the AI model",
         "/permissions" => "tool permission level (ask/auto/readonly)",
-        "/effort" => "set reasoning effort",
-        "/mcp" => "manage MCP servers",
-        "/plugin" => "manage plugins",
-        "/marketplace" => "browse the plugin marketplace",
+        "/mcp" => "inspect configured MCP servers",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
         "/compact" => "compress context to free token budget",
@@ -2805,32 +2780,6 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())
                 .collect();
-        }
-        "/effort" => {
-            return ["low", "medium", "high", "max"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/mcp" | "/plugin" | "/marketplace" => {
-            return [
-                "list",
-                "add",
-                "remove",
-                "install",
-                "filesystem",
-                "github",
-                "git",
-                "sqlite",
-                "brave-search",
-                "memory",
-                "duckduckgo",
-            ]
-            .iter()
-            .filter(|&&s| s.starts_with(token))
-            .map(|s| s.to_string())
-            .collect();
         }
         _ => {}
     }
@@ -3882,13 +3831,6 @@ mod tests {
     fn test_context_meter_noop_when_zero() {
         super::context_meter(0, 0);
         super::context_meter(5000, 100000);
-    }
-
-    #[test]
-    fn test_inference_telemetry_noop_when_zero() {
-        super::inference_telemetry(0, 0.0);
-        super::inference_telemetry(100, 2.0);
-        super::inference_telemetry(500, 10.0);
     }
 
     #[test]

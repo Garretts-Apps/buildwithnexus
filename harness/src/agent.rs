@@ -251,7 +251,7 @@ fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     if tail_start <= sys_end {
         return;
     }
-    report::notice("  ⟳ compacting context…");
+    report::info("  ⟳ compacting context…");
     let taken = std::mem::take(msgs);
     *msgs = compact_with(taken, |middle| model_summary(p, middle));
 }
@@ -387,7 +387,7 @@ fn tool_input_for_execution(
         return input.clone();
     };
     report::notice(&format!(
-        "  recovery: using current workspace for placeholder/root path in {name}"
+        "  ⟳ recovery: using current workspace for placeholder/root path in {name}"
     ));
     trace::record_visible(
         "tool_input_repaired",
@@ -613,13 +613,10 @@ fn request_reply(
         report::assistant(&r.text);
         return Ok(r);
     }
-    tui::line(&format!(
-        "  {} {} · {} [{}]",
-        tui::yellow("⚡"),
-        tui::bold(label),
-        tui::cyan(&format!("reasoning with {}", p.model)),
-        tui::dim(&format!("{} tools available", defs.len()))
-    ));
+    // Quiet chrome: this fires before every model call (up to ~30 per turn),
+    // so keep it one short dim line instead of re-announcing model and tool
+    // count in bright colors each step.
+    tui::line(&tui::dim(&format!("  · {label}")));
     let thinking = std::cell::RefCell::new(ThinkingStream::default());
     let mut streamed = false;
     let mut renderer = tui::StreamRenderer::new();
@@ -668,7 +665,7 @@ fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_tex
             .any(|call| tools::is_mutating_call(&call.name, &call.input))
     {
         if !report::is_json() {
-            report::notice("  recovery: ignored unrelated tool JSON for casual input");
+            report::info("  ⟳ recovery: ignored unrelated tool JSON for casual input");
         }
         trace::record_visible(
             "tool_input_repaired",
@@ -685,7 +682,7 @@ fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_tex
     }
     if !report::is_json() {
         report::notice(&format!(
-            "  recovery: parsed {} tool call{} from model JSON",
+            "  ⟳ recovery: parsed {} tool call{} from model JSON",
             calls.len(),
             if calls.len() == 1 { "" } else { "s" }
         ));
@@ -1521,12 +1518,13 @@ fn confirm_tool(label: &str, tool_key: &str) -> Option<String> {
             "blocked (no interactive terminal to confirm: {label})"
         ));
     }
-    let q = format!(
-        "  {} {}? {} ",
-        tui::yellow("➤"),
-        tui::bold(label),
-        tui::dim("[y: yes | n: no | s: allow session | a: allow always | d <reason>: deny with feedback]")
-    );
+    // Action on its own line; the key legend stays short so the prompt never
+    // wraps mid-legend on a normal-width terminal.
+    tui::line(&format!("  {} {}", tui::yellow("➤"), tui::bold(label)));
+    tui::line(&tui::dim(
+        "    y yes · n no · s allow this session · a always allow · d <reason> deny",
+    ));
+    let q = format!("  {} ", tui::yellow("allow?"));
     let ans = tui::ask(&q).unwrap_or_default();
     let trimmed = ans.trim();
     let lower = trimmed.to_lowercase();
@@ -1770,14 +1768,13 @@ fn build_inner(
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
-            report::notice("interrupted");
+            report::notice("  ⚠ interrupted");
             return Ok(String::new());
         }
         maybe_compact(p, msgs);
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
         }
-        let start_instant = std::time::Instant::now();
         let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
             Ok(r) => r,
             Err(e) => {
@@ -1798,11 +1795,6 @@ fn build_inner(
             }
         };
         let reply = normalize_text_tool_calls(reply, &defs, &task_for_recovery);
-        let elapsed = start_instant.elapsed().as_secs_f64();
-        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
-        if !report::is_json() {
-            tui::inference_telemetry(gen_toks.max(10), elapsed);
-        }
         hooks::notify("PostResponse", cwd);
         // Output truncated at the token limit: the reply (and any tool call in
         // it) may be incomplete — ask the model to continue instead of acting
@@ -1841,14 +1833,14 @@ fn build_inner(
                 // message would serialize to an empty content array (API 400).
                 if !empty_reply_retried {
                     empty_reply_retried = true;
-                    report::notice("model returned no output — asking it to continue");
+                    report::notice("  ⚠ model returned no output — asking it to continue");
                     msgs.push(Msg::User(
                         "You returned no output. Continue the task: call a tool or state your final answer."
                             .to_string(),
                     ));
                     continue;
                 }
-                report::notice("model returned no output");
+                report::notice("  ⚠ model returned no output");
                 return Ok(reply.text);
             }
             // Imperative task answered with how-to prose instead of tool
@@ -2225,10 +2217,10 @@ fn build_inner(
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
                         report::notice(&format!(
-                            "  [Verification: {} — asking the model to address violations]",
-                            rep.status
+                            "  ⚠ verification {} — asking the model to address violations",
+                            rep.status.label()
                         ));
-                        report::notice(&violations);
+                        tui::line(&tui::render_md(&violations));
                         msgs.push(Msg::User(format!(
                             "Verification of your finished work returned `{}` with these rule \
                              violations:\n{violations}\nAddress them, then call finish again.",
@@ -2241,7 +2233,10 @@ fn build_inner(
                         // Fix rounds exhausted: finish anyway with an honest note.
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
-                        report::notice(&format!("  [Verification: {}]", rep.status));
+                        report::notice(&format!(
+                            "  ⚠ verification {}",
+                            rep.status.label()
+                        ));
                         return Ok(format!(
                             "{s}\n\n[verification note] The verifier still reports `{}` after \
                              {verifier_fix_rounds} fix attempts:\n{violations}",
@@ -2249,10 +2244,15 @@ fn build_inner(
                         ));
                     }
                     crate::verifier::VerificationStatus::PassedWithWarnings => {
-                        report::notice(&format!("  [Verification: {}]", rep.status));
+                        report::notice(&format!(
+                            "  ⚠ verification {}",
+                            rep.status.label()
+                        ));
                         if !rep.rule_violations.is_empty() {
-                            report::notice(&crate::rules::RuleEngine::format_violations(
-                                &rep.rule_violations,
+                            tui::line(&tui::render_md(
+                                &crate::rules::RuleEngine::format_violations(
+                                    &rep.rule_violations,
+                                ),
                             ));
                         }
                     }
@@ -2344,7 +2344,7 @@ fn spawn_subagent(
         (cwd.to_path_buf(), String::new())
     };
 
-    report::notice(&format!("  ↳ subagent: {task}"));
+    report::info(&format!("  ↳ subagent: {}", trace::preview(task, 80)));
     trace::record_visible(
         "subagent_spawn",
         format!("{role}: {}", trace::preview(task, 80)),
@@ -2830,14 +2830,8 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             ));
         }
         maybe_compact(p, &mut msgs);
-        let start_instant = std::time::Instant::now();
         let reply = request_reply(p, &msgs, &defs, "planning")?;
         let reply = normalize_text_tool_calls(reply, &defs, task);
-        let elapsed = start_instant.elapsed().as_secs_f64();
-        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
-        if !report::is_json() {
-            tui::inference_telemetry(gen_toks.max(10), elapsed);
-        }
 
         if reply.calls.is_empty() {
             let candidate_steps = parse_plan_steps(&reply.text);
@@ -3155,14 +3149,8 @@ pub fn run_brainstorm(
                 );
             }
             tui::line("");
-            let start_instant = std::time::Instant::now();
             let reply = request_reply(p, &msgs, &defs, "thinking")?;
             let reply = normalize_text_tool_calls(reply, &defs, &question);
-            let elapsed = start_instant.elapsed().as_secs_f64();
-            let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
-            if !report::is_json() {
-                tui::inference_telemetry(gen_toks.max(10), elapsed);
-            }
 
             if reply.calls.is_empty() {
                 msgs.push(Msg::Assistant {
@@ -3370,14 +3358,8 @@ pub fn run_chat_turn(
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
         maybe_compact(p, &mut msgs);
-        let start_instant = std::time::Instant::now();
         let reply = request_reply(p, &msgs, &defs, "thinking")?;
         let reply = normalize_text_tool_calls(reply, &defs, question);
-        let elapsed = start_instant.elapsed().as_secs_f64();
-        let gen_toks = (reply.text.len() / 4) + (reply.calls.len() * 40);
-        if !report::is_json() {
-            tui::inference_telemetry(gen_toks.max(10), elapsed);
-        }
 
         if reply.calls.is_empty() {
             if !reply.text.trim().is_empty() && !report::is_json() {

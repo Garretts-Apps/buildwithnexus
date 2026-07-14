@@ -255,20 +255,21 @@ fn headless(
     hooks::notify("SessionStart", &cwd);
 
     if !report::is_json() {
+        // No hand-drawn box: long provider/model/cwd values would shatter
+        // fixed-width borders. Plain aligned rows can't overflow.
+        println!(
+            "{} {}",
+            tui::bold("buildwithnexus headless"),
+            tui::dim(&format!("v{}", crate::VERSION))
+        );
         println!(
             "{}",
-            tui::bold(&format!(
-                "╭── buildwithnexus headless [v{}] ──────────────────────────────────╮",
-                crate::VERSION
+            tui::dim(&format!(
+                "  model  {} · {}",
+                provider.protocol, provider.model
             ))
         );
-        println!(
-            "│ Provider: {:<24} Model: {:<30} │",
-            provider.protocol, provider.model
-        );
-        println!("│ Working Dir: {:<58} │", cwd.display());
-        println!("│ Mode: High-Quality Non-Interactive Operational Execution               │");
-        println!("╰───────────────────────────────────────────────────────────────────────╯");
+        println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
         println!();
         check_and_offer_install_dependencies(false);
     }
@@ -281,21 +282,9 @@ fn headless(
     if !report::is_json() {
         println!();
         if r.is_ok() {
-            println!(
-                "{}",
-                tui::green(&format!(
-                    "✓ Headless execution completed successfully in {:.2?}.",
-                    elapsed
-                ))
-            );
+            println!("{}", tui::green(&format!("✓ done in {elapsed:.2?}")));
         } else {
-            println!(
-                "{}",
-                tui::red(&format!(
-                    "✗ Headless execution failed after {:.2?}.",
-                    elapsed
-                ))
-            );
+            println!("{}", tui::red(&format!("✗ failed after {elapsed:.2?}")));
         }
     }
 
@@ -370,8 +359,13 @@ fn repl(
 
     loop {
         // Tick background workflows and surface any completion notifications.
+        // Color by outcome — a "✗ workflow failed" line must not render green.
         if let Some(note) = workflow::tick() {
-            tui::line(&tui::green(&note));
+            if note.contains('✗') {
+                tui::line(&tui::red(&note));
+            } else {
+                tui::line(&tui::green(&note));
+            }
         }
         // Prune old done/cancelled workflows, keep last 20.
         workflow::prune(20);
@@ -1229,14 +1223,12 @@ fn handle_memory(
     transcript: &mut Vec<provider::Msg>,
     sid: &str,
 ) {
-    tui::line(&tui::accent("  /memory — session memory"));
+    tui::line(&tui::accent("  session memory"));
     match config::load_memory() {
-        None => tui::line(&tui::dim("  (no memory saved yet)")),
+        None => tui::line(&tui::dim("  no memory saved yet")),
         Some(mem) => {
-            tui::line(&tui::dim("  Current memory:"));
-            for l in mem.lines() {
-                tui::line(&format!("    {l}"));
-            }
+            // memory.md is Markdown — render headings/bullets/emphasis.
+            tui::line(&tui::render_md(&mem));
         }
     }
     tui::line("");
@@ -1436,8 +1428,10 @@ fn handle_model(provider: &mut Provider) {
 }
 
 fn handle_voice(arg: &str) -> Option<String> {
-    tui::line(&tui::accent("  /voice — audio transcription & voice input"));
-    tui::line("  Supported backends: whisper-cpp, whisper-cli, openai-whisper, local models");
+    tui::line(&tui::accent("  voice input"));
+    tui::line(&tui::dim(
+        "  supported backends: whisper-cpp, whisper-cli, openai-whisper, local models",
+    ));
     let audio_path = if arg.trim().is_empty() {
         tui::line(&tui::dim(
             "  Tip: You can drop an audio file (.wav/.mp3/.m4a) directly or pass `/voice <path>`",
@@ -1482,7 +1476,7 @@ fn handle_voice(arg: &str) -> Option<String> {
                     .args(["-f", path, "-otxt"])
                     .output()
                 {
-                    tui::line(&tui::green(&format!("  Transcription complete via {bin}!")));
+                    tui::line(&tui::green(&format!("  ✓ transcribed via {bin}")));
                     let txt_path = format!("{path}.txt");
                     if let Ok(txt) = std::fs::read_to_string(&txt_path) {
                         let _ = std::fs::remove_file(&txt_path);
@@ -1506,9 +1500,9 @@ fn handle_voice(arg: &str) -> Option<String> {
 
 fn handle_local(_provider: &mut Provider) {
     tui::line(&tui::accent(
-        "  /local — local model management & inference optimization",
+        "  local models",
     ));
-    tui::line("  Scanning local servers and model directories...");
+    tui::line(&tui::dim("  scanning local servers and model directories…"));
     let mut servers = Vec::new();
     if let Ok(o) = std::process::Command::new("curl")
         .args(["-s", "http://localhost:11434/api/tags"])
@@ -1590,7 +1584,7 @@ fn handle_kb_index(cwd: &std::path::Path) {
         tui::bold(&kb.entities.len().to_string())
     ));
 
-    tui::line("  Scanning workspace for source files and extracting symbols...");
+    tui::line(&tui::dim("  scanning workspace for source files and symbols…"));
     let mut count = 0;
     let mut dirs_to_visit = vec![cwd.to_path_buf()];
     while let Some(dir) = dirs_to_visit.pop() {
@@ -1735,15 +1729,13 @@ fn handle_kb_index(cwd: &std::path::Path) {
     if let Err(e) = kb.save() {
         tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
     } else {
-        tui::line(&tui::green(&format!("  ✓ Successfully scanned workspace and indexed {count} symbols into `.buildwithnexus/knowledge/entities.json`!")));
-        tui::line(&tui::dim("  Tip: Use `@kb:<name>` or `@symbol:<name>` in your prompts to inject symbol definitions."));
+        tui::line(&tui::green(&format!("  ✓ indexed {count} symbols")));
+        tui::line(&tui::dim("  tip: @kb:<name> or @symbol:<name> injects symbol definitions into prompts"));
     }
 }
 
 fn handle_verify_audit(cwd: &std::path::Path) {
-    tui::line(&tui::accent(
-        "  /verify (/audit) — running operational judgment verifier on workspace",
-    ));
+    tui::line(&tui::accent("  verifying workspace against rules and tests"));
 
     let mut changed_files = Vec::new();
     if let Ok(o) = std::process::Command::new("git")
@@ -1762,7 +1754,9 @@ fn handle_verify_audit(cwd: &std::path::Path) {
         }
     }
     if changed_files.is_empty() {
-        tui::line(&tui::dim("  No modified git files detected. Running verifier against recent files in workspace..."));
+        tui::line(&tui::dim(
+            "  no modified git files — checking recent files in the workspace…",
+        ));
         if let Ok(rd) = std::fs::read_dir(cwd) {
             for e in rd.flatten() {
                 if let Some(s) = e.path().to_str() {
@@ -1787,22 +1781,11 @@ fn handle_verify_audit(cwd: &std::path::Path) {
     };
 
     let report = verifier.verify(&ctx);
+    // The report is Markdown — render it instead of echoing raw ##/**/`.
     let report_str = crate::verifier::Verifier::format_report(&report);
-    for line in report_str.lines() {
-        if line.starts_with("=== ") {
-            tui::line(&tui::bold(line));
-        } else if line.contains("PASSED") {
-            tui::line(&tui::green(line));
-        } else if line.contains("WARNING") || line.contains("MEDIUM") {
-            tui::line(&tui::yellow(line));
-        } else if line.contains("FAILED") || line.contains("CRITICAL") || line.contains("HIGH") {
-            tui::line(&tui::red(line));
-        } else {
-            tui::line(line);
-        }
-    }
+    tui::line(&tui::render_md(&report_str));
     tui::line(&tui::dim(
-        "  Tip: Use `@rules:<id>` or `/rules` to inspect specific constraints.",
+        "  tip: @rules:<id> or /rules inspects specific constraints",
     ));
 }
 
@@ -1828,10 +1811,8 @@ fn handle_workflows() {
         ));
         return;
     }
-    tui::line(&tui::accent("  /workflows — background task manager"));
-    tui::line(&tui::dim(
-        "  ──────────────────────────────────────────────────────────────",
-    ));
+    tui::line(&tui::accent("  background workflows"));
+    tui::line(&tui::rule());
     for s in &snaps {
         let status_color = match s.status_str.as_str() {
             "running" => tui::blue(&s.status_str),
@@ -1858,9 +1839,7 @@ fn handle_workflows() {
             iter_label
         ));
     }
-    tui::line(&tui::dim(
-        "  ──────────────────────────────────────────────────────────────",
-    ));
+    tui::line(&tui::rule());
     tui::line(&tui::dim(
         "  c<id> cancel  ·  i<id> inspect output  ·  Enter dismiss",
     ));
@@ -2186,9 +2165,11 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
 
 fn handle_align(cwd: &std::path::Path) {
     tui::line(&tui::accent(
-        "  /grill-me — Interactive Operational Alignment & Decision Grill",
+        "  alignment interview",
     ));
-    tui::line("  We will conduct an operational alignment review before proceeding with complex modifications.");
+    tui::line(&tui::dim(
+        "  a short alignment review before proceeding with complex changes",
+    ));
 
     let q1 = tui::ask("  1. What is the primary operational risk? [1: Regression | 2: Data Loss | 3: Performance | 4: Security]: ").unwrap_or_default();
     let risk_label = match q1.trim() {
@@ -2213,7 +2194,7 @@ fn handle_align(cwd: &std::path::Path) {
         _ => "Medium (>75%)",
     };
 
-    tui::line(&tui::green("  ✓ Operational alignment recorded!"));
+    tui::line(&tui::green("  ✓ alignment recorded"));
     tui::line(&format!("    • Primary Risk: {}", tui::bold(risk_label)));
     tui::line(&format!("    • Reversibility: {}", tui::bold(rev_label)));
     tui::line(&format!(
@@ -2250,9 +2231,11 @@ fn handle_align(cwd: &std::path::Path) {
 
 fn handle_teamwork() {
     tui::line(&tui::accent(
-        "  /teamwork-preview — Autonomous Multi-Agent Swarm Preview",
+        "  teamwork — multi-agent swarm preview",
     ));
-    tui::line("  When executing complex projects, buildwithnexus orchestrates specialized subagent teams:");
+    tui::line(&tui::dim(
+        "  for complex projects, buildwithnexus orchestrates specialized subagent teams:",
+    ));
     tui::line(&format!(
         "    • {} — Explores documentation, code graphs, and symbol trees",
         tui::bold("Researcher Subagent")
@@ -2275,8 +2258,12 @@ fn handle_teamwork() {
 fn handle_agents() {
     match config::load_agents() {
         Some(agents) => {
-            for line in agents.lines().take(80) {
-                tui::line(&format!("  {line}"));
+            // Agents.md is Markdown — render it instead of dumping #/**/- raw.
+            let shown: Vec<&str> = agents.lines().take(80).collect();
+            tui::line(&tui::render_md(&shown.join("\n")));
+            let total = agents.lines().count();
+            if total > 80 {
+                tui::line(&tui::dim(&format!("  …(+{} more lines)", total - 80)));
             }
         }
         None => tui::line(&tui::dim("  no Agents.md found")),
@@ -2307,200 +2294,109 @@ fn handle_doctor_tui() {
 }
 
 fn print_help() {
-    tui::line(&tui::accent("  buildwithnexus commands"));
+    // (command, args/aliases hint, description) grouped by section. Rendered
+    // as an auto-aligned table so alignment can't drift as commands change.
+    type Row = (&'static str, &'static str, &'static str);
+    let sections: &[(&str, &[Row])] = &[
+        (
+            "modes",
+            &[
+                ("Shift+Tab", "", "cycle PLAN → BUILD → BRAINSTORM"),
+                ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
+                ("/permissions", "[ask|auto|readonly]", "tool permission level"),
+                ("/model", "[name]", "hot-swap the AI model mid-session"),
+                ("/local", "", "local model server & GGUF/Ollama management"),
+            ],
+        ),
+        (
+            "context & git",
+            &[
+                ("/compact", "", "compress context to free token budget"),
+                ("/context", "", "show context window usage"),
+                ("/diff", "", "show current git diff summary"),
+                ("/review", "", "AI code review of staged git diff"),
+                ("/commit", "", "AI-drafted conventional commit message"),
+                ("/pr", "", "AI-drafted PR title + description"),
+                ("/checkpoints", "", "list edit checkpoints"),
+                ("/undo", "(/rewind) <git|all|id>", "restore a checkpoint"),
+            ],
+        ),
+        (
+            "automation",
+            &[
+                ("/schedule", "<delay> <task>", "one-shot scheduled workflow"),
+                ("/loop", "<interval> <task>", "repeating scheduled workflow"),
+                ("/workflows", "(/tasks)", "list background workflows"),
+                ("/btw", "<context>", "inject context into next agent turn"),
+                ("/teamwork", "(/swarm)", "multi-agent swarm preview"),
+                ("/grill-me", "(/align)", "operational alignment interview"),
+            ],
+        ),
+        (
+            "project",
+            &[
+                ("/memory", "", "view and edit session memory"),
+                ("/skills", "", "list skills and custom commands"),
+                ("/tools", "", "browse callable tools"),
+                ("/rules", "", "inspect engineering rules and violations"),
+                ("/kb", "(/index)", "query or index project knowledge base"),
+                ("/verify", "(/audit)", "verify codebase against rules and tests"),
+                ("/agents", "", "show loaded Agents.md context"),
+                ("/mcp", "", "inspect configured MCP servers"),
+                ("/trace", "", "inspect hooks, tools, skills, subagents"),
+            ],
+        ),
+        (
+            "session",
+            &[
+                ("/new", "", "start a fresh session"),
+                ("/resume", "", "pick a saved session to resume"),
+                ("/init", "", "run setup (keys, providers, local models)"),
+                ("/config", "", "configure hooks, memory, commands via AI"),
+                ("/voice", "[<file>]", "audio transcription & voice input"),
+                ("/vim", "", "toggle Vim modal editing"),
+                ("/mouse", "[on|off]", "wheel scroll + drag-copy (/scroll)"),
+                ("/doctor", "(/debug)", "diagnose setup"),
+                ("/clear", "", "clear the screen"),
+                ("/exit", "", "exit"),
+            ],
+        ),
+    ];
+
+    let cmd_w = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter())
+        .map(|(cmd, _, _)| cmd.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    tui::line("");
+    tui::line(&tui::bold(&tui::accent("  commands")));
+    for (title, rows) in sections {
+        tui::line("");
+        tui::line(&tui::dim(&format!("  {title}")));
+        for (cmd, args, desc) in rows.iter() {
+            let pad = " ".repeat(cmd_w.saturating_sub(cmd.chars().count()));
+            let args_part = if args.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", tui::dim(args))
+            };
+            tui::line(&format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
+        }
+    }
+    tui::line("");
+    tui::line(&tui::dim("  input"));
     tui::line(&tui::dim(
-        "  ─────────────────────────────────────────────────────────────",
-    ));
-    tui::line(&format!(
-        "  {}  cycle modes (PLAN → BUILD → BRAINSTORM)",
-        tui::bold("Shift+Tab")
-    ));
-    tui::line(&format!(
-        "  {}         show/switch mode  {}",
-        tui::bold("/mode"),
-        tui::dim("[plan|build|brainstorm]")
-    ));
-    tui::line(&format!(
-        "  {}   show/switch tool permissions  {}",
-        tui::bold("/permissions"),
-        tui::dim("[ask|auto|readonly]")
-    ));
-    tui::line(&format!(
-        "  {}         mouse wheel scrolling  {}",
-        tui::bold("/mouse"),
-        tui::dim("[on|off]  on by default; /scroll is an alias")
-    ));
-    tui::line(&format!(
-        "  {}        scroll transcript",
-        tui::bold("PgUp/PgDn · Alt+↑/↓")
-    ));
-    tui::line(&tui::dim(
-        "               or just say: \"switch to build mode\" / \"use readonly\"",
-    ));
-    tui::line(&format!(
-        "  {}        hot-swap the AI model mid-session",
-        tui::bold("/model")
-    ));
-    tui::line(&format!(
-        "  {}        local model server & GGUF/Ollama management",
-        tui::bold("/local")
-    ));
-    tui::line(&format!(
-        "  {}      compact context  {}",
-        tui::bold("/compact"),
-        tui::dim("(free up token budget)")
-    ));
-    tui::line(&format!(
-        "  {}          show current context usage",
-        tui::bold("/context")
-    ));
-    tui::line(&format!(
-        "  {}             show current git diff summary",
-        tui::bold("/diff")
-    ));
-    tui::line(&format!(
-        "  {}       AI code review of staged git diff",
-        tui::bold("/review")
-    ));
-    tui::line(&format!(
-        "  {}       AI-drafted conventional commit message",
-        tui::bold("/commit")
-    ));
-    tui::line(&format!(
-        "  {}           AI-drafted PR title + description",
-        tui::bold("/pr")
-    ));
-    tui::line(&format!(
-        "  {}    schedule a one-shot workflow  {}",
-        tui::bold("/schedule"),
-        tui::dim("<delay> <task>")
-    ));
-    tui::line(&format!(
-        "  {}         start a repeating workflow  {}",
-        tui::bold("/loop"),
-        tui::dim("<interval> <task>")
-    ));
-    tui::line(&format!(
-        "  {}   list and manage background workflows  {}",
-        tui::bold("/workflows"),
-        tui::dim("(/tasks)")
-    ));
-    tui::line(&format!(
-        "  {}          inject context into next agent turn  {}",
-        tui::bold("/btw"),
-        tui::dim("<context>")
-    ));
-    tui::line(&format!(
-        "  {}        audio transcription & offline voice input  {}",
-        tui::bold("/voice"),
-        tui::dim("([<file>])")
-    ));
-    tui::line(&format!(
-        "  {}       configure hooks, memory, commands via AI",
-        tui::bold("/config")
-    ));
-    tui::line(&format!(
-        "  {}       view/edit session memory",
-        tui::bold("/memory")
-    ));
-    tui::line(&format!(
-        "  {}       list available skills and custom commands",
-        tui::bold("/skills")
-    ));
-    tui::line(&format!(
-        "  {}        browse callable tools",
-        tui::bold("/tools")
-    ));
-    tui::line(&format!(
-        "  {}        inspect engineering rules and violations",
-        tui::bold("/rules")
-    ));
-    tui::line(&format!(
-        "  {}           query or index project knowledge base  {}",
-        tui::bold("/kb"),
-        tui::dim("(/index)")
-    ));
-    tui::line(&format!(
-        "  {}       verify codebase against rules and tests  {}",
-        tui::bold("/verify"),
-        tui::dim("(/audit)")
-    ));
-    tui::line(&format!(
-        "  {}          inspect configured enterprise MCP servers",
-        tui::bold("/mcp")
-    ));
-    tui::line(&format!(
-        "  {}        inspect hooks, tools, skills, and subagents",
-        tui::bold("/trace")
-    ));
-    tui::line(&format!(
-        "  {}       show loaded Agents.md context",
-        tui::bold("/agents")
-    ));
-    tui::line(&format!(
-        "  {}  list edit checkpoints",
-        tui::bold("/checkpoints")
-    ));
-    tui::line(&format!(
-        "  {}         restore checkpoint (<git|all|id>)  {}",
-        tui::bold("/undo"),
-        tui::dim("(/rewind)")
-    ));
-    tui::line(&format!(
-        "  {}     interactive operational alignment  {}",
-        tui::bold("/grill-me"),
-        tui::dim("(/align · /interview)")
-    ));
-    tui::line(&format!(
-        "  {}     autonomous multi-agent swarm preview  {}",
-        tui::bold("/teamwork"),
-        tui::dim("(/swarm)")
-    ));
-    tui::line(&format!(
-        "  {}       diagnose setup  {}",
-        tui::bold("/doctor"),
-        tui::dim("(/debug)")
-    ));
-    tui::line(&format!(
-        "  {}          start a fresh session",
-        tui::bold("/new")
-    ));
-    tui::line(&format!(
-        "  {}      pick a saved session to resume",
-        tui::bold("/resume")
-    ));
-    tui::line(&format!(
-        "  {}         run setup (keys, providers, local models)",
-        tui::bold("/init")
-    ));
-    tui::line(&format!(
-        "  {}        clear the screen",
-        tui::bold("/clear")
-    ));
-    tui::line(&format!("  {}         exit", tui::bold("/exit")));
-    tui::line(&tui::dim(
-        "  ─────────────────────────────────────────────────────────────",
-    ));
-    tui::line(&tui::dim("  !<cmd>   run a shell command directly"));
-    tui::line(&tui::dim(
-        "  @<tool>  tab-complete operational tools (@diff, @status, @rules, @kb:, @symbol:, @url:)",
-    ));
-    tui::line(&format!(
-        "  {}          toggle Vim modal editing mode (Normal/Insert)",
-        tui::bold("/vim")
+        "    !<cmd> shell command · @<path> attach file · @diff @status @kb: @symbol:",
     ));
     tui::line(&tui::dim(
-        "  Tab      autocomplete /commands and their sub-args",
+        "    Tab complete · ↑↓ history · ^R search · ^G $EDITOR · \\+Enter newline",
     ));
     tui::line(&tui::dim(
-        "  ←→ ^A ^E  move · ^W ^U ^K kill · ^Y yank · ↑↓ history",
+        "    ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · PgUp/PgDn scroll",
     ));
-    tui::line(&tui::dim(
-        "  ^G open in $EDITOR · ^R reverse search · \\ + Enter = newline",
-    ));
-    tui::line(&tui::dim(
-        "  Tools active in all modes: read_file, run_command, grep, etc.",
-    ));
+    tui::line("");
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
@@ -3027,7 +2923,7 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
     if missing.is_empty() {
         if interactive {
             tui::line(&tui::green(
-                "  ✓ All required OOTB dependencies (git, rg, node, npm, python3) are installed!",
+                "  ✓ dependencies installed (git, rg, node, npm, python3)",
             ));
         }
         return;

@@ -475,7 +475,26 @@ pub fn is_readonly_command(cmd: &str) -> bool {
 }
 
 // A one-line, human-readable preview of what a call will do (shown at the gate).
+// One transcript line max: newlines/runs of whitespace collapse to single
+// spaces and long arguments get an ellipsis, so a multi-line heredoc or a
+// 300-char one-liner can't smear across the transcript (or the permission
+// prompt, which reuses this).
+const PREVIEW_MAX_CHARS: usize = 80;
+
+fn clamp_preview(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= PREVIEW_MAX_CHARS {
+        return flat;
+    }
+    let cut: String = flat.chars().take(PREVIEW_MAX_CHARS - 1).collect();
+    format!("{cut}…")
+}
+
 pub fn preview(name: &str, input: &Value) -> String {
+    clamp_preview(&raw_preview(name, input))
+}
+
+fn raw_preview(name: &str, input: &Value) -> String {
     match name {
         "write" | "write_file" => format!("write {}", path_arg(input).unwrap_or("?")),
         "edit" | "edit_file" => format!("edit {}", path_arg(input).unwrap_or("?")),
@@ -5371,7 +5390,7 @@ print("hello " + data.get("name", "world"))
             &d,
         );
         assert!(!ver.is_error, "{}", ver.content);
-        assert!(ver.content.contains("Verification Report"));
+        assert!(ver.content.contains("## Verification:"));
 
         let _ = fs::remove_dir_all(&d);
     }

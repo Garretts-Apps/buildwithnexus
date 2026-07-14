@@ -343,7 +343,7 @@ fn hunk_lines(ops: &[(char, &str)]) -> Vec<String> {
 
 pub fn tool_denied(reason: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::dim(&format!("  ✗ {reason}"))),
+        Mode::Human => tui::line(&tui::red(&format!("  ✗ {reason}"))),
         Mode::Json => emit(json!({"type": "tool_denied", "reason": reason})),
     }
 }
@@ -352,7 +352,8 @@ pub fn finish(summary: &str) {
     match mode() {
         Mode::Human => {
             tui::line("");
-            tui::line(&tui::green(&format!("✨ {summary}")));
+            tui::line(&tui::green(&format!("  ✓ {}", tui::bold("done"))));
+            tui::line(&tui::render_md(summary));
         }
         Mode::Json => emit(json!({"type": "finish", "summary": summary})),
     }
@@ -360,14 +361,24 @@ pub fn finish(summary: &str) {
 
 pub fn error(msg: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!("  {msg}"))),
+        Mode::Human => tui::line(&tui::red(&format!("  ✗ {msg}"))),
         Mode::Json => emit(json!({"type": "error", "message": msg})),
     }
 }
 
+// Warnings: things the user should notice (truncation, fallbacks, retries).
 pub fn notice(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::yellow(msg)),
+        Mode::Json => emit(json!({"type": "notice", "message": msg})),
+    }
+}
+
+// Informational chrome (progress, sub-steps): dim, so it never competes with
+// warnings for attention.
+pub fn info(msg: &str) {
+    match mode() {
+        Mode::Human => tui::line(&tui::dim(msg)),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }

@@ -14,6 +14,19 @@ pub enum VerificationStatus {
     Failed,
 }
 
+impl VerificationStatus {
+    /// Human-readable label for transcript display (vs the snake_case serde
+    /// name used on the wire).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::PassedWithWarnings => "passed with warnings",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl fmt::Display for VerificationStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -284,23 +297,23 @@ impl Verifier {
 
     /// Formats the verification report as human-readable Markdown text.
     pub fn format_report(report: &VerificationReport) -> String {
-        let mut out = format!(
-            "## Verification Report: {}\n\n",
-            report.status.to_string().to_uppercase()
-        );
+        let mut out = format!("## Verification: {}\n\n", report.status.label());
         out.push_str(&format!("- **Task**: {}\n", report.task_description));
         out.push_str(&format!(
             "- **Confidence**: {:.2} ({})\n",
-            report.confidence,
-            report.confidence_level.to_uppercase()
+            report.confidence, report.confidence_level
         ));
         out.push_str(&format!(
-            "- **Files Changed**: {}\n",
+            "- **Files changed**: {}\n",
             report.files_changed.len()
         ));
         out.push_str(&format!(
-            "- **Tests Run**: {}\n\n",
-            report.tests_status.tests_run
+            "- **Tests run**: {}\n\n",
+            if report.tests_status.tests_run {
+                "yes"
+            } else {
+                "no"
+            }
         ));
 
         if !report.rule_violations.is_empty() {

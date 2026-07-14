@@ -97,10 +97,12 @@ fn parse_session(path: &Path, text: &str) -> Option<Session> {
     match serde_json::from_str(text) {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "warning: skipping corrupt session file {}: {e}",
+            // tui::line, not eprintln — this runs inside the alt-screen TUI
+            // during /resume and a raw write corrupts the display.
+            crate::tui::line(&crate::tui::yellow(&format!(
+                "  ⚠ skipping corrupt session file {}: {e}",
                 path.display()
-            );
+            )));
             None
         }
     }
