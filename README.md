@@ -147,7 +147,7 @@ cargo build --release --manifest-path harness/Cargo.toml   # → harness/target/
 bash scripts/vendor.sh                                      # vendor deps for offline / reproducible builds
 ```
 
-The npm package is a thin wrapper: `postinstall` downloads the prebuilt binary
+The npm package is a thin, script-free wrapper: the first run downloads the prebuilt binary
 for your platform from the GitHub Release and **verifies its SHA-256** before
 use, falling back to a `cargo` build (using vendored deps when present). Releases
 also carry build-provenance attestations (`gh attestation verify`).

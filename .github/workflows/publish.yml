@@ -1,14 +1,15 @@
 name: Publish to npm
 
-# The published package is a thin, zero-dependency wrapper: `postinstall`
-# fetches the SHA-256-verified prebuilt binary for the user's platform from the
-# GitHub Release, falling back to a cargo build. So publishing is just
-# `npm publish` of the wrapper — no bundle step.
+# The published package is a thin, zero-dependency, script-free wrapper: the
+# FIRST RUN fetches the SHA-256-verified prebuilt binary for the user's
+# platform from the GitHub Release (no npm install scripts — keeps
+# supply-chain scanners green). So publishing is just `npm publish` of the
+# wrapper — no bundle step.
 #
 # Sequencing: publishing is chained off the `release` workflow's COMPLETION, not
 # the raw `v*` tag. release.yml builds and attaches the per-platform binaries on
 # the tag; only once that whole workflow succeeds do we publish to npm — so a
-# user never installs a version whose binaries aren't up yet (the postinstall
+# user never installs a version whose binaries aren't up yet (the first-run
 # fast path). workflow_dispatch stays for manual/emergency publishes.
 on:
   workflow_run:
@@ -20,7 +21,7 @@ on:
         # Default 'none': publish the version already on main, whose release
         # binaries exist. A bump here can't push a tag (OIDC-only, no PAT), so
         # release.yml never builds binaries for the bumped version — leaving
-        # postinstall with a 404 fast path. Bump via a PR to main instead.
+        # the first-run download with a 404. Bump via a PR to main instead.
         description: "Version bump — keep 'none' to publish the current version (recommended)"
         required: true
         default: "none"
@@ -107,7 +108,7 @@ jobs:
             echo "::warning::Could not push bump+tag to main. Publishing to npm anyway."
           fi
 
-      # Guard the install path: a syntax error in the wrapper or postinstall
+      # Guard the launch path: a syntax error in the wrapper or bootstrap
       # would break `npm install` for every user. Cheap to check, expensive to miss.
       - name: Syntax-check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done

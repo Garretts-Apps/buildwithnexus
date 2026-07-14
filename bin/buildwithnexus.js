@@ -34,14 +34,21 @@ function maybeAutoUpdate() {
 
 maybeAutoUpdate();
 
-const bin = existing();
+let bin = existing();
 if (!bin) {
-  process.stderr.write(
-    'buildwithnexus: native binary not found.\n' +
-    '  Reinstall the package, or build it locally with Rust (https://rustup.rs):\n' +
-    '    npm explore buildwithnexus -- npm run build\n'
+  // First run: fetch the checksum-verified prebuilt for this platform.
+  // Installs are script-free by design — the download happens here, visibly,
+  // instead of inside npm install.
+  const boot = spawnSync(
+    process.execPath,
+    [path.join(__dirname, '..', 'scripts', 'bootstrap.js')],
+    { stdio: 'inherit' }
   );
-  process.exit(1);
+  bin = existing();
+  if (!bin || (boot.status !== 0 && !bin)) {
+    process.stderr.write('buildwithnexus: no native binary available for this platform.\n');
+    process.exit(1);
+  }
 }
 
 const result = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });

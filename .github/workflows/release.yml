@@ -1,7 +1,7 @@
 name: release
 
 # Build the native harness for every supported platform and attach the binaries
-# to the GitHub Release. The npm postinstall downloads these as its fast path.
+# to the GitHub Release. The npm wrapper's first run downloads these.
 # publish.yml chains off this workflow's completion to push to npm.
 on:
   push:

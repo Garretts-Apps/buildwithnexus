@@ -11,19 +11,14 @@
     "index.js",
     "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
+    "scripts/bootstrap.js",
     "scripts/auto-update.js",
-    "scripts/postinstall.js",
-    "harness/Cargo.toml",
-    "harness/Cargo.lock",
-    "harness/src/",
     "README.md",
     "LICENSE",
     "SECURITY.md"
   ],
   "scripts": {
-    "postinstall": "node scripts/postinstall.js",
     "build": "cargo build --release --manifest-path harness/Cargo.toml",
-    "vendor": "bash scripts/vendor.sh",
     "start": "node bin/buildwithnexus.js"
   },
   "engines": {

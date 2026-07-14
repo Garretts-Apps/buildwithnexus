@@ -1,12 +1,13 @@
 'use strict';
-// Get a working native binary on `npm install`, then walk the user into setup.
-// Order: already present -> download a checksum-verified prebuilt -> build from
-// source. Never hard-fails the install (a thrown postinstall aborts `npm i`).
+// First-run bootstrap: fetch the checksum-verified prebuilt binary for this
+// platform from the GitHub Release. Runs from the launcher the first time the
+// CLI starts (NOT as an npm install script — installs stay script-free).
+// Only ever downloads from GitHub's own hosts, and refuses any binary whose
+// SHA-256 doesn't match the published checksum.
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const { spawnSync } = require('child_process');
 const { ROOT, ext, target, installedBinary, existing } = require('./resolve-binary.js');
 
 const pkg = require(path.join(ROOT, 'package.json'));
@@ -64,36 +65,9 @@ function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-function hasCargo() {
-  const r = spawnSync('cargo', ['--version'], { stdio: 'ignore' });
-  return !r.error && r.status === 0;
-}
-
-function buildFromSource() {
-  log('buildwithnexus: building native binary from source (cargo)…');
-  const manifest = path.join(ROOT, 'harness', 'Cargo.toml');
-  const offline = fs.existsSync(path.join(ROOT, 'harness', 'vendor'));
-  const args = ['build', '--release', '--manifest-path', manifest];
-  if (offline) args.push('--offline');
-  const r = spawnSync('cargo', args, { stdio: 'inherit' });
-  if (r.status !== 0) return false;
-  fs.mkdirSync(path.join(ROOT, 'bin'), { recursive: true });
-  const rootTarget = path.join(ROOT, 'target', 'release', 'buildwithnexus' + ext());
-  const harnessTarget = path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext());
-  const built = fs.existsSync(rootTarget) ? rootTarget : harnessTarget;
-  fs.copyFileSync(built, installedBinary());
-  try { fs.chmodSync(installedBinary(), 0o755); } catch {}
-  return true;
-}
-
-function isLocalCheckout() {
-  return fs.existsSync(path.join(ROOT, '.git'));
-}
-
 async function obtain() {
   if (process.env.BWN_SKIP_INSTALL) return false;
-  if (isLocalCheckout() && hasCargo() && buildFromSource()) return true;
-  if (existing() && !isLocalCheckout()) return true;
+  if (existing()) return true;
 
   const t = target();
   if (t) {
@@ -116,11 +90,9 @@ async function obtain() {
       return true;
     } catch (e) {
       try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch {}
-      log(`buildwithnexus: prebuilt unavailable (${e.message}); falling back to source build…`);
+      log(`buildwithnexus: prebuilt unavailable (${e.message}).`);
     }
   }
-
-  if (hasCargo() && buildFromSource()) return true;
   return false;
 }
 
@@ -134,12 +106,19 @@ function walkthrough(ok) {
     log('  Then describe a task. It plans, edits files, and runs commands — asking before each change.');
   } else {
     log('  \x1b[33mbuildwithnexus: native binary not available yet.\x1b[0m');
-    log('  Install Rust (https://rustup.rs), then:  npm explore buildwithnexus -- npm run build');
+    log('  Build from source: git clone https://github.com/Garretts-Apps/buildwithnexus');
+    log('  then: cargo build --release --manifest-path harness/Cargo.toml');
+    log('  and point BWN_BIN at the built binary.');
   }
   log('');
 }
 
 obtain()
-  .then(walkthrough)
-  .catch(() => walkthrough(false))
-  .finally(() => process.exit(0));
+  .then((ok) => {
+    walkthrough(ok);
+    process.exit(ok ? 0 : 1);
+  })
+  .catch(() => {
+    walkthrough(false);
+    process.exit(1);
+  });
