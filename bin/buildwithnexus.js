@@ -4,10 +4,21 @@
 // so the alternate-screen TUI works exactly as if it were invoked directly.
 // Deliberately boring — no install scripts, no network, no dynamic code. The
 // binary itself handles update checks.
+const path = require('path');
 const { spawnSync } = require('child_process');
 const { existing, platformPackage, target } = require('../scripts/resolve-binary.js');
 
-const bin = existing();
+let bin = existing();
+if (!bin) {
+  // Fallback: the platform optionalDependency is absent (--omit=optional, or
+  // the platform package isn't published yet). Fetch the checksum-verified
+  // prebuilt from the GitHub release — visibly, on first run, never during
+  // npm install.
+  spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'bootstrap.js')], {
+    stdio: 'inherit',
+  });
+  bin = existing();
+}
 if (!bin) {
   const pkg = platformPackage();
   const t = target();

@@ -145,8 +145,17 @@ jobs:
       # A brand-new package can't use OIDC before it exists — publish each
       # once manually (npm publish --access public from npm/<platform>) or
       # create them via a granular token, then add the trusted publishers.
+      # Runs on every invocation (not gated on the main-package check) and
+      # skips versions that already exist — so tokens can be added later and
+      # the workflow simply re-run to fill in whatever is missing.
       - name: Publish platform binary packages
-        if: steps.published.outputs.already == 'false'
+        env:
+          # One-time bootstrap only: npm OIDC cannot CREATE a package, so the
+          # five platform packages' first publish uses this granular token
+          # (created in the npmjs.com UI, pasted as a repo secret). After the
+          # first release: attach Trusted Publishers to each package and
+          # DELETE this secret — later versions publish via OIDC.
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
           V=$(node -p "require('./package.json').version")
@@ -172,8 +181,26 @@ jobs:
             [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
             chmod +x "npm/${p}/bin/buildwithnexus${ext}"
             node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-            (cd "npm/${p}" && npm publish --access public --provenance) \
-              || echo "::warning::publish of buildwithnexus-${p} failed — configure its npm Trusted Publisher (see comment above)"
+            # OIDC first; bootstrap-token fallback for the first publish of
+            # a brand-new package (see env comment above).
+            if ! (cd "npm/${p}" && npm publish --access public --provenance); then
+              if [ -n "${NPM_TOKEN}" ]; then
+                echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token"
+                (cd "npm/${p}" && npm publish --access public --provenance \
+                  --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
+                  || echo "::warning::bootstrap-token publish of buildwithnexus-${p} also failed"
+              else
+                echo "::warning::OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set"
+              fi
+            fi
+          done
+          # Installs stay safe even if platform packages are missing: the
+          # launcher falls back to a checksum-verified first-run download
+          # from the GitHub release. Surface what's missing, loudly.
+          for p in "${!T[@]}"; do
+            if ! npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
+              echo "::warning::buildwithnexus-${p}@${V} is not on the registry — installs will use the first-run download fallback until it is published (add NPM_TOKEN and re-run this workflow)"
+            fi
           done
           # Pin the main package's optionalDependencies to this exact version.
           node -e "const fs=require('fs'),j=require('./package.json');for(const k of Object.keys(j.optionalDependencies||{}))j.optionalDependencies[k]='${V}';fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')"
@@ -197,22 +224,33 @@ jobs:
         run: npm publish --access public --provenance
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
-      # `cargo install bwn` (alias crate). Requires a CARGO_REGISTRY_TOKEN
-      # repo secret (create at https://crates.io/settings/tokens with
-      # publish-new + publish-update scope). Skips with a warning when the
-      # secret is absent. bwn depends on the just-published buildwithnexus,
-      # so it retries while the index propagates.
+      # `cargo install bwn` (alias crate). OIDC only — the auth action
+      # exchanges this job's OIDC token for a 30-minute crates.io token.
+      # Like npm, crates.io Trusted Publishing must be configured per crate
+      # (crates.io → crate → Settings → Trusted Publishing: this repo,
+      # publish.yml) and the FIRST publish of each crate is a one-time
+      # `cargo publish` from a maintainer machine (cargo login).
+      # Not gated on the npm check: crates.io can be published later (add the
+      # token or configure Trusted Publishing, then re-run this workflow) —
+      # the step skips crate versions that already exist.
       - name: Install Rust for crates.io publish
-        if: steps.published.outputs.already == 'false'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Get crates.io token via OIDC
+        id: cratesio
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish to crates.io
-        if: steps.published.outputs.already == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # OIDC token when Trusted Publishing is configured; otherwise the
+          # one-time bootstrap token secret (crates.io UI → API Tokens) used
+          # to create the crates. Delete the secret after attaching Trusted
+          # Publishing to both crates.
+          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish (npm publish is unaffected)."
+            echo "::warning::no crates.io OIDC token and no CARGO_REGISTRY_TOKEN bootstrap secret — skipping crates.io publish."
             exit 0
           fi
           set -e
@@ -221,6 +259,10 @@ jobs:
             echo "buildwithnexus ${V} already on crates.io — skipping."
           else
             cargo publish -p buildwithnexus --locked
+          fi
+          if cargo info "bwn@${V}" >/dev/null 2>&1; then
+            echo "bwn ${V} already on crates.io — done."
+            exit 0
           fi
           # bwn depends on the crate above; wait out index propagation.
           for i in 1 2 3 4 5; do

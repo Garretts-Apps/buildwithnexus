@@ -11,6 +11,7 @@
     "index.js",
     "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
+    "scripts/bootstrap.js",
     "README.md",
     "LICENSE",
     "SECURITY.md",

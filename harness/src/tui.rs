@@ -457,6 +457,49 @@ pub fn diff_del_emph_span(s: &str) -> String {
     on_bg(DIFF_DEL_EMPH_BG, TEXT, s)
 }
 
+// ── inline image preview ─────────────────────────────────────────────────────
+// Renders RGB pixels as half-block cells: each character shows two vertically
+// stacked pixels ('▀' with fg = top pixel, bg = bottom pixel). Works in every
+// truecolor terminal — no kitty/iTerm2 graphics protocol needed — and the
+// result is ordinary transcript lines, so scrolling, wrapping, and repaints
+// all behave. Returns no lines when color is off or the buffer is malformed.
+pub fn image_preview(rgb: &[u8], w: u32, h: u32) -> Vec<String> {
+    if no_color() || !truecolor() {
+        return Vec::new();
+    }
+    image_preview_cells(rgb, w, h)
+}
+
+// Pure renderer (no terminal-capability gate) — unit-testable.
+fn image_preview_cells(rgb: &[u8], w: u32, h: u32) -> Vec<String> {
+    let (w, h) = (w as usize, h as usize);
+    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+        return Vec::new();
+    }
+    let px = |x: usize, y: usize| {
+        let i = (y * w + x) * 3;
+        (rgb[i], rgb[i + 1], rgb[i + 2])
+    };
+    let mut out = Vec::with_capacity(h.div_ceil(2));
+    for row in 0..h.div_ceil(2) {
+        let mut line = String::with_capacity(w * 24 + 16);
+        line.push_str("  ");
+        for x in 0..w {
+            let (tr, tg, tb) = px(x, row * 2);
+            if row * 2 + 1 < h {
+                let (br, bg, bb) = px(x, row * 2 + 1);
+                line.push_str(&format!("\x1b[38;2;{tr};{tg};{tb};48;2;{br};{bg};{bb}m▀"));
+            } else {
+                line.push_str(&format!("\x1b[38;2;{tr};{tg};{tb}m▀"));
+            }
+        }
+        line.push_str(&reset_all());
+        line.push_str(&reset_bg());
+        out.push(line);
+    }
+    out
+}
+
 // Terminal width for layout done outside this module (diff gutters).
 pub fn term_width() -> usize {
     term_size().0 as usize
@@ -2070,12 +2113,12 @@ fn wordmark() -> String {
     if no_color() {
         return "buildwithnexus".to_string();
     }
-    // Gradient stops: Tokyo Night purple → blue → cyan → green.
+    // Gradient stops: monochrome blue ramp, deep → pale.
     let stops: &[(u8, u8, u8)] = &[
-        (0xbb, 0x9a, 0xf7),
+        (0x3d, 0x6d, 0xe0),
         (0x7a, 0xa2, 0xf7),
-        (0x7d, 0xcf, 0xff),
-        (0x9e, 0xce, 0x6a),
+        (0x9e, 0xc9, 0xff),
+        (0xcf, 0xe5, 0xff),
     ];
     let word = "buildwithnexus";
     let n = word.len();
@@ -4519,6 +4562,32 @@ mod tests {
                 assert_eq!(got, want, "start={start} count={count}");
             }
         }
+    }
+
+    #[test]
+    fn image_preview_renders_half_blocks() {
+        // 2x2 image: red/green over blue/white → one text row, two cells.
+        let rgb = [255u8, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let rows = image_preview_cells(&rgb, 2, 2);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.matches('▀').count(), 2, "{r}");
+        assert!(
+            r.contains("38;2;255;0;0") && r.contains("48;2;0;0;255"),
+            "{r}"
+        );
+        assert!(
+            r.contains("38;2;0;255;0") && r.contains("48;2;255;255;255"),
+            "{r}"
+        );
+        // Odd height: the last pixel row renders fg-only.
+        let rgb3 = [10u8, 20, 30, 40, 50, 60, 70, 80, 90];
+        let rows3 = image_preview_cells(&rgb3, 1, 3);
+        assert_eq!(rows3.len(), 2);
+        assert!(rows3[1].contains("38;2;70;80;90"), "{}", rows3[1]);
+        // Malformed buffer → nothing.
+        assert!(image_preview_cells(&[1, 2], 2, 2).is_empty());
+        assert!(image_preview_cells(&rgb, 0, 2).is_empty());
     }
 
     #[test]
