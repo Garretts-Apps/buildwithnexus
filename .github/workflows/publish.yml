@@ -255,12 +255,25 @@ jobs:
           fi
           set -e
           V=$(node -p "require('./package.json').version")
-          if cargo info "buildwithnexus@${V}" >/dev/null 2>&1; then
+          # `cargo info <name>` resolves workspace members LOCALLY, so from
+          # inside this repo it always says our crates exist — ask the
+          # registry's sparse index instead.
+          on_registry() {
+            local n=$1 p
+            case ${#n} in
+              1) p="1/$n" ;;
+              2) p="2/$n" ;;
+              3) p="3/${n:0:1}/$n" ;;
+              *) p="${n:0:2}/${n:2:2}/$n" ;;
+            esac
+            curl -sf "https://index.crates.io/$p" | grep -q "\"vers\":\"$V\""
+          }
+          if on_registry buildwithnexus; then
             echo "buildwithnexus ${V} already on crates.io — skipping."
           else
             cargo publish -p buildwithnexus --locked
           fi
-          if cargo info "bwn@${V}" >/dev/null 2>&1; then
+          if on_registry bwn; then
             echo "bwn ${V} already on crates.io — done."
             exit 0
           fi
