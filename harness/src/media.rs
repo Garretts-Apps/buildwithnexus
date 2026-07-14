@@ -214,6 +214,68 @@ pub fn attach_video(path: &Path) -> Option<VideoAttachment> {
     Some(VideoAttachment { frames, summary })
 }
 
+// ── inline thumbnails ────────────────────────────────────────────────────────
+// Decode an image (or a video's first frame) to a small RGB24 buffer via
+// ffmpeg — no image-decoding dependencies in the binary. The TUI renders it
+// as half-block cells so attached screenshots are visible in the transcript.
+
+fn probe_dims(path: &Path) -> Option<(u32, u32)> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let s = v["streams"].get(0)?;
+    let (w, h) = (s["width"].as_u64()? as u32, s["height"].as_u64()? as u32);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// RGB thumbnail of an image or a video's first frame, scaled to fit
+/// max_w × max_h with aspect preserved. Returns (width, height, rgb24).
+pub fn decode_thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if !ffmpeg_available() {
+        return None;
+    }
+    let (iw, ih) = probe_dims(path)?;
+    let scale = f64::min(max_w as f64 / iw as f64, max_h as f64 / ih as f64).min(1.0);
+    let w = ((iw as f64 * scale) as u32).max(1);
+    // Even height: half-block cells show two rows of pixels per text line.
+    let h = (((ih as f64 * scale) as u32).max(2) / 2) * 2;
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!("scale={w}:{h}"),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.len() != (w * h * 3) as usize {
+        return None;
+    }
+    Some((w, h, out.stdout))
+}
+
 // ── clipboard capture ────────────────────────────────────────────────────────
 
 /// Grabs an image from the system clipboard into a temp PNG, if one is there.

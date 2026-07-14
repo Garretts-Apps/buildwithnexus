@@ -83,6 +83,18 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         "write" | "write_file" | "edit" | "edit_file" | "patch" | "apply_patch" => {
             ("✦", tui::yellow(preview))
         }
+        // The .docx path is an OSC 8 file:// link — click opens the document
+        // in Word / the OS default app on supporting terminals.
+        "create_docx" => (
+            "✦",
+            match input["path"]
+                .as_str()
+                .or_else(|| input["filePath"].as_str())
+            {
+                Some(p) if !p.trim().is_empty() => tui::file_link(p, &tui::yellow(preview)),
+                _ => tui::yellow(preview),
+            },
+        ),
         "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
             ("⚡", tui::blue(preview))
         }

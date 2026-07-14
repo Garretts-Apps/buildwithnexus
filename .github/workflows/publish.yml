@@ -145,8 +145,10 @@ jobs:
       # A brand-new package can't use OIDC before it exists — publish each
       # once manually (npm publish --access public from npm/<platform>) or
       # create them via a granular token, then add the trusted publishers.
+      # Runs on every invocation (not gated on the main-package check) and
+      # skips versions that already exist — so tokens can be added later and
+      # the workflow simply re-run to fill in whatever is missing.
       - name: Publish platform binary packages
-        if: steps.published.outputs.already == 'false'
         env:
           # One-time bootstrap only: npm OIDC cannot CREATE a package, so the
           # five platform packages' first publish uses this granular token
@@ -192,17 +194,14 @@ jobs:
               fi
             fi
           done
-          # FAIL CLOSED: the main package's optionalDependencies point at these
-          # exact versions — publishing it while any platform package is
-          # missing would ship installs with no binary at all.
-          missing=0
+          # Installs stay safe even if platform packages are missing: the
+          # launcher falls back to a checksum-verified first-run download
+          # from the GitHub release. Surface what's missing, loudly.
           for p in "${!T[@]}"; do
             if ! npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
-              echo "::error::buildwithnexus-${p}@${V} is not on the registry — aborting main publish"
-              missing=1
+              echo "::warning::buildwithnexus-${p}@${V} is not on the registry — installs will use the first-run download fallback until it is published (add NPM_TOKEN and re-run this workflow)"
             fi
           done
-          [ "$missing" -eq 0 ] || exit 1
           # Pin the main package's optionalDependencies to this exact version.
           node -e "const fs=require('fs'),j=require('./package.json');for(const k of Object.keys(j.optionalDependencies||{}))j.optionalDependencies[k]='${V}';fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')"
 
@@ -231,18 +230,18 @@ jobs:
       # (crates.io → crate → Settings → Trusted Publishing: this repo,
       # publish.yml) and the FIRST publish of each crate is a one-time
       # `cargo publish` from a maintainer machine (cargo login).
+      # Not gated on the npm check: crates.io can be published later (add the
+      # token or configure Trusted Publishing, then re-run this workflow) —
+      # the step skips crate versions that already exist.
       - name: Install Rust for crates.io publish
-        if: steps.published.outputs.already == 'false'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Get crates.io token via OIDC
         id: cratesio
-        if: steps.published.outputs.already == 'false'
         continue-on-error: true
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
-        if: steps.published.outputs.already == 'false'
         env:
           # OIDC token when Trusted Publishing is configured; otherwise the
           # one-time bootstrap token secret (crates.io UI → API Tokens) used
@@ -260,6 +259,10 @@ jobs:
             echo "buildwithnexus ${V} already on crates.io — skipping."
           else
             cargo publish -p buildwithnexus --locked
+          fi
+          if cargo info "bwn@${V}" >/dev/null 2>&1; then
+            echo "bwn ${V} already on crates.io — done."
+            exit 0
           fi
           # bwn depends on the crate above; wait out index propagation.
           for i in 1 2 3 4 5; do

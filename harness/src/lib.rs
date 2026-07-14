@@ -2617,6 +2617,14 @@ fn extract_attachments(
                             _ => "image/png",
                         };
                         images.push((media_type.to_string(), media::b64_encode(&buf)));
+                        // Show the attachment in the transcript: a half-block
+                        // thumbnail rendered inline (any truecolor terminal).
+                        if let Some((tw, th, rgb)) = media::decode_thumbnail(&p, 64, 36) {
+                            let rows = tui::image_preview(&rgb, tw, th);
+                            if !rows.is_empty() {
+                                tui::line(&rows.join("\n"));
+                            }
+                        }
                         if !clean.is_empty() {
                             clean.push(' ');
                         }
@@ -2645,6 +2653,13 @@ fn extract_attachments(
                         let n = v.frames.len();
                         images.extend(v.frames);
                         text_attachments.push(v.summary);
+                        // First frame as an inline thumbnail.
+                        if let Some((tw, th, rgb)) = media::decode_thumbnail(&p, 64, 36) {
+                            let rows = tui::image_preview(&rgb, tw, th);
+                            if !rows.is_empty() {
+                                tui::line(&rows.join("\n"));
+                            }
+                        }
                         if !clean.is_empty() {
                             clean.push(' ');
                         }
