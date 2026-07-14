@@ -2070,12 +2070,12 @@ fn wordmark() -> String {
     if no_color() {
         return "buildwithnexus".to_string();
     }
-    // Gradient stops: Tokyo Night purple → blue → cyan → green.
+    // Gradient stops: monochrome blue ramp, deep → pale.
     let stops: &[(u8, u8, u8)] = &[
-        (0xbb, 0x9a, 0xf7),
+        (0x3d, 0x6d, 0xe0),
         (0x7a, 0xa2, 0xf7),
-        (0x7d, 0xcf, 0xff),
-        (0x9e, 0xce, 0x6a),
+        (0x9e, 0xc9, 0xff),
+        (0xcf, 0xe5, 0xff),
     ];
     let word = "buildwithnexus";
     let n = word.len();
