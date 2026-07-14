@@ -205,10 +205,12 @@ pub fn diff(path: &str, old: &str, new: &str) {
     } else {
         ("edit", format!("(+{added} -{removed})"))
     };
+    // The path is an OSC 8 file:// link — click opens the file in the OS
+    // default app on supporting terminals.
     tui::line(&format!(
         "  {} {} {}",
         tui::accent("⏺"),
-        tui::bold(&format!("{verb} {path}")),
+        tui::file_link(path, &tui::bold(&format!("{verb} {path}"))),
         tui::dim(&stat)
     ));
     // Single batched line() call → one repaint for the whole diff body.

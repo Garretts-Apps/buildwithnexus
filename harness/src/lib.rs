@@ -7,6 +7,7 @@ pub mod config;
 pub mod hooks;
 pub mod knowledge;
 pub mod local;
+pub mod media;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
@@ -271,7 +272,9 @@ fn headless(
         );
         println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
         println!();
-        check_and_offer_install_dependencies(false);
+        // Off the critical path: five `which` probes cost real startup latency,
+    // and with interactive=false this only prints when something is missing.
+    std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
     let start_time = std::time::Instant::now();
@@ -346,7 +349,9 @@ fn repl(
     tui::line(&tui::dim(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
-    check_and_offer_install_dependencies(false);
+    // Off the critical path: five `which` probes cost real startup latency,
+    // and with interactive=false this only prints when something is missing.
+    std::thread::spawn(|| check_and_offer_install_dependencies(false));
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();
@@ -965,14 +970,18 @@ fn repl(
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
         // its own Msg::User push and uses this multimodal turn instead.
-        let (clean_task, image_data) = extract_attachments(t, cwd);
+        let vision = media::model_supports_vision(&provider);
+        let (clean_task, image_data) = extract_attachments(t, cwd, vision);
         let n_images = image_data.len();
         if n_images > 0 {
             transcript.push(Msg::UserImages {
                 text: clean_task.clone(),
                 images: image_data,
             });
-            tui::line(&tui::dim(&format!("  attached {n_images} image(s)")));
+            tui::line(&tui::dim(&format!(
+                "  ⎘ attached {n_images} image{}",
+                if n_images == 1 { "" } else { "s" }
+            )));
         }
 
         // Merge any /btw context queued since the last turn.
@@ -2388,10 +2397,10 @@ fn print_help() {
     tui::line("");
     tui::line(&tui::dim("  input"));
     tui::line(&tui::dim(
-        "    !<cmd> shell command · @<path> attach file · @diff @status @kb: @symbol:",
+        "    !<cmd> shell command · @<path> attach file/image/video · @diff @kb: @symbol:",
     ));
     tui::line(&tui::dim(
-        "    Tab complete · ↑↓ history · ^R search · ^G $EDITOR · \\+Enter newline",
+        "    ^V paste image/text · Tab complete · ↑↓ history · ^R search · ^G $EDITOR",
     ));
     tui::line(&tui::dim(
         "    ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · PgUp/PgDn scroll",
@@ -2417,9 +2426,15 @@ impl Mode {
     }
 }
 
-// Parse `@path` attachment tokens. Images become multimodal entries; readable
-// text files are appended to the prompt. Unreadable tokens are left unchanged.
-fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
+// Parse `@path` attachment tokens. Images become multimodal entries; videos
+// are parsed with ffmpeg into sampled frames + a metadata block; readable
+// text files are appended to the prompt. Unreadable tokens are left
+// unchanged. `vision` gates image/video attachment to multimodal models.
+fn extract_attachments(
+    task: &str,
+    cwd: &std::path::Path,
+    vision: bool,
+) -> (String, Vec<(String, String)>) {
     use std::io::Read;
     let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
     let mut images: Vec<(String, String)> = Vec::new();
@@ -2435,7 +2450,8 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
         });
         let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
         let is_img = image_exts.contains(&ext.as_str());
-        if !is_at && !is_img {
+        let is_video = media::VIDEO_EXTS.contains(&ext.as_str());
+        if !is_at && !is_img && !is_video {
             if !clean.is_empty() {
                 clean.push(' ');
             }
@@ -2573,8 +2589,12 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
             } else {
                 cwd.join(raw_path)
             };
-            if image_exts.contains(&ext.as_str()) {
-                if let Ok(mut f) = std::fs::File::open(&p) {
+            if image_exts.contains(&ext.as_str()) && p.exists() {
+                if !vision {
+                    tui::line(&tui::yellow(
+                        "  ⚠ current model is not multimodal — image not attached",
+                    ));
+                } else if let Ok(mut f) = std::fs::File::open(&p) {
                     let mut buf = Vec::new();
                     if f.read_to_end(&mut buf).is_ok() {
                         let media_type = match ext.as_str() {
@@ -2583,7 +2603,7 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
                             "webp" => "image/webp",
                             _ => "image/png",
                         };
-                        images.push((media_type.to_string(), base64_encode(&buf)));
+                        images.push((media_type.to_string(), media::b64_encode(&buf)));
                         if !clean.is_empty() {
                             clean.push(' ');
                         }
@@ -2593,6 +2613,38 @@ fn extract_attachments(task: &str, cwd: &std::path::Path) -> (String, Vec<(Strin
                         ));
                         continue;
                     }
+                }
+            } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
+                if !vision {
+                    tui::line(&tui::yellow(
+                        "  ⚠ current model is not multimodal — video not attached",
+                    ));
+                } else if !media::ffmpeg_available() {
+                    tui::line(&tui::yellow(
+                        "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",
+                    ));
+                } else {
+                    tui::line(&tui::dim(&format!(
+                        "  ⎘ parsing video {} with ffmpeg…",
+                        p.file_name().unwrap_or_default().to_string_lossy()
+                    )));
+                    if let Some(v) = media::attach_video(&p) {
+                        let n = v.frames.len();
+                        images.extend(v.frames);
+                        text_attachments.push(v.summary);
+                        if !clean.is_empty() {
+                            clean.push(' ');
+                        }
+                        clean.push_str(&format!(
+                            "[video: {} — {n} sampled frames attached in order]",
+                            p.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                        continue;
+                    }
+                    tui::line(&tui::red(&format!(
+                        "  ✗ could not decode video {}",
+                        p.display()
+                    )));
                 }
             } else if let Some(text) = read_text_attachment(&p, range) {
                 text_attachments.push(format!("[file: {}]\n{}", p.display(), text));
@@ -2655,36 +2707,6 @@ fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -
     )
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 {
-            chunk[1] as usize
-        } else {
-            0
-        };
-        let b2 = if chunk.len() > 2 {
-            chunk[2] as usize
-        } else {
-            0
-        };
-        out.push(ALPHA[b0 >> 2] as char);
-        out.push(ALPHA[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHA[((b1 & 0xf) << 2) | (b2 >> 6)] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHA[b2 & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
 
 // Suggest a mode from the task phrasing (used for the "tip" hint, not a gate).
 pub fn classify(task: &str) -> Mode {
@@ -3211,7 +3233,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
 
-        let (text, images) = extract_attachments("please read @src/lib.rs:2-3", &dir);
+        let (text, images) = extract_attachments("please read @src/lib.rs:2-3", &dir, true);
         assert!(images.is_empty());
         assert!(text.contains("[file:"));
         assert!(text.contains("two\nthree"));

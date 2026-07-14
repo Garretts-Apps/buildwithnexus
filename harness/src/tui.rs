@@ -1194,9 +1194,11 @@ fn format_links(s: &str) -> String {
                 out.push_str(&rest[..start]);
                 let label = &rest[start + 1..mid_abs];
                 let url = &rest[mid_abs + 2..end_abs];
+                // OSC 8: the label itself is clickable in modern terminals;
+                // the dim URL suffix keeps older terminals usable.
                 out.push_str(&format!(
                     "{} {}",
-                    underline(&cyan(label)),
+                    hyperlink(url, &underline(&cyan(label))),
                     dim(&format!("({url})"))
                 ));
                 rest = &rest[end_abs + 1..];
@@ -1399,21 +1401,81 @@ pub fn render_md(text: &str) -> String {
     out.join("\n")
 }
 
+// Consume one escape sequence (the ESC itself already consumed). Handles
+// CSI/SGR (ends at an ASCII letter) and OSC strings (ESC ] … BEL or ESC \),
+// which OSC 8 hyperlinks use. `out` receives the consumed chars when the
+// caller preserves escapes (clip/wrap); pass None to discard (strip).
+fn eat_escape(chars: &mut std::iter::Peekable<std::str::Chars>, mut out: Option<&mut String>) {
+    let mut push = |c: char| {
+        if let Some(o) = out.as_deref_mut() {
+            o.push(c);
+        }
+    };
+    if chars.peek() == Some(&']') {
+        // OSC: terminated by BEL or ST (ESC \).
+        while let Some(d) = chars.next() {
+            push(d);
+            if d == '\x07' {
+                break;
+            }
+            if d == '\x1b' {
+                if chars.peek() == Some(&'\\') {
+                    push(chars.next().unwrap_or('\\'));
+                }
+                break;
+            }
+        }
+    } else {
+        for d in chars.by_ref() {
+            push(d);
+            if d.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            for d in chars.by_ref() {
-                if d.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            eat_escape(&mut chars, None);
         } else {
             out.push(c);
         }
     }
     out
+}
+
+// OSC 8 terminal hyperlink: `label` becomes clickable (opens `url`) in
+// supporting terminals — iTerm2, kitty, WezTerm, Windows Terminal, GNOME
+// Terminal, foot, and most modern emulators. Plain label elsewhere.
+pub fn hyperlink(url: &str, label: &str) -> String {
+    if no_color() || !io::stdout().is_terminal() {
+        return label.to_string();
+    }
+    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+}
+
+// Clickable file link: resolves to an absolute file:// URL so terminals can
+// open the document/screenshot in the OS default app on click.
+pub fn file_link(path: &str, label: &str) -> String {
+    let abs = std::fs::canonicalize(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| {
+            let p = std::path::Path::new(path);
+            if p.is_absolute() {
+                path.to_string()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(p)
+                    .display()
+                    .to_string()
+            }
+        });
+    hyperlink(&format!("file://{abs}"), label)
 }
 
 fn prompt_width(prompt: &str) -> u16 {
@@ -1978,6 +2040,17 @@ pub fn enter_alt(raw: bool) {
         ALT_SCREEN.store(true, Ordering::Relaxed);
         set_output_region();
         let _ = execute!(io::stdout(), MoveTo(0, 0));
+        // Never show a black frame: paint the composer box and footer right
+        // away, before the caller draws the banner. If anything later stalls,
+        // the screen still shows chrome instead of a void.
+        {
+            let mut out = io::stdout();
+            queue_composer_box(&mut out);
+            queue_composer_right_border(&mut out);
+            let _ = out.flush();
+        }
+        render_footer();
+        let _ = execute!(io::stdout(), MoveTo(0, 0));
     }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
@@ -2133,12 +2206,7 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             out.push(c);
-            for d in chars.by_ref() {
-                out.push(d);
-                if d.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            eat_escape(&mut chars, Some(&mut out));
             continue;
         }
         let w = char_width(c);
@@ -2167,12 +2235,7 @@ fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             current.push(c);
-            for d in chars.by_ref() {
-                current.push(d);
-                if d.is_ascii_alphabetic() {
-                    break;
-                }
-            }
+            eat_escape(&mut chars, Some(&mut current));
             continue;
         }
         let w = char_width(c);
@@ -3171,6 +3234,30 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
+            KeyCode::Char('v') if ctrl => {
+                // Paste from the system clipboard: an image lands as a temp
+                // png and inserts an @path attachment token; plain text
+                // inserts at the cursor (for terminals that pass Ctrl+V
+                // through instead of translating it to a Paste event).
+                if let Some(img) = crate::media::clipboard_image_to_temp() {
+                    line(&dim(&format!("  ⎘ clipboard image → {}", img.display())));
+                    for ch in format!("@{} ", img.display()).chars() {
+                        buf.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                } else if let Some(text) = crate::media::clipboard_text() {
+                    for raw in text.chars() {
+                        let ch = match raw {
+                            '\n' | '\r' | '\t' => ' ',
+                            c if c.is_control() => continue,
+                            c => c,
+                        };
+                        buf.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                }
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+            }
             KeyCode::Char('l') if ctrl => reline!(),
             KeyCode::Char('g') if ctrl => {
                 let cur: String = buf.iter().collect();
@@ -3855,6 +3942,25 @@ mod tests {
         assert!(maybe_json_buffer_is_too_large(&lines));
         let lines = vec!["{".to_string(), "\"message\":\"ordinary\"".to_string()];
         assert!(!maybe_json_buffer_is_too_large(&lines));
+    }
+
+    #[test]
+    fn osc8_hyperlinks_are_zero_width_for_strip_clip_and_wrap() {
+        // OSC 8 link: ESC ] 8 ; ; URL ST label ESC ] 8 ; ; ST
+        let link = "\x1b]8;;https://example.com/doc\x1b\\click me\x1b]8;;\x1b\\ tail";
+        assert_eq!(strip_ansi(link), "click me tail");
+        // The URL inside the OSC string must cost zero display columns.
+        assert_eq!(strip_ansi(&clip_ansi_line(link, 8)), "click me");
+        assert_eq!(
+            wrap_ansi_line(link, 100)
+                .iter()
+                .map(|l| strip_ansi(l))
+                .collect::<String>(),
+            "click me tail"
+        );
+        // BEL-terminated OSC variant too.
+        let bel = "\x1b]8;;file:///tmp/a.png\x07shot\x1b]8;;\x07";
+        assert_eq!(strip_ansi(bel), "shot");
     }
 
     #[test]
