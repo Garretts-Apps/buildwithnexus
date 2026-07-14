@@ -1,0 +1,24 @@
+{
+  "name": "buildwithnexus-darwin-arm64",
+  "version": "0.12.1",
+  "description": "buildwithnexus prebuilt binary for darwin arm64 (aarch64-apple-darwin). Install the 'buildwithnexus' package instead of this one.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Garretts-Apps/buildwithnexus.git"
+  },
+  "homepage": "https://buildwithnexus.dev",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

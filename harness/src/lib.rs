@@ -16,6 +16,7 @@ pub mod session;
 pub mod tools;
 pub mod trace;
 pub mod tui;
+pub mod update;
 pub mod verifier;
 pub mod workflow;
 
@@ -349,9 +350,13 @@ fn repl(
     tui::line(&tui::dim(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
+    if let Some(notice) = update::startup_notice() {
+        tui::line(&tui::dim(&notice));
+    }
     // Off the critical path: five `which` probes cost real startup latency,
     // and with interactive=false this only prints when something is missing.
     std::thread::spawn(|| check_and_offer_install_dependencies(false));
+    update::spawn_check();
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();

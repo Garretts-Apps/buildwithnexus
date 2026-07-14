@@ -1,0 +1,19 @@
+[package]
+name = "bwn"
+version = "0.12.1"
+edition = "2021"
+description = "bwn — short-name alias crate for the buildwithnexus agentic AI coding CLI"
+license = "MIT"
+repository = "https://github.com/Garretts-Apps/buildwithnexus"
+homepage = "https://buildwithnexus.dev"
+readme = "README.md"
+keywords = ["ai", "agent", "cli", "tui", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "bwn"
+path = "src/main.rs"
+
+[dependencies]
+# Path for workspace builds; version for the published crate.
+buildwithnexus = { version = "0.12.1", path = "../harness" }

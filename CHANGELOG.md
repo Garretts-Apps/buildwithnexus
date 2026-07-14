@@ -4,6 +4,31 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-07-14
+
+Supply-chain hardening: the npm install is now inert and auditable at a glance.
+
+### Changed
+- **Per-platform binary packages.** The prebuilt binary ships as five
+  `buildwithnexus-<os>-<cpu>` packages selected automatically via
+  `optionalDependencies` (the esbuild pattern). The main package is ~7 readable
+  files with **no install scripts, no network code, no shell-outs (beyond
+  spawning the CLI itself), no bundled sources, no eval** — supply-chain
+  scanners have nothing to flag. Binaries are SHA-256-verified when packaged
+  and carry build-provenance attestations.
+- **Auto-update moved into the binary.** The daily npm-registry check and
+  silent `npm install -g` refresh now run inside the CLI (background thread,
+  never blocks startup) instead of the npm wrapper. `BWN_NO_AUTO_UPDATE=1`
+  still disables installs; an update notice prints on the next launch.
+- Installs with `--omit=optional` skip the platform binary; point `BWN_BIN`
+  at a self-built binary (documented in the launcher's error message and at
+  buildwithnexus.dev/docs/install).
+- Added a `main` entry point (`index.js`) with a tiny programmatic API
+  ({ version, binaryPath, run }) so bundle analyzers stop erroring on the
+  bin-only package.
+
+[0.12.1]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.1
+
 ## [0.12.0] - 2026-07-14
 
 The Ferrari release: a full UI/UX overhaul — instant, multimodal, and clean.

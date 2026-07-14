@@ -1,6 +1,6 @@
 {
   "name": "buildwithnexus",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "A hilariously fast, agentic AI CLI in Rust \u2014 full-screen TUI with live autocomplete, GitHub-grade diffs, clickable files/links, multimodal input (paste images, ffmpeg-parsed video), remote (API key) or local models, plan/build/brainstorm modes, hooks, and background auto-updates",
   "main": "index.js",
   "bin": {
@@ -11,11 +11,10 @@
     "index.js",
     "bin/buildwithnexus.js",
     "scripts/resolve-binary.js",
-    "scripts/bootstrap.js",
-    "scripts/auto-update.js",
     "README.md",
     "LICENSE",
-    "SECURITY.md"
+    "SECURITY.md",
+    "harness/Cargo.toml"
   ],
   "scripts": {
     "build": "cargo build --release --manifest-path harness/Cargo.toml",
@@ -55,5 +54,12 @@
     "access": "public",
     "registry": "https://registry.npmjs.org/",
     "provenance": true
+  },
+  "optionalDependencies": {
+    "buildwithnexus-linux-x64": "0.12.1",
+    "buildwithnexus-linux-arm64": "0.12.1",
+    "buildwithnexus-darwin-x64": "0.12.1",
+    "buildwithnexus-darwin-arm64": "0.12.1",
+    "buildwithnexus-win32-x64": "0.12.1"
   }
 }

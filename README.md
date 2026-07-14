@@ -12,7 +12,9 @@ GitHub-grade diffs, clickable files and links, and multimodal input straight
 from your clipboard.
 
 ```bash
-npm install -g buildwithnexus
+npm install -g buildwithnexus     # prebuilt binary via platform packages
+# or, with a Rust toolchain:
+cargo install buildwithnexus      # installs `buildwithnexus` + the `bwn` alias
 buildwithnexus
 ```
 
@@ -147,10 +149,12 @@ cargo build --release --manifest-path harness/Cargo.toml   # → harness/target/
 bash scripts/vendor.sh                                      # vendor deps for offline / reproducible builds
 ```
 
-The npm package is a thin, script-free wrapper: the first run downloads the prebuilt binary
-for your platform from the GitHub Release and **verifies its SHA-256** before
-use, falling back to a `cargo` build (using vendored deps when present). Releases
-also carry build-provenance attestations (`gh attestation verify`).
+The npm package is a thin, inert wrapper — **no install scripts, no network
+code, no bundled sources**. The prebuilt binary ships as a per-platform
+package (`buildwithnexus-<os>-<cpu>`) selected automatically via
+`optionalDependencies`, SHA-256-verified when packaged, with build-provenance
+attestations (`gh attestation verify`). Installing with `--omit=optional`
+skips the binary — build from source and point `BWN_BIN` at the result.
 
 ## Safety
 

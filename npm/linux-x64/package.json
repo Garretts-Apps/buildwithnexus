@@ -1,0 +1,24 @@
+{
+  "name": "buildwithnexus-linux-x64",
+  "version": "0.12.1",
+  "description": "buildwithnexus prebuilt binary for linux x64 (x86_64-unknown-linux-gnu). Install the 'buildwithnexus' package instead of this one.",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Garretts-Apps/buildwithnexus.git"
+  },
+  "homepage": "https://buildwithnexus.dev",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
