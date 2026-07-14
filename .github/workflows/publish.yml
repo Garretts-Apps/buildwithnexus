@@ -147,8 +147,6 @@ jobs:
       # create them via a granular token, then add the trusted publishers.
       - name: Publish platform binary packages
         if: steps.published.outputs.already == 'false'
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
           V=$(node -p "require('./package.json').version")
@@ -174,20 +172,14 @@ jobs:
             [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
             chmod +x "npm/${p}/bin/buildwithnexus${ext}"
             node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-            # OIDC first; brand-new packages can't use trusted publishing yet,
-            # so fall back to NPM_TOKEN (granular token that may create new
-            # packages) when it's configured. Revoke the token once all five
-            # exist and have Trusted Publishers attached.
-            if ! (cd "npm/${p}" && npm publish --access public --provenance); then
-              if [ -n "${NPM_TOKEN}" ]; then
-                echo "OIDC publish failed for buildwithnexus-${p} — retrying with NPM_TOKEN"
-                (cd "npm/${p}" && NODE_AUTH_TOKEN="${NPM_TOKEN}" npm publish --access public --provenance \
-                  --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
-                  || echo "::warning::token publish of buildwithnexus-${p} also failed"
-              else
-                echo "::warning::publish of buildwithnexus-${p} failed and no NPM_TOKEN fallback is set"
-              fi
-            fi
+            # OIDC only. npm's trusted publishing cannot CREATE a package —
+            # the very first publish of each platform package is a one-time
+            # manual step: run scripts/first-publish-platform-packages.sh
+            # from a logged-in maintainer machine, then attach a Trusted
+            # Publisher to each package on npmjs.com (this repo, publish.yml).
+            # Every later version publishes here via OIDC.
+            (cd "npm/${p}" && npm publish --access public --provenance) \
+              || echo "::warning::OIDC publish of buildwithnexus-${p} failed — if this is its first version, run scripts/first-publish-platform-packages.sh and attach a Trusted Publisher"
           done
           # FAIL CLOSED: the main package's optionalDependencies point at these
           # exact versions — publishing it while any platform package is
@@ -222,22 +214,29 @@ jobs:
         run: npm publish --access public --provenance
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
-      # `cargo install bwn` (alias crate). Requires a CARGO_REGISTRY_TOKEN
-      # repo secret (create at https://crates.io/settings/tokens with
-      # publish-new + publish-update scope). Skips with a warning when the
-      # secret is absent. bwn depends on the just-published buildwithnexus,
-      # so it retries while the index propagates.
+      # `cargo install bwn` (alias crate). OIDC only — the auth action
+      # exchanges this job's OIDC token for a 30-minute crates.io token.
+      # Like npm, crates.io Trusted Publishing must be configured per crate
+      # (crates.io → crate → Settings → Trusted Publishing: this repo,
+      # publish.yml) and the FIRST publish of each crate is a one-time
+      # `cargo publish` from a maintainer machine (cargo login).
       - name: Install Rust for crates.io publish
         if: steps.published.outputs.already == 'false'
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Get crates.io token via OIDC
+        id: cratesio
+        if: steps.published.outputs.already == 'false'
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish to crates.io
         if: steps.published.outputs.already == 'false'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token }}
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish (npm publish is unaffected)."
+            echo "::warning::no crates.io OIDC token — configure Trusted Publishing for the crates (first publish is manual: cargo publish -p buildwithnexus && cargo publish -p bwn). Skipping."
             exit 0
           fi
           set -e
