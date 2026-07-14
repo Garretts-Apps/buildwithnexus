@@ -943,10 +943,10 @@ pub fn render_queued_composer() {
     if let Ok(ta) = typeahead().lock() {
         if let Ok(mq) = message_queue().lock() {
             let mut out = io::stdout();
-            let c_row = composer_row();
+            let c_top = composer_top();
             let q_len = mq.len() as u16;
             for (i, msg) in mq.iter().enumerate() {
-                let row = c_row.saturating_sub(q_len).saturating_add(i as u16);
+                let row = c_top.saturating_sub(q_len).saturating_add(i as u16);
                 let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
                 let _ = write!(
                     out,
@@ -986,22 +986,39 @@ fn term_size() -> (u16, u16) {
     (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
 }
 
+// Alt-screen bottom chrome: a 3-row bordered composer box plus the footer.
+//   h-4  ╭───────────────────╮   composer_top()
+//   h-3  │ › input text      │   composer_row()
+//   h-2  ╰───────────────────╯   composer_bottom()
+//   h-1  permission: ask · …     footer_row()
+// Queued messages stack directly above the box.
 fn reserved_rows() -> u16 {
     let q_len = message_queue().lock().map(|q| q.len()).unwrap_or(0) as u16;
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        2 + q_len
+        4 + q_len
     } else {
         1 + q_len
     }
 }
 
+// Columns taken by the box's left border ("│ ") before the prompt.
+const COMPOSER_PAD: u16 = 2;
+
 fn composer_row() -> u16 {
     let (_, h) = term_size();
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        h.saturating_sub(2).min(h.saturating_sub(1))
+        h.saturating_sub(3)
     } else {
         h.saturating_sub(1)
     }
+}
+
+fn composer_top() -> u16 {
+    composer_row().saturating_sub(1)
+}
+
+fn composer_bottom() -> u16 {
+    composer_row().saturating_add(1)
 }
 
 fn footer_row() -> u16 {
@@ -1306,12 +1323,37 @@ fn clear_composer() {
         return;
     }
     let mut out = io::stdout();
+    for row in composer_top()..=composer_bottom() {
+        let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+    }
+    let _ = out.flush();
+}
+
+// Draw the composer box borders and return with the cursor ready at the
+// start of the input row's content area. The caller writes the inner line.
+fn queue_composer_box(out: &mut io::Stdout) {
+    let (width, _) = term_size();
+    let w = width as usize;
+    let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
+    let bottom = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
+    let _ = queue!(out, MoveTo(0, composer_top()), Clear(ClearType::CurrentLine));
+    let _ = write!(out, "{}", dim(&top));
     let _ = queue!(
         out,
-        MoveTo(0, composer_row()),
+        MoveTo(0, composer_bottom()),
         Clear(ClearType::CurrentLine)
     );
-    let _ = out.flush();
+    let _ = write!(out, "{}", dim(&bottom));
+    let _ = queue!(out, MoveTo(0, composer_row()), Clear(ClearType::CurrentLine));
+    let _ = write!(out, "{} ", dim("│"));
+}
+
+// Close the input row with the right-hand border, clipping anything that
+// would collide with it.
+fn queue_composer_right_border(out: &mut io::Stdout) {
+    let (width, _) = term_size();
+    let _ = queue!(out, MoveTo(width.saturating_sub(1), composer_row()));
+    let _ = write!(out, "{}", dim("│"));
 }
 
 fn queue_footer(out: &mut io::Stdout) {
@@ -1459,7 +1501,7 @@ fn scroll_to_bottom() {
 }
 
 fn in_output_region(row: u16) -> bool {
-    ALT_SCREEN.load(Ordering::Relaxed) && row < composer_row()
+    ALT_SCREEN.load(Ordering::Relaxed) && row < composer_top()
 }
 
 fn selection_start(row: u16, col: u16) {
@@ -1579,7 +1621,11 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     }
     let (width, _) = term_size();
     let pwidth = prompt_width(prompt);
-    let avail = width.saturating_sub(pwidth).max(8) as usize;
+    // Room inside the box: left border "│ " + prompt … text … " │" right border.
+    let avail = width
+        .saturating_sub(pwidth)
+        .saturating_sub(COMPOSER_PAD + 2)
+        .max(8) as usize;
     let (s, _col) = viewport(cursor, avail, *scroll);
     *scroll = s;
     let end = (s + avail).min(buf.len());
@@ -1590,16 +1636,18 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         .map(char_width)
         .sum::<usize>();
     let mut out = io::stdout();
-    let _ = queue!(
-        out,
-        MoveTo(0, composer_row()),
-        Clear(ClearType::CurrentLine)
-    );
+    queue_composer_box(&mut out);
     let _ = write!(out, "{prompt}{shown}");
+    queue_composer_right_border(&mut out);
     queue_footer(&mut out);
     let _ = queue!(
         out,
-        MoveTo(pwidth.saturating_add(col_width as u16), composer_row())
+        MoveTo(
+            COMPOSER_PAD
+                .saturating_add(pwidth)
+                .saturating_add(col_width as u16),
+            composer_row()
+        )
     );
     let _ = out.flush();
 }
@@ -1654,27 +1702,27 @@ fn wordmark() -> String {
 // The UI chrome (mode badge, wordmark, keys) is identical regardless of model.
 pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
     let w = term_size().0 as usize;
-    let top_bar = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
-    let bot_bar = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
 
-    line(&accent(&top_bar));
-    // Wordmark row — gradient "buildwithnexus" + domain
+    line("");
+    // Wordmark row — gradient "buildwithnexus" + version.
     line(&clip_ansi_line(
         &format!(
-            "  {}  {}  {}  {}  {}",
+            "  {}  {}",
             bold(&wordmark()),
-            dim("·"),
-            paint(ACCENT, "buildwithnexus.dev"),
-            dim("·"),
             dim(&format!("v{}", crate::VERSION)),
         ),
         w,
     ));
-    // Context row — provider · model · cwd (truncated to fit)
+    line(&dim(&format!("  {}", "─".repeat(w.saturating_sub(4)))));
+    // Aligned key/value context rows: dim keys, plain values.
+    line(&clip_ansi_line(
+        &format!("  {}  {provider} · {model}", dim("model")),
+        w,
+    ));
     let cwd_display: String = cwd
         .chars()
         .rev()
-        .take(w.saturating_sub(30))
+        .take(w.saturating_sub(12))
         .collect::<String>()
         .chars()
         .rev()
@@ -1685,25 +1733,20 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         cwd.to_string()
     };
     line(&clip_ansi_line(
-        &dim(&format!(
-            "  ⚙ Provider: {}  ·  🤖 Model: {}  ·  📂 {}",
-            provider, model, cwd_label
-        )),
+        &format!("  {}    {}", dim("cwd"), dim(&cwd_label)),
         w,
     ));
-    // Mode row
     line(&banner_mode_row(mode, w));
-    line(&accent(&bot_bar));
+    line("");
 }
 
 fn banner_mode_row(mode: &str, width: usize) -> String {
     clip_ansi_line(
         &format!(
-            "  Mode: {}    {}  {}  {}",
+            "  {}   {}   {}",
+            dim("mode"),
             mode_badge(mode),
-            dim("[Shift+Tab] cycle mode"),
-            dim("·"),
-            dim("[/help] commands"),
+            dim("Shift+Tab cycle · /help commands"),
         ),
         width,
     )
@@ -1720,7 +1763,9 @@ fn refresh_banner_mode(mode: &str) {
     };
     for line in lines.iter_mut() {
         let plain = strip_ansi(line);
-        if plain.contains("Mode:") && plain.contains("Shift+Tab") {
+        // "Shift+Tab cycle" is unique to the banner's mode row (the REPL
+        // hint line says "Shift+Tab to change mode").
+        if plain.contains("Shift+Tab cycle") {
             *line = row;
             break;
         }
@@ -2604,7 +2649,8 @@ fn render_suggestions(sug: &[String], sel: usize) {
         .unwrap_or(0);
     let mut out = io::stdout();
     let _ = execute!(out, SavePosition);
-    let base = composer_row().saturating_sub(show as u16);
+    // Sit just above the composer box's top border.
+    let base = composer_top().saturating_sub(show as u16);
     for i in 0..show {
         let idx = first + i;
         let row = base + i as u16;
@@ -2808,7 +2854,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
         flush();
     }
     let mut start = if ALT_SCREEN.load(Ordering::Relaxed) {
-        (prompt_width(prompt), composer_row())
+        (prompt_width(prompt) + COMPOSER_PAD, composer_row())
     } else {
         crossterm::cursor::position().unwrap_or((0, 0))
     };
@@ -2837,7 +2883,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
     macro_rules! reline {
         () => {{
             if ALT_SCREEN.load(Ordering::Relaxed) {
-                start = (prompt_width(prompt), composer_row());
+                start = (prompt_width(prompt) + COMPOSER_PAD, composer_row());
             } else {
                 print!("\r{prompt}");
                 flush();
@@ -2939,7 +2985,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     set_output_region();
                     render_output();
                     clear_composer();
-                    start = (prompt_width(prompt), composer_row());
+                    start = (prompt_width(prompt) + COMPOSER_PAD, composer_row());
                     scroll = 0;
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
@@ -3060,13 +3106,25 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     };
                     {
                         let mut out = io::stdout();
-                        let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
-                        let _ = write!(
-                            out,
-                            "{}{}",
-                            dim(&format!("(reverse-i-search)`{query}`: ")),
-                            m.as_deref().unwrap_or("")
-                        );
+                        if ALT_SCREEN.load(Ordering::Relaxed) {
+                            queue_composer_box(&mut out);
+                            let _ = write!(
+                                out,
+                                "{}{}",
+                                dim(&format!("(reverse-i-search)`{query}`: ")),
+                                m.as_deref().unwrap_or("")
+                            );
+                            queue_composer_right_border(&mut out);
+                        } else {
+                            let _ =
+                                queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
+                            let _ = write!(
+                                out,
+                                "{}{}",
+                                dim(&format!("(reverse-i-search)`{query}`: ")),
+                                m.as_deref().unwrap_or("")
+                            );
+                        }
                         let _ = out.flush();
                     }
                     let ev = match read() {
@@ -3487,22 +3545,24 @@ pub fn spinner_start(label: &str) -> Spinner {
     let label = label.to_string();
     let handle = thread::spawn(move || {
         let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let started = std::time::Instant::now();
         let mut i = 0usize;
         while r2.load(Ordering::Relaxed) {
             if ALT_SCREEN.load(Ordering::Relaxed) {
                 let mut out = io::stdout();
                 let _ = execute!(out, SavePosition);
-                let _ = queue!(
-                    out,
-                    MoveTo(0, composer_row()),
-                    Clear(ClearType::CurrentLine)
-                );
+                queue_composer_box(&mut out);
                 let _ = write!(
                     out,
-                    "{} {}",
+                    "{} {} {}",
                     accent(&frames[i % frames.len()].to_string()),
-                    dim(&label)
+                    dim(&label),
+                    dim(&format!(
+                        "· {}s · Esc to interrupt",
+                        started.elapsed().as_secs()
+                    ))
                 );
+                queue_composer_right_border(&mut out);
                 let _ = execute!(out, RestorePosition);
                 let _ = out.flush();
             } else {
