@@ -50,16 +50,17 @@ The prebuilt binary arrives as one of five per-platform packages
 (`buildwithnexus-<os>-<cpu>`) declared as `optionalDependencies` and selected
 by npm via `os`/`cpu` — the same pattern esbuild uses.
 
-**First-run fallback:** if no platform package is installed (for example,
-`--omit=optional`, an unsupported combination, or a platform package not yet
-published for a brand-new version), the first launch downloads the binary for
-your platform from the matching GitHub Release over HTTPS
-(`scripts/bootstrap.js`; downloads are restricted to `github.com` /
-`objects.githubusercontent.com`) and verifies its SHA-256 against the
-checksum published with the release before marking it executable. To avoid
-any runtime download, install normally (the platform package makes the
-fallback dead code) or set `BWN_BIN` to a binary you built or verified
-yourself.
+**First-run fallback (consent-gated):** if no platform package is installed
+(for example, `--omit=optional`, an unsupported combination, or a platform
+package not yet published for a brand-new version), the launcher offers to
+download the binary for your platform from the matching GitHub Release over
+HTTPS — it asks `[y/N]` on a TTY, and in non-interactive use requires
+`bwn --bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`. Downloads are restricted to
+`github.com` / `objects.githubusercontent.com` (`scripts/bootstrap.js`) and
+the SHA-256 is verified against the checksum published with the release
+before the binary is marked executable. Nothing is ever downloaded without
+that explicit consent; alternatively set `BWN_BIN` to a binary you built or
+verified yourself.
 
 ## Verifying a Release
 
@@ -88,11 +89,19 @@ cargo build --release --locked --manifest-path harness/Cargo.toml
 
 ## Auto-updates
 
-The CLI (not the npm wrapper) checks the npm registry at most once a day in a
-detached background process and installs newer versions via `npm install -g`.
-Set `BWN_NO_AUTO_UPDATE=1` to disable installs — an update notice still prints
-on the next launch. Installs performed by other means (cargo, source builds)
-are never auto-updated.
+Update behavior is controlled by the `auto_update` setting in
+`~/.buildwithnexus/settings.json`:
+
+| Value       | Behavior                                                        |
+|-------------|-----------------------------------------------------------------|
+| `"off"`     | No registry check, no notices.                                  |
+| `"notify"`  | **Default.** Daily check; a one-line notice on the next launch when a newer version exists. Never installs. |
+| `"install"` | Daily check plus silent background `npm install -g`; notice on the next launch. |
+
+`BWN_NO_AUTO_UPDATE=1` is honored for back-compat and caps `"install"` to
+`"notify"`. The check runs inside the CLI (not the npm wrapper), never blocks
+startup, and installs performed by other means (cargo, source builds) are
+never auto-updated.
 
 ## Hardening Inside the Package
 
