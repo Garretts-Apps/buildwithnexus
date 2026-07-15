@@ -1,7 +1,8 @@
 [package]
 name = "bwn"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2021"
+rust-version = "1.94"
 description = "bwn — short-name alias crate for the buildwithnexus agentic AI coding CLI"
 license = "MIT"
 repository = "https://github.com/Garretts-Apps/buildwithnexus"
@@ -16,4 +17,4 @@ path = "src/main.rs"
 
 [dependencies]
 # Path for workspace builds; version for the published crate.
-buildwithnexus = { version = "0.12.2", path = "../harness" }
+buildwithnexus = { version = "0.12.3", path = "../harness" }

@@ -141,6 +141,12 @@ pub struct Settings {
     /// skips /api/show detection.
     #[serde(default)]
     pub context_tokens: Option<u32>,
+    /// npm auto-update policy: "off" (no check, no notices), "notify"
+    /// (daily check, startup notice, never installs — the default), or
+    /// "install" (daily check + silent `npm install -g`, notice on next
+    /// launch). BWN_NO_AUTO_UPDATE=1 caps "install" back to "notify".
+    #[serde(default = "default_auto_update")]
+    pub auto_update: String,
     /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
@@ -165,6 +171,7 @@ impl Default for Settings {
             temperature: None,
             max_tokens: None,
             context_tokens: None,
+            auto_update: default_auto_update(),
             allowed_commands: Vec::new(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
@@ -176,6 +183,10 @@ impl Default for Settings {
 // Anything that can mutate files, run arbitrary code, or reach the network
 // (git, npm, curl, docker, patch, …) must prompt; users who want more can add
 // their own entries via `allowed_commands` in settings.
+fn default_auto_update() -> String {
+    "notify".into()
+}
+
 fn default_allowed_commands() -> Vec<String> {
     [
         "ls", "cat", "head", "tail", "grep", "rg", "pwd", "echo", "which", "wc", "du", "df",

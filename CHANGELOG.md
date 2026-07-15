@@ -4,6 +4,22 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.3] - 2026-07-14
+
+### Changed
+- **Auto-update now defaults to notify-only.** New `auto_update` setting in
+  `settings.json`: `"off"` (no check, no notices), `"notify"` (daily check,
+  one-line startup notice, never installs — the default), `"install"` (the
+  previous behavior: silent background `npm install -g`). `BWN_NO_AUTO_UPDATE=1`
+  still works and caps `"install"` back to `"notify"`. A tool that edits files
+  and runs commands should not change its own executable without being asked.
+- **First-run binary download requires explicit consent.** When the platform
+  package is absent, the launcher now asks `[y/N]` on a TTY, or requires
+  `bwn --bootstrap` / `BWN_ALLOW_BOOTSTRAP=1` in non-interactive use — it no
+  longer downloads automatically.
+
+[0.12.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.3
+
 ## [0.12.2] - 2026-07-14
 
 ### Fixed

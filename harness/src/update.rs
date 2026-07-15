@@ -1,10 +1,10 @@
 // Self-update, inside the binary (the npm wrapper is deliberately inert: no
-// network, no scripts — so update checking lives here). At most once a day a
-// background thread asks the npm registry for the latest published version;
-// when a newer one exists it refreshes the global npm install silently and
-// the next launch prints a one-line notice. BWN_NO_AUTO_UPDATE=1 disables the
-// install (the notice still appears); everything here is best-effort and must
-// never affect the session.
+// network, no scripts — so update checking lives here). Policy comes from the
+// `auto_update` setting: "off" (no check, no notices), "notify" (daily
+// registry check, one-line startup notice, never installs — the default), or
+// "install" (daily check + silent `npm install -g`, notice on next launch).
+// BWN_NO_AUTO_UPDATE=1 caps "install" back to "notify" for back-compat.
+// Everything here is best-effort and must never affect the session.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,9 +67,24 @@ pub fn newer(a: &str, b: &str) -> bool {
     false
 }
 
-// One-line startup notice when a background update landed (or is available
-// with auto-update disabled). Consumes the notice so it prints once.
-pub fn startup_notice() -> Option<String> {
+// Effective policy: the `auto_update` setting, with BWN_NO_AUTO_UPDATE=1
+// capping "install" back to "notify" and unknown values treated as "notify".
+fn effective_policy(setting: &str) -> &'static str {
+    let env_cap = std::env::var("BWN_NO_AUTO_UPDATE").is_ok_and(|v| v == "1");
+    match setting {
+        "off" => "off",
+        "install" if !env_cap => "install",
+        _ => "notify",
+    }
+}
+
+// One-line startup notice when a background update landed (or a newer version
+// was seen and installs are off). Consumes the notice so it prints once.
+pub fn startup_notice(policy: &str) -> Option<String> {
+    let policy = effective_policy(policy);
+    if policy == "off" {
+        return None;
+    }
     let st = read_state();
     let updated = st["updatedTo"].as_str().unwrap_or("");
     if !updated.is_empty()
@@ -82,30 +97,31 @@ pub fn startup_notice() -> Option<String> {
         ));
     }
     let latest = st["latestSeen"].as_str().unwrap_or("");
-    if auto_update_disabled()
+    if policy != "install"
         && !latest.is_empty()
         && newer(latest, crate::VERSION)
         && st["noticeShownFor"].as_str() != Some(latest)
     {
         write_state(&[("noticeShownFor", serde_json::json!(latest))]);
         return Some(format!(
-            "  ⬆ v{latest} is available — npm install -g {PKG}@latest"
+            "  ⬆ v{latest} is available — npm install -g {PKG}@latest (or set auto_update: \"install\")"
         ));
     }
     None
 }
 
-fn auto_update_disabled() -> bool {
-    std::env::var("BWN_NO_AUTO_UPDATE").is_ok_and(|v| v == "1")
-}
-
 // Fire-and-forget daily check. Never blocks startup; all failures are silent.
-pub fn spawn_check() {
+pub fn spawn_check(policy: &str) {
+    let policy = effective_policy(policy);
+    if policy == "off" {
+        return;
+    }
     let last = read_state()["lastCheck"].as_u64().unwrap_or(0);
     if now_secs().saturating_sub(last) < CHECK_INTERVAL_SECS {
         return;
     }
-    std::thread::spawn(|| {
+    let install = policy == "install";
+    std::thread::spawn(move || {
         write_state(&[("lastCheck", serde_json::json!(now_secs()))]);
         let Ok(resp) = ureq::get(&format!("https://registry.npmjs.org/{PKG}/latest"))
             .timeout(Duration::from_secs(10))
@@ -120,7 +136,7 @@ pub fn spawn_check() {
             return;
         };
         write_state(&[("latestSeen", serde_json::json!(latest))]);
-        if !newer(latest, crate::VERSION) || auto_update_disabled() {
+        if !newer(latest, crate::VERSION) || !install {
             return;
         }
         let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
@@ -146,7 +162,21 @@ pub fn spawn_check() {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{effective_policy, newer};
+
+    #[test]
+    fn policy_resolution() {
+        // Serial: the BWN_NO_AUTO_UPDATE env var is process-global state.
+        std::env::remove_var("BWN_NO_AUTO_UPDATE");
+        assert_eq!(effective_policy("off"), "off");
+        assert_eq!(effective_policy("notify"), "notify");
+        assert_eq!(effective_policy("install"), "install");
+        assert_eq!(effective_policy("bogus"), "notify");
+        std::env::set_var("BWN_NO_AUTO_UPDATE", "1");
+        assert_eq!(effective_policy("install"), "notify");
+        assert_eq!(effective_policy("off"), "off");
+        std::env::remove_var("BWN_NO_AUTO_UPDATE");
+    }
 
     #[test]
     fn version_comparison() {
