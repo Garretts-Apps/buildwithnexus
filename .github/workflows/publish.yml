@@ -42,13 +42,16 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Gate: a successful `release` run — whether it came from a v* tag push or a
-    # manual run (whose head_branch is the branch, not a tag) — or a direct
-    # manual dispatch of this workflow. A failed release never publishes.
+    # Gate: a successful `release` run — from a v* tag push, an automatic
+    # main-push release (version-gated in release.yml), or a manual run — or a
+    # direct manual dispatch of this workflow. A failed release never
+    # publishes; a version-gated release that skipped chains into a run that
+    # self-skips on its own already-published checks.
     if: >-
       ${{ github.event_name == 'workflow_dispatch' ||
           (github.event.workflow_run.conclusion == 'success' &&
            (startsWith(github.event.workflow_run.head_branch, 'v') ||
+            github.event.workflow_run.head_branch == 'main' ||
             github.event.workflow_run.event == 'workflow_dispatch')) }}
     permissions:
       contents: write
