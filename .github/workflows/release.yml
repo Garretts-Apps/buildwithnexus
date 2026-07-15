@@ -3,9 +3,18 @@ name: release
 # Build the native harness for every supported platform and attach the binaries
 # to the GitHub Release. The npm wrapper's first run downloads these.
 # publish.yml chains off this workflow's completion to push to npm.
+#
+# Fully automatic releases: every push to main runs the `gate` job, which
+# releases only when package.json's version has no v<version> tag yet. So
+# merging a PR that bumps the version ships everything — binaries, GitHub
+# release, crates.io, then npm via the chained publish — with zero clicks,
+# while docs-only merges do nothing. Tag pushes and manual dispatches always
+# release. (The tag this workflow creates is made with GITHUB_TOKEN, which
+# never triggers workflows — no recursion.)
 on:
   push:
     tags: ["v*"]
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +23,37 @@ permissions:
   attestations: write
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: true
+      - name: Release only unreleased versions on main pushes
+        id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" == refs/tags/* || "$EVENT" == workflow_dispatch ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          V=$(node -p "require('./package.json').version")
+          if git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1; then
+            echo "v${V} is already tagged — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v${V} is not tagged yet — releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -130,7 +169,8 @@ jobs:
   # Idempotent: versions already on the registry index are skipped, so
   # re-dispatching a release is safe.
   crates:
-    needs: build
+    needs: [gate, build]
+    if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
