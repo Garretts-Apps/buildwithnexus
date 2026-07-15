@@ -193,7 +193,8 @@ jobs:
                   --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
                   || echo "::warning::bootstrap-token publish of buildwithnexus-${p} also failed"
               else
-                echo "::warning::OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set"
+                echo "OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set — skipping."
+                echo "- \`buildwithnexus-${p}@${V}\` not published (no NPM_TOKEN; expected until the one-time bootstrap)" >> "$GITHUB_STEP_SUMMARY"
               fi
             fi
           done
@@ -202,7 +203,8 @@ jobs:
           # from the GitHub release. Surface what's missing, loudly.
           for p in "${!T[@]}"; do
             if ! npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
-              echo "::warning::buildwithnexus-${p}@${V} is not on the registry — installs will use the first-run download fallback until it is published (add NPM_TOKEN and re-run this workflow)"
+              echo "buildwithnexus-${p}@${V} is not on the registry — installs use the first-run download fallback until it is published."
+              echo "- \`buildwithnexus-${p}@${V}\` missing from the registry — installs fall back to the first-run download (add NPM_TOKEN and re-run to fill in)" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
           # Pin the main package's optionalDependencies to this exact version.
@@ -237,14 +239,17 @@ jobs:
       # token or configure Trusted Publishing, then re-run this workflow) —
       # the step skips crate versions that already exist.
       - name: Install Rust for crates.io publish
+        if: github.event_name == 'workflow_dispatch'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Get crates.io token via OIDC
+        if: github.event_name == 'workflow_dispatch'
         id: cratesio
         continue-on-error: true
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io
+        if: github.event_name == 'workflow_dispatch'
         env:
           # OIDC token when Trusted Publishing is configured; otherwise the
           # one-time bootstrap token secret (crates.io UI → API Tokens) used

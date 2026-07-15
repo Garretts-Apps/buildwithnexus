@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "bwn"
-path = "src/main.rs"
+path = "src/bwn.rs"
 
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
