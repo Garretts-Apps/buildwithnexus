@@ -14,7 +14,7 @@ from your clipboard.
 ```bash
 npm install -g buildwithnexus     # prebuilt binary via platform packages
 # or, with a Rust toolchain:
-cargo install buildwithnexus      # installs `buildwithnexus` + the `bwn` alias
+cargo install buildwithnexus --locked   # installs `buildwithnexus` + the `bwn` alias
 buildwithnexus
 ```
 

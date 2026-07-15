@@ -1,7 +1,7 @@
 {
   "name": "buildwithnexus",
   "version": "0.12.2",
-  "description": "A hilariously fast, agentic AI CLI in Rust \u2014 full-screen TUI with live autocomplete, GitHub-grade diffs, clickable files/links, multimodal input (paste images, ffmpeg-parsed video), remote (API key) or local models, plan/build/brainstorm modes, hooks, and background auto-updates",
+  "description": "Fast, local-first AI coding agent for the terminal, written in Rust. Works with hosted APIs (Anthropic, OpenAI) and local models (Ollama).",
   "main": "index.js",
   "bin": {
     "buildwithnexus": "bin/buildwithnexus.js",
