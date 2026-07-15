@@ -51,8 +51,70 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  # Creates (or refreshes) the tag + release ONCE, with the CHANGELOG section
+  # as the body and GitHub's auto-generated notes appended. The build matrix
+  # only uploads assets — when this step ran per matrix job with
+  # append_body: true, every job (and every re-dispatch) appended another
+  # copy of the notes. body replacement here makes re-dispatches idempotent.
+  release:
     needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The release tag is the pushed v* tag; otherwise it is derived from
+      # package.json so it always matches the version npm will publish.
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        env:
+          GIT_REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$GIT_REF" == refs/tags/* ]]; then
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            v=$(node -p "require('./package.json').version")
+            echo "tag=v${v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pull the matching version section out of CHANGELOG.md for the release
+      # body. Falls back to a generic line if the section is missing so the
+      # release step never fails on a docs gap.
+      - name: Extract release notes
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          out="RELEASE_NOTES.md"
+          # Print lines from the matching "## [version]" header up to the next
+          # top-level "## " header (exclusive).
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {grab=1; next}
+            grab && /^## / {grab=0}
+            grab {print}
+          ' CHANGELOG.md > "$out"
+          if [ ! -s "$out" ]; then
+            echo "Release $TAG. See CHANGELOG.md for details." > "$out"
+          fi
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
+          append_body: false
+          generate_release_notes: true
+
+  build:
+    needs: [gate, release]
     if: needs.gate.outputs.release == 'true'
     strategy:
       fail-fast: false
@@ -104,60 +166,17 @@ jobs:
           if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
 
-      # The release tag is the pushed v* tag; on workflow_dispatch it is derived
-      # from package.json so it always matches the version npm will publish.
-      - name: Resolve release tag
-        id: meta
-        shell: bash
-        env:
-          GIT_REF: ${{ github.ref }}
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [[ "$GIT_REF" == refs/tags/* ]]; then
-            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
-            v=$(node -p "require('./package.json').version")
-            echo "tag=v${v}" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Pull the matching version section out of CHANGELOG.md for the release
-      # body. Falls back to a generic line if the section is missing so the
-      # release step never fails on a docs gap.
-      - name: Extract release notes
-        id: notes
-        shell: bash
-        env:
-          TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          version="${TAG#v}"
-          out="RELEASE_NOTES.md"
-          # Print lines from the matching "## [version]" header up to the next
-          # top-level "## " header (exclusive).
-          awk -v v="$version" '
-            $0 ~ "^## \\[" v "\\]" {grab=1; next}
-            grab && /^## / {grab=0}
-            grab {print}
-          ' CHANGELOG.md > "$out"
-          if [ ! -s "$out" ]; then
-            echo "Release $TAG. See CHANGELOG.md for details." > "$out"
-          fi
-          echo "path=$out" >> "$GITHUB_OUTPUT"
-
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
 
-      # Creates the tag + release on workflow_dispatch; on a tag push it just
-      # attaches assets to the existing release. The CHANGELOG section becomes
-      # the release body, with GitHub's auto-generated commit/PR notes appended.
-      - name: Upload to release
+      # Asset upload only — the `release` job created the release and owns
+      # the body (softprops leaves unspecified fields untouched).
+      - name: Upload assets to release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          body_path: ${{ steps.notes.outputs.path }}
-          append_body: true
-          generate_release_notes: true
+          tag_name: ${{ needs.release.outputs.tag }}
           files: buildwithnexus-${{ matrix.target }}*
 
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
