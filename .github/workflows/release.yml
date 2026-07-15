@@ -120,3 +120,70 @@ jobs:
           append_body: true
           generate_release_notes: true
           files: buildwithnexus-${{ matrix.target }}*
+
+  # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
+  # Publishing refuses OIDC tokens for workflow_run-triggered jobs, and
+  # publish.yml chains off this workflow via workflow_run — so its crates step
+  # could never authenticate without a stored token. This workflow's triggers
+  # (v* tag push, workflow_dispatch) are both accepted. Requires a Trusted
+  # Publishing entry on BOTH crates pointing at workflow file `release.yml`.
+  # Idempotent: versions already on the registry index are skipped, so
+  # re-dispatching a release is safe.
+  crates:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Get crates.io token via OIDC
+        id: cratesio
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::no crates.io OIDC token — add a Trusted Publishing entry for workflow release.yml on both crates. Skipping."
+            exit 0
+          fi
+          set -e
+          V=$(node -p "require('./package.json').version")
+          # `cargo info <name>` resolves workspace members LOCALLY, so from
+          # inside this repo it always says our crates exist — ask the
+          # registry's sparse index instead.
+          on_registry() {
+            local n=$1 p
+            case ${#n} in
+              1) p="1/$n" ;;
+              2) p="2/$n" ;;
+              3) p="3/${n:0:1}/$n" ;;
+              *) p="${n:0:2}/${n:2:2}/$n" ;;
+            esac
+            curl -sf "https://index.crates.io/$p" | grep -q "\"vers\":\"$V\""
+          }
+          if on_registry buildwithnexus; then
+            echo "buildwithnexus ${V} already on crates.io — skipping."
+          else
+            cargo publish -p buildwithnexus --locked
+          fi
+          if on_registry bwn; then
+            echo "bwn ${V} already on crates.io — done."
+            exit 0
+          fi
+          # bwn depends on the crate above; wait out index propagation.
+          for i in 1 2 3 4 5; do
+            if cargo publish -p bwn --locked; then exit 0; fi
+            echo "bwn publish attempt ${i} failed (index propagation?) — retrying in 30s"
+            sleep 30
+          done
+          echo "::warning::bwn alias crate did not publish — re-run this workflow or dispatch 'Publish to npm' manually."
