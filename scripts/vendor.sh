@@ -20,7 +20,7 @@ if [[ "${1:-}" == "--tar" ]]; then
   out="$ROOT/buildwithnexus-vendored-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2).tar.gz"
   echo "→ packing self-contained bundle …"
   tar -czf "$out" -C "$ROOT" \
-    harness/Cargo.toml harness/Cargo.lock harness/src harness/vendor harness/.cargo \
+    Cargo.toml Cargo.lock harness/Cargo.toml harness/src harness/vendor harness/.cargo \
     bin scripts package.json README.md LICENSE
   echo "→ $out"
 fi

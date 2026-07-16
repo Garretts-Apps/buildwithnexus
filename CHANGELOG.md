@@ -4,6 +4,15 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.4] - 2026-07-16
+
+### Fixed
+- **The first-run `[y/N]` consent prompt now actually waits on macOS.** Node
+  keeps a TTY stdin in non-blocking mode, so the launcher's synchronous read
+  threw `EAGAIN` and fell through to "native binary not found" before you
+  could answer. The prompt now reads from a fresh blocking `/dev/tty` handle
+  (falling back to stdin where `/dev/tty` doesn't exist, e.g. Windows).
+
 ## [0.12.3] - 2026-07-14
 
 ### Changed
