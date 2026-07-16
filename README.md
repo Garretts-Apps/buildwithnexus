@@ -19,9 +19,30 @@ buildwithnexus
 ```
 
 The first launch walks you through choosing a model. Then describe a task.
-Once installed, buildwithnexus keeps itself current: a background check
-updates the npm package at most once a day (set `BWN_NO_AUTO_UPDATE=1` to
-opt out).
+A daily background check tells you when a new version is out; set
+`auto_update: "install"` in settings to apply updates automatically, or
+`"off"` to silence the check.
+
+## Try it in a sandbox
+
+Want to kick the tires without touching your machine?
+
+**GitHub Codespaces — one click, in the browser.**
+[Open a codespace on this repo](https://codespaces.new/Garretts-Apps/buildwithnexus?quickstart=1)
+— the devcontainer preinstalls the binary, so when the terminal appears just
+run `bwn`. Add `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` as a Codespaces secret
+(or export it in the terminal) to talk to a hosted model.
+
+**Docker — local and fully disposable.** A scratch container that is deleted
+on exit, so nothing the agent does can reach your files:
+
+```bash
+docker run -it --rm -e BWN_ALLOW_BOOTSTRAP=1 -e ANTHROPIC_API_KEY \
+  node:22-slim npx -y buildwithnexus
+```
+
+Drop `--rm` to keep the sandbox between runs, or add `-v "$PWD":/work -w /work`
+once you're ready to let it loose on a real project.
 
 ## The TUI
 
