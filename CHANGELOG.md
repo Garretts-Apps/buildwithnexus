@@ -20,6 +20,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `google/gemini-2.5-pro`) routes to OpenRouter automatically.
 
 ### Fixed
+- **Malformed tagged tool calls are reprompted, not presented as answers.**
+  When a local model emits a tool call as tagged text (`<tool_call>{…}`) and
+  the JSON inside is broken or cut off, the agent loop previously treated the
+  raw markup as the final answer and stopped. It now detects the failed tool
+  intent, feeds the model one corrective message ("re-emit as exactly one
+  JSON object…"), and only then gives up — bounded to a single retry so a
+  model that can't produce valid JSON still terminates.
 - **`/model` now swaps providers, not just the model string.** Picking an
   Ollama or OpenAI model while on Anthropic previously sent the new name to
   the old provider's API. The picker now maps every choice to the provider
