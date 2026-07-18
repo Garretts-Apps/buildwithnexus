@@ -21,6 +21,9 @@ path = "src/main.rs"
 [[bin]]
 name = "bwn"
 path = "src/bwn.rs"
+# The alias shim collides with the bwn crate's bin in workspace `cargo doc`
+# output paths, and a two-line shim has nothing to document anyway.
+doc = false
 
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
