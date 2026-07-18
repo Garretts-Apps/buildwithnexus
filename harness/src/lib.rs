@@ -189,6 +189,38 @@ fn broken_settings_msg() -> String {
         .to_string()
 }
 
+// One rotating line under the banner: half real tips, half jokes — the
+// personality lives here, in the terminal, never in the way. Errors stay
+// serious; this line is the only place bwn gets to be funny at startup.
+const STARTUP_TIPS: &[&str] = &[
+    "tip: Shift+Tab cycles PLAN → BUILD → BRAINSTORM. plan first, thank yourself later",
+    "tip: Esc interrupts the agent mid-thought. it can take it",
+    "tip: Ctrl+V pastes a screenshot straight into the prompt — the model sees what you see",
+    "tip: @ completes file paths, @kb: searches the knowledge base",
+    "tip: double-click a word, triple-click a line. copied, confirmed, footer says so",
+    "tip: /checkpoint before you get brave",
+    "tip: /model swaps models mid-session — it validates before it commits",
+    "tip: ↑ filters history by what you've typed, and never eats your draft",
+    "tip: /vim exists. you already knew, somehow",
+    "tip: queue your next prompt while the agent works — it sends itself when the turn ends",
+    "tip: local models via Ollama keep your code where it belongs: on your machine",
+    "tip: Ctrl+G opens your $EDITOR when the prompt outgrows one line",
+    "tip: file paths in edit headers are clickable. yes, even the .docx",
+    "tip: bwn started faster than you read this sentence",
+    "tip: the other terminals keep asking about bwn. tell them not to worry about it",
+    "tip: /trace shows receipts — every tool call, hook, and skill load",
+    "tip: 966µs → 4.5µs per streamed chunk. we timed it so you don't have to feel it",
+    "tip: /schedule and /loop run work while you're at lunch. bwn doesn't take lunch",
+];
+
+fn startup_tip() -> &'static str {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    STARTUP_TIPS[nanos % STARTUP_TIPS.len()]
+}
+
 fn is_loopback_url(u: &str) -> bool {
     let rest = u
         .strip_prefix("http://")
@@ -420,6 +452,7 @@ fn repl(
     tui::line(&tui::dim(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
+    tui::line(&tui::dim(&format!("  {}", startup_tip())));
     if let Some(notice) = update::startup_notice(&settings.auto_update) {
         tui::line(&tui::dim(&notice));
     }
@@ -3392,6 +3425,18 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_tips_fit_one_line_and_stay_in_character() {
+        assert!(STARTUP_TIPS.len() >= 12, "keep the rotation fresh");
+        for t in STARTUP_TIPS {
+            assert!(t.starts_with("tip: "), "uniform prefix: {t}");
+            assert!(t.chars().count() <= 100, "must fit one line: {t}");
+            assert!(!t.contains('!'), "exclamation marks are hype: {t}");
+        }
+        // The picker always returns a member, whatever the clock says.
+        assert!(STARTUP_TIPS.contains(&startup_tip()));
+    }
 
     #[test]
     fn model_pick_routes_to_serving_provider() {

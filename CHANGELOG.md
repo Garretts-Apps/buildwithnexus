@@ -7,6 +7,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.12.5] - Unreleased
 
 ### Added
+- **Startup tips** — one rotating dim line under the banner: half real tips
+  (Shift+Tab modes, Ctrl+V screenshots, /checkpoint), half personality
+  ("bwn started faster than you read this sentence"). Jokes live here and
+  only here — error messages stay strictly business.
 - **The letsbeheroes skill collection** — eight bundled process skills
   (`/letsbeheroes`, `/hero-brainstorm`, `/hero-plan`, `/hero-execute`,
   `/hero-debug`, `/hero-ship`, `/hero-wait`, `/hero-subagents`) that encode
