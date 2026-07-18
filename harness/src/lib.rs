@@ -144,8 +144,14 @@ pub fn run() {
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
-    let mut settings = match config::load_settings() {
+    let load = config::load_settings_diag();
+    warn_settings_issues(&load);
+    let mut settings = match load.settings {
         Some(s) => s,
+        // Settings files exist but none were usable: refuse to fall through
+        // to onboarding, which would overwrite them. Broken config is a fix,
+        // not a first run.
+        None if load.any_present => return Err(broken_settings_msg()),
         None => onboarding::run().ok_or("setup cancelled")?,
     };
     if let Some(p) = &opts.provider {
@@ -160,6 +166,24 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         .as_deref()
         .unwrap_or(&settings.permission);
     Ok((provider, agent::permission(perm_name)))
+}
+
+/// Every ignored settings file gets one loud stderr line — a typo in a config
+/// file must never be invisible.
+fn warn_settings_issues(load: &config::SettingsLoad) {
+    for i in &load.issues {
+        eprintln!(
+            "{}",
+            tui::yellow(&format!("buildwithnexus: warning: {}: {}", i.source, i.error))
+        );
+    }
+}
+
+fn broken_settings_msg() -> String {
+    "settings files exist but none could be used (see warnings above).\n  \
+     Fix the file, or delete it and run `buildwithnexus init` to set up again.\n  \
+     `buildwithnexus doctor` lists every settings file and its status."
+        .to_string()
 }
 
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
@@ -302,9 +326,16 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // Always scaffold on interactive launch so existing users also get the
     // directory skeleton and starter Agents.md if they're missing.
     config::scaffold_home();
-    let onboarded = config::load_settings().is_some();
-    if !onboarded && onboarding::run().is_none() {
-        return;
+    let load = config::load_settings_diag();
+    warn_settings_issues(&load);
+    if load.settings.is_none() {
+        if load.any_present {
+            eprintln!("{}", tui::red(&broken_settings_msg()));
+            std::process::exit(1);
+        }
+        if onboarding::run().is_none() {
+            return;
+        }
     }
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
@@ -2835,7 +2866,14 @@ fn run_doctor() {
     println!();
 
     // Settings
-    match config::load_settings() {
+    let load = config::load_settings_diag();
+    for i in &load.issues {
+        println!("  ✗ settings       {}: {}", i.source, i.error);
+    }
+    match load.settings {
+        None if load.any_present => {
+            println!("  ✗ settings       present but unusable — fix the file(s) above");
+        }
         None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
         Some(s) => {
             println!(

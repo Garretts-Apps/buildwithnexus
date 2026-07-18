@@ -1,6 +1,6 @@
 {
   "name": "buildwithnexus",
-  "version": "0.12.4",
+  "version": "0.12.5",
   "description": "Fast, local-first AI coding agent for the terminal, written in Rust. Works with hosted APIs (Anthropic, OpenAI) and local models (Ollama).",
   "main": "index.js",
   "bin": {
@@ -58,11 +58,11 @@
     "provenance": true
   },
   "optionalDependencies": {
-    "buildwithnexus-linux-x64": "0.12.4",
-    "buildwithnexus-linux-arm64": "0.12.4",
-    "buildwithnexus-darwin-x64": "0.12.4",
-    "buildwithnexus-darwin-arm64": "0.12.4",
-    "buildwithnexus-win32-x64": "0.12.4"
+    "buildwithnexus-linux-x64": "0.12.5",
+    "buildwithnexus-linux-arm64": "0.12.5",
+    "buildwithnexus-darwin-x64": "0.12.5",
+    "buildwithnexus-darwin-arm64": "0.12.5",
+    "buildwithnexus-win32-x64": "0.12.5"
   },
   "browser": "./index.browser.js"
 }

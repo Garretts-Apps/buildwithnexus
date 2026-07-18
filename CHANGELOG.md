@@ -4,6 +4,16 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.5] - Unreleased
+
+### Fixed
+- **Broken settings files are now diagnosed, never silently dropped.** A JSON
+  typo in any settings file previously made the CLI act as if you'd never
+  configured it — and first-run onboarding could then overwrite your config.
+  Startup now prints one warning per unusable file with the exact line and
+  column, refuses to re-onboard while broken files exist, and
+  `buildwithnexus doctor` lists every settings file with its parse status.
+
 ## [0.12.4] - 2026-07-16
 
 ### Fixed

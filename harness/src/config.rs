@@ -608,63 +608,72 @@ unnecessary complexity. Produces a concise numbered list of findings.
 }
 
 pub fn load_settings() -> Option<Settings> {
-    load_settings_from_dir(&std::env::current_dir().unwrap_or_else(|_| home()))
+    load_settings_diag().settings
 }
 
 /// Loads settings from global ~/.buildwithnexus/config.json, settings.json, settings.local.json,
 /// and project .buildwithnexus/settings.json, settings.local.json, merging them in hierarchy order.
 pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
+    load_settings_from_dir_diag(workdir).settings
+}
+
+/// A settings file that exists on disk but was ignored, and why — surfaced at
+/// startup and in `doctor` so a typo never silently drops configuration.
+pub struct SettingsIssue {
+    pub source: String,
+    pub error: String,
+}
+
+pub struct SettingsLoad {
+    pub settings: Option<Settings>,
+    pub issues: Vec<SettingsIssue>,
+    /// At least one settings file exists on disk — distinguishes "broken
+    /// config" (never clobber it) from a true first run (offer onboarding).
+    pub any_present: bool,
+}
+
+pub fn load_settings_diag() -> SettingsLoad {
+    load_settings_from_dir_diag(&std::env::current_dir().unwrap_or_else(|_| home()))
+}
+
+pub fn load_settings_from_dir_diag(workdir: &std::path::Path) -> SettingsLoad {
+    let dot = workdir.join(".buildwithnexus");
+    let paths = [
+        home().join("config.json"), // legacy base
+        settings_path(),
+        home().join("settings.local.json"),
+        dot.join("settings.json"),
+        dot.join("settings.local.json"),
+    ];
+
     let mut sources = Vec::new();
-
-    // 1. Global config.json (legacy base)
-    if let Ok(text) = fs::read_to_string(home().join("config.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 2. Global settings.json
-    if let Ok(text) = fs::read_to_string(settings_path()) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 3. Global settings.local.json
-    if let Ok(text) = fs::read_to_string(home().join("settings.local.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 4. Project settings.json
-    let proj_path = workdir.join(".buildwithnexus").join("settings.json");
-    if let Ok(text) = fs::read_to_string(&proj_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 5. Project settings.local.json
-    let local_path = workdir.join(".buildwithnexus").join("settings.local.json");
-    if let Ok(text) = fs::read_to_string(&local_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
+    let mut issues = Vec::new();
+    let mut any_present = false;
+    for p in &paths {
+        let Ok(text) = fs::read_to_string(p) else {
+            continue;
+        };
+        any_present = true;
+        // serde_json's Display includes line and column — keep it verbatim.
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(val) if val.is_object() => sources.push(val),
+            Ok(_) => issues.push(SettingsIssue {
+                source: p.display().to_string(),
+                error: "top level must be a JSON object — file ignored".into(),
+            }),
+            Err(e) => issues.push(SettingsIssue {
+                source: p.display().to_string(),
+                error: format!("{e} — file ignored"),
+            }),
         }
     }
 
     if sources.is_empty() {
-        return None;
+        return SettingsLoad {
+            settings: None,
+            issues,
+            any_present,
+        };
     }
 
     let mut merged = sources.remove(0);
@@ -672,7 +681,24 @@ pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
         merge_json_values(&mut merged, source);
     }
 
-    serde_json::from_value(merged).ok()
+    match serde_json::from_value(merged) {
+        Ok(s) => SettingsLoad {
+            settings: Some(s),
+            issues,
+            any_present,
+        },
+        Err(e) => {
+            issues.push(SettingsIssue {
+                source: "merged settings".into(),
+                error: format!("{e} — check the value types in the files listed by `buildwithnexus doctor`"),
+            });
+            SettingsLoad {
+                settings: None,
+                issues,
+                any_present,
+            }
+        }
+    }
 }
 
 fn merge_json_values(target: &mut serde_json::Value, source: serde_json::Value) {
@@ -801,6 +827,70 @@ mod tests {
         static N: AtomicU64 = AtomicU64::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("bwn-cfg-{id}"))
+    }
+
+    #[test]
+    fn settings_diag_reports_broken_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let work = h.join("proj");
+        fs::create_dir_all(&work).unwrap();
+
+        // No files anywhere: a true first run — nothing present, no issues.
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none());
+        assert!(l.issues.is_empty());
+        assert!(!l.any_present);
+
+        // Syntax error: file is present, ignored, and the issue names it.
+        fs::write(h.join("settings.json"), "{ \"provider\": \"openai\", }").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none());
+        assert!(l.any_present);
+        assert_eq!(l.issues.len(), 1);
+        assert!(l.issues[0].source.contains("settings.json"));
+        assert!(l.issues[0].error.contains("line"));
+
+        // Valid JSON, wrong shape: array top level is ignored with a clear reason.
+        fs::write(h.join("settings.json"), "[1,2,3]").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none() && l.any_present);
+        assert!(l.issues[0].error.contains("JSON object"));
+
+        // Valid file + wrong field type: the merged deserialize fails loudly
+        // instead of silently dropping all configuration.
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask","auto_update":true}"#,
+        )
+        .unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none() && l.any_present);
+        assert!(l.issues.iter().any(|i| i.source == "merged settings"));
+
+        // Fixed file loads cleanly with zero issues.
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#,
+        )
+        .unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_some());
+        assert!(l.issues.is_empty());
+
+        // A broken project-local file is reported but doesn't take down the
+        // valid global settings.
+        fs::create_dir_all(work.join(".buildwithnexus")).unwrap();
+        fs::write(work.join(".buildwithnexus/settings.json"), "{oops").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_some());
+        assert_eq!(l.issues.len(), 1);
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
     }
 
     #[test]
