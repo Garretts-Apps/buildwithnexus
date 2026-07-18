@@ -2503,7 +2503,24 @@ fn handle_checkpoints(cwd: &std::path::Path) {
 
 fn handle_undo(cwd: &std::path::Path, arg: &str) {
     let arg = arg.trim();
-    if arg == "git" {
+    if arg.is_empty() {
+        // Bare /undo reverts the last agent turn as a unit — the recovery for
+        // a partial multi-file edit, where undoing one file would quietly
+        // leave the rest changed.
+        match checkpoint::undo_last_turn(cwd) {
+            Ok(cps) => {
+                tui::line(&tui::green(&format!(
+                    "  ✓ undid the last agent turn — restored {} file{}:",
+                    cps.len(),
+                    if cps.len() == 1 { "" } else { "s" }
+                )));
+                for c in cps {
+                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                }
+            }
+            Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+        }
+    } else if arg == "git" {
         match checkpoint::git_rollback(cwd) {
             Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
             Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
@@ -2522,19 +2539,19 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             }
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
-    } else if !arg.is_empty() {
-        match checkpoint::undo_by_id(cwd, arg) {
+    } else if arg == "latest" {
+        match checkpoint::undo_latest(cwd) {
             Ok(cp) => tui::line(&tui::green(&format!(
-                "  ✓ restored checkpoint {} ({})",
-                cp.id,
+                "  ✓ restored latest {}",
                 cp.path.display()
             ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
     } else {
-        match checkpoint::undo_latest(cwd) {
+        match checkpoint::undo_by_id(cwd, arg) {
             Ok(cp) => tui::line(&tui::green(&format!(
-                "  ✓ restored latest {}",
+                "  ✓ restored checkpoint {} ({})",
+                cp.id,
                 cp.path.display()
             ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
@@ -2697,7 +2714,11 @@ fn print_help() {
                 ("/commit", "", "AI-drafted conventional commit message"),
                 ("/pr", "", "AI-drafted PR title + description"),
                 ("/checkpoints", "", "list edit checkpoints"),
-                ("/undo", "(/rewind) <git|all|id>", "restore a checkpoint"),
+                (
+                    "/undo",
+                    "(/rewind) [latest|git|all|<id>]",
+                    "bare: revert the last agent turn's edits",
+                ),
             ],
         ),
         (

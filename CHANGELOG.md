@@ -24,6 +24,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `google/gemini-2.5-pro`) routes to OpenRouter automatically.
 
 ### Fixed
+- **Bare `/undo` now reverts the whole last agent turn.** After a partial
+  multi-file edit (the agent changed three files and broke two, or Esc landed
+  mid-batch), `/undo` used to restore only the single most-recent checkpoint —
+  it looked like an undo while quietly leaving the other files changed. Bare
+  `/undo` now restores every file the last agent turn touched, in the right
+  order even when one file was edited several times; `latest` keeps the old
+  single-checkpoint behavior.
+- **Rapid multi-file batches no longer lose checkpoints.** Checkpoint ids
+  were timestamp-only, so several writes in the same millisecond overwrote
+  each other's snapshots on disk — some files in a fast batch were silently
+  unrecoverable. Ids now carry a sequence number, which also makes restore
+  ordering deterministic within a millisecond.
 - **Malformed tagged tool calls are reprompted, not presented as answers.**
   When a local model emits a tool call as tagged text (`<tool_call>{…}`) and
   the JSON inside is broken or cut off, the agent loop previously treated the

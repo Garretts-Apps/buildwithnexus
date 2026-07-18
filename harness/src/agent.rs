@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use crate::checkpoint;
 use crate::config;
 use crate::hooks::{self, PreDecision};
 use crate::provider::{self, complete, Msg, Provider, Reply, ToolResult};
@@ -1728,6 +1729,11 @@ fn build_inner(
     msgs: &mut Vec<Msg>,
     sid: Option<&str>,
 ) -> Result<String, String> {
+    // Top-level runs mark a turn boundary so bare /undo can revert exactly
+    // this run's writes; subagent recursion must not shrink that window.
+    if depth == 0 {
+        checkpoint::mark_turn_start();
+    }
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));

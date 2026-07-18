@@ -19,6 +19,11 @@ pub struct Checkpoint {
     pub created_ms: u128,
     pub existed: bool,
     pub content: String,
+    /// Process-wide sequence number, part of the id so several checkpoints in
+    /// the same millisecond (a fast multi-file batch) can never collide, and
+    /// the tiebreaker for restore ordering. Old files default to 0.
+    #[serde(default)]
+    pub seq: u64,
     /// False when the original contents could not be captured (file too large
     /// or not valid UTF-8). Restore refuses to overwrite such files rather than
     /// clobbering them with an empty string. Defaults to true so checkpoint
@@ -41,6 +46,32 @@ fn dir(cwd: &Path) -> PathBuf {
     std::env::temp_dir()
         .join("bwn-checkpoints-test")
         .join(sanitize_id_part(&cwd.to_string_lossy()))
+}
+
+// Set when a user prompt starts a top-level agent run. Bare /undo restores
+// exactly the files that run touched — the recovery path for a partial
+// multi-file edit (agent changed 3 files, broke 2, or Esc landed mid-batch).
+static TURN_START_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn mark_turn_start() {
+    TURN_START_MS.store(now_ms() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restores every checkpoint recorded since the current agent turn began.
+/// Newest-first restore order means a file edited several times in the turn
+/// ends at its pre-turn contents.
+pub fn undo_last_turn(cwd: &Path) -> Result<Vec<Checkpoint>, String> {
+    let since = TURN_START_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if since == 0 {
+        return Err(
+            "no agent turn recorded in this session — use /undo latest, /undo <id>, or /undo all"
+                .into(),
+        );
+    }
+    undo_all_since(cwd, since as u128).map_err(|_| {
+        "the last agent turn made no file changes — use /undo latest, /undo <id>, or /undo all"
+            .to_string()
+    })
 }
 
 /// Returns the current Unix timestamp in milliseconds.
@@ -75,7 +106,11 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         (String::new(), true)
     };
     let created_ms = now_ms();
-    let id = format!("{}-{}", created_ms, sanitize_id_part(action));
+    // A fast multi-file batch records several checkpoints in one millisecond;
+    // a timestamp-only id made them overwrite each other on disk.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!("{}-{}-{}", created_ms, seq, sanitize_id_part(action));
     let cp = Checkpoint {
         id: id.clone(),
         cwd: cwd.to_path_buf(),
@@ -85,6 +120,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         existed,
         content,
         snapshotted,
+        seq,
     };
     let checkpoint_dir = dir(cwd);
     let _ = fs::create_dir_all(&checkpoint_dir);
@@ -104,7 +140,7 @@ pub fn list(cwd: &Path) -> Vec<Checkpoint> {
         .filter_map(|s| serde_json::from_str::<Checkpoint>(&s).ok())
         .filter(|cp| cp.cwd == cwd)
         .collect();
-    items.sort_by_key(|cp| std::cmp::Reverse(cp.created_ms));
+    items.sort_by_key(|cp| std::cmp::Reverse((cp.created_ms, cp.seq)));
     items
 }
 
@@ -199,6 +235,52 @@ pub fn git_rollback(cwd: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn undo_last_turn_reverts_a_partial_multi_file_batch() {
+        let d = std::env::temp_dir().join(format!("bwn-cp-turn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+
+        // Pre-turn edit: must NOT be reverted by a last-turn undo.
+        let earlier = d.join("earlier.txt");
+        fs::write(&earlier, "old").unwrap();
+        record(&d, &earlier, "edit_file");
+        fs::write(&earlier, "edited before the turn").unwrap();
+
+        // The agent turn begins, then edits three files and dies mid-batch —
+        // one of them twice, so restore ordering matters.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        mark_turn_start();
+        let files: Vec<_> = (1..=3).map(|i| d.join(format!("f{i}.txt"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            fs::write(f, format!("original {i}")).unwrap();
+            record(&d, f, "edit_file");
+            fs::write(f, format!("broken {i}")).unwrap();
+        }
+        record(&d, &files[0], "edit_file");
+        fs::write(&files[0], "broken again 0").unwrap();
+
+        let restored = undo_last_turn(&d).expect("turn undo must succeed");
+        assert_eq!(restored.len(), 4, "all in-turn checkpoints restored");
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(
+                fs::read_to_string(f).unwrap(),
+                format!("original {i}"),
+                "file {i} back to pre-turn contents"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&earlier).unwrap(),
+            "edited before the turn",
+            "pre-turn work is untouched"
+        );
+
+        // The turn's checkpoints are consumed; a second bare undo says so
+        // instead of silently rewinding older history.
+        assert!(undo_last_turn(&d).is_err());
+        let _ = fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn test_record_and_undo_by_id() {

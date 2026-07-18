@@ -3010,7 +3010,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/trace" => "inspect hooks, tools, skills, subagents",
         "/agents" => "manage subagents",
         "/checkpoints" => "list edit checkpoints",
-        "/undo" | "/rewind" => "revert to an edit checkpoint",
+        "/undo" | "/rewind" => "revert the last agent turn (or latest/git/all/<id>)",
         "/vim" => "toggle vim editing mode",
         "/voice" => "voice input",
         "/local" => "manage local models",
