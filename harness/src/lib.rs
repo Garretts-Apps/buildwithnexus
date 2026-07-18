@@ -453,6 +453,13 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    let restored = workflow::restore();
+    if restored > 0 {
+        tui::line(&tui::green(&format!(
+            "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
+            if restored == 1 { "" } else { "s" }
+        )));
+    }
     if let Some(notice) = update::startup_notice(&settings.auto_update) {
         tui::line(&tui::dim(&notice));
     }

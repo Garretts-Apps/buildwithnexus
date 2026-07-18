@@ -24,6 +24,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `google/gemini-2.5-pro`) routes to OpenRouter automatically.
 
 ### Fixed
+- **Pending `/schedule` and `/loop` workflows survive restarts.** They lived
+  only in process memory, so quitting, crashing, or resuming a session
+  silently discarded them. Pending workflows now persist to
+  `~/.buildwithnexus/workflows.json` (atomic writes, file removed when the
+  queue is empty) and are restored at the next interactive launch with a
+  visible "⟳ restored N scheduled workflows" notice. Loop iteration counts
+  and next-fire times carry over; headless workflow subprocesses never touch
+  the store.
 - **Bare `/undo` now reverts the whole last agent turn.** After a partial
   multi-file edit (the agent changed three files and broke two, or Esc landed
   mid-batch), `/undo` used to restore only the single most-recent checkpoint —
