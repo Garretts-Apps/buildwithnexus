@@ -183,6 +183,23 @@ pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, 
     request(p, msgs, tools, false, &mut sink, &mut noop)
 }
 
+/// One-token probe through the real completion path — proves the key is
+/// accepted, the model exists, and the server is reachable, so a model swap
+/// can be validated before it's declared successful. Costs ≤1 output token.
+pub fn validate(p: &Provider) -> Result<(), String> {
+    let probe = Provider {
+        protocol: p.protocol,
+        base_url: p.base_url.clone(),
+        api_key: p.api_key.clone(),
+        model: p.model.clone(),
+        context_tokens: p.context_tokens,
+        temperature: None,
+        max_tokens: Some(1),
+        ollama_ctx: std::sync::OnceLock::new(),
+    };
+    complete(&probe, &[Msg::User("ping".into())], &[]).map(|_| ())
+}
+
 // Streams assistant text to `on_text` and thinking tokens (when available) to
 // `on_thinking` as they arrive; tool calls are accumulated and returned on completion.
 pub fn stream(
@@ -1415,6 +1432,64 @@ fn ollama_stream(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // One-shot HTTP server: answers `responses.len()` requests with the given
+    // (status, body) pairs, then exits. Runs the real wire path end-to-end.
+    fn mock_server(responses: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for (code, body) in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                    .unwrap();
+                // Drain the request without caring about its shape.
+                let mut buf = [0u8; 16384];
+                let mut seen = Vec::new();
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            seen.extend_from_slice(&buf[..n]);
+                            // Headers done and some body bytes read is enough.
+                            if seen.windows(4).any(|w| w == b"\r\n\r\n") && seen.ends_with(b"}") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn validate_passes_on_ok_and_reports_auth_and_connect_failures() {
+        let ok_body = r#"{"choices":[{"message":{"role":"assistant","content":"y"},"finish_reason":"stop"}]}"#;
+        let auth_body = r#"{"error":{"message":"invalid api key"}}"#;
+        let (base, handle) = mock_server(vec![(200, ok_body), (401, auth_body)]);
+        let p = Provider {
+            protocol: Protocol::OpenAi,
+            base_url: base,
+            api_key: Some("sk-test".into()),
+            model: "test-model".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        assert!(validate(&p).is_ok(), "200 must validate");
+        let err = validate(&p).unwrap_err();
+        assert!(err.contains("401"), "auth failure must surface the status: {err}");
+        handle.join().unwrap();
+    }
 
     fn tc(id: &str, name: &str, input: Value) -> ToolCall {
         ToolCall {

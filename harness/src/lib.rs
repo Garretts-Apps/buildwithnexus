@@ -1691,16 +1691,6 @@ fn swap_model(
             )));
             return;
         }
-    } else if preset.id == "custom" {
-        tui::line(&tui::dim(&format!(
-            "  note: the server at {} must be running and serving '{model}'.",
-            custom_url.as_deref().unwrap_or(preset.base_url)
-        )));
-    } else if preset.local {
-        tui::line(&tui::dim(&format!(
-            "  note: {} must be running at {} with this model loaded.",
-            preset.label, preset.base_url
-        )));
     }
 
     // A custom base_url belongs to the provider it was set for.
@@ -1714,11 +1704,42 @@ fn swap_model(
     s.model = model.to_string();
     match build_provider(&s) {
         Ok(p) => {
+            // No success message without proof: a one-token probe through the
+            // real request path catches bad keys, unknown model names, and
+            // unreachable servers now instead of on the next prompt. Ollama
+            // was already validated live above (server + installed model),
+            // and a probe there could cold-load a large model.
+            if preset.id != "ollama" {
+                tui::line(&tui::dim(&format!(
+                    "  validating {model} — one-token probe…"
+                )));
+                if let Err(e) = provider::validate(&p) {
+                    tui::line(&tui::red(&format!("  ✗ validation failed: {e}")));
+                    let hint = if e.contains("401") || e.contains("403") {
+                        format!(
+                            "the API key was rejected — re-run /model to enter a new one, or update {}",
+                            if preset.id == "custom" { config::CUSTOM_KEY } else { preset.env_key }
+                        )
+                    } else if e.contains("404") || e.to_lowercase().contains("model") {
+                        format!("'{model}' doesn't look like a model this provider serves — check the name")
+                    } else if e.contains("connection failed") {
+                        format!("nothing is answering at {} — start the server, then /model again", p.base_url)
+                    } else {
+                        "fix the issue above, then /model again".to_string()
+                    };
+                    tui::line(&tui::dim(&format!("    {hint}")));
+                    tui::line(&tui::dim(&format!(
+                        "    keeping the current model ({}).",
+                        provider.model
+                    )));
+                    return;
+                }
+            }
             *provider = p;
             config::save_settings(&s);
             provider::prewarm(provider);
             tui::line(&tui::green(&format!(
-                "  ✓ active model hot-swapped → {} on {}",
+                "  ✓ active model hot-swapped → {} on {} (validated)",
                 model, preset.label
             )));
         }

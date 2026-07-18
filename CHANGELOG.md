@@ -27,6 +27,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that Ollama is reachable and actually has the model (with install/pull
   steps when not), and keeps the current model on any failure instead of
   reporting a successful swap that would break the next prompt.
+- **"✓ hot-swapped" is only printed after live validation.** Every swap
+  (except Ollama, which is validated via its API beforehand) runs a one-token
+  probe through the real request path first — a rejected key, an unknown
+  model name, or an unreachable server fails the swap on the spot with a
+  targeted hint, instead of surfacing as a raw HTTP error on your next
+  prompt.
 - **Broken settings files are now diagnosed, never silently dropped.** A JSON
   typo in any settings file previously made the CLI act as if you'd never
   configured it — and first-run onboarding could then overwrite your config.
