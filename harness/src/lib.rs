@@ -174,7 +174,10 @@ fn warn_settings_issues(load: &config::SettingsLoad) {
     for i in &load.issues {
         eprintln!(
             "{}",
-            tui::yellow(&format!("buildwithnexus: warning: {}: {}", i.source, i.error))
+            tui::yellow(&format!(
+                "buildwithnexus: warning: {}: {}",
+                i.source, i.error
+            ))
         );
     }
 }
@@ -1473,7 +1476,11 @@ fn handle_model(provider: &mut Provider) {
             _ => &[],
         };
         for m in extras {
-            options.push((p.id.to_string(), m.to_string(), format!("{}{}", p.label, status)));
+            options.push((
+                p.id.to_string(),
+                m.to_string(),
+                format!("{}{}", p.label, status),
+            ));
         }
     }
 
@@ -1486,7 +1493,11 @@ fn handle_model(provider: &mut Provider) {
 
     for (idx, (prov, model, desc)) in options.iter().enumerate() {
         let num = format!("{:>2}", idx + 1);
-        let shown = if model.is_empty() { "(you choose)" } else { model };
+        let shown = if model.is_empty() {
+            "(you choose)"
+        } else {
+            model
+        };
         tui::line(&format!(
             "  {} {} {} — {}",
             tui::accent(&num),
@@ -1613,8 +1624,8 @@ fn swap_model(
             });
         }
         if config::load_key(config::CUSTOM_KEY).is_none() {
-            let key = tui::ask("  API key (press Enter if the server needs none): ")
-                .unwrap_or_default();
+            let key =
+                tui::ask("  API key (press Enter if the server needs none): ").unwrap_or_default();
             if !key.trim().is_empty() {
                 config::save_key(config::CUSTOM_KEY, key.trim());
                 tui::line(&tui::green(&format!("  ✓ {} saved", config::CUSTOM_KEY)));
@@ -1673,8 +1684,12 @@ fn swap_model(
             )));
             tui::line(&tui::dim("    1. install: https://ollama.com"));
             tui::line(&tui::dim("    2. start it:  ollama serve"));
-            tui::line(&tui::dim(&format!("    3. pull the model:  ollama pull {model}")));
-            tui::line(&tui::dim("    then run /model again — keeping the current model."));
+            tui::line(&tui::dim(&format!(
+                "    3. pull the model:  ollama pull {model}"
+            )));
+            tui::line(&tui::dim(
+                "    then run /model again — keeping the current model.",
+            ));
             return;
         }
         let have = installed
@@ -1723,7 +1738,10 @@ fn swap_model(
                     } else if e.contains("404") || e.to_lowercase().contains("model") {
                         format!("'{model}' doesn't look like a model this provider serves — check the name")
                     } else if e.contains("connection failed") {
-                        format!("nothing is answering at {} — start the server, then /model again", p.base_url)
+                        format!(
+                            "nothing is answering at {} — start the server, then /model again",
+                            p.base_url
+                        )
                     } else {
                         "fix the issue above, then /model again".to_string()
                     };
@@ -3378,25 +3396,51 @@ mod tests {
     #[test]
     fn model_pick_routes_to_serving_provider() {
         let p = |s: &str| parse_model_pick(s, "anthropic");
-        assert_eq!(p("claude-sonnet-4-6"), ("anthropic".into(), "claude-sonnet-4-6".into()));
+        assert_eq!(
+            p("claude-sonnet-4-6"),
+            ("anthropic".into(), "claude-sonnet-4-6".into())
+        );
         assert_eq!(p("gpt-4o"), ("openai".into(), "gpt-4o".into()));
-        assert_eq!(p("ollama/qwen2.5-coder"), ("ollama".into(), "qwen2.5-coder".into()));
-        assert_eq!(p("local/phi-4.gguf"), ("llamacpp".into(), "phi-4.gguf".into()));
+        assert_eq!(
+            p("ollama/qwen2.5-coder"),
+            ("ollama".into(), "qwen2.5-coder".into())
+        );
+        assert_eq!(
+            p("local/phi-4.gguf"),
+            ("llamacpp".into(), "phi-4.gguf".into())
+        );
         // Gemini has no native preset — routed through OpenRouter's naming.
-        assert_eq!(p("gemini-2.5-pro"), ("openrouter".into(), "google/gemini-2.5-pro".into()));
+        assert_eq!(
+            p("gemini-2.5-pro"),
+            ("openrouter".into(), "google/gemini-2.5-pro".into())
+        );
         // org/model naming is OpenRouter's scheme.
-        assert_eq!(p("meta-llama/llama-3.3-70b"), ("openrouter".into(), "meta-llama/llama-3.3-70b".into()));
+        assert_eq!(
+            p("meta-llama/llama-3.3-70b"),
+            ("openrouter".into(), "meta-llama/llama-3.3-70b".into())
+        );
         // Explicit "<provider> <model>" wins over inference.
-        assert_eq!(p("groq llama-3.3-70b-versatile"), ("groq".into(), "llama-3.3-70b-versatile".into()));
+        assert_eq!(
+            p("groq llama-3.3-70b-versatile"),
+            ("groq".into(), "llama-3.3-70b-versatile".into())
+        );
         // Unknown names stay on the current provider for the swap to validate.
-        assert_eq!(p("mystery-model"), ("anthropic".into(), "mystery-model".into()));
+        assert_eq!(
+            p("mystery-model"),
+            ("anthropic".into(), "mystery-model".into())
+        );
         // Custom endpoints are addressable by preset name too.
-        assert_eq!(p("custom vllm-model"), ("custom".into(), "vllm-model".into()));
+        assert_eq!(
+            p("custom vllm-model"),
+            ("custom".into(), "vllm-model".into())
+        );
     }
 
     #[test]
     fn custom_provider_keyless_http_and_key_guard() {
-        let _g = config::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let h = std::env::temp_dir().join("bwn-custom-provider-test");
         let _ = std::fs::remove_dir_all(&h);
         std::fs::create_dir_all(&h).unwrap();

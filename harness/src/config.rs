@@ -741,7 +741,9 @@ pub fn load_settings_from_dir_diag(workdir: &std::path::Path) -> SettingsLoad {
         Err(e) => {
             issues.push(SettingsIssue {
                 source: "merged settings".into(),
-                error: format!("{e} — check the value types in the files listed by `buildwithnexus doctor`"),
+                error: format!(
+                    "{e} — check the value types in the files listed by `buildwithnexus doctor`"
+                ),
             });
             SettingsLoad {
                 settings: None,

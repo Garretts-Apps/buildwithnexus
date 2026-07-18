@@ -1487,7 +1487,10 @@ mod tests {
         };
         assert!(validate(&p).is_ok(), "200 must validate");
         let err = validate(&p).unwrap_err();
-        assert!(err.contains("401"), "auth failure must surface the status: {err}");
+        assert!(
+            err.contains("401"),
+            "auth failure must surface the status: {err}"
+        );
         handle.join().unwrap();
     }
 
