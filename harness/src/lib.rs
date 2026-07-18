@@ -1,5 +1,44 @@
-// Library root. The binary is a thin shim; everything lives here so integration
-// suites can reach the internals directly.
+//! A hilariously fast, agentic AI coding CLI — one static binary, written in
+//! Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter, Groq,
+//! Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
+//! OpenAI-compatible `/v1` endpoint.
+//!
+//! This crate is the whole application: the binaries (`buildwithnexus` and
+//! the `bwn` alias) are thin shims over [`run`]. It ships as a library so
+//! integration suites can reach the internals directly — it is not a stable
+//! API for building other tools on, and minor versions may rearrange it.
+//!
+//! # Install
+//!
+//! ```text
+//! cargo install buildwithnexus --locked   # installs `buildwithnexus` + `bwn`
+//! npm install -g buildwithnexus           # prebuilt, provenance-attested binary
+//! ```
+//!
+//! Then run `bwn` in a repository and describe a task. The agent plans,
+//! edits files, and runs commands — asking before each change (permission
+//! gates), with checkpoints that can rewind any write (`/undo`), lifecycle
+//! hooks, and hot-swappable models (`/model`, validated before it commits).
+//!
+//! # Map of the crate
+//!
+//! | Module | What lives there |
+//! |---|---|
+//! | [`agent`] | the ReAct loop: planning, tool calls, recovery, compaction |
+//! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
+//! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
+//! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
+//! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
+//! | [`session`] | save/resume of conversations |
+//! | [`workflow`] | background `/schedule` and `/loop` runs, persisted across restarts |
+//! | [`config`] | provider presets, settings files, key store, bundled skills |
+//! | [`hooks`] | Claude-Code-style lifecycle hooks (deny-capable, never grant) |
+//!
+//! Performance is the project's primary design lever; every claim is
+//! measured and reproducible — see `BENCHMARKS.md` in the repository.
+//! Docs, guides, and the changelog live at
+//! <https://buildwithnexus.dev>; source at
+//! <https://github.com/Garretts-Apps/buildwithnexus>.
 
 pub mod agent;
 pub mod checkpoint;
