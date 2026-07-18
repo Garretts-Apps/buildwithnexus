@@ -113,13 +113,30 @@ pub const PRESETS: &[Preset] = &[
         default_model: "local-model",
         local: true,
     },
+    // Any OpenAI-compatible /v1 server: vLLM, TGI, LiteLLM, a corporate
+    // gateway… The key is optional (CUSTOM_API_KEY) because most self-hosted
+    // servers don't need one; build_provider refuses to send a configured key
+    // to a non-HTTPS, non-loopback URL.
+    Preset {
+        id: "custom",
+        label: "OpenAI-compatible endpoint",
+        protocol: Protocol::OpenAi,
+        base_url: "http://localhost:8000/v1",
+        env_key: "",
+        default_model: "local-model",
+        local: true,
+    },
 ];
+
+/// Optional key for the `custom` preset — not wired through `env_key` so the
+/// key stays optional (env_key drives the "must be set" checks).
+pub const CUSTOM_KEY: &str = "CUSTOM_API_KEY";
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub provider: String,
     pub model: String,
@@ -436,6 +453,40 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
         ),
         ("frontend-ux", include_str!("bundled_skills/frontend-ux.md")),
         ("static-app", include_str!("bundled_skills/static-app.md")),
+        // The letsbeheroes collection: process discipline (how to work),
+        // complementing the domain skills above (what to work on).
+        (
+            "letsbeheroes",
+            include_str!("bundled_skills/letsbeheroes/letsbeheroes.md"),
+        ),
+        (
+            "hero-brainstorm",
+            include_str!("bundled_skills/letsbeheroes/hero-brainstorm.md"),
+        ),
+        (
+            "hero-plan",
+            include_str!("bundled_skills/letsbeheroes/hero-plan.md"),
+        ),
+        (
+            "hero-execute",
+            include_str!("bundled_skills/letsbeheroes/hero-execute.md"),
+        ),
+        (
+            "hero-debug",
+            include_str!("bundled_skills/letsbeheroes/hero-debug.md"),
+        ),
+        (
+            "hero-ship",
+            include_str!("bundled_skills/letsbeheroes/hero-ship.md"),
+        ),
+        (
+            "hero-wait",
+            include_str!("bundled_skills/letsbeheroes/hero-wait.md"),
+        ),
+        (
+            "hero-subagents",
+            include_str!("bundled_skills/letsbeheroes/hero-subagents.md"),
+        ),
     ]
 }
 
@@ -942,6 +993,43 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"static-app"));
         assert!(names.contains(&"frontend-ux"));
+    }
+
+    #[test]
+    fn bundled_skills_include_letsbeheroes_collection() {
+        let skills = bundled_skills();
+        let names: Vec<_> = skills.iter().map(|(n, _)| *n).collect();
+        for n in [
+            "letsbeheroes",
+            "hero-brainstorm",
+            "hero-plan",
+            "hero-execute",
+            "hero-debug",
+            "hero-ship",
+            "hero-wait",
+            "hero-subagents",
+        ] {
+            assert!(names.contains(&n), "missing skill {n}");
+        }
+        // Every member the charter references must actually be registered.
+        let charter = skills
+            .iter()
+            .find(|(n, _)| *n == "letsbeheroes")
+            .map(|(_, c)| *c)
+            .unwrap();
+        for n in &names {
+            if let Some(member) = n.strip_prefix("hero-") {
+                assert!(
+                    charter.contains(&format!("/hero-{member}")),
+                    "charter doesn't mention /hero-{member}"
+                );
+            }
+        }
+        // No duplicate names across the whole corpus.
+        let mut uniq = std::collections::HashSet::new();
+        for n in &names {
+            assert!(uniq.insert(n), "duplicate skill name {n}");
+        }
     }
 
     #[test]

@@ -6,7 +6,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.12.5] - Unreleased
 
+### Added
+- **The letsbeheroes skill collection** — eight bundled process skills
+  (`/letsbeheroes`, `/hero-brainstorm`, `/hero-plan`, `/hero-execute`,
+  `/hero-debug`, `/hero-ship`, `/hero-wait`, `/hero-subagents`) that encode
+  the working discipline: brainstorm → plan → execute → debug → verify,
+  plus condition-based waiting and subagent delegation.
+- **Any OpenAI-compatible endpoint as a provider** — new `custom` preset for
+  vLLM / TGI / LiteLLM / gateways: `/model` takes `<url> <model>` directly or
+  walks through URL, optional `CUSTOM_API_KEY`, and model name. A configured
+  key is never sent over plain HTTP to a non-loopback host.
+- **Any OpenRouter model** — `/model org/model` (e.g. `meta-llama/…`,
+  `google/gemini-2.5-pro`) routes to OpenRouter automatically.
+
 ### Fixed
+- **`/model` now swaps providers, not just the model string.** Picking an
+  Ollama or OpenAI model while on Anthropic previously sent the new name to
+  the old provider's API. The picker now maps every choice to the provider
+  that serves it, walks you through a missing API key on the spot, checks
+  that Ollama is reachable and actually has the model (with install/pull
+  steps when not), and keeps the current model on any failure instead of
+  reporting a successful swap that would break the next prompt.
 - **Broken settings files are now diagnosed, never silently dropped.** A JSON
   typo in any settings file previously made the CLI act as if you'd never
   configured it — and first-run onboarding could then overwrite your config.
