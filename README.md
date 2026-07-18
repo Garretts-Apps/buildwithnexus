@@ -80,6 +80,21 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
+### Package history
+
+If you browse the npm version history you'll see the same name carrying
+earlier, unrelated architectures — that's expected, not a hijack:
+
+| npm versions | what they were |
+|---|---|
+| 0.1.x – 0.7.x | a VM-isolation "runtime" experiment (QEMU/Docker era) |
+| 0.8.x | the TypeScript orchestrator with the Python/LangGraph backend |
+| **0.10.1 and later** | **this codebase** — the ground-up Rust CLI (0.10 inline UI, 0.11+ full-screen TUI) |
+
+The pre-0.10 versions share nothing with the current code and aren't
+maintained; install `latest`. The Rust line is also the only one published
+to crates.io.
+
 ## Models
 
 Two wire protocols cover everything. Pick a provider during setup (or `bwn init`):
