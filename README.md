@@ -80,6 +80,11 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
+"Hilariously fast" is a measurement, not a mood: 2 ms full-process startup,
+a 4.6 MiB resident TUI, and 3.6 µs to render a streamed chunk into a
+2,000-line transcript. Every number and how to regenerate it:
+[BENCHMARKS.md](BENCHMARKS.md).
+
 ### Package history
 
 If you browse the npm version history you'll see the same name carrying

@@ -47,6 +47,33 @@ fn long_conversation(turns: usize) -> Vec<Msg> {
     msgs
 }
 
+fn bench_wrap_cache(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    // A realistic transcript line (~150 cols, wraps to two rows at width 100)
+    // and a long session: 2,000 transcript lines.
+    let line = "the agent read three files, proposed a diff with word-level highlights, \
+                then streamed an explanation of the change while tests ran in the background"
+        .to_string();
+    let mut g = c.benchmark_group("transcript_append");
+    // What 0.12.0 shipped: a streamed chunk re-wraps exactly one line
+    // (append + reset = two single-line rewraps, an upper bound).
+    g.bench_function("incremental/2000lines", |b| {
+        let mut t = uibench::transcript(2_000, 100, &line);
+        b.iter(|| uibench::append_and_reset(black_box(&mut t), black_box("token "), &line))
+    });
+    // What every chunk cost before the wrap cache: re-wrap the whole
+    // transcript. Width alternates so the cache can't short-circuit.
+    g.bench_function("full_rewrap/2000lines", |b| {
+        let mut t = uibench::transcript(2_000, 100, &line);
+        let mut flip = false;
+        b.iter(|| {
+            flip = !flip;
+            uibench::full_rewrap(black_box(&mut t), if flip { 99 } else { 100 })
+        })
+    });
+    g.finish();
+}
+
 fn bench_body_builders(c: &mut Criterion) {
     let msgs = long_conversation(30);
     let defs = tools::defs(true);
@@ -166,6 +193,7 @@ fn bench_path_and_classify(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_wrap_cache,
     bench_body_builders,
     bench_cache_pass,
     bench_redact,
