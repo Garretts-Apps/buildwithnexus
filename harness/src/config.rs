@@ -280,10 +280,7 @@ pub fn save_history(entries: &[String]) {
         .iter()
         .map(|e| format!("{}\n", e.replace('\n', " ")))
         .collect();
-    let p = history_path();
-    if fs::write(&p, body).is_ok() {
-        restrict(&p);
-    }
+    write_atomic(&history_path(), &body, true);
 }
 
 // ── memory ────────────────────────────────────────────────────────────────────
@@ -302,8 +299,7 @@ pub fn load_memory() -> Option<String> {
 
 pub fn save_memory(content: &str) {
     ensure_home();
-    let p = memory_path();
-    let _ = fs::write(&p, content);
+    write_atomic(&memory_path(), content, false);
 }
 
 pub fn append_memory(entry: &str) {
@@ -790,10 +786,7 @@ fn merge_json_values(target: &mut serde_json::Value, source: serde_json::Value) 
 pub fn save_settings(s: &Settings) {
     ensure_home();
     if let Ok(text) = serde_json::to_string_pretty(s) {
-        let p = settings_path();
-        if fs::write(&p, text).is_ok() {
-            restrict(&p);
-        }
+        write_atomic(&settings_path(), &text, true);
     }
 }
 
@@ -831,10 +824,7 @@ pub fn save_key(name: &str, value: &str) {
     let mut map = read_keys_file();
     map.insert(name.to_string(), value.to_string());
     let body: String = map.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    let p = keys_path();
-    if fs::write(&p, body).is_ok() {
-        restrict(&p);
-    }
+    write_atomic(&keys_path(), &body, true);
 }
 
 pub fn mask(key: &str) -> String {
@@ -853,6 +843,31 @@ pub fn mask(key: &str) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+// Atomic write for user data (settings, keys, memory, history): temp file in
+// the same directory, then rename — a crash mid-save can never truncate the
+// file it replaces. With `restricted`, permissions are tightened on the TEMP
+// file, so a secrets file is never visible at its real name with default
+// (world-readable) permissions, even for an instant.
+fn write_atomic(path: &std::path::Path, contents: &str, restricted: bool) -> bool {
+    let mut name = match path.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return false,
+    };
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    if fs::write(&tmp, contents).is_err() {
+        return false;
+    }
+    if restricted {
+        restrict(&tmp);
+    }
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -1118,6 +1133,42 @@ mod tests {
         assert!(load_key("").is_none());
 
         std::env::remove_var("TESTKEY_A");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn config_saves_are_atomic_restricted_and_leave_no_temp() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        std::env::set_var("NEXUS_HOME", &h);
+
+        save_key("ATOMKEY", "secret-value");
+        save_settings(&Settings::default());
+        save_memory("remember this");
+
+        assert_eq!(load_key("ATOMKEY").as_deref(), Some("secret-value"));
+        assert!(load_settings_from_dir_diag(&h).settings.is_some());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for f in [".env.keys", "settings.json"] {
+                let mode = fs::metadata(h.join(f)).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{f} must be owner-only, got {mode:o}");
+            }
+        }
+
+        // Atomic saves must not strand temp files next to the real ones.
+        let stray: Vec<_> = fs::read_dir(&h)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(stray.is_empty(), "stray temp files: {stray:?}");
+
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }

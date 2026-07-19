@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.12.5"
+version = "0.12.6"
 edition = "2021"
 rust-version = "1.94"
 description = "A hilariously fast agentic AI coding CLI — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
@@ -33,6 +33,13 @@ ureq = { version = "2.10", features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+# Signal-safe terminal restore: SIGTERM/SIGHUP while in the alternate screen
+# must leave the terminal usable, and a signal handler may only call
+# async-signal-safe functions — raw write(2), tcsetattr(2), _exit(2).
+# Already in the tree transitively via crossterm; this makes it direct.
+libc = "0.2"
 
 [dev-dependencies]
 # Integration tests construct mock-server JSON and parse the --json event stream.

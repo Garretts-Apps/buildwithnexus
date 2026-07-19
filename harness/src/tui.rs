@@ -270,7 +270,12 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 const BACKGROUND: Rgb = Rgb(0x1a, 0x1b, 0x26);
 const ACCENT: Rgb = Rgb(0xbb, 0x9a, 0xf7);
 const TEXT: Rgb = Rgb(0xc0, 0xca, 0xf5);
-const MUTED: Rgb = Rgb(0x56, 0x5f, 0x89);
+// Secondary/dim text. Tokyo Night's classic comment color (#565f89) measures
+// 2.76:1 against this background — below the WCAG AA 4.5:1 text minimum and
+// genuinely hard to read. This stays in the same blue-violet comment family
+// (between Storm's #7982a9 and fg_dark #a9b1d6) at 4.93:1, while remaining
+// clearly quieter than TEXT's 10.6:1.
+const MUTED: Rgb = Rgb(0x7e, 0x88, 0xb3);
 const SUCCESS: Rgb = Rgb(0x9e, 0xce, 0x6a);
 const WARNING: Rgb = Rgb(0xe0, 0xaf, 0x68);
 const ERROR: Rgb = Rgb(0xf7, 0x76, 0x8e);
@@ -2291,8 +2296,65 @@ pub fn context_meter(used: usize, total: usize) {
 // Enter the alternate screen and raw mode (and capture panics to restore the
 // terminal even on crash). The bottom row is reserved for the composer; output
 // scrolls in the region above it.
+// ── signal-safe terminal restore ──────────────────────────────────────────────
+// The panic hook restores the terminal when we crash from inside, but a
+// SIGTERM/SIGHUP/SIGINT from outside kills the process directly — without a
+// handler the user's terminal is left in the alternate screen with raw mode
+// on ("typing shows nothing") until they run `reset`. Signal handlers may only
+// use async-signal-safe calls, so this is raw write(2) + tcsetattr(2) +
+// _exit(2), nothing else.
+#[cfg(unix)]
+mod signal_restore {
+    use super::{ALT_SCREEN, RAW};
+    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
+
+    // Snapshot of the cooked terminal, taken before raw mode is enabled.
+    // Written once before the handlers are installed; the handler only reads.
+    static ORIG_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
+
+    pub fn install() {
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut t) == 0 {
+                let _ = ORIG_TERMIOS.set(t);
+            }
+            let h: extern "C" fn(libc::c_int) = handler;
+            for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+                libc::signal(sig, h as usize);
+            }
+        }
+    }
+
+    extern "C" fn handler(sig: libc::c_int) {
+        unsafe {
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                // Reset colors, show the cursor, drop mouse/bracketed-paste
+                // reporting, leave the alternate screen.
+                const RESTORE: &[u8] =
+                    b"\x1b[0m\x1b[?25h\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
+                let _ = libc::write(
+                    libc::STDOUT_FILENO,
+                    RESTORE.as_ptr() as *const libc::c_void,
+                    RESTORE.len(),
+                );
+            }
+            if RAW.load(Ordering::Relaxed) {
+                if let Some(t) = ORIG_TERMIOS.get() {
+                    let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+                }
+            }
+            libc::_exit(128 + sig);
+        }
+    }
+}
+
 pub fn enter_alt(raw: bool) {
     if raw {
+        // Before any terminal-state change: snapshot the cooked termios and
+        // arm the restore-on-signal handlers.
+        #[cfg(unix)]
+        signal_restore::install();
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
         invalidate_stream_line();
         if let Ok(mut t) = transcript().lock() {

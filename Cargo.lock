@@ -49,10 +49,11 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "buildwithnexus"
-version = "0.12.5"
+version = "0.12.6"
 dependencies = [
  "criterion",
  "crossterm",
+ "libc",
  "serde",
  "serde_json",
  "shlex",
@@ -61,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "bwn"
-version = "0.12.5"
+version = "0.12.6"
 dependencies = [
  "buildwithnexus",
 ]

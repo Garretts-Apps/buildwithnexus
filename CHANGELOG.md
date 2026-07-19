@@ -4,7 +4,58 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.5] - Unreleased
+## [0.12.6] - Unreleased
+
+### Added
+- **A killed TUI restores your terminal.** SIGTERM, SIGHUP, SIGINT, and
+  SIGQUIT now run an async-signal-safe handler that leaves the alternate
+  screen, shows the cursor, disables mouse/paste reporting, and restores the
+  pre-raw terminal settings before exiting — no more `reset` after an external
+  kill. Adds `libc` as a unix-only direct dependency (it was already in the
+  tree via crossterm), making it six direct dependencies.
+- **`doctor` now probes your configured provider live.** A `provider` line
+  runs the same one-token validation `/model` uses — a present-but-rejected
+  key, a wrong model name, or an unreachable server shows up in `doctor`
+  instead of on your next prompt. Ollama is probed for free via its API;
+  hosted providers pay one output token, which is what a diagnostic command
+  is for.
+
+### Changed
+- **`/undo git` and `/undo all` now confirm before destroying work.** Every
+  file write asks first — but the two most destructive commands didn't:
+  `/undo git` silently discarded ALL unstaged changes (including your hand
+  edits), and `/undo all` rewound 24 hours of checkpoints unprompted. Both
+  now state exactly what they're about to do (`/undo all` lists the files)
+  and require a `[y/N]`.
+- **Readable dim text.** Tokyo Night's classic comment color (#565f89)
+  measured 2.76:1 against the background — below the WCAG AA minimum and
+  genuinely hard to read for tips, hints, paths, and help text. Secondary
+  text is now #7e88b3 (4.93:1): same blue-violet comment family, still
+  clearly quieter than body text. Status meaning never relies on color
+  alone (✓/✗/⚠ glyphs, +/- diff gutters), and the error red is Tokyo
+  Night's pink-red, which stays distinct under red-green color blindness.
+- **"Write a poem" no longer gets nudged into writing files.** The
+  explain-vs-act nudge now requires workspace evidence in the task (a path,
+  file, project, bug, …) on top of an imperative verb — a chat deliverable
+  like "write a poem about pirates" is answered in the transcript, while
+  "write a poem to pirates.txt" still acts on the file.
+
+### Fixed
+- **Settings, API keys, memory, history, and checkpoints are written
+  atomically too** — and the key store's permissions are now tightened on
+  the temp file *before* it becomes visible, so `.env.keys` is never
+  world-readable, even for an instant. Checkpoint restores are atomic as
+  well: recovery can't truncate the file it's recovering.
+- **All file writes in the tool layer are atomic.** `write_file`,
+  `edit_file`, `multi_edit`, `create_docx`, artifact writes, and the editor
+  tools wrote directly to the destination — a crash or power loss mid-write
+  could leave a truncated file. Every content write now goes through
+  same-directory temp + rename (which also can't split a file across
+  filesystems), and the destination's permissions are copied onto the
+  replacement, so editing a script no longer risks silently stripping its
+  executable bit.
+
+## [0.12.5] - 2026-07-19
 
 ### Added
 - **Startup tips** — one rotating dim line under the banner: half real tips

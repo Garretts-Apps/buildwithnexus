@@ -593,6 +593,32 @@ fn task_arg(input: &Value) -> Option<&str> {
         .or_else(|| input["description"].as_str())
 }
 
+// Write file contents atomically: same-directory temp + rename, so a crash
+// or power loss mid-write can never leave a truncated file (std's rename
+// replaces existing destinations on both POSIX and Windows). The
+// destination's permissions are copied onto the temp first — a plain
+// replace-by-rename would silently strip an executable bit from a script
+// the agent edits.
+fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".bwn-tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    fs::write(&tmp, contents)?;
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
@@ -803,7 +829,7 @@ fn read_server_record(name: &str) -> Result<Value, String> {
 fn write_server_record(name: &str, record: &Value) -> Result<(), String> {
     let path = server_record_path(name);
     let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
-    fs::write(&path, text)
+    write_atomic(&path, text)
         .map_err(|e| format!("cannot write server record {}: {e}", path.display()))
 }
 
@@ -3109,7 +3135,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             checkpoint::record(cwd, &p, "write_file");
             let prior = fs::read_to_string(&p).unwrap_or_default();
-            match fs::write(&p, content) {
+            match write_atomic(&p, content) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, content);
                     ok(format!("wrote {} ({} bytes)", p.display(), content.len()))
@@ -3146,7 +3172,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
                     checkpoint::record(cwd, &p, "edit_file");
                     let updated = apply_lenient(&body, &hit, new);
-                    return match fs::write(&p, &updated) {
+                    return match write_atomic(&p, &updated) {
                         Ok(_) => {
                             crate::report::diff(&p.display().to_string(), &body, &updated);
                             ok(format!("edited {} ({LENIENT_MATCH_NOTE})", p.display()))
@@ -3170,7 +3196,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             checkpoint::record(cwd, &p, "edit_file");
             let updated = body.replacen(old, new, 1);
-            match fs::write(&p, &updated) {
+            match write_atomic(&p, &updated) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &body, &updated);
                     ok(format!("edited {}", p.display()))
@@ -3234,7 +3260,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             } else {
                 String::new()
             };
-            match fs::write(&p, &body) {
+            match write_atomic(&p, &body) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, &body);
                     ok(format!(
@@ -3396,7 +3422,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             checkpoint::record(cwd, &p, "create_docx");
             let bytes = docx_bytes(title, body);
-            match fs::write(&p, &bytes) {
+            match write_atomic(&p, &bytes) {
                 Ok(_) => ok(format!("created {} ({} bytes)", p.display(), bytes.len())),
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
@@ -3968,7 +3994,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = None;
                     }
-                    match fs::write(&p, file_text) {
+                    match write_atomic(&p, file_text) {
                         Ok(_) => ok(format!("successfully created file {}", p.display())),
                         Err(e) => err(format!("cannot write {}: {e}", p.display())),
                     }
@@ -3996,7 +4022,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                                     UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                                 *guard = Some((p.clone(), body));
                             }
-                            return match fs::write(&p, &next) {
+                            return match write_atomic(&p, &next) {
                                 Ok(_) => ok(format!(
                                     "successfully edited file {} ({LENIENT_MATCH_NOTE})",
                                     p.display()
@@ -4022,7 +4048,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
-                    match fs::write(&p, &next) {
+                    match write_atomic(&p, &next) {
                         Ok(_) => ok(format!("successfully edited file {}", p.display())),
                         Err(e) => err(format!("cannot write {}: {e}", p.display())),
                     }
@@ -4052,7 +4078,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
-                    match fs::write(&p, &next) {
+                    match write_atomic(&p, &next) {
                         Ok(_) => ok(format!(
                             "successfully inserted text after line {insert_line} in {}",
                             p.display()
@@ -4076,7 +4102,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         }
                     }
                     if let Some((_, old_content)) = guard.take() {
-                        match fs::write(&p, &old_content) {
+                        match write_atomic(&p, &old_content) {
                             Ok(_) => ok(format!(
                                 "successfully reverted the last edit to {}",
                                 p.display()
@@ -4133,7 +4159,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .unwrap_or(0);
             let filename = format!("{}_{timestamp}.{ext}", safe_title);
             let p = dir.join(&filename);
-            if let Err(e) = fs::write(&p, contents) {
+            if let Err(e) = write_atomic(&p, contents) {
                 return err(format!("cannot write artifact: {e}"));
             }
             let clean_name = if (safe_title.is_empty()
@@ -6153,6 +6179,61 @@ print("hello " + data.get("name", "world"))
     }
 
     // ── unknown tool ────────────────────────────────────────────────────────
+    #[test]
+    fn atomic_writes_preserve_permissions_and_leave_no_temp() {
+        let d = tempdir();
+        let p = d.join("script.sh");
+        run(
+            "write_file",
+            &json!({"path": "script.sh", "content": "#!/bin/sh\necho one\n"}),
+            &d,
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Rewriting through the tool layer must keep the executable bit —
+        // temp+rename replaces the inode, so permissions are copied over.
+        let r = run(
+            "write_file",
+            &json!({"path": "script.sh", "content": "#!/bin/sh\necho two\n"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "#!/bin/sh\necho two\n",
+            "content replaced"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&p).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "executable bit survived: {mode:o}");
+        }
+
+        // edit_file goes through the same path.
+        let r = run(
+            "edit_file",
+            &json!({"path": "script.sh", "old": "two", "new": "three"}),
+            &d,
+        );
+        assert!(!r.is_error, "{}", r.content);
+        assert!(fs::read_to_string(&p).unwrap().contains("three"));
+
+        // No temp artifacts remain in the directory after any of it.
+        let leftovers: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("bwn-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn unknown_tool_suggests_nearest_and_lists_valid() {
         let d = tempdir();
