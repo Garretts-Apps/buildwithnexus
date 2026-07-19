@@ -21,6 +21,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is for.
 
 ### Changed
+- **`/undo git` and `/undo all` now confirm before destroying work.** Every
+  file write asks first — but the two most destructive commands didn't:
+  `/undo git` silently discarded ALL unstaged changes (including your hand
+  edits), and `/undo all` rewound 24 hours of checkpoints unprompted. Both
+  now state exactly what they're about to do (`/undo all` lists the files)
+  and require a `[y/N]`.
 - **Readable dim text.** Tokyo Night's classic comment color (#565f89)
   measured 2.76:1 against the background — below the WCAG AA minimum and
   genuinely hard to read for tips, hints, paths, and help text. Secondary

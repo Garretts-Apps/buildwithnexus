@@ -2567,12 +2567,55 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
         }
     } else if arg == "git" {
+        // The one command here that can destroy work bwn didn't do: it
+        // discards ALL unstaged changes, including the user's hand edits.
+        // Every file write asks first — the most destructive command must too.
+        tui::line(&tui::yellow(
+            "  /undo git runs `git checkout -- .` — it discards ALL unstaged changes,",
+        ));
+        tui::line(&tui::yellow(
+            "  including edits you made by hand outside bwn.",
+        ));
+        let go = tui::ask("  Discard all unstaged changes? [y/N]: ").unwrap_or_default();
+        if !matches!(go.trim(), "y" | "Y" | "yes" | "YES") {
+            tui::line(&tui::dim("  cancelled — nothing discarded."));
+            return;
+        }
         match checkpoint::git_rollback(cwd) {
             Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
             Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
         }
     } else if arg == "all" || arg == "session" {
         let since = checkpoint::now_ms().saturating_sub(24 * 3600 * 1000);
+        // Say exactly what's about to be rewound before doing it.
+        let pending: Vec<checkpoint::Checkpoint> = checkpoint::list(cwd)
+            .into_iter()
+            .filter(|c| c.created_ms >= since)
+            .collect();
+        if pending.is_empty() {
+            tui::line(&tui::dim("  no checkpoints in the last 24 hours."));
+            return;
+        }
+        tui::line(&tui::yellow(&format!(
+            "  /undo all rewinds every checkpoint from the last 24 hours — {} restore{}:",
+            pending.len(),
+            if pending.len() == 1 { "" } else { "s" }
+        )));
+        for c in pending.iter().take(8) {
+            tui::line(&tui::dim(&format!(
+                "    - {} ({})",
+                c.path.display(),
+                c.action
+            )));
+        }
+        if pending.len() > 8 {
+            tui::line(&tui::dim(&format!("    … and {} more", pending.len() - 8)));
+        }
+        let go = tui::ask("  Rewind all of it? [y/N]: ").unwrap_or_default();
+        if !matches!(go.trim(), "y" | "Y" | "yes" | "YES") {
+            tui::line(&tui::dim("  cancelled — nothing restored."));
+            return;
+        }
         match checkpoint::undo_all_since(cwd, since) {
             Ok(cps) => {
                 tui::line(&tui::green(&format!(
