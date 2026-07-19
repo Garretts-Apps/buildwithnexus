@@ -3,10 +3,14 @@
 // The REPL calls tick() each turn to check due schedules and collect status.
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -24,7 +28,7 @@ pub enum WorkflowStatus {
     Cancelled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkflowKind {
     Once,
     // Repeat with `interval_secs` between the end of one run and start of next.
@@ -68,6 +72,105 @@ fn manager() -> &'static Mutex<Manager> {
             active: None,
         })
     })
+}
+
+// ── persistence ───────────────────────────────────────────────────────────────
+// Pending /schedule and /loop workflows used to live only in process memory:
+// quit, crash, or /resume and they vanished silently. They now persist to
+// workflows.json on every mutation and are restored at interactive startup.
+//
+// Only the interactive REPL enables persistence (restore() flips the flag).
+// Workflow runs are subprocesses of this same binary — if they also wrote the
+// store file, every child would clobber the parent's queue.
+static PERSIST: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize, Deserialize)]
+struct PersistedWorkflow {
+    task: String,
+    kind: WorkflowKind,
+    iteration: u32,
+    next_fire_ms: Option<u64>,
+}
+
+#[cfg(not(test))]
+fn store_path() -> PathBuf {
+    crate::config::home().join("workflows.json")
+}
+
+#[cfg(test)]
+fn store_path() -> PathBuf {
+    std::env::temp_dir().join(format!("bwn-workflows-test-{}.json", std::process::id()))
+}
+
+// Atomic write (temp + rename), same discipline as session saves. An empty
+// queue removes the file so stale state can't outlive its workflows.
+fn save_pending_locked(m: &Manager) {
+    if !PERSIST.load(Ordering::Relaxed) {
+        return;
+    }
+    let pending: Vec<PersistedWorkflow> = m
+        .workflows
+        .iter()
+        // Running counts as pending: the subprocess dies with this process,
+        // so after a restart the run should fire again.
+        .filter(|w| matches!(w.status, WorkflowStatus::Pending | WorkflowStatus::Running))
+        .map(|w| PersistedWorkflow {
+            task: w.task.clone(),
+            kind: w.kind.clone(),
+            iteration: w.iteration,
+            next_fire_ms: w.next_fire_ms,
+        })
+        .collect();
+    let path = store_path();
+    if pending.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(body) = serde_json::to_string_pretty(&pending) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Loads workflows saved by a previous session and enables persistence for
+/// this one. Called once from the interactive REPL; returns how many pending
+/// workflows were restored so the UI can say so out loud.
+pub fn restore() -> usize {
+    if PERSIST.swap(true, Ordering::Relaxed) {
+        return 0; // already restored in this process
+    }
+    let Ok(text) = std::fs::read_to_string(store_path()) else {
+        return 0;
+    };
+    let Ok(list) = serde_json::from_str::<Vec<PersistedWorkflow>>(&text) else {
+        return 0;
+    };
+    let mut m = manager().lock().unwrap_or_else(|e| e.into_inner());
+    let mut restored = 0;
+    for p in list {
+        let id = m.next_id;
+        m.next_id += 1;
+        m.workflows.push(Workflow {
+            id,
+            task: p.task,
+            kind: p.kind,
+            status: WorkflowStatus::Pending,
+            output: Vec::new(),
+            created_ms: now_ms(),
+            started_ms: None,
+            finished_ms: None,
+            iteration: p.iteration,
+            next_fire_ms: p.next_fire_ms,
+        });
+        restored += 1;
+    }
+    save_pending_locked(&m);
+    restored
 }
 
 // Human-readable label for a workflow kind.
@@ -119,6 +222,7 @@ pub fn enqueue(task: &str, kind: WorkflowKind) -> usize {
         iteration: 0,
         next_fire_ms: None,
     });
+    save_pending_locked(&m);
     id
 }
 
@@ -135,6 +239,7 @@ pub fn cancel(id: usize) -> bool {
         if matches!(wf.status, WorkflowStatus::Pending | WorkflowStatus::Running) {
             wf.status = WorkflowStatus::Cancelled;
             wf.finished_ms = Some(now_ms());
+            save_pending_locked(&m);
             return true;
         }
     }
@@ -252,6 +357,7 @@ pub fn tick() -> Option<String> {
     }
 
     // If nothing is running, try to start the next due workflow.
+    let mut started_or_failed = false;
     if m.active.is_none() {
         let due_idx = m.workflows.iter().position(|w| {
             if !matches!(w.status, WorkflowStatus::Pending) {
@@ -312,8 +418,15 @@ pub fn tick() -> Option<String> {
                 } else {
                     m.workflows[idx].status = WorkflowStatus::Failed("failed to spawn".to_string());
                 }
+                started_or_failed = true;
             }
         }
+    }
+
+    // Completions, loop reschedules, starts (iteration bump), and spawn
+    // failures all change persisted state — keep the store in sync.
+    if notification.is_some() || started_or_failed {
+        save_pending_locked(&m);
     }
 
     notification
@@ -367,6 +480,74 @@ pub fn parse_interval_secs(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // One combined test: the manager, the PERSIST flag, and the store file
+    // are process-global, so splitting these steps into parallel tests would
+    // race. Order inside is the lifecycle: save on enqueue → save on cancel →
+    // restore from a prior session's file.
+    #[test]
+    fn pending_workflows_persist_and_restore_across_sessions() {
+        let path = store_path();
+        let _ = std::fs::remove_file(&path);
+
+        // Simulate the previous session's leftovers: one future /schedule and
+        // one /loop, written in the on-disk format.
+        let prior = vec![
+            PersistedWorkflow {
+                task: "nightly summary".into(),
+                kind: WorkflowKind::Scheduled {
+                    fire_at_ms: now_ms() + 3_600_000,
+                },
+                iteration: 0,
+                next_fire_ms: None,
+            },
+            PersistedWorkflow {
+                task: "poll ci".into(),
+                kind: WorkflowKind::Loop { interval_secs: 300 },
+                iteration: 7,
+                next_fire_ms: Some(now_ms() + 250_000),
+            },
+        ];
+        std::fs::write(&path, serde_json::to_string(&prior).unwrap()).unwrap();
+
+        // Interactive startup restores both and enables persistence.
+        let restored = restore();
+        assert_eq!(restored, 2);
+        let snaps = snapshots();
+        assert!(snaps.iter().any(|s| s.task == "nightly summary"));
+        assert!(snaps
+            .iter()
+            .any(|s| s.task == "poll ci" && s.iteration == 7));
+        assert_eq!(active_count(), 2);
+
+        // A second restore in the same process is a no-op, not a duplicate.
+        assert_eq!(restore(), 0);
+        assert_eq!(active_count(), 2);
+
+        // New enqueues are saved immediately…
+        let id = enqueue(
+            "new one",
+            WorkflowKind::Scheduled {
+                fire_at_ms: now_ms() + 3_600_000,
+            },
+        );
+        let on_disk: Vec<PersistedWorkflow> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 3);
+
+        // …and cancels drop them from the store.
+        assert!(cancel(id));
+        let on_disk: Vec<PersistedWorkflow> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 2);
+        assert!(on_disk.iter().all(|p| p.task != "new one"));
+
+        // Cancelling everything removes the file entirely.
+        for s in snapshots() {
+            let _ = cancel(s.id);
+        }
+        assert!(!path.exists(), "empty queue must not leave a stale store");
+    }
 
     #[test]
     fn parse_delay_seconds() {

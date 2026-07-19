@@ -80,6 +80,26 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
+"Hilariously fast" is a measurement, not a mood: 2 ms full-process startup,
+a 4.6 MiB resident TUI, and 3.6 µs to render a streamed chunk into a
+2,000-line transcript. Every number and how to regenerate it:
+[BENCHMARKS.md](BENCHMARKS.md).
+
+### Package history
+
+If you browse the npm version history you'll see the same name carrying
+earlier, unrelated architectures — that's expected, not a hijack:
+
+| npm versions | what they were |
+|---|---|
+| 0.1.x – 0.7.x | a VM-isolation "runtime" experiment (QEMU/Docker era) |
+| 0.8.x | the TypeScript orchestrator with the Python/LangGraph backend |
+| **0.10.1 and later** | **this codebase** — the ground-up Rust CLI (0.10 inline UI, 0.11+ full-screen TUI) |
+
+The pre-0.10 versions share nothing with the current code and aren't
+maintained; install `latest`. The Rust line is also the only one published
+to crates.io.
+
 ## Models
 
 Two wire protocols cover everything. Pick a provider during setup (or `bwn init`):
@@ -189,6 +209,9 @@ skips the binary — build from source and point `BWN_BIN` at the result.
   redacted from surfaced errors.
 - In non-interactive / `--json` runs, anything that would prompt is denied
   rather than blocking.
+- Every write is checkpointed before it happens; bare `/undo` reverts the
+  whole last agent turn. Failure modes, checkpoint mechanics, and what is
+  deliberately **not** protected: [RECOVERY.md](RECOVERY.md).
 
 ## License
 

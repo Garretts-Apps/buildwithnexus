@@ -10,6 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use crate::checkpoint;
 use crate::config;
 use crate::hooks::{self, PreDecision};
 use crate::provider::{self, complete, Msg, Provider, Reply, ToolResult};
@@ -650,6 +651,19 @@ fn reply_truncated_at_token_limit(reply: &Reply) -> bool {
     reply.stop_reason.as_deref() == Some("max_tokens")
 }
 
+// Tag forms local models use to emit tool calls as text (see
+// extract_json_tool_candidate). Shared so the malformed-markup detector and
+// the parser can never drift apart.
+const TOOL_CALL_TAGS: [&str; 4] = ["<tools>", "<tool_call>", "<function_call>", "<function>"];
+
+// A reply that produced no calls but still carries tool-call markup is a
+// failed tool call, not a final answer — the tagged JSON was malformed or cut
+// off before the parser could extract it. Detecting it lets the loop ask for
+// a re-emit instead of presenting broken markup to the user as the answer.
+fn malformed_tool_markup(reply: &Reply) -> bool {
+    reply.calls.is_empty() && TOOL_CALL_TAGS.iter().any(|t| reply.text.contains(t))
+}
+
 static TEXT_TOOL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_text: &str) -> Reply {
@@ -1016,7 +1030,7 @@ fn extract_json_tool_candidate(text: &str) -> Option<&str> {
     // llama.cpp/Ollama) emit calls as `<tools>{…}</tools>` or
     // `<tool_call>{…}</tool_call>` text in `content` instead of native
     // tool_calls. Pull the first balanced JSON object out of the tagged region.
-    for tag in ["<tools>", "<tool_call>", "<function_call>", "<function>"] {
+    for tag in TOOL_CALL_TAGS {
         if let Some(pos) = text.find(tag) {
             if let Some(json) = balanced_json_object(&text[pos + tag.len()..]) {
                 return Some(json);
@@ -1715,6 +1729,11 @@ fn build_inner(
     msgs: &mut Vec<Msg>,
     sid: Option<&str>,
 ) -> Result<String, String> {
+    // Top-level runs mark a turn boundary so bare /undo can revert exactly
+    // this run's writes; subagent recursion must not shrink that window.
+    if depth == 0 {
+        checkpoint::mark_turn_start();
+    }
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
@@ -1754,6 +1773,7 @@ fn build_inner(
     let mut artifact_error_count = 0usize;
     let mut static_artifact_recovery_count = 0usize;
     let mut empty_reply_retried = false;
+    let mut malformed_markup_retried = false;
     let mut token_limit_continuations = 0usize;
     let mut forced_compact_retry = false;
     let mut verifier_fix_rounds = 0usize;
@@ -1823,6 +1843,31 @@ fn build_inner(
                 });
             }
             msgs.push(Msg::User(follow_up.to_string()));
+            continue;
+        }
+        // Tool markup that didn't parse into a call: the model tried to act
+        // but emitted broken JSON inside the tags. Reprompting once turns a
+        // garbage "final answer" into a corrected call; bounded so a model
+        // that can't produce valid JSON still terminates.
+        if malformed_tool_markup(&reply) && !malformed_markup_retried {
+            malformed_markup_retried = true;
+            report::notice("  ⚠ tool-call markup didn't parse — asking the model to re-emit it");
+            trace::record_visible(
+                "tool_input_repaired",
+                "reprompted malformed tagged tool call",
+                serde_json::json!({"text_preview": trace::preview(&reply.text, 120)}),
+            );
+            msgs.push(Msg::Assistant {
+                text: reply.text.clone(),
+                calls: vec![],
+            });
+            msgs.push(Msg::User(
+                "Your tool call could not be parsed — the tagged JSON was malformed or \
+                 incomplete. Re-emit it as exactly one JSON object of the form \
+                 {\"name\": \"<tool>\", \"arguments\": { … }} inside a single <tool_call> tag, \
+                 with nothing else in the message."
+                    .to_string(),
+            ));
             continue;
         }
         if reply.calls.is_empty() {
@@ -3544,6 +3589,38 @@ mod tests {
         assert_eq!(normalized.calls.len(), 1);
         assert_eq!(normalized.calls[0].name, "start_server");
         assert_eq!(normalized.calls[0].input["command"], "npm start");
+    }
+
+    #[test]
+    fn malformed_tool_markup_detected_only_when_calls_failed_to_parse() {
+        let broken = |text: &str| Reply {
+            text: text.to_string(),
+            calls: vec![],
+            stop_reason: Some("stop".into()),
+        };
+        // Truncated tagged call: intent to act, nothing parseable.
+        assert!(malformed_tool_markup(&broken(
+            r#"<tool_call>{"name": "edit_file", "arguments": {"path": "src/ma"#
+        )));
+        // Well-formed tag but garbage JSON inside.
+        assert!(malformed_tool_markup(&broken(
+            "<tools>{name: read_file path=x}</tools>"
+        )));
+        // Plain prose final answers never trigger it.
+        assert!(!malformed_tool_markup(&broken(
+            "Done — the fix is in src/main.rs and tests pass."
+        )));
+        // A reply whose markup DID parse has calls, so it never triggers.
+        let parsed = Reply {
+            text: String::new(),
+            calls: vec![provider::ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "x"}),
+            }],
+            stop_reason: Some("stop".into()),
+        };
+        assert!(!malformed_tool_markup(&parsed));
     }
 
     #[test]

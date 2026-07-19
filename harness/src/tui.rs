@@ -87,6 +87,38 @@ struct Transcript {
     width: usize,              // 0 = not yet sized
 }
 
+/// Bench-only surface for the transcript wrap cache — criterion can't reach
+/// the private type. Regenerates the flagship rendering claim: appending a
+/// streamed chunk re-wraps ONE line (incremental cache) vs re-wrapping the
+/// whole transcript (the pre-0.12.0 behavior every keystroke paid for).
+pub mod bench {
+    use super::Transcript;
+
+    pub struct WrapCache(Transcript);
+
+    pub fn transcript(lines: usize, width: usize, line: &str) -> WrapCache {
+        let mut t = Transcript::new();
+        t.ensure_width(width);
+        for _ in 0..lines {
+            t.push(line.to_string());
+        }
+        WrapCache(t)
+    }
+
+    /// One streamed chunk landing: append to the open line, then restore it —
+    /// two single-line rewraps, a strict upper bound on the real per-chunk cost.
+    pub fn append_and_reset(c: &mut WrapCache, chunk: &str, base: &str) {
+        let i = c.0.len() - 1;
+        c.0.append_to(i, chunk);
+        c.0.set(i, base.to_string());
+    }
+
+    /// The old behavior: every chunk re-wrapped the entire transcript.
+    pub fn full_rewrap(c: &mut WrapCache, width: usize) {
+        c.0.ensure_width(width);
+    }
+}
+
 impl Transcript {
     const fn new() -> Self {
         Transcript {
@@ -3010,7 +3042,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/trace" => "inspect hooks, tools, skills, subagents",
         "/agents" => "manage subagents",
         "/checkpoints" => "list edit checkpoints",
-        "/undo" | "/rewind" => "revert to an edit checkpoint",
+        "/undo" | "/rewind" => "revert the last agent turn (or latest/git/all/<id>)",
         "/vim" => "toggle vim editing mode",
         "/voice" => "voice input",
         "/local" => "manage local models",

@@ -4,6 +4,73 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.5] - Unreleased
+
+### Added
+- **Startup tips** — one rotating dim line under the banner: half real tips
+  (Shift+Tab modes, Ctrl+V screenshots, /checkpoint), half personality
+  ("bwn started faster than you read this sentence"). Jokes live here and
+  only here — error messages stay strictly business.
+- **The letsbeheroes skill collection** — eight bundled process skills
+  (`/letsbeheroes`, `/hero-brainstorm`, `/hero-plan`, `/hero-execute`,
+  `/hero-debug`, `/hero-ship`, `/hero-wait`, `/hero-subagents`) that encode
+  the working discipline: brainstorm → plan → execute → debug → verify,
+  plus condition-based waiting and subagent delegation.
+- **Any OpenAI-compatible endpoint as a provider** — new `custom` preset for
+  vLLM / TGI / LiteLLM / gateways: `/model` takes `<url> <model>` directly or
+  walks through URL, optional `CUSTOM_API_KEY`, and model name. A configured
+  key is never sent over plain HTTP to a non-loopback host.
+- **Any OpenRouter model** — `/model org/model` (e.g. `meta-llama/…`,
+  `google/gemini-2.5-pro`) routes to OpenRouter automatically.
+
+### Fixed
+- **Pending `/schedule` and `/loop` workflows survive restarts.** They lived
+  only in process memory, so quitting, crashing, or resuming a session
+  silently discarded them. Pending workflows now persist to
+  `~/.buildwithnexus/workflows.json` (atomic writes, file removed when the
+  queue is empty) and are restored at the next interactive launch with a
+  visible "⟳ restored N scheduled workflows" notice. Loop iteration counts
+  and next-fire times carry over; headless workflow subprocesses never touch
+  the store.
+- **Bare `/undo` now reverts the whole last agent turn.** After a partial
+  multi-file edit (the agent changed three files and broke two, or Esc landed
+  mid-batch), `/undo` used to restore only the single most-recent checkpoint —
+  it looked like an undo while quietly leaving the other files changed. Bare
+  `/undo` now restores every file the last agent turn touched, in the right
+  order even when one file was edited several times; `latest` keeps the old
+  single-checkpoint behavior.
+- **Rapid multi-file batches no longer lose checkpoints.** Checkpoint ids
+  were timestamp-only, so several writes in the same millisecond overwrote
+  each other's snapshots on disk — some files in a fast batch were silently
+  unrecoverable. Ids now carry a sequence number, which also makes restore
+  ordering deterministic within a millisecond.
+- **Malformed tagged tool calls are reprompted, not presented as answers.**
+  When a local model emits a tool call as tagged text (`<tool_call>{…}`) and
+  the JSON inside is broken or cut off, the agent loop previously treated the
+  raw markup as the final answer and stopped. It now detects the failed tool
+  intent, feeds the model one corrective message ("re-emit as exactly one
+  JSON object…"), and only then gives up — bounded to a single retry so a
+  model that can't produce valid JSON still terminates.
+- **`/model` now swaps providers, not just the model string.** Picking an
+  Ollama or OpenAI model while on Anthropic previously sent the new name to
+  the old provider's API. The picker now maps every choice to the provider
+  that serves it, walks you through a missing API key on the spot, checks
+  that Ollama is reachable and actually has the model (with install/pull
+  steps when not), and keeps the current model on any failure instead of
+  reporting a successful swap that would break the next prompt.
+- **"✓ hot-swapped" is only printed after live validation.** Every swap
+  (except Ollama, which is validated via its API beforehand) runs a one-token
+  probe through the real request path first — a rejected key, an unknown
+  model name, or an unreachable server fails the swap on the spot with a
+  targeted hint, instead of surfacing as a raw HTTP error on your next
+  prompt.
+- **Broken settings files are now diagnosed, never silently dropped.** A JSON
+  typo in any settings file previously made the CLI act as if you'd never
+  configured it — and first-run onboarding could then overwrite your config.
+  Startup now prints one warning per unusable file with the exact line and
+  column, refuses to re-onboard while broken files exist, and
+  `buildwithnexus doctor` lists every settings file with its parse status.
+
 ## [0.12.4] - 2026-07-16
 
 ### Fixed

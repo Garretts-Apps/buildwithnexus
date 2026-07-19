@@ -1,5 +1,44 @@
-// Library root. The binary is a thin shim; everything lives here so integration
-// suites can reach the internals directly.
+//! A hilariously fast, agentic AI coding CLI — one static binary, written in
+//! Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter, Groq,
+//! Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
+//! OpenAI-compatible `/v1` endpoint.
+//!
+//! This crate is the whole application: the binaries (`buildwithnexus` and
+//! the `bwn` alias) are thin shims over [`run`]. It ships as a library so
+//! integration suites can reach the internals directly — it is not a stable
+//! API for building other tools on, and minor versions may rearrange it.
+//!
+//! # Install
+//!
+//! ```text
+//! cargo install buildwithnexus --locked   # installs `buildwithnexus` + `bwn`
+//! npm install -g buildwithnexus           # prebuilt, provenance-attested binary
+//! ```
+//!
+//! Then run `bwn` in a repository and describe a task. The agent plans,
+//! edits files, and runs commands — asking before each change (permission
+//! gates), with checkpoints that can rewind any write (`/undo`), lifecycle
+//! hooks, and hot-swappable models (`/model`, validated before it commits).
+//!
+//! # Map of the crate
+//!
+//! | Module | What lives there |
+//! |---|---|
+//! | [`agent`] | the ReAct loop: planning, tool calls, recovery, compaction |
+//! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
+//! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
+//! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
+//! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
+//! | [`session`] | save/resume of conversations |
+//! | [`workflow`] | background `/schedule` and `/loop` runs, persisted across restarts |
+//! | [`config`] | provider presets, settings files, key store, bundled skills |
+//! | [`hooks`] | Claude-Code-style lifecycle hooks (deny-capable, never grant) |
+//!
+//! Performance is the project's primary design lever; every claim is
+//! measured and reproducible — see `BENCHMARKS.md` in the repository.
+//! Docs, guides, and the changelog live at
+//! <https://buildwithnexus.dev>; source at
+//! <https://github.com/Garretts-Apps/buildwithnexus>.
 
 pub mod agent;
 pub mod checkpoint;
@@ -144,8 +183,14 @@ pub fn run() {
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
-    let mut settings = match config::load_settings() {
+    let load = config::load_settings_diag();
+    warn_settings_issues(&load);
+    let mut settings = match load.settings {
         Some(s) => s,
+        // Settings files exist but none were usable: refuse to fall through
+        // to onboarding, which would overwrite them. Broken config is a fix,
+        // not a first run.
+        None if load.any_present => return Err(broken_settings_msg()),
         None => onboarding::run().ok_or("setup cancelled")?,
     };
     if let Some(p) = &opts.provider {
@@ -160,6 +205,80 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         .as_deref()
         .unwrap_or(&settings.permission);
     Ok((provider, agent::permission(perm_name)))
+}
+
+/// Every ignored settings file gets one loud stderr line — a typo in a config
+/// file must never be invisible.
+fn warn_settings_issues(load: &config::SettingsLoad) {
+    for i in &load.issues {
+        eprintln!(
+            "{}",
+            tui::yellow(&format!(
+                "buildwithnexus: warning: {}: {}",
+                i.source, i.error
+            ))
+        );
+    }
+}
+
+fn broken_settings_msg() -> String {
+    "settings files exist but none could be used (see warnings above).\n  \
+     Fix the file, or delete it and run `buildwithnexus init` to set up again.\n  \
+     `buildwithnexus doctor` lists every settings file and its status."
+        .to_string()
+}
+
+// One rotating line under the banner: half real tips, half jokes — the
+// personality lives here, in the terminal, never in the way. Errors stay
+// serious; this line is the only place bwn gets to be funny at startup.
+const STARTUP_TIPS: &[&str] = &[
+    "tip: Shift+Tab cycles PLAN → BUILD → BRAINSTORM. plan first, thank yourself later",
+    "tip: Esc interrupts the agent mid-thought. it can take it",
+    "tip: Ctrl+V pastes a screenshot straight into the prompt — the model sees what you see",
+    "tip: @ completes file paths, @kb: searches the knowledge base",
+    "tip: double-click a word, triple-click a line. copied, confirmed, footer says so",
+    "tip: /checkpoint before you get brave",
+    "tip: /model swaps models mid-session — it validates before it commits",
+    "tip: ↑ filters history by what you've typed, and never eats your draft",
+    "tip: /vim exists. you already knew, somehow",
+    "tip: queue your next prompt while the agent works — it sends itself when the turn ends",
+    "tip: local models via Ollama keep your code where it belongs: on your machine",
+    "tip: Ctrl+G opens your $EDITOR when the prompt outgrows one line",
+    "tip: file paths in edit headers are clickable. yes, even the .docx",
+    "tip: bwn started faster than you read this sentence",
+    "tip: the other terminals keep asking about bwn. tell them not to worry about it",
+    "tip: /trace shows receipts — every tool call, hook, and skill load",
+    "tip: 966µs → 4.5µs per streamed chunk. we timed it so you don't have to feel it",
+    "tip: /schedule and /loop run work while you're at lunch. bwn doesn't take lunch",
+];
+
+fn startup_tip() -> &'static str {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0);
+    STARTUP_TIPS[nanos % STARTUP_TIPS.len()]
+}
+
+fn is_loopback_url(u: &str) -> bool {
+    let rest = u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))
+        .unwrap_or(u);
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host = host.strip_prefix('[').map_or_else(
+        // Not bracketed: strip a :port if present.
+        || host.split(':').next().unwrap_or("").to_string(),
+        // Bracketed IPv6: take up to the closing bracket.
+        |h| h.split(']').next().unwrap_or("").to_string(),
+    );
+    host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
 }
 
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
@@ -184,7 +303,10 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     } else {
         s.model.clone()
     };
-    let api_key = if preset.env_key.is_empty() {
+    let api_key = if preset.id == "custom" {
+        // Optional — most self-hosted OpenAI-compatible servers are keyless.
+        config::load_key(config::CUSTOM_KEY)
+    } else if preset.env_key.is_empty() {
         None
     } else {
         config::load_key(preset.env_key)
@@ -193,6 +315,18 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
         return Err(format!(
             "{} not set; run `buildwithnexus init`",
             preset.env_key
+        ));
+    }
+    // The custom preset allows plain http for loopback servers, but a
+    // configured key must never travel unencrypted to a remote host.
+    if preset.id == "custom"
+        && api_key.is_some()
+        && !base_url.starts_with("https://")
+        && !is_loopback_url(&base_url)
+    {
+        return Err(format!(
+            "refusing to send {} to a non-HTTPS remote endpoint ({base_url}); use https:// or a loopback address",
+            config::CUSTOM_KEY
         ));
     }
     let mut context_tokens = match preset.id {
@@ -302,9 +436,16 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // Always scaffold on interactive launch so existing users also get the
     // directory skeleton and starter Agents.md if they're missing.
     config::scaffold_home();
-    let onboarded = config::load_settings().is_some();
-    if !onboarded && onboarding::run().is_none() {
-        return;
+    let load = config::load_settings_diag();
+    warn_settings_issues(&load);
+    if load.settings.is_none() {
+        if load.any_present {
+            eprintln!("{}", tui::red(&broken_settings_msg()));
+            std::process::exit(1);
+        }
+        if onboarding::run().is_none() {
+            return;
+        }
     }
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
@@ -350,6 +491,14 @@ fn repl(
     tui::line(&tui::dim(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
+    tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    let restored = workflow::restore();
+    if restored > 0 {
+        tui::line(&tui::green(&format!(
+            "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
+            if restored == 1 { "" } else { "s" }
+        )));
+    }
     if let Some(notice) = update::startup_notice(&settings.auto_update) {
         tui::line(&tui::dim(&notice));
     }
@@ -1350,94 +1499,352 @@ fn handle_model(provider: &mut Provider) {
     tui::line(&tui::accent(
         "  /model — interactive model selection & hot-swap",
     ));
+    let settings = config::load_settings().unwrap_or_default();
     tui::line(&format!(
-        "  Current active model: {}",
-        tui::bold(&provider.model)
+        "  Current: {} on {}",
+        tui::bold(&provider.model),
+        tui::bold(&settings.provider)
     ));
     tui::line("");
 
-    let mut options: Vec<(String, String)> = Vec::new();
+    // (provider id, model, description) — every entry names the provider that
+    // will actually serve it, so a pick can be validated before it's applied.
+    let mut options: Vec<(String, String, String)> = Vec::new();
 
-    // 1. Scan for local GGUF models
-    let mut gguf_found = false;
-    for name in crate::local::scan_gguf() {
-        if !gguf_found {
-            tui::line(&tui::bold("  [Local GGUF Models Found]"));
-            gguf_found = true;
+    // Models a running Ollama actually has installed — known-good picks.
+    let ollama_base = if settings.provider == "ollama" {
+        settings
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:11434".into())
+    } else {
+        "http://localhost:11434".into()
+    };
+    let ollama_installed = provider::ollama_models(&ollama_base);
+    if !ollama_installed.is_empty() {
+        for m in ollama_installed.iter().take(12) {
+            options.push(("ollama".into(), m.clone(), "installed Ollama model".into()));
         }
-        let model_id = format!("local/{}", name);
-        options.push((model_id.clone(), "Local GGUF Model".to_string()));
     }
-    if !gguf_found {
-        tui::line(&tui::dim(
-            "  [No local GGUF models found in ~/.buildwithnexus/models or scanned dirs]",
+
+    // GGUF files on disk need a llama.cpp / LM Studio server in front of them.
+    for name in crate::local::scan_gguf() {
+        options.push((
+            "llamacpp".into(),
+            name,
+            "GGUF on disk — needs a running llama.cpp/LM Studio server".into(),
         ));
     }
 
-    tui::line("");
-    tui::line(&tui::bold("  [Standard Cloud & Server Presets]"));
-    let presets = [
-        (
-            "claude-3-7-sonnet",
-            "Anthropic Claude 3.7 Sonnet (Reasoning)",
-        ),
-        (
-            "claude-3-5-sonnet",
-            "Anthropic Claude 3.5 Sonnet (Balanced)",
-        ),
-        ("claude-3-haiku", "Anthropic Claude 3 Haiku (Fast/Light)"),
-        ("gpt-4o", "OpenAI GPT-4o (Multimodal Flagship)"),
-        ("gpt-4o-mini", "OpenAI GPT-4o Mini (Fast/Economic)"),
-        ("gemini-2.5-pro", "Google Gemini 2.5 Pro (Long Context)"),
-        (
-            "gemini-2.5-flash",
-            "Google Gemini 2.5 Flash (Fast/High Volume)",
-        ),
-        ("ollama/llama3", "Local Ollama Llama 3"),
-        ("ollama/qwen2.5-coder", "Local Ollama Qwen 2.5 Coder"),
-    ];
-    for (id, desc) in presets {
-        options.push((id.to_string(), desc.to_string()));
+    // Cloud presets, each showing whether it's already configured.
+    for p in config::PRESETS.iter().filter(|p| !p.local) {
+        let status = if config::load_key(p.env_key).is_some() {
+            String::new()
+        } else {
+            format!(" — needs {}", p.env_key)
+        };
+        options.push((
+            p.id.to_string(),
+            p.default_model.to_string(),
+            format!("{}{}", p.label, status),
+        ));
+        // Popular alternates beyond each preset's default.
+        let extras: &[&str] = match p.id {
+            "anthropic" => &["claude-opus-4-8", "claude-haiku-4-5"],
+            "openai" => &["gpt-4o-mini"],
+            _ => &[],
+        };
+        for m in extras {
+            options.push((
+                p.id.to_string(),
+                m.to_string(),
+                format!("{}{}", p.label, status),
+            ));
+        }
     }
 
-    for (idx, (id, desc)) in options.iter().enumerate() {
+    // Bring-your-own OpenAI-compatible server (vLLM, TGI, LiteLLM, a gateway).
+    options.push((
+        "custom".into(),
+        String::new(),
+        "any OpenAI-compatible endpoint — asks for URL, key (optional), model".into(),
+    ));
+
+    for (idx, (prov, model, desc)) in options.iter().enumerate() {
         let num = format!("{:>2}", idx + 1);
+        let shown = if model.is_empty() {
+            "(you choose)"
+        } else {
+            model
+        };
         tui::line(&format!(
-            "  {} {} — {}",
+            "  {} {} {} — {}",
             tui::accent(&num),
-            tui::bold(id),
+            tui::bold(shown),
+            tui::dim(&format!("[{prov}]")),
             tui::dim(desc)
         ));
     }
     tui::line("");
     tui::line(&tui::dim(
-        "  Tip: Type a number (e.g. `1`), a model name, or press Enter to keep current.",
+        "  Pick a number, or type: a model name (claude-*, gpt-*, ollama/<name>),",
+    ));
+    tui::line(&tui::dim(
+        "  any OpenRouter model (org/model), `<provider> <model>` (e.g. `openai gpt-4o`),",
+    ));
+    tui::line(&tui::dim(
+        "  or `<url> <model>` for an OpenAI-compatible server. Enter keeps the current model.",
     ));
 
     let pick = tui::ask("  Select model: ").unwrap_or_default();
-    let pick = pick.trim();
-    if !pick.is_empty() {
-        let chosen = if let Ok(idx) = pick.parse::<usize>() {
-            if idx > 0 && idx <= options.len() {
-                options[idx - 1].0.clone()
+    let pick = pick.trim().to_string();
+    if pick.is_empty() {
+        return;
+    }
+    // "<url> [model]" targets a custom OpenAI-compatible endpoint directly.
+    if pick.starts_with("http://") || pick.starts_with("https://") {
+        let (url, model) = pick
+            .split_once(char::is_whitespace)
+            .map(|(u, m)| (u.trim().to_string(), m.trim().to_string()))
+            .unwrap_or((pick.clone(), String::new()));
+        swap_model(provider, "custom", &model, Some(url));
+        return;
+    }
+    let (target_provider, model) = if let Ok(idx) = pick.parse::<usize>() {
+        if idx > 0 && idx <= options.len() {
+            let (p, m, _) = options[idx - 1].clone();
+            (p, m)
+        } else {
+            tui::line(&tui::red(&format!(
+                "  ✗ number {idx} out of range (1-{}), keeping current model",
+                options.len()
+            )));
+            return;
+        }
+    } else {
+        parse_model_pick(&pick, &settings.provider)
+    };
+    swap_model(provider, &target_provider, &model, None);
+}
+
+/// Maps a typed model name to the provider that serves it. Anything
+/// unrecognized stays on the current provider — the swap then validates it.
+fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
+    // Explicit "<provider> <model>" always wins.
+    if let Some((p, m)) = pick.split_once(char::is_whitespace) {
+        if config::preset(p.trim()).is_some() {
+            return (p.trim().to_string(), m.trim().to_string());
+        }
+    }
+    if let Some(rest) = pick.strip_prefix("ollama/") {
+        return ("ollama".into(), rest.to_string());
+    }
+    if let Some(rest) = pick.strip_prefix("local/") {
+        return ("llamacpp".into(), rest.to_string());
+    }
+    let lower = pick.to_ascii_lowercase();
+    if lower.starts_with("claude") {
+        return ("anthropic".into(), pick.to_string());
+    }
+    if lower.starts_with("gpt") || lower.starts_with("chatgpt") {
+        return ("openai".into(), pick.to_string());
+    }
+    // Gemini has no native preset — OpenRouter serves it.
+    if lower.starts_with("gemini") {
+        return ("openrouter".into(), format!("google/{lower}"));
+    }
+    // org/model naming is OpenRouter's scheme.
+    if pick.contains('/') {
+        return ("openrouter".into(), pick.to_string());
+    }
+    (current_provider.to_string(), pick.to_string())
+}
+
+/// Applies a model swap only after the target provider is actually usable:
+/// walks the user through a missing API key (or a custom endpoint's URL),
+/// checks that a local server is reachable and has the model, and keeps the
+/// current model on any failure.
+fn swap_model(
+    provider: &mut Provider,
+    target_provider: &str,
+    model: &str,
+    base_url_override: Option<String>,
+) {
+    let Some(preset) = config::preset(target_provider) else {
+        let ids: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
+        tui::line(&tui::red(&format!(
+            "  ✗ unknown provider '{target_provider}' — valid: {}",
+            ids.join(", ")
+        )));
+        return;
+    };
+    let mut s = config::load_settings().unwrap_or_default();
+    let switching = s.provider != preset.id;
+    let mut model = model.to_string();
+    let mut custom_url = base_url_override;
+
+    // Custom OpenAI-compatible endpoint: gather URL, optional key, and model.
+    if preset.id == "custom" {
+        if custom_url.is_none() {
+            let default_url = if !switching {
+                s.base_url.clone().unwrap_or_else(|| preset.base_url.into())
             } else {
-                tui::line(&tui::red(&format!(
-                    "  ✗ number {idx} out of range (1-{}), keeping current model",
-                    options.len()
+                preset.base_url.to_string()
+            };
+            let url = tui::ask(&format!(
+                "  Endpoint base URL (OpenAI-compatible, usually ends in /v1) [{default_url}]: "
+            ))
+            .unwrap_or_default();
+            let url = url.trim();
+            custom_url = Some(if url.is_empty() {
+                default_url
+            } else {
+                url.to_string()
+            });
+        }
+        if config::load_key(config::CUSTOM_KEY).is_none() {
+            let key =
+                tui::ask("  API key (press Enter if the server needs none): ").unwrap_or_default();
+            if !key.trim().is_empty() {
+                config::save_key(config::CUSTOM_KEY, key.trim());
+                tui::line(&tui::green(&format!("  ✓ {} saved", config::CUSTOM_KEY)));
+            }
+        }
+        if model.is_empty() {
+            let m = tui::ask("  Model name (as the server expects it): ").unwrap_or_default();
+            model = m.trim().to_string();
+            if model.is_empty() {
+                tui::line(&tui::dim(&format!(
+                    "  swap cancelled — keeping {}.",
+                    provider.model
                 )));
                 return;
             }
-        } else {
-            pick.to_string()
-        };
-        provider.model = chosen.clone();
-        if let Some(mut s) = config::load_settings() {
-            s.model = chosen.clone();
-            config::save_settings(&s);
         }
-        tui::line(&tui::green(&format!(
-            "  ✓ active model hot-swapped → {chosen}"
+    }
+
+    // Missing API key: configure it right here instead of failing on the
+    // next request with a raw HTTP error.
+    if !preset.env_key.is_empty() && config::load_key(preset.env_key).is_none() {
+        tui::line(&tui::yellow(&format!(
+            "  {} isn't configured yet — {} is not set.",
+            preset.label, preset.env_key
         )));
+        tui::line(&tui::dim(
+            "  Paste an API key to set it up now, or press Enter to cancel the swap.",
+        ));
+        let key = tui::ask(&format!("  {}: ", preset.env_key)).unwrap_or_default();
+        let key = key.trim();
+        if key.is_empty() {
+            tui::line(&tui::dim(&format!(
+                "  swap cancelled — keeping {}. Configure later with `export {}=…` or `buildwithnexus init`.",
+                provider.model, preset.env_key
+            )));
+            return;
+        }
+        config::save_key(preset.env_key, key);
+        tui::line(&tui::green(&format!("  ✓ {} saved", preset.env_key)));
+    }
+
+    // Ollama: confirm the server is up and actually has the model before
+    // committing — the alternative is an opaque failure mid-conversation.
+    if preset.id == "ollama" {
+        let base = if !switching {
+            s.base_url
+                .clone()
+                .unwrap_or_else(|| preset.base_url.to_string())
+        } else {
+            preset.base_url.to_string()
+        };
+        let installed = provider::ollama_models(&base);
+        if installed.is_empty() {
+            tui::line(&tui::yellow(&format!(
+                "  ✗ can't reach Ollama at {base} (or it has no models)."
+            )));
+            tui::line(&tui::dim("    1. install: https://ollama.com"));
+            tui::line(&tui::dim("    2. start it:  ollama serve"));
+            tui::line(&tui::dim(&format!(
+                "    3. pull the model:  ollama pull {model}"
+            )));
+            tui::line(&tui::dim(
+                "    then run /model again — keeping the current model.",
+            ));
+            return;
+        }
+        let have = installed
+            .iter()
+            .any(|m| *m == model || m.split(':').next() == Some(model.as_str()));
+        if !have {
+            tui::line(&tui::yellow(&format!(
+                "  ✗ Ollama is running but '{model}' isn't installed."
+            )));
+            let shown: Vec<&str> = installed.iter().take(8).map(String::as_str).collect();
+            tui::line(&tui::dim(&format!("    installed: {}", shown.join(", "))));
+            tui::line(&tui::dim(&format!(
+                "    pull it with  ollama pull {model}  — keeping the current model."
+            )));
+            return;
+        }
+    }
+
+    // A custom base_url belongs to the provider it was set for.
+    if switching {
+        s.base_url = None;
+    }
+    if let Some(u) = custom_url {
+        s.base_url = Some(u);
+    }
+    s.provider = preset.id.to_string();
+    s.model = model.to_string();
+    match build_provider(&s) {
+        Ok(p) => {
+            // No success message without proof: a one-token probe through the
+            // real request path catches bad keys, unknown model names, and
+            // unreachable servers now instead of on the next prompt. Ollama
+            // was already validated live above (server + installed model),
+            // and a probe there could cold-load a large model.
+            if preset.id != "ollama" {
+                tui::line(&tui::dim(&format!(
+                    "  validating {model} — one-token probe…"
+                )));
+                if let Err(e) = provider::validate(&p) {
+                    tui::line(&tui::red(&format!("  ✗ validation failed: {e}")));
+                    let hint = if e.contains("401") || e.contains("403") {
+                        format!(
+                            "the API key was rejected — re-run /model to enter a new one, or update {}",
+                            if preset.id == "custom" { config::CUSTOM_KEY } else { preset.env_key }
+                        )
+                    } else if e.contains("404") || e.to_lowercase().contains("model") {
+                        format!("'{model}' doesn't look like a model this provider serves — check the name")
+                    } else if e.contains("connection failed") {
+                        format!(
+                            "nothing is answering at {} — start the server, then /model again",
+                            p.base_url
+                        )
+                    } else {
+                        "fix the issue above, then /model again".to_string()
+                    };
+                    tui::line(&tui::dim(&format!("    {hint}")));
+                    tui::line(&tui::dim(&format!(
+                        "    keeping the current model ({}).",
+                        provider.model
+                    )));
+                    return;
+                }
+            }
+            *provider = p;
+            config::save_settings(&s);
+            provider::prewarm(provider);
+            tui::line(&tui::green(&format!(
+                "  ✓ active model hot-swapped → {} on {} (validated)",
+                model, preset.label
+            )));
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  ✗ swap failed: {e} — keeping the current model."
+            )));
+        }
     }
 }
 
@@ -2142,7 +2549,24 @@ fn handle_checkpoints(cwd: &std::path::Path) {
 
 fn handle_undo(cwd: &std::path::Path, arg: &str) {
     let arg = arg.trim();
-    if arg == "git" {
+    if arg.is_empty() {
+        // Bare /undo reverts the last agent turn as a unit — the recovery for
+        // a partial multi-file edit, where undoing one file would quietly
+        // leave the rest changed.
+        match checkpoint::undo_last_turn(cwd) {
+            Ok(cps) => {
+                tui::line(&tui::green(&format!(
+                    "  ✓ undid the last agent turn — restored {} file{}:",
+                    cps.len(),
+                    if cps.len() == 1 { "" } else { "s" }
+                )));
+                for c in cps {
+                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                }
+            }
+            Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+        }
+    } else if arg == "git" {
         match checkpoint::git_rollback(cwd) {
             Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
             Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
@@ -2161,19 +2585,19 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             }
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
-    } else if !arg.is_empty() {
-        match checkpoint::undo_by_id(cwd, arg) {
+    } else if arg == "latest" {
+        match checkpoint::undo_latest(cwd) {
             Ok(cp) => tui::line(&tui::green(&format!(
-                "  ✓ restored checkpoint {} ({})",
-                cp.id,
+                "  ✓ restored latest {}",
                 cp.path.display()
             ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
         }
     } else {
-        match checkpoint::undo_latest(cwd) {
+        match checkpoint::undo_by_id(cwd, arg) {
             Ok(cp) => tui::line(&tui::green(&format!(
-                "  ✓ restored latest {}",
+                "  ✓ restored checkpoint {} ({})",
+                cp.id,
                 cp.path.display()
             ))),
             Err(e) => tui::line(&tui::red(&format!("  {e}"))),
@@ -2336,7 +2760,11 @@ fn print_help() {
                 ("/commit", "", "AI-drafted conventional commit message"),
                 ("/pr", "", "AI-drafted PR title + description"),
                 ("/checkpoints", "", "list edit checkpoints"),
-                ("/undo", "(/rewind) <git|all|id>", "restore a checkpoint"),
+                (
+                    "/undo",
+                    "(/rewind) [latest|git|all|<id>]",
+                    "bare: revert the last agent turn's edits",
+                ),
             ],
         ),
         (
@@ -2835,7 +3263,14 @@ fn run_doctor() {
     println!();
 
     // Settings
-    match config::load_settings() {
+    let load = config::load_settings_diag();
+    for i in &load.issues {
+        println!("  ✗ settings       {}: {}", i.source, i.error);
+    }
+    match load.settings {
+        None if load.any_present => {
+            println!("  ✗ settings       present but unusable — fix the file(s) above");
+        }
         None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
         Some(s) => {
             println!(
@@ -3057,6 +3492,108 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_tips_fit_one_line_and_stay_in_character() {
+        assert!(STARTUP_TIPS.len() >= 12, "keep the rotation fresh");
+        for t in STARTUP_TIPS {
+            assert!(t.starts_with("tip: "), "uniform prefix: {t}");
+            assert!(t.chars().count() <= 100, "must fit one line: {t}");
+            assert!(!t.contains('!'), "exclamation marks are hype: {t}");
+        }
+        // The picker always returns a member, whatever the clock says.
+        assert!(STARTUP_TIPS.contains(&startup_tip()));
+    }
+
+    #[test]
+    fn model_pick_routes_to_serving_provider() {
+        let p = |s: &str| parse_model_pick(s, "anthropic");
+        assert_eq!(
+            p("claude-sonnet-4-6"),
+            ("anthropic".into(), "claude-sonnet-4-6".into())
+        );
+        assert_eq!(p("gpt-4o"), ("openai".into(), "gpt-4o".into()));
+        assert_eq!(
+            p("ollama/qwen2.5-coder"),
+            ("ollama".into(), "qwen2.5-coder".into())
+        );
+        assert_eq!(
+            p("local/phi-4.gguf"),
+            ("llamacpp".into(), "phi-4.gguf".into())
+        );
+        // Gemini has no native preset — routed through OpenRouter's naming.
+        assert_eq!(
+            p("gemini-2.5-pro"),
+            ("openrouter".into(), "google/gemini-2.5-pro".into())
+        );
+        // org/model naming is OpenRouter's scheme.
+        assert_eq!(
+            p("meta-llama/llama-3.3-70b"),
+            ("openrouter".into(), "meta-llama/llama-3.3-70b".into())
+        );
+        // Explicit "<provider> <model>" wins over inference.
+        assert_eq!(
+            p("groq llama-3.3-70b-versatile"),
+            ("groq".into(), "llama-3.3-70b-versatile".into())
+        );
+        // Unknown names stay on the current provider for the swap to validate.
+        assert_eq!(
+            p("mystery-model"),
+            ("anthropic".into(), "mystery-model".into())
+        );
+        // Custom endpoints are addressable by preset name too.
+        assert_eq!(
+            p("custom vllm-model"),
+            ("custom".into(), "vllm-model".into())
+        );
+    }
+
+    #[test]
+    fn custom_provider_keyless_http_and_key_guard() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join("bwn-custom-provider-test");
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        std::env::remove_var(config::CUSTOM_KEY);
+
+        // Keyless over plain http to loopback: fine (vLLM's default posture).
+        let s = Settings {
+            provider: "custom".into(),
+            model: "my-vllm-model".into(),
+            base_url: Some("http://localhost:8000/v1".into()),
+            ..Default::default()
+        };
+        let p = build_provider(&s).expect("keyless custom endpoint must build");
+        assert!(p.api_key.is_none());
+        assert_eq!(p.base_url, "http://localhost:8000/v1");
+        assert_eq!(p.model, "my-vllm-model");
+
+        // With a key configured, plain http to a REMOTE host is refused…
+        config::save_key(config::CUSTOM_KEY, "sk-custom");
+        let mut remote = s.clone();
+        remote.base_url = Some("http://gateway.example.com/v1".into());
+        assert!(build_provider(&remote).is_err());
+        // …but loopback and https are both fine.
+        assert!(build_provider(&s).unwrap().api_key.is_some());
+        let mut tls = s.clone();
+        tls.base_url = Some("https://gateway.example.com/v1".into());
+        assert!(build_provider(&tls).is_ok());
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn loopback_url_detection() {
+        assert!(is_loopback_url("http://localhost:8000/v1"));
+        assert!(is_loopback_url("http://127.0.0.1:11434"));
+        assert!(is_loopback_url("http://[::1]:8080/v1"));
+        assert!(!is_loopback_url("http://gateway.example.com/v1"));
+        assert!(!is_loopback_url("http://localhost.evil.com/v1"));
+    }
 
     #[test]
     fn classify_brainstorm_phrases() {

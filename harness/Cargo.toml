@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.12.4"
+version = "0.12.5"
 edition = "2021"
 rust-version = "1.94"
 description = "A hilariously fast agentic AI coding CLI — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
@@ -21,6 +21,9 @@ path = "src/main.rs"
 [[bin]]
 name = "bwn"
 path = "src/bwn.rs"
+# The alias shim collides with the bwn crate's bin in workspace `cargo doc`
+# output paths, and a two-line shim has nothing to document anyway.
+doc = false
 
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.

@@ -113,13 +113,30 @@ pub const PRESETS: &[Preset] = &[
         default_model: "local-model",
         local: true,
     },
+    // Any OpenAI-compatible /v1 server: vLLM, TGI, LiteLLM, a corporate
+    // gateway… The key is optional (CUSTOM_API_KEY) because most self-hosted
+    // servers don't need one; build_provider refuses to send a configured key
+    // to a non-HTTPS, non-loopback URL.
+    Preset {
+        id: "custom",
+        label: "OpenAI-compatible endpoint",
+        protocol: Protocol::OpenAi,
+        base_url: "http://localhost:8000/v1",
+        env_key: "",
+        default_model: "local-model",
+        local: true,
+    },
 ];
+
+/// Optional key for the `custom` preset — not wired through `env_key` so the
+/// key stays optional (env_key drives the "must be set" checks).
+pub const CUSTOM_KEY: &str = "CUSTOM_API_KEY";
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub provider: String,
     pub model: String,
@@ -436,6 +453,40 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
         ),
         ("frontend-ux", include_str!("bundled_skills/frontend-ux.md")),
         ("static-app", include_str!("bundled_skills/static-app.md")),
+        // The letsbeheroes collection: process discipline (how to work),
+        // complementing the domain skills above (what to work on).
+        (
+            "letsbeheroes",
+            include_str!("bundled_skills/letsbeheroes/letsbeheroes.md"),
+        ),
+        (
+            "hero-brainstorm",
+            include_str!("bundled_skills/letsbeheroes/hero-brainstorm.md"),
+        ),
+        (
+            "hero-plan",
+            include_str!("bundled_skills/letsbeheroes/hero-plan.md"),
+        ),
+        (
+            "hero-execute",
+            include_str!("bundled_skills/letsbeheroes/hero-execute.md"),
+        ),
+        (
+            "hero-debug",
+            include_str!("bundled_skills/letsbeheroes/hero-debug.md"),
+        ),
+        (
+            "hero-ship",
+            include_str!("bundled_skills/letsbeheroes/hero-ship.md"),
+        ),
+        (
+            "hero-wait",
+            include_str!("bundled_skills/letsbeheroes/hero-wait.md"),
+        ),
+        (
+            "hero-subagents",
+            include_str!("bundled_skills/letsbeheroes/hero-subagents.md"),
+        ),
     ]
 }
 
@@ -608,63 +659,72 @@ unnecessary complexity. Produces a concise numbered list of findings.
 }
 
 pub fn load_settings() -> Option<Settings> {
-    load_settings_from_dir(&std::env::current_dir().unwrap_or_else(|_| home()))
+    load_settings_diag().settings
 }
 
 /// Loads settings from global ~/.buildwithnexus/config.json, settings.json, settings.local.json,
 /// and project .buildwithnexus/settings.json, settings.local.json, merging them in hierarchy order.
 pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
+    load_settings_from_dir_diag(workdir).settings
+}
+
+/// A settings file that exists on disk but was ignored, and why — surfaced at
+/// startup and in `doctor` so a typo never silently drops configuration.
+pub struct SettingsIssue {
+    pub source: String,
+    pub error: String,
+}
+
+pub struct SettingsLoad {
+    pub settings: Option<Settings>,
+    pub issues: Vec<SettingsIssue>,
+    /// At least one settings file exists on disk — distinguishes "broken
+    /// config" (never clobber it) from a true first run (offer onboarding).
+    pub any_present: bool,
+}
+
+pub fn load_settings_diag() -> SettingsLoad {
+    load_settings_from_dir_diag(&std::env::current_dir().unwrap_or_else(|_| home()))
+}
+
+pub fn load_settings_from_dir_diag(workdir: &std::path::Path) -> SettingsLoad {
+    let dot = workdir.join(".buildwithnexus");
+    let paths = [
+        home().join("config.json"), // legacy base
+        settings_path(),
+        home().join("settings.local.json"),
+        dot.join("settings.json"),
+        dot.join("settings.local.json"),
+    ];
+
     let mut sources = Vec::new();
-
-    // 1. Global config.json (legacy base)
-    if let Ok(text) = fs::read_to_string(home().join("config.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 2. Global settings.json
-    if let Ok(text) = fs::read_to_string(settings_path()) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 3. Global settings.local.json
-    if let Ok(text) = fs::read_to_string(home().join("settings.local.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 4. Project settings.json
-    let proj_path = workdir.join(".buildwithnexus").join("settings.json");
-    if let Ok(text) = fs::read_to_string(&proj_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
-        }
-    }
-
-    // 5. Project settings.local.json
-    let local_path = workdir.join(".buildwithnexus").join("settings.local.json");
-    if let Ok(text) = fs::read_to_string(&local_path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            if val.is_object() {
-                sources.push(val);
-            }
+    let mut issues = Vec::new();
+    let mut any_present = false;
+    for p in &paths {
+        let Ok(text) = fs::read_to_string(p) else {
+            continue;
+        };
+        any_present = true;
+        // serde_json's Display includes line and column — keep it verbatim.
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(val) if val.is_object() => sources.push(val),
+            Ok(_) => issues.push(SettingsIssue {
+                source: p.display().to_string(),
+                error: "top level must be a JSON object — file ignored".into(),
+            }),
+            Err(e) => issues.push(SettingsIssue {
+                source: p.display().to_string(),
+                error: format!("{e} — file ignored"),
+            }),
         }
     }
 
     if sources.is_empty() {
-        return None;
+        return SettingsLoad {
+            settings: None,
+            issues,
+            any_present,
+        };
     }
 
     let mut merged = sources.remove(0);
@@ -672,7 +732,26 @@ pub fn load_settings_from_dir(workdir: &std::path::Path) -> Option<Settings> {
         merge_json_values(&mut merged, source);
     }
 
-    serde_json::from_value(merged).ok()
+    match serde_json::from_value(merged) {
+        Ok(s) => SettingsLoad {
+            settings: Some(s),
+            issues,
+            any_present,
+        },
+        Err(e) => {
+            issues.push(SettingsIssue {
+                source: "merged settings".into(),
+                error: format!(
+                    "{e} — check the value types in the files listed by `buildwithnexus doctor`"
+                ),
+            });
+            SettingsLoad {
+                settings: None,
+                issues,
+                any_present,
+            }
+        }
+    }
 }
 
 fn merge_json_values(target: &mut serde_json::Value, source: serde_json::Value) {
@@ -804,6 +883,70 @@ mod tests {
     }
 
     #[test]
+    fn settings_diag_reports_broken_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let work = h.join("proj");
+        fs::create_dir_all(&work).unwrap();
+
+        // No files anywhere: a true first run — nothing present, no issues.
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none());
+        assert!(l.issues.is_empty());
+        assert!(!l.any_present);
+
+        // Syntax error: file is present, ignored, and the issue names it.
+        fs::write(h.join("settings.json"), "{ \"provider\": \"openai\", }").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none());
+        assert!(l.any_present);
+        assert_eq!(l.issues.len(), 1);
+        assert!(l.issues[0].source.contains("settings.json"));
+        assert!(l.issues[0].error.contains("line"));
+
+        // Valid JSON, wrong shape: array top level is ignored with a clear reason.
+        fs::write(h.join("settings.json"), "[1,2,3]").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none() && l.any_present);
+        assert!(l.issues[0].error.contains("JSON object"));
+
+        // Valid file + wrong field type: the merged deserialize fails loudly
+        // instead of silently dropping all configuration.
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask","auto_update":true}"#,
+        )
+        .unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_none() && l.any_present);
+        assert!(l.issues.iter().any(|i| i.source == "merged settings"));
+
+        // Fixed file loads cleanly with zero issues.
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#,
+        )
+        .unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_some());
+        assert!(l.issues.is_empty());
+
+        // A broken project-local file is reported but doesn't take down the
+        // valid global settings.
+        fs::create_dir_all(work.join(".buildwithnexus")).unwrap();
+        fs::write(work.join(".buildwithnexus/settings.json"), "{oops").unwrap();
+        let l = load_settings_from_dir_diag(&work);
+        assert!(l.settings.is_some());
+        assert_eq!(l.issues.len(), 1);
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
     fn mask_short_keys_fully_hidden() {
         assert_eq!(mask("short"), "***");
         assert_eq!(mask("12345678"), "***");
@@ -852,6 +995,43 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"static-app"));
         assert!(names.contains(&"frontend-ux"));
+    }
+
+    #[test]
+    fn bundled_skills_include_letsbeheroes_collection() {
+        let skills = bundled_skills();
+        let names: Vec<_> = skills.iter().map(|(n, _)| *n).collect();
+        for n in [
+            "letsbeheroes",
+            "hero-brainstorm",
+            "hero-plan",
+            "hero-execute",
+            "hero-debug",
+            "hero-ship",
+            "hero-wait",
+            "hero-subagents",
+        ] {
+            assert!(names.contains(&n), "missing skill {n}");
+        }
+        // Every member the charter references must actually be registered.
+        let charter = skills
+            .iter()
+            .find(|(n, _)| *n == "letsbeheroes")
+            .map(|(_, c)| *c)
+            .unwrap();
+        for n in &names {
+            if let Some(member) = n.strip_prefix("hero-") {
+                assert!(
+                    charter.contains(&format!("/hero-{member}")),
+                    "charter doesn't mention /hero-{member}"
+                );
+            }
+        }
+        // No duplicate names across the whole corpus.
+        let mut uniq = std::collections::HashSet::new();
+        for n in &names {
+            assert!(uniq.insert(n), "duplicate skill name {n}");
+        }
     }
 
     #[test]

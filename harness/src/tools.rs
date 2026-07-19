@@ -1469,7 +1469,7 @@ pub fn is_wsl_windows_mount(path: &Path) -> bool {
     false
 }
 
-/// True when a shell command string references /mnt/<drive>/ paths in WSL2.
+/// True when a shell command string references `/mnt/<drive>/` paths in WSL2.
 /// Catches `cp /mnt/c/foo .`, `rm /mnt/d/bar`, etc.
 pub fn command_touches_wsl_mount(cmd: &str) -> bool {
     if !is_wsl() {
