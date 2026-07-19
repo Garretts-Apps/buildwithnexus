@@ -7,6 +7,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.12.6] - Unreleased
 
 ### Fixed
+- **Settings, API keys, memory, history, and checkpoints are written
+  atomically too** — and the key store's permissions are now tightened on
+  the temp file *before* it becomes visible, so `.env.keys` is never
+  world-readable, even for an instant. Checkpoint restores are atomic as
+  well: recovery can't truncate the file it's recovering.
 - **All file writes in the tool layer are atomic.** `write_file`,
   `edit_file`, `multi_edit`, `create_docx`, artifact writes, and the editor
   tools wrote directly to the destination — a crash or power loss mid-write

@@ -125,8 +125,24 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
     let checkpoint_dir = dir(cwd);
     let _ = fs::create_dir_all(&checkpoint_dir);
     if let Ok(body) = serde_json::to_string_pretty(&cp) {
-        let _ = fs::write(checkpoint_dir.join(format!("{id}.json")), body);
+        // Atomic: a truncated snapshot would silently drop out of list() —
+        // that's a recovery point lost exactly when recovery matters.
+        let _ = write_atomic(&checkpoint_dir.join(format!("{id}.json")), body.as_bytes());
     }
+}
+
+// Same-directory temp + rename; a crash mid-write never leaves a partial file.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut name = match path.file_name() {
+        Some(n) => n.to_os_string(),
+        None => return Err(std::io::Error::other("path has no file name")),
+    };
+    name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = path.with_file_name(name);
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 /// Returns all recorded checkpoints for the given workspace directory, sorted newest first.
@@ -156,7 +172,7 @@ fn restore_one(cp: &Checkpoint) -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        fs::write(&cp.path, &cp.content)
+        write_atomic(&cp.path, cp.content.as_bytes())
             .map_err(|e| format!("cannot restore {}: {e}", cp.path.display()))?;
     } else if cp.path.exists() {
         fs::remove_file(&cp.path)
