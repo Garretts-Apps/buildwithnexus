@@ -209,6 +209,9 @@ skips the binary — build from source and point `BWN_BIN` at the result.
   redacted from surfaced errors.
 - In non-interactive / `--json` runs, anything that would prompt is denied
   rather than blocking.
+- Every write is checkpointed before it happens; bare `/undo` reverts the
+  whole last agent turn. Failure modes, checkpoint mechanics, and what is
+  deliberately **not** protected: [RECOVERY.md](RECOVERY.md).
 
 ## License
 
