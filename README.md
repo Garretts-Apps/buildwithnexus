@@ -5,7 +5,7 @@
 
 A hilariously fast, **agentic AI CLI** — written in Rust. Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands, asking before each change. One static binary, five direct
+commands, asking before each change. One static binary, six direct
 dependencies, no runtime to babysit — and a terminal UI built to feel
 instant: incremental rendering with atomic frames, live autocomplete,
 GitHub-grade diffs, clickable files and links, and multimodal input straight

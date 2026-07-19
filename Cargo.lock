@@ -53,6 +53,7 @@ version = "0.12.6"
 dependencies = [
  "criterion",
  "crossterm",
+ "libc",
  "serde",
  "serde_json",
  "shlex",

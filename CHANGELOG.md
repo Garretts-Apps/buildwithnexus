@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.12.6] - Unreleased
 
 ### Added
+- **A killed TUI restores your terminal.** SIGTERM, SIGHUP, SIGINT, and
+  SIGQUIT now run an async-signal-safe handler that leaves the alternate
+  screen, shows the cursor, disables mouse/paste reporting, and restores the
+  pre-raw terminal settings before exiting — no more `reset` after an external
+  kill. Adds `libc` as a unix-only direct dependency (it was already in the
+  tree via crossterm), making it six direct dependencies.
 - **`doctor` now probes your configured provider live.** A `provider` line
   runs the same one-token validation `/model` uses — a present-but-rejected
   key, a wrong model name, or an unreachable server shows up in `doctor`
