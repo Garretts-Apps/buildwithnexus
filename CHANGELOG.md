@@ -6,6 +6,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.12.6] - Unreleased
 
+### Added
+- **`doctor` now probes your configured provider live.** A `provider` line
+  runs the same one-token validation `/model` uses — a present-but-rejected
+  key, a wrong model name, or an unreachable server shows up in `doctor`
+  instead of on your next prompt. Ollama is probed for free via its API;
+  hosted providers pay one output token, which is what a diagnostic command
+  is for.
+
 ### Fixed
 - **Settings, API keys, memory, history, and checkpoints are written
   atomically too** — and the key store's permissions are now tightened on

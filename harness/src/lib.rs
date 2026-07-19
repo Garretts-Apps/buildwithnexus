@@ -3283,6 +3283,43 @@ fn run_doctor() {
                 },
                 s.permission
             );
+            // Live connectivity through the exact path real requests take —
+            // key presence says nothing about whether the provider answers.
+            // Ollama is probed via its free /api/tags; everything else pays
+            // one output token, which is what a diagnostic command is for.
+            match build_provider(&s) {
+                Ok(p) => {
+                    if config::preset(&s.provider).is_some_and(|pr| pr.id == "ollama") {
+                        let models = provider::ollama_models(&p.base_url);
+                        if models.is_empty() {
+                            println!(
+                                "  ✗ provider       can't reach Ollama at {} — is it running? (ollama serve)",
+                                p.base_url
+                            );
+                        } else {
+                            println!(
+                                "  ✓ provider       Ollama at {} — {} model{} installed",
+                                p.base_url,
+                                models.len(),
+                                if models.len() == 1 { "" } else { "s" }
+                            );
+                        }
+                    } else {
+                        match provider::validate(&p) {
+                            Ok(()) => println!(
+                                "  ✓ provider       {} answers as {} (one-token probe)",
+                                s.provider, p.model
+                            ),
+                            Err(e) => println!(
+                                "  ✗ provider       {}: {}",
+                                s.provider,
+                                e.chars().take(160).collect::<String>()
+                            ),
+                        }
+                    }
+                }
+                Err(e) => println!("  ✗ provider       {e}"),
+            }
         }
     }
 
