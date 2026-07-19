@@ -4,7 +4,19 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.5] - Unreleased
+## [0.12.6] - Unreleased
+
+### Fixed
+- **All file writes in the tool layer are atomic.** `write_file`,
+  `edit_file`, `multi_edit`, `create_docx`, artifact writes, and the editor
+  tools wrote directly to the destination — a crash or power loss mid-write
+  could leave a truncated file. Every content write now goes through
+  same-directory temp + rename (which also can't split a file across
+  filesystems), and the destination's permissions are copied onto the
+  replacement, so editing a script no longer risks silently stripping its
+  executable bit.
+
+## [0.12.5] - 2026-07-19
 
 ### Added
 - **Startup tips** — one rotating dim line under the banner: half real tips
