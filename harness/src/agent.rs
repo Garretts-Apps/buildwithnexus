@@ -2795,11 +2795,92 @@ fn task_is_imperative(task: &str) -> bool {
         })
 }
 
+// Workspace evidence: a path-ish token or a noun that names something living
+// in the repo. An imperative verb alone is not enough to demand tool calls —
+// "write a poem about pirates" is a chat deliverable, and prose IS the work.
+fn task_references_workspace(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    // Path-ish tokens: an explicit separator, or word.ext with a short
+    // alphanumeric extension ("pirates.txt", "src/main.rs", "0.12.6").
+    if lower.split_whitespace().any(|w| {
+        let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '.');
+        if w.contains('/') {
+            return true;
+        }
+        match w.rsplit_once('.') {
+            Some((stem, ext)) => {
+                !stem.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            }
+            None => false,
+        }
+    }) {
+        return true;
+    }
+    lower.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+        matches!(
+            w,
+            "file"
+                | "files"
+                | "folder"
+                | "directory"
+                | "repo"
+                | "repository"
+                | "project"
+                | "script"
+                | "module"
+                | "function"
+                | "class"
+                | "struct"
+                | "method"
+                | "test"
+                | "tests"
+                | "bug"
+                | "code"
+                | "codebase"
+                | "app"
+                | "application"
+                | "game"
+                | "page"
+                | "website"
+                | "site"
+                | "api"
+                | "endpoint"
+                | "server"
+                | "config"
+                | "configuration"
+                | "dependency"
+                | "dependencies"
+                | "package"
+                | "readme"
+                | "changelog"
+                | "docs"
+                | "documentation"
+                | "html"
+                | "css"
+                | "json"
+                | "yaml"
+                | "toml"
+                | "component"
+                | "library"
+                | "crate"
+                | "branch"
+                | "commit"
+                | "database"
+                | "migration"
+                | "schema"
+        )
+    })
+}
+
 // Fix 14 decision: nudge the model to act instead of explaining. Fires only
-// for imperative tasks, only before any mutating tool has run this session,
-// and only while the per-task cap has not been reached. A prose reply with no
-// tool activity at all, or one that reads as how-to instructions, is treated
-// as explaining rather than doing.
+// for imperative tasks that reference the workspace (a file, path, project,
+// bug, …), only before any mutating tool has run this session, and only while
+// the per-task cap has not been reached. A prose reply with no tool activity
+// at all, or one that reads as how-to instructions, is treated as explaining
+// rather than doing. Creative/chat asks ("write a poem about pirates") never
+// nudge — the prose answer is the deliverable, not a failure to act.
 fn should_nudge_to_act(
     task: &str,
     reply_text: &str,
@@ -2807,7 +2888,11 @@ fn should_nudge_to_act(
     mutating_tool_ran: bool,
     nudges_so_far: usize,
 ) -> bool {
-    if nudges_so_far >= MAX_ACT_NUDGES || mutating_tool_ran || !task_is_imperative(task) {
+    if nudges_so_far >= MAX_ACT_NUDGES
+        || mutating_tool_ran
+        || !task_is_imperative(task)
+        || !task_references_workspace(task)
+    {
         return false;
     }
     !any_tool_ran || reads_as_instructions(reply_text)
@@ -4451,5 +4536,37 @@ mod tests {
             false,
             MAX_ACT_NUDGES
         ));
+    }
+
+    #[test]
+    fn act_nudge_skips_chat_deliverables_without_workspace_reference() {
+        let prose = "Here's how you can do it:\nSteps:\n1. First, gather ideas";
+        // Imperative verb, but the deliverable is prose — never nudge.
+        for task in [
+            "write a poem about pirates",
+            "write me a haiku",
+            "make up a bedtime story about a dragon",
+            "generate five names for a coffee shop",
+            "write a limerick, make it rhyme",
+        ] {
+            assert!(
+                !should_nudge_to_act(task, prose, false, false, 0),
+                "chat deliverable must not nudge: {task}"
+            );
+            assert!(!task_references_workspace(task), "{task}");
+        }
+        // The same creative verbs WITH workspace evidence still nudge.
+        for task in [
+            "write a poem about pirates to pirates.txt",
+            "write a README for this project",
+            "make a snake game",
+            "generate a config file for the linter",
+            "write tests for the parser module",
+        ] {
+            assert!(
+                should_nudge_to_act(task, prose, false, false, 0),
+                "workspace task must nudge: {task}"
+            );
+        }
     }
 }

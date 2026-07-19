@@ -270,7 +270,12 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 const BACKGROUND: Rgb = Rgb(0x1a, 0x1b, 0x26);
 const ACCENT: Rgb = Rgb(0xbb, 0x9a, 0xf7);
 const TEXT: Rgb = Rgb(0xc0, 0xca, 0xf5);
-const MUTED: Rgb = Rgb(0x56, 0x5f, 0x89);
+// Secondary/dim text. Tokyo Night's classic comment color (#565f89) measures
+// 2.76:1 against this background — below the WCAG AA 4.5:1 text minimum and
+// genuinely hard to read. This stays in the same blue-violet comment family
+// (between Storm's #7982a9 and fg_dark #a9b1d6) at 4.93:1, while remaining
+// clearly quieter than TEXT's 10.6:1.
+const MUTED: Rgb = Rgb(0x7e, 0x88, 0xb3);
 const SUCCESS: Rgb = Rgb(0x9e, 0xce, 0x6a);
 const WARNING: Rgb = Rgb(0xe0, 0xaf, 0x68);
 const ERROR: Rgb = Rgb(0xf7, 0x76, 0x8e);

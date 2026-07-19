@@ -20,6 +20,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hosted providers pay one output token, which is what a diagnostic command
   is for.
 
+### Changed
+- **Readable dim text.** Tokyo Night's classic comment color (#565f89)
+  measured 2.76:1 against the background — below the WCAG AA minimum and
+  genuinely hard to read for tips, hints, paths, and help text. Secondary
+  text is now #7e88b3 (4.93:1): same blue-violet comment family, still
+  clearly quieter than body text. Status meaning never relies on color
+  alone (✓/✗/⚠ glyphs, +/- diff gutters), and the error red is Tokyo
+  Night's pink-red, which stays distinct under red-green color blindness.
+- **"Write a poem" no longer gets nudged into writing files.** The
+  explain-vs-act nudge now requires workspace evidence in the task (a path,
+  file, project, bug, …) on top of an imperative verb — a chat deliverable
+  like "write a poem about pirates" is answered in the transcript, while
+  "write a poem to pirates.txt" still acts on the file.
+
 ### Fixed
 - **Settings, API keys, memory, history, and checkpoints are written
   atomically too** — and the key store's permissions are now tightened on
