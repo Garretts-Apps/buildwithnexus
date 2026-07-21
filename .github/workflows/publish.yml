@@ -72,7 +72,7 @@ jobs:
           persist-credentials: true
           submodules: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           # Note: registry-url *intentionally omitted* — when a Trusted Publisher
