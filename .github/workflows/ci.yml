@@ -87,13 +87,14 @@ jobs:
         with:
           tool: cargo-audit
 
-      # Advisory DB scan of the harness lockfile. New advisories in unchanged
-      # deps shouldn't block unrelated PRs — on PRs the report is informational;
-      # on main pushes it fails the build.
+      # Advisory DB scan of the workspace lockfile (covers harness + bwn). The
+      # lockfile lives at the repo root, not in harness/, so audit it there —
+      # running from harness/ found no Cargo.lock and errored out. New advisories
+      # in unchanged deps shouldn't block unrelated PRs — on PRs the report is
+      # informational; on main pushes it fails the build.
       - name: Audit dependencies
-        working-directory: harness
         continue-on-error: ${{ github.event_name == 'pull_request' }}
-        run: cargo audit
+        run: cargo audit -f Cargo.lock
 
   actionlint:
     name: Lint workflows
