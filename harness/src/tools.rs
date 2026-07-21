@@ -275,6 +275,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"changed_files":{"type":"array","items":{"type":"string"}},"task_type":{"type":"string"}}}) },
         ToolDef { name: "verify", description: "Run the verification layer (rules, tests, static analysis, confidence calculation) to generate a structured quality and safety report.",
             schema: json!({"type":"object","properties":{"task_description":{"type":"string"},"changed_files":{"type":"array","items":{"type":"string"}}},"required":["task_description"]}) },
+        ToolDef { name: "check_work", description: "Check your work: auto-detect the project (Cargo/npm/pnpm/yarn/Python/Go) and run its build, tests, and linter, returning a concise pass/fail report. Use after a code change, before finish, to confirm it actually works. Optional `only` (build|test|lint) runs just one check; optional `command` runs a single custom check command instead of auto-detection.",
+            schema: json!({"type":"object","properties":{"only":{"type":"string","enum":["build","test","lint"]},"command":{"type":"string"}}}) },
         ToolDef { name: "mcp_call", description: "Call a tool or query a resource on an enterprise Model Context Protocol (MCP) server configured in settings.json.",
             schema: json!({"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}) },
     ];
@@ -403,6 +405,7 @@ pub fn is_mutating(name: &str) -> bool {
             | "remove_path"
             | "bash"
             | "run_command"
+            | "check_work"
             | "start_server"
             | "stop_server"
             | "open_browser"
@@ -551,6 +554,11 @@ fn raw_preview(name: &str, input: &Value) -> String {
             "verify task: {}",
             input["task_description"].as_str().unwrap_or("?")
         ),
+        "check_work" => match (input["command"].as_str(), input["only"].as_str()) {
+            (Some(cmd), _) => format!("check work: {cmd}"),
+            (None, Some(only)) => format!("check work: {only}"),
+            (None, None) => "check work: build + test + lint".to_string(),
+        },
         "mcp_call" => format!(
             "MCP call: {}/{}",
             input["server"].as_str().unwrap_or("?"),
@@ -2591,6 +2599,248 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
     }
 }
 
+// ── check_work ────────────────────────────────────────────────────────────────
+// Tests/builds can be slow, so this gets a longer leash than a normal command.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+
+// One thing to run: a human label, a kind (build|test|lint|custom) so `only` can
+// filter, and the shell command itself.
+struct WorkCheck {
+    label: String,
+    kind: &'static str,
+    cmd: String,
+}
+
+fn shell_command(cmd: &str, cwd: &Path) -> Command {
+    let mut command = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+    command.current_dir(cwd);
+    command
+}
+
+// Script names declared in package.json (empty on any read/parse failure).
+fn package_json_scripts(cwd: &Path) -> Vec<String> {
+    std::fs::read_to_string(cwd.join("package.json"))
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .and_then(|v| {
+            v.get("scripts")
+                .and_then(|s| s.as_object())
+                .map(|m| m.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+// Auto-detect the project's build/test/lint commands from marker files. Returns
+// the first matching ecosystem's checks — projects aren't run through two
+// toolchains at once.
+fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
+    let has = |f: &str| cwd.join(f).exists();
+    let owned = |s: &str| s.to_string();
+    if has("Cargo.toml") {
+        return vec![
+            WorkCheck {
+                label: owned("cargo build"),
+                kind: "build",
+                cmd: owned("cargo build --quiet"),
+            },
+            WorkCheck {
+                label: owned("cargo test"),
+                kind: "test",
+                cmd: owned("cargo test --quiet"),
+            },
+            WorkCheck {
+                label: owned("cargo clippy"),
+                kind: "lint",
+                cmd: owned("cargo clippy --quiet -- -D warnings"),
+            },
+        ];
+    }
+    if has("package.json") {
+        let pm = if has("pnpm-lock.yaml") {
+            "pnpm"
+        } else if has("yarn.lock") {
+            "yarn"
+        } else {
+            "npm"
+        };
+        let scripts = package_json_scripts(cwd);
+        let has_script = |s: &str| scripts.iter().any(|x| x == s);
+        let mut checks = Vec::new();
+        if has_script("typecheck") {
+            checks.push(WorkCheck {
+                label: owned("typecheck"),
+                kind: "build",
+                cmd: format!("{pm} run typecheck"),
+            });
+        }
+        if has_script("build") {
+            checks.push(WorkCheck {
+                label: owned("build"),
+                kind: "build",
+                cmd: format!("{pm} run build"),
+            });
+        }
+        if has_script("test") {
+            checks.push(WorkCheck {
+                label: owned("test"),
+                kind: "test",
+                cmd: format!("{pm} test"),
+            });
+        }
+        if has_script("lint") {
+            checks.push(WorkCheck {
+                label: owned("lint"),
+                kind: "lint",
+                cmd: format!("{pm} run lint"),
+            });
+        }
+        return checks;
+    }
+    if has("go.mod") {
+        return vec![
+            WorkCheck {
+                label: owned("go build"),
+                kind: "build",
+                cmd: owned("go build ./..."),
+            },
+            WorkCheck {
+                label: owned("go test"),
+                kind: "test",
+                cmd: owned("go test ./..."),
+            },
+            WorkCheck {
+                label: owned("go vet"),
+                kind: "lint",
+                cmd: owned("go vet ./..."),
+            },
+        ];
+    }
+    if has("pyproject.toml")
+        || has("setup.py")
+        || has("setup.cfg")
+        || has("requirements.txt")
+        || has("tox.ini")
+    {
+        return vec![
+            WorkCheck {
+                label: owned("pytest"),
+                kind: "test",
+                cmd: owned("python -m pytest -q"),
+            },
+            WorkCheck {
+                label: owned("ruff"),
+                kind: "lint",
+                cmd: owned("ruff check ."),
+            },
+        ];
+    }
+    Vec::new()
+}
+
+// A non-zero exit that means "the checker itself isn't installed" — reported as
+// skipped, not failed, so a missing linter never masquerades as a real problem.
+fn check_tool_missing(output: &str, code: Option<i32>) -> bool {
+    let l = output.to_lowercase();
+    code == Some(127)
+        || l.contains("command not found")
+        || l.contains(": not found")
+        || l.contains("is not recognized as an internal or external command")
+        || l.contains("no such command")
+        || l.contains("no module named pytest")
+}
+
+fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
+    let checks = if let Some(cmd) = input["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        vec![WorkCheck {
+            label: cmd.to_string(),
+            kind: "custom",
+            cmd: cmd.to_string(),
+        }]
+    } else {
+        let only = input["only"].as_str().unwrap_or("").trim();
+        let mut checks = detect_checks(cwd);
+        if !only.is_empty() {
+            checks.retain(|c| c.kind == only);
+        }
+        checks
+    };
+
+    if checks.is_empty() {
+        return ok(
+            "check_work: no build/test/lint commands detected for this project. \
+             Pass `command` to run a specific check, or run the project's checks with run_command.",
+        );
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut any_fail = false;
+    let mut ran = 0usize;
+    for c in &checks {
+        let cap = match run_with_timeout(shell_command(&c.cmd, cwd), None, CHECK_TIMEOUT) {
+            Ok(cap) => cap,
+            Err(e) => {
+                any_fail = true;
+                sections.push(format!("✗ {} — could not run: {e} (`{}`)", c.label, c.cmd));
+                continue;
+            }
+        };
+        let combined = format!("{}\n{}", cap.stdout, cap.stderr);
+        if cap.timed_out {
+            any_fail = true;
+            sections.push(format!(
+                "✗ {} — timed out after {}s (`{}`)",
+                c.label,
+                CHECK_TIMEOUT.as_secs(),
+                c.cmd
+            ));
+        } else if check_tool_missing(&combined, cap.code) {
+            sections.push(format!(
+                "– {} — skipped (checker not installed: `{}`)",
+                c.label, c.cmd
+            ));
+        } else if cap.code == Some(0) {
+            ran += 1;
+            sections.push(format!("✓ {} passed (`{}`)", c.label, c.cmd));
+        } else {
+            ran += 1;
+            any_fail = true;
+            let tail = truncate_head_tail(combined.trim().to_string(), 1500);
+            sections.push(format!(
+                "✗ {} FAILED (exit {}, `{}`)\n{}",
+                c.label,
+                cap.code.unwrap_or(-1),
+                c.cmd,
+                tail
+            ));
+        }
+    }
+
+    let header = if any_fail {
+        "check_work: FAILED — fix what's below and run check_work again."
+    } else if ran == 0 {
+        "check_work: nothing ran (every checker was missing)."
+    } else {
+        "check_work: all checks passed."
+    };
+    Outcome {
+        content: truncate_head_tail(format!("{header}\n\n{}", sections.join("\n\n")), MAX_OUT),
+        is_error: any_fail,
+        finished: false,
+    }
+}
+
 // UTC calendar conversion (Howard Hinnant's civil-from-days) so kb_record can
 // stamp real timestamps without pulling in a date dependency.
 fn iso8601_utc(secs: u64) -> String {
@@ -3746,6 +3996,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let report = verifier.verify(&ctx);
             ok(crate::verifier::Verifier::format_report(&report))
         }
+        "check_work" => run_check_work(input, cwd),
         "mcp_call" => {
             let server = input["server"].as_str().unwrap_or("");
             let tool = input["tool"].as_str().unwrap_or("");
@@ -6298,6 +6549,66 @@ print("hello " + data.get("name", "world"))
         let r = run("read_file", &json!({"path": "nope.txt"}), &d);
         assert!(r.is_error);
         assert!(r.content.contains("do not invent another path"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    // ── check_work ──────────────────────────────────────────────────────────
+    #[test]
+    fn check_work_detects_ecosystems() {
+        let d = tempdir();
+        // Empty dir → nothing detected.
+        assert!(detect_checks(&d).is_empty());
+
+        // Cargo project → build/test/lint.
+        fs::write(d.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let kinds: Vec<_> = detect_checks(&d).into_iter().map(|c| c.kind).collect();
+        assert_eq!(kinds, vec!["build", "test", "lint"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn check_work_npm_uses_declared_scripts_and_lockfile() {
+        let d = tempdir();
+        fs::write(
+            d.join("package.json"),
+            r#"{"scripts":{"build":"tsc","test":"vitest"}}"#,
+        )
+        .unwrap();
+        fs::write(d.join("pnpm-lock.yaml"), "").unwrap();
+        let checks = detect_checks(&d);
+        // Only declared scripts appear, run through the detected package manager.
+        assert!(checks.iter().any(|c| c.cmd == "pnpm run build"));
+        assert!(checks.iter().any(|c| c.cmd == "pnpm test"));
+        assert!(!checks.iter().any(|c| c.kind == "lint")); // no lint script declared
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn check_work_reports_pass_fail_and_missing() {
+        let d = tempdir();
+        // A custom command that passes.
+        let ok = run("check_work", &json!({"command": "true"}), &d);
+        assert!(!ok.is_error, "{}", ok.content);
+        assert!(ok.content.contains("all checks passed"));
+
+        // A custom command that fails surfaces as an error with the exit code.
+        let bad = run("check_work", &json!({"command": "exit 3"}), &d);
+        assert!(bad.is_error);
+        assert!(bad.content.contains("FAILED"));
+
+        // A missing checker is reported as skipped, never a failure.
+        let missing = run(
+            "check_work",
+            &json!({"command": "this-tool-does-not-exist-xyz"}),
+            &d,
+        );
+        assert!(!missing.is_error, "{}", missing.content);
+        assert!(missing.content.contains("skipped"));
+
+        // Nothing to detect → a helpful, non-error message.
+        let none = run("check_work", &json!({}), &d);
+        assert!(!none.is_error);
+        assert!(none.content.contains("no build/test/lint"));
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -4,7 +4,40 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.7] - Unreleased
+## [0.12.8] - Unreleased
+
+### Changed
+- **bwn has a personality now — it's a partner, not a job title.** In PLAN
+  mode a casual aside like "do you know any jokes?" used to get a stiff,
+  robotic refusal ("I am a planning engineer and I don't have the ability to
+  tell jokes"). A shared voice is now injected ahead of every mode — build,
+  plan, brainstorm, chat — establishing bwn as a coding *partner* (it builds
+  autonomously, brainstorms, or plans *with* you), plain-spoken and dry, that
+  answers a greeting or a joke like a person would before getting back to
+  work. The old "planning engineer" / "senior software engineer" job-title
+  framing is gone. Wit stays in the conversation and out of error paths.
+- **PLAN mode no longer forces a plan onto non-tasks.** A greeting, a joke,
+  an identity question, or a creative aside gets a short natural reply instead
+  of being pushed through the plan-or-refuse machinery; only concrete
+  workspace tasks are decomposed into steps.
+
+### Added
+- **`check_work` — a one-call "does my change actually work?" button.** It
+  auto-detects the project (Cargo, npm/pnpm/yarn, Python, Go) and runs its
+  build, tests, and linter, returning a concise pass/fail report. A missing
+  linter is reported as skipped, never a false failure. BUILD mode is now told
+  to check its work before finishing, and never to claim a check passed that
+  it didn't run.
+
+### Fixed
+- **A long BUILD turn lands gracefully instead of erroring at the step
+  budget.** Reaching the per-turn step limit used to surface a raw
+  "reached the 30-step limit without finishing" error. The budget is larger
+  now, a wrap-up nudge fires one step before it runs out, and if the work is
+  still going it ends with an honest summary of what got done and the exact
+  next step — never a scary error for simply doing a lot.
+
+## [0.12.7] - 2026-07-21
 
 ### Changed
 - **The thinking stream renders markdown as formatted text.** Headings,
@@ -24,7 +57,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   region is now re-asserted whenever the reserved-row count changes, and the
   queued-composer row paints as one atomic frame.
 
-## [0.12.6] - Unreleased
+## [0.12.6] - 2026-07-18
 
 ### Added
 - **A killed TUI restores your terminal.** SIGTERM, SIGHUP, SIGINT, and
