@@ -19,7 +19,11 @@ use crate::tools;
 use crate::trace;
 use crate::tui;
 
-const MAX_ITERS: usize = 30;
+// Step budget for a single BUILD turn. Generous, because complex agentic work
+// legitimately needs many round-trips; and hitting it is never surfaced as a
+// raw error — the turn lands gracefully with an honest summary (see the tail of
+// run_agent). A wrap-up nudge fires one step before the budget runs out.
+const MAX_ITERS: usize = 60;
 const MAX_DEPTH: usize = 3;
 const KEEP_RECENT: usize = 6;
 const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
@@ -1254,8 +1258,8 @@ pub struct Role {
 
 pub fn role(id: &str) -> Role {
     let system = match id {
-        "researcher" => "You are a meticulous research engineer. Investigate the codebase with the read and list tools before drawing conclusions. Cite file paths. Do not modify files unless explicitly asked.",
-        _ => "You are an autonomous senior software engineer. \
+        "researcher" => "You are bwn in research mode: investigate before you conclude. Use the read and list tools to inspect the codebase, cite file paths, and don't modify files unless explicitly asked.",
+        _ => "You are bwn in BUILD mode: a coding partner who ships the work, not a title. \
 Use the tools to inspect and modify the project directly. \
 Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
@@ -1264,6 +1268,9 @@ When asked to build or create something, call tools to create the files on disk 
 For local web apps that require a dev server, use start_server, wait_for_url, inspect read_server_log if readiness fails, then open_browser when useful. \
 If a path or file is missing, use discovery tools before asking the user. \
 DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
+Check your own work before you call it done: after a code change, run the project's tests/build/lint — \
+use check_work (it auto-detects and runs them) or run_command — read what fails, and fix it before finishing. \
+Don't claim something passes that you didn't run.\n\
 When the task is complete, call the finish tool with a one-paragraph summary.\n\n\
 IMPORTANT — tool discipline:\n\
 • Before using run_command to install anything (npm install, pip install, cargo add, brew install, \
@@ -1293,12 +1300,36 @@ fn artifact_guidance(task: &str) -> Option<String> {
     })
 }
 
+// Shared identity + voice, injected ahead of every mode's contract so the
+// personality is consistent whether the model is building, planning, or just
+// chatting. bwn is a partner, not a job title — and a stiff canned refusal is a
+// bug, not a personality. Voice rules mirror IDENTITY.md: dry and quick, wit in
+// chat but never in error paths, lowercase bwn.
+fn persona() -> String {
+    "[Who you are]\n\
+     You are buildwithnexus — bwn for short — an AI coding partner that lives in the terminal. \
+     Not a form to fill out, not a job title, not an assistant waiting for orders: a partner. \
+     Depending on the mode you build the work autonomously, brainstorm it, or work out a plan together — \
+     three ways of pairing, not three different personalities.\n\
+     Voice: plain-spoken, direct, a little dry. Quick and occasionally funny when it fits, never goofy, \
+     never corporate, never padded with filler. Bias toward doing the work over describing it.\n\
+     Handle people like a person would. If someone says hi, cracks a joke, or asks something off-task, \
+     answer briefly and in character, then get back to it — don't force it into a task, a file, or a plan. \
+     Canned refusals like \"I am a planning engineer and I cannot…\" or \"I am not able to tell jokes\" are a \
+     bug: you can hold a normal conversation. Keep the wit in the room and out of error paths — when \
+     something actually fails, be clear and useful, not cute, and punch at the problem, not the user."
+        .to_string()
+}
+
 // Build the system prompt prefix from memory and skills/agents files.
 // When context_tokens is small (≤16K), skip expensive sections to leave
 // room for tool definitions + actual conversation.
 fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
     let compact = context_tokens <= 16_384;
     let mut parts: Vec<String> = Vec::new();
+
+    // Identity leads every prompt — it is short and always worth the tokens.
+    parts.push(persona());
 
     let home_str = std::env::var("HOME").unwrap_or_default();
     let mut path_info = format!(
@@ -2307,10 +2338,32 @@ fn build_inner(
         } else if let Some(nudge) = loop_nudge {
             msgs.push(Msg::User(nudge));
         }
+        // One step before the budget runs out, tell the model to wrap up so the
+        // final iteration lands a real result instead of being cut mid-thought.
+        if step + 1 == MAX_ITERS {
+            msgs.push(Msg::User(
+                "You're almost out of step budget for this turn. Wrap up now: finish the smallest \
+                 coherent piece you can, then call finish with a summary of what you did and the \
+                 exact next step. Don't start anything large."
+                    .into(),
+            ));
+        }
     }
-    Err(format!(
-        "reached the {MAX_ITERS}-step limit without finishing"
-    ))
+    // Ran out of step budget without a finish call. This must never surface as a
+    // raw \"hit the limit\" error — land the turn gracefully with an honest
+    // summary of where things stand, returned as a normal reply.
+    msgs.push(Msg::User(
+        "That's the end of the step budget for this turn — stop calling tools now. In a few plain \
+         sentences (no tool calls), tell me what you got done, what's still left, and the exact next \
+         step to pick up. Be honest about anything unverified."
+            .into(),
+    ));
+    match request_reply(p, msgs.as_slice(), &defs, "wrapping up") {
+        Ok(r) if !r.text.trim().is_empty() => Ok(r.text),
+        // Even if the wrap-up call fails or comes back empty, don't hand the user
+        // a scary error for simply doing a lot of work — end the turn cleanly.
+        _ => Ok(String::new()),
+    }
 }
 
 // Feedback for a tool call whose arguments failed to parse: name the tool,
@@ -2873,6 +2926,15 @@ fn task_references_workspace(task: &str) -> bool {
     })
 }
 
+// A message is "plannable" when it's a concrete build/change request aimed at
+// the workspace — the only thing PLAN mode should decompose into steps. A
+// greeting, a joke, an identity/meta question, or a creative aside ("write a
+// poem") is not: those get a natural in-character reply, not a forced plan.
+// Reuses the same imperative + workspace-evidence signals as the act-nudge.
+fn task_is_plannable(task: &str) -> bool {
+    task_is_imperative(task) && task_references_workspace(task)
+}
+
 // Fix 14 decision: nudge the model to act instead of explaining. Fires only
 // for imperative tasks that reference the workspace (a file, path, project,
 // bug, …), only before any mutating tool has run this session, and only while
@@ -2927,12 +2989,11 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
-        "You are a planning engineer with full access to the codebase. \
-        Use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect the project as needed. \
+        "You are bwn in PLAN mode: a coding partner working out an implementation plan with the user. \
+        You have full read access to the codebase — use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect it as needed. \
         Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
-        When ready, call exit_plan or ExitPlanMode with a concise numbered implementation plan. \
-        The plan must be concrete, actionable, and at most 8 steps. \
-        Do not include code fences, shell snippets, intro text, or outro text.\n\n{prefix}"
+        When the user has given you a real task to plan, call exit_plan or ExitPlanMode with a concise numbered implementation plan — concrete, actionable, at most 8 steps, no code fences, no shell snippets, no intro or outro prose. \
+        But not every message is a task. If the user just greets you, jokes around, asks who you are or what you can do, or makes small talk, don't force a plan and don't recite a capability disclaimer — reply in a line or two, naturally and in character, then offer to plan the real work if there is any.\n\n{prefix}"
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
@@ -2956,6 +3017,15 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
 
         if reply.calls.is_empty() {
             let candidate_steps = parse_plan_steps(&reply.text);
+            // Non-plannable input — a greeting, a joke, "who are you", small talk.
+            // The model answered naturally instead of planning, and that reply has
+            // already streamed to the user. Accept it and end the turn. Forcing a
+            // plan or a canned refusal here is exactly the personality failure we
+            // want gone. (A real task with junk output still falls through to the
+            // recovery path below, because task_is_plannable stays true for it.)
+            if !plan_steps_are_actionable(&candidate_steps) && !task_is_plannable(task) {
+                return Ok(());
+            }
             if !plan_steps_are_actionable(&candidate_steps) && plan_format_recovery_count < 2 {
                 plan_format_recovery_count += 1;
                 msgs.push(Msg::Assistant {
@@ -3657,8 +3727,17 @@ mod tests {
     #[test]
     fn role_selection() {
         assert!(role("researcher").system.contains("research"));
-        assert!(role("engineer").system.contains("software engineer"));
-        assert!(role("ceo").system.contains("software engineer"));
+        // The default role is a coding partner in BUILD mode — no job title.
+        assert!(role("engineer").system.contains("BUILD mode"));
+        assert!(role("ceo").system.contains("BUILD mode"));
+        // Personality guardrail: bwn never introduces itself with a job title.
+        for id in ["engineer", "researcher", "ceo"] {
+            let sys = role(id).system.to_lowercase();
+            assert!(
+                !sys.contains("software engineer") && !sys.contains("full stack"),
+                "role {id} should not carry a job title"
+            );
+        }
     }
 
     #[test]
@@ -4566,6 +4645,34 @@ mod tests {
                 should_nudge_to_act(task, prose, false, false, 0),
                 "workspace task must nudge: {task}"
             );
+        }
+    }
+
+    #[test]
+    fn plan_mode_only_plans_real_workspace_tasks() {
+        // Casual / off-task input is NOT plannable — PLAN mode should answer it
+        // naturally instead of forcing a plan or a robotic refusal.
+        for task in [
+            "do you know any jokes?",
+            "hi",
+            "who are you?",
+            "what can you do?",
+            "how are you today",
+            "tell me a joke",
+            "write a poem about pirates",
+            "thanks!",
+        ] {
+            assert!(!task_is_plannable(task), "should not be plannable: {task}");
+        }
+        // Concrete build/change requests aimed at the workspace ARE plannable.
+        for task in [
+            "add rate limiting to the api",
+            "fix the collision bug in the game",
+            "refactor the parser module",
+            "convert the config file to toml",
+            "add tests for the auth code",
+        ] {
+            assert!(task_is_plannable(task), "should be plannable: {task}");
         }
     }
 }
