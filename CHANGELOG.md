@@ -4,6 +4,26 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.7] - Unreleased
+
+### Changed
+- **The thinking stream renders markdown as formatted text.** Headings,
+  `**bold**`, `*italic*`, `` `code` ``, bullets, and quotes in the model's
+  reasoning showed their raw markers; they now render as real styling, kept
+  in the muted thinking palette so reasoning stays visually quiet. Lines are
+  buffered to their newline before rendering, so a half-streamed span never
+  flashes as raw text.
+
+### Fixed
+- **No more whole-screen flashes, and the queued-prompt bar always shows.**
+  The terminal's scroll region is sized from the reserved rows, which grow
+  when you queue a prompt — but it was only re-applied on launch and resize,
+  never when a prompt was queued mid-stream. The stale region let streaming
+  output scroll over the queued-composer row (it would vanish, notably on
+  Ghostty) and occasionally scroll the whole screen (a visible flash). The
+  region is now re-asserted whenever the reserved-row count changes, and the
+  queued-composer row paints as one atomic frame.
+
 ## [0.12.6] - Unreleased
 
 ### Added

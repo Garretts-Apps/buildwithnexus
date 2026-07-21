@@ -554,8 +554,11 @@ fn is_placeholder_path(path: &str) -> bool {
 
 #[derive(Default)]
 struct ThinkingStream {
-    active: bool,
     step: usize,
+    // Current line, buffered until its newline so markdown renders whole —
+    // a half-streamed span like `**bo` can't be rendered, and re-rendering a
+    // partial line already on screen would mean erase-and-repaint (flicker).
+    line: String,
 }
 
 impl ThinkingStream {
@@ -564,42 +567,38 @@ impl ThinkingStream {
             return;
         }
         tui::poll_typeahead();
-        let mut rest = chunk.replace('\r', "");
-        if rest.is_empty() {
+        for ch in chunk.chars() {
+            match ch {
+                '\r' => {}
+                '\n' => self.flush_line(),
+                _ => self.line.push(ch),
+            }
+        }
+    }
+
+    // Emit one completed thinking line as a single write: spinner + rendered
+    // markdown + newline. Writing whole lines (never mid-line cursor moves)
+    // keeps the stream from repainting rows the user is already reading.
+    fn flush_line(&mut self) {
+        let content = self.line.trim_end().to_string();
+        self.line.clear();
+        if content.is_empty() {
             return;
         }
-        while let Some(nl) = rest.find('\n') {
-            let part = rest[..nl].trim_end();
-            if !part.is_empty() || self.active {
-                self.start();
-                tui::write_stream(&tui::dim(part));
-                tui::write_stream("\n");
-                self.active = false;
-            }
-            rest = rest[nl + 1..].to_string();
-        }
-        if !rest.is_empty() {
-            self.start();
-            tui::write_stream(&tui::dim(&rest));
-        }
+        let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let s = spinners[self.step % spinners.len()];
+        self.step += 1;
+        tui::write_stream(&format!(
+            "  {} {} {}\n",
+            tui::cyan(s),
+            tui::dim("thinking ›"),
+            tui::render_md_dim_line(&content)
+        ));
     }
 
     fn finish(&mut self) {
-        if self.active {
-            tui::write_stream("\n");
-            self.active = false;
-        }
+        self.flush_line();
         tui::render_queued_composer();
-    }
-
-    fn start(&mut self) {
-        if !self.active {
-            let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let s = spinners[self.step % spinners.len()];
-            self.step += 1;
-            tui::write_stream(&format!("  {} {} ", tui::cyan(s), tui::dim("thinking ›")));
-            self.active = true;
-        }
     }
 }
 

@@ -5,7 +5,7 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -1138,9 +1138,16 @@ pub fn render_queued_composer() {
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    // The queued rows live just above the composer, inside the reserved area —
+    // make sure the scroll region already excludes them so they can't be
+    // scrolled away between now and the next stream frame.
+    ensure_output_region();
     if let Ok(ta) = typeahead().lock() {
         if let Ok(mq) = message_queue().lock() {
             let mut out = io::stdout();
+            // One atomic frame (DEC 2026): the queued rows paint together with
+            // no intermediate state a fast terminal could show mid-repaint.
+            let _ = write!(out, "\x1b[?2026h");
             let c_top = composer_top();
             let q_len = mq.len() as u16;
             for (i, msg) in mq.iter().enumerate() {
@@ -1155,6 +1162,7 @@ pub fn render_queued_composer() {
                     dim("(Ctrl+Q edit, Ctrl+X rm)")
                 );
             }
+            let _ = write!(out, "\x1b[?2026l");
             let _ = out.flush();
         }
         let mut scroll = 0usize;
@@ -1447,6 +1455,98 @@ pub fn render_md_line(s: &str) -> String {
 /// never shown raw. All other lines go through [`render_md_line`], so
 /// headings, lists, quotes, links and inline styles render consistently
 /// whether text arrives streamed or as a complete reply.
+// Inline markdown for subdued/meta text (the thinking stream): renders
+// **bold**, *italic*, and `code` as real styling while keeping the whole line
+// muted. It relies on bold()/italic()/underline() using attribute-only resets
+// (22/23/24) that never touch the foreground color, so the MUTED base set by
+// the caller's paint() survives across every styled span — no color flashes
+// back to bright mid-line.
+fn format_inline_md_dim(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '`' {
+            if let Some(rel) = chars[i + 1..].iter().position(|&x| x == '`') {
+                let code: String = chars[i + 1..i + 1 + rel].iter().collect();
+                // Underline (not a color) marks code so the line stays muted.
+                out.push_str(&underline(&code));
+                i += rel + 2;
+                continue;
+            }
+        }
+        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
+            if let Some(rel) = find_closer(&chars, i + 2, "**") {
+                let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
+                out.push_str(&bold(&format_inline_md_dim(&inner)));
+                i += 2 + rel + 2;
+                continue;
+            }
+        }
+        if c == '*' {
+            if let Some(rel) = find_closer(&chars, i + 1, "*") {
+                let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
+                out.push_str(&italic(&inner));
+                i += 1 + rel + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+// Index (relative to `from`) of the next `marker` that closes a span: it must
+// exist and not open on whitespace. Returns None if the span never closes, so
+// an unmatched `*` stays literal.
+fn find_closer(chars: &[char], from: usize, marker: &str) -> Option<usize> {
+    let m: Vec<char> = marker.chars().collect();
+    if from >= chars.len() || chars[from].is_whitespace() {
+        return None;
+    }
+    let mut j = from;
+    while j + m.len() <= chars.len() {
+        if chars[j..j + m.len()] == m[..] && j > from && !chars[j - 1].is_whitespace() {
+            return Some(j - from);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// One line of thinking-stream markdown: block markers (headings, list
+/// bullets, quotes) and inline styling become real formatting, all kept in the
+/// muted thinking palette so the reasoning stays visually quiet.
+pub fn render_md_dim_line(s: &str) -> String {
+    if no_color() {
+        return s.to_string();
+    }
+    let trimmed = s.trim_start();
+    let indent = &s[..s.len() - trimmed.len()];
+    let inner = if let Some(h) = trimmed
+        .strip_prefix("### ")
+        .or_else(|| trimmed.strip_prefix("## "))
+        .or_else(|| trimmed.strip_prefix("# "))
+    {
+        bold(&format_inline_md_dim(h))
+    } else if let Some(q) = trimmed.strip_prefix("> ") {
+        format!("│ {}", italic(&format_inline_md_dim(q)))
+    } else if let Some(b) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        format!("• {}", format_inline_md_dim(b))
+    } else {
+        format_inline_md_dim(trimmed)
+    };
+    // Paint the whole assembled line MUTED once; the attribute toggles inside
+    // never reset the color, so it stays dim end to end.
+    paint(MUTED, &format!("{indent}{inner}"))
+}
+
 pub fn render_md(text: &str) -> String {
     let w = term_size().0 as usize;
     let mut out: Vec<String> = Vec::new();
@@ -1561,18 +1661,42 @@ fn prompt_width(prompt: &str) -> u16 {
     str_width(&strip_ansi(prompt)).min(u16::MAX as usize) as u16
 }
 
+// Last DECSTBM bottom row we told the terminal about. reserved_rows() grows
+// when a prompt is queued, so the scroll region must shrink to match — else
+// streaming output scrolls over (or scrolls away) the queued-composer row and
+// can scroll the whole screen (a visible flash). 0 = no region set.
+static LAST_REGION_BOTTOM: AtomicU16 = AtomicU16::new(0);
+
 fn set_output_region() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
     let (_, h) = term_size();
     let bottom = h.saturating_sub(reserved_rows()).max(1);
+    LAST_REGION_BOTTOM.store(bottom, Ordering::Relaxed);
     print!("\x1b[1;{bottom}r\x1b[1;1H");
     flush();
 }
 
+// Re-assert the scroll region only when the reserved-row count changed (a
+// queued prompt appeared/cleared, or the terminal resized). Cheap on the hot
+// path — no write when nothing moved — and unlike set_output_region it never
+// homes the cursor, so it's safe to call every frame.
+fn ensure_output_region() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let (_, h) = term_size();
+    let bottom = h.saturating_sub(reserved_rows()).max(1);
+    if LAST_REGION_BOTTOM.swap(bottom, Ordering::Relaxed) != bottom {
+        print!("\x1b[1;{bottom}r");
+        flush();
+    }
+}
+
 fn reset_output_region() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
+        LAST_REGION_BOTTOM.store(0, Ordering::Relaxed);
         print!("\x1b[r");
         flush();
     }
@@ -1772,6 +1896,9 @@ fn render_output() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    // Keep the scroll region matched to the current reserved rows before we
+    // repaint — a just-queued prompt must not be scrolled over.
+    ensure_output_region();
     let (width, height) = term_size();
     let width = width as usize;
     let rows = height.saturating_sub(reserved_rows()) as usize;
@@ -4520,6 +4647,32 @@ mod tests {
         assert_eq!(plain(&format_inline_md("a *word* b")), "a word b");
         assert_eq!(plain(&format_inline_md("a **bold** c")), "a bold c");
         assert_eq!(plain(&format_inline_md("use `code` here")), "use code here");
+    }
+
+    #[test]
+    fn render_md_dim_line_formats_markers_and_stays_muted() {
+        // Markers are consumed — no raw ** or # or ` reaches the screen.
+        assert_eq!(
+            plain(&render_md_dim_line("a **bold** and `code`")),
+            "a bold and code"
+        );
+        assert_eq!(plain(&render_md_dim_line("## a heading")), "a heading");
+        assert_eq!(plain(&render_md_dim_line("- a bullet")), "• a bullet");
+        assert_eq!(plain(&render_md_dim_line("> a quote")), "│ a quote");
+
+        // Bold is emitted as an attribute toggle (1…22), and the foreground
+        // never flips to the bright TEXT color mid-line — the whole line stays
+        // in the muted thinking palette.
+        let out = render_md_dim_line("plain **bold** plain");
+        assert!(out.contains("\x1b[1m"), "bold attribute present: {out:?}");
+        let text_fg = format!("38;2;{};{};{}", TEXT.0, TEXT.1, TEXT.2);
+        assert!(
+            !out.contains(&text_fg),
+            "dim line must never switch to bright TEXT fg: {out:?}"
+        );
+
+        // An unbalanced marker stays literal instead of eating the rest.
+        assert_eq!(plain(&render_md_dim_line("2 * 3 = 6")), "2 * 3 = 6");
     }
 
     #[test]
