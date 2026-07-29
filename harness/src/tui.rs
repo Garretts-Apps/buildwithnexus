@@ -1707,9 +1707,9 @@ fn clear_composer() {
         return;
     }
     let mut out = io::stdout();
-    for row in composer_top()..=composer_bottom() {
-        let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
-    }
+    queue_composer_box(&mut out);
+    let _ = write!(out, "{}", dim("bwn is working… (Esc to interrupt)"));
+    queue_composer_right_border(&mut out);
     let _ = out.flush();
 }
 
