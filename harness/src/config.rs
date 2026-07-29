@@ -333,6 +333,24 @@ pub fn load_agents() -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
+/// Load custom user system prompt from project-local `.buildwithnexus/system.md`
+/// or global `~/.buildwithnexus/system.md`.
+pub fn load_system_prompt() -> Option<String> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let proj = cwd.join(".buildwithnexus").join("system.md");
+        if let Ok(t) = fs::read_to_string(&proj) {
+            if !t.trim().is_empty() {
+                return Some(t.trim().to_string());
+            }
+        }
+    }
+    let global = home().join("system.md");
+    fs::read_to_string(&global)
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| t.trim().to_string())
+}
+
 // Returns (name, content) pairs for all skill files.
 pub fn load_skills() -> Vec<(String, String)> {
     let mut out = Vec::new();

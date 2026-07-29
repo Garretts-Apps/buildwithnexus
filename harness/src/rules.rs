@@ -250,6 +250,16 @@ impl RuleEngine {
             enabled: true,
         });
 
+        engine.add_rule(Rule {
+            id: "artifact_quality_check".to_string(),
+            description: "Generated web artifacts must enforce quality design and real physics".to_string(),
+            severity: Severity::Medium,
+            applies_when: vec![Condition::FileMatches(".*\\.html$".to_string())],
+            requires: vec!["responsive_controls".to_string(), "real_physics".to_string()],
+            message: "HTML artifact generated without responsive controls or complete interactive logic.".to_string(),
+            enabled: true,
+        });
+
         engine
     }
 

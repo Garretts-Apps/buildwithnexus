@@ -1265,6 +1265,7 @@ Prefer small, verifiable edits. Read before you write. \
 When writing or editing files, provide the complete, fully working code. NEVER use placeholders (e.g. `// ... rest of code`). \
 BUILD mode means execute: for any concrete build/fix/create/change request, inspect the project and make the needed edits instead of replying with a capability statement. \
 When asked to build or create something, call tools to create the files on disk (write_file, edit_file, run_command) instead of pasting instructions or code blocks in chat — you are the builder. \
+For web applications, games, or interactive artifacts: NEVER create primitive placeholder dots or fake physics when actual mechanics/physics are requested. Use real, frame-rate independent physics (exponential dt-decay for friction), curated dark-mode color palettes, modern typography, glassmorphism, responsive canvas scaling, and complete touch/keyboard controls. \
 For local web apps that require a dev server, use start_server, wait_for_url, inspect read_server_log if readiness fails, then open_browser when useful. \
 If a path or file is missing, use discovery tools before asking the user. \
 DO NOT ask the user for permission, themes, or choices unless absolutely necessary. If the user leaves something open-ended (e.g. 'pick a theme' or 'make it cool'), MAKE A REASONABLE DECISION and proceed immediately. \
@@ -1390,6 +1391,10 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
             agents
         };
         parts.push(format!("[Agent knowledge — Agents.md]\n{agents_text}"));
+    }
+
+    if let Some(sys_prompt) = config::load_system_prompt() {
+        parts.push(format!("[Custom User System Prompt — system.md]\n{sys_prompt}"));
     }
 
     // Skip rules, knowledge, hooks, and skill descriptions for small contexts
@@ -2451,6 +2456,9 @@ fn spawn_subagent(
             Ok(r) => (r, false),
             Err(e) => (format!("subagent error: {e}"), true),
         };
+    if isolate {
+        cleanup_worktree(cwd, &run_cwd);
+    }
     trace::record_visible(
         "subagent_done",
         format!("{role}: {}", trace::preview(task, 80)),
@@ -2478,6 +2486,14 @@ fn make_worktree(cwd: &Path) -> Option<PathBuf> {
         .output()
         .ok()?;
     out.status.success().then_some(wt)
+}
+
+fn cleanup_worktree(cwd: &Path, wt: &Path) {
+    let _ = Command::new("git")
+        .current_dir(cwd)
+        .args(["worktree", "remove", "--force"])
+        .arg(wt)
+        .output();
 }
 
 fn parse_plan_steps(plan_text: &str) -> Vec<String> {
