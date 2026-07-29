@@ -2549,6 +2549,11 @@ fn run_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {
+                if crate::tui::interrupted() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("command interrupted by user".to_string());
+                }
                 if std::time::Instant::now() >= deadline {
                     timed_out = true;
                     let _ = child.kill();

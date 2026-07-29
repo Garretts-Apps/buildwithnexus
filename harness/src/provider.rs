@@ -538,6 +538,9 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<()
                     crate::tui::poll_typeahead();
                     last_poll = Instant::now();
                 }
+                if crate::tui::interrupted() {
+                    return Err("interrupted".to_string());
+                }
                 if let Some(payload) = line.strip_prefix("data:") {
                     if f(payload.trim()) {
                         return Ok(());
