@@ -4,6 +4,17 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.12] - 2026-07-29
+
+### Fixed & Enhanced
+- **In-Place Menu Rendering (`/model`, `/mode`, `/permissions`):**
+  TUI selection menus now update in-place using cursor movement, eliminating duplicated
+  lists when navigating with Up/Down arrow keys. Upon selection, menus clear cleanly into a single confirmation line.
+- **Auto `llama-server` Background Launcher:**
+  Selecting a local GGUF model automatically checks ports 8080/1234/11434/8000. If no server is running, it finds `llama-server` on the host machine and launches it automatically in the background.
+- **Cloud Provider Base URL Reset:**
+  Swapping between cloud model providers automatically resets `base_url` to the target provider's default API endpoint.
+
 ## [0.12.11] - 2026-07-29
 
 ### Added & Fixed
