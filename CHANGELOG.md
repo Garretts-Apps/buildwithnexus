@@ -4,7 +4,20 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.8] - Unreleased
+## [0.12.9] - 2026-07-29
+
+### Fixed
+- **Brainstorm mode no longer auto-switches to Build on greetings.** Saying
+  "hi" (or any short greeting) while in Brainstorm mode previously fell through
+  to `run_brainstorm`, where the LLM could emit `[SUGGEST:BUILD]` and trigger
+  a mode change. Simple conversational inputs are now detected before the
+  Brainstorm early-return and are handled by the lightweight chat loop
+  regardless of current mode.
+- **Sessions no longer start in Build mode.** The default mode is now
+  Brainstorm, so launching bwn and typing a casual message no longer kicks
+  off an agentic build run.
+
+## [0.12.8] - 2026-07-29
 
 ### Changed
 - **bwn has a personality now — it's a partner, not a job title.** In PLAN
