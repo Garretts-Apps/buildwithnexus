@@ -2972,7 +2972,15 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     let mut selected = 0usize;
     cursor_hide();
 
+    let box_height = (items.len() + 3) as u16;
+    let mut first_render = true;
+
     let result = loop {
+        if !first_render {
+            print!("\x1B[{}A", box_height);
+        }
+        first_render = false;
+
         line("");
         line(&accent(&format!(
             "  ┌── {title} ──────────────────────────────────────"
@@ -3031,9 +3039,11 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         };
 
         if action == "enter" {
+            print!("\x1B[{}A\x1B[0J", box_height);
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
             break Some(selected);
         } else if action == "cancel" {
+            print!("\x1B[{}A\x1B[0J", box_height);
             line(&dim("  cancelled selection"));
             break None;
         } else {

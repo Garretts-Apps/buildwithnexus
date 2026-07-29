@@ -39,6 +39,37 @@ pub fn scan_gguf() -> Vec<String> {
     found
 }
 
+// Absolute path to a specific GGUF file found in gguf_dirs.
+pub fn find_gguf_path(filename: &str) -> Option<PathBuf> {
+    for d in gguf_dirs() {
+        if let Some(found) = search_gguf_dir(&d, filename, 0) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn search_gguf_dir(dir: &Path, filename: &str, depth: usize) -> Option<PathBuf> {
+    if depth > 6 {
+        return None;
+    }
+    let rd = std::fs::read_dir(dir).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(found) = search_gguf_dir(&p, filename, depth + 1) {
+                return Some(found);
+            }
+        } else if p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy() == filename)
+        {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 6 {
         return;

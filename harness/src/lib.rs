@@ -1659,9 +1659,19 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
         "http://localhost:8000/v1",
     ];
     for url in candidates {
-        let probe = format!("{}/models", url.trim_end_matches('/'));
-        if ureq::get(&probe)
+        let root = url.trim_end_matches('/').trim_end_matches("/v1");
+        let probe = format!("{root}/v1/models");
+        if let Ok(res) = ureq::get(&probe)
             .timeout(std::time::Duration::from_millis(400))
+            .call()
+        {
+            if res.status() < 500 {
+                return Some(url.to_string());
+            }
+        }
+        let root_probe = format!("{root}/health");
+        if ureq::get(&root_probe)
+            .timeout(std::time::Duration::from_millis(300))
             .call()
             .is_ok()
         {
@@ -1669,6 +1679,70 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn find_llama_server_binary() -> Option<std::path::PathBuf> {
+    for path in [
+        "/opt/homebrew/bin/llama-server",
+        "/usr/local/bin/llama-server",
+        "/usr/bin/llama-server",
+    ] {
+        let p = std::path::PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("llama-server");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<String> {
+    if let Some(active_url) = find_active_local_base_url(preferred_url) {
+        return Some(active_url);
+    }
+    let server_bin = find_llama_server_binary()?;
+    let gguf_path = crate::local::find_gguf_path(model_name)?;
+
+    tui::line(&tui::accent(&format!(
+        "  ⟳ starting local llama-server for {model_name} on port 8080…"
+    )));
+
+    let spawn_res = std::process::Command::new(server_bin)
+        .arg("-m")
+        .arg(&gguf_path)
+        .arg("--port")
+        .arg("8080")
+        .arg("-c")
+        .arg("8192")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    if spawn_res.is_err() {
+        return None;
+    }
+
+    for _ in 0..25 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if ureq::get("http://localhost:8080/v1/models")
+            .timeout(std::time::Duration::from_millis(300))
+            .call()
+            .is_ok()
+        {
+            tui::line(&tui::green(
+                "  ✓ local llama-server is active at http://localhost:8080/v1",
+            ));
+            return Some("http://localhost:8080/v1".to_string());
+        }
+    }
+    Some("http://localhost:8080/v1".to_string())
 }
 
 /// Applies a model swap only after the target provider is actually usable:
@@ -1800,7 +1874,7 @@ fn swap_model(
 
     if preset.id == "llamacpp" || preset.id == "lmstudio" {
         let preferred = custom_url.as_deref().unwrap_or(preset.base_url);
-        if let Some(active_url) = find_active_local_base_url(preferred) {
+        if let Some(active_url) = ensure_local_gguf_server(preferred, &model) {
             custom_url = Some(active_url);
         } else {
             tui::line(&tui::yellow(&format!(
