@@ -1335,10 +1335,8 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
                     provider::Msg::UserImages { text, .. } => {
                         tui::line(&format!("{} {}", tui::accent("›"), text));
                     }
-                    provider::Msg::Assistant { text, .. } => {
-                        if !text.trim().is_empty() {
-                            tui::line(&tui::render_md(text));
-                        }
+                    provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
+                        tui::line(&tui::render_md(text));
                     }
                     _ => {}
                 }
