@@ -197,7 +197,22 @@ pub fn validate(p: &Provider) -> Result<(), String> {
         max_tokens: Some(1),
         ollama_ctx: std::sync::OnceLock::new(),
     };
-    complete(&probe, &[Msg::User("ping".into())], &[]).map(|_| ())
+    match complete(&probe, &[Msg::User("ping".into())], &[]) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if p.protocol == Protocol::OpenAi && (e.contains("404") || e.contains("not found")) =>
+        {
+            if p.model != "local-model" && p.base_url.contains("localhost") {
+                let mut fallback_probe = probe;
+                fallback_probe.model = "local-model".to_string();
+                if complete(&fallback_probe, &[Msg::User("ping".into())], &[]).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // Streams assistant text to `on_text` and thinking tokens (when available) to

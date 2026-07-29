@@ -1650,6 +1650,27 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
     (current_provider.to_string(), pick.to_string())
 }
 
+fn find_active_local_base_url(preferred: &str) -> Option<String> {
+    let candidates = [
+        preferred,
+        "http://localhost:8080/v1",
+        "http://localhost:1234/v1",
+        "http://localhost:11434/v1",
+        "http://localhost:8000/v1",
+    ];
+    for url in candidates {
+        let probe = format!("{}/models", url.trim_end_matches('/'));
+        if ureq::get(&probe)
+            .timeout(std::time::Duration::from_millis(400))
+            .call()
+            .is_ok()
+        {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 /// Applies a model swap only after the target provider is actually usable:
 /// walks the user through a missing API key (or a custom endpoint's URL),
 /// checks that a local server is reachable and has the model, and keeps the
@@ -1777,11 +1798,31 @@ fn swap_model(
         }
     }
 
-    // A custom base_url belongs to the provider it was set for.
-    if switching {
-        s.base_url = None;
+    if preset.id == "llamacpp" || preset.id == "lmstudio" {
+        let preferred = custom_url.as_deref().unwrap_or(preset.base_url);
+        if let Some(active_url) = find_active_local_base_url(preferred) {
+            custom_url = Some(active_url);
+        } else {
+            tui::line(&tui::yellow(&format!(
+                "  ✗ no local server running on ports 8080/1234/11434/8000 for '{model}'."
+            )));
+            tui::line(&tui::dim(
+                "    1. start llama.cpp server:  llama-server -m ~/.models/<model> --port 8080",
+            ));
+            tui::line(&tui::dim(
+                "    2. or start LM Studio local server on port 1234",
+            ));
+            tui::line(&tui::dim(
+                "    then re-run /model — keeping the current model.",
+            ));
+            return;
+        }
     }
-    if let Some(u) = custom_url {
+
+    // A custom base_url belongs to the provider it was set for.
+    if preset.id != "custom" && custom_url.is_none() {
+        s.base_url = None;
+    } else if let Some(u) = custom_url {
         s.base_url = Some(u);
     }
     s.provider = preset.id.to_string();
