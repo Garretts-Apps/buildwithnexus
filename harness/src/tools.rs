@@ -702,7 +702,7 @@ pub fn read_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathB
 
 pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
     match name {
-        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" => {
+        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" | "remove_path" => {
             path_arg(input).map(|p| resolve(cwd, p))
         }
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"

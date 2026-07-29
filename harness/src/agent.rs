@@ -1394,7 +1394,9 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
     }
 
     if let Some(sys_prompt) = config::load_system_prompt() {
-        parts.push(format!("[Custom User System Prompt — system.md]\n{sys_prompt}"));
+        parts.push(format!(
+            "[Custom User System Prompt — system.md]\n{sys_prompt}"
+        ));
     }
 
     // Skip rules, knowledge, hooks, and skill descriptions for small contexts
@@ -2140,7 +2142,7 @@ fn build_inner(
             if let Some(p) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
                 if p.exists() && !read_paths.contains(&p) {
                     let msg = format!(
-                        "read('{}') required before editing. Read the file first, then retry.",
+                        "read('{}') required before editing or deleting existing file. Read the file first, then retry.",
                         p.display()
                     );
                     report::tool_denied(&msg);

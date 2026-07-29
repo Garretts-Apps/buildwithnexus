@@ -438,6 +438,7 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
         ),
         ("rust-cli", include_str!("bundled_skills/rust-cli.md")),
         ("tool-use", include_str!("bundled_skills/tool-use.md")),
+        ("git", include_str!("bundled_skills/git.md")),
         ("git-release", include_str!("bundled_skills/git-release.md")),
         (
             "spec-writing",
