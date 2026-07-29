@@ -481,7 +481,7 @@ fn repl(
     tui::set_permission_mode(permission_label(&perm));
 
     // Show the full-screen header banner.
-    let mode_name = "BUILD"; // default starting mode
+    let mode_name = "BRAINSTORM"; // default starting mode
     tui::show_banner(
         &settings.provider,
         &provider.model,
@@ -510,7 +510,7 @@ fn repl(
     let mut transcript: Vec<provider::Msg> = Vec::new();
     let mut sid = session::new_id();
     trace::set_session(&sid);
-    let mut mode = Mode::Build;
+    let mut mode = Mode::Brainstorm;
     let mut last_suggested_mode: Option<&'static str> = None;
     // /btw: extra context injected into the next task without interrupting.
     let mut btw_ctx: Option<String> = None;
