@@ -1204,7 +1204,9 @@ fn mode_label(mode: &Mode) -> &'static str {
 fn auto_switch_mode(task: &str, current: &Mode) -> Option<Mode> {
     let target = classify(task);
     match (&target, current) {
-        (Mode::Build, Mode::Brainstorm) | (Mode::Plan, Mode::Brainstorm) => Some(target),
+        // Never auto-switch directly from BRAINSTORM to BUILD — always step through PLAN first.
+        (Mode::Build, Mode::Brainstorm) => Some(Mode::Plan),
+        (Mode::Plan, Mode::Brainstorm) => Some(Mode::Plan),
         _ => None,
     }
 }
@@ -1320,9 +1322,28 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
     if let Some(n) = pick {
         if n >= 1 && n <= sessions.len().min(15) {
             let s = sessions.swap_remove(n - 1);
-            tui::line(&tui::green(&format!("  ✓ resumed: {}", s.title)));
+            let title = s.title.clone();
             *transcript = s.msgs;
             *sid = s.id;
+            tui::line(&tui::green(&format!("  ✓ resumed: {title}")));
+            tui::line(&tui::dim("  ── restored history ──"));
+            for msg in transcript.iter() {
+                match msg {
+                    provider::Msg::User(text) => {
+                        tui::line(&format!("{} {}", tui::accent("›"), text));
+                    }
+                    provider::Msg::UserImages { text, .. } => {
+                        tui::line(&format!("{} {}", tui::accent("›"), text));
+                    }
+                    provider::Msg::Assistant { text, .. } => {
+                        if !text.trim().is_empty() {
+                            tui::line(&tui::render_md(text));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            tui::line(&tui::dim("  ────────────────────"));
         }
     }
 }
@@ -3214,6 +3235,9 @@ pub fn classify(task: &str) -> Mode {
         "what should",
         "what if",
         "ideas for",
+        "ideas on",
+        "what to build",
+        "what to create",
         "what do you think",
         "why would",
         "why is",
@@ -3223,6 +3247,7 @@ pub fn classify(task: &str) -> Mode {
         "advice on",
         "suggest",
         "tradeoffs",
+        "brainstorm",
     ]) {
         return Mode::Brainstorm;
     }
@@ -3252,7 +3277,7 @@ pub fn classify(task: &str) -> Mode {
     if task.split_whitespace().count() > 8 {
         Mode::Plan
     } else {
-        Mode::Build
+        Mode::Brainstorm
     }
 }
 
@@ -3686,6 +3711,10 @@ mod tests {
             Mode::Brainstorm
         ));
         assert!(matches!(classify("why is this slow"), Mode::Brainstorm));
+        assert!(matches!(
+            classify("i need some ideas on what to build"),
+            Mode::Brainstorm
+        ));
     }
 
     #[test]
@@ -3703,8 +3732,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_short_defaults_build() {
-        assert!(matches!(classify("foo bar"), Mode::Build));
+    fn classify_short_defaults_brainstorm() {
+        assert!(matches!(classify("foo bar"), Mode::Brainstorm));
     }
 
     #[test]
@@ -3722,10 +3751,10 @@ mod tests {
 
     #[test]
     fn auto_switch_escalates_out_of_brainstorm_only() {
-        // A build request in chat mode must actually build, not chat.
+        // Brainstorming mode escalates to Plan mode first before stepping to Build mode.
         assert!(matches!(
             auto_switch_mode("build me a snake game", &Mode::Brainstorm),
-            Some(Mode::Build)
+            Some(Mode::Plan)
         ));
         assert!(matches!(
             auto_switch_mode("plan the migration to sqlite", &Mode::Brainstorm),
