@@ -4,6 +4,17 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.10] - 2026-07-29
+
+### Changed
+- **First-run binary download is now automatic for interactive sessions.**
+  When the platform binary is missing (platform packages not yet published,
+  or installed with `--omit=optional`), `bwn` now downloads the
+  checksum-verified binary from the GitHub release immediately instead of
+  prompting `[y/N]`. The user already opted in by running
+  `npm install -g buildwithnexus`. Non-TTY environments (CI, scripts, pipes)
+  are unaffected — they still require `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`.
+
 ## [0.12.9] - 2026-07-29
 
 ### Fixed

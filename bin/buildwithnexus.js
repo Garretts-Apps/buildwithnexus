@@ -8,46 +8,23 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { existing, platformPackage, target } = require('../scripts/resolve-binary.js');
 
-// Blocking y/N prompt on the controlling TTY — the launcher is synchronous by
-// design, so a readline event loop would be more machinery than the question.
-// Node keeps a TTY stdin (fd 0) in non-blocking mode, so readSync(0) throws
-// EAGAIN on macOS instead of waiting — a freshly opened /dev/tty fd blocks
-// like the question needs. Windows has no /dev/tty; there fd 0 does block.
-function askConsent() {
-  const fs = require('fs');
-  process.stderr.write(
-    `buildwithnexus: no prebuilt binary is installed for ${process.platform} ${process.arch}.\n` +
-    '  Download the checksum-verified binary from the GitHub release now? [y/N] '
-  );
-  let fd = 0;
-  try {
-    fd = fs.openSync('/dev/tty', 'r');
-  } catch {}
-  try {
-    const buf = Buffer.alloc(64);
-    const n = fs.readSync(fd, buf, 0, 64, null);
-    return /^y(es)?$/i.test(buf.toString('utf8', 0, n).trim());
-  } catch {
-    return false;
-  } finally {
-    if (fd !== 0) fs.closeSync(fd);
-  }
-}
-
 let args = process.argv.slice(2);
 let bin = existing();
 if (!bin) {
-  // The platform optionalDependency is absent (--omit=optional, or the
-  // platform package isn't published yet). The checksum-verified download
-  // from the GitHub release requires explicit consent: the --bootstrap flag,
-  // BWN_ALLOW_BOOTSTRAP=1, or a y at the interactive prompt. Never during
-  // npm install, never silently.
+  // The platform optionalDependency is absent (platform packages not yet
+  // published, or installed with --omit=optional). Fall back to a
+  // checksum-verified download from the GitHub release.
+  //
+  // Interactive runs (TTY) auto-download — the user already consented by
+  // running `npm install -g buildwithnexus`. Non-TTY environments (CI,
+  // pipes, scripts) never auto-download; use --bootstrap or
+  // BWN_ALLOW_BOOTSTRAP=1 to opt in explicitly there.
   const flagIdx = args.indexOf('--bootstrap');
   if (flagIdx !== -1) args = args.filter((a) => a !== '--bootstrap');
   const consented =
     flagIdx !== -1 ||
     process.env.BWN_ALLOW_BOOTSTRAP === '1' ||
-    (process.stdin.isTTY && process.stderr.isTTY && askConsent());
+    process.stdin.isTTY;  // interactive: user is present; they installed it, they want it to work
   if (consented) {
     spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'bootstrap.js')], {
       stdio: 'inherit',
