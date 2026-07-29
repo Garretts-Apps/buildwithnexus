@@ -894,7 +894,8 @@ fn repl(
                 let items = vec![
                     tui::SelectItem {
                         label: "Plan".into(),
-                        detail: "Break down implementation into concrete steps before building".into(),
+                        detail: "Break down implementation into concrete steps before building"
+                            .into(),
                     },
                     tui::SelectItem {
                         label: "Build".into(),
@@ -902,7 +903,8 @@ fn repl(
                     },
                     tui::SelectItem {
                         label: "Brainstorm".into(),
-                        detail: "Conversational thought partner with full codebase read access".into(),
+                        detail: "Conversational thought partner with full codebase read access"
+                            .into(),
                     },
                 ];
                 let title = format!("Select Execution Mode (Current: {})", mode_label(&mode));
@@ -1598,7 +1600,9 @@ fn handle_model(provider: &mut Provider) {
     if let Some(idx) = tui::select_item(&title, &select_items) {
         let (target_provider, model, _) = options[idx].clone();
         if target_provider == "custom" && model.is_empty() {
-            let pick = tui::ask("  Enter endpoint URL & model (e.g. http://localhost:8080/v1 model): ").unwrap_or_default();
+            let pick =
+                tui::ask("  Enter endpoint URL & model (e.g. http://localhost:8080/v1 model): ")
+                    .unwrap_or_default();
             let pick = pick.trim();
             if !pick.is_empty() {
                 let (url, m) = pick

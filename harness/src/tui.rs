@@ -1761,7 +1761,7 @@ fn queue_footer(out: &mut io::Stdout) {
     }
     let (width, _) = term_size();
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
-    
+
     let footer = footer_text().lock().map(|f| f.clone()).unwrap_or_default();
     let base_text = if footer.is_empty() {
         format!(
@@ -1776,8 +1776,8 @@ fn queue_footer(out: &mut io::Stdout) {
 
     let used = CONTEXT_USED.load(Ordering::Relaxed);
     let total = CONTEXT_TOTAL.load(Ordering::Relaxed);
-    let ctx_badge = if total > 0 {
-        let pct = (used * 100 / total).min(100);
+    let ctx_badge = if let Some(raw_pct) = (used * 100).checked_div(total) {
+        let pct = raw_pct.min(100);
         let bar_width = 8usize;
         let filled = (pct * bar_width / 100).min(bar_width);
         let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
@@ -2954,7 +2954,12 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     if !is_raw() {
         line(&accent(&format!("  {title}")));
         for (i, item) in items.iter().enumerate() {
-            line(&format!("  {:>2}. {} — {}", i + 1, bold(&item.label), dim(&item.detail)));
+            line(&format!(
+                "  {:>2}. {} — {}",
+                i + 1,
+                bold(&item.label),
+                dim(&item.detail)
+            ));
         }
         let ans = ask("  Select number: ").unwrap_or_default();
         let idx = ans.trim().parse::<usize>().ok()?;
@@ -2969,7 +2974,9 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
 
     let result = loop {
         line("");
-        line(&accent(&format!("  ┌── {title} ──────────────────────────────────────")));
+        line(&accent(&format!(
+            "  ┌── {title} ──────────────────────────────────────"
+        )));
         for (i, item) in items.iter().enumerate() {
             let is_sel = i == selected;
             if is_sel {
@@ -2987,7 +2994,9 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                 ));
             }
         }
-        line(&dim("  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────"));
+        line(&dim(
+            "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────",
+        ));
         flush();
 
         let mut next_sel = selected;
