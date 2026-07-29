@@ -5665,7 +5665,7 @@ print("hello " + data.get("name", "world"))
             &d,
         );
         assert!(!ver.is_error, "{}", ver.content);
-        assert!(ver.content.contains("Verification:"));
+        assert!(ver.content.contains("## Verification:"));
 
         let _ = fs::remove_dir_all(&d);
     }
