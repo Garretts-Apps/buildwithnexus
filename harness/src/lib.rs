@@ -636,12 +636,9 @@ fn repl(
         if let Some(model_arg) = t.strip_prefix("/model ") {
             let new_model = model_arg.trim();
             if !new_model.is_empty() {
-                provider.model = new_model.to_string();
-                if let Some(mut s) = config::load_settings() {
-                    s.model = new_model.to_string();
-                    config::save_settings(&s);
-                }
-                tui::line(&tui::green(&format!("  ✓ model → {new_model}")));
+                let settings = config::load_settings().unwrap_or_default();
+                let (prov, m) = parse_model_pick(new_model, &settings.provider);
+                swap_model(&mut provider, &prov, &m, None);
             }
             continue;
         }
@@ -894,37 +891,42 @@ fn repl(
                 continue;
             }
             "/mode" => {
-                tui::line(&format!(
-                    "  Current mode: {}",
-                    tui::mode_badge(mode_label(&mode))
-                ));
-                tui::line(&tui::dim(
-                    "  Tab-complete: /mode plan|build|brainstorm  ·  Shift+Tab to cycle",
-                ));
-                tui::line("");
-                tui::line(&format!("    {}  {}", tui::bold("1"), "plan"));
-                tui::line(&format!("    {}  {}", tui::bold("2"), "build"));
-                tui::line(&format!("    {}  {}", tui::bold("3"), "brainstorm"));
-                tui::line("");
-                let pick =
-                    tui::ask("  switch to [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
-                match pick.trim() {
-                    "1" | "plan" => {
-                        mode = Mode::Plan;
-                        last_suggested_mode = None;
-                        tui::show_mode_change("PLAN");
+                let items = vec![
+                    tui::SelectItem {
+                        label: "Plan".into(),
+                        detail: "Break down implementation into concrete steps before building"
+                            .into(),
+                    },
+                    tui::SelectItem {
+                        label: "Build".into(),
+                        detail: "Agentic execution — edit files, run commands, solve tasks".into(),
+                    },
+                    tui::SelectItem {
+                        label: "Brainstorm".into(),
+                        detail: "Conversational thought partner with full codebase read access"
+                            .into(),
+                    },
+                ];
+                let title = format!("Select Execution Mode (Current: {})", mode_label(&mode));
+                if let Some(idx) = tui::select_item(&title, &items) {
+                    match idx {
+                        0 => {
+                            mode = Mode::Plan;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("PLAN");
+                        }
+                        1 => {
+                            mode = Mode::Build;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("BUILD");
+                        }
+                        2 => {
+                            mode = Mode::Brainstorm;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("BRAINSTORM");
+                        }
+                        _ => {}
                     }
-                    "2" | "build" => {
-                        mode = Mode::Build;
-                        last_suggested_mode = None;
-                        tui::show_mode_change("BUILD");
-                    }
-                    "3" | "brainstorm" => {
-                        mode = Mode::Brainstorm;
-                        last_suggested_mode = None;
-                        tui::show_mode_change("BRAINSTORM");
-                    }
-                    _ => {}
                 }
                 continue;
             }
@@ -1518,22 +1520,9 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
 }
 
 fn handle_model(provider: &mut Provider) {
-    tui::line(&tui::accent(
-        "  /model — interactive model selection & hot-swap",
-    ));
     let settings = config::load_settings().unwrap_or_default();
-    tui::line(&format!(
-        "  Current: {} on {}",
-        tui::bold(&provider.model),
-        tui::bold(&settings.provider)
-    ));
-    tui::line("");
-
-    // (provider id, model, description) — every entry names the provider that
-    // will actually serve it, so a pick can be validated before it's applied.
     let mut options: Vec<(String, String, String)> = Vec::new();
 
-    // Models a running Ollama actually has installed — known-good picks.
     let ollama_base = if settings.provider == "ollama" {
         settings
             .base_url
@@ -1549,28 +1538,25 @@ fn handle_model(provider: &mut Provider) {
         }
     }
 
-    // GGUF files on disk need a llama.cpp / LM Studio server in front of them.
     for name in crate::local::scan_gguf() {
         options.push((
             "llamacpp".into(),
             name,
-            "GGUF on disk — needs a running llama.cpp/LM Studio server".into(),
+            "GGUF on disk — local server".into(),
         ));
     }
 
-    // Cloud presets, each showing whether it's already configured.
     for p in config::PRESETS.iter().filter(|p| !p.local) {
         let status = if config::load_key(p.env_key).is_some() {
-            String::new()
+            "ready".into()
         } else {
-            format!(" — needs {}", p.env_key)
+            format!("needs {}", p.env_key)
         };
         options.push((
             p.id.to_string(),
             p.default_model.to_string(),
-            format!("{}{}", p.label, status),
+            format!("{} ({})", p.label, status),
         ));
-        // Popular alternates beyond each preset's default.
         let extras: &[&str] = match p.id {
             "anthropic" => &["claude-opus-4-8", "claude-haiku-4-5"],
             "openai" => &["gpt-4o-mini"],
@@ -1580,73 +1566,55 @@ fn handle_model(provider: &mut Provider) {
             options.push((
                 p.id.to_string(),
                 m.to_string(),
-                format!("{}{}", p.label, status),
+                format!("{} ({})", p.label, status),
             ));
         }
     }
 
-    // Bring-your-own OpenAI-compatible server (vLLM, TGI, LiteLLM, a gateway).
     options.push((
         "custom".into(),
         String::new(),
-        "any OpenAI-compatible endpoint — asks for URL, key (optional), model".into(),
+        "custom OpenAI-compatible endpoint".into(),
     ));
 
-    for (idx, (prov, model, desc)) in options.iter().enumerate() {
-        let num = format!("{:>2}", idx + 1);
-        let shown = if model.is_empty() {
-            "(you choose)"
-        } else {
-            model
-        };
-        tui::line(&format!(
-            "  {} {} {} — {}",
-            tui::accent(&num),
-            tui::bold(shown),
-            tui::dim(&format!("[{prov}]")),
-            tui::dim(desc)
-        ));
-    }
-    tui::line("");
-    tui::line(&tui::dim(
-        "  Pick a number, or type: a model name (claude-*, gpt-*, ollama/<name>),",
-    ));
-    tui::line(&tui::dim(
-        "  any OpenRouter model (org/model), `<provider> <model>` (e.g. `openai gpt-4o`),",
-    ));
-    tui::line(&tui::dim(
-        "  or `<url> <model>` for an OpenAI-compatible server. Enter keeps the current model.",
-    ));
+    let select_items: Vec<tui::SelectItem> = options
+        .iter()
+        .map(|(prov, model, desc)| {
+            let label = if model.is_empty() {
+                format!("[{prov}] custom endpoint")
+            } else {
+                format!("{prov} / {model}")
+            };
+            tui::SelectItem {
+                label,
+                detail: desc.clone(),
+            }
+        })
+        .collect();
 
-    let pick = tui::ask("  Select model: ").unwrap_or_default();
-    let pick = pick.trim().to_string();
-    if pick.is_empty() {
-        return;
-    }
-    // "<url> [model]" targets a custom OpenAI-compatible endpoint directly.
-    if pick.starts_with("http://") || pick.starts_with("https://") {
-        let (url, model) = pick
-            .split_once(char::is_whitespace)
-            .map(|(u, m)| (u.trim().to_string(), m.trim().to_string()))
-            .unwrap_or((pick.clone(), String::new()));
-        swap_model(provider, "custom", &model, Some(url));
-        return;
-    }
-    let (target_provider, model) = if let Ok(idx) = pick.parse::<usize>() {
-        if idx > 0 && idx <= options.len() {
-            let (p, m, _) = options[idx - 1].clone();
-            (p, m)
+    let title = format!(
+        "Select AI Model (Current: {} on {})",
+        provider.model, settings.provider
+    );
+
+    if let Some(idx) = tui::select_item(&title, &select_items) {
+        let (target_provider, model, _) = options[idx].clone();
+        if target_provider == "custom" && model.is_empty() {
+            let pick =
+                tui::ask("  Enter endpoint URL & model (e.g. http://localhost:8080/v1 model): ")
+                    .unwrap_or_default();
+            let pick = pick.trim();
+            if !pick.is_empty() {
+                let (url, m) = pick
+                    .split_once(char::is_whitespace)
+                    .map(|(u, m)| (u.trim().to_string(), m.trim().to_string()))
+                    .unwrap_or((pick.to_string(), String::new()));
+                swap_model(provider, "custom", &m, Some(url));
+            }
         } else {
-            tui::line(&tui::red(&format!(
-                "  ✗ number {idx} out of range (1-{}), keeping current model",
-                options.len()
-            )));
-            return;
+            swap_model(provider, &target_provider, &model, None);
         }
-    } else {
-        parse_model_pick(&pick, &settings.provider)
-    };
-    swap_model(provider, &target_provider, &model, None);
+    }
 }
 
 /// Maps a typed model name to the provider that serves it. Anything
@@ -2437,34 +2405,28 @@ fn permission_label(perm: &Permission) -> &'static str {
 
 fn handle_permissions(perm: &mut Permission) {
     let current = permission_label(perm);
-    tui::line(&tui::accent("  /permissions — tool permission mode"));
-    tui::line(&format!("  Current: {}", tui::bold(current)));
-    tui::line(&tui::dim("  Tab-complete: /permissions ask|auto|readonly"));
-    tui::line("");
-    tui::line(&format!(
-        "    {}  {} — confirm before each file write or command  {}",
-        tui::bold("1"),
-        tui::bold("ask"),
-        tui::dim("(recommended)")
-    ));
-    tui::line(&format!(
-        "    {}  {} — auto-approve all actions                   {}",
-        tui::bold("2"),
-        tui::bold("auto"),
-        tui::dim("(yolo)")
-    ));
-    tui::line(&format!(
-        "    {}  {} — never write files or run commands",
-        tui::bold("3"),
-        tui::bold("readonly")
-    ));
-    tui::line("");
-    let pick = tui::ask("  choice [1/2/3 or name, Enter to keep]: ").unwrap_or_default();
-    match pick.trim() {
-        "1" | "ask" => apply_permission(perm, "ask"),
-        "2" | "auto" => apply_permission(perm, "auto"),
-        "3" | "readonly" => apply_permission(perm, "readonly"),
-        _ => {}
+    let items = vec![
+        tui::SelectItem {
+            label: "ask".into(),
+            detail: "Confirm before each file write or command (recommended)".into(),
+        },
+        tui::SelectItem {
+            label: "auto".into(),
+            detail: "Auto-approve all safe tool operations (yolo)".into(),
+        },
+        tui::SelectItem {
+            label: "readonly".into(),
+            detail: "Never write files or run mutating commands".into(),
+        },
+    ];
+    let title = format!("Select Tool Permission Mode (Current: {current})");
+    if let Some(idx) = tui::select_item(&title, &items) {
+        match idx {
+            0 => apply_permission(perm, "ask"),
+            1 => apply_permission(perm, "auto"),
+            2 => apply_permission(perm, "readonly"),
+            _ => {}
+        }
     }
 }
 

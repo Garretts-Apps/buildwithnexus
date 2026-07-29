@@ -629,6 +629,9 @@ fn request_reply(
         msgs,
         defs,
         &mut |c| {
+            if tui::interrupted() {
+                return;
+            }
             thinking.borrow_mut().finish();
             renderer.push(c);
             tui::poll_typeahead();
@@ -636,11 +639,24 @@ fn request_reply(
             streamed = true;
         },
         &mut |t| {
+            if tui::interrupted() {
+                return;
+            }
             thinking.borrow_mut().push(t);
         },
     );
     thinking.borrow_mut().finish();
-    let r = res?;
+    let r = match res {
+        Ok(r) => r,
+        Err(e) if e == "interrupted" || e.contains("interrupted") => {
+            renderer.flush();
+            if streamed {
+                report::assistant_end();
+            }
+            return Err("interrupted".to_string());
+        }
+        Err(e) => return Err(e),
+    };
     renderer.flush();
     if streamed {
         report::assistant_end();
@@ -1753,6 +1769,21 @@ pub fn run_build_session(
     r
 }
 
+struct AgentRunningGuard;
+
+impl AgentRunningGuard {
+    fn new() -> Self {
+        tui::set_agent_running(true);
+        Self
+    }
+}
+
+impl Drop for AgentRunningGuard {
+    fn drop(&mut self) {
+        tui::set_agent_running(false);
+    }
+}
+
 // `sid` is Some for the top-level session (per-round transcript saves) and
 // None for subagents, whose transcripts live inside the parent's results.
 #[allow(clippy::too_many_arguments)]
@@ -1766,6 +1797,7 @@ fn build_inner(
     msgs: &mut Vec<Msg>,
     sid: Option<&str>,
 ) -> Result<String, String> {
+    let _running_guard = (depth == 0).then(AgentRunningGuard::new);
     // Top-level runs mark a turn boundary so bare /undo can revert exactly
     // this run's writes; subagent recursion must not shrink that window.
     if depth == 0 {
@@ -1825,7 +1857,12 @@ fn build_inner(
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
-            report::notice("  ⚠ interrupted");
+            let kind = tui::consume_interrupt();
+            let msg = match kind {
+                tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
+                _ => "  ⚠ interrupted",
+            };
+            report::notice(msg);
             return Ok(String::new());
         }
         maybe_compact(p, msgs);
@@ -1835,9 +1872,18 @@ fn build_inner(
         let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
             Ok(r) => r,
             Err(e) => {
+                let lower = e.to_ascii_lowercase();
+                if lower.contains("interrupted") {
+                    let kind = tui::consume_interrupt();
+                    let msg = match kind {
+                        tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
+                        _ => "  ⚠ interrupted",
+                    };
+                    report::notice(msg);
+                    return Ok(String::new());
+                }
                 // A context-overflow rejection is recoverable: force-compact the
                 // transcript and retry once instead of dying.
-                let lower = e.to_ascii_lowercase();
                 if !forced_compact_retry
                     && (lower.contains("prompt is too long") || lower.contains("context length"))
                 {
@@ -3004,6 +3050,7 @@ fn reads_as_instructions(text: &str) -> bool {
 // The planning phase now has tools available so the model can inspect the
 // codebase while breaking down the task. Execution still runs through BUILD.
 pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
+    let _running_guard = AgentRunningGuard::new();
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
@@ -3330,6 +3377,7 @@ pub fn run_brainstorm(
     cwd: &Path,
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
+    let _running_guard = AgentRunningGuard::new();
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!("You are a sharp, concise thought partner with full access to the codebase and the internet. \
@@ -3552,6 +3600,7 @@ pub fn run_chat_turn(
     cwd: &Path,
     question: &str,
 ) -> Result<(), String> {
+    let _running_guard = AgentRunningGuard::new();
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(

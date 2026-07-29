@@ -4,6 +4,20 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.11] - 2026-07-29
+
+### Added & Fixed
+- **Interactive Slash Command Dialogs (`/model`, `/mode`, `/permissions`):**
+  Commands like `/model`, `/mode`, and `/permissions` now pop interactive TUI dialogs
+  navigable with `Up`/`Down` arrow keys (`j`/`k`) and `Enter` to select.
+- **Strict Slash Command Handling:** Unrecognized commands (e.g. `/unknown`) show an error
+  message instead of falling through as natural language prompts to the AI.
+- **Immediate Cancellation (`Esc` & `Ctrl+C`):** Pressing `Esc` or `Ctrl+C` now aborts HTTP stream
+  chunk reading and running child processes instantly. `Esc` preserves the message queue
+  for the next queued task, while `Ctrl+C` clears the queue for a full stop.
+- **Clean Footer Statusline:** Context & token usage (`ctx: 25% 32k/128k`) move to the footer
+  statusline below the composer box, eliminating log clutter in the chat thread.
+
 ## [0.12.10] - 2026-07-29
 
 ### Changed

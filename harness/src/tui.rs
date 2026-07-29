@@ -24,8 +24,19 @@ static RAW: AtomicBool = AtomicBool::new(false);
 static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
 static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
-// Set by poll_typeahead() when it absorbs a Ctrl+C so interrupted() still fires.
-static TYPEAHEAD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InterruptKind {
+    None = 0,
+    Escape = 1,
+    CtrlC = 2,
+}
+
+static INTERRUPT_KIND_VAL: AtomicU8 = AtomicU8::new(0);
+static AGENT_RUNNING: AtomicBool = AtomicBool::new(false);
+static CONTEXT_USED: AtomicUsize = AtomicUsize::new(0);
+static CONTEXT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
 static VIM_MODE: AtomicBool = AtomicBool::new(false);
 static VIM_STATE_VAL: AtomicU8 = AtomicU8::new(0); // 0 = Normal, 1 = Insert, 2 = Visual
 
@@ -1050,7 +1061,7 @@ pub fn poll_typeahead() {
                         continue;
                     }
                     KeyCode::Char('c') if ctrl => {
-                        TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
+                        trigger_interrupt(InterruptKind::CtrlC);
                         ta.buf.clear();
                         ta.cursor = 0;
                         ta.from_queue = false;
@@ -1061,9 +1072,9 @@ pub fn poll_typeahead() {
                         ta.cursor = 0;
                     }
                     KeyCode::Esc => {
-                        // If the buffer holds a message dequeued via Ctrl+Q,
-                        // Esc returns it to the queue instead of discarding it.
-                        if ta.from_queue && !ta.buf.is_empty() {
+                        if is_agent_running() {
+                            trigger_interrupt(InterruptKind::Escape);
+                        } else if ta.from_queue && !ta.buf.is_empty() {
                             let msg: String = ta.buf.iter().collect();
                             if let Ok(mut mq) = message_queue().lock() {
                                 mq.push(msg);
@@ -1077,17 +1088,13 @@ pub fn poll_typeahead() {
                             render_footer();
                             render_queued_composer();
                             continue;
+                        } else if !ta.buf.is_empty() {
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            ta.from_queue = false;
+                        } else {
+                            trigger_interrupt(InterruptKind::Escape);
                         }
-                        if ta.buf.is_empty() {
-                            // Esc with nothing typed interrupts the agent —
-                            // any queued prompts auto-send at the next
-                            // prompt, so Esc = "stop and move on".
-                            TYPEAHEAD_INTERRUPTED.store(true, Ordering::Relaxed);
-                        }
-                        // Esc with a draft clears the draft only.
-                        ta.buf.clear();
-                        ta.cursor = 0;
-                        ta.from_queue = false;
                     }
                     KeyCode::Backspace if !ctrl => {
                         if ta.cursor > 0 {
@@ -1752,40 +1759,75 @@ fn queue_footer(out: &mut io::Stdout) {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    let Ok(footer) = footer_text().lock() else {
-        return;
-    };
     let (width, _) = term_size();
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
-    if !footer.is_empty() {
-        let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
-        let vim_badge = if is_vim_mode() {
-            let label = get_vim_state_label();
-            let colored = match label {
-                "NORMAL" => green(&format!("[VIM:{label}]")),
-                "INSERT" => yellow(&format!("[VIM:{label}]")),
-                "VISUAL" => cyan(&format!("[VIM:{label}]")),
-                _ => green("[VIM]"),
-            };
-            format!(" {} ", bold(&colored))
+
+    let footer = footer_text().lock().map(|f| f.clone()).unwrap_or_default();
+    let base_text = if footer.is_empty() {
+        format!(
+            "{} {} {}",
+            dim("permission:"),
+            bold("ask"),
+            dim("· /permissions · wheel/PgUp · /mouse")
+        )
+    } else {
+        footer
+    };
+
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let total = CONTEXT_TOTAL.load(Ordering::Relaxed);
+    let ctx_badge = if let Some(raw_pct) = (used * 100).checked_div(total) {
+        let pct = raw_pct.min(100);
+        let bar_width = 8usize;
+        let filled = (pct * bar_width / 100).min(bar_width);
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+        let colored_bar = if pct >= 80 {
+            red(&bar)
+        } else if pct >= 60 {
+            yellow(&bar)
         } else {
-            String::new()
+            green(&bar)
         };
-        let mut text = if offset > 0 {
-            format!(
-                "{}{} {}",
-                vim_badge,
-                footer.as_str(),
-                dim(&format!("· scroll +{offset}"))
-            )
-        } else {
-            format!("{}{}", vim_badge, footer.as_str())
+        format!(
+            " {} [{}] {}",
+            dim("ctx:"),
+            colored_bar,
+            dim(&format!("{pct}% {}k/{}k", used / 1_000, total / 1_000))
+        )
+    } else {
+        String::new()
+    };
+
+    let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
+    let vim_badge = if is_vim_mode() {
+        let label = get_vim_state_label();
+        let colored = match label {
+            "NORMAL" => green(&format!("[VIM:{label}]")),
+            "INSERT" => yellow(&format!("[VIM:{label}]")),
+            "VISUAL" => cyan(&format!("[VIM:{label}]")),
+            _ => green("[VIM]"),
         };
-        if let Some(fl) = active_flash() {
-            text = format!("{text}  {}", accent(&fl));
-        }
-        let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
+        format!("{} ", bold(&colored))
+    } else {
+        String::new()
+    };
+
+    let mut text = if offset > 0 {
+        format!(
+            "{}{}{} {}",
+            vim_badge,
+            base_text,
+            ctx_badge,
+            dim(&format!("· scroll +{offset}"))
+        )
+    } else {
+        format!("{}{}{}", vim_badge, base_text, ctx_badge)
+    };
+
+    if let Some(fl) = active_flash() {
+        text = format!("{text}  {}", accent(&fl));
     }
+    let _ = write!(out, "{}", clip_ansi_line(&text, width as usize));
 }
 
 fn render_footer() {
@@ -2392,32 +2434,14 @@ pub fn show_mode_change(mode: &str) {
 }
 
 // Live context-window meter — call after each API round-trip.
-// Color shifts green → yellow → red as the window fills up.
+// Updates statusline below composer bar. Color shifts green → yellow → red as the window fills up.
 pub fn context_meter(used: usize, total: usize) {
     if total == 0 {
         return;
     }
-    let pct = (used * 100 / total).min(100);
-    let bar_width = 20usize;
-    let filled = (pct * bar_width / 100).min(bar_width);
-    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-    let colored = if pct >= 80 {
-        red(&bar)
-    } else if pct >= 60 {
-        yellow(&bar)
-    } else {
-        green(&bar)
-    };
-    line(&format!(
-        "  {} [{}] {}",
-        dim("context"),
-        colored,
-        dim(&format!(
-            "{pct}% · {}k / {}k tokens",
-            used / 1_000,
-            total / 1_000,
-        )),
-    ));
+    CONTEXT_USED.store(used, Ordering::Relaxed);
+    CONTEXT_TOTAL.store(total, Ordering::Relaxed);
+    render_footer();
 }
 
 // Enter the alternate screen and raw mode (and capture panics to restore the
@@ -2851,16 +2875,40 @@ pub fn bell() {
     }
 }
 
-// Non-blocking: drain pending key events and report whether Ctrl-C was pressed.
-pub fn interrupted() -> bool {
+// Non-blocking: drain pending key events and report whether Ctrl-C or Esc was pressed.
+pub fn set_agent_running(running: bool) {
+    AGENT_RUNNING.store(running, Ordering::Relaxed);
+    if running {
+        INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
+    }
+}
+
+pub fn is_agent_running() -> bool {
+    AGENT_RUNNING.load(Ordering::Relaxed)
+}
+
+pub fn trigger_interrupt(kind: InterruptKind) {
+    INTERRUPT_KIND_VAL.store(kind as u8, Ordering::Relaxed);
+    if kind == InterruptKind::CtrlC {
+        if let Ok(mut mq) = message_queue().lock() {
+            mq.clear();
+        }
+    }
+}
+
+pub fn get_interrupt_kind() -> InterruptKind {
     if !is_raw() {
-        return false;
+        return InterruptKind::None;
     }
-    // poll_typeahead() may have consumed a Ctrl+C and set this flag.
-    if TYPEAHEAD_INTERRUPTED.swap(false, Ordering::Relaxed) {
-        return true;
+    let cur = match INTERRUPT_KIND_VAL.load(Ordering::Relaxed) {
+        1 => InterruptKind::Escape,
+        2 => InterruptKind::CtrlC,
+        _ => InterruptKind::None,
+    };
+    if cur != InterruptKind::None {
+        return cur;
     }
-    let mut hit = false;
+    let mut hit = InterruptKind::None;
     while poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(k)) = read() {
             if k.kind != KeyEventKind::Press {
@@ -2868,12 +2916,133 @@ pub fn interrupted() -> bool {
             }
             let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'));
-            if ctrl_c || k.code == KeyCode::Esc {
-                hit = true;
+            if ctrl_c {
+                hit = InterruptKind::CtrlC;
+            } else if k.code == KeyCode::Esc {
+                hit = InterruptKind::Escape;
             }
         }
     }
+    if hit != InterruptKind::None {
+        trigger_interrupt(hit);
+    }
     hit
+}
+
+pub fn interrupted() -> bool {
+    get_interrupt_kind() != InterruptKind::None
+}
+
+pub fn consume_interrupt() -> InterruptKind {
+    let kind = get_interrupt_kind();
+    INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
+    kind
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectItem {
+    pub label: String,
+    pub detail: String,
+}
+
+// Interactive selection menu — pops a list dialog that users can navigate
+// using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
+pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    if !is_raw() {
+        line(&accent(&format!("  {title}")));
+        for (i, item) in items.iter().enumerate() {
+            line(&format!(
+                "  {:>2}. {} — {}",
+                i + 1,
+                bold(&item.label),
+                dim(&item.detail)
+            ));
+        }
+        let ans = ask("  Select number: ").unwrap_or_default();
+        let idx = ans.trim().parse::<usize>().ok()?;
+        if idx > 0 && idx <= items.len() {
+            return Some(idx - 1);
+        }
+        return None;
+    }
+
+    let mut selected = 0usize;
+    cursor_hide();
+
+    let result = loop {
+        line("");
+        line(&accent(&format!(
+            "  ┌── {title} ──────────────────────────────────────"
+        )));
+        for (i, item) in items.iter().enumerate() {
+            let is_sel = i == selected;
+            if is_sel {
+                line(&format!(
+                    "  │  {} {} {}",
+                    accent("❯"),
+                    bold(&item.label),
+                    green(&format!("({})", item.detail))
+                ));
+            } else {
+                line(&format!(
+                    "  │    {} {}",
+                    dim(&item.label),
+                    dim(&format!("({})", item.detail))
+                ));
+            }
+        }
+        line(&dim(
+            "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────",
+        ));
+        flush();
+
+        let mut next_sel = selected;
+        let action = loop {
+            if let Ok(Event::Key(k)) = read() {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        next_sel = selected.saturating_sub(1);
+                        break "nav";
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if selected + 1 < items.len() {
+                            next_sel = selected + 1;
+                        }
+                        break "nav";
+                    }
+                    KeyCode::Enter => {
+                        break "enter";
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        break "cancel";
+                    }
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break "cancel";
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        if action == "enter" {
+            line(&green(&format!("  ✓ selected: {}", items[selected].label)));
+            break Some(selected);
+        } else if action == "cancel" {
+            line(&dim("  cancelled selection"));
+            break None;
+        } else {
+            selected = next_sel;
+        }
+    };
+
+    cursor_show();
+    result
 }
 
 // ── input event ──────────────────────────────────────────────────────────────
