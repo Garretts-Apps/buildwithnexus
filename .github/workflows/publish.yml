@@ -186,10 +186,13 @@ jobs:
             node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
             # OIDC first; bootstrap-token fallback for the first publish of
             # a brand-new package (see env comment above).
+            # NOTE: --provenance requires an OIDC token. The NPM_TOKEN fallback
+            # uses a classic token, so we intentionally omit --provenance here —
+            # passing it causes npm to return 404 on new packages.
             if ! (cd "npm/${p}" && npm publish --access public --provenance); then
               if [ -n "${NPM_TOKEN}" ]; then
-                echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token"
-                (cd "npm/${p}" && npm publish --access public --provenance \
+                echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token (no provenance)"
+                (cd "npm/${p}" && npm publish --access public \
                   --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
                   || echo "::warning::bootstrap-token publish of buildwithnexus-${p} also failed"
               else
