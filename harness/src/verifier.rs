@@ -297,18 +297,18 @@ impl Verifier {
 
     /// Formats the verification report as human-readable Markdown text.
     pub fn format_report(report: &VerificationReport) -> String {
-        let mut out = format!("## Verification: {}\n\n", report.status.label());
-        out.push_str(&format!("- **Task**: {}\n", report.task_description));
+        let mut out = format!("Verification: {}\n\n", report.status.label());
+        out.push_str(&format!("  • Task: {}\n", report.task_description));
         out.push_str(&format!(
-            "- **Confidence**: {:.2} ({})\n",
+            "  • Confidence: {:.2} ({})\n",
             report.confidence, report.confidence_level
         ));
         out.push_str(&format!(
-            "- **Files changed**: {}\n",
+            "  • Files changed: {}\n",
             report.files_changed.len()
         ));
         out.push_str(&format!(
-            "- **Tests run**: {}\n\n",
+            "  • Tests run: {}\n\n",
             if report.tests_status.tests_run {
                 "yes"
             } else {
