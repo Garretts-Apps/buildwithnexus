@@ -421,7 +421,7 @@ fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
 
 fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
     let mut attempts = 0;
-    let max_attempts = 5;
+    let max_attempts = if is_local_url(req.url()) { 15 } else { 5 };
     let mut delay_ms = 500;
 
     loop {

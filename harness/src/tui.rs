@@ -3005,6 +3005,11 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     let mut first_render = true;
     let mut last_box_height = 0;
 
+    let print_line = |s: &str| {
+        let mut out = io::stdout();
+        let _ = execute!(out, crossterm::style::Print(s), crossterm::style::Print("\r\n"));
+    };
+
     let result = loop {
         let (width, height) = term_size();
         let max_items = (height.saturating_sub(6)).max(1) as usize;
@@ -3018,13 +3023,18 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         }
 
         if !first_render {
-            print!("\x1B[{}A\x1B[0J", last_box_height);
+            let mut out = io::stdout();
+            let _ = execute!(
+                out,
+                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            );
         }
         first_render = false;
         last_box_height = box_height;
 
-        line("");
-        line(&clip_ansi_line(
+        print_line("");
+        print_line(&clip_ansi_line(
             &accent(&format!(
                 "  ┌── {title} ─────────────────────────────────────────────────────────────"
             )),
@@ -3051,9 +3061,9 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                     dim(&format!("({})", item.detail))
                 )
             };
-            line(&clip_ansi_line(&formatted, width as usize));
+            print_line(&clip_ansi_line(&formatted, width as usize));
         }
-        line(&clip_ansi_line(&dim(
+        print_line(&clip_ansi_line(&dim(
             "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────────────────────────────",
         ), width as usize));
         flush();
@@ -3090,11 +3100,21 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         };
 
         if action == "enter" {
-            print!("\x1B[{}A\x1B[0J", last_box_height);
+            let mut out = io::stdout();
+            let _ = execute!(
+                out,
+                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            );
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
             break Some(selected);
         } else if action == "cancel" {
-            print!("\x1B[{}A\x1B[0J", last_box_height);
+            let mut out = io::stdout();
+            let _ = execute!(
+                out,
+                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+            );
             line(&dim("  cancelled selection"));
             break None;
         } else {
