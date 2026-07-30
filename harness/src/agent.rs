@@ -2638,6 +2638,21 @@ fn plan_step_is_actionable(step: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    for tool in [
+        "read_file",
+        "write_file",
+        "grep_files",
+        "list_dir",
+        "find_paths",
+        "run_command",
+        "fetch_url",
+        "apply_patch",
+        "edit_file",
+    ] {
+        if lower_step.starts_with(tool) {
+            return false;
+        }
+    }
     if (trimmed.starts_with('.') || trimmed.ends_with('/')) && !trimmed.contains(' ') {
         return false;
     }
@@ -3049,12 +3064,10 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         "You are bwn in PLAN mode: a coding partner working out an implementation plan with the user. \
         You have full read access to the codebase — use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect it as needed. \
         Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
-        When the user gives you a task to plan, inspect the workspace and call exit_plan or ExitPlanMode with a concrete implementation plan. \
-        Your plan must explicitly specify: \
-        1. The target programming language, framework, and main file path(s) to create/modify (e.g. Python script in `main.py`, Rust CLI in `src/main.rs`, Node.js app in `index.js`, or Bash script in `app.sh`). \
-        2. The specific interactive logic and components to write. \
-        3. How to verify and run the result. \
-        Keep the plan actionable, concrete, and concise (3 to 8 steps). If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
+        When the user gives you a task to plan, inspect the workspace and call exit_plan or ExitPlanMode with a concise 3-to-5 step implementation plan. \
+        Describe human implementation steps (e.g. 1. Create main.py with interactive input loop 2. Test script with python main.py). \
+        Do not list raw tool names (like read_file or write_file) as plan steps. \
+        If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
