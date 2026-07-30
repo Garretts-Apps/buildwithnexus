@@ -3053,6 +3053,17 @@ pub struct SelectItem {
 
 // Interactive selection menu — pops a list dialog that users can navigate
 // using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
+pub fn drain_stdin() {
+    if !is_raw() {
+        return;
+    }
+    while poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = read();
+    }
+}
+
+// Interactive selection menu — pops a list dialog that users can navigate
+// using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
 pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     if items.is_empty() {
         return None;
@@ -3075,6 +3086,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         return None;
     }
 
+    drain_stdin();
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
     cursor_hide();
@@ -3086,7 +3098,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         let (width, height) = term_size();
         let max_items = (height.saturating_sub(6)).max(1) as usize;
         let visible_items = items.len().min(max_items);
-        let total_lines = (visible_items + 3) as u16;
+        let total_lines = (visible_items + 2) as u16;
 
         if selected < scroll_offset {
             scroll_offset = selected;
@@ -3106,13 +3118,12 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         } else {
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_total_lines),
+                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
+                crossterm::cursor::MoveToColumn(0),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
         }
         last_total_lines = total_lines;
-
-        let _ = execute!(out, crossterm::style::Print("\r\n"));
 
         let header = clip_ansi_line(
             &accent(&format!(
@@ -3189,7 +3200,8 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             let mut out = io::stdout();
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_total_lines),
+                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
+                crossterm::cursor::MoveToColumn(0),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
@@ -3198,7 +3210,8 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             let mut out = io::stdout();
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_total_lines),
+                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
+                crossterm::cursor::MoveToColumn(0),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
             line(&dim("  cancelled selection"));
