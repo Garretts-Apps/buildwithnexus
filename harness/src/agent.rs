@@ -752,7 +752,30 @@ fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<prov
         }
     }
     // Fall back to Gemma's `tool_code` Python-call format.
-    parse_tool_code_call(text, &names)
+    if let Some(calls) = parse_tool_code_call(text, &names) {
+        return Some(calls);
+    }
+    parse_prose_tool_call(text, &names)
+}
+
+fn parse_prose_tool_call(
+    text: &str,
+    names: &HashSet<&'static str>,
+) -> Option<Vec<provider::ToolCall>> {
+    let lower = text.to_lowercase();
+    if (names.contains("exit_plan") || names.contains("ExitPlanMode"))
+        && (lower.contains("exit plan mode")
+            || lower.contains("exit_plan")
+            || lower.contains("exitplanmode"))
+    {
+        let name = if names.contains("exit_plan") {
+            "exit_plan"
+        } else {
+            "ExitPlanMode"
+        };
+        return Some(vec![text_tool_call(name, serde_json::json!({}))]);
+    }
+    None
 }
 
 // Positional argument names for the tools small models most often call, so a
