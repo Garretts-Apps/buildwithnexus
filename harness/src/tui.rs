@@ -3076,12 +3076,8 @@ impl Drop for PauseAgentRunningGuard {
 }
 
 pub fn drain_stdin() {
-    if !is_raw() {
-        return;
-    }
-    while poll(Duration::from_millis(0)).unwrap_or(false) {
-        let _ = read();
-    }
+    // Intentionally no-op: do NOT read and discard stdin events so typed-ahead
+    // keystrokes (like "good point") are preserved 100% reliably.
 }
 
 // Interactive selection menu — pops a list dialog that users can navigate
