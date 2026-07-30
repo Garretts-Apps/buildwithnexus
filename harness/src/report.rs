@@ -70,8 +70,8 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         emit(json!({"type": "tool_call", "name": name, "input": input}));
         return;
     }
-    // `finish` is rendered by finish() — don't double up with a header line.
-    if name == "finish" {
+    // `finish` and `exit_plan` are internal control signals — don't double up with a header line.
+    if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
     }
     // A role-colored header line (icon + what it's about to do).
@@ -161,6 +161,11 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
             json!({"type": "tool_result", "name": name, "content": content, "is_error": is_error}),
         );
         return;
+    }
+    if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
+        if !is_error {
+            return;
+        }
     }
     // Human mode previously showed nothing here — the user couldn't see command
     // output or errors. Surface results compactly, indented under the call.

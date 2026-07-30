@@ -3338,31 +3338,40 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             tui::line(&format!("  {}. {}", i + 1, s));
         }
         tui::line("");
-        let ans = tui::ask(&format!(
-            "  {} execute, {} edit <n>, {} cancel: ",
-            tui::bold("[Enter]"),
-            tui::bold("e"),
-            tui::bold("c")
-        ))
-        .unwrap_or_default();
-        let a = ans.trim();
-        if a.is_empty() || a == "y" {
-            break;
-        }
-        if a == "c" {
-            tui::line(&tui::yellow("  cancelled"));
-            return Ok(());
-        }
-        if let Some(rest) = a.strip_prefix("e") {
-            if let Ok(n) = rest.trim().parse::<usize>() {
-                if n >= 1 && n <= steps.len() {
-                    if let Some(new) = tui::ask("  new text: ") {
-                        if !new.trim().is_empty() {
-                            steps[n - 1] = new.trim().to_string();
+        let items = vec![
+            tui::SelectItem {
+                label: "Execute Plan".into(),
+                detail: "Switch to BUILD mode and start implementing".into(),
+            },
+            tui::SelectItem {
+                label: "Edit Step".into(),
+                detail: "Modify one of the plan steps".into(),
+            },
+            tui::SelectItem {
+                label: "Cancel".into(),
+                detail: "Cancel planning without executing".into(),
+            },
+        ];
+        match tui::select_item("Approve Plan", &items) {
+            Some(0) | None => break, // Default: Enter executes plan
+            Some(1) => {
+                if let Some(n_str) = tui::ask("  step number to edit: ") {
+                    if let Ok(n) = n_str.trim().parse::<usize>() {
+                        if n >= 1 && n <= steps.len() {
+                            if let Some(new_text) = tui::ask("  new text: ") {
+                                if !new_text.trim().is_empty() {
+                                    steps[n - 1] = new_text.trim().to_string();
+                                }
+                            }
                         }
                     }
                 }
             }
+            Some(2) => {
+                tui::line(&tui::yellow("  cancelled"));
+                return Ok(());
+            }
+            _ => break,
         }
     }
 
