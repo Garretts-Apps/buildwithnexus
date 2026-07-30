@@ -1223,12 +1223,7 @@ pub fn render_queued_composer() {
         } else {
             format!("{} ", accent("›"))
         };
-        render_composer(
-            &prompt_str,
-            &ta.buf,
-            ta.cursor,
-            &mut scroll,
-        );
+        render_composer(&prompt_str, &ta.buf, ta.cursor, &mut scroll);
         cursor_color_accent();
         set_cursor_shape(CursorShape::Bar);
         cursor_show();
