@@ -3339,7 +3339,7 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             },
         ];
         match tui::select_item("Approve Plan", &items) {
-            Some(0) | None => break, // Default: Enter executes plan
+            Some(0) => break, // Execute Plan: explicitly selected
             Some(1) => {
                 let step_items: Vec<tui::SelectItem> = steps
                     .iter()
@@ -3357,11 +3357,14 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                     }
                 }
             }
-            Some(2) => {
+            Some(2) | None => {
                 tui::line(&tui::yellow("  cancelled"));
                 return Ok(());
             }
-            _ => break,
+            _ => {
+                tui::line(&tui::yellow("  cancelled"));
+                return Ok(());
+            }
         }
     }
 
