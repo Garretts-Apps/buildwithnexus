@@ -4,6 +4,13 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.13] - 2026-07-29
+
+### Fixed
+- **Slash Commands Trailing Whitespace Guard (`/model`, `/mode`, `/permissions`):**
+  Fixed whitespace handling so typing `/model ` (with trailing spaces) opens the interactive
+  model selection dialog instead of skipping execution.
+
 ## [0.12.12] - 2026-07-29
 
 ### Fixed & Enhanced

@@ -585,38 +585,84 @@ fn repl(
 
         // /mode with an inline argument, e.g. `/mode build`, `/mode 1`.
         if let Some(mode_arg) = t.strip_prefix("/mode ") {
-            match mode_arg.trim() {
-                "1" | "plan" => {
-                    mode = Mode::Plan;
-                    last_suggested_mode = None;
-                    tui::show_mode_change("PLAN");
+            let arg = mode_arg.trim();
+            if arg.is_empty() {
+                let items = vec![
+                    tui::SelectItem {
+                        label: "Plan".into(),
+                        detail: "Break down implementation into concrete steps before building"
+                            .into(),
+                    },
+                    tui::SelectItem {
+                        label: "Build".into(),
+                        detail: "Agentic execution — edit files, run commands, solve tasks".into(),
+                    },
+                    tui::SelectItem {
+                        label: "Brainstorm".into(),
+                        detail: "Conversational thought partner with full codebase read access"
+                            .into(),
+                    },
+                ];
+                let title = format!("Select Execution Mode (Current: {})", mode_label(&mode));
+                if let Some(idx) = tui::select_item(&title, &items) {
+                    match idx {
+                        0 => {
+                            mode = Mode::Plan;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("PLAN");
+                        }
+                        1 => {
+                            mode = Mode::Build;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("BUILD");
+                        }
+                        2 => {
+                            mode = Mode::Brainstorm;
+                            last_suggested_mode = None;
+                            tui::show_mode_change("BRAINSTORM");
+                        }
+                        _ => {}
+                    }
                 }
-                "2" | "build" => {
-                    mode = Mode::Build;
-                    last_suggested_mode = None;
-                    tui::show_mode_change("BUILD");
+            } else {
+                match arg {
+                    "1" | "plan" => {
+                        mode = Mode::Plan;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("PLAN");
+                    }
+                    "2" | "build" => {
+                        mode = Mode::Build;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("BUILD");
+                    }
+                    "3" | "brainstorm" => {
+                        mode = Mode::Brainstorm;
+                        last_suggested_mode = None;
+                        tui::show_mode_change("BRAINSTORM");
+                    }
+                    other => tui::line(&tui::red(&format!(
+                        "  unknown mode '{other}' — try: plan, build, brainstorm"
+                    ))),
                 }
-                "3" | "brainstorm" => {
-                    mode = Mode::Brainstorm;
-                    last_suggested_mode = None;
-                    tui::show_mode_change("BRAINSTORM");
-                }
-                other => tui::line(&tui::red(&format!(
-                    "  unknown mode '{other}' — try: plan, build, brainstorm"
-                ))),
             }
             continue;
         }
 
         // /permissions with an inline argument, e.g. `/permissions auto`.
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
-            match perm_arg.trim() {
-                "ask" | "1" => apply_permission(&mut perm, "ask"),
-                "auto" | "2" => apply_permission(&mut perm, "auto"),
-                "readonly" | "3" => apply_permission(&mut perm, "readonly"),
-                other => tui::line(&tui::red(&format!(
-                    "  unknown permission '{other}' — try: ask, auto, readonly"
-                ))),
+            let arg = perm_arg.trim();
+            if arg.is_empty() {
+                handle_permissions(&mut perm);
+            } else {
+                match arg {
+                    "ask" | "1" => apply_permission(&mut perm, "ask"),
+                    "auto" | "2" => apply_permission(&mut perm, "auto"),
+                    "readonly" | "3" => apply_permission(&mut perm, "readonly"),
+                    other => tui::line(&tui::red(&format!(
+                        "  unknown permission '{other}' — try: ask, auto, readonly"
+                    ))),
+                }
             }
             continue;
         }
@@ -639,6 +685,8 @@ fn repl(
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
                 swap_model(&mut provider, &prov, &m, None);
+            } else {
+                handle_model(&mut provider);
             }
             continue;
         }
