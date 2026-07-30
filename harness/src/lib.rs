@@ -1306,8 +1306,6 @@ fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Opt
 
 fn should_answer_conversationally(task: &str, current: &Mode) -> bool {
     // Simple greetings are always conversational, even in Brainstorm mode.
-    // Without this, "hi" in Brainstorm falls into run_brainstorm where the
-    // model can emit [SUGGEST:BUILD] and trigger an unwanted mode switch.
     if is_simple_conversation(task) {
         return true;
     }
@@ -1369,6 +1367,14 @@ fn looks_like_action_request(task: &str) -> bool {
         "read",
         "inspect",
         "list",
+        "app",
+        "script",
+        "program",
+        "function",
+        "input",
+        "return",
+        "code",
+        "logic",
     ];
     action_words.iter().any(|word| {
         l == *word
