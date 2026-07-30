@@ -282,8 +282,19 @@ fn flatten_openai_messages(body: &mut Value) {
             // marker it sees and stop making real calls. The following "Tool
             // result:" user turn already conveys what happened.
             "assistant" => {
-                if !text.is_empty() {
-                    folded.push(("assistant".into(), text));
+                let mut content = text;
+                if let Some(calls) = m["tool_calls"].as_array() {
+                    for c in calls {
+                        let name = c["function"]["name"].as_str().unwrap_or("");
+                        let args = c["function"]["arguments"].as_str().unwrap_or("");
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&format!("`{name}({args})`"));
+                    }
+                }
+                if !content.is_empty() {
+                    folded.push(("assistant".into(), content));
                 }
             }
             "tool" => {
@@ -334,6 +345,9 @@ fn openai_exchange(
 ) -> Result<Reply, String> {
     if streaming {
         body["stream"] = json!(true);
+    }
+    if is_local_url(req.url()) {
+        flatten_openai_messages(&mut body);
     }
     match send_raw(req.clone(), body.clone()) {
         Ok(resp) => finish_openai(resp, streaming, on_text, on_thinking),

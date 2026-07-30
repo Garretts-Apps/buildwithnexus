@@ -828,6 +828,12 @@ fn maybe_json_buffer_is_too_large(lines: &[String]) -> bool {
 
 fn is_tool_call_json_block(lang: &str, code: &str) -> bool {
     let lang = lang.trim().to_ascii_lowercase();
+    if matches!(
+        lang.as_str(),
+        "tool_code" | "tools" | "tool_call" | "function"
+    ) {
+        return true;
+    }
     if !lang.is_empty() && lang != "json" {
         return false;
     }
@@ -3007,7 +3013,11 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
 
     let print_line = |s: &str| {
         let mut out = io::stdout();
-        let _ = execute!(out, crossterm::style::Print(s), crossterm::style::Print("\r\n"));
+        let _ = execute!(
+            out,
+            crossterm::style::Print(s),
+            crossterm::style::Print("\r\n")
+        );
     };
 
     let result = loop {
