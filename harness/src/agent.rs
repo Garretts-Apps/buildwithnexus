@@ -2617,11 +2617,9 @@ fn fallback_exit_plan_input(task: &str) -> serde_json::Value {
         ]
     } else {
         vec![
-            format!("Implement the user's requested task: {task}."),
-            "Inspect only the files or directories needed for that task.".to_string(),
-            "Make the required edits or generated files with the appropriate tools.".to_string(),
-            "Verify the result with focused checks or tests.".to_string(),
-            "Summarize the completed work and any remaining risks.".to_string(),
+            format!("Inspect workspace and requirements for: {task}"),
+            format!("Create and edit target source files to build: {task}"),
+            format!("Verify execution and run checks/tests for: {task}"),
         ]
     };
     serde_json::json!({ "steps": steps })
@@ -2636,52 +2634,23 @@ fn plan_step_is_actionable(step: &str) -> bool {
     {
         return false;
     }
-    let first = step
-        .trim()
-        .trim_start_matches(['`', '\'', '"', '['])
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| !c.is_ascii_alphabetic())
-        .to_ascii_lowercase();
-    matches!(
-        first.as_str(),
-        "add"
-            | "analyze"
-            | "audit"
-            | "build"
-            | "check"
-            | "compare"
-            | "configure"
-            | "create"
-            | "document"
-            | "edit"
-            | "find"
-            | "fix"
-            | "generate"
-            | "identify"
-            | "implement"
-            | "inspect"
-            | "install"
-            | "list"
-            | "load"
-            | "open"
-            | "publish"
-            | "read"
-            | "refactor"
-            | "remove"
-            | "review"
-            | "run"
-            | "search"
-            | "start"
-            | "stop"
-            | "summarize"
-            | "test"
-            | "update"
-            | "use"
-            | "verify"
-            | "write"
-    )
+    let trimmed = step.trim().trim_matches('`');
+    if trimmed.is_empty() {
+        return false;
+    }
+    if (trimmed.starts_with('.') || trimmed.ends_with('/')) && !trimmed.contains(' ') {
+        return false;
+    }
+    if (trimmed.ends_with(".md")
+        || trimmed.ends_with(".rs")
+        || trimmed.ends_with(".py")
+        || trimmed.ends_with(".json")
+        || trimmed.ends_with(".example"))
+        && !trimmed.contains(' ')
+    {
+        return false;
+    }
+    true
 }
 
 fn strip_plan_marker(line: &str) -> Option<&str> {
@@ -3080,8 +3049,12 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         "You are bwn in PLAN mode: a coding partner working out an implementation plan with the user. \
         You have full read access to the codebase — use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect it as needed. \
         Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
-        When the user has given you a real task to plan, call exit_plan or ExitPlanMode with a concise numbered implementation plan — concrete, actionable, at most 8 steps, no code fences, no shell snippets, no intro or outro prose. \
-        But not every message is a task. If the user just greets you, jokes around, asks who you are or what you can do, or makes small talk, don't force a plan and don't recite a capability disclaimer — reply in a line or two, naturally and in character, then offer to plan the real work if there is any.\n\n{prefix}"
+        When the user gives you a task to plan, inspect the workspace and call exit_plan or ExitPlanMode with a concrete implementation plan. \
+        Your plan must explicitly specify: \
+        1. The target programming language, framework, and main file path(s) to create/modify (e.g. Python script in `main.py`, Rust CLI in `src/main.rs`, Node.js app in `index.js`, or Bash script in `app.sh`). \
+        2. The specific interactive logic and components to write. \
+        3. How to verify and run the result. \
+        Keep the plan actionable, concrete, and concise (3 to 8 steps). If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
