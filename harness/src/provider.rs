@@ -183,10 +183,17 @@ pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, 
     request(p, msgs, tools, false, &mut sink, &mut noop)
 }
 
+fn is_local_url(url: &str) -> bool {
+    url.contains("localhost")
+        || url.contains("127.0.0.1")
+        || url.contains("::1")
+        || url.contains("0.0.0.0")
+}
+
 /// One-token probe through the real completion path — proves the key is
 /// accepted, the model exists, and the server is reachable, so a model swap
 /// can be validated before it's declared successful. Costs ≤1 output token.
-pub fn validate(p: &Provider) -> Result<(), String> {
+pub fn validate(p: &Provider) -> Result<Option<String>, String> {
     let probe = Provider {
         protocol: p.protocol,
         base_url: p.base_url.clone(),
@@ -198,15 +205,15 @@ pub fn validate(p: &Provider) -> Result<(), String> {
         ollama_ctx: std::sync::OnceLock::new(),
     };
     match complete(&probe, &[Msg::User("ping".into())], &[]) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(None),
         Err(e)
             if p.protocol == Protocol::OpenAi && (e.contains("404") || e.contains("not found")) =>
         {
-            if p.model != "local-model" && p.base_url.contains("localhost") {
+            if p.model != "local-model" && is_local_url(&p.base_url) {
                 let mut fallback_probe = probe;
                 fallback_probe.model = "local-model".to_string();
                 if complete(&fallback_probe, &[Msg::User("ping".into())], &[]).is_ok() {
-                    return Ok(());
+                    return Ok(Some("local-model".to_string()));
                 }
             }
             Err(e)

@@ -1134,6 +1134,14 @@ pub fn poll_typeahead() {
                 MouseEventKind::Up(MouseButton::Left) => selection_finish(m.row, m.column),
                 _ => {}
             },
+            Ok(Event::Resize(_, _)) => {
+                if ALT_SCREEN.load(Ordering::Relaxed) {
+                    set_output_region();
+                    render_output();
+                    render_footer();
+                    render_queued_composer();
+                }
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -1792,7 +1800,19 @@ fn queue_footer(out: &mut io::Stdout) {
             " {} [{}] {}",
             dim("ctx:"),
             colored_bar,
-            dim(&format!("{pct}% {}k/{}k", used / 1_000, total / 1_000))
+            dim(&format!(
+                "{pct}% {}/{}",
+                if used < 1000 {
+                    format!("{}", used)
+                } else {
+                    format!("{:.1}k", used as f64 / 1000.0)
+                },
+                if total < 1000 {
+                    format!("{}", total)
+                } else {
+                    format!("{:.1}k", total as f64 / 1000.0)
+                }
+            ))
         )
     } else {
         String::new()
@@ -1835,7 +1855,11 @@ fn render_footer() {
         return;
     }
     let mut out = io::stdout();
+    let _ = write!(out, "\x1b[?2026h");
+    let _ = execute!(out, SavePosition);
     queue_footer(&mut out);
+    let _ = execute!(out, RestorePosition);
+    let _ = write!(out, "\x1b[?2026l");
     let _ = out.flush();
 }
 
@@ -1928,10 +1952,7 @@ pub fn set_permission_mode(mode: &str) {
             dim("· /permissions · wheel/PgUp · drag-copy · /mouse")
         );
     }
-    let mut out = io::stdout();
-    let _ = execute!(out, SavePosition);
     render_footer();
-    let _ = execute!(out, RestorePosition);
 }
 
 fn render_output() {
@@ -2030,7 +2051,14 @@ fn scroll_output(delta: isize) {
     let next = if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        current.saturating_add(delta as usize)
+        let total = if let Ok(t) = transcript().lock() {
+            t.total_rows()
+        } else {
+            0
+        };
+        let rows = term_size().1.saturating_sub(reserved_rows()) as usize;
+        let max_offset = total.saturating_sub(rows);
+        current.saturating_add(delta as usize).min(max_offset)
     };
     SCROLL_OFFSET.store(next, Ordering::Relaxed);
     render_output();
@@ -2276,9 +2304,14 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         .saturating_sub(pwidth)
         .saturating_sub(COMPOSER_PAD + 2)
         .max(8) as usize;
-    let (s, _col) = viewport(cursor, avail, *scroll);
+    let (s, _col) = viewport(buf, cursor, avail, *scroll);
     *scroll = s;
-    let end = (s + avail).min(buf.len());
+    let mut end = s;
+    let mut current_width = 0;
+    while end < buf.len() && current_width + char_width(buf[end]) <= avail {
+        current_width += char_width(buf[end]);
+        end += 1;
+    }
     let shown: String = buf[s..end].iter().collect();
     let col_width = buf[s..cursor.min(buf.len())]
         .iter()
@@ -2356,11 +2389,7 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
     line("");
     // Wordmark row — gradient "buildwithnexus" + version.
     line(&clip_ansi_line(
-        &format!(
-            "  {}  {}",
-            bold(&wordmark()),
-            dim(&format!("v{}", crate::VERSION)),
-        ),
+        &format!("  {}  {}", bold(&wordmark()), dim(crate::VERSION),),
         w,
     ));
     line(&dim(&format!("  {}", "─".repeat(w.saturating_sub(4)))));
@@ -2970,41 +2999,63 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     }
 
     let mut selected = 0usize;
+    let mut scroll_offset = 0usize;
     cursor_hide();
 
-    let box_height = (items.len() + 3) as u16;
     let mut first_render = true;
+    let mut last_box_height = 0;
 
     let result = loop {
+        let (width, height) = term_size();
+        let max_items = (height.saturating_sub(6)).max(1) as usize;
+        let visible_items = items.len().min(max_items);
+        let box_height = (visible_items + 3) as u16;
+
+        if selected < scroll_offset {
+            scroll_offset = selected;
+        } else if selected >= scroll_offset + visible_items {
+            scroll_offset = selected + 1 - visible_items;
+        }
+
         if !first_render {
-            print!("\x1B[{}A", box_height);
+            print!("\x1B[{}A\x1B[0J", last_box_height);
         }
         first_render = false;
+        last_box_height = box_height;
 
         line("");
-        line(&accent(&format!(
-            "  ┌── {title} ──────────────────────────────────────"
-        )));
-        for (i, item) in items.iter().enumerate() {
+        line(&clip_ansi_line(
+            &accent(&format!(
+                "  ┌── {title} ─────────────────────────────────────────────────────────────"
+            )),
+            width as usize,
+        ));
+        for (i, item) in items
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_items)
+        {
             let is_sel = i == selected;
-            if is_sel {
-                line(&format!(
+            let formatted = if is_sel {
+                format!(
                     "  │  {} {} {}",
                     accent("❯"),
                     bold(&item.label),
                     green(&format!("({})", item.detail))
-                ));
+                )
             } else {
-                line(&format!(
+                format!(
                     "  │    {} {}",
                     dim(&item.label),
                     dim(&format!("({})", item.detail))
-                ));
-            }
+                )
+            };
+            line(&clip_ansi_line(&formatted, width as usize));
         }
-        line(&dim(
-            "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────",
-        ));
+        line(&clip_ansi_line(&dim(
+            "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────────────────────────────",
+        ), width as usize));
         flush();
 
         let mut next_sel = selected;
@@ -3039,11 +3090,11 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         };
 
         if action == "enter" {
-            print!("\x1B[{}A\x1B[0J", box_height);
+            print!("\x1B[{}A\x1B[0J", last_box_height);
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
             break Some(selected);
         } else if action == "cancel" {
-            print!("\x1B[{}A\x1B[0J", box_height);
+            print!("\x1B[{}A\x1B[0J", last_box_height);
             line(&dim("  cancelled selection"));
             break None;
         } else {
@@ -3154,15 +3205,19 @@ enum RawLine {
     CycleMode,
 }
 
-fn viewport(cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
+fn viewport(buf: &[char], cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
     let avail = avail.max(1);
     let mut s = scroll;
     if cursor < s {
         s = cursor;
-    } else if cursor >= s + avail {
-        s = cursor + 1 - avail;
+    } else {
+        let mut cur_width: usize = buf[s..cursor].iter().copied().map(char_width).sum();
+        while cur_width >= avail && s < cursor {
+            cur_width -= char_width(buf[s]);
+            s += 1;
+        }
     }
-    (s, cursor - s)
+    (s, buf[s..cursor].iter().copied().map(char_width).sum())
 }
 
 fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: &mut usize) {
@@ -3172,7 +3227,7 @@ fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: 
     }
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
     let avail = width.saturating_sub(start.0).max(8) as usize;
-    let (s, _col) = viewport(cursor, avail, *scroll);
+    let (s, _col) = viewport(buf, cursor, avail, *scroll);
     *scroll = s;
     let end = (s + avail).min(buf.len());
     let shown: String = buf[s..end].iter().collect();
@@ -3311,8 +3366,20 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
 // Cached: the autocomplete popup consults this on every keystroke, and the
 // skill/command set doesn't change within a session.
 fn load_slash_commands() -> Vec<String> {
-    static CMDS: OnceLock<Vec<String>> = OnceLock::new();
-    CMDS.get_or_init(load_slash_commands_uncached).clone()
+    #[allow(clippy::type_complexity)]
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(u64, Vec<String>)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let now = monotonic_ms();
+    let mut lock = cache.lock().unwrap();
+    if let Some((ts, cmds)) = &*lock {
+        if now.saturating_sub(*ts) < 5_000 {
+            return cmds.clone();
+        }
+    }
+    let cmds = load_slash_commands_uncached();
+    *lock = Some((now, cmds.clone()));
+    cmds
 }
 
 fn load_slash_commands_uncached() -> Vec<String> {
@@ -3561,9 +3628,24 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
         out.sort();
         return out;
     }
-    let (base, dir, prefix) = match partial.rfind('/') {
-        Some(i) => (&partial[..=i], cwd.join(&partial[..=i]), &partial[i + 1..]),
-        None => ("", cwd.to_path_buf(), partial),
+    let mut completion_partial = partial;
+    let mut range_suffix = "";
+    if let Some(idx) = completion_partial.rfind(':') {
+        if completion_partial[idx + 1..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-')
+        {
+            range_suffix = &completion_partial[idx..];
+            completion_partial = &completion_partial[..idx];
+        }
+    }
+    let (base, dir, prefix) = match completion_partial.rfind('/') {
+        Some(i) => (
+            &completion_partial[..=i],
+            cwd.join(&completion_partial[..=i]),
+            &completion_partial[i + 1..],
+        ),
+        None => ("", cwd.to_path_buf(), completion_partial),
     };
     let mut out = Vec::new();
     if base.is_empty() {
@@ -3582,6 +3664,8 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
                 let mut full = format!("{base}{name}");
                 if e.path().is_dir() {
                     full.push('/');
+                } else {
+                    full.push_str(range_suffix);
                 }
                 out.push(full);
             }
@@ -3797,8 +3881,18 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 {
                     let col = m.column as usize;
                     if col >= start.0 as usize {
-                        let offset = col - start.0 as usize + scroll;
-                        cursor = offset.min(buf.len());
+                        let target_col = col - start.0 as usize;
+                        let mut current_col = 0;
+                        let mut target_idx = scroll;
+                        while target_idx < buf.len() {
+                            let w = char_width(buf[target_idx]);
+                            if current_col + w > target_col {
+                                break;
+                            }
+                            current_col += w;
+                            target_idx += 1;
+                        }
+                        cursor = target_idx.min(buf.len());
                         redraw(prompt, start, &buf, cursor, &mut scroll);
                     }
                 }
@@ -4244,6 +4338,11 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 if let Ok(h) = history().lock() {
                     if !h.is_empty() {
+                        if let Some(cur) = hist_idx {
+                            if buf != h[cur].chars().collect::<Vec<char>>() {
+                                hist_idx = None;
+                            }
+                        }
                         if hist_idx.is_none() {
                             // First ↑: stash the draft and filter recall by it.
                             hist_draft = buf.clone();
@@ -4265,18 +4364,22 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 }
                 if let Ok(h) = history().lock() {
                     if let Some(cur) = hist_idx {
-                        match hist_match(&h, &hist_prefix, Some(cur), false) {
-                            Some(idx) => {
-                                hist_idx = Some(idx);
-                                buf = h[idx].chars().collect();
-                                cursor = buf.len();
-                            }
-                            None => {
-                                // Past the newest entry: the draft comes back
-                                // instead of a destroyed line.
-                                hist_idx = None;
-                                buf = hist_draft.clone();
-                                cursor = buf.len();
+                        if buf != h[cur].chars().collect::<Vec<char>>() {
+                            hist_idx = None;
+                        } else {
+                            match hist_match(&h, &hist_prefix, Some(cur), false) {
+                                Some(idx) => {
+                                    hist_idx = Some(idx);
+                                    buf = h[idx].chars().collect();
+                                    cursor = buf.len();
+                                }
+                                None => {
+                                    // Past the newest entry: the draft comes back
+                                    // instead of a destroyed line.
+                                    hist_idx = None;
+                                    buf = hist_draft.clone();
+                                    cursor = buf.len();
+                                }
                             }
                         }
                     }
@@ -4531,16 +4634,18 @@ mod tests {
 
     #[test]
     fn viewport_keeps_cursor_visible() {
-        assert_eq!(viewport(3, 10, 0), (0, 3));
-        assert_eq!(viewport(20, 10, 0), (11, 9));
-        assert_eq!(viewport(2, 10, 11), (2, 0));
-        assert_eq!(viewport(9, 10, 0), (0, 9));
-        assert_eq!(viewport(15, 10, 11), (11, 4));
+        let buf = &['a'; 25];
+        assert_eq!(viewport(buf, 3, 10, 0), (0, 3));
+        assert_eq!(viewport(buf, 20, 10, 0), (11, 9));
+        assert_eq!(viewport(buf, 2, 10, 11), (2, 0));
+        assert_eq!(viewport(buf, 9, 10, 0), (0, 9));
+        assert_eq!(viewport(buf, 15, 10, 11), (11, 4));
     }
 
     #[test]
     fn viewport_handles_zero_width() {
-        let (s, col) = viewport(5, 0, 3);
+        let buf = &['a'; 10];
+        let (s, col) = viewport(buf, 5, 0, 3);
         assert!(col < 1 || s <= 5);
         let _ = (s, col);
     }

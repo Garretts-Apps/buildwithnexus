@@ -32,7 +32,7 @@ fn gguf_dirs() -> Vec<PathBuf> {
 pub fn scan_gguf() -> Vec<String> {
     let mut found = Vec::new();
     for d in gguf_dirs() {
-        collect_gguf(&d, 0, &mut found);
+        collect_gguf(&d, &d, 0, &mut found);
     }
     found.sort();
     found.dedup();
@@ -42,50 +42,67 @@ pub fn scan_gguf() -> Vec<String> {
 // Absolute path to a specific GGUF file found in gguf_dirs.
 pub fn find_gguf_path(filename: &str) -> Option<PathBuf> {
     for d in gguf_dirs() {
-        if let Some(found) = search_gguf_dir(&d, filename, 0) {
+        if let Some(found) = search_gguf_dir(&d, &d, filename, 0) {
             return Some(found);
         }
     }
     None
 }
 
-fn search_gguf_dir(dir: &Path, filename: &str, depth: usize) -> Option<PathBuf> {
+fn search_gguf_dir(
+    base_dir: &Path,
+    current_dir: &Path,
+    filename: &str,
+    depth: usize,
+) -> Option<PathBuf> {
     if depth > 6 {
         return None;
     }
-    let rd = std::fs::read_dir(dir).ok()?;
+    let rd = std::fs::read_dir(current_dir).ok()?;
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            if let Some(found) = search_gguf_dir(&p, filename, depth + 1) {
+            if let Some(found) = search_gguf_dir(base_dir, &p, filename, depth + 1) {
                 return Some(found);
             }
         } else if p
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy() == filename)
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
         {
-            return Some(p);
+            if let Ok(rel) = p.strip_prefix(base_dir) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if rel_str.eq_ignore_ascii_case(&filename.replace('\\', "/")) {
+                    return Some(p);
+                }
+            } else if p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(filename))
+            {
+                return Some(p);
+            }
         }
     }
     None
 }
 
-fn collect_gguf(dir: &Path, depth: usize, out: &mut Vec<String>) {
+fn collect_gguf(base_dir: &Path, current_dir: &Path, depth: usize, out: &mut Vec<String>) {
     if depth > 6 {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else {
+    let Ok(rd) = std::fs::read_dir(current_dir) else {
         return;
     };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            collect_gguf(&p, depth + 1, out);
+            collect_gguf(base_dir, &p, depth + 1, out);
         } else if p
             .extension()
             .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
         {
-            if let Some(name) = p.file_name() {
+            if let Ok(rel) = p.strip_prefix(base_dir) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            } else if let Some(name) = p.file_name() {
                 out.push(name.to_string_lossy().into_owned());
             }
         }
@@ -112,7 +129,7 @@ mod tests {
 
         let found = scan_gguf();
         assert!(found.contains(&"qwen2.5-3b.gguf".to_string()));
-        assert!(found.contains(&"llama3.2-1b.GGUF".to_string())); // case-insensitive ext
+        assert!(found.contains(&"sub/llama3.2-1b.GGUF".to_string())); // case-insensitive ext
         assert!(!found.iter().any(|f| f.ends_with(".txt")));
 
         std::env::remove_var("NEXUS_HOME");

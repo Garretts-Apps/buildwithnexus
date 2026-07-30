@@ -66,23 +66,40 @@ pub fn run() -> Option<Settings> {
             tui::green("recommended local")
         ));
     }
-    tui::line(&tui::dim("  Local"));
+    let mut display_presets = Vec::new();
     for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| p.local) {
+        display_presets.push((i, p));
+    }
+    for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| !p.local) {
+        display_presets.push((i, p));
+    }
+
+    tui::line(&tui::dim("  Local"));
+    let mut disp_num = 1;
+    for &(_i, p) in &display_presets {
+        if !p.local {
+            break;
+        }
         tui::line(&format!(
             "  {}  {:<26} {}",
-            tui::bold(&(i + 1).to_string()),
+            tui::bold(&disp_num.to_string()),
             p.label,
             tui::green("local")
         ));
+        disp_num += 1;
     }
     tui::line(&tui::dim("  Remote"));
-    for (i, p) in PRESETS.iter().enumerate().filter(|(_, p)| !p.local) {
+    for &(_i, p) in &display_presets {
+        if p.local {
+            continue;
+        }
         tui::line(&format!(
             "  {}  {:<26} {}",
-            tui::bold(&(i + 1).to_string()),
+            tui::bold(&disp_num.to_string()),
             p.label,
             tui::blue("remote")
         ));
+        disp_num += 1;
     }
     tui::line("");
 
@@ -97,13 +114,13 @@ pub fn run() -> Option<Settings> {
             continue;
         }
         if let Ok(n) = ans.parse::<usize>() {
-            if n >= 1 && n <= PRESETS.len() {
-                break &PRESETS[n - 1];
+            if n >= 1 && n <= display_presets.len() {
+                break display_presets[n - 1].1;
             }
         }
-        if let Some(p) = PRESETS
+        if let Some(&(_, p)) = display_presets
             .iter()
-            .find(|p| p.id.eq_ignore_ascii_case(ans) || p.label.eq_ignore_ascii_case(ans))
+            .find(|&&(_, p)| p.id.eq_ignore_ascii_case(ans) || p.label.eq_ignore_ascii_case(ans))
         {
             break p;
         }
@@ -148,14 +165,12 @@ pub fn run() -> Option<Settings> {
             if pick.id == "ollama" {
                 let pull = tui::ask("  pull qwen2.5:3b now? [y/N]: ").unwrap_or_default();
                 if matches!(pull.trim(), "y" | "Y" | "yes" | "YES") {
-                    let out = crate::tools::run(
-                        "run_command",
-                        &serde_json::json!({"command": "ollama pull qwen2.5:3b"}),
-                        std::path::Path::new("."),
-                    );
-                    for line in out.content.lines() {
-                        tui::line(&tui::dim(&format!("    {line}")));
-                    }
+                    let _ = std::process::Command::new("ollama")
+                        .arg("pull")
+                        .arg("qwen2.5:3b")
+                        .stdout(std::process::Stdio::inherit())
+                        .stderr(std::process::Stdio::inherit())
+                        .status();
                 }
             }
         } else {
