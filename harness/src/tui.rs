@@ -3080,22 +3080,13 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     cursor_hide();
 
     let mut first_render = true;
-    let mut last_box_height = 0;
-
-    let print_line = |s: &str| {
-        let mut out = io::stdout();
-        let _ = execute!(
-            out,
-            crossterm::style::Print(s),
-            crossterm::style::Print("\r\n")
-        );
-    };
+    let mut last_total_lines = 0u16;
 
     let result = loop {
         let (width, height) = term_size();
         let max_items = (height.saturating_sub(6)).max(1) as usize;
         let visible_items = items.len().min(max_items);
-        let box_height = (visible_items + 3) as u16;
+        let total_lines = (visible_items + 3) as u16;
 
         if selected < scroll_offset {
             scroll_offset = selected;
@@ -3103,24 +3094,34 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             scroll_offset = selected + 1 - visible_items;
         }
 
-        if !first_render {
-            let mut out = io::stdout();
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?2026h");
+
+        if first_render {
+            for _ in 0..total_lines {
+                let _ = writeln!(out);
+            }
+            let _ = execute!(out, crossterm::cursor::MoveUp(total_lines));
+            first_render = false;
+        } else {
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::cursor::MoveUp(last_total_lines),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
         }
-        first_render = false;
-        last_box_height = box_height;
+        last_total_lines = total_lines;
 
-        print_line("");
-        print_line(&clip_ansi_line(
+        let _ = execute!(out, crossterm::style::Print("\r\n"));
+
+        let header = clip_ansi_line(
             &accent(&format!(
                 "  ┌── {title} ─────────────────────────────────────────────────────────────"
             )),
             width as usize,
-        ));
+        );
+        let _ = execute!(out, crossterm::style::Print(&header), crossterm::style::Print("\r\n"));
+
         for (i, item) in items
             .iter()
             .enumerate()
@@ -3142,12 +3143,16 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                     dim(&format!("({})", item.detail))
                 )
             };
-            print_line(&clip_ansi_line(&formatted, width as usize));
+            let line_str = clip_ansi_line(&formatted, width as usize);
+            let _ = execute!(out, crossterm::style::Print(&line_str), crossterm::style::Print("\r\n"));
         }
-        print_line(&clip_ansi_line(&dim(
+
+        let footer = clip_ansi_line(&dim(
             "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────────────────────────────",
-        ), width as usize));
-        flush();
+        ), width as usize);
+        let _ = execute!(out, crossterm::style::Print(&footer));
+        let _ = write!(out, "\x1b[?2026l");
+        let _ = out.flush();
 
         let mut next_sel = selected;
         let action = loop {
@@ -3184,7 +3189,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             let mut out = io::stdout();
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::cursor::MoveUp(last_total_lines),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
@@ -3193,7 +3198,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             let mut out = io::stdout();
             let _ = execute!(
                 out,
-                crossterm::cursor::MoveUp(last_box_height),
+                crossterm::cursor::MoveUp(last_total_lines),
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
             );
             line(&dim("  cancelled selection"));
