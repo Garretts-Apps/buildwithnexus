@@ -963,7 +963,7 @@ pub fn poll_typeahead() {
     while poll(Duration::ZERO).unwrap_or(false) {
         match read() {
             Ok(Event::Key(k)) => {
-                if k.kind != KeyEventKind::Press {
+                if k.kind == KeyEventKind::Release {
                     continue;
                 }
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1096,6 +1096,27 @@ pub fn poll_typeahead() {
                             trigger_interrupt(InterruptKind::Escape);
                         }
                     }
+                    KeyCode::Home | KeyCode::Char('a') if ctrl => {
+                        ta.cursor = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('e') if ctrl => {
+                        ta.cursor = ta.buf.len();
+                    }
+                    KeyCode::Char('w') if ctrl => {
+                        let d = ta.cursor;
+                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] == ' ' {
+                            ta.cursor -= 1;
+                        }
+                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] != ' ' {
+                            ta.cursor -= 1;
+                        }
+                        let cur = ta.cursor;
+                        ta.buf.drain(cur..d);
+                    }
+                    KeyCode::Char('k') if ctrl => {
+                        let cur = ta.cursor;
+                        ta.buf.truncate(cur);
+                    }
                     KeyCode::Backspace if !ctrl => {
                         if ta.cursor > 0 {
                             let i = ta.cursor - 1;
@@ -1124,6 +1145,19 @@ pub fn poll_typeahead() {
                         ta.cursor += 1;
                     }
                     _ => {}
+                }
+            }
+            Ok(Event::Paste(s)) => {
+                let mut ta = match typeahead().lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                for c in s.chars() {
+                    if c != '\r' && c != '\n' {
+                        let i = ta.cursor;
+                        ta.buf.insert(i, c);
+                        ta.cursor += 1;
+                    }
                 }
             }
             Ok(Event::Mouse(m)) => match m.kind {
@@ -1191,6 +1225,9 @@ pub fn render_queued_composer() {
             ta.cursor,
             &mut scroll,
         );
+        cursor_color_accent();
+        set_cursor_shape(CursorShape::Bar);
+        cursor_show();
     }
 }
 
