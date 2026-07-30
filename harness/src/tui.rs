@@ -1165,6 +1165,10 @@ pub fn render_queued_composer() {
     ensure_output_region();
     if let Ok(ta) = typeahead().lock() {
         if let Ok(mq) = message_queue().lock() {
+            if ta.buf.is_empty() && mq.is_empty() {
+                clear_composer();
+                return;
+            }
             let mut out = io::stdout();
             // One atomic frame (DEC 2026): the queued rows paint together with
             // no intermediate state a fast terminal could show mid-repaint.
@@ -2045,7 +2049,6 @@ fn render_output_throttled() {
     if now.saturating_sub(last) >= FRAME_MS || last == 0 {
         LAST_STREAM_FRAME_MS.store(now.max(1), Ordering::Relaxed);
         render_output();
-        clear_composer();
     }
 }
 
