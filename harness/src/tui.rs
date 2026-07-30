@@ -1192,11 +1192,7 @@ pub fn render_queued_composer() {
     // scrolled away between now and the next stream frame.
     ensure_output_region();
     if let Ok(ta) = typeahead().lock() {
-        if let Ok(mq) = message_queue().lock() {
-            if ta.buf.is_empty() && mq.is_empty() {
-                clear_composer();
-                return;
-            }
+        let has_queued = if let Ok(mq) = message_queue().lock() {
             let mut out = io::stdout();
             // One atomic frame (DEC 2026): the queued rows paint together with
             // no intermediate state a fast terminal could show mid-repaint.
@@ -1217,10 +1213,18 @@ pub fn render_queued_composer() {
             }
             let _ = write!(out, "\x1b[?2026l");
             let _ = out.flush();
-        }
+            !mq.is_empty()
+        } else {
+            false
+        };
         let mut scroll = 0usize;
+        let prompt_str = if is_agent_running() && (!ta.buf.is_empty() || has_queued) {
+            format!("{} {} ", dim("queued"), accent("›"))
+        } else {
+            format!("{} ", accent("›"))
+        };
         render_composer(
-            &format!("{} {} ", dim("queued"), accent("›")),
+            &prompt_str,
             &ta.buf,
             ta.cursor,
             &mut scroll,
@@ -1759,14 +1763,7 @@ fn reset_output_region() {
 }
 
 fn clear_composer() {
-    if !ALT_SCREEN.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut out = io::stdout();
-    queue_composer_box(&mut out);
-    let _ = write!(out, "{}", dim("bwn is working… (Esc to interrupt)"));
-    queue_composer_right_border(&mut out);
-    let _ = out.flush();
+    render_queued_composer();
 }
 
 // Draw the composer box borders and return with the cursor ready at the
