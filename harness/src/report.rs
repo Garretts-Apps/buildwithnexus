@@ -162,10 +162,8 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         );
         return;
     }
-    if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
-        if !is_error {
-            return;
-        }
+    if (name == "finish" || name == "exit_plan" || name == "ExitPlanMode") && !is_error {
+        return;
     }
     // Human mode previously showed nothing here — the user couldn't see command
     // output or errors. Surface results compactly, indented under the call.

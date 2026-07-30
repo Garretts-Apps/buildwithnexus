@@ -1223,12 +1223,7 @@ pub fn render_queued_composer() {
         } else {
             format!("{} ", accent("›"))
         };
-        render_composer(
-            &prompt_str,
-            &ta.buf,
-            ta.cursor,
-            &mut scroll,
-        );
+        render_composer(&prompt_str, &ta.buf, ta.cursor, &mut scroll);
         cursor_color_accent();
         set_cursor_shape(CursorShape::Bar);
         cursor_show();
@@ -3053,10 +3048,40 @@ pub struct SelectItem {
 
 // Interactive selection menu — pops a list dialog that users can navigate
 // using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
+struct PauseAgentRunningGuard {
+    was_running: bool,
+}
+
+impl PauseAgentRunningGuard {
+    fn new() -> Self {
+        let was_running = is_agent_running();
+        if was_running {
+            set_agent_running(false);
+        }
+        Self { was_running }
+    }
+}
+
+impl Drop for PauseAgentRunningGuard {
+    fn drop(&mut self) {
+        if self.was_running {
+            set_agent_running(true);
+        }
+    }
+}
+
+pub fn drain_stdin() {
+    // Intentionally no-op: do NOT read and discard stdin events so typed-ahead
+    // keystrokes (like "good point") are preserved 100% reliably.
+}
+
+// Interactive selection menu — pops a list dialog that users can navigate
+// using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
 pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     if items.is_empty() {
         return None;
     }
+    let _pause_guard = PauseAgentRunningGuard::new();
     if !is_raw() {
         line(&accent(&format!("  {title}")));
         for (i, item) in items.iter().enumerate() {
@@ -3075,27 +3100,16 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         return None;
     }
 
+    drain_stdin();
     let mut selected = 0usize;
     let mut scroll_offset = 0usize;
     cursor_hide();
-
-    let mut first_render = true;
-    let mut last_box_height = 0;
-
-    let print_line = |s: &str| {
-        let mut out = io::stdout();
-        let _ = execute!(
-            out,
-            crossterm::style::Print(s),
-            crossterm::style::Print("\r\n")
-        );
-    };
 
     let result = loop {
         let (width, height) = term_size();
         let max_items = (height.saturating_sub(6)).max(1) as usize;
         let visible_items = items.len().min(max_items);
-        let box_height = (visible_items + 3) as u16;
+        let total_lines = (visible_items + 2) as u16;
 
         if selected < scroll_offset {
             scroll_offset = selected;
@@ -3103,24 +3117,21 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             scroll_offset = selected + 1 - visible_items;
         }
 
-        if !first_render {
-            let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_box_height),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
-        }
-        first_render = false;
-        last_box_height = box_height;
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?2026h");
+        let _ = execute!(out, SavePosition);
 
-        print_line("");
-        print_line(&clip_ansi_line(
+        let base = composer_top().saturating_sub(total_lines);
+
+        let header = clip_ansi_line(
             &accent(&format!(
                 "  ┌── {title} ─────────────────────────────────────────────────────────────"
             )),
             width as usize,
-        ));
+        );
+        let _ = queue!(out, MoveTo(0, base), Clear(ClearType::CurrentLine));
+        let _ = write!(out, "{header}");
+
         for (i, item) in items
             .iter()
             .enumerate()
@@ -3142,12 +3153,22 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                     dim(&format!("({})", item.detail))
                 )
             };
-            print_line(&clip_ansi_line(&formatted, width as usize));
+            let row = base + 1 + (i - scroll_offset) as u16;
+            let line_str = clip_ansi_line(&formatted, width as usize);
+            let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+            let _ = write!(out, "{line_str}");
         }
-        print_line(&clip_ansi_line(&dim(
+
+        let footer = clip_ansi_line(&dim(
             "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────────────────────────────",
-        ), width as usize));
-        flush();
+        ), width as usize);
+        let footer_row = base + 1 + visible_items as u16;
+        let _ = queue!(out, MoveTo(0, footer_row), Clear(ClearType::CurrentLine));
+        let _ = write!(out, "{footer}");
+
+        let _ = execute!(out, RestorePosition);
+        let _ = write!(out, "\x1b[?2026l");
+        let _ = out.flush();
 
         let mut next_sel = selected;
         let action = loop {
@@ -3182,28 +3203,26 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
 
         if action == "enter" {
             let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_box_height),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
+            for r in base..=footer_row {
+                let _ = queue!(out, MoveTo(0, r), Clear(ClearType::CurrentLine));
+            }
+            let _ = out.flush();
+            render_output();
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
             break Some(selected);
         } else if action == "cancel" {
             let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_box_height),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
+            for r in base..=footer_row {
+                let _ = queue!(out, MoveTo(0, r), Clear(ClearType::CurrentLine));
+            }
+            let _ = out.flush();
+            render_output();
             line(&dim("  cancelled selection"));
             break None;
         } else {
             selected = next_sel;
         }
     };
-
-    cursor_show();
     result
 }
 
@@ -3217,6 +3236,7 @@ pub enum InputEvent {
 
 // ── single-line ask ──────────────────────────────────────────────────────────
 pub fn ask(prompt: &str) -> Option<String> {
+    let _pause_guard = PauseAgentRunningGuard::new();
     if is_raw() {
         match read_line_raw(prompt) {
             None => None,

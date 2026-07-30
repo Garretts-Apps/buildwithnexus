@@ -2638,6 +2638,21 @@ fn plan_step_is_actionable(step: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    for tool in [
+        "read_file",
+        "write_file",
+        "grep_files",
+        "list_dir",
+        "find_paths",
+        "run_command",
+        "fetch_url",
+        "apply_patch",
+        "edit_file",
+    ] {
+        if lower_step.starts_with(tool) {
+            return false;
+        }
+    }
     if (trimmed.starts_with('.') || trimmed.ends_with('/')) && !trimmed.contains(' ') {
         return false;
     }
@@ -3046,15 +3061,13 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
-        "You are bwn in PLAN mode: a coding partner working out an implementation plan with the user. \
-        You have full read access to the codebase — use read_file/list_dir/list_tree/find_paths/grep_files/fetch_url and read-only bash/run_command calls to inspect it as needed. \
-        Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
-        When the user gives you a task to plan, inspect the workspace and call exit_plan or ExitPlanMode with a concrete implementation plan. \
-        Your plan must explicitly specify: \
-        1. The target programming language, framework, and main file path(s) to create/modify (e.g. Python script in `main.py`, Rust CLI in `src/main.rs`, Node.js app in `index.js`, or Bash script in `app.sh`). \
-        2. The specific interactive logic and components to write. \
-        3. How to verify and run the result. \
-        Keep the plan actionable, concrete, and concise (3 to 8 steps). If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
+        "You are bwn in PLAN mode: an expert software architect and technical lead working out an implementation plan with the user. \
+        You have full read access to inspect the codebase as needed. Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
+        When the user gives you a high-level or underspecified task (or when key choices like tech stack, exit conditions, or edge case handling are ambiguous): \
+        1. Interrogate the user to resolve design decisions, edge cases, tech stack choices, and requirements. Use the `question` tool or ask clear targeted questions before finalizing the plan. \
+        2. Once requirements and edge cases are clear, call exit_plan or ExitPlanMode with a concise 3-to-5 step implementation plan describing concrete human implementation steps (e.g. 1. Create main.py with stdin loop 2. Handle Ctrl+C and exit keywords 3. Verify with python main.py). \
+        Do not list raw tool names (like read_file or write_file) as plan steps. \
+        If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
@@ -3326,25 +3339,32 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             },
         ];
         match tui::select_item("Approve Plan", &items) {
-            Some(0) | None => break, // Default: Enter executes plan
+            Some(0) => break, // Execute Plan: explicitly selected
             Some(1) => {
-                if let Some(n_str) = tui::ask("  step number to edit: ") {
-                    if let Ok(n) = n_str.trim().parse::<usize>() {
-                        if n >= 1 && n <= steps.len() {
-                            if let Some(new_text) = tui::ask("  new text: ") {
-                                if !new_text.trim().is_empty() {
-                                    steps[n - 1] = new_text.trim().to_string();
-                                }
-                            }
+                let step_items: Vec<tui::SelectItem> = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| tui::SelectItem {
+                        label: format!("{}. {}", i + 1, s),
+                        detail: "Select step to edit".into(),
+                    })
+                    .collect();
+                if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
+                    if let Some(new_text) = tui::ask(&format!("  edit step {}: ", idx + 1)) {
+                        if !new_text.trim().is_empty() {
+                            steps[idx] = new_text.trim().to_string();
                         }
                     }
                 }
             }
-            Some(2) => {
+            Some(2) | None => {
                 tui::line(&tui::yellow("  cancelled"));
                 return Ok(());
             }
-            _ => break,
+            _ => {
+                tui::line(&tui::yellow("  cancelled"));
+                return Ok(());
+            }
         }
     }
 
