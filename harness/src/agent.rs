@@ -3341,14 +3341,18 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
         match tui::select_item("Approve Plan", &items) {
             Some(0) | None => break, // Default: Enter executes plan
             Some(1) => {
-                if let Some(n_str) = tui::ask("  step number to edit: ") {
-                    if let Ok(n) = n_str.trim().parse::<usize>() {
-                        if n >= 1 && n <= steps.len() {
-                            if let Some(new_text) = tui::ask("  new text: ") {
-                                if !new_text.trim().is_empty() {
-                                    steps[n - 1] = new_text.trim().to_string();
-                                }
-                            }
+                let step_items: Vec<tui::SelectItem> = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| tui::SelectItem {
+                        label: format!("{}. {}", i + 1, s),
+                        detail: "Select step to edit".into(),
+                    })
+                    .collect();
+                if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
+                    if let Some(new_text) = tui::ask(&format!("  edit step {}: ", idx + 1)) {
+                        if !new_text.trim().is_empty() {
+                            steps[idx] = new_text.trim().to_string();
                         }
                     }
                 }

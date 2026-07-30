@@ -3053,6 +3053,28 @@ pub struct SelectItem {
 
 // Interactive selection menu — pops a list dialog that users can navigate
 // using Up/Down arrow keys (or j/k) and select with Enter, or cancel with Esc.
+struct PauseAgentRunningGuard {
+    was_running: bool,
+}
+
+impl PauseAgentRunningGuard {
+    fn new() -> Self {
+        let was_running = is_agent_running();
+        if was_running {
+            set_agent_running(false);
+        }
+        Self { was_running }
+    }
+}
+
+impl Drop for PauseAgentRunningGuard {
+    fn drop(&mut self) {
+        if self.was_running {
+            set_agent_running(true);
+        }
+    }
+}
+
 pub fn drain_stdin() {
     if !is_raw() {
         return;
@@ -3068,6 +3090,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     if items.is_empty() {
         return None;
     }
+    let _pause_guard = PauseAgentRunningGuard::new();
     if !is_raw() {
         line(&accent(&format!("  {title}")));
         for (i, item) in items.iter().enumerate() {
@@ -3235,6 +3258,7 @@ pub enum InputEvent {
 
 // ── single-line ask ──────────────────────────────────────────────────────────
 pub fn ask(prompt: &str) -> Option<String> {
+    let _pause_guard = PauseAgentRunningGuard::new();
     if is_raw() {
         match read_line_raw(prompt) {
             None => None,
