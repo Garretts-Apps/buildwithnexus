@@ -1218,7 +1218,14 @@ fn repl(
             agent::run_chat_turn(&provider, perm, cwd, t)
         } else {
             match &mode {
-                Mode::Plan => agent::run_plan(&provider, perm, t, cwd),
+                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd) {
+                    Ok(()) => {
+                        mode = Mode::Build;
+                        tui::show_mode_change("BUILD");
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
                 Mode::Build => agent::run_build_session(
                     &provider,
                     perm,
