@@ -462,6 +462,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
     let result = repl(provider, perm, &cwd, raw, initial_prompt);
+    kill_local_server();
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -575,7 +576,20 @@ fn repl(
         if let Some(cmd) = t.strip_prefix('!') {
             let cmd = cmd.trim();
             if !cmd.is_empty() {
-                let out = tools::run("run_command", &serde_json::json!({ "command": cmd }), cwd);
+                let tool_input = serde_json::json!({ "command": cmd });
+                if let hooks::PreDecision::Deny(r) =
+                    hooks::pre_tool_use("run_command", &tool_input, cwd)
+                {
+                    tui::line(&tui::red(&format!("  blocked by hook: {r}")));
+                    tui::bell();
+                    continue;
+                }
+                if let Some(reason) = agent::gate(perm, "run_command", &tool_input, cwd) {
+                    tui::line(&tui::red(&format!("  {reason}")));
+                    tui::bell();
+                    continue;
+                }
+                let out = tools::run("run_command", &tool_input, cwd);
                 for l in out.content.lines() {
                     tui::line(&tui::dim(&format!("  {l}")));
                 }
@@ -797,7 +811,7 @@ fn repl(
         }
 
         match t {
-            "/exit" | "/quit" | "exit" => return Ok(()),
+            "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
             "/clear" => {
                 transcript.clear();
                 sid = session::new_id();
@@ -1138,6 +1152,9 @@ fn repl(
                 tui::line(&tui::red(&format!(
                     "  unknown command /{cmd_name} — /help for all commands"
                 )));
+                continue;
+            } else {
+                tui::line(&tui::red("  type /help for available commands"));
                 continue;
             }
         }
@@ -1586,12 +1603,14 @@ fn handle_model(provider: &mut Provider) {
         }
     }
 
+    let no_server = find_llama_server_binary().is_none();
     for name in crate::local::scan_gguf() {
-        options.push((
-            "llamacpp".into(),
-            name,
-            "GGUF on disk — local server".into(),
-        ));
+        let detail = if no_server {
+            "GGUF on disk — local server (needs llama-server)".into()
+        } else {
+            "GGUF on disk — local server".into()
+        };
+        options.push(("llamacpp".into(), name, detail));
     }
 
     for p in config::PRESETS.iter().filter(|p| !p.local) {
@@ -1714,7 +1733,11 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
             .call()
         {
             if res.status() < 500 {
-                return Some(url.to_string());
+                if let Some(ct) = res.header("content-type") {
+                    if ct.contains("application/json") {
+                        return Some(url.to_string());
+                    }
+                }
             }
         }
         let root_probe = format!("{root}/health");
@@ -1751,8 +1774,30 @@ fn find_llama_server_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+static LLAMA_SERVER_PROCESS: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+pub fn kill_local_server() {
+    if let Ok(mut lock) = LLAMA_SERVER_PROCESS.lock() {
+        if let Some(mut child) = lock.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<String> {
     if let Some(active_url) = find_active_local_base_url(preferred_url) {
+        if active_url.contains("8080") {
+            let probe = format!("{}/models", active_url.trim_end_matches('/'));
+            if let Ok(res) = ureq::get(&probe).call() {
+                if let Ok(json) = res.into_string() {
+                    if !json.contains(model_name) {
+                        tui::line(&tui::yellow(&format!("  ⚠ local server at {active_url} is loaded with a different model. Switch it manually if needed.")));
+                    }
+                }
+            }
+        }
         return Some(active_url);
     }
     let server_bin = find_llama_server_binary()?;
@@ -1773,24 +1818,37 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
         .stderr(std::process::Stdio::null())
         .spawn();
 
-    if spawn_res.is_err() {
-        return None;
+    match spawn_res {
+        Ok(child) => {
+            if let Ok(mut lock) = LLAMA_SERVER_PROCESS.lock() {
+                *lock = Some(child);
+            }
+        }
+        Err(_) => return None,
     }
 
-    for _ in 0..25 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    use std::io::Write;
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        print!(".");
+        let _ = std::io::stdout().flush();
         if ureq::get("http://localhost:8080/v1/models")
             .timeout(std::time::Duration::from_millis(300))
             .call()
             .is_ok()
         {
+            println!();
             tui::line(&tui::green(
                 "  ✓ local llama-server is active at http://localhost:8080/v1",
             ));
             return Some("http://localhost:8080/v1".to_string());
         }
     }
-    Some("http://localhost:8080/v1".to_string())
+    println!();
+    tui::line(&tui::red(
+        "  ✗ local llama-server failed to start within 30 seconds",
+    ));
+    None
 }
 
 /// Applies a model swap only after the target provider is actually usable:
@@ -1928,6 +1986,11 @@ fn swap_model(
             tui::line(&tui::yellow(&format!(
                 "  ✗ no local server running on ports 8080/1234/11434/8000 for '{model}'."
             )));
+            if find_llama_server_binary().is_none() {
+                tui::line(&tui::dim(
+                    "    llama-server not found. Install it with: brew install llama.cpp",
+                ));
+            }
             tui::line(&tui::dim(
                 "    1. start llama.cpp server:  llama-server -m ~/.models/<model> --port 8080",
             ));
@@ -1960,29 +2023,39 @@ fn swap_model(
                 tui::line(&tui::dim(&format!(
                     "  validating {model} — one-token probe…"
                 )));
-                if let Err(e) = provider::validate(&p) {
-                    tui::line(&tui::red(&format!("  ✗ validation failed: {e}")));
-                    let hint = if e.contains("401") || e.contains("403") {
-                        format!(
+                match provider::validate(&p) {
+                    Ok(Some(new_model)) => {
+                        s.model = new_model.clone();
+                        provider.model = new_model;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tui::line(&tui::red(&format!("  ✗ validation failed: {e}")));
+                        let hint = if e.contains("401") || e.contains("403") {
+                            format!(
                             "the API key was rejected — re-run /model to enter a new one, or update {}",
                             if preset.id == "custom" { config::CUSTOM_KEY } else { preset.env_key }
                         )
-                    } else if e.contains("404") || e.to_lowercase().contains("model") {
-                        format!("'{model}' doesn't look like a model this provider serves — check the name")
-                    } else if e.contains("connection failed") {
-                        format!(
-                            "nothing is answering at {} — start the server, then /model again",
-                            p.base_url
-                        )
-                    } else {
-                        "fix the issue above, then /model again".to_string()
-                    };
-                    tui::line(&tui::dim(&format!("    {hint}")));
-                    tui::line(&tui::dim(&format!(
-                        "    keeping the current model ({}).",
-                        provider.model
-                    )));
-                    return;
+                        } else if e.contains("404") || e.to_lowercase().contains("model") {
+                            format!("'{model}' doesn't look like a model this provider serves — check the name")
+                        } else if e.contains("Connection refused")
+                            || e.contains("connect error")
+                            || e.contains("connection failed")
+                        {
+                            format!(
+                                "nothing is answering at {} — start the server, then /model again",
+                                p.base_url
+                            )
+                        } else {
+                            "fix the issue above, then /model again".to_string()
+                        };
+                        tui::line(&tui::dim(&format!("    {hint}")));
+                        tui::line(&tui::dim(&format!(
+                            "    keeping the current model ({}).",
+                            provider.model
+                        )));
+                        return;
+                    }
                 }
             }
             *provider = p;
@@ -2160,8 +2233,12 @@ fn handle_kb_index(cwd: &std::path::Path) {
         "  scanning workspace for source files and symbols…",
     ));
     let mut count = 0;
+    tui::set_agent_running(true);
     let mut dirs_to_visit = vec![cwd.to_path_buf()];
     while let Some(dir) = dirs_to_visit.pop() {
+        if tui::interrupted() {
+            break;
+        }
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for entry in rd.flatten() {
                 let path = entry.path();
@@ -2300,6 +2377,7 @@ fn handle_kb_index(cwd: &std::path::Path) {
             }
         }
     }
+    tui::set_agent_running(false);
     if let Err(e) = kb.save() {
         tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
     } else {
@@ -2922,6 +3000,30 @@ fn handle_doctor_tui() {
 }
 
 fn print_help() {
+    tui::line(&tui::dim(
+        "  /plan <task>        Break down implementation into steps",
+    ));
+    tui::line(&tui::dim(
+        "  /build <task>       Agentic execution of a task",
+    ));
+    tui::line(&tui::dim(
+        "  /brainstorm <task>  Conversational thought partner",
+    ));
+    tui::line(&tui::dim("  /model <name>       Hot-swap the AI model"));
+    tui::line(&tui::dim(
+        "  /permissions        Change what the agent can do unprompted",
+    ));
+    tui::line(&tui::dim(
+        "  /schedule <delay>   Run a task later (e.g. 5m cargo test)",
+    ));
+    tui::line(&tui::dim(
+        "  /loop <interval>    Run a task repeatedly (e.g. 30m)",
+    ));
+    tui::line(&tui::dim(
+        "  /trace <id>         View detailed receipts for a turn",
+    ));
+    tui::line("");
+    tui::line(&tui::bold(&tui::accent("  commands")));
     // (command, args/aliases hint, description) grouped by section. Rendered
     // as an auto-aligned table so alignment can't drift as commands change.
     type Row = (&'static str, &'static str, &'static str);
@@ -3011,7 +3113,6 @@ fn print_help() {
         .unwrap_or(0);
 
     tui::line("");
-    tui::line(&tui::bold(&tui::accent("  commands")));
     for (title, rows) in sections {
         tui::line("");
         tui::line(&tui::dim(&format!("  {title}")));
@@ -3500,7 +3601,7 @@ fn run_doctor() {
                         }
                     } else {
                         match provider::validate(&p) {
-                            Ok(()) => println!(
+                            Ok(_) => println!(
                                 "  ✓ provider       {} answers as {} (one-token probe)",
                                 s.provider, p.model
                             ),
