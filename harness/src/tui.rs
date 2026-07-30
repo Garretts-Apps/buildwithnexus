@@ -3114,9 +3114,6 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     let mut scroll_offset = 0usize;
     cursor_hide();
 
-    let mut first_render = true;
-    let mut last_total_lines = 0u16;
-
     let result = loop {
         let (width, height) = term_size();
         let max_items = (height.saturating_sub(6)).max(1) as usize;
@@ -3131,22 +3128,9 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
 
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?2026h");
+        let _ = execute!(out, SavePosition);
 
-        if first_render {
-            for _ in 0..total_lines {
-                let _ = writeln!(out);
-            }
-            let _ = execute!(out, crossterm::cursor::MoveUp(total_lines));
-            first_render = false;
-        } else {
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
-                crossterm::cursor::MoveToColumn(0),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
-        }
-        last_total_lines = total_lines;
+        let base = composer_top().saturating_sub(total_lines);
 
         let header = clip_ansi_line(
             &accent(&format!(
@@ -3154,7 +3138,8 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             )),
             width as usize,
         );
-        let _ = execute!(out, crossterm::style::Print(&header), crossterm::style::Print("\r\n"));
+        let _ = queue!(out, MoveTo(0, base), Clear(ClearType::CurrentLine));
+        let _ = write!(out, "{header}");
 
         for (i, item) in items
             .iter()
@@ -3177,14 +3162,20 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                     dim(&format!("({})", item.detail))
                 )
             };
+            let row = base + 1 + (i - scroll_offset) as u16;
             let line_str = clip_ansi_line(&formatted, width as usize);
-            let _ = execute!(out, crossterm::style::Print(&line_str), crossterm::style::Print("\r\n"));
+            let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+            let _ = write!(out, "{line_str}");
         }
 
         let footer = clip_ansi_line(&dim(
             "  └── Use ↑/↓ to navigate, Enter to select, Esc to cancel ──────────────────────────────",
         ), width as usize);
-        let _ = execute!(out, crossterm::style::Print(&footer));
+        let footer_row = base + 1 + visible_items as u16;
+        let _ = queue!(out, MoveTo(0, footer_row), Clear(ClearType::CurrentLine));
+        let _ = write!(out, "{footer}");
+
+        let _ = execute!(out, RestorePosition);
         let _ = write!(out, "\x1b[?2026l");
         let _ = out.flush();
 
@@ -3221,30 +3212,26 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
 
         if action == "enter" {
             let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
-                crossterm::cursor::MoveToColumn(0),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
+            for r in base..=footer_row {
+                let _ = queue!(out, MoveTo(0, r), Clear(ClearType::CurrentLine));
+            }
+            let _ = out.flush();
+            render_output();
             line(&green(&format!("  ✓ selected: {}", items[selected].label)));
             break Some(selected);
         } else if action == "cancel" {
             let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::cursor::MoveUp(last_total_lines.saturating_sub(1)),
-                crossterm::cursor::MoveToColumn(0),
-                crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-            );
+            for r in base..=footer_row {
+                let _ = queue!(out, MoveTo(0, r), Clear(ClearType::CurrentLine));
+            }
+            let _ = out.flush();
+            render_output();
             line(&dim("  cancelled selection"));
             break None;
         } else {
             selected = next_sel;
         }
     };
-
-    cursor_show();
     result
 }
 
