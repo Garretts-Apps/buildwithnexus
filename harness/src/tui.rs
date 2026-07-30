@@ -712,9 +712,6 @@ impl StreamRenderer {
                     let code = lines.join("\n");
                     if !is_tool_call_json_block(&lang, &code) {
                         self.render_code_block(&lang, &lines);
-                        osc52_copy(&code);
-                        let notice = dim("  ✓ ⎘ copied to clipboard");
-                        self.emit(&notice);
                     }
                     self.state = StreamState::Normal;
                 } else {
@@ -738,9 +735,6 @@ impl StreamRenderer {
                 let code = lines.join("\n");
                 if !is_tool_call_json_block(&lang, &code) {
                     self.render_code_block(&lang, &lines);
-                    osc52_copy(&code);
-                    let notice = dim("  ✓ ⎘ copied to clipboard");
-                    self.emit(&notice);
                 }
             }
             StreamState::MaybeJson { lines } => {
@@ -1995,7 +1989,7 @@ fn render_output() {
     let sel = selection().lock().ok().and_then(|g| *g);
     let mut plain_rows = Vec::with_capacity(rows);
     for row in 0..rows {
-        let _ = queue!(out, MoveTo(0, row as u16), Clear(ClearType::CurrentLine));
+        let _ = queue!(out, MoveTo(0, row as u16));
         if let Some(line) = visible.get(row) {
             let plain = strip_ansi(line);
             if let Some(sel) = sel {
@@ -2003,16 +1997,17 @@ fn render_output() {
                     let _ = write!(
                         out,
                         "{}",
-                        clip_ansi_line(&selected_line(&plain, range), width)
+                        pad_ansi_line(&selected_line(&plain, range), width)
                     );
                 } else {
-                    let _ = write!(out, "{line}");
+                    let _ = write!(out, "{}", pad_ansi_line(line, width));
                 }
             } else {
-                let _ = write!(out, "{line}");
+                let _ = write!(out, "{}", pad_ansi_line(line, width));
             }
             plain_rows.push(plain);
         } else {
+            let _ = write!(out, "{}", " ".repeat(width));
             plain_rows.push(String::new());
         }
     }
@@ -2749,6 +2744,32 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
     out
 }
 
+fn pad_ansi_line(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut visible = 0usize;
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            eat_escape(&mut chars, Some(&mut out));
+            continue;
+        }
+        let w = char_width(c);
+        if visible + w > width {
+            break;
+        }
+        out.push(c);
+        visible += w;
+    }
+    if visible < width {
+        out.push_str(&" ".repeat(width - visible));
+    }
+    out
+}
+
 // Wrap into rows of at most `max_cols` display columns; width-aware like
 // clip_ansi_line so the alt-screen row math holds for emoji/CJK lines.
 fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
@@ -2913,11 +2934,24 @@ pub fn bell() {
     }
 }
 
+fn start_typeahead_thread() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            if is_raw() && is_agent_running() {
+                poll_typeahead();
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        });
+    });
+}
+
 // Non-blocking: drain pending key events and report whether Ctrl-C or Esc was pressed.
 pub fn set_agent_running(running: bool) {
     AGENT_RUNNING.store(running, Ordering::Relaxed);
     if running {
         INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
+        start_typeahead_thread();
     }
 }
 
