@@ -220,6 +220,14 @@ pub struct Settings {
     /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    /// Tools/binaries approved with "always allow", keyed by canonical project
+    /// directory — an `a` answer in one project never silences the gate in
+    /// another. Lives in the user settings file only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_allowed: BTreeMap<String, Vec<String>>,
+    /// How many background workflows may run at once (default 2).
+    #[serde(default = "default_max_concurrent_workflows")]
+    pub max_concurrent_workflows: usize,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -274,6 +282,8 @@ impl Default for Settings {
             max_budget_usd: None,
             auto_update: default_auto_update(),
             allowed_commands: Vec::new(),
+            project_allowed: BTreeMap::new(),
+            max_concurrent_workflows: default_max_concurrent_workflows(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             instruction_files: default_instruction_files(),
@@ -282,6 +292,10 @@ impl Default for Settings {
             sandbox_network: true,
         }
     }
+}
+
+fn default_max_concurrent_workflows() -> usize {
+    2
 }
 
 // Only unambiguously read-only binaries auto-approve in Ask mode by default.
@@ -307,6 +321,51 @@ pub fn load_allowed_commands() -> Vec<String> {
     match load_settings() {
         Some(s) if !s.allowed_commands.is_empty() => s.allowed_commands,
         _ => default_allowed_commands(),
+    }
+}
+
+/// Canonical key for a project directory in `project_allowed`.
+pub fn project_key(cwd: &std::path::Path) -> String {
+    cwd.canonicalize()
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Tools approved with "always allow" for this project only.
+pub fn load_project_allowed(cwd: &std::path::Path) -> Vec<String> {
+    load_settings()
+        .and_then(|s| s.project_allowed.get(&project_key(cwd)).cloned())
+        .unwrap_or_default()
+}
+
+/// Persist an "always allow" answer for `tool` scoped to this project.
+pub fn add_project_allowed(cwd: &std::path::Path, tool: &str) {
+    if tool.is_empty() {
+        return;
+    }
+    let Some(mut s) = load_settings() else {
+        return;
+    };
+    let list = s.project_allowed.entry(project_key(cwd)).or_default();
+    if !list.iter().any(|t| t == tool) {
+        list.push(tool.to_string());
+        save_settings(&s);
+    }
+}
+
+/// Drop every per-project "always allow" entry for this project. Returns how
+/// many entries were cleared.
+pub fn reset_project_allowed(cwd: &std::path::Path) -> usize {
+    let Some(mut s) = load_settings() else {
+        return 0;
+    };
+    match s.project_allowed.remove(&project_key(cwd)) {
+        Some(list) => {
+            save_settings(&s);
+            list.len()
+        }
+        None => 0,
     }
 }
 
@@ -1217,6 +1276,7 @@ pub fn scaffold_home() {
         "hooks/PostResponse",
         "hooks/OnError",
         "hooks/Stop",
+        "hooks/SubagentStop",
     ] {
         let _ = fs::create_dir_all(h.join(sub));
     }
@@ -1955,6 +2015,52 @@ mod tests {
     }
 
     #[test]
+    fn project_allowed_is_scoped_per_project_and_resettable() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        save_settings(&Settings::default());
+
+        let a = h.join("proj-a");
+        let b = h.join("proj-b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        add_project_allowed(&a, "write_file");
+        add_project_allowed(&a, "write_file"); // idempotent
+        add_project_allowed(&a, "npm");
+
+        assert_eq!(load_project_allowed(&a), vec!["write_file", "npm"]);
+        assert!(load_project_allowed(&b).is_empty(), "scope must not leak");
+        // The legacy global list is untouched.
+        assert!(load_settings().unwrap().allowed_commands.is_empty());
+        // Keys are canonical so `proj-a/.` resolves to the same entry.
+        assert_eq!(load_project_allowed(&a.join(".")).len(), 2);
+
+        assert_eq!(reset_project_allowed(&a), 2);
+        assert!(load_project_allowed(&a).is_empty());
+        assert_eq!(reset_project_allowed(&a), 0);
+        // An empty map is omitted from the file entirely.
+        let text = fs::read_to_string(h.join("settings.json")).unwrap();
+        assert!(!text.contains("project_allowed"), "{text}");
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn max_concurrent_workflows_defaults_to_two() {
+        let base = r#""provider":"ollama","model":"llama3.2","permission":"ask""#;
+        let s: Settings = serde_json::from_str(&format!("{{{base}}}")).unwrap();
+        assert_eq!(s.max_concurrent_workflows, 2);
+        assert!(s.project_allowed.is_empty());
+        let s: Settings =
+            serde_json::from_str(&format!("{{{base},\"max_concurrent_workflows\":4}}")).unwrap();
+        assert_eq!(s.max_concurrent_workflows, 4);
+    }
+
+    #[test]
     fn memory_roundtrip() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
@@ -1986,7 +2092,11 @@ mod tests {
         fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
 
         fs::write(h.join("settings.json"), r#"{"provider": "openai", "model": "gpt-4o", "reasoning_effort": "low", "allowed_commands": ["git status"]}"#).unwrap();
-        fs::write(h.join("settings.local.json"), r#"{"reasoning_effort": "medium"}"#).unwrap();
+        fs::write(
+            h.join("settings.local.json"),
+            r#"{"reasoning_effort": "medium"}"#,
+        )
+        .unwrap();
         fs::write(
             proj.join(".buildwithnexus").join("settings.json"),
             r#"{"model": "gpt-4o-mini", "allowed_commands": ["cargo check"]}"#,

@@ -4,6 +4,7 @@
 // transcript types are serializable (see provider::Msg).
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,66 @@ pub fn new_id() -> String {
 
 fn file(id: &str) -> PathBuf {
     dir().join(format!("{id}.json"))
+}
+
+/// Where the transcript for `id` is (or will be) saved.
+pub fn path(id: &str) -> PathBuf {
+    file(id)
+}
+
+// The id of the session this process is running — the same value the
+// transcript is saved under, so hooks and traces can name the real file.
+// `claimed` is false while the id has only been minted for hooks (e.g. a
+// headless SessionStart) and no session owns it yet.
+struct Current {
+    id: String,
+    claimed: bool,
+}
+
+static CURRENT: Mutex<Option<Current>> = Mutex::new(None);
+
+/// Marks `id` as the process's current session, owned by a running session.
+pub fn set_current(id: &str) {
+    if let Ok(mut c) = CURRENT.lock() {
+        *c = Some(Current {
+            id: id.to_string(),
+            claimed: true,
+        });
+    }
+}
+
+/// The current session id, if one has been established.
+pub fn current() -> Option<String> {
+    CURRENT
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().map(|c| c.id.clone()))
+}
+
+/// The current session id, minting one when none has been set yet — so
+/// SessionStart hooks and the first build session agree on the id.
+pub fn current_or_new() -> String {
+    let mut c = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    c.get_or_insert_with(|| Current {
+        id: new_id(),
+        claimed: false,
+    })
+    .id
+    .clone()
+}
+
+/// The id a new build session should save under: the minted-but-unowned
+/// current id when there is one (headless runs), otherwise a fresh id — a
+/// session that already owns the current id (the REPL) is never clobbered.
+pub fn claim_or_new() -> String {
+    let mut c = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    match c.as_mut() {
+        Some(cur) if !cur.claimed => {
+            cur.claimed = true;
+            cur.id.clone()
+        }
+        _ => new_id(),
+    }
 }
 
 // First non-empty user message, truncated — the human-readable label.
@@ -230,6 +291,28 @@ mod tests {
             // Corrupt file must still be on disk (skipped, not deleted).
             assert!(dir().join("corrupt.json").exists());
         });
+    }
+
+    #[test]
+    fn current_session_id_is_sticky_and_claimable_once() {
+        // Process-global: run the whole lifecycle in one test.
+        let first = current_or_new();
+        assert_eq!(first.len(), 16);
+        assert_eq!(current_or_new(), first, "first id wins");
+        assert_eq!(current().as_deref(), Some(first.as_str()));
+        // A minted-for-hooks id is handed to the first build session…
+        assert_eq!(claim_or_new(), first);
+        // …but never to a second one: an owned id is not shared.
+        assert_ne!(claim_or_new(), first);
+        assert_eq!(current().as_deref(), Some(first.as_str()));
+        set_current("0000000000000077");
+        assert_eq!(current_or_new(), "0000000000000077");
+        assert_ne!(
+            claim_or_new(),
+            "0000000000000077",
+            "set_current owns the id"
+        );
+        assert!(path("0000000000000077").ends_with("sessions/0000000000000077.json"));
     }
 
     #[test]

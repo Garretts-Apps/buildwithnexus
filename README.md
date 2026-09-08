@@ -140,13 +140,13 @@ event in `--json` mode.
 
 - **PLAN** — decompose the task into steps you approve or edit, then execute.
 - **BUILD** — the agentic ReAct loop: read/edit files, run commands, iterate.
-- **BRAINSTORM** — free-form chat, no tools.
+- **BRAINSTORM** — free-form chat with read-only tools (read, grep, fetch, read-only commands); never writes. Action-like prompts auto-escalate to BUILD.
 
 ```bash
 buildwithnexus                 # full-screen interactive session
 buildwithnexus run <task>      # execute a task (agentic, headless)
 buildwithnexus plan <task>     # decompose, approve, then execute
-buildwithnexus brainstorm <q>  # free-form chat
+buildwithnexus brainstorm <q>  # free-form chat (read-only tools)
 buildwithnexus init            # (re)configure provider / model / key
 buildwithnexus providers       # list built-in providers
 buildwithnexus doctor          # diagnose setup (keys, tools, connectivity)
@@ -164,8 +164,8 @@ Inside the interactive session:
 /commit                   AI-drafted conventional commit message
 /pr                       AI-drafted pull request title + description
 /schedule <delay> <task>  run a task once in the background (5s, 2m, 1h)
-/loop <interval> <task>   run a task repeatedly in the background
-/workflows                list and manage background workflows
+/loop <interval> <task>   run a task repeatedly in the background (up to max_concurrent_workflows at once, default 2)
+/workflows                list and manage background workflows (i<id> shows a run's log, kept in ~/.buildwithnexus/workflows/)
 /btw <context>            inject context into the next agent turn
 /config                   configure hooks, memory, and commands via AI
 /memory                   view and edit session memory
@@ -176,7 +176,18 @@ Inside the interactive session:
 ## Permissions
 
 Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
-`ask` (default), `auto` (yolo), or `readonly`. Set it during setup.
+`ask` (default), `auto` (yolo), or `readonly`. Set it during setup. In
+`readonly`, mutations are refused outright — never prompted — so an approved
+sensitive-path or dangerous-command confirmation can't slip one through.
+
+Answering `a` (always allow) at a prompt remembers that tool **for the current
+project only** (`project_allowed` in `~/.buildwithnexus/settings.json`, keyed by
+directory). `/permissions reset` forgets those answers for the project you're in.
+The legacy global `allowed_commands` list keeps working.
+
+Headless `plan` needs a terminal to approve the plan; pass `--yes` / `-y` to
+auto-approve and execute (in `--json` mode the plan is emitted as a `plan` event
+first). Without a terminal and without `--yes` it exits 2 immediately.
 
 ### Sandbox
 
@@ -213,13 +224,22 @@ Run your own commands at the same lifecycle points as Claude Code, configured in
 (project). User hooks are always active; **project hooks run only after you trust
 that folder** (you're prompted once, and a project hook may *deny* a tool but
 never *grant* one — so cloning a hostile repo can't run or unlock anything).
-Events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`,
-`SessionEnd`. Each hook command receives the event as JSON on stdin.
+Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
+`PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
+`PostToolUse`, `PostResponse`, `OnError`, `Stop` (after every BUILD, PLAN,
+BRAINSTORM, or chat response), and `SubagentStop` (when a `spawn_subagent` call
+returns; its payload carries the subagent's `tool_input`). Each hook command
+receives the event as JSON on stdin with Claude Code's field names:
+`hook_event_name`, `session_id` (the id the transcript is saved under),
+`transcript_path`, `permission_mode` (`ask` | `auto` | `readonly`), `cwd`, plus
+the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`).
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
 `permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
 prompt; otherwise the normal gate applies. Matchers are `*`, an exact tool name,
-or a `|`-separated list. See [`examples/settings.json`](./examples/settings.json).
+or a `|`-separated list; each segment may use `*` and `?` wildcards
+(`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
+[`examples/settings.json`](./examples/settings.json).
 
 ```json
 {

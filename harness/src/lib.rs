@@ -90,6 +90,8 @@ struct CliOptions {
     // True once `--` was seen: everything after it is literal text, even
     // words that start with '-'.
     args_literal: bool,
+    /// `--yes` / `-y`: auto-approve a plan and execute it (headless `plan`).
+    yes: bool,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
@@ -105,6 +107,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--json" {
             opts.json = true;
+            continue;
+        }
+        if arg == "--yes" || arg == "-y" {
+            opts.yes = true;
             continue;
         }
         let (flag, inline) = arg
@@ -180,9 +186,20 @@ pub fn run() {
                 agent::run_build(p, perm, "engineer", &rest(), &cwd)
             })
         }
-        "plan" => headless(&opts, |p, perm, cwd| {
-            agent::run_plan(p, perm, &rest(), &cwd)
-        }),
+        "plan" => {
+            // Approving a plan needs a terminal; without one (and without
+            // --yes) fail fast instead of hanging on the selector.
+            if !opts.yes && !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "buildwithnexus: `plan` needs an interactive terminal to approve the plan — \
+                     pass --yes (-y) to auto-approve and execute"
+                );
+                std::process::exit(2);
+            }
+            headless(&opts, |p, perm, cwd| {
+                agent::run_plan(p, perm, &rest(), &cwd, opts.yes)
+            })
+        }
         "brainstorm" => headless(&opts, |p, perm, cwd| {
             agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
         }),
@@ -492,6 +509,7 @@ fn headless(
     provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
+    hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
 
     if !report::is_json() {
@@ -582,6 +600,9 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
 
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     hooks::init(&cwd, raw);
+    hooks::set_permission_mode(agent::permission_name(perm));
+    // Once per process: the session id is fixed here so SessionStart, every
+    // turn's hooks, and the saved transcript all agree on it.
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
     let result = repl(provider, perm, &cwd, raw, initial_prompt);
@@ -621,6 +642,10 @@ fn repl(
         tui::line(&tui::dim(&format!("  {note}")));
     }
     let restored = workflow::restore();
+    workflow::set_max_concurrent(settings.max_concurrent_workflows);
+    // Background scheduler: due workflows start while the user is idle at the
+    // prompt; their completion notices are shown at the next prompt.
+    workflow::start_scheduler();
     if restored > 0 {
         tui::line(&tui::green(&format!(
             "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
@@ -636,7 +661,9 @@ fn repl(
     update::spawn_check(&settings.auto_update);
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
-    let mut sid = session::new_id();
+    // The REPL owns the id SessionStart already announced.
+    let mut sid = session::current_or_new();
+    session::set_current(&sid);
     trace::set_session(&sid);
     let mut mode = Mode::Brainstorm;
     let mut last_suggested_mode: Option<&'static str> = None;
@@ -645,9 +672,12 @@ fn repl(
     let mut pending_prompt = initial_prompt;
 
     loop {
-        // Tick background workflows and surface any completion notifications.
+        // Tick background workflows and surface any completion notifications
+        // (both those queued by the scheduler thread and this tick's own).
         // Color by outcome — a "✗ workflow failed" line must not render green.
-        if let Some(note) = workflow::tick() {
+        let mut notes = workflow::take_notices();
+        notes.extend(workflow::tick());
+        for note in notes {
             if note.contains('✗') {
                 tui::line(&tui::red(&note));
             } else {
@@ -826,8 +856,9 @@ fn repl(
                     "ask" | "1" => apply_permission(&mut perm, "ask"),
                     "auto" | "2" => apply_permission(&mut perm, "auto"),
                     "readonly" | "3" => apply_permission(&mut perm, "readonly"),
+                    "reset" => handle_permissions_reset(cwd),
                     other => tui::line(&tui::red(&format!(
-                        "  unknown permission '{other}' — try: ask, auto, readonly"
+                        "  unknown permission '{other}' — try: ask, auto, readonly, reset"
                     ))),
                 }
             }
@@ -942,7 +973,7 @@ fn repl(
 
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
-            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd) {
+            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd, false) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
             tui::bell();
@@ -979,6 +1010,7 @@ fn repl(
                 transcript.clear();
                 usage::forget_last();
                 sid = session::new_id();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 tui::clear();
                 tui::line(&tui::dim("  ✓ context cleared — fresh session"));
@@ -988,6 +1020,7 @@ fn repl(
                 transcript.clear();
                 usage::forget_last();
                 sid = session::new_id();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 tui::line(&tui::dim("  started a fresh session"));
                 continue;
@@ -995,6 +1028,7 @@ fn repl(
             "/resume" => {
                 handle_resume(&mut transcript, &mut sid);
                 usage::forget_last();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 continue;
             }
@@ -1401,7 +1435,7 @@ fn repl(
             agent::run_chat_turn(&provider, perm, cwd, t)
         } else {
             match &mode {
-                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd) {
+                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd, false) {
                     Ok(()) => {
                         mode = Mode::Build;
                         tui::show_mode_change("BUILD");
@@ -2710,6 +2744,17 @@ fn handle_verify_audit(cwd: &std::path::Path) {
         }
     }
 
+    // Actually run the project's checks (build/test/lint) and feed the
+    // verdict into the verifier's tests dimension instead of inferring it.
+    let check_input = serde_json::json!({});
+    let check = tools::run("check_work", &check_input, cwd);
+    let tests_passed = if verify_check_had_nothing_to_run(&check.content) {
+        None
+    } else {
+        Some(!check.is_error)
+    };
+    tui::line(&tui::render_md(&check.content));
+
     let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
     let ctx = crate::verifier::VerificationContext {
         task_description: "Interactive workspace verification and operational audit".to_string(),
@@ -2720,6 +2765,7 @@ fn handle_verify_audit(cwd: &std::path::Path) {
         tests_added: vec![],
         dependencies_changed: vec![],
         git_diff: None,
+        tests_passed,
     };
 
     let report = verifier.verify(&ctx);
@@ -2729,6 +2775,12 @@ fn handle_verify_audit(cwd: &std::path::Path) {
     tui::line(&tui::dim(
         "  tip: @rules:<id> or /rules inspects specific constraints",
     ));
+}
+
+// check_work found no project checks to run (or every checker was missing):
+// no verdict, rather than a false "tests passed".
+fn verify_check_had_nothing_to_run(report: &str) -> bool {
+    report.contains("no build/test/lint commands detected") || report.contains("nothing ran")
 }
 
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
@@ -2915,6 +2967,7 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
 // Apply a permission string, update the in-session value, and persist to settings.json.
 fn apply_permission(perm: &mut Permission, ps: &str) {
     *perm = agent::permission(ps);
+    hooks::set_permission_mode(agent::permission_name(*perm));
     if let Some(mut settings) = config::load_settings() {
         settings.permission = ps.to_string();
         config::save_settings(&settings);
@@ -2928,6 +2981,21 @@ fn permission_label(perm: &Permission) -> &'static str {
         Permission::Ask => "ask",
         Permission::Auto => "auto",
         Permission::ReadOnly => "readonly",
+    }
+}
+
+// `/permissions reset`: forget every "always allow" answer given in this
+// project (the per-project map in the user settings file).
+fn handle_permissions_reset(cwd: &std::path::Path) {
+    let n = config::reset_project_allowed(cwd);
+    if n == 0 {
+        tui::line(&tui::dim("  no \"always allow\" entries for this project"));
+    } else {
+        tui::line(&tui::green(&format!(
+            "  ✓ cleared {n} \"always allow\" entr{} for {}",
+            if n == 1 { "y" } else { "ies" },
+            cwd.display()
+        )));
     }
 }
 
@@ -3432,8 +3500,8 @@ fn print_help() {
                 ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
                 (
                     "/permissions",
-                    "[ask|auto|readonly]",
-                    "tool permission level",
+                    "[ask|auto|readonly|reset]",
+                    "tool permission level (reset: forget always-allow)",
                 ),
                 (
                     "/sandbox",
@@ -4008,13 +4076,15 @@ fn usage() {
          \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
          \x20 --json                        structured headless output\n\
+         \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
          \x20 /effort [off|low|medium|high]    show or set reasoning depth\n\
-         \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20 /permissions [ask|auto|readonly|reset] show or switch tool permission level\n\
+         \x20                                  (reset forgets this project's always-allow answers)\n\
          \x20 /sandbox [off|auto|require|status] OS sandbox for shell commands\n\
          \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\

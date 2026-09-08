@@ -4088,6 +4088,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 tests_added: vec![],
                 dependencies_changed: vec![],
                 git_diff: None,
+                tests_passed: None,
             };
             let report = verifier.verify(&ctx);
             ok(crate::verifier::Verifier::format_report(&report))

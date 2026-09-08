@@ -89,7 +89,7 @@ fn sanitize_id_part(s: &str) -> String {
 }
 
 /// Records a file modification checkpoint before an edit tool mutates `path`.
-/// Stores the previous contents (or empty if the file did not exist) in `.buildwithnexus/checkpoints`.
+/// Stores the previous contents (or empty if the file did not exist) in `~/.buildwithnexus/checkpoints`.
 pub fn record(cwd: &Path, path: &Path, action: &str) {
     let existed = path.exists();
     // Capture the previous contents. Oversized or non-UTF-8 files cannot be
