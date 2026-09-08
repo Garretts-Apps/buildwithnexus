@@ -120,7 +120,7 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600).
 
-**Reasoning.** `effort` in settings (`off` by default, or `low` / `medium` /
+**Reasoning.** `reasoning_effort` in settings (`off` by default, or `low` / `medium` /
 `high`; `--effort <level>` per run, `/effort` in-session) maps to each API's
 native control: Claude 4.6+ gets adaptive thinking with `output_config.effort`,
 older Claude models a `budget_tokens` thinking budget (2048 / 8192 / 16384),

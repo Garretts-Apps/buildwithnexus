@@ -186,7 +186,10 @@ pub struct Settings {
     pub permission: String,
     /// Reasoning level: "off" (default), "low", "medium", or "high" — see
     /// [`Effort`]. `--effort` and `/effort` override and persist it.
-    #[serde(default = "default_effort")]
+    // Stored as `reasoning_effort`: the pre-0.13 `effort` key was never read and
+    // every saved settings file carries its old default ("low"), so honoring it
+    // would switch reasoning on for existing users. Stale `effort` keys are ignored.
+    #[serde(default = "default_effort", rename = "reasoning_effort")]
     pub effort: String,
     #[serde(default)]
     pub base_url: Option<String>,
@@ -1982,8 +1985,8 @@ mod tests {
         let _ = fs::remove_dir_all(&proj);
         fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
 
-        fs::write(h.join("settings.json"), r#"{"provider": "openai", "model": "gpt-4o", "effort": "low", "allowed_commands": ["git status"]}"#).unwrap();
-        fs::write(h.join("settings.local.json"), r#"{"effort": "medium"}"#).unwrap();
+        fs::write(h.join("settings.json"), r#"{"provider": "openai", "model": "gpt-4o", "reasoning_effort": "low", "allowed_commands": ["git status"]}"#).unwrap();
+        fs::write(h.join("settings.local.json"), r#"{"reasoning_effort": "medium"}"#).unwrap();
         fs::write(
             proj.join(".buildwithnexus").join("settings.json"),
             r#"{"model": "gpt-4o-mini", "allowed_commands": ["cargo check"]}"#,
