@@ -263,9 +263,9 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"expect_status":{"type":"integer","minimum":100,"maximum":599},"expect_text":{"type":"string"}},"required":["url"]}) },
         ToolDef { name: "open_browser", description: "Open a URL or local file in the user's default browser. Use after publishing an HTML artifact or starting a web server.",
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string"}}}) },
-        ToolDef { name: "list_skills", description: "List available skill names and short descriptions. Use before load_skill when choosing task-specific instructions.",
+        ToolDef { name: "list_skills", description: "List available skills with their source and short description. Use before load_skill when choosing task-specific instructions.",
             schema: json!({"type":"object","properties":{}}) },
-        ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task.",
+        ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task. Folder skills report their directory so referenced scripts/references can be read with read_file.",
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
         ToolDef { name: "kb_query", description: "Query the project's local structured knowledge base (.buildwithnexus/knowledge/) for entities, relationships, and architectural decisions.",
             schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
@@ -3921,9 +3921,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "list_skills" => {
-            let rows = crate::config::load_skill_descriptions()
+            let rows = crate::config::discover_skills(cwd)
                 .into_iter()
-                .map(|(name, desc)| format!("{name}: {desc}"))
+                .map(|s| {
+                    format!(
+                        "{} [{}]: {}",
+                        s.name,
+                        s.source.label(),
+                        s.description_or_default()
+                    )
+                })
                 .collect::<Vec<_>>();
             if rows.is_empty() {
                 ok("no skills available")
@@ -4193,12 +4200,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if wanted.is_empty() {
                 return err("name is required");
             }
-            for (name, content) in crate::config::load_skills() {
-                if name == wanted {
+            for skill in crate::config::discover_skills(cwd) {
+                if skill.name == wanted {
+                    let name = &skill.name;
+                    let content = skill.loaded_text();
                     crate::trace::record_visible(
                         "skill",
                         format!("loaded {name}"),
-                        json!({"name": name, "bytes": content.len(), "preview": crate::trace::preview(&content, 600)}),
+                        json!({"name": name, "source": skill.source.label(), "bytes": content.len(), "preview": crate::trace::preview(&content, 600)}),
                     );
                     return ok(format!("# Skill: {name}\n{content}"));
                 }

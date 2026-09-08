@@ -1408,6 +1408,26 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         }
     }
 
+    // Project instructions (AGENTS.md / CLAUDE.md) come before memory and the
+    // Agents.md roles: repository conventions frame everything that follows.
+    let instructions = config::load_instructions(cwd);
+    if let Some(text) = config::instructions_prompt(&instructions) {
+        trace::record_visible(
+            "instructions",
+            format!("loaded {} instruction file(s)", instructions.len()),
+            serde_json::json!({
+                "files": instructions.iter().map(|f| f.label.clone()).collect::<Vec<_>>(),
+                "bytes": text.len(),
+            }),
+        );
+        let text = if compact && text.len() > 2_000 {
+            format!("{}…", truncate_at_char_boundary(&text, 2_000))
+        } else {
+            text
+        };
+        parts.push(text);
+    }
+
     if let Some(mem) = config::load_memory() {
         // Memory is user-important; always include but truncate for small ctx
         let mem_text = if compact && mem.len() > 300 {
@@ -1461,7 +1481,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         if !active_hooks.is_empty() {
             parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));
         }
-        let skill_descs = config::load_skill_descriptions();
+        let skill_descs = config::load_skill_descriptions(cwd);
         if !skill_descs.is_empty() {
             let joined = skill_descs
                 .iter()
@@ -4450,6 +4470,45 @@ mod tests {
         assert!(!super::is_session_allowed_tool("custom_test_tool"));
         super::add_session_allowed_tool("custom_test_tool");
         assert!(super::is_session_allowed_tool("custom_test_tool"));
+    }
+
+    #[test]
+    fn context_prefix_injects_instructions_before_memory_and_agents() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("bwn-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        std::fs::write(home.join("memory.md"), "- MEMORY-MARKER").unwrap();
+        std::fs::write(home.join("Agents.md"), "## Engineer\nROLES-MARKER").unwrap();
+        let cwd = base.join("repo").join("src");
+        std::fs::create_dir_all(base.join("repo").join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(base.join("repo").join("AGENTS.md"), "ROOT-INSTRUCTIONS").unwrap();
+        std::fs::write(cwd.join("CLAUDE.md"), "SRC-INSTRUCTIONS").unwrap();
+
+        let prefix = context_prefix(&cwd, 200_000);
+        let instr = prefix.find("[Project instructions").unwrap();
+        let root = prefix.find("ROOT-INSTRUCTIONS").unwrap();
+        let src = prefix.find("SRC-INSTRUCTIONS").unwrap();
+        let mem = prefix.find("[Memory from previous sessions]").unwrap();
+        let roles = prefix.find("[Agent knowledge — Agents.md]").unwrap();
+        assert!(instr < root && root < src && src < mem && mem < roles);
+        assert!(prefix.contains("MEMORY-MARKER") && prefix.contains("ROLES-MARKER"));
+
+        // Small contexts keep the section but cap it.
+        let big = "x".repeat(10_000);
+        std::fs::write(base.join("repo").join("AGENTS.md"), &big).unwrap();
+        let compact = context_prefix(&cwd, 8_000);
+        let start = compact.find("[Project instructions").unwrap();
+        let section = &compact[start..compact[start..].find("\n\n[").unwrap() + start];
+        assert!(section.len() < 2_100 && section.ends_with('…'));
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
