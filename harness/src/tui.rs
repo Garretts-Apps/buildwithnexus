@@ -3648,7 +3648,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/mode" => "show or switch mode",
         "/model" => "hot-swap the AI model",
         "/permissions" => "tool permission level (ask/auto/readonly)",
-        "/mcp" => "inspect configured MCP servers",
+        "/mcp" => "MCP servers: list, <name>, add, remove, reload",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
         "/compact" => "compress context to free token budget",
@@ -3907,6 +3907,13 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
         }
         "/permissions" => {
             return ["ask", "auto", "readonly"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/mcp" => {
+            return ["add", "remove", "reload"]
                 .iter()
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())

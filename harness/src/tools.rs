@@ -52,8 +52,6 @@ const MAX_MATCH_LINE: usize = 500;
 // Default deadline for run_command / python_tool; long-running processes
 // should use start_server instead.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-// Deadline for a single MCP tools/call round trip.
-const MCP_TIMEOUT: Duration = Duration::from_secs(30);
 
 static UNDO_BACKUP: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
 
@@ -302,7 +300,22 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             },"required":["task"]}),
         });
     }
+    v.extend(mcp_defs());
     v
+}
+
+// Tools discovered on connected MCP servers, advertised as
+// `mcp__<server>__<tool>` with the server's own description and input
+// schema. Empty until discovery finishes (see mcp::start_background).
+fn mcp_defs() -> Vec<ToolDef> {
+    crate::mcp::tools()
+        .into_iter()
+        .map(|t| ToolDef {
+            name: crate::mcp::intern(&t.mangled),
+            description: crate::mcp::intern(&t.description),
+            schema: t.input_schema,
+        })
+        .collect()
 }
 
 // Models reporting at most this many context tokens get the compact tool set.
@@ -329,68 +342,75 @@ pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<To
 // advertising duplicates wastes prompt tokens and confuses weak models. Keep
 // this list at 12 defs or fewer.
 fn compact_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "read_file"
-            | "write_file"
-            | "edit_file"
-            | "run_command"
-            | "find_files"
-            | "grep_files"
-            | "list_dir"
-            | "finish"
-            | "Artifact"
-            | "python_tool"
-    )
+    // MCP tools are opt-in per user, so they stay even on the compact surface.
+    crate::mcp::is_mcp_tool(name)
+        || matches!(
+            name,
+            "read_file"
+                | "write_file"
+                | "edit_file"
+                | "run_command"
+                | "find_files"
+                | "grep_files"
+                | "list_dir"
+                | "finish"
+                | "Artifact"
+                | "python_tool"
+        )
 }
 
 pub fn defs_readonly() -> Vec<ToolDef> {
     defs(false)
         .into_iter()
         .filter(|d| {
-            matches!(
-                d.name,
-                "bash"
-                    | "read"
-                    | "glob"
-                    | "grep"
-                    | "list"
-                    | "webfetch"
-                    | "websearch"
-                    | "todoread"
-                    | "skill"
-                    | "question"
-                    | "AskUserQuestion"
-                    | "exit_plan"
-                    | "ExitPlanMode"
-                    | "read_file"
-                    | "read_many_files"
-                    | "list_dir"
-                    | "list_tree"
-                    | "file_info"
-                    | "find_paths"
-                    | "find_files"
-                    | "grep_files"
-                    | "run_command"
-                    | "todo_read"
-                    | "fetch_url"
-                    | "web_search"
-                    | "headless_browser"
-                    | "list_servers"
-                    | "read_server_log"
-                    | "wait_for_url"
-                    | "list_skills"
-                    | "load_skill"
-                    | "kb_query"
-                    | "rule_check"
-                    | "verify"
-            )
+            (crate::mcp::is_mcp_tool(d.name) && !is_mutating(d.name))
+                || matches!(
+                    d.name,
+                    "bash"
+                        | "read"
+                        | "glob"
+                        | "grep"
+                        | "list"
+                        | "webfetch"
+                        | "websearch"
+                        | "todoread"
+                        | "skill"
+                        | "question"
+                        | "AskUserQuestion"
+                        | "exit_plan"
+                        | "ExitPlanMode"
+                        | "read_file"
+                        | "read_many_files"
+                        | "list_dir"
+                        | "list_tree"
+                        | "file_info"
+                        | "find_paths"
+                        | "find_files"
+                        | "grep_files"
+                        | "run_command"
+                        | "todo_read"
+                        | "fetch_url"
+                        | "web_search"
+                        | "headless_browser"
+                        | "list_servers"
+                        | "read_server_log"
+                        | "wait_for_url"
+                        | "list_skills"
+                        | "load_skill"
+                        | "kb_query"
+                        | "rule_check"
+                        | "verify"
+                )
         })
         .collect()
 }
 
-// Mutating tools pass through the permission gate; reads never do.
+// Mutating tools pass through the permission gate; reads never do. MCP tools
+// count as mutating unless the server annotated them `readOnlyHint: true`.
 pub fn is_mutating(name: &str) -> bool {
+    if crate::mcp::is_mcp_tool(name) {
+        return !crate::mcp::is_read_only(name);
+    }
     matches!(
         name,
         "write"
@@ -564,6 +584,10 @@ fn raw_preview(name: &str, input: &Value) -> String {
             input["server"].as_str().unwrap_or("?"),
             input["tool"].as_str().unwrap_or("?")
         ),
+        n if crate::mcp::is_mcp_tool(n) => match crate::mcp::demangle(n) {
+            Some((server, tool)) => format!("MCP call: {server}/{tool}"),
+            None => format!("MCP call: {n}"),
+        },
         "python_tool" => format!("python tool: {}", input["path"].as_str().unwrap_or("?")),
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
             let cmd = input["command"].as_str().unwrap_or("view");
@@ -3088,6 +3112,15 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+// `isError: true` from the server is a tool error, like any local failure.
+fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
+    match r {
+        Ok((text, false)) => ok(truncate(text, MAX_OUT)),
+        Ok((text, true)) => err(truncate(text, MAX_OUT)),
+        Err(e) => err(e),
+    }
+}
+
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     // Mutating file tools never silently write outside the working directory;
     // the permission gate can confirm such calls, but the execution layer
@@ -4005,132 +4038,20 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         "mcp_call" => {
             let server = input["server"].as_str().unwrap_or("");
             let tool = input["tool"].as_str().unwrap_or("");
-            let args = &input["arguments"];
             if server.is_empty() || tool.is_empty() {
                 return err("server and tool names are required");
             }
-            let s = crate::config::load_settings().unwrap_or_default();
-            if let Some(srv_config) = s.mcp_servers.get(server) {
-                let cmd = srv_config["command"].as_str().unwrap_or("");
-                let srv_args: Vec<&str> = srv_config["args"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                if cmd.is_empty() {
-                    return err(format!(
-                        "MCP server '{server}' has no command configured in settings"
-                    ));
-                }
-                // A real MCP server hangs without the initialize handshake, and
-                // waiting for process exit hangs forever on servers that keep
-                // stdin open — so handshake first, then read the tools/call
-                // response line-by-line under a deadline.
-                let init = json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {"name": "buildwithnexus", "version": "1.0"}
-                    }
-                });
-                let initialized = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized"
-                });
-                let call_req = json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {
-                        "name": tool,
-                        "arguments": args
-                    }
-                });
-                let mut child = match Command::new(cmd)
-                    .args(&srv_args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return err(format!(
-                            "failed to spawn MCP server '{server}' ({cmd}): {e}"
-                        ))
-                    }
-                };
-                let mut stdin = child.stdin.take();
-                if let Some(w) = stdin.as_mut() {
-                    for msg in [&init, &initialized, &call_req] {
-                        let _ = std::io::Write::write_all(w, msg.to_string().as_bytes());
-                        let _ = std::io::Write::write_all(w, b"\n");
-                    }
-                    let _ = std::io::Write::flush(w);
-                }
-                let (tx, rx) = std::sync::mpsc::channel::<String>();
-                if let Some(stdout) = child.stdout.take() {
-                    std::thread::spawn(move || {
-                        let reader = std::io::BufReader::new(stdout);
-                        for line in std::io::BufRead::lines(reader) {
-                            let Ok(line) = line else { break };
-                            if tx.send(line).is_err() {
-                                break;
-                            }
-                        }
-                    });
-                }
-                let deadline = std::time::Instant::now() + MCP_TIMEOUT;
-                let outcome = loop {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        break err(format!(
-                            "MCP server '{server}' did not answer tools/call within {}s; verify the server command and tool name",
-                            MCP_TIMEOUT.as_secs()
-                        ));
-                    }
-                    match rx.recv_timeout(remaining) {
-                        // Skip the initialize response (id 1) and any
-                        // notifications; only id 2 is our tools/call answer.
-                        Ok(line) => {
-                            let Ok(resp) = serde_json::from_str::<Value>(&line) else {
-                                continue;
-                            };
-                            if resp["id"] != json!(2) {
-                                continue;
-                            }
-                            if let Some(res) = resp.get("result") {
-                                break ok(res.to_string());
-                            }
-                            if let Some(err_val) = resp.get("error") {
-                                break err(format!("MCP server error: {err_val}"));
-                            }
-                            break ok(resp.to_string());
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            break err(format!(
-                                "MCP server '{server}' did not answer tools/call within {}s; verify the server command and tool name",
-                                MCP_TIMEOUT.as_secs()
-                            ))
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            break err(format!(
-                                "MCP server '{server}' exited before answering tools/call"
-                            ))
-                        }
-                    }
-                };
-                drop(stdin);
-                let _ = child.kill();
-                let _ = child.wait();
-                outcome
-            } else {
-                err(format!(
-                    "MCP server '{server}' not found in settings.json mcp_servers"
-                ))
-            }
+            // Legacy entry point: same persistent connection as `mcp__*`.
+            crate::mcp::ensure_ready();
+            mcp_outcome(crate::mcp::call(server, tool, &input["arguments"]))
+        }
+        n if crate::mcp::is_mcp_tool(n) => {
+            let Some((server, tool)) = crate::mcp::demangle(n) else {
+                return err(format!(
+                    "malformed MCP tool name: {n} (expected mcp__<server>__<tool>)"
+                ));
+            };
+            mcp_outcome(crate::mcp::call(&server, &tool, input))
         }
         "skill" | "load_skill" => {
             let wanted = input["name"]
