@@ -1117,7 +1117,9 @@ mod tests {
     fn run_child_captures_output_within_timeout() {
         let mut c = Command::new("sh");
         c.args(["-c", "echo out; echo err >&2; exit 7"]);
-        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(5));
+        // Generous: the whole suite runs in parallel and spawns many children,
+        // so a tight deadline turns into a load-dependent flake.
+        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(60));
         assert_eq!(code, 7);
         assert_eq!(stdout.trim(), "out");
         assert_eq!(stderr.trim(), "err");

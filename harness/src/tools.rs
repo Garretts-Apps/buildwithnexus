@@ -2215,6 +2215,26 @@ fn find_python_tool(cwd: &Path, raw: &str) -> PathBuf {
     direct
 }
 
+// `python3` on a stock Windows install is a Microsoft Store alias that opens
+// the Store instead of running; prefer `python` there when `python3` fails.
+fn python_interpreter() -> &'static str {
+    static PY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    PY.get_or_init(|| {
+        if cfg!(windows) {
+            let ok = Command::new("python3")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                return "python";
+            }
+        }
+        "python3"
+    })
+}
+
 fn list_python_tools(cwd: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for dir in python_tool_dirs(cwd) {
@@ -3941,7 +3961,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let path = find_python_tool(cwd, raw);
             let payload = input.get("input").cloned().unwrap_or_else(|| json!({}));
-            let mut command = Command::new("python3");
+            let mut command = Command::new(python_interpreter());
             command.arg(&path).current_dir(cwd);
             match run_with_timeout(
                 command,

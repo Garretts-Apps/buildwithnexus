@@ -1228,10 +1228,13 @@ pub fn discover_hook_scripts(event: &str) -> Vec<PathBuf> {
         for e in entries {
             let p = e.path();
             if let Some(ext) = p.extension().map(|x| x.to_string_lossy().to_lowercase()) {
-                if matches!(
+                let unix_like = matches!(
                     ext.as_str(),
                     "sh" | "bash" | "py" | "python" | "rs" | "rust"
-                ) {
+                );
+                // PowerShell and cmd scripts only have an interpreter on Windows.
+                let windows_only = cfg!(windows) && matches!(ext.as_str(), "ps1" | "cmd" | "bat");
+                if unix_like || windows_only {
                     scripts.push(p);
                 }
             }

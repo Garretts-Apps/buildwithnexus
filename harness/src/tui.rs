@@ -897,7 +897,9 @@ fn osc52_copy(text: &str) {
     let encoded = b64_encode(text.as_bytes());
     print!("\x1b]52;c;{encoded}\x07");
     let _ = io::stdout().flush();
-    if crate::tools::is_wsl() {
+    // Native Windows and WSL both have clip.exe; the terminal may not honor
+    // OSC 52, so mirror the text into the system clipboard as well.
+    if cfg!(windows) || crate::tools::is_wsl() {
         if let Ok(mut child) = std::process::Command::new("clip.exe")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
