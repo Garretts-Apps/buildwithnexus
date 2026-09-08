@@ -3611,6 +3611,7 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/mode",
     "/model",
     "/permissions",
+    "/sandbox",
     "/mcp",
     "/scroll",
     "/mouse",
@@ -3761,6 +3762,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/mode" => "show or switch mode",
         "/model" => "hot-swap the AI model",
         "/permissions" => "tool permission level (ask/auto/readonly)",
+        "/sandbox" => "OS sandbox for shell commands (off/auto/require)",
         "/mcp" => "inspect configured MCP servers",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
@@ -4068,6 +4070,13 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
         }
         "/permissions" => {
             return ["ask", "auto", "readonly"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/sandbox" => {
+            return ["off", "auto", "require", "status"]
                 .iter()
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())

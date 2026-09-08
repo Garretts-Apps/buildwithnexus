@@ -19,7 +19,7 @@ static MODE: OnceLock<Mode> = OnceLock::new();
 pub fn set(m: Mode) {
     let _ = MODE.set(m);
 }
-fn mode() -> Mode {
+pub fn mode() -> Mode {
     *MODE.get().unwrap_or(&Mode::Human)
 }
 pub fn is_json() -> bool {
@@ -94,6 +94,11 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
                 Some(p) if !p.trim().is_empty() => tui::file_link(p, &tui::yellow(preview)),
                 _ => tui::yellow(preview),
             },
+        ),
+        // The OS sandbox (sandbox.rs) confines this one — say so on the header.
+        "bash" | "run_command" if crate::sandbox::would_confine() => (
+            "⚡",
+            format!("{} {}", tui::blue(preview), tui::dim("[sandboxed]")),
         ),
         "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
             ("⚡", tui::blue(preview))
