@@ -898,8 +898,68 @@ fn restrict(path: &std::path::Path) {
     }
 }
 
-#[cfg(not(unix))]
+// Windows has no mode bits; the equivalent of 0600/0700 is an ACL that drops
+// inheritance and grants only the current user. Done by shelling out to the
+// built-in `icacls` rather than pulling in a Windows API crate. Directories
+// are only tightened once per process — `ensure_home` runs on every save and
+// a process spawn per call would be wasteful.
+#[cfg(windows)]
+fn restrict(path: &std::path::Path) {
+    use std::process::{Command, Stdio};
+    let is_dir = fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    if is_dir {
+        static DIR_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if DIR_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+    }
+    let user = std::env::var("USERNAME").ok();
+    let args = icacls_args(path, is_dir, user.as_deref());
+    let outcome = Command::new("icacls")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output();
+    let problem = match outcome {
+        Ok(o) if o.status.success() => return,
+        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        Err(e) => e.to_string(),
+    };
+    // Never abort a save over permissions; the file is still written.
+    eprintln!(
+        "{}",
+        crate::tui::dim(&format!(
+            "  ⚠ could not restrict {} to the current user (icacls): {problem}",
+            path.display()
+        ))
+    );
+}
+
+#[cfg(not(any(unix, windows)))]
 fn restrict(_path: &std::path::Path) {}
+
+// `icacls <path> /inheritance:r /grant:r <user>:(perms)` — strip inherited
+// ACEs and replace the explicit ones with a single grant to `user`. Without
+// `USERNAME`, the well-known OWNER RIGHTS SID (`*S-1-3-4`) grants whoever
+// owns the file, i.e. the account that just wrote it. Files get read+write;
+// directories get full control that inherits (OI)(CI) so files created in
+// them are usable at all — a bare (R,W) on a folder would leave new children
+// with no inherited ACEs.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn icacls_args(path: &std::path::Path, is_dir: bool, user: Option<&str>) -> Vec<String> {
+    let who = match user.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) => u.to_string(),
+        None => "*S-1-3-4".to_string(),
+    };
+    let perms = if is_dir { "(OI)(CI)F" } else { "(R,W)" };
+    vec![
+        path.to_string_lossy().into_owned(),
+        "/inheritance:r".to_string(),
+        "/grant:r".to_string(),
+        format!("{who}:{perms}"),
+    ]
+}
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1291,5 +1351,26 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn icacls_args_grant_only_current_user() {
+        let p = std::path::Path::new(r"C:\Users\me\.buildwithnexus\.env.keys");
+        let a = icacls_args(p, false, Some("me"));
+        assert_eq!(
+            a,
+            vec![
+                r"C:\Users\me\.buildwithnexus\.env.keys",
+                "/inheritance:r",
+                "/grant:r",
+                "me:(R,W)"
+            ]
+        );
+        // Directories: full control, inherited by new children.
+        let d = icacls_args(p.parent().unwrap(), true, Some("me"));
+        assert_eq!(d[3], "me:(OI)(CI)F");
+        // No USERNAME (or a blank one): fall back to the OWNER RIGHTS SID.
+        assert_eq!(icacls_args(p, false, None)[3], "*S-1-3-4:(R,W)");
+        assert_eq!(icacls_args(p, false, Some("  "))[3], "*S-1-3-4:(R,W)");
     }
 }
