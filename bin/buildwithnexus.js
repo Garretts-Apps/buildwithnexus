@@ -9,6 +9,13 @@ const { spawnSync } = require('child_process');
 const { existing, platformPackage, target } = require('../scripts/resolve-binary.js');
 
 let args = process.argv.slice(2);
+// Consume launcher options even when the binary is already installed. Respect
+// `--` so a task can still refer to the literal flag.
+const separatorIdx = args.indexOf('--');
+const flagIdx = args.findIndex((a, i) =>
+  a === '--bootstrap' && (separatorIdx === -1 || i < separatorIdx));
+args = args.filter((a, i) =>
+  a !== '--bootstrap' || (separatorIdx !== -1 && i > separatorIdx));
 let bin = existing();
 if (!bin) {
   // The platform optionalDependency is absent (platform packages not yet
@@ -19,8 +26,6 @@ if (!bin) {
   // running `npm install -g buildwithnexus`. Non-TTY environments (CI,
   // pipes, scripts) never auto-download; use --bootstrap or
   // BWN_ALLOW_BOOTSTRAP=1 to opt in explicitly there.
-  const flagIdx = args.indexOf('--bootstrap');
-  if (flagIdx !== -1) args = args.filter((a) => a !== '--bootstrap');
   const consented =
     flagIdx !== -1 ||
     process.env.BWN_ALLOW_BOOTSTRAP === '1' ||

@@ -2022,7 +2022,7 @@ fn render_output() {
         if let Some(line) = visible.get(row) {
             let plain = strip_ansi(line);
             if let Some(sel) = sel {
-                if let Some(range) = selection_range_for(sel, row as u16, plain.chars().count()) {
+                if let Some(range) = selection_range_for(sel, row as u16, &plain) {
                     let _ = write!(
                         out,
                         "{}",
@@ -2142,11 +2142,18 @@ fn click_count(row: u16, col: u16) -> u8 {
 // in the plain text of the visible row. None when the cell is blank.
 fn word_span_at(line: &str, col: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
-    let c = *chars.get(col)?;
+    let mut cell = 0;
+    let index = chars.iter().position(|&ch| {
+        let width = char_width(ch);
+        let hit = cell <= col && col < cell + width;
+        cell += width;
+        hit
+    })?;
+    let c = chars[index];
     if c.is_whitespace() {
         return None;
     }
-    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_' || char_width(ch) == 0;
     let class = if ident(c) { 0 } else { 1 };
     let same = |ch: char| {
         if class == 0 {
@@ -2155,15 +2162,17 @@ fn word_span_at(line: &str, col: usize) -> Option<(usize, usize)> {
             !ch.is_whitespace() && !ident(ch)
         }
     };
-    let mut start = col;
+    let mut start = index;
     while start > 0 && same(chars[start - 1]) {
         start -= 1;
     }
-    let mut end = col;
+    let mut end = index;
     while end + 1 < chars.len() && same(chars[end + 1]) {
         end += 1;
     }
-    Some((start, end))
+    let from: usize = chars[..start].iter().copied().map(char_width).sum();
+    let to: usize = chars[..=end].iter().copied().map(char_width).sum();
+    Some((from, to.saturating_sub(1)))
 }
 
 fn selection_start(row: u16, col: u16) {
@@ -2197,7 +2206,7 @@ fn selection_start(row: u16, col: u16) {
             let len = visible_rows()
                 .lock()
                 .ok()
-                .and_then(|rows| rows.get(row as usize).map(|l| l.chars().count()))
+                .and_then(|rows| rows.get(row as usize).map(|l| str_width(l)))
                 .unwrap_or(0);
             Selection {
                 anchor: SelectPos { row, col: 0 },
@@ -2269,7 +2278,7 @@ fn normalized_selection(sel: Selection) -> (SelectPos, SelectPos) {
     }
 }
 
-fn selection_range_for(sel: Selection, row: u16, line_len: usize) -> Option<(usize, usize)> {
+fn selection_range_for(sel: Selection, row: u16, line: &str) -> Option<(usize, usize)> {
     let (start, end) = normalized_selection(sel);
     if row < start.row || row > end.row {
         return None;
@@ -2278,15 +2287,29 @@ fn selection_range_for(sel: Selection, row: u16, line_len: usize) -> Option<(usi
         start.col as usize
     } else {
         0
-    }
-    .min(line_len);
+    };
     let to = if row == end.row {
         (end.col as usize).saturating_add(1)
     } else {
-        line_len
+        str_width(line)
+    };
+    // Mouse positions are display columns; the renderer and clipboard slice
+    // Unicode characters. Include a wide character when either cell is hit,
+    // and keep combining marks attached to a selected base character.
+    let mut col = 0;
+    let mut first = None;
+    let mut end = 0;
+    for (i, ch) in line.chars().enumerate() {
+        let width = char_width(ch);
+        if (width > 0 && col < to && col + width > from)
+            || (width == 0 && first.is_some() && end == i)
+        {
+            first.get_or_insert(i);
+            end = i + 1;
+        }
+        col += width;
     }
-    .min(line_len);
-    (to > from).then_some((from, to))
+    first.map(|start| (start, end))
 }
 
 // Theme selection tint (Tokyo Night visual-select) — far gentler than
@@ -2316,8 +2339,7 @@ fn selected_text() -> Option<String> {
     let mut out = Vec::new();
     for row in start.row..=end.row {
         let line = rows.get(row as usize).map(String::as_str).unwrap_or("");
-        let len = line.chars().count();
-        if let Some((from, to)) = selection_range_for(sel, row, len) {
+        if let Some((from, to)) = selection_range_for(sel, row, line) {
             out.push(line.chars().skip(from).take(to - from).collect::<String>());
         } else if row > start.row && row < end.row {
             out.push(String::new());
@@ -3241,7 +3263,7 @@ pub fn ask(prompt: &str) -> Option<String> {
         match read_line_raw(prompt) {
             None => None,
             Some(RawLine::Submit(s, _)) => Some(s),
-            Some(RawLine::CycleMode) => None, // shouldn't cycle mode inside a y/n prompt
+            Some(RawLine::CycleMode(_, _)) => None,
         }
     } else {
         print!("{prompt}");
@@ -3258,6 +3280,18 @@ pub fn ask(prompt: &str) -> Option<String> {
 // Multi-line task input. A trailing `\` + Enter adds another line; plain Enter
 // submits. Shift+Tab returns CycleMode without submitting.
 // Pre-fills the first line with any keystrokes typed during agent processing.
+#[derive(Default)]
+struct TaskDraft {
+    lines: Vec<String>,
+    buf: Vec<char>,
+    cursor: usize,
+}
+
+fn task_draft() -> &'static Mutex<Option<TaskDraft>> {
+    static DRAFT: std::sync::OnceLock<Mutex<Option<TaskDraft>>> = std::sync::OnceLock::new();
+    DRAFT.get_or_init(|| Mutex::new(None))
+}
+
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     // Take the message out inside a tight block: echo_submitted → line →
     // render_output re-locks the queue, and std Mutex is not reentrant.
@@ -3273,27 +3307,46 @@ pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     if !is_raw() {
         return ask(prompt).map(InputEvent::Text);
     }
-    let (prefill, prefill_cur) = take_typeahead();
-    let mut acc = String::new();
-    let mut p = prompt.to_string();
+    // A mode change must preserve both the current line/cursor and any
+    // completed continuation lines. Keep this separate from queued messages.
+    let mut draft = task_draft()
+        .lock()
+        .ok()
+        .and_then(|mut d| d.take())
+        .unwrap_or_else(|| {
+            let (buf, cursor) = take_typeahead();
+            TaskDraft {
+                buf,
+                cursor,
+                ..TaskDraft::default()
+            }
+        });
+    let mut p = if draft.lines.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{} ", dim("…"))
+    };
     // Use the typeahead buffer to pre-fill only the very first read.
-    let mut first = Some((prefill, prefill_cur));
+    let mut first = Some((std::mem::take(&mut draft.buf), draft.cursor));
     loop {
         let rl = if let Some((pf, pc)) = first.take() {
-            read_line_raw_prefill(&p, pf, pc)
+            read_line_raw_prefill(&p, pf, pc, true)
         } else {
-            read_line_raw(&p)
+            read_line_raw_prefill(&p, Vec::new(), 0, true)
         };
         match rl? {
-            RawLine::CycleMode => return Some(InputEvent::CycleMode),
-            RawLine::Submit(text, cont) => {
-                if acc.is_empty() {
-                    acc = text;
-                } else {
-                    acc.push('\n');
-                    acc.push_str(&text);
+            RawLine::CycleMode(buf, cursor) => {
+                draft.buf = buf;
+                draft.cursor = cursor;
+                if let Ok(mut saved) = task_draft().lock() {
+                    *saved = Some(draft);
                 }
+                return Some(InputEvent::CycleMode);
+            }
+            RawLine::Submit(text, cont) => {
+                draft.lines.push(text);
                 if !cont {
+                    let acc = draft.lines.join("\n");
                     push_history(&acc);
                     return Some(InputEvent::Text(acc));
                 }
@@ -3323,7 +3376,7 @@ fn history() -> &'static std::sync::Mutex<Vec<String>> {
 // ── raw-mode editor internals ────────────────────────────────────────────────
 enum RawLine {
     Submit(String, bool), // text, continue (multiline)?
-    CycleMode,
+    CycleMode(Vec<char>, usize),
 }
 
 fn viewport(buf: &[char], cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
@@ -3534,6 +3587,24 @@ fn token_at(buf: &[char], cursor: usize) -> (usize, String) {
         start -= 1;
     }
     (start, buf[start..cursor].iter().collect())
+}
+
+// Replace the whole token, including text to the right of the cursor.
+// Replacing only the prefix turns /he|lp into /helplp on completion.
+fn apply_completion(buf: &mut Vec<char>, cursor: &mut usize, candidate: &str, space: bool) {
+    let (start, _) = token_at(buf, *cursor);
+    let mut end = *cursor;
+    while end < buf.len() && !buf[end].is_whitespace() {
+        end += 1;
+    }
+    buf.splice(start..end, candidate.chars());
+    *cursor = start + candidate.chars().count();
+    if space && !candidate.ends_with('/') && !candidate.ends_with(':') {
+        if !buf.get(*cursor).is_some_and(|c| c.is_whitespace()) {
+            buf.insert(*cursor, ' ');
+        }
+        *cursor += 1;
+    }
 }
 
 fn common_prefix(items: &[String]) -> String {
@@ -3861,10 +3932,15 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
 }
 
 fn read_line_raw(prompt: &str) -> Option<RawLine> {
-    read_line_raw_prefill(prompt, vec![], 0)
+    read_line_raw_prefill(prompt, vec![], 0, false)
 }
 
-fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -> Option<RawLine> {
+fn read_line_raw_prefill(
+    prompt: &str,
+    prefill: Vec<char>,
+    prefill_cur: usize,
+    allow_mode_cycle: bool,
+) -> Option<RawLine> {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         print!("{prompt}");
         flush();
@@ -4062,19 +4138,20 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 render_footer();
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
-            // Shift+Tab → cycle mode (clear the line and signal the REPL).
-            KeyCode::BackTab => {
-                buf.clear();
+            // Shift+Tab changes mode while retaining the draft. Ordinary
+            // questions/approval prompts do not support mode changes.
+            KeyCode::BackTab if allow_mode_cycle => {
                 clear_composer();
                 flush();
-                return Some(RawLine::CycleMode);
+                return Some(RawLine::CycleMode(buf, cursor));
             }
-            KeyCode::Tab if ev.modifiers.contains(KeyModifiers::SHIFT) => {
-                buf.clear();
+            KeyCode::Tab if ev.modifiers.contains(KeyModifiers::SHIFT) && allow_mode_cycle => {
                 clear_composer();
                 flush();
-                return Some(RawLine::CycleMode);
+                return Some(RawLine::CycleMode(buf, cursor));
             }
+            KeyCode::BackTab => {}
+            KeyCode::Tab if ev.modifiers.contains(KeyModifiers::SHIFT) => {}
             KeyCode::Char('c') if ctrl => {
                 if buf.is_empty() {
                     clear_composer();
@@ -4516,14 +4593,8 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                     let (tok_start, token) = token_at(&buf, cursor);
                     let is_cmd = token.starts_with('/')
                         && buf[..tok_start].iter().all(|c| c.is_whitespace());
-                    let new: Vec<char> = cand.chars().collect();
-                    buf.splice(tok_start..cursor, new.iter().copied());
-                    cursor = tok_start + new.len();
+                    apply_completion(&mut buf, &mut cursor, &cand, !is_cmd);
                     if !is_cmd {
-                        if !cand.ends_with('/') && !cand.ends_with(':') {
-                            buf.insert(cursor, ' ');
-                            cursor += 1;
-                        }
                         redraw(prompt, start, &buf, cursor, &mut scroll);
                         continue;
                     }
@@ -4548,14 +4619,7 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
             KeyCode::Tab => {
                 if !sug.is_empty() {
                     let cand = sug[sug_idx].clone();
-                    let (tok_start, _) = token_at(&buf, cursor);
-                    let new: Vec<char> = cand.chars().collect();
-                    buf.splice(tok_start..cursor, new.iter().copied());
-                    cursor = tok_start + new.len();
-                    if !cand.ends_with('/') && !cand.ends_with(':') {
-                        buf.insert(cursor, ' ');
-                        cursor += 1;
-                    }
+                    apply_completion(&mut buf, &mut cursor, &cand, true);
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                     continue;
                 }
@@ -4563,20 +4627,12 @@ fn read_line_raw_prefill(prompt: &str, prefill: Vec<char>, prefill_cur: usize) -
                 let cands = completions(&buf, tok_start, &token);
                 if cands.len() == 1 {
                     let cand = &cands[0];
-                    let new: Vec<char> = cand.chars().collect();
-                    buf.splice(tok_start..cursor, new.iter().copied());
-                    cursor = tok_start + new.len();
-                    if !cand.ends_with('/') {
-                        buf.insert(cursor, ' ');
-                        cursor += 1;
-                    }
+                    apply_completion(&mut buf, &mut cursor, cand, true);
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                 } else if cands.len() > 1 {
                     let common = common_prefix(&cands);
                     if common.chars().count() > token.chars().count() {
-                        let new: Vec<char> = common.chars().collect();
-                        buf.splice(tok_start..cursor, new.iter().copied());
-                        cursor = tok_start + new.len();
+                        apply_completion(&mut buf, &mut cursor, &common, false);
                         redraw(prompt, start, &buf, cursor, &mut scroll);
                     } else {
                         clear_composer();
@@ -4778,17 +4834,67 @@ mod tests {
             focus: SelectPos { row: 2, col: 7 },
             sticky: false,
         };
-        assert_eq!(selection_range_for(one, 2, 20), Some((3, 8)));
-        assert_eq!(selection_range_for(one, 1, 20), None);
+        assert_eq!(selection_range_for(one, 2, &"x".repeat(20)), Some((3, 8)));
+        assert_eq!(selection_range_for(one, 1, &"x".repeat(20)), None);
 
         let many = Selection {
             anchor: SelectPos { row: 1, col: 4 },
             focus: SelectPos { row: 3, col: 2 },
             sticky: false,
         };
-        assert_eq!(selection_range_for(many, 1, 10), Some((4, 10)));
-        assert_eq!(selection_range_for(many, 2, 10), Some((0, 10)));
-        assert_eq!(selection_range_for(many, 3, 10), Some((0, 3)));
+        assert_eq!(selection_range_for(many, 1, &"x".repeat(10)), Some((4, 10)));
+        assert_eq!(selection_range_for(many, 2, &"x".repeat(10)), Some((0, 10)));
+        assert_eq!(selection_range_for(many, 3, &"x".repeat(10)), Some((0, 3)));
+    }
+
+    #[test]
+    fn selection_uses_terminal_cells_and_keeps_combining_marks() {
+        let select = |line: &str, from, to| {
+            let sel = Selection {
+                anchor: SelectPos { row: 0, col: from },
+                focus: SelectPos { row: 0, col: to },
+                sticky: false,
+            };
+            selection_range_for(sel, 0, line)
+                .map(|(a, b)| line.chars().skip(a).take(b - a).collect::<String>())
+        };
+        assert_eq!(select("你 hello", 3, 7).as_deref(), Some("hello"));
+        assert_eq!(select("你 hello", 1, 1).as_deref(), Some("你"));
+        assert_eq!(select("🙂 ok", 3, 4).as_deref(), Some("ok"));
+        assert_eq!(select("e\u{301} ok", 0, 0).as_deref(), Some("e\u{301}"));
+        assert_eq!(select("e\u{301} ok", 2, 3).as_deref(), Some("ok"));
+        assert_eq!(select("你 hello", 7, 3).as_deref(), Some("hello"));
+        assert_eq!(select("short", 20, 25), None);
+    }
+
+    #[test]
+    fn word_selection_reports_display_columns() {
+        assert_eq!(word_span_at("你 hello", 3), Some((3, 7)));
+        assert_eq!(word_span_at("你 hello", 1), Some((0, 1)));
+        assert_eq!(word_span_at("🙂 hello", 4), Some((3, 7)));
+        assert_eq!(word_span_at("e\u{301} hello", 0), Some((0, 0)));
+        assert_eq!(word_span_at("你 hello", 2), None);
+    }
+
+    #[test]
+    fn completion_replaces_suffix_without_duplicating_spaces() {
+        let mut buf: Vec<char> = "/help".chars().collect();
+        let mut cursor = 3;
+        apply_completion(&mut buf, &mut cursor, "/help", true);
+        assert_eq!(buf.iter().collect::<String>(), "/help ");
+        assert_eq!(cursor, 6);
+
+        let mut buf: Vec<char> = "/mode brainstorm tail".chars().collect();
+        let mut cursor = 8;
+        apply_completion(&mut buf, &mut cursor, "build", true);
+        assert_eq!(buf.iter().collect::<String>(), "/mode build tail");
+        assert_eq!(cursor, 12);
+
+        let mut buf: Vec<char> = "read @文档.txt".chars().collect();
+        let mut cursor = 7;
+        apply_completion(&mut buf, &mut cursor, "@文件/", true);
+        assert_eq!(buf.iter().collect::<String>(), "read @文件/");
+        assert_eq!(cursor, buf.len());
     }
 
     #[test]

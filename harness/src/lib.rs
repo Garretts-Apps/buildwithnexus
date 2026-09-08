@@ -70,51 +70,65 @@ use provider::Provider;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 struct CliOptions {
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     prompt: Option<String>,
+    json: bool,
 }
 
-fn parse_cli_options(args: Vec<String>) -> (CliOptions, Vec<String>) {
+fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
     let mut opts = CliOptions::default();
     let mut rest = Vec::new();
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
-        if let Some(v) = arg.strip_prefix("--provider=") {
-            opts.provider = Some(v.to_string());
-        } else if arg == "--provider" {
-            opts.provider = it.next();
-        } else if let Some(v) = arg.strip_prefix("--model=") {
-            opts.model = Some(v.to_string());
-        } else if arg == "--model" {
-            opts.model = it.next();
-        } else if let Some(v) = arg.strip_prefix("--permission-mode=") {
-            opts.permission_mode = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--permission=") {
-            opts.permission_mode = Some(v.to_string());
-        } else if arg == "--permission-mode" || arg == "--permission" {
-            opts.permission_mode = it.next();
-        } else if let Some(v) = arg.strip_prefix("--prompt=") {
-            opts.prompt = Some(v.to_string());
-        } else if arg == "--prompt" {
-            opts.prompt = it.next();
-        } else {
-            rest.push(arg);
+        if arg == "--" {
+            rest.extend(it);
+            break;
         }
+        if arg == "--json" {
+            opts.json = true;
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        let slot = match flag {
+            "--provider" => &mut opts.provider,
+            "--model" => &mut opts.model,
+            "--permission-mode" | "--permission" => &mut opts.permission_mode,
+            "--prompt" => &mut opts.prompt,
+            _ => {
+                rest.push(arg);
+                continue;
+            }
+        };
+        let value = inline
+            .map(str::to_string)
+            .or_else(|| it.next().filter(|v| !v.starts_with('-')));
+        *slot = Some(
+            value
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| format!("{flag} requires a value; see `buildwithnexus --help`"))?,
+        );
     }
-    (opts, rest)
+    Ok((opts, rest))
 }
 
 pub fn run() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--json") {
-        args.retain(|a| a != "--json");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (opts, args) = match parse_cli_options(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("buildwithnexus: {e}");
+            std::process::exit(2);
+        }
+    };
+    if opts.json {
         report::set(report::Mode::Json);
     }
-    let (opts, args) = parse_cli_options(args);
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
 
@@ -3536,6 +3550,13 @@ fn usage() {
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
          \x20 buildwithnexus version | help\n\n\
+         OPTIONS:\n\
+         \x20 --provider <name>             override the configured provider\n\
+         \x20 --model <name>                override the configured model\n\
+         \x20 --permission-mode <mode>      ask, auto, or readonly\n\
+         \x20 --prompt <text>               initial interactive prompt\n\
+         \x20 --json                        structured headless output\n\
+         \x20 --                            stop parsing options (run -- <task>)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
@@ -4117,10 +4138,66 @@ mod tests {
             "--permission-mode=acceptEdits".into(),
             "fix".into(),
             "tests".into(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(opts.model.as_deref(), Some("qwen3"));
         assert_eq!(opts.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(rest, vec!["fix", "tests"]);
+    }
+
+    #[test]
+    fn cli_separator_preserves_literal_option_names() {
+        let (opts, rest) = parse_cli_options(
+            ["--json", "run", "--", "explain", "--model", "--json"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(opts.json);
+        assert!(opts.model.is_none());
+        assert_eq!(rest, ["run", "explain", "--model", "--json"]);
+
+        let (opts, rest) =
+            parse_cli_options(["run", "--", "--json"].map(str::to_string).to_vec()).unwrap();
+        assert!(!opts.json);
+        assert_eq!(rest, ["run", "--json"]);
+    }
+
+    #[test]
+    fn cli_options_reject_missing_or_empty_values() {
+        for flag in [
+            "--provider",
+            "--model",
+            "--permission-mode",
+            "--permission",
+            "--prompt",
+        ] {
+            for args in [
+                vec![flag.to_string()],
+                vec![flag.to_string(), "--json".to_string()],
+                vec![flag.to_string(), "".to_string()],
+                vec![format!("{flag}=")],
+            ] {
+                let error = parse_cli_options(args).unwrap_err();
+                assert!(
+                    error.contains(&format!("{flag} requires a value")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_inline_prompt_can_start_with_a_dash() {
+        let (opts, rest) = parse_cli_options(
+            ["--prompt=--model", "--model=example"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(opts.prompt.as_deref(), Some("--model"));
+        assert_eq!(opts.model.as_deref(), Some("example"));
+        assert!(rest.is_empty());
     }
 
     #[test]
