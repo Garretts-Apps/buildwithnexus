@@ -183,6 +183,54 @@ or a `|`-separated list. See [`examples/settings.json`](./examples/settings.json
 }
 ```
 
+## Project instructions (AGENTS.md / CLAUDE.md)
+
+The same instruction files other coding agents read are loaded into every
+system prompt — BUILD, PLAN, BRAINSTORM, quick chat replies, sub-agents, and
+headless `--json` runs. Discovery order (most general first, later files take
+precedence):
+
+1. `~/.buildwithnexus/AGENTS.md` (global, optional)
+2. every directory from the git root (or filesystem root) down to the cwd:
+   `AGENTS.md`, else `CLAUDE.md` (so a repo shipping both isn't loaded twice),
+   then `.buildwithnexus/AGENTS.md`
+
+Each file is capped at 32 KiB (cut with a visible marker) and 96 KiB in
+total. A dim line at startup lists what was found:
+`instructions: AGENTS.md, src/AGENTS.md`. `/init` offers to create a starter
+`AGENTS.md` (build/test commands, conventions, do-nots) when the cwd has none.
+The `instruction_files` settings key changes which names are looked up
+(default `["AGENTS.md", "CLAUDE.md"]`; add `"GEMINI.md"`, or `[]` to disable).
+
+The mixed-case `.buildwithnexus/Agents.md` is different: it defines agent
+roles/capabilities (`/agents` shows it) and is loaded after the instructions.
+
+## Skills
+
+Skills are markdown instructions loaded on demand: the system prompt carries
+only each skill's name and description, and the full body is loaded by
+`/<name>`, the `load_skill` tool (alias `skill`), or `list_skills` → `load_skill`.
+Two layouts are supported, from any of these roots:
+
+```
+~/.buildwithnexus/skills/   ./.buildwithnexus/skills/    (source: user / project)
+~/.claude/skills/           ./.claude/skills/            (source: claude)
+~/.agents/skills/           ./.agents/skills/            (source: agents)
+```
+
+- **`<name>/SKILL.md`** folders (the Agent Skills open standard) with YAML
+  frontmatter — `name` (defaults to the folder name) and `description`
+  (required for a useful listing; a missing one shows as `(no description)`
+  with a one-time warning). Unknown keys are ignored. When loaded, the skill
+  reports its directory so `scripts/` or `references/` inside it can be read
+  with the file tools.
+- **`<name>.md`** flat files, where the first prose line is the description.
+
+On a name collision the more specific source wins: project beats user beats
+bundled, and a `SKILL.md` folder beats a flat file of the same name. Add more
+roots with the `skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
+`/skills` lists every skill with its source and description.
+
 ## Build from source
 
 ```bash

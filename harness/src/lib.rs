@@ -136,6 +136,8 @@ pub fn run() {
         "" => interactive(opts.prompt.clone(), opts),
         "init" | "da-init" | "setup" => {
             onboarding::run();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            offer_starter_agents_md(&cwd);
         }
         "providers" => {
             for p in config::PRESETS {
@@ -420,6 +422,9 @@ fn headless(
             ))
         );
         println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
+        for note in config::startup_context_notices(&cwd) {
+            println!("{}", tui::dim(&format!("  {note}")));
+        }
         println!();
         // Off the critical path: five `which` probes cost real startup latency,
         // and with interactive=false this only prints when something is missing.
@@ -507,6 +512,9 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    for note in config::startup_context_notices(cwd) {
+        tui::line(&tui::dim(&format!("  {note}")));
+    }
     let restored = workflow::restore();
     if restored > 0 {
         tui::line(&tui::green(&format!(
@@ -857,6 +865,7 @@ fn repl(
             "/init" => {
                 tui::leave_alt();
                 onboarding::run();
+                offer_starter_agents_md(cwd);
                 tui::enter_alt(raw);
                 continue;
             }
@@ -1027,7 +1036,7 @@ fn repl(
                 continue;
             }
             "/skills" => {
-                handle_skills();
+                handle_skills(cwd);
                 continue;
             }
             "/tools" => {
@@ -1541,19 +1550,30 @@ fn handle_memory(
     }
 }
 
-fn handle_skills() {
-    let skills = config::load_skills();
+fn handle_skills(cwd: &std::path::Path) {
+    let skills = config::discover_skills(cwd);
     if skills.is_empty() {
         tui::line(&tui::dim("  No skills found."));
         tui::line(&tui::dim(&format!(
-            "  Add .md files to {}/skills/",
+            "  Add <name>.md files or <name>/SKILL.md folders to {}/skills/",
             config::home().display()
         )));
         return;
     }
+    // First detail line is what the list shows: source + description.
     let mut items: Vec<(String, String)> = skills
-        .into_iter()
-        .map(|(name, content)| (format!("/{name}"), content))
+        .iter()
+        .map(|s| {
+            (
+                format!("/{}", s.name),
+                format!(
+                    "[{}] {}\n\n{}",
+                    s.source.label(),
+                    s.description_or_default(),
+                    s.loaded_text()
+                ),
+            )
+        })
         .collect();
     for cmd in config::load_custom_commands()
         .into_iter()
@@ -1603,6 +1623,31 @@ fn handle_mcp() {
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
     tui::browse_items("mcp servers", &items);
+}
+
+/// `/init` step: offer a starter AGENTS.md when the cwd has no instruction file.
+fn offer_starter_agents_md(cwd: &std::path::Path) {
+    if cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists() {
+        return;
+    }
+    tui::line("");
+    tui::line(&tui::dim(&format!(
+        "  No AGENTS.md in {} — it tells the agent your build/test commands, conventions, and do-nots.",
+        cwd.display()
+    )));
+    let answer =
+        tui::ask("  create a starter AGENTS.md here? [Y/n] ").unwrap_or_else(|| "n".into());
+    if matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
+        match config::create_starter_agents_md(cwd) {
+            Ok(p) => tui::line(&tui::green(&format!(
+                "  ✓ created {} — fill in the placeholders",
+                p.display()
+            ))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else {
+        tui::line(&tui::dim("  skipped"));
+    }
 }
 
 fn find_custom_command(name: &str) -> Option<config::CustomCommand> {

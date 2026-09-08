@@ -1,9 +1,9 @@
 // Provider presets, persisted settings, API-key store, memory, and skills.
 // Everything here is flat data + direct file IO.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -171,10 +171,24 @@ pub struct Settings {
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub plugins: BTreeMap<String, serde_json::Value>,
+    /// Project instruction file names looked up in every directory from the
+    /// git root down to the cwd; the first match per directory wins. Default
+    /// `["AGENTS.md", "CLAUDE.md"]`; `[]` disables instruction loading.
+    #[serde(default = "default_instruction_files")]
+    pub instruction_files: Vec<String>,
+    /// Extra skill roots (each holding `<name>/SKILL.md` folders or flat
+    /// `<name>.md` files) scanned in addition to the built-in locations.
+    /// `~/` is expanded; relative paths resolve against the project cwd.
+    #[serde(default)]
+    pub skill_dirs: Vec<String>,
 }
 
 fn default_effort() -> String {
     "low".into()
+}
+
+fn default_instruction_files() -> Vec<String> {
+    vec!["AGENTS.md".into(), "CLAUDE.md".into()]
 }
 
 impl Default for Settings {
@@ -192,6 +206,8 @@ impl Default for Settings {
             allowed_commands: Vec::new(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
+            instruction_files: default_instruction_files(),
+            skill_dirs: Vec::new(),
         }
     }
 }
@@ -314,8 +330,11 @@ pub fn append_memory(entry: &str) {
 }
 
 // ── agents + skills ───────────────────────────────────────────────────────────
-// Agents.md defines roles/capabilities the model can invoke. Skills are
-// individual markdown files that describe custom behaviors.
+// `Agents.md` (mixed case, harness-specific) defines roles/capabilities the
+// model can adopt. It is distinct from the cross-harness project instruction
+// files `AGENTS.md` / `CLAUDE.md` handled by `load_instructions` below, which
+// carry repository conventions. Skills are markdown instructions loaded on
+// demand — either flat `<name>.md` files or `<name>/SKILL.md` folders.
 
 pub fn load_agents() -> Option<String> {
     // Project-local Agents.md takes precedence over the home one.
@@ -351,43 +370,377 @@ pub fn load_system_prompt() -> Option<String> {
         .map(|t| t.trim().to_string())
 }
 
-// Returns (name, content) pairs for all skill files.
-pub fn load_skills() -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (name, content) in bundled_skills() {
-        seen.insert(name.to_string());
-        out.push((name.to_string(), content.trim().to_string()));
-    }
-    for dir in [
-        skills_dir(),
-        std::env::current_dir()
-            .ok()
-            .map(|d| d.join(".buildwithnexus/skills"))
-            .unwrap_or_default(),
-    ] {
-        if let Ok(rd) = fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let path = e.path();
-                if path.extension().is_some_and(|x| x == "md") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        let name = path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        if !name.is_empty() && !content.trim().is_empty() {
-                            if seen.contains(&name) {
-                                out.retain(|(existing, _)| existing != &name);
-                            }
-                            seen.insert(name.clone());
-                            out.push((name, content.trim().to_string()));
-                        }
-                    }
-                }
-            }
+// ── project instruction files (AGENTS.md / CLAUDE.md) ─────────────────────────
+// The cross-harness "how to work in this repo" files: build/test commands,
+// conventions, do-nots. Discovery order (most general first):
+//   1. ~/.buildwithnexus/AGENTS.md
+//   2. every directory from the git root (or filesystem root) down to the cwd:
+//      the first `instruction_files` name present (AGENTS.md, else CLAUDE.md),
+//      then `.buildwithnexus/AGENTS.md`.
+// Names are matched against the exact directory listing so a case-insensitive
+// filesystem never mistakes the roles file `Agents.md` for `AGENTS.md`.
+
+/// Per-file cap; longer files are cut with a visible marker.
+pub const INSTRUCTION_FILE_CAP: usize = 32 * 1024;
+/// Cap across all loaded instruction files; later files are omitted.
+pub const INSTRUCTION_TOTAL_CAP: usize = 96 * 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstructionFile {
+    pub path: PathBuf,
+    /// Display name: relative to the git root when there is one.
+    pub label: String,
+    pub content: String,
+    pub truncated: bool,
+}
+
+/// Nearest ancestor of `start` (inclusive) that contains a `.git` entry.
+pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Exact-case names in `dir`; empty when unreadable.
+fn dir_names(dir: &Path) -> HashSet<String> {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn user_home() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+fn tilde(path: &Path) -> String {
+    if let Some(h) = user_home() {
+        if let Ok(rest) = path.strip_prefix(&h) {
+            return format!("~/{}", rest.display());
         }
     }
+    path.display().to_string()
+}
+
+fn cut_at_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Instruction files for `cwd`, honouring the `instruction_files` setting.
+pub fn load_instructions(cwd: &Path) -> Vec<InstructionFile> {
+    let names = load_settings_from_dir(cwd)
+        .map(|s| s.instruction_files)
+        .unwrap_or_else(default_instruction_files);
+    load_instructions_with(cwd, &names)
+}
+
+/// `names` are tried in order in each directory; the first present wins.
+/// An empty list disables instruction loading entirely.
+pub fn load_instructions_with(cwd: &Path, names: &[String]) -> Vec<InstructionFile> {
+    let mut out = Vec::new();
+    if names.is_empty() {
+        return out;
+    }
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let root = find_git_root(&cwd);
+
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    let h = home();
+    if dir_names(&h).contains("AGENTS.md") {
+        let p = h.join("AGENTS.md");
+        let label = tilde(&p);
+        candidates.push((p, label));
+    }
+    let label_for = |p: &Path| -> String {
+        match &root {
+            Some(r) => p
+                .strip_prefix(r)
+                .map(|rel| rel.display().to_string())
+                .unwrap_or_else(|_| p.display().to_string()),
+            None => p.display().to_string(),
+        }
+    };
+    let mut chain: Vec<&Path> = cwd.ancestors().collect();
+    chain.reverse();
+    for dir in chain {
+        if root.as_deref().is_some_and(|r| !dir.starts_with(r)) {
+            continue;
+        }
+        let listing = dir_names(dir);
+        if let Some(n) = names.iter().find(|n| listing.contains(n.as_str())) {
+            let p = dir.join(n);
+            let label = label_for(&p);
+            candidates.push((p, label));
+        }
+        let dot = dir.join(".buildwithnexus");
+        if dir_names(&dot).contains("AGENTS.md") {
+            let p = dot.join("AGENTS.md");
+            let label = label_for(&p);
+            candidates.push((p, label));
+        }
+    }
+
+    let mut total = 0usize;
+    for (path, label) in candidates {
+        let Some(raw) = fs::read_to_string(&path)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        let remaining = INSTRUCTION_TOTAL_CAP.saturating_sub(total);
+        let (content, truncated) = if remaining == 0 {
+            (
+                format!(
+                    "[… omitted: {} KiB total instruction cap reached — read {} directly]",
+                    INSTRUCTION_TOTAL_CAP / 1024,
+                    path.display()
+                ),
+                true,
+            )
+        } else if raw.len() > INSTRUCTION_FILE_CAP.min(remaining) {
+            let cap = INSTRUCTION_FILE_CAP.min(remaining);
+            (
+                format!(
+                    "{}\n\n[… truncated at {} KiB — read {} for the rest]",
+                    cut_at_char_boundary(&raw, cap),
+                    cap / 1024,
+                    path.display()
+                ),
+                true,
+            )
+        } else {
+            (raw, false)
+        };
+        total += content.len();
+        out.push(InstructionFile {
+            path,
+            label,
+            content,
+            truncated,
+        });
+    }
     out
+}
+
+/// System-prompt section for the loaded files, or None when there are none.
+pub fn instructions_prompt(files: &[InstructionFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "[Project instructions — AGENTS.md / CLAUDE.md]\n\
+         Repository instructions, most general first; later files are more specific and take precedence. Follow them.\n",
+    );
+    for f in files {
+        s.push_str(&format!("\n--- {} ---\n{}\n", f.path.display(), f.content));
+    }
+    Some(s)
+}
+
+/// One-line startup notice, e.g. `instructions: AGENTS.md, src/AGENTS.md`.
+pub fn instructions_notice(files: &[InstructionFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let names = files
+        .iter()
+        .map(|f| {
+            if f.truncated {
+                format!("{} (truncated)", f.label)
+            } else {
+                f.label.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("instructions: {names}"))
+}
+
+/// Starter written by `/init` when the cwd has no AGENTS.md.
+pub const STARTER_AGENTS_MD: &str = "\
+# AGENTS.md
+
+Instructions for AI coding agents working in this repository.
+
+## Build & test
+
+- Build: `<command>`
+- Test: `<command>`
+- Lint / format: `<command>`
+
+## Conventions
+
+- <language, style, and directory layout rules>
+- <how commits and pull requests are written>
+
+## Do not
+
+- <files or directories that must not be edited>
+- <commands that must not be run>
+";
+
+/// Create a starter AGENTS.md in `cwd`; refuses to overwrite an existing one.
+pub fn create_starter_agents_md(cwd: &Path) -> Result<PathBuf, String> {
+    let p = cwd.join("AGENTS.md");
+    if p.exists() {
+        return Err(format!("{} already exists", p.display()));
+    }
+    fs::write(&p, STARTER_AGENTS_MD).map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(p)
+}
+
+// ── skills ────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillSource {
+    Bundled,
+    /// `~/.buildwithnexus/skills/`
+    User,
+    /// `./.buildwithnexus/skills/`
+    Project,
+    /// `~/.claude/skills/` or `./.claude/skills/`
+    Claude,
+    /// `~/.agents/skills/` or `./.agents/skills/`
+    Agents,
+    /// A `skill_dirs` entry from settings.
+    Custom,
+}
+
+impl SkillSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            SkillSource::Bundled => "bundled",
+            SkillSource::User => "user",
+            SkillSource::Project => "project",
+            SkillSource::Claude => "claude",
+            SkillSource::Agents => "agents",
+            SkillSource::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Skill {
+    pub name: String,
+    /// From `description:` frontmatter (or the first prose line of a flat
+    /// file). None for a SKILL.md folder that declares none.
+    pub description: Option<String>,
+    /// Markdown body with any frontmatter stripped.
+    pub content: String,
+    pub source: SkillSource,
+    /// Folder of a `<name>/SKILL.md` skill; None for flat files and bundled.
+    pub dir: Option<PathBuf>,
+}
+
+impl Skill {
+    pub fn description_or_default(&self) -> &str {
+        self.description.as_deref().unwrap_or("(no description)")
+    }
+
+    /// Full text handed to the model. Folder skills lead with their directory
+    /// so referenced files (scripts/, references/, …) are addressable with
+    /// the ordinary file tools.
+    pub fn loaded_text(&self) -> String {
+        match &self.dir {
+            Some(d) => format!(
+                "Skill directory: {}\n\
+                 (Files this skill references, e.g. scripts/ or references/, live under that path — read them with read_file.)\n\n{}",
+                d.display(),
+                self.content
+            ),
+            None => self.content.clone(),
+        }
+    }
+}
+
+fn unquote(v: &str) -> String {
+    let b = v.as_bytes();
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
+        return v[1..v.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+    }
+    if b.len() >= 2 && b[0] == b'\'' && b[b.len() - 1] == b'\'' {
+        return v[1..v.len() - 1].replace("''", "'");
+    }
+    v.to_string()
+}
+
+/// Minimal YAML frontmatter: `---` … `---` with `key: value` scalars
+/// (quoted or bare) and `|` / `>` block scalars. Unknown keys are kept in
+/// the map and ignored by callers. Returns the fields and the body after the
+/// closing fence; text without a complete fence is all body.
+pub fn parse_frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return (BTreeMap::new(), text);
+    };
+    if first.trim_end() != "---" {
+        return (BTreeMap::new(), text);
+    }
+    let mut pos = first.len();
+    let mut map = BTreeMap::new();
+    let mut block: Option<(String, char)> = None;
+    let mut closed = false;
+    for line in lines {
+        pos += line.len();
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let t = raw.trim();
+        if t == "---" || t == "..." {
+            closed = true;
+            break;
+        }
+        if let Some((key, style)) = &block {
+            if raw.starts_with([' ', '\t']) || t.is_empty() {
+                if !t.is_empty() {
+                    let entry: &mut String = map.entry(key.clone()).or_default();
+                    if !entry.is_empty() {
+                        entry.push(if *style == '|' { '\n' } else { ' ' });
+                    }
+                    entry.push_str(t);
+                }
+                continue;
+            }
+            block = None;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = t.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            continue;
+        }
+        let v = v.trim();
+        let style = v.chars().next();
+        if matches!(style, Some('|') | Some('>')) && v[1..].trim_matches(['-', '+']).is_empty() {
+            block = Some((k.to_string(), style.unwrap_or('|')));
+            map.insert(k.to_string(), String::new());
+            continue;
+        }
+        map.insert(k.to_string(), unquote(v));
+    }
+    if !closed {
+        return (BTreeMap::new(), text);
+    }
+    (map, &text[pos..])
 }
 
 /// Extract a short description from a skill's markdown content.
@@ -412,18 +765,183 @@ pub fn skill_description(content: &str) -> String {
     title
 }
 
-/// Returns (name, short_description) pairs for all skills.
-/// Only extracts the description line — never loads the full skill body into the
-/// model's context. Bad/small models benefit from this because the system prompt
-/// stays small and they can selectively load_skill the ones they need.
-pub fn load_skill_descriptions() -> Vec<(String, String)> {
-    load_skills()
-        .into_iter()
-        .map(|(name, content)| {
-            let desc = skill_description(&content);
-            (name, desc)
+fn skill_from_text(
+    default_name: &str,
+    text: &str,
+    source: SkillSource,
+    dir: Option<PathBuf>,
+) -> Option<Skill> {
+    let (fm, body) = parse_frontmatter(text);
+    let name = fm
+        .get("name")
+        .map(|n| n.trim().trim_start_matches('/').to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| default_name.to_string());
+    let content = body.trim().to_string();
+    let description = match fm.get("description").map(|d| d.trim()) {
+        Some(d) if !d.is_empty() => Some(d.to_string()),
+        // Flat files never had frontmatter; keep the prose heuristic for them.
+        _ if dir.is_none() && !content.is_empty() => Some(skill_description(&content)),
+        _ => None,
+    };
+    if content.is_empty() && description.is_none() {
+        return None;
+    }
+    Some(Skill {
+        name,
+        description,
+        content,
+        source,
+        dir,
+    })
+}
+
+// Later sources win on a name collision.
+fn push_skill(out: &mut Vec<Skill>, skill: Skill) {
+    out.retain(|s| s.name != skill.name);
+    out.push(skill);
+}
+
+// Flat `<name>.md` files first, then `<name>/SKILL.md` folders, so a folder
+// beats a flat file of the same name in the same root.
+fn scan_skill_root(dir: &Path, source: SkillSource, out: &mut Vec<Skill>) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    let mut folders = Vec::new();
+    for path in entries {
+        let stem = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem.is_empty() || stem.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            if path.join("SKILL.md").is_file() {
+                folders.push(path);
+            }
+        } else if path.extension().is_some_and(|x| x == "md") {
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Some(s) = skill_from_text(&stem, &text, source, None) {
+                    push_skill(out, s);
+                }
+            }
+        }
+    }
+    for folder in folders {
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Ok(text) = fs::read_to_string(folder.join("SKILL.md")) {
+            if let Some(s) = skill_from_text(&name, &text, source, Some(folder)) {
+                push_skill(out, s);
+            }
+        }
+    }
+}
+
+/// Skill roots in precedence order (lowest first): user-level `.agents`,
+/// `.claude`, `~/.buildwithnexus/skills`, then `skill_dirs` from settings,
+/// then the project-level `.agents`, `.claude`, `.buildwithnexus/skills`.
+fn skill_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource)> {
+    let mut roots = Vec::new();
+    if let Some(u) = user_home() {
+        roots.push((u.join(".agents").join("skills"), SkillSource::Agents));
+        roots.push((u.join(".claude").join("skills"), SkillSource::Claude));
+    }
+    roots.push((skills_dir(), SkillSource::User));
+    if let Some(s) = load_settings_from_dir(cwd) {
+        for d in s.skill_dirs {
+            let d = d.trim();
+            if d.is_empty() {
+                continue;
+            }
+            let p = match d.strip_prefix("~/") {
+                Some(rest) => match user_home() {
+                    Some(u) => u.join(rest),
+                    None => continue,
+                },
+                None => cwd.join(d),
+            };
+            roots.push((p, SkillSource::Custom));
+        }
+    }
+    roots.push((cwd.join(".agents").join("skills"), SkillSource::Agents));
+    roots.push((cwd.join(".claude").join("skills"), SkillSource::Claude));
+    roots.push((
+        cwd.join(".buildwithnexus").join("skills"),
+        SkillSource::Project,
+    ));
+    roots
+}
+
+/// All skills visible from `cwd`: bundled, then every root from `skill_roots`;
+/// a later source replaces an earlier one of the same name.
+pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
+    let mut out = Vec::new();
+    for (name, content) in bundled_skills() {
+        if let Some(s) = skill_from_text(name, content, SkillSource::Bundled, None) {
+            push_skill(&mut out, s);
+        }
+    }
+    for (dir, source) in skill_roots(cwd) {
+        scan_skill_root(&dir, source, &mut out);
+    }
+    out
+}
+
+/// Warnings worth one dim line: SKILL.md folders without a description.
+pub fn skill_warnings(skills: &[Skill]) -> Vec<String> {
+    skills
+        .iter()
+        .filter(|s| s.description.is_none())
+        .filter_map(|s| {
+            s.dir.as_ref().map(|d| {
+                format!(
+                    "skill {}: no `description:` in {} frontmatter",
+                    s.name,
+                    d.join("SKILL.md").display()
+                )
+            })
         })
         .collect()
+}
+
+/// `skill_warnings` filtered to ones not yet returned in this process.
+pub fn skill_warnings_once(skills: &[Skill]) -> Vec<String> {
+    static SEEN: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut lock = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = lock.get_or_insert_with(HashSet::new);
+    skill_warnings(skills)
+        .into_iter()
+        .filter(|w| seen.insert(w.clone()))
+        .collect()
+}
+
+/// Returns (name, description) pairs for all skills — never the bodies, so the
+/// system prompt stays small and the model load_skill's what it needs.
+pub fn load_skill_descriptions(cwd: &Path) -> Vec<(String, String)> {
+    discover_skills(cwd)
+        .into_iter()
+        .map(|s| {
+            let desc = s.description_or_default().to_string();
+            (s.name, desc)
+        })
+        .collect()
+}
+
+/// Dim startup lines: which instruction files loaded, plus skill warnings.
+pub fn startup_context_notices(cwd: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(n) = instructions_notice(&load_instructions(cwd)) {
+        out.push(n);
+    }
+    out.extend(skill_warnings_once(&discover_skills(cwd)));
+    out
 }
 
 pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
@@ -552,11 +1070,14 @@ pub fn load_custom_commands() -> Vec<CustomCommand> {
             }
         }
     }
-    for (name, content) in bundled_skills() {
-        if !seen.contains(name) {
+    // Every discovered skill (bundled, user, project, .claude, .agents) is a
+    // slash command too; an explicit commands/ entry of the same name wins.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for skill in discover_skills(&cwd) {
+        if !seen.contains(&skill.name) {
             out.push(CustomCommand {
-                name: name.to_string(),
-                content: content.trim().to_string(),
+                content: skill.loaded_text(),
+                name: skill.name,
                 script: None,
             });
         }
@@ -1291,5 +1812,388 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("bwn-{tag}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn instructions_walk_git_root_to_cwd_with_claude_fallback() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        write(&h.join("AGENTS.md"), "global rules");
+        // The roles file must never be mistaken for an instruction file.
+        write(&h.join("Agents.md"), "## Engineer\nrole text");
+
+        let outer = unique_dir("instr");
+        write(&outer.join("AGENTS.md"), "ABOVE THE GIT ROOT");
+        let root = outer.join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root.join("AGENTS.md"), "root agents");
+        write(&root.join("CLAUDE.md"), "root claude (shadowed)");
+        write(&root.join("sub").join("CLAUDE.md"), "sub claude");
+        let leaf = root.join("sub").join("leaf");
+        write(&leaf.join("AGENTS.md"), "leaf agents");
+        write(&leaf.join(".buildwithnexus").join("AGENTS.md"), "leaf dot");
+        write(&leaf.join(".buildwithnexus").join("Agents.md"), "## Roles");
+        write(&leaf.join("deeper").join("AGENTS.md"), "below cwd");
+
+        let files = load_instructions_with(&leaf, &default_instruction_files());
+        let labels: Vec<&str> = files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels.len(), 5, "{labels:?}");
+        assert!(labels[0].ends_with("AGENTS.md") && files[0].content == "global rules");
+        assert_eq!(
+            &labels[1..],
+            [
+                "AGENTS.md",
+                "sub/CLAUDE.md",
+                "sub/leaf/AGENTS.md",
+                "sub/leaf/.buildwithnexus/AGENTS.md"
+            ]
+        );
+        let bodies: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+        assert!(!bodies.contains(&"ABOVE THE GIT ROOT"));
+        assert!(!bodies.contains(&"root claude (shadowed)"));
+        assert!(!bodies.iter().any(|b| b.contains("## Roles")));
+        assert!(files.iter().all(|f| !f.truncated));
+
+        let notice = instructions_notice(&files).unwrap();
+        assert!(notice.starts_with("instructions: "));
+        assert!(notice.ends_with(
+            "AGENTS.md, sub/CLAUDE.md, sub/leaf/AGENTS.md, sub/leaf/.buildwithnexus/AGENTS.md"
+        ));
+        let prompt = instructions_prompt(&files).unwrap();
+        assert!(prompt.starts_with("[Project instructions"));
+        let a = prompt.find("global rules").unwrap();
+        let b = prompt.find("root agents").unwrap();
+        let c = prompt.find("leaf dot").unwrap();
+        assert!(a < b && b < c);
+        assert!(prompt.contains(&format!("--- {} ---", leaf.join("AGENTS.md").display())));
+        assert!(instructions_prompt(&[]).is_none());
+        assert!(instructions_notice(&[]).is_none());
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn instructions_without_git_walk_from_filesystem_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let d = unique_dir("nogit");
+        let cwd = d.join("a").join("b");
+        write(&d.join("a").join("AGENTS.md"), "parent");
+        write(&cwd.join("AGENTS.md"), "child");
+        let files = load_instructions_with(&cwd, &default_instruction_files());
+        let bodies: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(bodies, ["parent", "child"]);
+        // No git root: labels are absolute paths.
+        assert!(files[1].path.is_absolute());
+        assert_eq!(files[1].label, files[1].path.display().to_string());
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn instructions_respect_settings_names_and_empty_disables() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        write(&h.join("AGENTS.md"), "global");
+        let root = unique_dir("names");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root.join("AGENTS.md"), "agents");
+        write(&root.join("GEMINI.md"), "gemini");
+
+        let only_gemini = load_instructions_with(&root, &["GEMINI.md".to_string()]);
+        let bodies: Vec<&str> = only_gemini.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(bodies, ["global", "gemini"]);
+        assert!(load_instructions_with(&root, &[]).is_empty());
+
+        // The settings key drives the default loader; `[]` switches it off.
+        write(
+            &h.join("settings.json"),
+            r#"{"provider":"openai","model":"gpt-4o","permission":"ask","instruction_files":["GEMINI.md","AGENTS.md"]}"#,
+        );
+        let via_settings = load_instructions(&root);
+        let bodies: Vec<&str> = via_settings.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(bodies, ["global", "gemini"]);
+        write(
+            &root.join(".buildwithnexus").join("settings.json"),
+            r#"{"instruction_files":[]}"#,
+        );
+        assert!(load_instructions(&root).is_empty());
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn instructions_enforce_per_file_and_total_caps() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let root = unique_dir("caps");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let big = "é".repeat(20 * 1024); // 40 KiB of 2-byte chars
+        write(&root.join("AGENTS.md"), &big);
+        write(&root.join("a").join("AGENTS.md"), &big);
+        write(&root.join("a").join("b").join("AGENTS.md"), &big);
+        let leaf = root.join("a").join("b").join("c");
+        write(&leaf.join("AGENTS.md"), "small but late");
+
+        let files = load_instructions_with(&leaf, &default_instruction_files());
+        assert_eq!(files.len(), 4);
+        for (i, f) in files[..3].iter().enumerate() {
+            assert!(f.truncated);
+            assert!(f.content.contains("[… truncated at "));
+            let body = f.content.split("\n\n[… truncated").next().unwrap();
+            assert!(body.len() <= INSTRUCTION_FILE_CAP);
+            assert!(body.chars().all(|c| c == 'é'));
+            if i < 2 {
+                // Full per-file cap, cut on a char boundary.
+                assert!(f.content.contains("[… truncated at 32 KiB"));
+                assert!(body.len() > INSTRUCTION_FILE_CAP - 4);
+            }
+        }
+        assert!(files[3].truncated);
+        assert!(files[3]
+            .content
+            .contains("omitted: 96 KiB total instruction cap"));
+        assert!(!files[3].content.contains("small but late"));
+        let total: usize = files.iter().map(|f| f.content.len()).sum();
+        assert!(total <= INSTRUCTION_TOTAL_CAP + 4 * 200);
+        let notice = instructions_notice(&files).unwrap();
+        assert!(notice.contains("AGENTS.md (truncated)"));
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frontmatter_parses_quoted_unquoted_crlf_and_missing() {
+        let (fm, body) = parse_frontmatter(
+            "---\nname: my-skill\ndescription: \"Use when: quoting \\\"things\\\"\"\nunknown: 3\n---\n\n# Body\ntext",
+        );
+        assert_eq!(fm["name"], "my-skill");
+        assert_eq!(fm["description"], "Use when: quoting \"things\"");
+        assert_eq!(fm["unknown"], "3");
+        assert_eq!(body.trim(), "# Body\ntext");
+
+        let (fm, body) =
+            parse_frontmatter("\u{feff}---\r\nname: 'it''s'\r\n# comment\r\n---\r\nbody\r\n");
+        assert_eq!(fm["name"], "it's");
+        assert!(!fm.contains_key("description"));
+        assert_eq!(body.trim(), "body");
+
+        let (fm, body) = parse_frontmatter("# No frontmatter\nplain");
+        assert!(fm.is_empty());
+        assert_eq!(body, "# No frontmatter\nplain");
+
+        // An unclosed fence is not frontmatter — everything stays body.
+        let (fm, body) = parse_frontmatter("---\nname: x\nstill body");
+        assert!(fm.is_empty());
+        assert_eq!(body, "---\nname: x\nstill body");
+
+        let (fm, _) = parse_frontmatter("---\n---\nempty");
+        assert!(fm.is_empty());
+    }
+
+    #[test]
+    fn frontmatter_block_scalars_fold_or_keep_lines() {
+        let (fm, body) = parse_frontmatter(
+            "---\ndescription: >-\n  first line\n  second line\nname: |\n  a\n  b\nafter: 1\n---\nbody",
+        );
+        assert_eq!(fm["description"], "first line second line");
+        assert_eq!(fm["name"], "a\nb");
+        assert_eq!(fm["after"], "1");
+        assert_eq!(body, "body");
+    }
+
+    #[test]
+    fn skill_precedence_folders_beat_flat_and_project_beats_user() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let old_home = std::env::var_os("HOME");
+        let user = unique_dir("userhome");
+        std::env::set_var("HOME", &user);
+        let proj = unique_dir("proj");
+
+        // user root: flat file and a folder of the same name → folder wins.
+        write(&h.join("skills").join("foo.md"), "Flat foo.\nmore");
+        write(
+            &h.join("skills").join("foo").join("SKILL.md"),
+            "---\nname: foo\ndescription: Folder foo\n---\nFolder body",
+        );
+        // project flat file beats the user folder.
+        write(
+            &proj.join(".buildwithnexus").join("skills").join("foo.md"),
+            "Project foo.",
+        );
+        // ~/.claude overrides a bundled name; folder name is the fallback name.
+        write(
+            &user
+                .join(".claude")
+                .join("skills")
+                .join("git")
+                .join("SKILL.md"),
+            "---\ndescription: \"Custom git\"\n---\nbody",
+        );
+        // ./.agents: frontmatter name wins over the folder name; no description.
+        write(
+            &proj
+                .join(".agents")
+                .join("skills")
+                .join("some-dir")
+                .join("SKILL.md"),
+            "---\nname: renamed\n---\nno desc body",
+        );
+        // skill_dirs entry from settings, relative to the project.
+        write(
+            &h.join("settings.json"),
+            r#"{"provider":"openai","model":"m","permission":"ask","skill_dirs":["extra"]}"#,
+        );
+        write(
+            &proj.join("extra").join("bar").join("SKILL.md"),
+            "---\ndescription: Bar\n---\nbar",
+        );
+        // hidden and non-skill entries are ignored
+        write(
+            &proj
+                .join(".claude")
+                .join("skills")
+                .join(".hidden")
+                .join("SKILL.md"),
+            "x",
+        );
+        write(
+            &proj
+                .join(".claude")
+                .join("skills")
+                .join("nope")
+                .join("README.md"),
+            "x",
+        );
+
+        let skills = discover_skills(&proj);
+        let find = |n: &str| skills.iter().find(|s| s.name == n).cloned();
+
+        let foo = find("foo").unwrap();
+        assert_eq!(foo.source, SkillSource::Project);
+        assert_eq!(foo.content, "Project foo.");
+        assert_eq!(foo.description.as_deref(), Some("Project foo."));
+        assert!(foo.dir.is_none());
+        assert_eq!(skills.iter().filter(|s| s.name == "foo").count(), 1);
+
+        let git = find("git").unwrap();
+        assert_eq!(git.source, SkillSource::Claude);
+        assert_eq!(git.description.as_deref(), Some("Custom git"));
+        assert_eq!(
+            git.dir.as_deref(),
+            Some(user.join(".claude/skills/git").as_path())
+        );
+        assert!(git.loaded_text().starts_with("Skill directory: "));
+        assert!(git.loaded_text().ends_with("\n\nbody"));
+
+        let renamed = find("renamed").unwrap();
+        assert_eq!(renamed.source, SkillSource::Agents);
+        assert!(renamed.description.is_none());
+        assert_eq!(renamed.description_or_default(), "(no description)");
+        assert!(find("some-dir").is_none());
+
+        let bar = find("bar").unwrap();
+        assert_eq!(bar.source, SkillSource::Custom);
+        assert!(find(".hidden").is_none() && find("nope").is_none());
+        assert!(find("rust-cli").is_some_and(|s| s.source == SkillSource::Bundled));
+
+        let warns = skill_warnings(&skills);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("renamed") && warns[0].contains("SKILL.md"));
+        assert_eq!(skill_warnings_once(&skills).len(), 1);
+        assert!(skill_warnings_once(&skills).is_empty());
+
+        let descs = load_skill_descriptions(&proj);
+        assert!(descs.contains(&("renamed".to_string(), "(no description)".to_string())));
+        assert!(descs.contains(&("git".to_string(), "Custom git".to_string())));
+
+        // A user-root folder skill also becomes a slash command.
+        write(
+            &h.join("skills").join("zed").join("SKILL.md"),
+            "---\ndescription: Z\n---\nzed body",
+        );
+        std::env::set_current_dir(&proj).unwrap();
+        let cmds = load_custom_commands();
+        let zed = cmds.iter().find(|c| c.name == "zed").unwrap();
+        assert!(zed.script.is_none() && zed.content.contains("Skill directory: "));
+        assert!(zed.content.ends_with("zed body"));
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&user);
+        let _ = std::env::set_current_dir(std::env::temp_dir());
+        let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn starter_agents_md_is_created_once() {
+        let d = unique_dir("starter");
+        let p = create_starter_agents_md(&d).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("## Build & test") && text.contains("## Do not"));
+        assert!(create_starter_agents_md(&d).is_err());
+        let files = load_instructions_with(&d, &default_instruction_files());
+        assert!(files.iter().any(|f| f.path == p));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn settings_instruction_files_and_skill_dirs_roundtrip() {
+        let s: Settings =
+            serde_json::from_str(r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#)
+                .unwrap();
+        assert_eq!(s.instruction_files, ["AGENTS.md", "CLAUDE.md"]);
+        assert!(s.skill_dirs.is_empty());
+        let s: Settings = serde_json::from_str(
+            r#"{"provider":"openai","model":"m","permission":"ask","instruction_files":[],"skill_dirs":["~/my-skills"]}"#,
+        )
+        .unwrap();
+        assert!(s.instruction_files.is_empty());
+        assert_eq!(s.skill_dirs, ["~/my-skills"]);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.instruction_files.is_empty());
+        assert_eq!(back.skill_dirs, ["~/my-skills"]);
     }
 }

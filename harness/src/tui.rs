@@ -3558,8 +3558,9 @@ fn load_slash_commands() -> Vec<String> {
 
 fn load_slash_commands_uncached() -> Vec<String> {
     let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
-    for (name, _) in crate::config::bundled_skills() {
-        let cmd = format!("/{name}");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for skill in crate::config::discover_skills(&cwd) {
+        let cmd = format!("/{}", skill.name);
         if !cmds.contains(&cmd) {
             cmds.push(cmd);
         }
