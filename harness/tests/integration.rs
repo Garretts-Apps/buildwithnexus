@@ -114,6 +114,11 @@ fn finish(summary: &str) -> String {
     tool_call("done", "finish", json!({"summary": summary}))
 }
 
+// A plain text reply with no tool calls.
+fn text(reply: &str) -> String {
+    json!({"choices": [{"message": {"content": reply}}]}).to_string()
+}
+
 // ── harness: write config, run the binary, parse events ─────────────────────
 fn write_config(home: &Path, provider: &str, permission: &str, port: u16) {
     let cfg = json!({
@@ -149,8 +154,13 @@ impl Run {
 }
 
 fn run(home: &Path, cwd: &Path, task: &str) -> Run {
+    run_args(home, cwd, &["--json", "run", task])
+}
+
+// Same harness, arbitrary argv — for `plan`, `brainstorm`, and flags.
+fn run_args(home: &Path, cwd: &Path, args: &[&str]) -> Run {
     let out = Command::new(BIN)
-        .args(["--json", "run", task])
+        .args(args)
         .current_dir(cwd)
         .env("NEXUS_HOME", home)
         .env("NO_COLOR", "1")
@@ -167,6 +177,26 @@ fn run(home: &Path, cwd: &Path, task: &str) -> Run {
         events,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+// Home settings with the given hooks (implicitly trusted).
+fn write_hooks(home: &Path, hooks: Value) {
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"hooks": hooks}).to_string(),
+    )
+    .unwrap();
+}
+
+// A single home hook group for `event`, matching everything.
+fn hook(command: &str) -> Value {
+    json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
+}
+
+fn count_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 // ── scenarios ───────────────────────────────────────────────────────────────
@@ -395,4 +425,372 @@ fn json_events_are_one_object_per_line() {
     // Every emitted line parsed as a standalone JSON object with a "type".
     assert!(!r.events.is_empty());
     assert!(r.events.iter().all(|e| e["type"].is_string()));
+}
+
+// ── hooks: payload, matchers, lifecycle events ──────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn hook_payload_carries_session_id_transcript_path_and_permission_mode() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({
+            "SessionStart": hook("cat > start-payload.json"),
+            "Stop": hook("cat > stop-payload.json"),
+        }),
+    );
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "out.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "write a file");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let payload: Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.join("stop-payload.json")).unwrap())
+            .unwrap();
+    assert_eq!(payload["hook_event_name"], "Stop");
+    assert_eq!(payload["permission_mode"], "auto");
+    assert_eq!(payload["cwd"].as_str(), cwd.to_str());
+    // The real session id — the one the transcript is saved under — not a pid.
+    let sid = payload["session_id"]
+        .as_str()
+        .expect("session_id is a string");
+    assert_eq!(sid.len(), 16, "{sid}");
+    assert!(sid.chars().all(|c| c.is_ascii_digit()), "{sid}");
+    let transcript = PathBuf::from(payload["transcript_path"].as_str().unwrap());
+    assert_eq!(
+        transcript,
+        home.join("sessions").join(format!("{sid}.json"))
+    );
+    assert!(
+        transcript.exists(),
+        "transcript must be saved at the advertised path"
+    );
+    // SessionStart (fired before the build turn existed) named the same session.
+    let start: Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.join("start-payload.json")).unwrap())
+            .unwrap();
+    assert_eq!(start["hook_event_name"], "SessionStart");
+    assert_eq!(start["session_id"], sid);
+    assert_eq!(start["permission_mode"], "auto");
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_matcher_globs_apply_per_segment() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // `*_file` must catch write_file but leave run_command alone.
+    write_hooks(
+        &home,
+        json!({"PreToolUse": [{ "matcher": "mcp__*|*_file",
+            "hooks": [{ "type": "command", "command": "echo glob-denied >&2; exit 2" }] }]}),
+    );
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "echo hi"})),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "out.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "do both");
+    let denied = r.text_of("tool_denied");
+    assert!(denied.contains("glob-denied"), "{denied}");
+    assert!(!cwd.join("out.txt").exists());
+    // run_command was not matched: it produced a real result.
+    assert!(r.text_of("tool_result").contains("hi"));
+}
+
+#[cfg(unix)]
+#[test]
+fn session_hooks_fire_once_and_subagent_stop_carries_the_task() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({
+            "SessionStart": hook("echo start >> starts.txt"),
+            "SessionEnd": hook("echo end >> ends.txt"),
+            "Stop": hook("echo stop >> stops.txt"),
+            "PrePrompt": hook("echo prompt >> preprompts.txt"),
+            "SubagentStop": hook("cat >> subagent.jsonl; echo >> subagent.jsonl"),
+        }),
+    );
+    let port = serve(vec![
+        tool_call("c1", "spawn_subagent", json!({"task": "do the subtask"})),
+        finish("subagent done"),
+        finish("parent done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "delegate something");
+    assert!(r.success, "stderr: {}", r.stderr);
+    // Once per process — not once per build turn, and not for the subagent.
+    assert_eq!(count_lines(&cwd.join("starts.txt")), 1);
+    assert_eq!(count_lines(&cwd.join("ends.txt")), 1);
+    // Stop: the top-level turn only.
+    assert_eq!(count_lines(&cwd.join("stops.txt")), 1);
+    // PrePrompt: one per model request (parent, subagent, parent).
+    assert_eq!(count_lines(&cwd.join("preprompts.txt")), 3);
+    let sub = std::fs::read_to_string(cwd.join("subagent.jsonl")).unwrap();
+    let payloads: Vec<Value> = sub
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(payloads.len(), 1, "{sub}");
+    assert_eq!(payloads[0]["hook_event_name"], "SubagentStop");
+    assert_eq!(payloads[0]["tool_name"], "spawn_subagent");
+    assert_eq!(payloads[0]["tool_input"]["task"], "do the subtask");
+    assert_eq!(payloads[0]["tool_response"]["is_error"], false);
+}
+
+// ── brainstorm is read-only ─────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn brainstorm_refuses_mutations_even_under_auto_and_fires_stop() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(&home, json!({"Stop": hook("echo stop >> stops.txt")}));
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "x.txt", "content": "nope"}),
+        ),
+        text("I can't write files in brainstorm — switch to BUILD."),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run_args(&home, &cwd, &["--json", "brainstorm", "make a file"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(
+        r.text_of("tool_denied").contains("read-only"),
+        "{:?}",
+        r.events
+    );
+    assert!(!cwd.join("x.txt").exists());
+    assert_eq!(count_lines(&cwd.join("stops.txt")), 1);
+}
+
+// ── headless plan ───────────────────────────────────────────────────────────
+
+#[test]
+fn plan_without_a_terminal_fails_fast_unless_yes() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let out = Command::new(BIN)
+        .args(["--json", "plan", "add a readme"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--yes"), "{err}");
+}
+
+#[test]
+fn plan_with_yes_emits_plan_event_then_executes() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "exit_plan",
+            json!({"steps": ["Create out.txt with hello.", "Verify the file exists."]}),
+        ),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "out.txt", "content": "hello"}),
+        ),
+        finish("executed the plan"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run_args(&home, &cwd, &["--json", "--yes", "plan", "create out.txt"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let plan = r.find("plan").expect("plan event");
+    assert_eq!(plan["steps"][0], "Create out.txt with hello.");
+    assert_eq!(plan["steps"].as_array().unwrap().len(), 2);
+    // The plan event precedes execution.
+    let plan_idx = r.events.iter().position(|e| e["type"] == "plan").unwrap();
+    let finish_idx = r.events.iter().position(|e| e["type"] == "finish").unwrap();
+    assert!(plan_idx < finish_idx);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("out.txt")).unwrap(),
+        "hello"
+    );
+    assert_eq!(r.find("finish").unwrap()["summary"], "executed the plan");
+}
+
+// ── check_work enforcement + verifier in --json ─────────────────────────────
+
+fn npm_available() -> bool {
+    Command::new("npm")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[test]
+fn finish_without_check_work_runs_it_and_feeds_failures_back_once() {
+    if !npm_available() {
+        eprintln!("skipping: npm not installed");
+        return;
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"p","version":"1.0.0","scripts":{"test":"exit 1"}}"#,
+    )
+    .unwrap();
+    // The model never calls check_work: the harness does, the test fails, the
+    // model gets one more round, then the turn finishes with a visible notice.
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "index.js", "content": "x"}),
+        ),
+        finish("first attempt"),
+        finish("second attempt"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "add index.js");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let checks: Vec<&Value> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_call" && e["name"] == "check_work")
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "check_work runs automatically exactly once"
+    );
+    let finishes = r.events.iter().filter(|e| e["type"] == "finish").count();
+    assert_eq!(finishes, 2, "one extra round after the failing report");
+    let notices = r.text_of("notice");
+    assert!(notices.contains("without check_work"), "{notices}");
+    assert!(notices.contains("check_work failed"), "{notices}");
+    // The verifier also runs headlessly and reports the failed checks.
+    let verify = r.find("verify").expect("verify event in --json mode");
+    assert_eq!(verify["report"]["tests_status"]["tests_ok"], false);
+}
+
+#[test]
+fn finish_without_check_work_passes_quietly_when_checks_pass() {
+    if !npm_available() {
+        eprintln!("skipping: npm not installed");
+        return;
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"p","version":"1.0.0","scripts":{"test":"exit 0"}}"#,
+    )
+    .unwrap();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "index.js", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "add index.js");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.events.iter().filter(|e| e["type"] == "finish").count(), 1);
+    assert!(!r.text_of("notice").contains("check_work failed"));
+    let verify = r.find("verify").expect("verify event");
+    assert_eq!(verify["report"]["tests_status"]["tests_ok"], true);
+    assert_eq!(verify["report"]["tests_status"]["tests_run"], true);
+}
+
+#[test]
+fn check_work_enforcement_skips_when_no_project_and_when_model_ran_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // No project files: the automatic check_work finds nothing and the turn
+    // finishes at once, with a verify event and no failure notice.
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "add notes");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.events.iter().filter(|e| e["type"] == "finish").count(), 1);
+    assert!(!r.text_of("notice").contains("check_work failed"));
+    assert!(r.has_event("verify"));
+
+    // The model ran check_work itself: the harness never adds a second one.
+    let cwd2 = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        tool_call("c2", "check_work", json!({"command": "true"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd2, "add notes");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let checks = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_call" && e["name"] == "check_work")
+        .count();
+    assert_eq!(checks, 1);
+    assert!(!r.text_of("notice").contains("without check_work"));
+}
+
+#[test]
+fn readonly_never_runs_automatic_check_work() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "x.txt", "content": "nope"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "readonly", port);
+    let r = run(&home, &cwd, "write a file");
+    assert!(r.text_of("tool_denied").contains("read-only"));
+    assert!(!r
+        .events
+        .iter()
+        .any(|e| e["type"] == "tool_call" && e["name"] == "check_work"));
 }

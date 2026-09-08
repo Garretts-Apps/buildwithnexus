@@ -579,6 +579,23 @@ pub fn finish(summary: &str) {
     }
 }
 
+// A produced plan (headless `plan`): the steps as a structured event so an
+// orchestrator can see what will run before execution starts. Human mode
+// already renders the numbered plan.
+pub fn plan(steps: &[String]) {
+    if mode() == Mode::Json {
+        emit(json!({"type": "plan", "steps": steps}));
+    }
+}
+
+// End-of-turn verifier result (JSON mode only; human mode renders the
+// violations inline).
+pub fn verify(status: &str, report: &Value) {
+    if mode() == Mode::Json {
+        emit(json!({"type": "verify", "status": status, "report": report}));
+    }
+}
+
 pub fn error(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::red(&format!("  ✗ {msg}"))),

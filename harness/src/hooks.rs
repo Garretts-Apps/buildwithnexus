@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,7 @@ pub fn init(cwd: &Path, interactive: bool) {
         "PostToolUse",
         "OnError",
         "Stop",
+        "SubagentStop",
     ] {
         for script in config::discover_hook_scripts(event) {
             list.push(Hook {
@@ -176,7 +177,76 @@ fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
 
 fn matches(matcher: &str, tool: &str) -> bool {
     let m = matcher.trim();
-    m.is_empty() || m == "*" || m.split('|').any(|p| p.trim() == tool)
+    m.is_empty() || m == "*" || m.split('|').any(|p| glob_match(p.trim(), tool))
+}
+
+// Case-sensitive wildcard match: `*` spans any run of characters (including
+// none), `?` exactly one. Hand-rolled (no regex crate) with the classic
+// single-backtrack-point algorithm, so it runs in O(n·m) worst case.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text idx)
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+// ── session context shared by every payload ──────────────────────────────────
+// Claude Code-compatible fields: `session_id` is the id the transcript is
+// saved under, `transcript_path` its on-disk location, `permission_mode` the
+// active gate ("ask" | "auto" | "readonly").
+static PERMISSION_MODE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_permission_mode(mode: &str) {
+    if let Ok(mut m) = PERMISSION_MODE.lock() {
+        *m = Some(mode.to_string());
+    }
+}
+
+fn permission_mode() -> String {
+    PERMISSION_MODE
+        .lock()
+        .ok()
+        .and_then(|m| m.clone())
+        .unwrap_or_else(|| "ask".to_string())
+}
+
+fn base_payload(event: &str, cwd: &Path) -> Value {
+    let sid = crate::session::current_or_new();
+    json!({
+        "hook_event_name": event,
+        "session_id": sid,
+        "transcript_path": crate::session::path(&sid).to_string_lossy(),
+        "permission_mode": permission_mode(),
+        "cwd": cwd.to_string_lossy(),
+    })
+}
+
+fn with_fields(mut payload: Value, extra: Value) -> Value {
+    if let (Some(base), Some(add)) = (payload.as_object_mut(), extra.as_object()) {
+        for (k, v) in add {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    payload
 }
 
 fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String, Duration)> {
@@ -542,10 +612,10 @@ fn decision_field(j: &Value) -> Option<&str> {
 }
 
 pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
-    let payload = json!({
-        "hook_event_name": "PreToolUse", "session_id": std::process::id(),
-        "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("PreToolUse", cwd),
+        json!({"tool_name": tool, "tool_input": input}),
+    );
     for (cmd, source, matcher, timeout) in commands_for("PreToolUse", Some(tool)) {
         if !report::is_json() {
             tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
@@ -607,12 +677,13 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
     if cmds.is_empty() {
         return;
     }
-    let payload = json!({
-        "hook_event_name": "PostToolUse", "session_id": std::process::id(),
-        "tool_name": tool, "tool_input": input,
-        "tool_response": {"content": response, "is_error": is_error},
-        "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("PostToolUse", cwd),
+        json!({
+            "tool_name": tool, "tool_input": input,
+            "tool_response": {"content": response, "is_error": is_error},
+        }),
+    );
     for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
@@ -645,10 +716,10 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
 }
 
 pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
-    let payload = json!({
-        "hook_event_name": "UserPromptSubmit", "session_id": std::process::id(),
-        "prompt": prompt, "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("UserPromptSubmit", cwd),
+        json!({"prompt": prompt}),
+    );
     let mut ctx = String::new();
     for (cmd, source, matcher, timeout) in commands_for("UserPromptSubmit", None) {
         trace::record_visible(
@@ -722,11 +793,17 @@ pub fn list_active() -> Vec<String> {
 }
 
 pub fn notify(event: &str, cwd: &Path) {
+    notify_with(event, cwd, json!({}));
+}
+
+// Lifecycle notification carrying extra payload fields, e.g. SubagentStop's
+// `tool_name`/`tool_input` — the completed subagent call.
+pub fn notify_with(event: &str, cwd: &Path, extra: Value) {
     let cmds = commands_for(event, None);
     if cmds.is_empty() {
         return;
     }
-    let payload = json!({"hook_event_name": event, "session_id": std::process::id(), "cwd": cwd.to_string_lossy()});
+    let payload = with_fields(base_payload(event, cwd), extra);
     for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
@@ -778,6 +855,57 @@ mod tests {
         assert!(matches("write_file | edit_file", "edit_file"));
         assert!(matches("a|b|c", "b"));
         assert!(!matches("a|b|c", "d"));
+        assert!(matches("Edit|Write", "Write"));
+        assert!(!matches("Edit|Write", "write"), "case-sensitive");
+    }
+
+    #[test]
+    fn matches_glob_wildcards_inside_segments() {
+        assert!(matches("*_file", "write_file"));
+        assert!(matches("*_file", "read_file"));
+        assert!(!matches("*_file", "run_command"));
+        assert!(matches("mcp__*", "mcp__github__list_issues"));
+        assert!(!matches("mcp__*", "run_command"));
+        assert!(matches("read_?ile", "read_file"));
+        assert!(!matches("read_?ile", "read_files"));
+        assert!(matches("run_command|mcp__*", "mcp__x"));
+        assert!(matches("*", "mcp__x"));
+    }
+
+    #[test]
+    fn glob_match_edge_cases() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("**", "abc"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
+        assert!(glob_match("*c", "abc"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        // Backtracking: the first `*` must be able to give characters back.
+        assert!(glob_match("*ab", "aab"));
+        assert!(glob_match("*ab*ab", "abxab"));
+        assert!(!glob_match("*ab*ab", "ab"));
+    }
+
+    #[test]
+    fn base_payload_carries_session_fields() {
+        set_permission_mode("auto");
+        let p = base_payload("Stop", Path::new("/proj"));
+        assert_eq!(p["hook_event_name"], "Stop");
+        assert_eq!(p["permission_mode"], "auto");
+        assert_eq!(p["cwd"], "/proj");
+        let sid = p["session_id"].as_str().unwrap();
+        assert_eq!(sid, crate::session::current_or_new());
+        assert!(p["transcript_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("sessions/{sid}.json")));
+        let p = with_fields(p, json!({"tool_name": "spawn_subagent"}));
+        assert_eq!(p["tool_name"], "spawn_subagent");
+        assert_eq!(p["hook_event_name"], "Stop");
     }
 
     #[test]
