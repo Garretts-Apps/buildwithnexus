@@ -3763,7 +3763,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/model" => "hot-swap the AI model",
         "/permissions" => "tool permission level (ask/auto/readonly)",
         "/sandbox" => "OS sandbox for shell commands (off/auto/require)",
-        "/mcp" => "inspect configured MCP servers",
+        "/mcp" => "MCP servers: list, <name>, add, remove, reload",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
         "/compact" => "compress context to free token budget",
@@ -4077,6 +4077,13 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
         }
         "/sandbox" => {
             return ["off", "auto", "require", "status"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/mcp" => {
+            return ["add", "remove", "reload"]
                 .iter()
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())

@@ -261,6 +261,56 @@ bundled, and a `SKILL.md` folder beats a flat file of the same name. Add more
 roots with the `skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
 `/skills` lists every skill with its source and description.
 
+## MCP servers
+
+buildwithnexus is a full [Model Context Protocol](https://modelcontextprotocol.io)
+client. Configure servers under `mcp_servers` in `~/.buildwithnexus/settings.json`
+(user) or `.buildwithnexus/settings.json` (project); both are merged.
+
+```json
+{
+  "mcp_servers": {
+    "fs":     { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+                "env": { "LOG_LEVEL": "warn" } },
+    "remote": { "url": "https://mcp.example.com/mcp",
+                "headers": { "Authorization": "Bearer …" }, "timeout_secs": 15 },
+    "old":    { "command": "legacy-server", "enabled": false }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `type` | `"stdio"` or `"http"` (Streamable HTTP). Optional: a `url` means http, a `command` means stdio. |
+| `command`, `args`, `env` | stdio: the process to spawn, kept alive for the whole session; stderr is captured for diagnostics. |
+| `url`, `headers` | http: the endpoint and extra request headers (auth tokens go here). `Mcp-Session-Id` is tracked automatically. |
+| `timeout_secs` | Per-request deadline (default `30`). A server that hangs or exits is reported once and its tools drop out for the session. |
+| `enabled` | `false` keeps the entry but never connects. |
+
+Servers connect lazily in the background on the first prompt (`--json`
+headless runs connect before the first request); each one logs
+`mcp: <name> connected, N tools` or its error. Discovered tools are advertised
+to the model as **`mcp__<server>__<tool>`** with the server's own description
+and input schema, and answer over the persistent connection. They count as
+mutating under the permission gate (prompted under `ask`, blocked under
+`readonly`) unless the server annotates them `readOnlyHint: true`. The older
+`mcp_call` tool (`server`, `tool`, `arguments`) still works over the same
+connection.
+
+```
+/mcp                                   servers: transport, status, tool count
+/mcp <name>                            a server's tools with descriptions
+/mcp add <name> <command> [args...]    stdio server → settings.json, then reconnect
+/mcp add <name> --url <url> [--header K=V]... [--timeout <secs>]
+/mcp remove <name>
+/mcp reload                            reconnect every server
+```
+
+`buildwithnexus mcp list|<name>|add|remove|reload` mirrors this for scripts
+(`add`/`remove` only edit the settings file; `list` connects). `/doctor` and
+`buildwithnexus doctor` connect to every configured server and report the
+outcome. Legacy SSE-only (`type: "sse"`) servers are not supported.
+
 ## Build from source
 
 ```bash

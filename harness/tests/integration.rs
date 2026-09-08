@@ -16,6 +16,11 @@ use std::thread;
 use serde_json::{json, Value};
 
 const BIN: &str = env!("CARGO_BIN_EXE_buildwithnexus");
+// A two-tool MCP server over stdio (see the script header for its surface).
+const FAKE_MCP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fake_mcp_server.py"
+);
 
 // ── unique temp dirs (no external deps, no Date/random) ─────────────────────
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -395,4 +400,208 @@ fn json_events_are_one_object_per_line() {
     // Every emitted line parsed as a standalone JSON object with a "type".
     assert!(!r.events.is_empty());
     assert!(r.events.iter().all(|e| e["type"].is_string()));
+}
+
+// ── MCP ─────────────────────────────────────────────────────────────────────
+fn write_mcp_settings(home: &Path) {
+    let settings = json!({
+        "mcp_servers": {
+            "fake": { "command": "python3", "args": [FAKE_MCP], "timeout_secs": 20 }
+        }
+    });
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+}
+
+#[test]
+fn mcp_tools_are_discovered_and_called_over_stdio() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_mcp_settings(&home);
+    let port = serve(vec![
+        tool_call("c1", "mcp__fake__echo", json!({"text": "hello mcp"})),
+        tool_call("c2", "mcp__fake__add", json!({"a": 2, "b": 3})),
+        finish("used mcp"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "use the mcp tools");
+    assert!(r.success, "stderr: {}", r.stderr);
+    // Discovery ran before the first request and reported both pages.
+    assert!(
+        r.text_of("notice").contains("mcp: fake connected, 2 tools"),
+        "notices: {}",
+        r.text_of("notice")
+    );
+    let results: Vec<&Value> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result")
+        .collect();
+    let echo = results
+        .iter()
+        .find(|e| e["name"] == "mcp__fake__echo")
+        .expect("echo result");
+    assert_eq!(echo["content"], "echo: hello mcp");
+    assert_eq!(echo["is_error"], false);
+    let add = results
+        .iter()
+        .find(|e| e["name"] == "mcp__fake__add")
+        .expect("add result");
+    assert_eq!(add["content"], "5");
+}
+
+#[test]
+fn mcp_read_only_hint_gates_under_readonly() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_mcp_settings(&home);
+    // `echo` carries no annotation → mutating → denied; `add` is
+    // readOnlyHint → allowed.
+    let port = serve(vec![
+        tool_call("c1", "mcp__fake__echo", json!({"text": "nope"})),
+        tool_call("c2", "mcp__fake__add", json!({"a": 20, "b": 22})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "readonly", port);
+
+    let r = run(&home, &cwd, "try both");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(r.text_of("tool_denied").contains("read-only"));
+    let add = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "mcp__fake__add")
+        .expect("add ran");
+    assert_eq!(add["content"], "42");
+}
+
+#[test]
+fn legacy_mcp_call_uses_the_same_connection() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_mcp_settings(&home);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "mcp_call",
+            json!({"server": "fake", "tool": "echo", "arguments": {"text": "legacy"}}),
+        ),
+        tool_call("c2", "mcp_call", json!({"server": "fake", "tool": "fail"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "legacy call");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let results: Vec<&Value> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result" && e["name"] == "mcp_call")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["content"], "echo: legacy");
+    assert_eq!(results[0]["is_error"], false);
+    // isError from the server surfaces as a tool error.
+    assert_eq!(results[1]["content"], "boom");
+    assert_eq!(results[1]["is_error"], true);
+}
+
+#[test]
+fn mcp_server_failure_is_a_notice_not_a_crash() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let settings = json!({
+        "mcp_servers": {
+            "ghost": { "command": "definitely-not-a-binary-xyz" },
+            "off": { "command": "x", "enabled": false }
+        }
+    });
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    let port = serve(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+
+    let r = run(&home, &cwd, "just finish");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let notices = r.text_of("notice");
+    assert!(notices.contains("mcp: ghost failed"), "{notices}");
+    assert!(
+        !notices.contains("off"),
+        "disabled servers stay silent: {notices}"
+    );
+}
+
+#[test]
+fn mcp_cli_add_list_remove_round_trip() {
+    let home = tmp("home");
+    // Settings need a provider to load at all; no request is ever made.
+    write_config(&home, "ollama", "auto", 9);
+    // Pre-existing keys the Settings struct doesn't model must survive edits.
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"hooks": {"Stop": []}}).to_string(),
+    )
+    .unwrap();
+    let cli = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("NEXUS_HOME", &home)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn binary");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (ok, out, err) = cli(&["mcp", "add", "fake", "python3", FAKE_MCP]);
+    assert!(ok, "{err}");
+    assert!(out.contains("added MCP server 'fake'"));
+    let (ok, out, _) = cli(&[
+        "mcp",
+        "add",
+        "remote",
+        "--url",
+        "https://example.com/mcp",
+        "--header",
+        "Authorization=Bearer t",
+    ]);
+    assert!(ok);
+    assert!(out.contains("added MCP server 'remote'"));
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["hooks"]["Stop"], json!([]));
+    assert_eq!(saved["mcp_servers"]["fake"]["command"], "python3");
+    assert_eq!(saved["mcp_servers"]["fake"]["args"][0], FAKE_MCP);
+    assert_eq!(saved["mcp_servers"]["remote"]["type"], "http");
+    assert_eq!(
+        saved["mcp_servers"]["remote"]["headers"]["Authorization"],
+        "Bearer t"
+    );
+
+    let (ok, _, _) = cli(&["mcp", "remove", "remote"]);
+    assert!(ok);
+    let (ok, _, err) = cli(&["mcp", "remove", "remote"]);
+    assert!(!ok);
+    assert!(err.contains("no MCP server named 'remote'"));
+
+    // `mcp list` connects for real: the stdio fixture answers.
+    let (ok, out, err) = cli(&["mcp", "list"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("fake"), "{out}");
+    assert!(out.contains("connected"), "{out}");
+    assert!(out.contains("2 tools"), "{out}");
+    let (ok, out, _) = cli(&["mcp", "fake"]);
+    assert!(ok);
+    assert!(out.contains("mcp__fake__echo"));
+    assert!(out.contains("mcp__fake__add [read-only]"));
+    assert!(out.contains("Add two integers"));
+
+    let (ok, out, _) = cli(&["doctor"]);
+    assert!(ok);
+    assert!(out.contains("mcp:fake"), "{out}");
+    assert!(out.contains("2 tools"), "{out}");
 }

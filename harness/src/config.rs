@@ -266,7 +266,7 @@ pub fn home() -> PathBuf {
     PathBuf::from(base).join(".buildwithnexus")
 }
 
-fn settings_path() -> PathBuf {
+pub fn settings_path() -> PathBuf {
     home().join("settings.json")
 }
 fn keys_path() -> PathBuf {
@@ -1345,6 +1345,39 @@ pub fn save_settings(s: &Settings) {
     ensure_home();
     if let Ok(text) = serde_json::to_string_pretty(s) {
         write_atomic(&settings_path(), &text, true);
+    }
+}
+
+/// Edits the user settings file in place as raw JSON, so keys the `Settings`
+/// struct doesn't model (hooks, comments) survive. A missing file starts as
+/// `{}`; a malformed one is refused rather than overwritten.
+pub fn update_settings_json(
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<(), String> {
+    ensure_home();
+    let path = settings_path();
+    let mut obj = match fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(serde_json::Value::Object(m)) => m,
+                Ok(_) => {
+                    return Err(format!(
+                        "{}: top level must be a JSON object",
+                        path.display()
+                    ))
+                }
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        }
+        _ => serde_json::Map::new(),
+    };
+    f(&mut obj);
+    let text =
+        serde_json::to_string_pretty(&serde_json::Value::Object(obj)).map_err(|e| e.to_string())?;
+    if write_atomic(&path, &text, true) {
+        Ok(())
+    } else {
+        Err(format!("could not write {}", path.display()))
     }
 }
 

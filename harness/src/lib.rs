@@ -27,6 +27,7 @@
 //! | [`agent`] | the ReAct loop: planning, tool calls, recovery, compaction |
 //! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
 //! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
+//! | [`mcp`] | Model Context Protocol client: stdio / HTTP servers, discovery, `mcp__*` dispatch |
 //! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
 //! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
 //! | [`session`] | save/resume of conversations |
@@ -46,6 +47,7 @@ pub mod config;
 pub mod hooks;
 pub mod knowledge;
 pub mod local;
+pub mod mcp;
 pub mod media;
 pub mod onboarding;
 pub mod provider;
@@ -194,6 +196,17 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
+        "mcp" => match mcp::manage(&args[1..], false) {
+            Ok(lines) => {
+                for l in lines {
+                    println!("  {l}");
+                }
+            }
+            Err(e) => {
+                eprintln!("buildwithnexus mcp: {e}");
+                std::process::exit(2);
+            }
+        },
         // A stray flag must not become an interactive prompt: `bwn --modle x`
         // silently launching the TUI hides the typo.
         other if !opts.args_literal && is_unknown_option(other) => {
@@ -474,6 +487,11 @@ fn headless(
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
+    // MCP tools must be on the surface before the first request; discovery
+    // is bounded by each server's timeout, and every outcome is a notice.
+    mcp::ensure_ready();
+    report_mcp_notices();
+
     let start_time = std::time::Instant::now();
     let r = f(&provider, perm, cwd.clone());
     let elapsed = start_time.elapsed();
@@ -491,6 +509,17 @@ fn headless(
     if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
         std::process::exit(1);
+    }
+}
+
+// Connected / failed / disconnected lines from background discovery.
+fn report_mcp_notices() {
+    for (msg, ok) in mcp::drain_notices() {
+        if ok {
+            report::info(&format!("  {msg}"));
+        } else {
+            report::notice(&format!("  {msg}"));
+        }
     }
 }
 
@@ -525,6 +554,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     tui::enter_alt(raw);
     let result = repl(provider, perm, &cwd, raw, initial_prompt);
     kill_local_server();
+    mcp::shutdown();
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -594,6 +624,16 @@ fn repl(
         }
         // Prune old done/cancelled workflows, keep last 20.
         workflow::prune(20);
+
+        // MCP servers connect in the background after the first prompt; their
+        // one-line outcomes surface here so they never interleave with a turn.
+        for (msg, ok) in mcp::drain_notices() {
+            if ok {
+                tui::line(&tui::dim(&format!("  {msg}")));
+            } else {
+                tui::line(&tui::yellow(&format!("  {msg}")));
+            }
+        }
 
         // Show workflow activity badge if any are pending/running.
         let active = workflow::active_count();
@@ -728,6 +768,12 @@ fn repl(
                     ))),
                 }
             }
+            continue;
+        }
+
+        // /mcp with arguments: `/mcp <name>`, `/mcp add …`, `/mcp remove …`, `/mcp reload`.
+        if let Some(mcp_arg) = t.strip_prefix("/mcp ") {
+            handle_mcp(mcp_arg);
             continue;
         }
 
@@ -1104,7 +1150,7 @@ fn repl(
                 continue;
             }
             "/mcp" => {
-                handle_mcp();
+                handle_mcp("");
                 continue;
             }
             "/vim" => {
@@ -1295,6 +1341,10 @@ fn repl(
             clean_task.clone()
         };
         let t = effective_task.as_str();
+
+        // Lazy MCP connect: kicked off by the first real prompt, never at
+        // startup, so servers only spawn once the session is actually used.
+        mcp::start_background();
 
         tui::line("");
         let r = if should_answer_conversationally(t, &mode) {
@@ -1664,25 +1714,19 @@ fn handle_tools() {
     tui::browse_items("tools", &items);
 }
 
-fn handle_mcp() {
-    let mut items = Vec::new();
-    if let Some(s) = config::load_settings() {
-        for (name, val) in &s.mcp_servers {
-            let desc = serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
-            items.push((name.clone(), format!("MCP Server Configuration:\n{desc}")));
+fn handle_mcp(arg: &str) {
+    let args = shlex::split(arg.trim()).unwrap_or_default();
+    match mcp::manage(&args, true) {
+        Ok(lines) => {
+            for l in lines {
+                tui::line(&format!("  {l}"));
+            }
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {e}")));
+            tui::bell();
         }
     }
-    if items.is_empty() {
-        tui::line(&tui::dim(
-            "  No MCP servers configured in settings.json (mcp_servers).",
-        ));
-        tui::line(&tui::dim(
-            "  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`.",
-        ));
-        return;
-    }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    tui::browse_items("mcp servers", &items);
 }
 
 /// `/init` step: offer a starter AGENTS.md when the cwd has no instruction file.
@@ -3191,6 +3235,36 @@ fn handle_agents() {
     }
 }
 
+// One line per configured MCP server, after a bounded connection attempt.
+fn doctor_mcp_lines() -> Vec<String> {
+    mcp::ensure_ready();
+    let reports = mcp::report();
+    if reports.is_empty() {
+        return vec!["  ·  mcp          no servers configured".into()];
+    }
+    reports
+        .into_iter()
+        .map(|r| {
+            let name = format!("mcp:{}", r.name);
+            match r.status {
+                mcp::Status::Connected => format!(
+                    "  ✓ {name:<14} {} · {} tool{}",
+                    r.transport,
+                    r.tools.len(),
+                    if r.tools.len() == 1 { "" } else { "s" }
+                ),
+                mcp::Status::Disabled => format!("  ·  {name:<13} disabled"),
+                mcp::Status::Connecting => {
+                    format!("  ✗ {name:<14} still connecting after the timeout")
+                }
+                mcp::Status::Failed(e) | mcp::Status::Invalid(e) => {
+                    format!("  ✗ {name:<14} {}", e.chars().take(160).collect::<String>())
+                }
+            }
+        })
+        .collect()
+}
+
 fn handle_doctor_tui() {
     tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));
     match config::load_settings() {
@@ -3204,6 +3278,9 @@ fn handle_doctor_tui() {
     let (glyph, text) = sandbox::doctor_summary();
     tui::line(&format!("  {glyph} sandbox: {text}"));
     tui::line(&format!("  home: {}", config::home().display()));
+    for line in doctor_mcp_lines() {
+        tui::line(&line);
+    }
     tui::line(&format!(
         "  rust: {}",
         std::process::Command::new("rustc")
@@ -3310,7 +3387,11 @@ fn print_help() {
                     "verify codebase against rules and tests",
                 ),
                 ("/agents", "", "show loaded Agents.md context"),
-                ("/mcp", "", "inspect configured MCP servers"),
+                (
+                    "/mcp",
+                    "[name|add|remove|reload]",
+                    "MCP servers and their tools",
+                ),
                 ("/trace", "", "inspect hooks, tools, skills, subagents"),
             ],
         ),
@@ -3811,6 +3892,7 @@ fn usage() {
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
          \x20 buildwithnexus version | help\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
@@ -3842,6 +3924,7 @@ fn usage() {
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                browse available skills and custom commands\n\
          \x20 /tools                 browse callable tools\n\
+         \x20 /mcp [name|add|remove|reload]  MCP servers and their tools\n\
          \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
          \x20 /agents /checkpoints /undo /doctor\n\
          \x20 /help /clear /new /resume /init /exit\n\
@@ -3944,6 +4027,11 @@ fn run_doctor() {
     match config::load_memory() {
         None => println!("  ·  memory.md     (empty)"),
         Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
+    }
+
+    // MCP servers: a real connect + handshake each, bounded by their timeouts.
+    for line in doctor_mcp_lines() {
+        println!("{line}");
     }
 
     // External tools
