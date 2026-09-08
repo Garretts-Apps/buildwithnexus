@@ -3805,7 +3805,8 @@ fn extra_command_desc(cmd: &str) -> String {
         std::sync::OnceLock::new();
     let map = CACHE.get_or_init(|| {
         let mut map = std::collections::HashMap::new();
-        for (name, desc) in crate::config::load_skill_descriptions() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        for (name, desc) in crate::config::load_skill_descriptions(&cwd) {
             if !desc.is_empty() {
                 map.insert(format!("/{name}"), desc);
             }
