@@ -64,7 +64,8 @@ once you're ready to let it loose on a real project.
 - **Claude-Code-grade ergonomics** — `Esc` interrupts the agent; messages
   typed while it works queue and auto-send; ↑ history is prefix-filtered and
   never destroys your draft; double-click selects a word, triple-click a
-  line, and every copy confirms itself in the footer.
+  line, and every copy confirms itself in the footer via OSC 52 (terminals
+  known to ignore OSC 52 get a one-time notice instead).
 
 ## Why
 

@@ -865,6 +865,29 @@ fn json_value_looks_like_tool_call(value: &serde_json::Value) -> bool {
     (has_name && has_args) || openai_function
 }
 
+// True only for terminals known to drop OSC 52: plain `xterm` (allowWindowOps
+// is off by default) and VTE-based ones (GNOME Terminal & co.) that don't
+// announce themselves via TERM_PROGRAM. Anything else — including an
+// unadorned xterm-256color, which tmux/ssh/most emulators present — is
+// "unsure" and keeps the copy confirmation. On WSL and macOS the copy also
+// goes through clip.exe / pbcopy, so it works regardless of the terminal.
+fn osc52_known_unsupported_for(term: &str, term_program: Option<&str>, vte: bool) -> bool {
+    if term_program.is_some_and(|p| !p.is_empty()) {
+        return false;
+    }
+    if crate::tools::is_wsl() || cfg!(target_os = "macos") {
+        return false;
+    }
+    vte || term == "xterm" || term == "linux"
+}
+
+fn osc52_known_unsupported() -> bool {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let vte = std::env::var_os("VTE_VERSION").is_some();
+    osc52_known_unsupported_for(&term, term_program.as_deref(), vte)
+}
+
 // Copy text to the terminal clipboard via the OSC 52 escape sequence.
 // Works in raw/interactive mode only; a no-op in cooked/piped sessions.
 fn osc52_copy(text: &str) {
@@ -954,6 +977,23 @@ fn message_queue() -> &'static std::sync::Mutex<Vec<String>> {
     MQ.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+// The queue is FIFO: ask_task sends index 0 next, so Ctrl+Q / Ctrl+X must act
+// on the front too — never `pop()`, which would edit or drop the newest
+// message while the oldest one goes out untouched.
+fn queue_take_next(mq: &mut Vec<String>) -> Option<String> {
+    if mq.is_empty() {
+        None
+    } else {
+        Some(mq.remove(0))
+    }
+}
+
+// Put a message pulled out via Ctrl+Q back at the front so it is still the
+// one sent next (Enter after editing, or Esc to abandon the edit).
+fn queue_put_back(mq: &mut Vec<String>, msg: String) {
+    mq.insert(0, msg);
+}
+
 /// Non-blocking drain of pending key events during agent processing.
 /// Buffers printable input; Ctrl+C clears the buffer and signals an interrupt.
 pub fn poll_typeahead() {
@@ -1007,7 +1047,11 @@ pub fn poll_typeahead() {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             if let Ok(mut mq) = message_queue().lock() {
-                                mq.push(trimmed.to_string());
+                                if ta.from_queue {
+                                    queue_put_back(&mut mq, trimmed.to_string());
+                                } else {
+                                    mq.push(trimmed.to_string());
+                                }
                             }
                             ta.buf.clear();
                             ta.cursor = 0;
@@ -1030,11 +1074,15 @@ pub fn poll_typeahead() {
                         continue;
                     }
                     KeyCode::Char('q') if ctrl => {
-                        // Pop under a short-lived lock, then render with no
-                        // guards held (see deadlock note on Enter above).
-                        let popped = message_queue().lock().ok().and_then(|mut mq| mq.pop());
-                        if let Some(last) = popped {
-                            ta.buf = last.chars().collect();
+                        // Take the NEXT message (front) under a short-lived
+                        // lock, then render with no guards held (see deadlock
+                        // note on Enter above).
+                        let next = message_queue()
+                            .lock()
+                            .ok()
+                            .and_then(|mut mq| queue_take_next(&mut mq));
+                        if let Some(next) = next {
+                            ta.buf = next.chars().collect();
                             ta.cursor = ta.buf.len();
                             ta.from_queue = true;
                             drop(ta);
@@ -1049,7 +1097,7 @@ pub fn poll_typeahead() {
                         let removed = message_queue()
                             .lock()
                             .ok()
-                            .and_then(|mut mq| mq.pop())
+                            .and_then(|mut mq| queue_take_next(&mut mq))
                             .is_some();
                         if removed {
                             drop(ta);
@@ -1077,7 +1125,7 @@ pub fn poll_typeahead() {
                         } else if ta.from_queue && !ta.buf.is_empty() {
                             let msg: String = ta.buf.iter().collect();
                             if let Ok(mut mq) = message_queue().lock() {
-                                mq.push(msg);
+                                queue_put_back(&mut mq, msg);
                             }
                             ta.buf.clear();
                             ta.cursor = 0;
@@ -1183,6 +1231,16 @@ pub fn poll_typeahead() {
     render_queued_composer();
 }
 
+// Only the front row (sent next) carries the edit/remove hint: Ctrl+Q and
+// Ctrl+X act on that message, not on whichever row was queued last.
+fn queued_row_hint(index: usize) -> &'static str {
+    if index == 0 {
+        "(next — Ctrl+Q edit, Ctrl+X rm)"
+    } else {
+        ""
+    }
+}
+
 pub fn render_queued_composer() {
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
@@ -1208,7 +1266,7 @@ pub fn render_queued_composer() {
                     dim("├─"),
                     dim("queued:"),
                     bold(msg),
-                    dim("(Ctrl+Q edit, Ctrl+X rm)")
+                    dim(queued_row_hint(i))
                 );
             }
             let _ = write!(out, "\x1b[?2026l");
@@ -2263,7 +2321,16 @@ fn selection_finish(row: u16, col: u16) {
     if let Some(text) = copied.filter(|s| !s.trim().is_empty()) {
         osc52_copy(&text);
         let n = text.chars().count();
-        flash_footer(&format!("⎘ copied {n} chars"));
+        if osc52_known_unsupported() {
+            // The escape went out anyway (harmless), but a "copied" flash
+            // would be a lie here — say so once and stay quiet afterwards.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                line(&dim("  clipboard: terminal does not advertise OSC 52"));
+            }
+        } else {
+            flash_footer(&format!("⎘ copied {n} chars (OSC 52)"));
+        }
     }
     render_queued_composer();
 }
@@ -3633,7 +3700,8 @@ fn common_prefix(items: &[String]) -> String {
 const POPUP_MAX_ROWS: usize = 8;
 
 // One-line description shown next to each built-in command in the popup.
-// User-defined commands and skills get an empty description.
+// User-defined commands and skills get an empty description here; see
+// extra_command_desc for those.
 fn slash_command_desc(cmd: &str) -> &'static str {
     match cmd {
         "/help" => "show all commands and keys",
@@ -3672,7 +3740,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/undo" | "/rewind" => "revert the last agent turn (or latest/git/all/<id>)",
         "/vim" => "toggle vim editing mode",
         "/voice" => "voice input",
-        "/local" => "manage local models",
+        "/local" => "probe local servers and list GGUF models",
         "/rules" => "manage project rules",
         "/kb" | "/index" => "query or index project knowledge base",
         "/verify" | "/audit" => "verify recent changes",
@@ -3680,6 +3748,52 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/teamwork" => "multi-agent swarm preview",
         "/exit" | "/quit" => "exit the session",
         _ => "",
+    }
+}
+
+// Descriptions for the non-builtin popup entries: a skill's first line (via
+// the skill loader) and "custom command" for scripts. Loaded once per
+// session — the popup consults this on every keystroke, so no file reads
+// after the first call.
+fn extra_command_desc(cmd: &str) -> String {
+    static CACHE: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    let map = CACHE.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        for (name, desc) in crate::config::load_skill_descriptions() {
+            if !desc.is_empty() {
+                map.insert(format!("/{name}"), desc);
+            }
+        }
+        for c in crate::config::load_custom_commands() {
+            let key = format!("/{}", c.name);
+            if c.script.is_some() {
+                map.insert(key, "custom command".to_string());
+            } else if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key) {
+                let desc = crate::config::skill_description(&c.content);
+                slot.insert(if desc.is_empty() {
+                    "custom command".to_string()
+                } else {
+                    desc
+                });
+            }
+        }
+        map
+    });
+    map.get(cmd).cloned().unwrap_or_default()
+}
+
+// Popup description for any candidate: builtin text first, then the cached
+// skill / custom-command description.
+fn popup_desc(cand: &str) -> String {
+    let builtin = slash_command_desc(cand);
+    if !builtin.is_empty() {
+        return builtin.to_string();
+    }
+    if cand.starts_with('/') {
+        extra_command_desc(cand)
+    } else {
+        String::new()
     }
 }
 
@@ -3736,7 +3850,8 @@ fn render_suggestions(sug: &[String], sel: usize) {
         let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
         let cand = &sug[idx];
         let padded = format!("{cand:<pad$}");
-        let desc = slash_command_desc(cand);
+        let desc = popup_desc(cand);
+        let desc = desc.as_str();
         let counter = if sug.len() > show && idx == sel {
             dim(&format!(" ({}/{})", sel + 1, sug.len()))
         } else {
@@ -4230,7 +4345,19 @@ fn read_line_raw_prefill(
             KeyCode::Char('g') if ctrl => {
                 let cur: String = buf.iter().collect();
                 if let Some(edited) = edit_in_editor(&cur) {
-                    buf = edited.replace('\n', " ").chars().collect();
+                    if edited.contains('\n') {
+                        // A multi-line edit is submitted as-is: the composer is
+                        // single-line, and flattening the newlines to spaces
+                        // silently destroys the structure the user just wrote.
+                        // ask_task joins submitted lines with '\n', so the
+                        // text goes through untouched.
+                        buf = edited.chars().collect();
+                        cursor = buf.len();
+                        reline!();
+                        echo_submitted(prompt, &edited);
+                        return Some(RawLine::Submit(edited, false));
+                    }
+                    buf = edited.chars().collect();
                     cursor = buf.len();
                 }
                 reline!();
@@ -5419,5 +5546,69 @@ mod tests {
         let p_bullet = plain(&bullet);
         assert!(p_bullet.contains("•"), "{p_bullet}");
         assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
+    }
+
+    #[test]
+    fn queue_edit_and_remove_act_on_the_message_sent_next() {
+        // ask_task sends index 0 next; Ctrl+Q / Ctrl+X must take that one,
+        // and an edited (or abandoned) message goes back to the front.
+        let mut mq = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(queue_take_next(&mut mq).as_deref(), Some("first"));
+        assert_eq!(mq, vec!["second".to_string()]);
+        queue_put_back(&mut mq, "first (edited)".to_string());
+        assert_eq!(mq, vec!["first (edited)".to_string(), "second".to_string()]);
+        assert_eq!(queue_take_next(&mut mq).as_deref(), Some("first (edited)"));
+        assert_eq!(queue_take_next(&mut mq).as_deref(), Some("second"));
+        assert_eq!(queue_take_next(&mut mq), None);
+        // Only the front row advertises the keys.
+        assert!(queued_row_hint(0).contains("Ctrl+Q edit"));
+        assert!(queued_row_hint(0).contains("Ctrl+X rm"));
+        assert_eq!(queued_row_hint(1), "");
+    }
+
+    #[test]
+    fn osc52_confirmation_suppressed_only_for_known_unsupported_terminals() {
+        // WSL/macOS copy through clip.exe/pbcopy, so the check is moot there.
+        if crate::tools::is_wsl() || cfg!(target_os = "macos") {
+            return;
+        }
+        // Known-unsupported: plain xterm / VTE without a TERM_PROGRAM.
+        assert!(osc52_known_unsupported_for("xterm", None, false));
+        assert!(osc52_known_unsupported_for("xterm-256color", None, true));
+        assert!(osc52_known_unsupported_for("linux", None, false));
+        // Unsure → keep the confirmation.
+        assert!(!osc52_known_unsupported_for("xterm-256color", None, false));
+        assert!(!osc52_known_unsupported_for("screen-256color", None, false));
+        assert!(!osc52_known_unsupported_for("xterm-kitty", None, false));
+        // A TERM_PROGRAM (iTerm2, WezTerm, vscode, tmux…) wins over TERM.
+        assert!(!osc52_known_unsupported_for(
+            "xterm",
+            Some("iTerm.app"),
+            false
+        ));
+        assert!(!osc52_known_unsupported_for(
+            "xterm-256color",
+            Some("WezTerm"),
+            true
+        ));
+        assert!(osc52_known_unsupported_for("xterm", Some(""), false));
+    }
+
+    #[test]
+    fn popup_desc_covers_skills_and_custom_commands() {
+        // Builtins keep their static text.
+        assert_eq!(popup_desc("/help"), slash_command_desc("/help"));
+        assert_eq!(
+            popup_desc("/local"),
+            "probe local servers and list GGUF models"
+        );
+        // A bundled skill shows its first line via the skill loader.
+        let (name, content) = crate::config::bundled_skills()[0];
+        let desc = popup_desc(&format!("/{name}"));
+        assert!(!desc.is_empty(), "skill /{name} needs a popup description");
+        assert_eq!(desc, crate::config::skill_description(content));
+        // @mentions and unknown commands stay blank.
+        assert_eq!(popup_desc("@src/lib.rs"), "");
+        assert_eq!(popup_desc("/no-such-command-xyz"), "");
     }
 }

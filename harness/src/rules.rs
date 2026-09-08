@@ -269,7 +269,7 @@ impl RuleEngine {
         engine
     }
 
-    /// Loads rules from a JSON or YAML file (using JSON parser here for minimal deps).
+    /// Loads rules from a JSON file (`{"rules": [...]}`); YAML is not supported.
     pub fn load_from_file(path: &str) -> Result<Self, String> {
         let data = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read rules file {}: {}", path, e))?;
@@ -479,5 +479,21 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.rule_id == "bug_fix_requires_regression_test"));
+    }
+
+    #[test]
+    fn load_from_file_is_json_only_and_names_the_file() {
+        let dir = std::env::temp_dir().join(format!("bwn-rules-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let yaml = dir.join("rules.yaml");
+        fs::write(&yaml, "rules:\n  - id: nope\n").unwrap();
+        let err = RuleEngine::load_from_file(&yaml.to_string_lossy()).unwrap_err();
+        assert!(err.contains("rules.yaml"), "{err}");
+        assert!(err.starts_with("Failed to parse rules file"), "{err}");
+        let missing = dir.join("missing.json");
+        let err = RuleEngine::load_from_file(&missing.to_string_lossy()).unwrap_err();
+        assert!(err.starts_with("Failed to read rules file"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
