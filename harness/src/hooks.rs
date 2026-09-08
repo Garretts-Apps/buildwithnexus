@@ -6,6 +6,7 @@
 //   type: "command"  — shell command string (existing format)
 //   type: "python"   — path to a Python script (uses python3 or python)
 //   type: "script"   — any executable script path; runtime detected by extension
+//                      (.sh/.bash/.py/.rs everywhere; .ps1/.cmd/.bat on Windows)
 //
 // Scripts in ~/.buildwithnexus/hooks/<Event>/*.{sh,py} are auto-discovered
 // without requiring settings.json entries.
@@ -266,30 +267,81 @@ fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
 }
 
 // ── execution ────────────────────────────────────────────────────────────────
-fn interpreter_for(path: &Path) -> (&'static str, Vec<&'static str>) {
-    match path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .as_deref()
-    {
+fn interpreter_for(path: &Path) -> Result<(&'static str, Vec<&'static str>), String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    interpreter_for_ext(ext.as_deref(), cfg!(windows), &interpreter_available).map_err(|missing| {
+        let hint = if cfg!(windows) && (missing == "sh" || missing == "bash") {
+            " (install Git for Windows for Git Bash, or use a .ps1/.cmd hook)"
+        } else {
+            ""
+        };
+        format!(
+            "hook {}: interpreter `{missing}` not found on PATH{hint}",
+            path.display()
+        )
+    })
+}
+
+// Does `<bin> --version` run and succeed? (Success, not just spawn: the
+// Windows Store `python3` alias stub exits non-zero.)
+fn interpreter_available(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// Picks the interpreter for a script by extension. `available` probes PATH;
+// `windows` selects the Windows table. Err carries the name of the missing
+// interpreter when nothing usable is on PATH.
+fn interpreter_for_ext(
+    ext: Option<&str>,
+    windows: bool,
+    available: &dyn Fn(&str) -> bool,
+) -> Result<(&'static str, Vec<&'static str>), String> {
+    match ext {
         Some("py") | Some("python") => {
-            // Prefer python3; fall back to python.
-            if std::process::Command::new("python3")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-            {
-                ("python3", vec![])
+            // Prefer python3; fall back to python (the only name the
+            // python.org Windows installer provides).
+            if available("python3") {
+                Ok(("python3", vec![]))
             } else {
-                ("python", vec![])
+                Ok(("python", vec![]))
             }
         }
-        Some("bash") => ("bash", vec![]),
+        Some("ps1") if windows => Ok((
+            "powershell.exe",
+            vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+        )),
+        Some("cmd") | Some("bat") if windows => Ok(("cmd.exe", vec!["/C"])),
+        Some("bash") if !windows => Ok(("bash", vec![])),
         // Shell scripts: run as `sh /path/script.sh` — NOT `sh -c /path/script.sh`
         // (the -c form treats the path as a command string, not a script file).
-        _ => ("sh", vec![]),
+        _ if !windows => Ok(("sh", vec![])),
+        // Windows: no shell by default. Git for Windows puts `sh`/`bash` on
+        // PATH; without either there's nothing sensible to run a .sh with.
+        Some("bash") => {
+            if available("bash") {
+                Ok(("bash", vec![]))
+            } else if available("sh") {
+                Ok(("sh", vec![]))
+            } else {
+                Err("bash".to_string())
+            }
+        }
+        _ => {
+            if available("sh") {
+                Ok(("sh", vec![]))
+            } else if available("bash") {
+                Ok(("bash", vec![]))
+            } else {
+                Err("sh".to_string())
+            }
+        }
     }
 }
 
@@ -331,7 +383,10 @@ fn run_script(
     if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
         return run_rust_hook(path, payload, cwd, timeout);
     }
-    let (interp, interp_args) = interpreter_for(path);
+    let (interp, interp_args) = match interpreter_for(path) {
+        Ok(i) => i,
+        Err(e) => return (HOOK_SPAWN_FAILED_CODE, String::new(), e),
+    };
     let mut c = Command::new(interp);
     for a in interp_args {
         c.arg(a);
@@ -938,6 +993,92 @@ mod tests {
         assert_eq!(code, 7);
         assert_eq!(stdout.trim(), "out");
         assert_eq!(stderr.trim(), "err");
+    }
+
+    #[test]
+    fn interpreter_table_unix() {
+        let all = |_: &str| true;
+        let none = |_: &str| false;
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), false, &all).unwrap().0,
+            "sh"
+        );
+        assert_eq!(interpreter_for_ext(None, false, &none).unwrap().0, "sh");
+        assert_eq!(
+            interpreter_for_ext(Some("bash"), false, &all).unwrap().0,
+            "bash"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), false, &all).unwrap().0,
+            "python3"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), false, &none).unwrap().0,
+            "python"
+        );
+        // .ps1/.cmd are not special off Windows: they fall through to sh.
+        assert_eq!(
+            interpreter_for_ext(Some("ps1"), false, &all).unwrap().0,
+            "sh"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("cmd"), false, &all).unwrap().0,
+            "sh"
+        );
+    }
+
+    #[test]
+    fn interpreter_table_windows() {
+        let none = |_: &str| false;
+        let git_bash = |b: &str| b == "sh" || b == "bash";
+        let only_bash = |b: &str| b == "bash";
+        assert_eq!(
+            interpreter_for_ext(Some("ps1"), true, &none).unwrap(),
+            (
+                "powershell.exe",
+                vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+            )
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("cmd"), true, &none).unwrap(),
+            ("cmd.exe", vec!["/C"])
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("bat"), true, &none).unwrap(),
+            ("cmd.exe", vec!["/C"])
+        );
+        // python3 missing (or the Store stub failing) → python.
+        assert_eq!(
+            interpreter_for_ext(Some("py"), true, &none).unwrap().0,
+            "python"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), true, &|b: &str| b == "python3")
+                .unwrap()
+                .0,
+            "python3"
+        );
+        // .sh: Git Bash when present, otherwise a clear miss naming `sh`.
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &git_bash).unwrap().0,
+            "sh"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &only_bash).unwrap().0,
+            "bash"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &none),
+            Err("sh".to_string())
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("bash"), true, &none),
+            Err("bash".to_string())
+        );
+        assert_eq!(
+            interpreter_for_ext(None, true, &none),
+            Err("sh".to_string())
+        );
     }
 
     #[test]

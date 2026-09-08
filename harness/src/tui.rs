@@ -2651,11 +2651,55 @@ mod signal_restore {
     }
 }
 
+// Windows counterpart: a console control handler for Ctrl+Break, closing the
+// console window, logoff and shutdown. (Ctrl+C never reaches it while raw
+// mode is on — the console delivers it as a key event instead.) The handler
+// runs on its own thread while the process is being torn down; it restores
+// the terminal and then returns FALSE so the default handler still ends the
+// process. `SetConsoleCtrlHandler` is declared here directly — kernel32 is
+// always linked on Windows and this avoids a Windows API crate.
+#[cfg(windows)]
+mod signal_restore {
+    use super::{ALT_SCREEN, RAW};
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    use std::sync::Once;
+
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+
+    pub fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            let _ = SetConsoleCtrlHandler(Some(handler), 1);
+        });
+    }
+
+    unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
+        if ALT_SCREEN.swap(false, Ordering::Relaxed) {
+            // Reset colors, show the cursor, drop mouse/bracketed-paste
+            // reporting, leave the alternate screen.
+            const RESTORE: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
+            let mut out = std::io::stdout();
+            let _ = out.write_all(RESTORE);
+            let _ = out.flush();
+        }
+        if RAW.swap(false, Ordering::Relaxed) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+        0
+    }
+}
+
 pub fn enter_alt(raw: bool) {
     if raw {
         // Before any terminal-state change: snapshot the cooked termios and
         // arm the restore-on-signal handlers.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         signal_restore::install();
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
         invalidate_stream_line();

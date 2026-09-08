@@ -201,6 +201,54 @@ are declared as `optionalDependencies` and are used automatically once
 published. Non-interactive environments opt in with `bwn --bootstrap` or
 `BWN_ALLOW_BOOTSTRAP=1`; or build from source and point `BWN_BIN` at the result.
 
+## Platform support
+
+Linux and macOS are the primary targets. Native Windows (PowerShell, cmd,
+Windows Terminal) and WSL are supported with the differences below. Nothing
+here needs extra dependencies — Windows integration shells out to the
+built-in tools (`powershell.exe`, `cmd.exe`, `icacls`, `tasklist`,
+`taskkill`).
+
+Works on native Windows:
+
+- The full TUI (alternate screen, raw mode, mouse, bracketed paste) via
+  crossterm. Ctrl+Break, closing the console window, logoff and shutdown
+  restore the terminal before the process ends; panics restore it too.
+- Ctrl+V paste of a clipboard **image** (PNG via `powershell.exe`
+  `Get-Clipboard -Format Image`) and clipboard text (`Get-Clipboard -Raw`).
+  WSL uses the same PowerShell path with a base64 round-trip.
+- `~/.buildwithnexus/.env.keys` and `settings.json` are restricted to the
+  current user with `icacls /inheritance:r /grant:r` — the ACL equivalent of
+  the `0600` mode used on Unix. A failure is reported as a dim warning and
+  never blocks the save.
+- Background dev servers (`start_server` / `list_servers` / `stop_server`)
+  without tmux: liveness via `tasklist /FI "PID eq <pid>"`, shutdown via
+  `taskkill /PID <pid> /T /F` (the recorded pid is the `cmd /C` wrapper;
+  `/T` takes its children down with it).
+- Hook scripts by extension: `.ps1` → `powershell.exe -NoProfile
+  -ExecutionPolicy Bypass -File`, `.cmd`/`.bat` → `cmd.exe /C`, `.py` →
+  `python3` if it runs, else `python`. `.sh`/`.bash` run with `sh`/`bash`
+  from PATH (Git for Windows provides both); without them the hook fails with
+  an error naming the missing interpreter instead of a silent `sh` spawn
+  failure. Shell-string hooks and the `bash`/`run_command` tools run under
+  `cmd /C`.
+- `~` and `~/…` (also `~\…`) resolve against `%USERPROFILE%` when `HOME` is
+  unset. Temp files use the system temp directory everywhere.
+
+Still Unix-only:
+
+- tmux-backed dev servers (Windows uses the plain background-process path).
+- Copy-to-clipboard from the transcript is emitted as OSC 52 on every
+  platform; the extra `clip.exe` / `pbcopy` fallback only runs on WSL and
+  macOS, so on native Windows it relies on the terminal honouring OSC 52
+  (Windows Terminal does).
+- Auto-discovery of `~/.buildwithnexus/hooks/<Event>/` scripts still looks
+  for `.sh`/`.bash`/`.py`/`.rs` only; `.ps1`/`.cmd`/`.bat` hooks must be
+  listed in `settings.json` as `type: "script"`.
+- The `python_tool` runner always invokes `python3`.
+- `xdg-open`-style helpers, `/proc`-based WSL detection and Unix signal
+  handling (`SIGTERM`/`SIGHUP`) have no Windows equivalent beyond the above.
+
 ## Safety
 
 - Default permission is **ask** — every file write, edit, and command is

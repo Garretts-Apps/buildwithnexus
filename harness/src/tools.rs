@@ -628,13 +628,23 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> 
 }
 
 fn resolve(cwd: &Path, p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+    // `~` expansion: $HOME, or %USERPROFILE% on Windows (where `~\x` is
+    // also accepted).
+    let user_home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let tilde_rest = p.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            p.strip_prefix("~\\")
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = tilde_rest {
+        if let Some(home) = user_home() {
             return PathBuf::from(home).join(rest);
         }
     }
     if p == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = user_home() {
             return PathBuf::from(home);
         }
     }
@@ -813,10 +823,39 @@ fn pid_running(pid: u64) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // `tasklist` exits 0 whether or not anything matched (a miss prints
+        // "INFO: No tasks are running..."), so the answer is in the output.
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| tasklist_reports_pid(&String::from_utf8_lossy(&o.stdout), pid))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
+}
+
+// Parses `tasklist /FO CSV /NH` output: one `"image","pid","session",...`
+// row per match. True when a row's PID column is exactly `pid`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tasklist_reports_pid(output: &str, pid: u64) -> bool {
+    let want = pid.to_string();
+    output.lines().any(|line| {
+        let line = line.trim();
+        if !line.starts_with('"') {
+            return false;
+        }
+        line.split("\",\"")
+            .nth(1)
+            .map(|f| f.trim_matches('"') == want)
+            .unwrap_or(false)
+    })
 }
 
 fn server_is_running(record: &Value) -> bool {
@@ -1021,6 +1060,19 @@ fn stop_server(input: &Value) -> Outcome {
         {
             stopped = Command::new("kill")
                 .arg(pid.to_string())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        }
+        #[cfg(windows)]
+        {
+            // The recorded pid is the `cmd /C` wrapper; `/T` takes the
+            // server it spawned down with it.
+            stopped = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
@@ -5213,6 +5265,22 @@ mod tests {
                 PathBuf::from(home).join("Documents")
             );
         }
+    }
+
+    #[test]
+    fn tasklist_csv_pid_match_is_exact() {
+        let hit = "\"node.exe\",\"4321\",\"Console\",\"1\",\"54,321 K\"\r\n";
+        assert!(tasklist_reports_pid(hit, 4321));
+        // Substring or other-column matches don't count.
+        assert!(!tasklist_reports_pid(hit, 432));
+        assert!(!tasklist_reports_pid(hit, 1));
+        // A miss is an INFO line on stdout with exit status 0.
+        let miss = "INFO: No tasks are running which match the specified criteria.\r\n";
+        assert!(!tasklist_reports_pid(miss, 4321));
+        assert!(!tasklist_reports_pid("", 4321));
+        // Image names with spaces still parse (CSV, not whitespace-split).
+        let spaced = "\"My Dev Server.exe\",\"77\",\"Services\",\"0\",\"1,000 K\"\n";
+        assert!(tasklist_reports_pid(spaced, 77));
     }
 
     #[test]
