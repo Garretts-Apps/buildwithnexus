@@ -7,7 +7,7 @@ A hilariously fast, **agentic AI CLI** — written in Rust. Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
 commands, asking before each change. One static binary, six direct
 dependencies, no runtime to babysit — and a terminal UI built to feel
-instant: incremental rendering with atomic frames, live autocomplete,
+instant: an incremental wrap cache with atomic frames, live autocomplete,
 GitHub-grade diffs, clickable files and links, and multimodal input straight
 from your clipboard.
 
@@ -53,8 +53,8 @@ once you're ready to let it loose on a real project.
   streaming is smooth on kitty/iTerm2/WezTerm/Alacritty with zero tearing.
 - **Live autocomplete** — type `/` for a command popup with descriptions;
   `@` completes files, `kb:` symbols. ↑/↓ navigate, Tab/Enter accept.
-- **Clean diffs** — line-number gutters, background-tinted rows, word-level
-  change highlighting, hunk elision. Same renderer for previews and applied
+- **Clean diffs** — line-number gutters, background-tinted rows, changed-span
+  highlighting, hunk elision. Same renderer for previews and applied
   changes.
 - **Clickable everything** — file paths and links are OSC 8 hyperlinks: click
   a path in an edit header and it opens in your OS default app.
@@ -102,7 +102,8 @@ to crates.io.
 
 ## Models
 
-Two wire protocols cover everything. Pick a provider during setup (or `bwn init`):
+Three wire protocols — Anthropic Messages, OpenAI chat completions, and native
+Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 
 | Provider | Kind | Key |
 |----------|------|-----|
@@ -191,11 +192,13 @@ bash scripts/vendor.sh                                      # vendor deps for of
 ```
 
 The npm package is a thin, inert wrapper — **no install scripts, no network
-code, no bundled sources**. The prebuilt binary ships as a per-platform
-package (`buildwithnexus-<os>-<cpu>`) selected automatically via
-`optionalDependencies`, SHA-256-verified when packaged, with build-provenance
-attestations (`gh attestation verify`). Installing with `--omit=optional`
-skips the binary — build from source and point `BWN_BIN` at the result.
+code, no bundled sources**. The binary is not in the tarball: on first run the
+launcher fetches the release asset for your platform and verifies its SHA-256
+checksum; every asset carries a build-provenance attestation
+(`gh attestation verify`). Per-platform packages (`buildwithnexus-<os>-<cpu>`)
+are declared as `optionalDependencies` and are used automatically once
+published. Non-interactive environments opt in with `bwn --bootstrap` or
+`BWN_ALLOW_BOOTSTRAP=1`; or build from source and point `BWN_BIN` at the result.
 
 ## Safety
 

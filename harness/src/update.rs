@@ -68,14 +68,32 @@ pub fn newer(a: &str, b: &str) -> bool {
 }
 
 // Effective policy: the `auto_update` setting, with BWN_NO_AUTO_UPDATE=1
-// capping "install" back to "notify" and unknown values treated as "notify".
+// capping "install" back to "notify", unknown values treated as "notify", and
+// "install" only honored for npm installs — `npm install -g` cannot update a
+// cargo or source build, so those are capped to "notify" as well.
 fn effective_policy(setting: &str) -> &'static str {
     let env_cap = std::env::var("BWN_NO_AUTO_UPDATE").is_ok_and(|v| v == "1");
+    let npm = std::env::current_exe()
+        .map(|p| installed_via_npm(&p))
+        .unwrap_or(false);
+    resolve_policy(setting, env_cap, npm)
+}
+
+fn resolve_policy(setting: &str, env_cap: bool, npm_install: bool) -> &'static str {
     match setting {
         "off" => "off",
-        "install" if !env_cap => "install",
+        "install" if !env_cap && npm_install => "install",
         _ => "notify",
     }
+}
+
+// The npm launcher always resolves the binary from a `node_modules` tree (the
+// per-platform package or the wrapper's own `bin/`); cargo installs live in
+// `~/.cargo/bin` and source builds in `target/`, neither of which npm can
+// replace.
+fn installed_via_npm(exe: &std::path::Path) -> bool {
+    exe.components()
+        .any(|c| c.as_os_str().to_str() == Some("node_modules"))
 }
 
 // One-line startup notice when a background update landed (or a newer version
@@ -162,20 +180,41 @@ pub fn spawn_check(policy: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_policy, newer};
+    use super::{effective_policy, installed_via_npm, newer, resolve_policy};
+    use std::path::Path;
 
     #[test]
     fn policy_resolution() {
-        // Serial: the BWN_NO_AUTO_UPDATE env var is process-global state.
+        assert_eq!(resolve_policy("off", false, true), "off");
+        assert_eq!(resolve_policy("notify", false, true), "notify");
+        assert_eq!(resolve_policy("install", false, true), "install");
+        assert_eq!(resolve_policy("bogus", false, true), "notify");
+        // BWN_NO_AUTO_UPDATE=1 caps install back to notify.
+        assert_eq!(resolve_policy("install", true, true), "notify");
+        assert_eq!(resolve_policy("off", true, true), "off");
+        // cargo / source installs are never auto-updated.
+        assert_eq!(resolve_policy("install", false, false), "notify");
+        assert_eq!(resolve_policy("off", false, false), "off");
+        // The test binary itself lives under target/, so "install" never
+        // resolves to "install" from the real entry point here.
         std::env::remove_var("BWN_NO_AUTO_UPDATE");
-        assert_eq!(effective_policy("off"), "off");
-        assert_eq!(effective_policy("notify"), "notify");
-        assert_eq!(effective_policy("install"), "install");
-        assert_eq!(effective_policy("bogus"), "notify");
-        std::env::set_var("BWN_NO_AUTO_UPDATE", "1");
-        assert_eq!(effective_policy("install"), "notify");
-        assert_eq!(effective_policy("off"), "off");
-        std::env::remove_var("BWN_NO_AUTO_UPDATE");
+        assert_ne!(effective_policy("install"), "install");
+    }
+
+    #[test]
+    fn npm_install_detection() {
+        assert!(installed_via_npm(Path::new(
+            "/usr/lib/node_modules/buildwithnexus-linux-x64/bin/buildwithnexus"
+        )));
+        assert!(installed_via_npm(Path::new(
+            "/home/u/.nvm/versions/node/v22/lib/node_modules/buildwithnexus/bin/buildwithnexus"
+        )));
+        assert!(!installed_via_npm(Path::new(
+            "/home/u/.cargo/bin/buildwithnexus"
+        )));
+        assert!(!installed_via_npm(Path::new(
+            "/src/bwn/target/release/buildwithnexus"
+        )));
     }
 
     #[test]
