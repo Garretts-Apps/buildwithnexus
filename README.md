@@ -157,6 +157,34 @@ Inside the interactive session:
 Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
 `ask` (default), `auto` (yolo), or `readonly`. Set it during setup.
 
+### Sandbox
+
+An optional OS-level layer *under* the permission gate for shell commands
+(`run_command`/`bash`, `!cmd`, and `check_work`). Settings key `"sandbox"`
+(or `--sandbox <mode>`, or `/sandbox <mode>` in a session):
+
+- `"off"` (default) — commands run as today.
+- `"auto"` — confine commands when a backend works; otherwise run them
+  unsandboxed and say so once per session.
+- `"require"` — refuse to run commands when no backend works.
+
+Backends are external binaries, probed once per session: `bwrap` (bubblewrap)
+on Linux and `sandbox-exec` (Seatbelt) on macOS. Windows and WSL have none.
+
+**Confined:** filesystem writes anywhere except the working directory and the
+temp dirs (`/tmp`, `$TMPDIR`); everything else — including
+`~/.buildwithnexus` and tool caches such as `~/.cargo` or `~/.npm` — is
+read-only to the command. Set `"sandbox_network": false` to also block the
+network inside the sandbox (default `true`, allowed).
+
+**Not confined:** reads (the whole filesystem stays visible), the agent's own
+file tools (already fenced to the working directory), hooks, MCP servers, and
+`start_server`. The sandbox never approves anything — the permission gate is
+unchanged; it only limits what an approved command can touch. Sandboxed
+commands are marked `[sandboxed]` on the tool header; `/sandbox status` and
+`buildwithnexus doctor` show backend availability and whether commands would
+be confined. To escape for one command, switch with `/sandbox off` and back.
+
 ## Hooks
 
 Run your own commands at the same lifecycle points as Claude Code, configured in

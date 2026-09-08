@@ -2616,7 +2616,12 @@ struct WorkCheck {
     cmd: String,
 }
 
-fn shell_command(cmd: &str, cwd: &Path) -> Command {
+// The platform shell for `cmd` in `cwd`, wrapped in the OS sandbox when the
+// session's sandbox policy confines it (sandbox.rs). Err = policy refuses.
+fn shell_command(cmd: &str, cwd: &Path) -> Result<Command, String> {
+    if let Some(c) = crate::sandbox::wrap(cmd, cwd)? {
+        return Ok(c);
+    }
     let mut command = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.args(["/C", cmd]);
@@ -2627,7 +2632,7 @@ fn shell_command(cmd: &str, cwd: &Path) -> Command {
         c
     };
     command.current_dir(cwd);
-    command
+    Ok(command)
 }
 
 // Script names declared in package.json (empty on any read/parse failure).
@@ -2793,7 +2798,9 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
     let mut any_fail = false;
     let mut ran = 0usize;
     for c in &checks {
-        let cap = match run_with_timeout(shell_command(&c.cmd, cwd), None, CHECK_TIMEOUT) {
+        let cap = match shell_command(&c.cmd, cwd)
+            .and_then(|command| run_with_timeout(command, None, CHECK_TIMEOUT))
+        {
             Ok(cap) => cap,
             Err(e) => {
                 any_fail = true;
@@ -3609,17 +3616,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if cmd.is_empty() {
                 return err("command argument is required and cannot be empty");
             }
-            let mut command = if cfg!(windows) {
-                let mut c = Command::new("cmd");
-                c.args(["/C", cmd]);
-                c
-            } else {
-                let mut c = Command::new("sh");
-                c.args(["-c", cmd]);
-                c
-            };
-            command.current_dir(cwd);
-            match run_with_timeout(command, None, COMMAND_TIMEOUT) {
+            match shell_command(cmd, cwd)
+                .and_then(|command| run_with_timeout(command, None, COMMAND_TIMEOUT))
+            {
                 Ok(cap) => command_outcome(cap, COMMAND_TIMEOUT),
                 Err(e) => err(e),
             }

@@ -51,6 +51,7 @@ pub mod onboarding;
 pub mod provider;
 pub mod report;
 pub mod rules;
+pub mod sandbox;
 pub mod session;
 pub mod tools;
 pub mod trace;
@@ -75,6 +76,7 @@ struct CliOptions {
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    sandbox: Option<String>,
     prompt: Option<String>,
     json: bool,
 }
@@ -99,6 +101,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--provider" => &mut opts.provider,
             "--model" => &mut opts.model,
             "--permission-mode" | "--permission" => &mut opts.permission_mode,
+            "--sandbox" => &mut opts.sandbox,
             "--prompt" => &mut opts.prompt,
             _ => {
                 rest.push(arg);
@@ -218,6 +221,15 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         .permission_mode
         .as_deref()
         .unwrap_or(&settings.permission);
+    // A bad --sandbox flag is a hard error; a bad settings value only warns
+    // (and leaves the sandbox off) so a typo can't lock the user out.
+    let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
+    if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
+        if opts.sandbox.is_some() {
+            return Err(e);
+        }
+        eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
+    }
     Ok((provider, agent::permission(perm_name)))
 }
 
@@ -603,6 +615,9 @@ fn repl(
                     tui::bell();
                     continue;
                 }
+                if sandbox::would_confine() {
+                    tui::line(&tui::dim("  [sandboxed]"));
+                }
                 let out = tools::run("run_command", &tool_input, cwd);
                 for l in out.content.lines() {
                     tui::line(&tui::dim(&format!("  {l}")));
@@ -692,6 +707,12 @@ fn repl(
                     ))),
                 }
             }
+            continue;
+        }
+
+        // /sandbox off|auto|require|status — OS-level shell sandbox.
+        if let Some(arg) = t.strip_prefix("/sandbox ") {
+            handle_sandbox(arg.trim());
             continue;
         }
 
@@ -1008,6 +1029,10 @@ fn repl(
             }
             "/permissions" => {
                 handle_permissions(&mut perm);
+                continue;
+            }
+            "/sandbox" => {
+                handle_sandbox("status");
                 continue;
             }
             "/mouse" => {
@@ -2698,6 +2723,34 @@ fn handle_permissions(perm: &mut Permission) {
     }
 }
 
+// `/sandbox`: bare or `status` reports; a mode switches the session and
+// persists to settings.json, like /permissions.
+fn handle_sandbox(arg: &str) {
+    match arg {
+        "" | "status" => {
+            for l in sandbox::status_lines() {
+                tui::line(&format!("  {l}"));
+            }
+        }
+        other => match sandbox::Mode::parse(other) {
+            Some(mode) => {
+                sandbox::set_mode(mode);
+                if let Some(mut settings) = config::load_settings() {
+                    settings.sandbox = mode.as_str().to_string();
+                    config::save_settings(&settings);
+                }
+                tui::line(&tui::green(&format!("  ✓ sandbox: {}", mode.as_str())));
+                for l in sandbox::status_lines().into_iter().skip(1) {
+                    tui::line(&tui::dim(&format!("  {l}")));
+                }
+            }
+            None => tui::line(&tui::red(&format!(
+                "  unknown sandbox mode '{other}' — try: off, auto, require, status"
+            ))),
+        },
+    }
+}
+
 fn handle_mouse(arg: Option<&str>) {
     let cmd = arg.unwrap_or("").trim();
     match cmd {
@@ -3013,6 +3066,8 @@ fn handle_doctor_tui() {
         }
         None => tui::line(&tui::yellow("  settings: not configured")),
     }
+    let (glyph, text) = sandbox::doctor_summary();
+    tui::line(&format!("  {glyph} sandbox: {text}"));
     tui::line(&format!("  home: {}", config::home().display()));
     tui::line(&format!(
         "  rust: {}",
@@ -3064,6 +3119,11 @@ fn print_help() {
                     "/permissions",
                     "[ask|auto|readonly]",
                     "tool permission level",
+                ),
+                (
+                    "/sandbox",
+                    "[off|auto|require|status]",
+                    "OS sandbox for shell commands",
                 ),
                 ("/model", "[name]", "hot-swap the AI model mid-session"),
                 ("/local", "", "local model server & GGUF/Ollama management"),
@@ -3554,6 +3614,7 @@ fn usage() {
          \x20 --provider <name>             override the configured provider\n\
          \x20 --model <name>                override the configured model\n\
          \x20 --permission-mode <mode>      ask, auto, or readonly\n\
+         \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
          \x20 --prompt <text>               initial interactive prompt\n\
          \x20 --json                        structured headless output\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
@@ -3562,6 +3623,7 @@ fn usage() {
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20 /sandbox [off|auto|require|status] OS sandbox for shell commands\n\
          \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
@@ -3596,7 +3658,7 @@ fn run_doctor() {
     for i in &load.issues {
         println!("  ✗ settings       {}: {}", i.source, i.error);
     }
-    match load.settings {
+    match load.settings.as_ref() {
         None if load.any_present => {
             println!("  ✗ settings       present but unusable — fix the file(s) above");
         }
@@ -3616,7 +3678,7 @@ fn run_doctor() {
             // key presence says nothing about whether the provider answers.
             // Ollama is probed via its free /api/tags; everything else pays
             // one output token, which is what a diagnostic command is for.
-            match build_provider(&s) {
+            match build_provider(s) {
                 Ok(p) => {
                     if config::preset(&s.provider).is_some_and(|pr| pr.id == "ollama") {
                         let models = provider::ollama_models(&p.base_url);
@@ -3651,6 +3713,16 @@ fn run_doctor() {
             }
         }
     }
+
+    // Sandbox: the probe runs the real backend once, so this reports whether
+    // shell commands would actually be confined on this machine.
+    if let Some(s) = &load.settings {
+        if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
+            println!("  ✗ sandbox        {e}");
+        }
+    }
+    let (glyph, text) = sandbox::doctor_summary();
+    println!("  {glyph} sandbox        {text}");
 
     // API key
     for preset in config::PRESETS
@@ -4146,6 +4218,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_options_extracts_sandbox_mode() {
+        let (opts, rest) = parse_cli_options(
+            ["--sandbox", "require", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(opts.sandbox.as_deref(), Some("require"));
+        assert_eq!(rest, ["run", "x"]);
+        let (opts, _) = parse_cli_options(["--sandbox=auto"].map(str::to_string).to_vec()).unwrap();
+        assert_eq!(opts.sandbox.as_deref(), Some("auto"));
+        assert!(parse_cli_options(
+            ["run", "--", "--sandbox", "auto"]
+                .map(str::to_string)
+                .to_vec()
+        )
+        .unwrap()
+        .0
+        .sandbox
+        .is_none());
+    }
+
+    #[test]
     fn cli_separator_preserves_literal_option_names() {
         let (opts, rest) = parse_cli_options(
             ["--json", "run", "--", "explain", "--model", "--json"]
@@ -4170,6 +4265,7 @@ mod tests {
             "--model",
             "--permission-mode",
             "--permission",
+            "--sandbox",
             "--prompt",
         ] {
             for args in [

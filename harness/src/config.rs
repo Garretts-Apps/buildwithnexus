@@ -171,6 +171,22 @@ pub struct Settings {
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub plugins: BTreeMap<String, serde_json::Value>,
+    /// OS-level sandbox for shell commands: "off" (default), "auto" (confine
+    /// when bwrap/sandbox-exec works, else run unsandboxed with a notice), or
+    /// "require" (refuse to run commands without a backend). See sandbox.rs.
+    #[serde(default = "default_sandbox")]
+    pub sandbox: String,
+    /// Whether sandboxed commands may reach the network (default true).
+    #[serde(default = "default_true")]
+    pub sandbox_network: bool,
+}
+
+fn default_sandbox() -> String {
+    "off".into()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_effort() -> String {
@@ -192,6 +208,8 @@ impl Default for Settings {
             allowed_commands: Vec::new(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
+            sandbox: default_sandbox(),
+            sandbox_network: true,
         }
     }
 }
