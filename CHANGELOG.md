@@ -4,6 +4,59 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.15] - 2026-09-08
+
+### Fixed
+- **Shift+Tab keeps your draft.** Cycling modes used to discard the composer,
+  including the cursor position and any continuation lines entered with a
+  trailing `\`. The draft, its lines, and the cursor now survive the mode
+  change. Shift+Tab is ignored inside ordinary y/N and question prompts
+  instead of cancelling them.
+- **Autocomplete replaces the whole token.** Accepting a completion with the
+  cursor mid-token (for example `/he|lp`) produced `/helplp`. Tab and Enter
+  completion now replace the entire token and reuse an existing separator
+  instead of inserting a second space.
+- **Mouse selection around wide characters.** Drag and double-click selection
+  now map terminal columns to characters, so text after CJK characters or
+  emoji highlights and copies the right span, and combining marks stay
+  attached to their base character.
+- **npm launcher consumes `--bootstrap` consistently.** When a binary was
+  already installed, `bwn --bootstrap ...` forwarded the flag to the native
+  CLI, where it could be read as task text. The launcher now strips it in
+  every case and preserves a literal `--bootstrap` after `--`.
+- **CLI argument parsing.** Options that take a value (`--provider`,
+  `--model`, `--permission-mode`, `--prompt`) now fail with exit code 2 when
+  the value is missing or empty instead of silently consuming the next
+  argument. `--` ends option parsing so a task can contain literal option
+  names (including `--json`), and `--help` lists the global options.
+
+### Added
+- Regression coverage for the fixes above: Rust unit tests for the parser,
+  completion, and selection helpers; a Node test for the npm launcher; and a
+  PTY test that drives the real TUI. All three run in CI.
+
+## [0.12.14] - 2026-07-30
+
+### Fixed
+- **PLAN mode approval menu.** The approval popup renders in place above the
+  composer (pre-reserved height, synchronized updates) instead of duplicating
+  on Up/Down navigation. Esc or closing the menu cancels the plan instead of
+  executing it, and the `exit_plan` log noise is gone. PLAN mode switches to
+  BUILD automatically once the plan completes.
+- **PLAN prompt quality.** Raw tool lists are rejected as plan steps, every
+  valid step is accepted, and the PLAN system prompt requires a tech stack and
+  file specs and asks about design choices and edge cases up front.
+- **Composer.** Full editing keys, cursor movement, key repeat, and paste
+  restored in the queued composer; flicker and missing character repaints
+  eliminated; the composer stays interactive at all times and the
+  "bwn is working" text is gone. Keystrokes typed during questions and menus
+  are no longer delayed, duplicated, or lost.
+- **`/model` menu** no longer duplicates entries, and the local server probe
+  timeout is longer.
+- Streamed code blocks no longer auto-copy to the clipboard.
+- A full TUI audit pass closed 35 rendering, cursor, and input-handling
+  findings.
+
 ## [0.12.13] - 2026-07-29
 
 ### Fixed

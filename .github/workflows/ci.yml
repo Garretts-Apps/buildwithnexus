@@ -42,6 +42,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Terminal input regression tests
+        run: python3 ../scripts/test-terminal-input.py ../target/debug/buildwithnexus
+
       - name: Build release
         run: cargo build --release --locked
 
@@ -69,6 +72,9 @@ jobs:
       # a typo can't ship to npm and break `npm install` for everyone.
       - name: Check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
+
+      - name: Test launcher arguments
+        run: node --test scripts/launcher.test.js
 
   audit:
     name: Cargo audit
