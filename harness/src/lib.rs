@@ -68,7 +68,7 @@ use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
+const MAX_ATTACHED_FILE_BYTES: u64 = 256 * 1024;
 
 #[derive(Default, Clone, Debug)]
 struct CliOptions {
@@ -77,6 +77,9 @@ struct CliOptions {
     permission_mode: Option<String>,
     prompt: Option<String>,
     json: bool,
+    // True once `--` was seen: everything after it is literal text, even
+    // words that start with '-'.
+    args_literal: bool,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
@@ -85,6 +88,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "--" {
+            opts.args_literal = true;
             rest.extend(it);
             break;
         }
@@ -185,6 +189,12 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
+        // A stray flag must not become an interactive prompt: `bwn --modle x`
+        // silently launching the TUI hides the typo.
+        other if !opts.args_literal && is_unknown_option(other) => {
+            eprintln!("buildwithnexus: unknown option '{other}'; see --help");
+            std::process::exit(2);
+        }
         _ if !args.is_empty() => {
             interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts)
         }
@@ -194,6 +204,27 @@ pub fn run() {
             std::process::exit(2);
         }
     }
+}
+
+// Options and flag-spelled subcommands the top-level match accepts. Anything
+// else that looks like a flag (`-x`, `--foo`) is a typo, not a prompt; a lone
+// `-` is left alone so it can still be a plain word.
+fn is_unknown_option(arg: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "-v",
+        "-V",
+        "--version",
+        "-h",
+        "--help",
+        "--headless",
+        "-p",
+        "--print",
+        "-c",
+        "--continue",
+        "-r",
+        "--resume",
+    ];
+    arg.len() > 1 && arg.starts_with('-') && !KNOWN.contains(&arg)
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
@@ -709,7 +740,11 @@ fn repl(
         // /model with an inline argument — hot-swap the model mid-session.
         if let Some(model_arg) = t.strip_prefix("/model ") {
             let new_model = model_arg.trim();
-            if !new_model.is_empty() {
+            if let Some((url, m)) = parse_model_endpoint(new_model) {
+                // `/model http://host:port/v1 <model>`: a custom endpoint,
+                // persisted the same way the picker's custom entry does it.
+                swap_model(&mut provider, "custom", &m, Some(url));
+            } else if !new_model.is_empty() {
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
                 swap_model(&mut provider, &prov, &m, None);
@@ -1711,6 +1746,19 @@ fn handle_model(provider: &mut Provider) {
     }
 }
 
+/// `/model <http(s)://url> [model]` → (base_url, model). A URL first token
+/// always means the custom OpenAI-compatible preset; it must never fall into
+/// the org/model → OpenRouter inference below.
+fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
+    let pick = pick.trim();
+    let (first, rest) = pick.split_once(char::is_whitespace).unwrap_or((pick, ""));
+    let lower = first.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    Some((first.to_string(), rest.trim().to_string()))
+}
+
 /// Maps a typed model name to the provider that serves it. Anything
 /// unrecognized stays on the current provider — the swap then validates it.
 fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
@@ -1737,8 +1785,9 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
     if lower.starts_with("gemini") {
         return ("openrouter".into(), format!("google/{lower}"));
     }
-    // org/model naming is OpenRouter's scheme.
-    if pick.contains('/') {
+    // org/model naming is OpenRouter's scheme — but a URL is not a model
+    // name (see parse_model_endpoint).
+    if pick.contains('/') && !pick.contains("://") {
         return ("openrouter".into(), pick.to_string());
     }
     (current_provider.to_string(), pick.to_string())
@@ -2215,16 +2264,14 @@ fn handle_rules(cwd: &std::path::Path) {
     ));
     let mut engine = crate::rules::RuleEngine::load_defaults();
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
-    if let Ok(rd) = std::fs::read_dir(&rules_dir) {
-        for e in rd.flatten() {
-            if let Ok(loaded) =
-                crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
-            {
-                for r in loaded.rules {
-                    engine.add_rule(r);
-                }
-            }
-        }
+    let (loaded, failures) = load_workspace_rule_files(&rules_dir);
+    for r in loaded {
+        engine.add_rule(r);
+    }
+    for (name, err) in failures {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ skipped rules file {name}: {err}"
+        )));
     }
     tui::line(&format!(
         "  {} active rules loaded for workspace:",
@@ -2243,7 +2290,50 @@ fn handle_rules(cwd: &std::path::Path) {
             r.description
         ));
     }
-    tui::line(&tui::dim("  Tip: Add custom JSON/YAML rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt"));
+    tui::line(&tui::dim(
+        "  Tip: Add custom JSON rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt",
+    ));
+}
+
+// Every file in the workspace rules dir, plus one (file name, error) per
+// file that failed to load — a broken rules file used to vanish silently.
+fn load_workspace_rule_files(
+    rules_dir: &std::path::Path,
+) -> (Vec<crate::rules::Rule>, Vec<(String, String)>) {
+    let mut rules = Vec::new();
+    let mut failures = Vec::new();
+    let Ok(rd) = std::fs::read_dir(rules_dir) else {
+        return (rules, failures);
+    };
+    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path_str = path.to_string_lossy();
+        match crate::rules::RuleEngine::load_from_file(&path_str) {
+            Ok(loaded) => rules.extend(loaded.rules),
+            Err(e) => {
+                // load_from_file already prefixes the path; keep the message
+                // to the reason so the line stays short.
+                let reason = [
+                    format!("Failed to parse rules file {path_str}: "),
+                    format!("Failed to read rules file {path_str}: "),
+                ]
+                .iter()
+                .find_map(|prefix| e.strip_prefix(prefix.as_str()))
+                .unwrap_or(&e)
+                .to_string();
+                failures.push((name, reason));
+            }
+        }
+    }
+    (rules, failures)
 }
 
 fn handle_kb_index(cwd: &std::path::Path) {
@@ -3065,8 +3155,12 @@ fn print_help() {
                     "[ask|auto|readonly]",
                     "tool permission level",
                 ),
-                ("/model", "[name]", "hot-swap the AI model mid-session"),
-                ("/local", "", "local model server & GGUF/Ollama management"),
+                (
+                    "/model",
+                    "[name | <url> <model>]",
+                    "hot-swap the AI model mid-session",
+                ),
+                ("/local", "", "probe local servers and list GGUF models"),
             ],
         ),
         (
@@ -3420,13 +3514,27 @@ fn extract_attachments(
                         p.display()
                     )));
                 }
-            } else if let Some(text) = read_text_attachment(&p, range) {
-                text_attachments.push(format!("[file: {}]\n{}", p.display(), text));
+            } else if let Some(att) = read_text_attachment(&p, range) {
+                if let Some(total_kib) = att.truncated_from_kib {
+                    tui::line(&tui::yellow(&format!(
+                        "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
+                        p.display(),
+                        MAX_ATTACHED_FILE_BYTES / 1024
+                    )));
+                }
+                text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
                 if !clean.is_empty() {
                     clean.push(' ');
                 }
                 clean.push_str(&format!("[file: {}]", p.display()));
                 continue;
+            } else if p.is_file() {
+                // Never drop an attachment silently: the token stays in the
+                // prompt as typed, and the user is told why.
+                tui::line(&tui::yellow(&format!(
+                    "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
+                    p.display()
+                )));
             }
         }
         if !clean.is_empty() {
@@ -3456,17 +3564,65 @@ fn split_attachment_range(raw: &str) -> (&str, Option<(usize, usize)>) {
     (raw, None)
 }
 
-fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -> Option<String> {
+struct TextAttachment {
+    text: String,
+    // Total file size in KiB when only the first MAX_ATTACHED_FILE_BYTES
+    // were attached; None when the whole file fit.
+    truncated_from_kib: Option<u64>,
+}
+
+// Oversized files are attached up to the cap with a visible marker rather
+// than dropped: a silently missing attachment sends the model a bare path.
+fn read_text_attachment(
+    path: &std::path::Path,
+    range: Option<(usize, usize)>,
+) -> Option<TextAttachment> {
     let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_ATTACHED_FILE_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    let Some((start, end)) = range else {
-        return Some(text);
+    let (text, truncated_from_kib) = if meta.len() > MAX_ATTACHED_FILE_BYTES {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = vec![0u8; MAX_ATTACHED_FILE_BYTES as usize];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(filled);
+        // Cut at a char boundary so a split multi-byte sequence doesn't
+        // turn a valid UTF-8 file into garbage.
+        let mut text = match String::from_utf8(buf) {
+            Ok(t) => t,
+            Err(e) => {
+                let valid = e.utf8_error().valid_up_to();
+                if valid == 0 {
+                    return None;
+                }
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).ok()?
+            }
+        };
+        let total_kib = meta.len().div_ceil(1024);
+        text.push_str(&format!(
+            "\n[truncated: file is {total_kib} KiB, first {} KiB attached]",
+            MAX_ATTACHED_FILE_BYTES / 1024
+        ));
+        (text, Some(total_kib))
+    } else {
+        (std::fs::read_to_string(path).ok()?, None)
     };
-    Some(
-        text.lines()
+    let Some((start, end)) = range else {
+        return Some(TextAttachment {
+            text,
+            truncated_from_kib,
+        });
+    };
+    Some(TextAttachment {
+        text: text
+            .lines()
             .enumerate()
             .filter_map(|(i, line)| {
                 let line_no = i + 1;
@@ -3478,7 +3634,8 @@ fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -
             })
             .collect::<Vec<_>>()
             .join("\n"),
-    )
+        truncated_from_kib,
+    })
 }
 
 // Suggest a mode from the task phrasing (used for the "tip" hint, not a gate).
@@ -4214,6 +4371,143 @@ mod tests {
             split_attachment_range("src/lib.rs:nope"),
             ("src/lib.rs:nope", None)
         );
+    }
+
+    #[test]
+    fn model_endpoint_pick_is_a_custom_url_not_openrouter() {
+        // `/model http://localhost:8000/v1 my-model` → custom preset with
+        // that base URL — never an OpenRouter "org/model" swap.
+        assert_eq!(
+            parse_model_endpoint("http://localhost:8000/v1 my-model"),
+            Some(("http://localhost:8000/v1".into(), "my-model".into()))
+        );
+        assert_eq!(
+            parse_model_endpoint("HTTPS://api.example.com/v1   gpt-x"),
+            Some(("HTTPS://api.example.com/v1".into(), "gpt-x".into()))
+        );
+        // URL only: swap_model asks for the model name.
+        assert_eq!(
+            parse_model_endpoint("http://localhost:8000/v1"),
+            Some(("http://localhost:8000/v1".into(), String::new()))
+        );
+        // Not a URL: the regular picker handles it.
+        assert_eq!(parse_model_endpoint("custom my-model"), None);
+        assert_eq!(parse_model_endpoint("meta-llama/llama-3.3-70b"), None);
+        assert_eq!(parse_model_endpoint(""), None);
+        // A stray URL reaching parse_model_pick stays on the current
+        // provider instead of being misread as an OpenRouter org/model.
+        assert_eq!(
+            parse_model_pick("http://localhost:8000/v1", "anthropic"),
+            ("anthropic".into(), "http://localhost:8000/v1".into())
+        );
+        // `/model custom <model>` keeps working.
+        assert_eq!(
+            parse_model_pick("custom my-model", "anthropic"),
+            ("custom".into(), "my-model".into())
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_flags_are_rejected_not_prompts() {
+        assert!(is_unknown_option("--modle"));
+        assert!(is_unknown_option("-x"));
+        assert!(is_unknown_option("--json=yes"));
+        // Known flag spellings of subcommands and options pass through.
+        for known in [
+            "-v",
+            "--version",
+            "-h",
+            "--help",
+            "-p",
+            "--print",
+            "-c",
+            "-r",
+            "--resume",
+        ] {
+            assert!(!is_unknown_option(known), "{known}");
+        }
+        // Plain words still become the interactive prompt (`bwn fix the bug`).
+        assert!(!is_unknown_option("fix"));
+        assert!(!is_unknown_option(""));
+        assert!(!is_unknown_option("-"));
+        // Everything after `--` is literal text, even if it looks like a flag.
+        let (opts, rest) =
+            parse_cli_options(vec!["--".into(), "-weird".into(), "task".into()]).unwrap();
+        assert!(opts.args_literal);
+        assert_eq!(rest, vec!["-weird".to_string(), "task".to_string()]);
+        let (opts, _) = parse_cli_options(vec!["fix".into(), "the".into(), "bug".into()]).unwrap();
+        assert!(!opts.args_literal);
+    }
+
+    #[test]
+    fn oversized_text_attachment_is_truncated_with_marker() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.log");
+        // 300 KiB of short lines, ending with a multi-byte char run so the
+        // cut lands mid-sequence and must be repaired.
+        let mut body = "0123456789abcde\n".repeat(300 * 1024 / 16);
+        body.push_str("éééé");
+        std::fs::write(&big, &body).unwrap();
+
+        let att = read_text_attachment(&big, None).expect("big files attach truncated");
+        assert_eq!(att.truncated_from_kib, Some(301));
+        assert!(att
+            .text
+            .ends_with("\n[truncated: file is 301 KiB, first 256 KiB attached]"));
+        let attached = att.text.split("\n[truncated").next().unwrap();
+        assert!(attached.len() <= MAX_ATTACHED_FILE_BYTES as usize);
+        assert!(attached.len() > MAX_ATTACHED_FILE_BYTES as usize - 32);
+        assert!(attached.starts_with("0123456789abcde\n"));
+
+        // Line ranges still apply on top of the truncated text.
+        let ranged = read_text_attachment(&big, Some((2, 2))).unwrap();
+        assert_eq!(ranged.text, "0123456789abcde");
+        assert_eq!(ranged.truncated_from_kib, Some(301));
+
+        // Small files are untouched.
+        let small = dir.join("small.txt");
+        std::fs::write(&small, "hi\n").unwrap();
+        let att = read_text_attachment(&small, None).unwrap();
+        assert_eq!(att.text, "hi\n");
+        assert_eq!(att.truncated_from_kib, None);
+
+        // The prompt carries the marker so the model knows the file is cut.
+        let (text, _) = extract_attachments("look at @big.log", &dir, false);
+        assert!(text.contains("[file: "));
+        assert!(text.contains("[truncated: file is 301 KiB, first 256 KiB attached]"));
+        assert!(!text.contains(" @big.log"), "token must not be pasted raw");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_rule_files_report_parse_failures() {
+        let dir = std::env::temp_dir().join(format!("bwn-rules-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.json"),
+            r#"{"rules":[{"id":"x","description":"d","severity":"low","message":"m"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.yaml"), "rules:\n  - id: nope\n").unwrap();
+
+        let (rules, failures) = load_workspace_rule_files(&dir);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "x");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "bad.yaml");
+        assert!(!failures[0].1.is_empty());
+        assert!(
+            !failures[0].1.contains("Failed to parse rules file"),
+            "reason only: {}",
+            failures[0].1
+        );
+        // No rules dir at all is not an error.
+        let (rules, failures) = load_workspace_rule_files(&dir.join("missing"));
+        assert!(rules.is_empty() && failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

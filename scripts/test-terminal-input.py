@@ -37,13 +37,19 @@ class TerminalInputTests(unittest.TestCase):
             "permission": "readonly",
             "auto_update": "off",
         }))
+        # A fake $EDITOR for the Ctrl+G test: replaces the draft with two lines.
+        self.editor = self.root / "editor.sh"
+        self.editor.write_text("#!/bin/sh\nprintf 'line one\\nline two\\n' > \"$1\"\n")
+        self.editor.chmod(0o755)
+        env = {**os.environ, "NEXUS_HOME": str(self.home),
+               "TERM": "xterm-256color", "NO_COLOR": "1",
+               "EDITOR": str(self.editor)}
+        env.pop("VISUAL", None)
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         self.proc = subprocess.Popen(
             [BINARY], stdin=slave, stdout=slave, stderr=slave,
-            cwd=self.root, start_new_session=True,
-            env={**os.environ, "NEXUS_HOME": str(self.home),
-                 "TERM": "xterm-256color", "NO_COLOR": "1"},
+            cwd=self.root, start_new_session=True, env=env,
         )
         os.close(slave)
         self.output = bytearray()
@@ -124,6 +130,35 @@ class TerminalInputTests(unittest.TestCase):
         self.send("\x1b[D\x1b[D")
         self.send("\r")
         self.assert_submitted("/help")
+
+    def test_editor_keeps_newlines(self):
+        self.send("draft")
+        self.send("\x07")  # Ctrl+G opens $EDITOR, which writes two lines
+        self.assert_submitted("line one line two")  # history flattens newlines
+        # The transcript echoes the prompt as two rows, never flattened.
+        self.wait_for(lambda: b"line two" in self.output, "multi-line echo")
+        self.assertNotIn(b"line one line two", bytes(self.output))
+
+
+class CliArgumentTests(unittest.TestCase):
+    def run_cli(self, *args):
+        with tempfile.TemporaryDirectory(prefix="bwn-cli-test-") as home:
+            return subprocess.run(
+                [BINARY, *args], capture_output=True, text=True, timeout=10,
+                env={**os.environ, "NEXUS_HOME": home, "NO_COLOR": "1"},
+            )
+
+    def test_unknown_option_exits_2_without_launching(self):
+        result = self.run_cli("--modle", "x")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("buildwithnexus: unknown option '--modle'; see --help",
+                      result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_known_flags_still_work(self):
+        result = self.run_cli("--version")
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout.startswith("buildwithnexus "))
 
 
 if __name__ == "__main__":
