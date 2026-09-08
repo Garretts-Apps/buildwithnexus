@@ -493,6 +493,7 @@ mod tests {
             context_tokens: 0,
             temperature: None,
             max_tokens: None,
+            effort: crate::config::Effort::Off,
             ollama_ctx: std::sync::OnceLock::new(),
         }
     }

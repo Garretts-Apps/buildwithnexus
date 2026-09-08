@@ -32,6 +32,7 @@
 //! | [`session`] | save/resume of conversations |
 //! | [`workflow`] | background `/schedule` and `/loop` runs, persisted across restarts |
 //! | [`config`] | provider presets, settings files, key store, bundled skills |
+//! | [`usage`] | session token ledger, price table, `--max-budget-usd` guard |
 //! | [`hooks`] | Claude-Code-style lifecycle hooks (deny-capable, never grant) |
 //!
 //! Performance is the project's primary design lever; every claim is
@@ -56,6 +57,7 @@ pub mod tools;
 pub mod trace;
 pub mod tui;
 pub mod update;
+pub mod usage;
 pub mod verifier;
 pub mod workflow;
 
@@ -76,12 +78,17 @@ struct CliOptions {
     model: Option<String>,
     permission_mode: Option<String>,
     prompt: Option<String>,
+    /// `--effort off|low|medium|high`, validated when the provider is built.
+    effort: Option<String>,
+    /// `--max-budget-usd <n>`: session spend ceiling, already parsed and > 0.
+    max_budget_usd: Option<f64>,
     json: bool,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
     let mut opts = CliOptions::default();
     let mut rest = Vec::new();
+    let mut budget_raw: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "--" {
@@ -100,6 +107,8 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--model" => &mut opts.model,
             "--permission-mode" | "--permission" => &mut opts.permission_mode,
             "--prompt" => &mut opts.prompt,
+            "--effort" => &mut opts.effort,
+            "--max-budget-usd" => &mut budget_raw,
             _ => {
                 rest.push(arg);
                 continue;
@@ -113,6 +122,18 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| format!("{flag} requires a value; see `buildwithnexus --help`"))?,
         );
+    }
+    if let Some(raw) = budget_raw {
+        let usd = raw
+            .trim()
+            .trim_start_matches('$')
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .ok_or_else(|| {
+                format!("--max-budget-usd expects a positive dollar amount (got '{raw}')")
+            })?;
+        opts.max_budget_usd = Some(usd);
     }
     Ok((opts, rest))
 }
@@ -214,6 +235,14 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     if let Some(model) = &opts.model {
         provider.model = model.clone();
     }
+    if let Some(level) = &opts.effort {
+        provider.effort = config::Effort::parse(level).ok_or_else(|| {
+            format!("--effort must be one of off, low, medium, high (got '{level}')")
+        })?;
+    }
+    // The CLI flag wins over the settings key; either arms the pre-request
+    // guard in the agent loop.
+    usage::set_budget(opts.max_budget_usd.or(settings.max_budget_usd));
     let perm_name = opts
         .permission_mode
         .as_deref()
@@ -372,6 +401,9 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
         context_tokens,
         temperature: s.temperature,
         max_tokens: s.max_tokens,
+        // An unrecognized level behaves like the default rather than
+        // rejecting the whole settings file.
+        effort: config::Effort::parse(&s.effort).unwrap_or_default(),
         ollama_ctx: std::sync::OnceLock::new(),
     };
     if provider.protocol == config::Protocol::OllamaNative {
@@ -677,6 +709,13 @@ fn repl(
             continue;
         }
 
+        // /effort with an inline level, e.g. `/effort high` (bare /effort is
+        // in the match below).
+        if let Some(level) = t.strip_prefix("/effort ") {
+            handle_effort(&mut provider, level);
+            continue;
+        }
+
         // /permissions with an inline argument, e.g. `/permissions auto`.
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
             let arg = perm_arg.trim();
@@ -828,6 +867,7 @@ fn repl(
             "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
             "/clear" => {
                 transcript.clear();
+                usage::forget_last();
                 sid = session::new_id();
                 trace::set_session(&sid);
                 tui::clear();
@@ -836,6 +876,7 @@ fn repl(
             }
             "/new" => {
                 transcript.clear();
+                usage::forget_last();
                 sid = session::new_id();
                 trace::set_session(&sid);
                 tui::line(&tui::dim("  started a fresh session"));
@@ -843,6 +884,7 @@ fn repl(
             }
             "/resume" => {
                 handle_resume(&mut transcript, &mut sid);
+                usage::forget_last();
                 trace::set_session(&sid);
                 continue;
             }
@@ -944,6 +986,14 @@ fn repl(
             }
             "/context" => {
                 handle_context(&transcript, provider.context_tokens);
+                continue;
+            }
+            "/cost" => {
+                handle_cost(&provider);
+                continue;
+            }
+            "/effort" => {
+                handle_effort(&mut provider, "");
                 continue;
             }
             "/agents" => {
@@ -2085,6 +2135,11 @@ fn swap_model(
                     }
                 }
             }
+            // The probe's one-token usage mustn't pose as the live prompt
+            // size, and a `--effort` given on the command line outlives the swap.
+            usage::forget_last();
+            let mut p = p;
+            p.effort = provider.effort;
             *provider = p;
             config::save_settings(&s);
             provider::prewarm(provider);
@@ -2480,6 +2535,7 @@ fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
     let before = transcript.len();
     let taken = std::mem::take(transcript);
     *transcript = agent::compact_msgs(provider, taken);
+    usage::forget_last();
     let after = transcript.len();
     tui::line(&tui::green(&format!(
         "  ✓ compacted: {before} → {after} messages"
@@ -2775,12 +2831,59 @@ fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
 }
 
 fn handle_context(transcript: &[provider::Msg], total: usize) {
-    let used = msg_token_estimate(transcript);
-    tui::context_meter(used, total);
+    let estimate = msg_token_estimate(transcript);
+    // The server's own count for the last request beats the chars/4 guess,
+    // but only while the transcript it measured is still the live one.
+    let measured = if transcript.is_empty() {
+        None
+    } else {
+        usage::last_context_tokens()
+    };
+    tui::context_meter(measured.unwrap_or(estimate), total);
+    tui::line(&tui::dim(&match measured {
+        Some(_) => {
+            format!("  measured from the last request's usage (chars/4 estimate: {estimate})")
+        }
+        None => "  estimated (chars/4) — no usage reported yet".to_string(),
+    }));
     tui::line(&tui::dim(&format!(
         "  {} messages in session",
         transcript.len()
     )));
+}
+
+fn handle_cost(provider: &Provider) {
+    tui::line(&tui::accent("  session usage"));
+    for l in usage::render(&usage::snapshot(), &provider.model) {
+        tui::line(&tui::dim(&l));
+    }
+}
+
+// `/effort` shows the level; `/effort <level>` applies it to the live
+// provider and persists it to settings.json.
+fn handle_effort(provider: &mut Provider, arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        tui::line(&tui::dim(&format!(
+            "  effort: {} — /effort off|low|medium|high",
+            provider.effort
+        )));
+        return;
+    }
+    match config::Effort::parse(arg) {
+        Some(level) => {
+            provider.effort = level;
+            let mut s = config::load_settings().unwrap_or_default();
+            s.effort = level.as_str().to_string();
+            config::save_settings(&s);
+            tui::line(&tui::green(&format!(
+                "  ✓ effort → {level} (saved to settings)"
+            )));
+        }
+        None => tui::line(&tui::red(&format!(
+            "  unknown effort '{arg}' — try: off, low, medium, high"
+        ))),
+    }
 }
 
 fn handle_checkpoints(cwd: &std::path::Path) {
@@ -3066,6 +3169,7 @@ fn print_help() {
                     "tool permission level",
                 ),
                 ("/model", "[name]", "hot-swap the AI model mid-session"),
+                ("/effort", "[off|low|medium|high]", "reasoning depth"),
                 ("/local", "", "local model server & GGUF/Ollama management"),
             ],
         ),
@@ -3074,6 +3178,7 @@ fn print_help() {
             &[
                 ("/compact", "", "compress context to free token budget"),
                 ("/context", "", "show context window usage"),
+                ("/cost", "", "session tokens and estimated cost"),
                 ("/diff", "", "show current git diff summary"),
                 ("/review", "", "AI code review of staged git diff"),
                 ("/commit", "", "AI-drafted conventional commit message"),
@@ -3555,17 +3660,21 @@ fn usage() {
          \x20 --model <name>                override the configured model\n\
          \x20 --permission-mode <mode>      ask, auto, or readonly\n\
          \x20 --prompt <text>               initial interactive prompt\n\
+         \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
+         \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
          \x20 --json                        structured headless output\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
+         \x20 /effort [off|low|medium|high]    show or set reasoning depth\n\
          \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
          \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
          \x20 /context               show current context usage\n\
+         \x20 /cost                  session tokens and estimated cost\n\
          \x20 /diff                  show current git diff summary\n\
          \x20 /review                AI code review of staged git diff\n\
          \x20 /commit                AI-drafted conventional commit message\n\
@@ -4143,6 +4252,46 @@ mod tests {
         assert_eq!(opts.model.as_deref(), Some("qwen3"));
         assert_eq!(opts.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(rest, vec!["fix", "tests"]);
+    }
+
+    #[test]
+    fn parse_cli_options_effort_and_budget() {
+        let (opts, rest) = parse_cli_options(
+            ["--effort", "high", "--max-budget-usd=1.50", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        assert_eq!(opts.max_budget_usd, Some(1.5));
+        assert_eq!(rest, ["run", "x"]);
+        // Defaults: no level, no budget.
+        let (opts, _) = parse_cli_options(vec![]).unwrap();
+        assert!(opts.effort.is_none());
+        assert!(opts.max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn parse_cli_options_budget_rejects_missing_or_non_positive_values() {
+        let err = parse_cli_options(["--max-budget-usd"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("--max-budget-usd requires a value"), "{err}");
+        let err = parse_cli_options(["--max-budget-usd", "abc"].map(str::to_string).to_vec())
+            .unwrap_err();
+        assert!(err.contains("positive dollar amount"), "{err}");
+        let err =
+            parse_cli_options(["--max-budget-usd", "0"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("positive dollar amount"), "{err}");
+        // Effort values are validated when the provider is built, but the
+        // missing-value rule applies here like every other option.
+        let err =
+            parse_cli_options(["--effort", "--json"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("--effort requires a value"), "{err}");
+        // After `--` the flags are literal task words.
+        let (opts, rest) =
+            parse_cli_options(["--", "--max-budget-usd", "5"].map(str::to_string).to_vec())
+                .unwrap();
+        assert!(opts.max_budget_usd.is_none());
+        assert_eq!(rest, ["--max-budget-usd", "5"]);
     }
 
     #[test]

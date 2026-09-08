@@ -136,11 +136,56 @@ pub fn preset(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
 
+/// Reasoning depth requested from the model. `Off` (the default) sends no
+/// thinking/reasoning parameters at all, so the wire shape is unchanged from
+/// before the setting existed; the other levels map per protocol in
+/// `provider` (Anthropic thinking, OpenAI `reasoning_effort` on reasoning
+/// models only, Ollama `think`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Effort {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub const LEVELS: [&'static str; 4] = ["off", "low", "medium", "high"];
+
+    pub fn parse(s: &str) -> Option<Effort> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "" => Some(Effort::Off),
+            "low" => Some(Effort::Low),
+            "medium" | "med" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Off => "off",
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub provider: String,
     pub model: String,
     pub permission: String,
+    /// Reasoning level: "off" (default), "low", "medium", or "high" — see
+    /// [`Effort`]. `--effort` and `/effort` override and persist it.
     #[serde(default = "default_effort")]
     pub effort: String,
     #[serde(default)]
@@ -158,6 +203,11 @@ pub struct Settings {
     /// skips /api/show detection.
     #[serde(default)]
     pub context_tokens: Option<u32>,
+    /// Session spend ceiling in USD (estimated from the price table); the
+    /// agent loop stops before the next model request once it's exceeded.
+    /// None or <= 0 → no limit. `--max-budget-usd` overrides it per run.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
     /// npm auto-update policy: "off" (no check, no notices), "notify"
     /// (daily check, startup notice, never installs — the default), or
     /// "install" (daily check + silent `npm install -g`, notice on next
@@ -174,7 +224,7 @@ pub struct Settings {
 }
 
 fn default_effort() -> String {
-    "low".into()
+    Effort::Off.as_str().into()
 }
 
 impl Default for Settings {
@@ -183,11 +233,12 @@ impl Default for Settings {
             provider: "anthropic".into(),
             model: String::new(),
             permission: "ask".into(),
-            effort: "low".into(),
+            effort: default_effort(),
             base_url: None,
             temperature: None,
             max_tokens: None,
             context_tokens: None,
+            max_budget_usd: None,
             auto_update: default_auto_update(),
             allowed_commands: Vec::new(),
             mcp_servers: BTreeMap::new(),
@@ -1110,6 +1161,40 @@ mod tests {
         assert!(s.base_url.is_none());
         // Newer knobs default to None on old settings files.
         assert!(s.context_tokens.is_none());
+    }
+
+    #[test]
+    fn effort_parses_levels_and_defaults_to_off() {
+        assert_eq!(Effort::parse("off"), Some(Effort::Off));
+        assert_eq!(Effort::parse(" Low "), Some(Effort::Low));
+        assert_eq!(Effort::parse("MEDIUM"), Some(Effort::Medium));
+        assert_eq!(Effort::parse("high"), Some(Effort::High));
+        assert_eq!(Effort::parse("max"), None);
+        assert_eq!(Effort::default(), Effort::Off);
+        assert_eq!(Effort::High.to_string(), "high");
+        for l in Effort::LEVELS {
+            assert_eq!(Effort::parse(l).unwrap().as_str(), l);
+        }
+        // Settings default to "off" so a fresh install sends no thinking params;
+        // a file without the key gets the same.
+        assert_eq!(Settings::default().effort, "off");
+        let s: Settings =
+            serde_json::from_str(r#"{"provider":"openai","model":"gpt-4o","permission":"ask"}"#)
+                .unwrap();
+        assert_eq!(s.effort, "off");
+        assert!(s.max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn settings_max_budget_usd_roundtrip() {
+        let s = Settings {
+            max_budget_usd: Some(2.5),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"max_budget_usd\":2.5"));
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.max_budget_usd, Some(2.5));
     }
 
     #[test]
