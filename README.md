@@ -120,6 +120,22 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600).
 
+**Reasoning.** `effort` in settings (`off` by default, or `low` / `medium` /
+`high`; `--effort <level>` per run, `/effort` in-session) maps to each API's
+native control: Claude 4.6+ gets adaptive thinking with `output_config.effort`,
+older Claude models a `budget_tokens` thinking budget (2048 / 8192 / 16384),
+OpenAI reasoning models (`o1`/`o3`/`o4`/`gpt-5`) `reasoning_effort`, and
+Ollama's native API `think: true`. Other models — including anything behind a
+local OpenAI-compatible server — receive no reasoning parameters at all.
+
+**Cost.** Every request's `usage` block feeds a session ledger: `/cost` shows
+input / output / cache-read / cache-write tokens, the request count, and an
+estimated dollar figure from a built-in price table (local providers show
+`$0.00 (local)`; an unlisted model shows tokens only, never a guessed price).
+`--max-budget-usd <n>` (or `max_budget_usd` in settings) stops the agent
+before the next model request once the estimate exceeds `n`, with a `notice`
+event in `--json` mode.
+
 ## Modes
 
 - **PLAN** — decompose the task into steps you approve or edit, then execute.
@@ -140,7 +156,10 @@ Inside the interactive session:
 
 ```
 /model [name]             hot-swap the AI model mid-session
+/effort [off|low|medium|high]  show or set reasoning depth (persisted to settings)
 /compact                  compress context (free up token budget)
+/context                  context window usage (measured from the last request when known)
+/cost                     session tokens by category, request count, estimated cost
 /review                   AI code review of current git diff
 /commit                   AI-drafted conventional commit message
 /pr                       AI-drafted pull request title + description

@@ -173,6 +173,9 @@ fn render_msgs(msgs: &[Msg]) -> String {
 }
 
 fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
+    // The last request's measured prompt size described the transcript
+    // being replaced; the meter falls back to the estimate until the next one.
+    crate::usage::forget_last();
     let (sys_end, tail_start) = compaction_split(&msgs);
     if tail_start <= sys_end {
         return msgs;
@@ -603,6 +606,25 @@ impl ThinkingStream {
     fn finish(&mut self) {
         self.flush_line();
         tui::render_queued_composer();
+    }
+}
+
+// Meter input after a round-trip: the size the server measured for the last
+// request when it reported usage, else the chars/4 estimate.
+fn context_used(msgs: &[Msg]) -> usize {
+    crate::usage::last_context_tokens().unwrap_or_else(|| estimate_tokens(msgs))
+}
+
+// `--max-budget-usd` guard, checked before each model request so a session
+// stops between requests rather than mid-stream. Prints the notice (a
+// `notice` event in --json mode) and reports whether the loop must stop.
+fn budget_exhausted() -> bool {
+    match crate::usage::budget_stop() {
+        Some(msg) => {
+            report::notice(&msg);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1908,6 +1930,9 @@ fn build_inner(
             report::notice(msg);
             return Ok(String::new());
         }
+        if budget_exhausted() {
+            return Ok(String::new());
+        }
         maybe_compact(p, msgs);
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
@@ -2364,7 +2389,7 @@ fn build_inner(
             crate::session::save(sid, cwd, &p.model, msgs);
         }
         if !report::is_json() {
-            tui::context_meter(estimate_tokens(msgs), p.context_tokens);
+            tui::context_meter(context_used(msgs), p.context_tokens);
             tui::poll_typeahead();
         }
         if let Some(s) = summary {
@@ -2454,6 +2479,9 @@ fn build_inner(
          step to pick up. Be honest about anything unverified."
             .into(),
     ));
+    if budget_exhausted() {
+        return Ok(String::new());
+    }
     match request_reply(p, msgs.as_slice(), &defs, "wrapping up") {
         Ok(r) if !r.text.trim().is_empty() => Ok(r.text),
         // Even if the wrap-up call fails or comes back empty, don't hand the user
@@ -3105,6 +3133,9 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
                 "planning stopped after {MAX_PLAN_TOOL_ROUNDS} tool rounds without producing a plan"
             ));
         }
+        if budget_exhausted() {
+            return Ok(());
+        }
         maybe_compact(p, &mut msgs);
         let reply = request_reply(p, &msgs, &defs, "planning")?;
         let reply = normalize_text_tool_calls(reply, &defs, task);
@@ -3450,6 +3481,9 @@ pub fn run_brainstorm(
                     "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
                 );
             }
+            if budget_exhausted() {
+                return Ok(None);
+            }
             tui::line("");
             let reply = request_reply(p, &msgs, &defs, "thinking")?;
             let reply = normalize_text_tool_calls(reply, &defs, &question);
@@ -3460,7 +3494,7 @@ pub fn run_brainstorm(
                     calls: vec![],
                 });
                 if !report::is_json() {
-                    tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                    tui::context_meter(context_used(&msgs), p.context_tokens);
                 }
                 break reply.text;
             }
@@ -3589,7 +3623,7 @@ pub fn run_brainstorm(
             });
             msgs.push(Msg::Tool(results));
             if !report::is_json() {
-                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                tui::context_meter(context_used(&msgs), p.context_tokens);
                 tui::poll_typeahead();
             }
             if let Some(loop_msg) = loop_summary {
@@ -3660,13 +3694,16 @@ pub fn run_chat_turn(
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
+        if budget_exhausted() {
+            return Ok(());
+        }
         maybe_compact(p, &mut msgs);
         let reply = request_reply(p, &msgs, &defs, "thinking")?;
         let reply = normalize_text_tool_calls(reply, &defs, question);
 
         if reply.calls.is_empty() {
             if !reply.text.trim().is_empty() && !report::is_json() {
-                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                tui::context_meter(context_used(&msgs), p.context_tokens);
             }
             return Ok(());
         }
@@ -3765,7 +3802,7 @@ pub fn run_chat_turn(
         });
         msgs.push(Msg::Tool(results));
         if !report::is_json() {
-            tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            tui::context_meter(context_used(&msgs), p.context_tokens);
             tui::poll_typeahead();
         }
         if let Some(loop_msg) = loop_summary {
@@ -3872,6 +3909,7 @@ mod tests {
             text: text.to_string(),
             calls: vec![],
             stop_reason: Some("stop".into()),
+            ..Default::default()
         };
         // Truncated tagged call: intent to act, nothing parseable.
         assert!(malformed_tool_markup(&broken(
@@ -3894,6 +3932,7 @@ mod tests {
                 input: serde_json::json!({"path": "x"}),
             }],
             stop_reason: Some("stop".into()),
+            ..Default::default()
         };
         assert!(!malformed_tool_markup(&parsed));
     }

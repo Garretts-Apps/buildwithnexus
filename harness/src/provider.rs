@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::config::Protocol;
+use crate::config::{Effort, Protocol};
 use crate::tools::ToolDef;
+use crate::usage::Usage;
 
 pub struct Provider {
     pub protocol: Protocol,
@@ -25,6 +26,8 @@ pub struct Provider {
     pub context_tokens: usize, // model context window, for compaction thresholds
     pub temperature: Option<f64>, // sampling temperature; None → per-protocol default
     pub max_tokens: Option<u32>, // response token cap; None → per-protocol default
+    /// Reasoning depth; `Off` leaves every request body exactly as before.
+    pub effort: Effort,
     /// Ollama native only: cached /api/show probe result, filled once per
     /// session. `Some(n)` is the chosen `options.num_ctx`; `None` means the
     /// probe failed (older server) and requests fall back to the OpenAI-compat
@@ -72,6 +75,12 @@ pub struct Reply {
     /// "tool_use" (OpenAI "tool_calls" maps here), "refusal", "stop", or None
     /// when the server didn't report one.
     pub stop_reason: Option<String>,
+    /// Token counts from the server's `usage` block; zero when it sent none.
+    pub usage: Usage,
+    /// Anthropic `thinking`/`redacted_thinking` blocks (with signatures),
+    /// verbatim, so a tool-use turn can be replayed with its reasoning — the
+    /// API rejects a thinking-enabled tool round whose assistant turn lost them.
+    pub thinking_blocks: Vec<Value>,
 }
 
 // One process-wide agent so the TLS connection is pooled and kept alive across
@@ -202,6 +211,7 @@ pub fn validate(p: &Provider) -> Result<Option<String>, String> {
         context_tokens: p.context_tokens,
         temperature: None,
         max_tokens: Some(1),
+        effort: Effort::Off,
         ollama_ctx: std::sync::OnceLock::new(),
     };
     match complete(&probe, &[Msg::User("ping".into())], &[]) {
@@ -334,8 +344,58 @@ fn flatten_openai_messages(body: &mut Value) {
     }
 }
 
-// Send an OpenAI-compatible request; on a template/role rejection, retry once
-// with a flattened, strictly-alternating message body.
+// A 400 that means "this server can't take the native request shape": either
+// the template/role rejection above, or a server that rejects the `tools` /
+// `tool_choice` fields outright. Only a 400 qualifies — 5xx/429 are retried
+// upstream, and a 401/404 is never fixed by reshaping the prompt.
+fn needs_flatten(e: &str) -> bool {
+    is_template_role_error(e) || (e.starts_with("HTTP 400") && e.to_lowercase().contains("tool"))
+}
+
+// Whether that rejection is worth remembering for the whole session: only a
+// 400 that names tools, the chat template, or message roles. A one-off
+// "does not support …" (an image, say) still gets the single retry but
+// mustn't strip native tools from every later request.
+fn flatten_is_sticky(e: &str) -> bool {
+    let l = e.to_lowercase();
+    e.starts_with("HTTP 400")
+        && (l.contains("tool") || l.contains("template") || l.contains("role"))
+}
+
+// Endpoints that rejected the native shape this session, so later calls go
+// straight to the flattened body instead of paying a failed request each time.
+fn flattened_endpoints() -> &'static std::sync::Mutex<Vec<String>> {
+    static F: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn flatten_remembered(url: &str) -> bool {
+    flattened_endpoints()
+        .lock()
+        .map(|v| v.iter().any(|u| u == url))
+        .unwrap_or(false)
+}
+
+fn remember_flatten(url: &str) {
+    if let Ok(mut v) = flattened_endpoints().lock() {
+        if !v.iter().any(|u| u == url) {
+            v.push(url.to_string());
+        }
+    }
+}
+
+// Streaming flags for the OpenAI shape: `stream_options.include_usage` makes
+// the server append a final chunk carrying the request's token counts.
+fn mark_streaming(body: &mut Value) {
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+}
+
+// Send an OpenAI-compatible request. Native tools and roles go first — local
+// servers (llama.cpp, LM Studio, vLLM, Ollama's /v1) mostly accept them and
+// then call tools properly. On a 400 that names tools/roles/template, retry
+// once with the flattened, tool-less body and remember the endpoint so the
+// rest of the session skips the failing attempt.
 fn openai_exchange(
     req: ureq::Request,
     mut body: Value,
@@ -344,14 +404,23 @@ fn openai_exchange(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     if streaming {
-        body["stream"] = json!(true);
+        mark_streaming(&mut body);
     }
-    if is_local_url(req.url()) {
+    let url = req.url().to_string();
+    if flatten_remembered(&url) {
         flatten_openai_messages(&mut body);
+        let resp = send_raw(req, body)?;
+        return finish_openai(resp, streaming, on_text, on_thinking);
     }
     match send_raw(req.clone(), body.clone()) {
         Ok(resp) => finish_openai(resp, streaming, on_text, on_thinking),
-        Err(e) if is_template_role_error(&e) => {
+        Err(e) if needs_flatten(&e) => {
+            if flatten_is_sticky(&e) {
+                remember_flatten(&url);
+                crate::report::info(
+                    "  ⟳ server rejected native tools/roles — using flattened prompts for the rest of the session",
+                );
+            }
             flatten_openai_messages(&mut body);
             let resp = send_raw(req, body)?;
             finish_openai(resp, streaming, on_text, on_thinking)
@@ -376,7 +445,25 @@ fn finish_openai(
     }
 }
 
+// The one choke point every model call passes through (blocking, streaming,
+// sub-agents, the /model probe): each completed reply is booked into the
+// session ledger and its thinking blocks are kept for replay.
 fn request(
+    p: &Provider,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    let reply = request_inner(p, msgs, tools, streaming, on_text, on_thinking)?;
+    let local = p.protocol == Protocol::OllamaNative || is_local_url(&p.base_url);
+    crate::usage::record(&p.model, local, reply.usage);
+    remember_thinking(&reply);
+    Ok(reply)
+}
+
+fn request_inner(
     p: &Provider,
     msgs: &[Msg],
     tools: &[ToolDef],
@@ -674,7 +761,8 @@ fn anthropic_request(
     msgs: &[Msg],
     tools: &[ToolDef],
 ) -> Result<(ureq::Request, Value), String> {
-    let body = anthropic_body(&p.model, msgs, tools, p.max_tokens);
+    let mut body = anthropic_body(&p.model, msgs, tools, p.max_tokens);
+    apply_anthropic_effort(&mut body, &p.model, p.effort);
     let key = p
         .api_key
         .as_deref()
@@ -685,6 +773,139 @@ fn anthropic_request(
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json");
     Ok((req, body))
+}
+
+// Thinking budgets for the `budget_tokens` form (models before Claude 4.6).
+fn thinking_budget(effort: Effort) -> Option<u32> {
+    match effort {
+        Effort::Off => None,
+        Effort::Low => Some(2048),
+        Effort::Medium => Some(8192),
+        Effort::High => Some(16384),
+    }
+}
+
+// (major, minor) of a Claude model id, tolerating both layouts —
+// "claude-opus-4-6", "claude-sonnet-4-20250514" (date, not a minor),
+// "claude-3-7-sonnet-…". None for anything that isn't a versioned claude-* id.
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let rest = model.trim().to_ascii_lowercase();
+    let rest = rest.strip_prefix("claude-")?;
+    let mut parts = rest.split('-').filter_map(|seg| seg.parse::<u32>().ok());
+    let major = parts.next()?;
+    let minor = parts.next().filter(|m| *m < 100).unwrap_or(0);
+    Some((major, minor))
+}
+
+// Reasoning on the Anthropic shape. Claude 4.6 and later take adaptive
+// thinking plus `output_config.effort` (the fixed `budget_tokens` form is
+// deprecated there and rejected from 4.7 on); earlier models and unversioned
+// ids get `thinking.enabled` with a budget, and max_tokens is raised to stay
+// strictly above it as the API requires. Thinking blocks recorded from the
+// model's earlier replies are put back in front of their tool_use blocks —
+// a thinking-enabled tool round is rejected without them.
+fn apply_anthropic_effort(body: &mut Value, model: &str, effort: Effort) {
+    let Some(budget) = thinking_budget(effort) else {
+        return;
+    };
+    let adaptive = claude_version(model).is_some_and(|v| v >= (4, 6));
+    if adaptive {
+        body["thinking"] = json!({"type": "adaptive"});
+        if claude_version(model).is_some_and(|v| v >= (4, 7)) {
+            // 4.7+ defaults to omitting thinking text; ask for the summary
+            // so the TUI's thinking stream has something to show.
+            body["thinking"]["display"] = json!("summarized");
+        }
+        body["output_config"] = json!({"effort": effort.as_str()});
+    } else {
+        let max_tokens = body["max_tokens"].as_u64().unwrap_or(8192);
+        if max_tokens <= u64::from(budget) {
+            body["max_tokens"] = json!(budget + 4096);
+        }
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+    }
+    replay_thinking_blocks(body);
+}
+
+// Thinking blocks from earlier replies, keyed by the id of the first tool
+// call they preceded. Bounded so a long session (or parallel sub-agents)
+// never grows it without limit.
+type ThinkingMemory = std::sync::Mutex<Vec<(String, Vec<Value>)>>;
+
+fn thinking_memory() -> &'static ThinkingMemory {
+    static M: std::sync::OnceLock<ThinkingMemory> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+const THINKING_MEMORY_CAP: usize = 64;
+
+fn remember_thinking(reply: &Reply) {
+    let (Some(first), false) = (reply.calls.first(), reply.thinking_blocks.is_empty()) else {
+        return;
+    };
+    if let Ok(mut m) = thinking_memory().lock() {
+        m.push((first.id.clone(), reply.thinking_blocks.clone()));
+        if m.len() > THINKING_MEMORY_CAP {
+            m.remove(0);
+        }
+    }
+}
+
+fn thinking_for(call_id: &str) -> Option<Vec<Value>> {
+    thinking_memory()
+        .lock()
+        .ok()?
+        .iter()
+        .rev()
+        .find(|(id, _)| id == call_id)
+        .map(|(_, blocks)| blocks.clone())
+}
+
+fn replay_thinking_blocks(body: &mut Value) {
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for m in messages.iter_mut() {
+        if m["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(content) = m["content"].as_array_mut() else {
+            continue;
+        };
+        let first_call = content
+            .iter()
+            .find(|b| b["type"].as_str() == Some("tool_use"))
+            .and_then(|b| b["id"].as_str())
+            .map(str::to_string);
+        let Some(blocks) = first_call.and_then(|id| thinking_for(&id)) else {
+            continue;
+        };
+        if content
+            .first()
+            .is_some_and(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
+        {
+            continue;
+        }
+        content.splice(0..0, blocks);
+    }
+}
+
+// Copy whichever usage counters an Anthropic `usage` object carries; fields
+// the server omits keep their previous value (message_start reports input,
+// message_delta reports output).
+fn anthropic_usage_into(u: &Value, into: &mut Usage) {
+    if let Some(n) = u["input_tokens"].as_u64() {
+        into.input = n;
+    }
+    if let Some(n) = u["cache_creation_input_tokens"].as_u64() {
+        into.cache_write = n;
+    }
+    if let Some(n) = u["cache_read_input_tokens"].as_u64() {
+        into.cache_read = n;
+    }
+    if let Some(n) = u["output_tokens"].as_u64() {
+        into.output = n;
+    }
 }
 
 // Put an ephemeral cache breakpoint on the last content block of the last
@@ -707,6 +928,7 @@ fn cache_last_message(messages: &mut [Value]) {
 fn anthropic_parse(v: Value) -> Result<Reply, String> {
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut thinking_blocks = Vec::new();
     if let Some(blocks) = v["content"].as_array() {
         for b in blocks {
             match b["type"].as_str() {
@@ -716,15 +938,20 @@ fn anthropic_parse(v: Value) -> Result<Reply, String> {
                     name: b["name"].as_str().unwrap_or_default().to_string(),
                     input: b["input"].clone(),
                 }),
+                Some("thinking" | "redacted_thinking") => thinking_blocks.push(b.clone()),
                 _ => {}
             }
         }
     }
     let stop_reason = v["stop_reason"].as_str().map(normalize_stop_reason);
+    let mut usage = Usage::default();
+    anthropic_usage_into(&v["usage"], &mut usage);
     Ok(Reply {
         text: strip_think(&text),
         calls,
         stop_reason,
+        usage,
+        thinking_blocks,
     })
 }
 
@@ -736,27 +963,41 @@ fn anthropic_stream(
     let mut text = String::new();
     let mut stop_reason: Option<String> = None;
     let mut stream_err: Option<String> = None;
+    let mut usage = Usage::default();
     // index → (id, name, accumulated input JSON)
     let mut pending: Vec<(usize, String, String, String)> = Vec::new();
+    // index → thinking/redacted_thinking block, assembled from its deltas so
+    // it can be replayed verbatim (signature included) on the next request.
+    let mut thinking: Vec<(usize, Value)> = Vec::new();
     for_each_sse(reader, |data| {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
         match v["type"].as_str() {
+            Some("message_start") => {
+                anthropic_usage_into(&v["message"]["usage"], &mut usage);
+            }
             Some("content_block_start") => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 let cb = &v["content_block"];
-                if cb["type"].as_str() == Some("tool_use") {
-                    pending.push((
+                match cb["type"].as_str() {
+                    Some("tool_use") => pending.push((
                         idx,
                         cb["id"].as_str().unwrap_or_default().to_string(),
                         cb["name"].as_str().unwrap_or_default().to_string(),
                         String::new(),
-                    ));
+                    )),
+                    Some("thinking") => thinking.push((
+                        idx,
+                        json!({"type": "thinking", "thinking": "", "signature": ""}),
+                    )),
+                    Some("redacted_thinking") => thinking.push((idx, cb.clone())),
+                    _ => {}
                 }
             }
             Some("content_block_delta") => {
                 let d = &v["delta"];
+                let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 match d["type"].as_str() {
                     Some("text_delta") => {
                         let t = d["text"].as_str().unwrap_or_default();
@@ -767,10 +1008,19 @@ fn anthropic_stream(
                         // Extended thinking tokens (claude-3-7+): surfaced separately so
                         // the caller can render them as internal monologue.
                         let t = d["thinking"].as_str().unwrap_or_default();
+                        if let Some((_, block)) = thinking.iter_mut().find(|e| e.0 == idx) {
+                            if let Some(acc) = block["thinking"].as_str() {
+                                block["thinking"] = json!(format!("{acc}{t}"));
+                            }
+                        }
                         on_thinking(t);
                     }
+                    Some("signature_delta") => {
+                        if let Some((_, block)) = thinking.iter_mut().find(|e| e.0 == idx) {
+                            block["signature"] = json!(d["signature"].as_str().unwrap_or_default());
+                        }
+                    }
                     Some("input_json_delta") => {
-                        let idx = v["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(e) = pending.iter_mut().find(|e| e.0 == idx) {
                             e.3.push_str(d["partial_json"].as_str().unwrap_or_default());
                         }
@@ -779,10 +1029,12 @@ fn anthropic_stream(
                 }
             }
             Some("message_delta") => {
-                // Final metadata for the turn — carries the stop reason.
+                // Final metadata for the turn — carries the stop reason and
+                // the output token count.
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     stop_reason = Some(normalize_stop_reason(r));
                 }
+                anthropic_usage_into(&v["usage"], &mut usage);
             }
             Some("error") => {
                 // Mid-stream server error (e.g. overloaded) — surface it so the
@@ -818,6 +1070,8 @@ fn anthropic_stream(
         text,
         calls,
         stop_reason,
+        usage,
+        thinking_blocks: thinking.into_iter().map(|(_, b)| b).collect(),
     })
 }
 
@@ -910,7 +1164,8 @@ fn openai_request_at(
     msgs: &[Msg],
     tools: &[ToolDef],
 ) -> (ureq::Request, Value) {
-    let body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
+    let mut body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
+    apply_openai_effort(&mut body, &p.model, p.effort);
     let mut req = agent()
         .post(&format!("{}/chat/completions", base.trim_end_matches('/')))
         .set("content-type", "application/json");
@@ -918,6 +1173,48 @@ fn openai_request_at(
         req = req.set("authorization", &format!("Bearer {key}"));
     }
     (req, body)
+}
+
+// Model names that accept `reasoning_effort` on the OpenAI shape: the o-series
+// and gpt-5 family. Everything else (gpt-4o, local models behind an
+// OpenAI-compatible server, …) rejects or ignores it, so it's never sent.
+fn is_openai_reasoning_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    ["o1", "o3", "o4", "gpt-5"].iter().any(|p| {
+        m.starts_with(p)
+            && m[p.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit())
+    })
+}
+
+fn apply_openai_effort(body: &mut Value, model: &str, effort: Effort) {
+    if effort != Effort::Off && is_openai_reasoning_model(model) {
+        body["reasoning_effort"] = json!(effort.as_str());
+    }
+}
+
+// Token counts from an OpenAI-shape `usage` object. `prompt_tokens` includes
+// the cached portion, which is split out so `input` means uncached tokens
+// like the Anthropic shape. None when the chunk carries no usage object.
+fn openai_usage(v: &Value) -> Option<Usage> {
+    let u = v.get("usage")?.as_object()?;
+    let prompt = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let cached = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d["cached_tokens"].as_u64())
+        .unwrap_or(0)
+        .min(prompt);
+    Some(Usage {
+        input: prompt - cached,
+        output: u
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read: cached,
+        cache_write: 0,
+    })
 }
 
 // Remove `<think>…</think>` reasoning blocks that local reasoning models
@@ -970,6 +1267,8 @@ fn openai_parse(v: Value) -> Result<Reply, String> {
         text,
         calls,
         stop_reason,
+        usage: openai_usage(&v).unwrap_or_default(),
+        ..Default::default()
     })
 }
 
@@ -1074,6 +1373,7 @@ fn openai_stream(
     let mut in_think = false;
     let mut think_carry = String::new();
     let mut stop_reason: Option<String> = None;
+    let mut usage = Usage::default();
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
     for_each_sse(reader, |data| {
@@ -1083,6 +1383,11 @@ fn openai_stream(
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
+        // With stream_options.include_usage the final chunk (empty choices)
+        // carries the totals; some servers put usage on every chunk instead.
+        if let Some(u) = openai_usage(&v) {
+            usage = u;
+        }
         // finish_reason rides on the last content-bearing chunk (or one after).
         if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
             stop_reason = Some(normalize_stop_reason(r));
@@ -1142,6 +1447,8 @@ fn openai_stream(
         text,
         calls,
         stop_reason,
+        usage,
+        ..Default::default()
     })
 }
 
@@ -1318,12 +1625,31 @@ fn ollama_request(
     tools: &[ToolDef],
     num_ctx: u32,
 ) -> (ureq::Request, Value) {
-    let body = ollama_body(&p.model, msgs, tools, p.temperature, p.max_tokens, num_ctx);
+    let mut body = ollama_body(&p.model, msgs, tools, p.temperature, p.max_tokens, num_ctx);
+    apply_ollama_effort(&mut body, p.effort);
     // Local server: no auth header.
     let req = agent()
         .post(&format!("{}/api/chat", ollama_root(&p.base_url)))
         .set("content-type", "application/json");
     (req, body)
+}
+
+// Ollama's native API has one switch for thinking-capable models: any level
+// other than Off turns it on (the model then streams a `thinking` field).
+fn apply_ollama_effort(body: &mut Value, effort: Effort) {
+    if effort != Effort::Off {
+        body["think"] = json!(true);
+    }
+}
+
+// Ollama reports prompt/response token counts on the final object.
+fn ollama_usage_into(v: &Value, into: &mut Usage) {
+    if let Some(n) = v["prompt_eval_count"].as_u64() {
+        into.input = n;
+    }
+    if let Some(n) = v["eval_count"].as_u64() {
+        into.output = n;
+    }
 }
 
 // Native Ollama sends tool-call arguments as an object; tolerate the string
@@ -1364,10 +1690,14 @@ fn ollama_parse(v: Value) -> Result<Reply, String> {
     }
     // done_reason "length" normalizes to "max_tokens" like OpenAI's "length".
     let stop_reason = v["done_reason"].as_str().map(normalize_stop_reason);
+    let mut usage = Usage::default();
+    ollama_usage_into(&v, &mut usage);
     Ok(Reply {
         text,
         calls,
         stop_reason,
+        usage,
+        ..Default::default()
     })
 }
 
@@ -1413,6 +1743,7 @@ fn ollama_stream(
     let mut think_carry = String::new();
     let mut stop_reason: Option<String> = None;
     let mut stream_err: Option<String> = None;
+    let mut usage = Usage::default();
     let mut calls: Vec<ToolCall> = Vec::new();
     for_each_ndjson(reader, |v| {
         // A mid-stream server error rides on an "error" field.
@@ -1452,6 +1783,7 @@ fn ollama_stream(
         }
         if v["done"].as_bool() == Some(true) {
             stop_reason = v["done_reason"].as_str().map(normalize_stop_reason);
+            ollama_usage_into(v, &mut usage);
             return true;
         }
         false
@@ -1464,6 +1796,8 @@ fn ollama_stream(
         text,
         calls,
         stop_reason,
+        usage,
+        ..Default::default()
     })
 }
 
@@ -1472,12 +1806,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    type Captured = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
     // One-shot HTTP server: answers `responses.len()` requests with the given
     // (status, body) pairs, then exits. Runs the real wire path end-to-end.
     fn mock_server(responses: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+        let (base, handle, _) = mock_server_capture(responses);
+        (base, handle)
+    }
+
+    // Same, also handing back each request body it received (in order) so a
+    // test can assert on the wire shape the client actually sent.
+    fn mock_server_capture(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<()>, Captured) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let captured: Captured = Default::default();
+        let sink = captured.clone();
         let handle = std::thread::spawn(move || {
             for (code, body) in responses {
                 let (mut sock, _) = listener.accept().unwrap();
@@ -1499,6 +1846,13 @@ mod tests {
                         Err(_) => break,
                     }
                 }
+                let body_start = seen
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(seen.len(), |i| i + 4);
+                sink.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&seen[body_start..]).into_owned());
                 let resp = format!(
                     "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -1506,7 +1860,7 @@ mod tests {
                 let _ = sock.write_all(resp.as_bytes());
             }
         });
-        (base, handle)
+        (base, handle, captured)
     }
 
     #[test]
@@ -1522,6 +1876,7 @@ mod tests {
             context_tokens: 8_192,
             temperature: None,
             max_tokens: None,
+            effort: Effort::Off,
             ollama_ctx: std::sync::OnceLock::new(),
         };
         assert!(validate(&p).is_ok(), "200 must validate");
@@ -2575,5 +2930,472 @@ mod tests {
         assert_eq!(ollama_pick_ctx(None, Some(4_096)), 4_096);
         // …but never exceeds a known model max.
         assert_eq!(ollama_pick_ctx(Some(8_192), Some(65_536)), 8_192);
+    }
+
+    // ── usage parsing ────────────────────────────────────────────────────────
+    #[test]
+    fn anthropic_parse_reads_usage_and_keeps_thinking_blocks() {
+        let r = anthropic_parse(json!({
+            "content": [
+                {"type": "thinking", "thinking": "hmm", "signature": "sig1"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 100, "output_tokens": 7,
+                      "cache_creation_input_tokens": 20, "cache_read_input_tokens": 300}
+        }))
+        .unwrap();
+        assert_eq!(
+            r.usage,
+            Usage {
+                input: 100,
+                output: 7,
+                cache_read: 300,
+                cache_write: 20
+            }
+        );
+        assert_eq!(r.thinking_blocks.len(), 2);
+        assert_eq!(r.thinking_blocks[0]["signature"], "sig1");
+        assert_eq!(r.thinking_blocks[1]["type"], "redacted_thinking");
+        assert_eq!(r.text, "hi");
+        assert_eq!(r.calls.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_stream_reads_usage_from_message_start_and_delta() {
+        let sse = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\n\
+                   data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let r = drain_anthropic(sse);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input: 50,
+                output: 42,
+                cache_read: 10,
+                cache_write: 5
+            }
+        );
+        assert_eq!(r.text, "ok");
+    }
+
+    #[test]
+    fn anthropic_stream_assembles_thinking_blocks_with_signature() {
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me \"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"see\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}\n\
+                   data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"XYZ\"}}\n\
+                   data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"read_file\"}}\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\
+                   data: {\"type\":\"message_stop\"}\n";
+        let mut thinking = String::new();
+        let r = anthropic_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |_| {},
+            &mut |t| thinking.push_str(t),
+        )
+        .unwrap();
+        assert_eq!(thinking, "let me see");
+        assert_eq!(r.thinking_blocks.len(), 2);
+        assert_eq!(r.thinking_blocks[0]["thinking"], "let me see");
+        assert_eq!(r.thinking_blocks[0]["signature"], "SIG");
+        assert_eq!(r.thinking_blocks[1]["data"], "XYZ");
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].id, "c1");
+    }
+
+    #[test]
+    fn usage_missing_fields_are_zero_never_error() {
+        assert!(anthropic_parse(json!({"content": []}))
+            .unwrap()
+            .usage
+            .is_empty());
+        assert!(openai_parse(json!({"choices": []}))
+            .unwrap()
+            .usage
+            .is_empty());
+        assert!(openai_parse(json!({"choices": [], "usage": null}))
+            .unwrap()
+            .usage
+            .is_empty());
+        assert!(ollama_parse(json!({"message": {}}))
+            .unwrap()
+            .usage
+            .is_empty());
+        assert!(drain_openai("data: [DONE]\n").usage.is_empty());
+        assert!(drain_ollama("{\"done\":true}\n").usage.is_empty());
+        // Wrong types are ignored, not fatal.
+        let r = openai_parse(json!({"usage": {"prompt_tokens": "lots"}})).unwrap();
+        assert!(r.usage.is_empty());
+    }
+
+    #[test]
+    fn openai_parse_splits_cached_tokens_out_of_prompt_tokens() {
+        let r = openai_parse(json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 9,
+                      "prompt_tokens_details": {"cached_tokens": 100}}
+        }))
+        .unwrap();
+        assert_eq!(
+            r.usage,
+            Usage {
+                input: 20,
+                output: 9,
+                cache_read: 100,
+                cache_write: 0
+            }
+        );
+        assert_eq!(r.usage.prompt_tokens(), 120);
+    }
+
+    #[test]
+    fn openai_stream_reads_usage_from_final_chunk() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":2}}\n\
+                   data: [DONE]\n";
+        let r = drain_openai(sse);
+        assert_eq!(r.text, "hi");
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            r.usage,
+            Usage {
+                input: 30,
+                output: 2,
+                cache_read: 0,
+                cache_write: 0
+            }
+        );
+    }
+
+    #[test]
+    fn mark_streaming_requests_usage_in_the_final_chunk() {
+        let mut body = json!({"model": "m"});
+        mark_streaming(&mut body);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn ollama_parse_and_stream_read_eval_counts() {
+        let r = ollama_parse(json!({
+            "message": {"content": "x"}, "done": true, "done_reason": "stop",
+            "prompt_eval_count": 77, "eval_count": 11
+        }))
+        .unwrap();
+        assert_eq!(r.usage.input, 77);
+        assert_eq!(r.usage.output, 11);
+        let r = drain_ollama(
+            "{\"message\":{\"content\":\"a\"},\"done\":false}\n\
+             {\"message\":{\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":5,\"eval_count\":3}\n",
+        );
+        assert_eq!(r.usage.input, 5);
+        assert_eq!(r.usage.output, 3);
+        assert_eq!(r.usage.cache_read, 0);
+    }
+
+    #[test]
+    fn request_records_every_completed_reply_into_the_ledger() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"y"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1234,"completion_tokens":56}}"#;
+        let (base, handle) = mock_server(vec![(200, body)]);
+        let p = Provider {
+            protocol: Protocol::OpenAi,
+            base_url: base,
+            api_key: None,
+            model: "ledger-test-model".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let before = crate::usage::snapshot();
+        complete(&p, &[Msg::User("ping".into())], &[]).unwrap();
+        handle.join().unwrap();
+        let after = crate::usage::snapshot();
+        // Other tests may record concurrently, so assert on lower bounds.
+        assert!(after.requests > before.requests);
+        assert!(after.totals.input >= before.totals.input + 1234);
+        assert!(after.totals.output >= before.totals.output + 56);
+        // A loopback base URL is a local provider: booked at $0, never unpriced.
+        assert!(after.local_requests > before.local_requests);
+    }
+
+    // ── reasoning controls ───────────────────────────────────────────────────
+    #[test]
+    fn claude_version_parses_both_id_layouts() {
+        assert_eq!(claude_version("claude-opus-4-6"), Some((4, 6)));
+        assert_eq!(claude_version("claude-sonnet-4-6-20260101"), Some((4, 6)));
+        assert_eq!(claude_version("claude-opus-5"), Some((5, 0)));
+        assert_eq!(claude_version("claude-fable-5-1"), Some((5, 1)));
+        assert_eq!(claude_version("claude-haiku-4-5"), Some((4, 5)));
+        assert_eq!(claude_version("claude-sonnet-4-20250514"), Some((4, 0)));
+        assert_eq!(claude_version("claude-3-7-sonnet-20250219"), Some((3, 7)));
+        assert_eq!(claude_version("gpt-4o"), None);
+        assert_eq!(claude_version("claude-proxy"), None);
+    }
+
+    #[test]
+    fn anthropic_effort_off_leaves_body_untouched() {
+        let mut body = anthropic_body("claude-opus-4-6", &[Msg::User("hi".into())], &[], None);
+        let before = body.clone();
+        apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Off);
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn anthropic_effort_uses_adaptive_thinking_on_claude_4_6_and_later() {
+        for (model, wants_display) in [
+            ("claude-sonnet-4-6", false),
+            ("claude-opus-4-8", true),
+            ("claude-opus-5", true),
+        ] {
+            let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], None);
+            apply_anthropic_effort(&mut body, model, Effort::Medium);
+            assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
+            assert!(body["thinking"].get("budget_tokens").is_none(), "{model}");
+            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
+            assert_eq!(body["max_tokens"], 8192, "{model}: max_tokens untouched");
+            assert_eq!(
+                body["thinking"].get("display").is_some(),
+                wants_display,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_effort_uses_budget_tokens_before_4_6_and_raises_max_tokens() {
+        let model = "claude-haiku-4-5";
+        for (effort, budget) in [
+            (Effort::Low, 2048),
+            (Effort::Medium, 8192),
+            (Effort::High, 16384),
+        ] {
+            let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], None);
+            apply_anthropic_effort(&mut body, model, effort);
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["thinking"]["budget_tokens"], budget);
+            assert!(body.get("output_config").is_none());
+            let max_tokens = body["max_tokens"].as_u64().unwrap();
+            assert!(max_tokens > budget, "{effort}: {max_tokens} <= {budget}");
+        }
+        // An explicit max_tokens already above the budget is kept.
+        let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], Some(30_000));
+        apply_anthropic_effort(&mut body, model, Effort::High);
+        assert_eq!(body["max_tokens"], 30_000);
+        // Unversioned ids (a proxy alias) take the classic form too.
+        let mut body = anthropic_body("my-alias", &[Msg::User("hi".into())], &[], None);
+        apply_anthropic_effort(&mut body, "my-alias", Effort::Low);
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn anthropic_effort_replays_recorded_thinking_before_tool_use() {
+        // Memory is process-wide; a unique call id keeps this test isolated.
+        let call_id = format!("replay-{}", std::process::id());
+        remember_thinking(&Reply {
+            calls: vec![tc(&call_id, "read_file", json!({}))],
+            thinking_blocks: vec![json!({"type": "thinking", "thinking": "t", "signature": "s"})],
+            ..Default::default()
+        });
+        let msgs = vec![
+            Msg::User("go".into()),
+            Msg::Assistant {
+                text: "on it".into(),
+                calls: vec![tc(&call_id, "read_file", json!({}))],
+            },
+            Msg::Tool(vec![ToolResult {
+                id: call_id.clone(),
+                content: "ok".into(),
+                is_error: false,
+            }]),
+        ];
+        let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);
+        apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Low);
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "s");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["type"], "tool_use");
+        // Idempotent: a second pass doesn't double the block.
+        replay_thinking_blocks(&mut body);
+        assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 3);
+        // Off never touches the transcript, even with blocks on record.
+        let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);
+        apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Off);
+        assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn remember_thinking_ignores_replies_without_calls_or_blocks() {
+        let id = format!("noreplay-{}", std::process::id());
+        remember_thinking(&Reply {
+            calls: vec![tc(&id, "x", json!({}))],
+            ..Default::default()
+        });
+        assert!(thinking_for(&id).is_none());
+        remember_thinking(&Reply {
+            thinking_blocks: vec![json!({"type": "thinking"})],
+            ..Default::default()
+        });
+        assert!(thinking_for(&id).is_none());
+    }
+
+    #[test]
+    fn openai_effort_only_for_reasoning_models() {
+        assert!(is_openai_reasoning_model("o3"));
+        assert!(is_openai_reasoning_model("o4-mini"));
+        assert!(is_openai_reasoning_model("O1-preview"));
+        assert!(is_openai_reasoning_model("gpt-5-mini"));
+        assert!(is_openai_reasoning_model("gpt-5.1"));
+        assert!(!is_openai_reasoning_model("gpt-4o"));
+        assert!(!is_openai_reasoning_model("gpt-4.1"));
+        assert!(!is_openai_reasoning_model("gpt-oss-20b"));
+        assert!(!is_openai_reasoning_model("qwen3:8b"));
+        assert!(!is_openai_reasoning_model("local-model"));
+        assert!(!is_openai_reasoning_model("o10-something"));
+
+        let mut body = json!({"model": "o3"});
+        apply_openai_effort(&mut body, "o3", Effort::High);
+        assert_eq!(body["reasoning_effort"], "high");
+        let mut body = json!({"model": "o3"});
+        apply_openai_effort(&mut body, "o3", Effort::Off);
+        assert!(body.get("reasoning_effort").is_none());
+        // Local OpenAI-compatible servers never see it unless the model name matches.
+        let mut body = json!({"model": "qwen3:8b"});
+        apply_openai_effort(&mut body, "qwen3:8b", Effort::High);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn ollama_effort_sets_think_for_any_level_but_off() {
+        let mut body = json!({"model": "m"});
+        apply_ollama_effort(&mut body, Effort::Off);
+        assert!(body.get("think").is_none());
+        for e in [Effort::Low, Effort::Medium, Effort::High] {
+            let mut body = json!({"model": "m"});
+            apply_ollama_effort(&mut body, e);
+            assert_eq!(body["think"], true);
+        }
+    }
+
+    // ── native tools on local OpenAI-compatible servers ──────────────────────
+    #[test]
+    fn needs_flatten_only_for_400s_naming_tools_roles_or_template() {
+        assert!(needs_flatten("HTTP 400: tools are not supported"));
+        assert!(needs_flatten("HTTP 400: unknown field tool_choice"));
+        assert!(needs_flatten(
+            "HTTP 400: Unable to generate parser for this template. Conversation roles must alternate user/assistant"
+        ));
+        assert!(!needs_flatten("HTTP 404: model not found"));
+        assert!(!needs_flatten("HTTP 500: tools exploded"));
+        assert!(!needs_flatten("HTTP 400: max_tokens must be positive"));
+        assert!(!needs_flatten("connection failed: refused"));
+        // Sticky only when the 400 names tools/template/roles; a capability
+        // rejection retries once without poisoning the endpoint.
+        assert!(flatten_is_sticky("HTTP 400: tools are not supported"));
+        assert!(flatten_is_sticky(
+            "HTTP 400: conversation roles must alternate"
+        ));
+        assert!(needs_flatten(
+            "HTTP 400: this model does not support images"
+        ));
+        assert!(!flatten_is_sticky(
+            "HTTP 400: this model does not support images"
+        ));
+        assert!(!flatten_is_sticky("HTTP 500: tools exploded"));
+    }
+
+    #[test]
+    fn loopback_sends_native_tools_first_then_flattens_after_400_and_remembers() {
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"y"},"finish_reason":"stop"}]}"#;
+        let reject = r#"{"error":{"message":"this template does not support tools"}}"#;
+        let (base, handle, bodies) = mock_server_capture(vec![(400, reject), (200, ok), (200, ok)]);
+        let p = Provider {
+            protocol: Protocol::OpenAi,
+            base_url: base,
+            api_key: None,
+            model: "local-model".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let tools = vec![ToolDef {
+            name: "read_file",
+            description: "read",
+            schema: json!({"type": "object"}),
+        }];
+        let msgs = [Msg::System("be brief".into()), Msg::User("hi".into())];
+        complete(&p, &msgs, &tools).unwrap();
+        complete(&p, &msgs, &tools).unwrap();
+        handle.join().unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "400 → retry, then one remembered call");
+        let sent: Vec<Value> = bodies
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        // First attempt: native tools and the real system role, even on loopback.
+        assert!(sent[0].get("tools").is_some());
+        assert_eq!(sent[0]["messages"][0]["role"], "system");
+        // Retry after the 400: flattened, tool-less.
+        assert!(sent[1].get("tools").is_none());
+        assert!(sent[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] != "system"));
+        // Second exchange goes straight to the flattened shape — no failed
+        // native attempt first.
+        assert!(sent[2].get("tools").is_none());
+        assert!(flatten_remembered(&format!(
+            "{}/chat/completions",
+            p.base_url
+        )));
+    }
+
+    #[test]
+    fn loopback_keeps_native_tools_when_the_server_accepts_them() {
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"y"},"finish_reason":"stop"}]}"#;
+        let (base, handle, bodies) = mock_server_capture(vec![(200, ok), (200, ok)]);
+        let p = Provider {
+            protocol: Protocol::OpenAi,
+            base_url: base,
+            api_key: None,
+            model: "local-model".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let tools = vec![ToolDef {
+            name: "read_file",
+            description: "read",
+            schema: json!({"type": "object"}),
+        }];
+        complete(&p, &[Msg::User("hi".into())], &tools).unwrap();
+        complete(&p, &[Msg::User("hi".into())], &tools).unwrap();
+        handle.join().unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for b in bodies.iter() {
+            let v: Value = serde_json::from_str(b).unwrap();
+            assert!(v.get("tools").is_some(), "native tools stay on: {b}");
+        }
+        // A 404 (or any non-400) must not poison the endpoint either.
+        assert!(!flatten_remembered(&format!(
+            "{}/chat/completions",
+            p.base_url
+        )));
     }
 }

@@ -3616,6 +3616,8 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/scroll",
     "/mouse",
     "/compact",
+    "/cost",
+    "/effort",
     "/review",
     "/commit",
     "/pr",
@@ -3772,6 +3774,8 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/pr" => "AI-drafted PR title + description",
         "/diff" => "show current git diff summary",
         "/context" => "show context window usage",
+        "/cost" => "session tokens and estimated cost",
+        "/effort" => "reasoning depth (off/low/medium/high)",
         "/schedule" => "one-shot scheduled workflow",
         "/loop" => "repeating scheduled workflow",
         "/workflows" => "list and manage background workflows",
@@ -4091,6 +4095,13 @@ fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
         }
         "/scroll" | "/mouse" => {
             return ["on", "off", "status"]
+                .iter()
+                .filter(|&&s| s.starts_with(token))
+                .map(|s| s.to_string())
+                .collect();
+        }
+        "/effort" => {
+            return crate::config::Effort::LEVELS
                 .iter()
                 .filter(|&&s| s.starts_with(token))
                 .map(|s| s.to_string())
