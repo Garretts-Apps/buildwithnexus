@@ -6,6 +6,7 @@
 //   type: "command"  — shell command string (existing format)
 //   type: "python"   — path to a Python script (uses python3 or python)
 //   type: "script"   — any executable script path; runtime detected by extension
+//                      (.sh/.bash/.py/.rs everywhere; .ps1/.cmd/.bat on Windows)
 //
 // Scripts in ~/.buildwithnexus/hooks/<Event>/*.{sh,py} are auto-discovered
 // without requiring settings.json entries.
@@ -14,7 +15,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,6 +111,7 @@ pub fn init(cwd: &Path, interactive: bool) {
         "PostToolUse",
         "OnError",
         "Stop",
+        "SubagentStop",
     ] {
         for script in config::discover_hook_scripts(event) {
             list.push(Hook {
@@ -176,7 +178,76 @@ fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
 
 fn matches(matcher: &str, tool: &str) -> bool {
     let m = matcher.trim();
-    m.is_empty() || m == "*" || m.split('|').any(|p| p.trim() == tool)
+    m.is_empty() || m == "*" || m.split('|').any(|p| glob_match(p.trim(), tool))
+}
+
+// Case-sensitive wildcard match: `*` spans any run of characters (including
+// none), `?` exactly one. Hand-rolled (no regex crate) with the classic
+// single-backtrack-point algorithm, so it runs in O(n·m) worst case.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', text idx)
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+// ── session context shared by every payload ──────────────────────────────────
+// Claude Code-compatible fields: `session_id` is the id the transcript is
+// saved under, `transcript_path` its on-disk location, `permission_mode` the
+// active gate ("ask" | "auto" | "readonly").
+static PERMISSION_MODE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_permission_mode(mode: &str) {
+    if let Ok(mut m) = PERMISSION_MODE.lock() {
+        *m = Some(mode.to_string());
+    }
+}
+
+fn permission_mode() -> String {
+    PERMISSION_MODE
+        .lock()
+        .ok()
+        .and_then(|m| m.clone())
+        .unwrap_or_else(|| "ask".to_string())
+}
+
+fn base_payload(event: &str, cwd: &Path) -> Value {
+    let sid = crate::session::current_or_new();
+    json!({
+        "hook_event_name": event,
+        "session_id": sid,
+        "transcript_path": crate::session::path(&sid).to_string_lossy(),
+        "permission_mode": permission_mode(),
+        "cwd": cwd.to_string_lossy(),
+    })
+}
+
+fn with_fields(mut payload: Value, extra: Value) -> Value {
+    if let (Some(base), Some(add)) = (payload.as_object_mut(), extra.as_object()) {
+        for (k, v) in add {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    payload
 }
 
 fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String, Duration)> {
@@ -266,30 +337,81 @@ fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
 }
 
 // ── execution ────────────────────────────────────────────────────────────────
-fn interpreter_for(path: &Path) -> (&'static str, Vec<&'static str>) {
-    match path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .as_deref()
-    {
+fn interpreter_for(path: &Path) -> Result<(&'static str, Vec<&'static str>), String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+    interpreter_for_ext(ext.as_deref(), cfg!(windows), &interpreter_available).map_err(|missing| {
+        let hint = if cfg!(windows) && (missing == "sh" || missing == "bash") {
+            " (install Git for Windows for Git Bash, or use a .ps1/.cmd hook)"
+        } else {
+            ""
+        };
+        format!(
+            "hook {}: interpreter `{missing}` not found on PATH{hint}",
+            path.display()
+        )
+    })
+}
+
+// Does `<bin> --version` run and succeed? (Success, not just spawn: the
+// Windows Store `python3` alias stub exits non-zero.)
+fn interpreter_available(bin: &str) -> bool {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// Picks the interpreter for a script by extension. `available` probes PATH;
+// `windows` selects the Windows table. Err carries the name of the missing
+// interpreter when nothing usable is on PATH.
+fn interpreter_for_ext(
+    ext: Option<&str>,
+    windows: bool,
+    available: &dyn Fn(&str) -> bool,
+) -> Result<(&'static str, Vec<&'static str>), String> {
+    match ext {
         Some("py") | Some("python") => {
-            // Prefer python3; fall back to python.
-            if std::process::Command::new("python3")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-            {
-                ("python3", vec![])
+            // Prefer python3; fall back to python (the only name the
+            // python.org Windows installer provides).
+            if available("python3") {
+                Ok(("python3", vec![]))
             } else {
-                ("python", vec![])
+                Ok(("python", vec![]))
             }
         }
-        Some("bash") => ("bash", vec![]),
+        Some("ps1") if windows => Ok((
+            "powershell.exe",
+            vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+        )),
+        Some("cmd") | Some("bat") if windows => Ok(("cmd.exe", vec!["/C"])),
+        Some("bash") if !windows => Ok(("bash", vec![])),
         // Shell scripts: run as `sh /path/script.sh` — NOT `sh -c /path/script.sh`
         // (the -c form treats the path as a command string, not a script file).
-        _ => ("sh", vec![]),
+        _ if !windows => Ok(("sh", vec![])),
+        // Windows: no shell by default. Git for Windows puts `sh`/`bash` on
+        // PATH; without either there's nothing sensible to run a .sh with.
+        Some("bash") => {
+            if available("bash") {
+                Ok(("bash", vec![]))
+            } else if available("sh") {
+                Ok(("sh", vec![]))
+            } else {
+                Err("bash".to_string())
+            }
+        }
+        _ => {
+            if available("sh") {
+                Ok(("sh", vec![]))
+            } else if available("bash") {
+                Ok(("bash", vec![]))
+            } else {
+                Err("sh".to_string())
+            }
+        }
     }
 }
 
@@ -331,7 +453,10 @@ fn run_script(
     if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
         return run_rust_hook(path, payload, cwd, timeout);
     }
-    let (interp, interp_args) = interpreter_for(path);
+    let (interp, interp_args) = match interpreter_for(path) {
+        Ok(i) => i,
+        Err(e) => return (HOOK_SPAWN_FAILED_CODE, String::new(), e),
+    };
     let mut c = Command::new(interp);
     for a in interp_args {
         c.arg(a);
@@ -542,10 +667,10 @@ fn decision_field(j: &Value) -> Option<&str> {
 }
 
 pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
-    let payload = json!({
-        "hook_event_name": "PreToolUse", "session_id": std::process::id(),
-        "tool_name": tool, "tool_input": input, "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("PreToolUse", cwd),
+        json!({"tool_name": tool, "tool_input": input}),
+    );
     for (cmd, source, matcher, timeout) in commands_for("PreToolUse", Some(tool)) {
         if !report::is_json() {
             tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
@@ -607,12 +732,13 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
     if cmds.is_empty() {
         return;
     }
-    let payload = json!({
-        "hook_event_name": "PostToolUse", "session_id": std::process::id(),
-        "tool_name": tool, "tool_input": input,
-        "tool_response": {"content": response, "is_error": is_error},
-        "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("PostToolUse", cwd),
+        json!({
+            "tool_name": tool, "tool_input": input,
+            "tool_response": {"content": response, "is_error": is_error},
+        }),
+    );
     for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
@@ -645,10 +771,10 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
 }
 
 pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
-    let payload = json!({
-        "hook_event_name": "UserPromptSubmit", "session_id": std::process::id(),
-        "prompt": prompt, "cwd": cwd.to_string_lossy()
-    });
+    let payload = with_fields(
+        base_payload("UserPromptSubmit", cwd),
+        json!({"prompt": prompt}),
+    );
     let mut ctx = String::new();
     for (cmd, source, matcher, timeout) in commands_for("UserPromptSubmit", None) {
         trace::record_visible(
@@ -722,11 +848,17 @@ pub fn list_active() -> Vec<String> {
 }
 
 pub fn notify(event: &str, cwd: &Path) {
+    notify_with(event, cwd, json!({}));
+}
+
+// Lifecycle notification carrying extra payload fields, e.g. SubagentStop's
+// `tool_name`/`tool_input` — the completed subagent call.
+pub fn notify_with(event: &str, cwd: &Path, extra: Value) {
     let cmds = commands_for(event, None);
     if cmds.is_empty() {
         return;
     }
-    let payload = json!({"hook_event_name": event, "session_id": std::process::id(), "cwd": cwd.to_string_lossy()});
+    let payload = with_fields(base_payload(event, cwd), extra);
     for (cmd, source, matcher, timeout) in cmds {
         trace::record_visible(
             "hook",
@@ -778,6 +910,57 @@ mod tests {
         assert!(matches("write_file | edit_file", "edit_file"));
         assert!(matches("a|b|c", "b"));
         assert!(!matches("a|b|c", "d"));
+        assert!(matches("Edit|Write", "Write"));
+        assert!(!matches("Edit|Write", "write"), "case-sensitive");
+    }
+
+    #[test]
+    fn matches_glob_wildcards_inside_segments() {
+        assert!(matches("*_file", "write_file"));
+        assert!(matches("*_file", "read_file"));
+        assert!(!matches("*_file", "run_command"));
+        assert!(matches("mcp__*", "mcp__github__list_issues"));
+        assert!(!matches("mcp__*", "run_command"));
+        assert!(matches("read_?ile", "read_file"));
+        assert!(!matches("read_?ile", "read_files"));
+        assert!(matches("run_command|mcp__*", "mcp__x"));
+        assert!(matches("*", "mcp__x"));
+    }
+
+    #[test]
+    fn glob_match_edge_cases() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("**", "abc"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
+        assert!(glob_match("*c", "abc"));
+        assert!(!glob_match("?", ""));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        // Backtracking: the first `*` must be able to give characters back.
+        assert!(glob_match("*ab", "aab"));
+        assert!(glob_match("*ab*ab", "abxab"));
+        assert!(!glob_match("*ab*ab", "ab"));
+    }
+
+    #[test]
+    fn base_payload_carries_session_fields() {
+        set_permission_mode("auto");
+        let p = base_payload("Stop", Path::new("/proj"));
+        assert_eq!(p["hook_event_name"], "Stop");
+        assert_eq!(p["permission_mode"], "auto");
+        assert_eq!(p["cwd"], "/proj");
+        let sid = p["session_id"].as_str().unwrap();
+        assert_eq!(sid, crate::session::current_or_new());
+        assert!(p["transcript_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("sessions/{sid}.json")));
+        let p = with_fields(p, json!({"tool_name": "spawn_subagent"}));
+        assert_eq!(p["tool_name"], "spawn_subagent");
+        assert_eq!(p["hook_event_name"], "Stop");
     }
 
     #[test]
@@ -934,10 +1117,98 @@ mod tests {
     fn run_child_captures_output_within_timeout() {
         let mut c = Command::new("sh");
         c.args(["-c", "echo out; echo err >&2; exit 7"]);
-        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(5));
+        // Generous: the whole suite runs in parallel and spawns many children,
+        // so a tight deadline turns into a load-dependent flake.
+        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(60));
         assert_eq!(code, 7);
         assert_eq!(stdout.trim(), "out");
         assert_eq!(stderr.trim(), "err");
+    }
+
+    #[test]
+    fn interpreter_table_unix() {
+        let all = |_: &str| true;
+        let none = |_: &str| false;
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), false, &all).unwrap().0,
+            "sh"
+        );
+        assert_eq!(interpreter_for_ext(None, false, &none).unwrap().0, "sh");
+        assert_eq!(
+            interpreter_for_ext(Some("bash"), false, &all).unwrap().0,
+            "bash"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), false, &all).unwrap().0,
+            "python3"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), false, &none).unwrap().0,
+            "python"
+        );
+        // .ps1/.cmd are not special off Windows: they fall through to sh.
+        assert_eq!(
+            interpreter_for_ext(Some("ps1"), false, &all).unwrap().0,
+            "sh"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("cmd"), false, &all).unwrap().0,
+            "sh"
+        );
+    }
+
+    #[test]
+    fn interpreter_table_windows() {
+        let none = |_: &str| false;
+        let git_bash = |b: &str| b == "sh" || b == "bash";
+        let only_bash = |b: &str| b == "bash";
+        assert_eq!(
+            interpreter_for_ext(Some("ps1"), true, &none).unwrap(),
+            (
+                "powershell.exe",
+                vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+            )
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("cmd"), true, &none).unwrap(),
+            ("cmd.exe", vec!["/C"])
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("bat"), true, &none).unwrap(),
+            ("cmd.exe", vec!["/C"])
+        );
+        // python3 missing (or the Store stub failing) → python.
+        assert_eq!(
+            interpreter_for_ext(Some("py"), true, &none).unwrap().0,
+            "python"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("py"), true, &|b: &str| b == "python3")
+                .unwrap()
+                .0,
+            "python3"
+        );
+        // .sh: Git Bash when present, otherwise a clear miss naming `sh`.
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &git_bash).unwrap().0,
+            "sh"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &only_bash).unwrap().0,
+            "bash"
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("sh"), true, &none),
+            Err("sh".to_string())
+        );
+        assert_eq!(
+            interpreter_for_ext(Some("bash"), true, &none),
+            Err("bash".to_string())
+        );
+        assert_eq!(
+            interpreter_for_ext(None, true, &none),
+            Err("sh".to_string())
+        );
     }
 
     #[test]

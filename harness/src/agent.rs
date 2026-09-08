@@ -173,6 +173,9 @@ fn render_msgs(msgs: &[Msg]) -> String {
 }
 
 fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
+    // The last request's measured prompt size described the transcript
+    // being replaced; the meter falls back to the estimate until the next one.
+    crate::usage::forget_last();
     let (sys_end, tail_start) = compaction_split(&msgs);
     if tail_start <= sys_end {
         return msgs;
@@ -603,6 +606,25 @@ impl ThinkingStream {
     fn finish(&mut self) {
         self.flush_line();
         tui::render_queued_composer();
+    }
+}
+
+// Meter input after a round-trip: the size the server measured for the last
+// request when it reported usage, else the chars/4 estimate.
+fn context_used(msgs: &[Msg]) -> usize {
+    crate::usage::last_context_tokens().unwrap_or_else(|| estimate_tokens(msgs))
+}
+
+// `--max-budget-usd` guard, checked before each model request so a session
+// stops between requests rather than mid-stream. Prints the notice (a
+// `notice` event in --json mode) and reports whether the loop must stop.
+fn budget_exhausted() -> bool {
+    match crate::usage::budget_stop() {
+        Some(msg) => {
+            report::notice(&msg);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1281,6 +1303,15 @@ pub enum Permission {
     ReadOnly,
 }
 
+// Wire name of the active gate — what hooks receive as `permission_mode`.
+pub fn permission_name(perm: Permission) -> &'static str {
+    match perm {
+        Permission::Ask => "ask",
+        Permission::Auto => "auto",
+        Permission::ReadOnly => "readonly",
+    }
+}
+
 pub fn permission(s: &str) -> Permission {
     let normalized = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
     match normalized.as_str() {
@@ -1408,6 +1439,26 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         }
     }
 
+    // Project instructions (AGENTS.md / CLAUDE.md) come before memory and the
+    // Agents.md roles: repository conventions frame everything that follows.
+    let instructions = config::load_instructions(cwd);
+    if let Some(text) = config::instructions_prompt(&instructions) {
+        trace::record_visible(
+            "instructions",
+            format!("loaded {} instruction file(s)", instructions.len()),
+            serde_json::json!({
+                "files": instructions.iter().map(|f| f.label.clone()).collect::<Vec<_>>(),
+                "bytes": text.len(),
+            }),
+        );
+        let text = if compact && text.len() > 2_000 {
+            format!("{}…", truncate_at_char_boundary(&text, 2_000))
+        } else {
+            text
+        };
+        parts.push(text);
+    }
+
     if let Some(mem) = config::load_memory() {
         // Memory is user-important; always include but truncate for small ctx
         let mem_text = if compact && mem.len() > 300 {
@@ -1461,7 +1512,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         if !active_hooks.is_empty() {
             parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));
         }
-        let skill_descs = config::load_skill_descriptions();
+        let skill_descs = config::load_skill_descriptions(cwd);
         if !skill_descs.is_empty() {
             let joined = skill_descs
                 .iter()
@@ -1599,10 +1650,10 @@ fn add_session_allowed_tool(key: &str) {
 
 #[allow(dead_code)]
 fn confirm(label: &str) -> Option<String> {
-    confirm_tool(label, "")
+    confirm_tool(label, "", Path::new("."))
 }
 
-fn confirm_tool(label: &str, tool_key: &str) -> Option<String> {
+fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
         return Some(format!(
             "blocked (no interactive terminal to confirm: {label})"
@@ -1625,14 +1676,9 @@ fn confirm_tool(label: &str, tool_key: &str) -> Option<String> {
         None
     } else if matches!(lower.as_str(), "a" | "always") {
         add_session_allowed_tool(tool_key);
-        if !tool_key.is_empty() {
-            if let Some(mut s) = crate::config::load_settings() {
-                if !s.allowed_commands.contains(&tool_key.to_string()) {
-                    s.allowed_commands.push(tool_key.to_string());
-                    crate::config::save_settings(&s);
-                }
-            }
-        }
+        // Scoped to this project (user settings `project_allowed`), so one
+        // `a` on write_file here never silences the gate elsewhere.
+        crate::config::add_project_allowed(cwd, tool_key);
         None
     } else if lower.starts_with("d ")
         || lower.starts_with("deny ")
@@ -1671,11 +1717,27 @@ pub(crate) fn gate(
         name.to_string()
     };
 
+    // Read-only: refuse every mutation outright, before the sensitive-path and
+    // catastrophic-command confirmations — those return "allowed" on `y`, which
+    // used to let an approved `rm -rf /` through in read-only mode. Clearly
+    // read-only shell commands (grep, find, git status…) still pass.
+    if matches!(perm, Permission::ReadOnly) && tools::is_mutating_call(name, input) {
+        let readonly_shell =
+            tools::command_arg_for(name, input).is_some_and(tools::is_readonly_command);
+        if !readonly_shell {
+            return Some("read-only mode: mutation skipped".into());
+        }
+    }
+
     let path = tools::touched_path(name, input, cwd);
 
     if let Some(p) = &path {
         if tools::is_sensitive(p) {
-            return confirm_tool(&format!("access sensitive path {}", p.display()), &tool_key);
+            return confirm_tool(
+                &format!("access sensitive path {}", p.display()),
+                &tool_key,
+                cwd,
+            );
         }
         // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
         // crosses the OS boundary — always confirm, even in Auto mode.
@@ -1686,12 +1748,13 @@ pub(crate) fn gate(
                     p.display()
                 ),
                 &tool_key,
+                cwd,
             );
         }
     }
     if let Some(c) = tools::command_arg_for(name, input) {
         if tools::catastrophic(c) {
-            return confirm_tool(&format!("run dangerous command `{c}`"), &tool_key);
+            return confirm_tool(&format!("run dangerous command `{c}`"), &tool_key, cwd);
         }
         // In WSL2, commands that reference /mnt/<drive>/ target the Windows
         // filesystem — confirm before running, even in Auto mode.
@@ -1699,37 +1762,32 @@ pub(crate) fn gate(
             return confirm_tool(
                 &format!("command targets Windows filesystem (WSL2): `{c}`"),
                 &tool_key,
+                cwd,
             );
         }
     }
 
     match perm {
         Permission::Auto => None,
-        Permission::ReadOnly => {
-            if tools::is_mutating_call(name, input) {
-                // run_command with clearly read-only shell tools (grep, find, etc.)
-                // should pass through even in ReadOnly mode.
-                if let Some(c) = tools::command_arg_for(name, input) {
-                    if tools::is_readonly_command(c) {
-                        return None;
-                    }
-                }
-                return Some("read-only mode: mutation skipped".into());
-            }
-            None // reads anywhere are allowed in readonly mode
-        }
+        // Mutations were refused above; reads anywhere and read-only shell
+        // commands are allowed in readonly mode.
+        Permission::ReadOnly => None,
         Permission::Ask => {
-            // run_command calls whose binary appears in allowed_commands skip the
-            // confirmation prompt — git, cargo, npm, etc. should just work.
+            // run_command calls whose binary appears in allowed_commands (the
+            // legacy global list) or in this project's "always allow" entries
+            // skip the confirmation prompt — git, cargo, npm, etc. should just work.
             if config::load_allowed_commands()
                 .iter()
                 .any(|a| a == &tool_key)
+                || config::load_project_allowed(cwd)
+                    .iter()
+                    .any(|a| a == &tool_key)
                 || is_session_allowed_tool(&tool_key)
             {
                 return None;
             }
             if tools::is_mutating_call(name, input) {
-                return confirm_tool(&tools::preview(name, input), &tool_key);
+                return confirm_tool(&tools::preview(name, input), &tool_key, cwd);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.
@@ -1759,7 +1817,7 @@ pub fn run_build(
         task,
         cwd,
         &mut transcript,
-        &crate::session::new_id(),
+        &crate::session::claim_or_new(),
     )
 }
 
@@ -1784,9 +1842,11 @@ pub fn run_build_session(
     transcript: &mut Vec<Msg>,
     sid: &str,
 ) -> Result<(), String> {
-    hooks::notify("SessionStart", cwd);
+    // SessionStart/SessionEnd fire once per process (lib.rs); a build turn
+    // only records which session and gate it runs under, then fires Stop.
+    crate::session::set_current(sid);
+    hooks::set_permission_mode(permission_name(perm));
     let r = build_inner(p, perm, role_id, task, cwd, 0, transcript, Some(sid)).map(|_| ());
-    hooks::notify("SessionEnd", cwd);
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
@@ -1877,6 +1937,11 @@ fn build_inner(
     // Executed calls and touched files, collected for the verifier pass.
     let mut tool_records: Vec<crate::verifier::ToolCallRecord> = Vec::new();
     let mut changed_files: Vec<String> = Vec::new();
+    // check_work enforcement: whether the model ran it, the last verdict, and
+    // whether the harness already ran it once on its behalf.
+    let mut check_work_called = false;
+    let mut check_work_passed: Option<bool> = None;
+    let mut auto_check_rounds = 0usize;
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -1888,10 +1953,15 @@ fn build_inner(
             report::notice(msg);
             return Ok(String::new());
         }
+        if budget_exhausted() {
+            return Ok(String::new());
+        }
         maybe_compact(p, msgs);
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
         }
+        // PrePrompt: fires before every model request in a build turn.
+        hooks::notify("PrePrompt", cwd);
         let reply = match request_reply(p, msgs.as_slice(), &defs, "thinking") {
             Ok(r) => r,
             Err(e) => {
@@ -2272,6 +2342,12 @@ fn build_inner(
             }
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
+            if call.name == "check_work" {
+                check_work_called = true;
+                if !check_work_found_no_project(&out.content) {
+                    check_work_passed = Some(!out.is_error);
+                }
+            }
             // Feed the verifier real data: every executed call, and the files
             // touched by successful write/edit tools.
             tool_records.push(crate::verifier::ToolCallRecord {
@@ -2344,19 +2420,73 @@ fn build_inner(
             crate::session::save(sid, cwd, &p.model, msgs);
         }
         if !report::is_json() {
-            tui::context_meter(estimate_tokens(msgs), p.context_tokens);
+            tui::context_meter(context_used(msgs), p.context_tokens);
             tui::poll_typeahead();
         }
         if let Some(s) = summary {
-            if depth == 0 && !report::is_json() {
+            // The model finished after editing files without checking its
+            // work: run check_work once on its behalf and, if the project's
+            // checks fail, hand the report back for one more round.
+            if should_auto_check_work(
+                perm,
+                depth,
+                changed_files.len(),
+                check_work_called,
+                auto_check_rounds,
+            ) {
+                auto_check_rounds += 1;
+                let input = serde_json::json!({});
+                report::notice(
+                    "  ⟳ finish called without check_work — running the project's checks",
+                );
+                report::tool_call("check_work", &tools::preview("check_work", &input), &input);
+                trace_tool_call("check_work", &input, "build", depth);
+                let out = tools::run("check_work", &input, cwd);
+                hooks::post_tool_use("check_work", &input, &out.content, out.is_error, cwd);
+                report::tool_result("check_work", &out.content, out.is_error);
+                trace_tool_result("check_work", &out.content, out.is_error, "build", depth);
+                tool_records.push(crate::verifier::ToolCallRecord {
+                    tool_name: "check_work".into(),
+                    args_summary: tools::preview("check_work", &input),
+                    result_preview: out.content.chars().take(200).collect(),
+                    timestamp: String::new(),
+                });
+                if !check_work_found_no_project(&out.content) {
+                    check_work_passed = Some(!out.is_error);
+                    if out.is_error {
+                        msgs.push(Msg::User(format!(
+                            "[harness] You called finish without running check_work, so it ran \
+                             automatically and the project's checks FAILED:\n{}\nFix the failures, \
+                             run check_work again, then call finish.",
+                            out.content
+                        )));
+                        continue;
+                    }
+                }
+            }
+            let s = if auto_check_rounds > 0 && check_work_passed == Some(false) {
+                report::notice("  ⚠ check_work failed — finishing anyway; see the report above");
+                format!(
+                    "{s}\n\n[check_work note] The project's checks still fail after the \
+                     automatic check_work round."
+                )
+            } else {
+                s
+            };
+            if depth == 0 {
                 let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
                 let ctx = crate::verifier::VerificationContext {
                     task_description: task.to_string(),
                     changed_files: changed_files.clone(),
                     tool_calls: tool_records.clone(),
+                    tests_passed: check_work_passed,
                     ..Default::default()
                 };
                 let rep = verifier.verify(&ctx);
+                report::verify(
+                    &rep.status.to_string(),
+                    &crate::verifier::Verifier::format_report_json(&rep),
+                );
                 match rep.status {
                     crate::verifier::VerificationStatus::Blocked
                     | crate::verifier::VerificationStatus::Failed
@@ -2371,7 +2501,9 @@ fn build_inner(
                             "  ⚠ verification {} — asking the model to address violations",
                             rep.status.label()
                         ));
-                        tui::line(&tui::render_md(&violations));
+                        if !report::is_json() {
+                            tui::line(&tui::render_md(&violations));
+                        }
                         msgs.push(Msg::User(format!(
                             "Verification of your finished work returned `{}` with these rule \
                              violations:\n{violations}\nAddress them, then call finish again.",
@@ -2393,7 +2525,7 @@ fn build_inner(
                     }
                     crate::verifier::VerificationStatus::PassedWithWarnings => {
                         report::notice(&format!("  ⚠ verification {}", rep.status.label()));
-                        if !rep.rule_violations.is_empty() {
+                        if !rep.rule_violations.is_empty() && !report::is_json() {
                             tui::line(&tui::render_md(
                                 &crate::rules::RuleEngine::format_violations(&rep.rule_violations),
                             ));
@@ -2434,12 +2566,39 @@ fn build_inner(
          step to pick up. Be honest about anything unverified."
             .into(),
     ));
+    if budget_exhausted() {
+        return Ok(String::new());
+    }
+    hooks::notify("PrePrompt", cwd);
     match request_reply(p, msgs.as_slice(), &defs, "wrapping up") {
         Ok(r) if !r.text.trim().is_empty() => Ok(r.text),
         // Even if the wrap-up call fails or comes back empty, don't hand the user
         // a scary error for simply doing a lot of work — end the turn cleanly.
         _ => Ok(String::new()),
     }
+}
+
+// Whether a finish call should trigger an automatic check_work: top-level
+// turns only, only when a file was actually written or edited, only when the
+// model skipped check_work itself, never in read-only mode, and once per turn.
+fn should_auto_check_work(
+    perm: Permission,
+    depth: usize,
+    files_changed: usize,
+    check_work_called: bool,
+    auto_rounds: usize,
+) -> bool {
+    depth == 0
+        && files_changed > 0
+        && !check_work_called
+        && !matches!(perm, Permission::ReadOnly)
+        && auto_rounds == 0
+}
+
+// check_work had nothing to run (no recognised project, or every checker is
+// missing) — nothing to enforce, and no verdict to record.
+fn check_work_found_no_project(report: &str) -> bool {
+    report.contains("no build/test/lint commands detected") || report.contains("nothing ran")
 }
 
 // Feedback for a tool call whose arguments failed to parse: name the tool,
@@ -2530,6 +2689,15 @@ fn spawn_subagent(
     if isolate {
         cleanup_worktree(cwd, &run_cwd);
     }
+    hooks::notify_with(
+        "SubagentStop",
+        cwd,
+        serde_json::json!({
+            "tool_name": "spawn_subagent",
+            "tool_input": input,
+            "tool_response": {"content": result, "is_error": is_error},
+        }),
+    );
     trace::record_visible(
         "subagent_done",
         format!("{role}: {}", trace::preview(task, 80)),
@@ -3056,8 +3224,17 @@ fn reads_as_instructions(text: &str) -> bool {
 // ── PLAN mode ─────────────────────────────────────────────────────────────────
 // The planning phase now has tools available so the model can inspect the
 // codebase while breaking down the task. Execution still runs through BUILD.
-pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Result<(), String> {
+// `auto_approve` (headless `--yes`) skips the approval selector and executes
+// the plan as soon as it is produced.
+pub fn run_plan(
+    p: &Provider,
+    perm: Permission,
+    task: &str,
+    cwd: &Path,
+    auto_approve: bool,
+) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
+    hooks::set_permission_mode(permission_name(perm));
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
@@ -3084,6 +3261,9 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
             return Err(format!(
                 "planning stopped after {MAX_PLAN_TOOL_ROUNDS} tool rounds without producing a plan"
             ));
+        }
+        if budget_exhausted() {
+            return Ok(());
         }
         maybe_compact(p, &mut msgs);
         let reply = request_reply(p, &msgs, &defs, "planning")?;
@@ -3310,60 +3490,67 @@ pub fn run_plan(p: &Provider, perm: Permission, task: &str, cwd: &Path) -> Resul
     };
 
     let mut steps = parse_plan_steps(&plan_text);
+    // The planning response is complete (a plan, or a natural reply above).
+    hooks::notify("Stop", cwd);
     if !plan_steps_are_actionable(&steps) {
         return Err(
             "planning did not produce an actionable numbered or bulleted plan after recovery attempts"
                 .into(),
         );
     }
+    report::plan(&steps);
 
-    loop {
-        tui::line("");
-        tui::line(&tui::accent("  Plan"));
-        for (i, s) in steps.iter().enumerate() {
-            tui::line(&format!("  {}. {}", i + 1, s));
-        }
-        tui::line("");
-        let items = vec![
-            tui::SelectItem {
-                label: "Execute Plan".into(),
-                detail: "Switch to BUILD mode and start implementing".into(),
-            },
-            tui::SelectItem {
-                label: "Edit Step".into(),
-                detail: "Modify one of the plan steps".into(),
-            },
-            tui::SelectItem {
-                label: "Cancel".into(),
-                detail: "Cancel planning without executing".into(),
-            },
-        ];
-        match tui::select_item("Approve Plan", &items) {
-            Some(0) => break, // Execute Plan: explicitly selected
-            Some(1) => {
-                let step_items: Vec<tui::SelectItem> = steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| tui::SelectItem {
-                        label: format!("{}. {}", i + 1, s),
-                        detail: "Select step to edit".into(),
-                    })
-                    .collect();
-                if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
-                    if let Some(new_text) = tui::ask(&format!("  edit step {}: ", idx + 1)) {
-                        if !new_text.trim().is_empty() {
-                            steps[idx] = new_text.trim().to_string();
+    if auto_approve {
+        report::info("  ✓ plan auto-approved (--yes) — executing");
+    } else {
+        loop {
+            tui::line("");
+            tui::line(&tui::accent("  Plan"));
+            for (i, s) in steps.iter().enumerate() {
+                tui::line(&format!("  {}. {}", i + 1, s));
+            }
+            tui::line("");
+            let items = vec![
+                tui::SelectItem {
+                    label: "Execute Plan".into(),
+                    detail: "Switch to BUILD mode and start implementing".into(),
+                },
+                tui::SelectItem {
+                    label: "Edit Step".into(),
+                    detail: "Modify one of the plan steps".into(),
+                },
+                tui::SelectItem {
+                    label: "Cancel".into(),
+                    detail: "Cancel planning without executing".into(),
+                },
+            ];
+            match tui::select_item("Approve Plan", &items) {
+                Some(0) => break, // Execute Plan: explicitly selected
+                Some(1) => {
+                    let step_items: Vec<tui::SelectItem> = steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| tui::SelectItem {
+                            label: format!("{}. {}", i + 1, s),
+                            detail: "Select step to edit".into(),
+                        })
+                        .collect();
+                    if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
+                        if let Some(new_text) = tui::ask(&format!("  edit step {}: ", idx + 1)) {
+                            if !new_text.trim().is_empty() {
+                                steps[idx] = new_text.trim().to_string();
+                            }
                         }
                     }
                 }
-            }
-            Some(2) | None => {
-                tui::line(&tui::yellow("  cancelled"));
-                return Ok(());
-            }
-            _ => {
-                tui::line(&tui::yellow("  cancelled"));
-                return Ok(());
+                Some(2) | None => {
+                    tui::line(&tui::yellow("  cancelled"));
+                    return Ok(());
+                }
+                _ => {
+                    tui::line(&tui::yellow("  cancelled"));
+                    return Ok(());
+                }
             }
         }
     }
@@ -3392,10 +3579,12 @@ fn approved_plan_build_task(task: &str, plan: &str) -> String {
 }
 
 // ── BRAINSTORM mode ───────────────────────────────────────────────────────────
-// Brainstorm is conversational but has full tool access. The model can grep,
-// read files, fetch URLs, and run commands when the conversation calls for it.
-// It also has a mode-transition sensor: if it detects the user wants to build
-// or plan, it suggests switching.
+// Brainstorm is conversational with read-only tool access: the model can grep,
+// read files, fetch URLs, and run read-only commands when the conversation
+// calls for it, but never writes — exactly like PLAN. (Action-like prompts are
+// auto-escalated to BUILD by the REPL before they get here.) It also has a
+// mode-transition sensor: if it detects the user wants to build or plan, it
+// suggests switching.
 pub fn run_brainstorm(
     p: &Provider,
     perm: Permission,
@@ -3403,16 +3592,19 @@ pub fn run_brainstorm(
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
     let _running_guard = AgentRunningGuard::new();
+    hooks::set_permission_mode(permission_name(perm));
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
-    let sys = format!("You are a sharp, concise thought partner with full access to the codebase and the internet. \
-        Use tools freely to look things up, read files, grep for patterns, or run commands — \
+    let sys = format!("You are a sharp, concise thought partner with read access to the codebase and the internet. \
+        Use tools freely to look things up, read files, grep for patterns, or run read-only commands — \
         whatever helps the conversation. \
+        This mode is read-only: do not write or edit files, apply patches, spawn subagents, or run mutating shell commands. \
+        If the user wants changes made, say so and suggest switching modes. \
         When you think the user is ready to stop discussing and start building or planning, \
         end your response with the exact token [SUGGEST:BUILD] or [SUGGEST:PLAN] on its own line. \
         Otherwise just respond naturally. No fluff.\n\n{prefix}");
 
-    let defs = tools::defs_for_context(false, p.context_tokens);
+    let defs = tools::defs_readonly(); // brainstorm inspects but never writes
     let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
     let mut question = first.to_string();
     let mut loop_guard = ToolLoopGuard::default();
@@ -3430,6 +3622,9 @@ pub fn run_brainstorm(
                     "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
                 );
             }
+            if budget_exhausted() {
+                return Ok(None);
+            }
             tui::line("");
             let reply = request_reply(p, &msgs, &defs, "thinking")?;
             let reply = normalize_text_tool_calls(reply, &defs, &question);
@@ -3440,7 +3635,7 @@ pub fn run_brainstorm(
                     calls: vec![],
                 });
                 if !report::is_json() {
-                    tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                    tui::context_meter(context_used(&msgs), p.context_tokens);
                 }
                 break reply.text;
             }
@@ -3506,9 +3701,13 @@ pub fn run_brainstorm(
                 let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
                     PreDecision::Deny(r) => Some(r),
                     PreDecision::Allow => None,
-                    PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
+                    // Read-only regardless of the session gate, like run_plan.
+                    PreDecision::Continue => {
+                        gate(Permission::ReadOnly, &call.name, &call_input, cwd)
+                    }
                 };
                 if let Some(reason) = reason {
+                    report::tool_denied(&reason);
                     trace::record_visible(
                         "tool_denied",
                         format!("{} denied", call.name),
@@ -3569,7 +3768,7 @@ pub fn run_brainstorm(
             });
             msgs.push(Msg::Tool(results));
             if !report::is_json() {
-                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                tui::context_meter(context_used(&msgs), p.context_tokens);
                 tui::poll_typeahead();
             }
             if let Some(loop_msg) = loop_summary {
@@ -3579,6 +3778,9 @@ pub fn run_brainstorm(
                 msgs.push(Msg::User(nudge));
             }
         };
+
+        // The reply is complete — the agent stopped responding for this turn.
+        hooks::notify("Stop", cwd);
 
         // Check for mode-transition suggestion embedded in the reply.
         let hint = if reply_text.contains("[SUGGEST:BUILD]") {
@@ -3626,6 +3828,18 @@ pub fn run_chat_turn(
     question: &str,
 ) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
+    hooks::set_permission_mode(permission_name(perm));
+    let r = chat_turn_inner(p, perm, cwd, question);
+    hooks::notify("Stop", cwd);
+    r
+}
+
+fn chat_turn_inner(
+    p: &Provider,
+    perm: Permission,
+    cwd: &Path,
+    question: &str,
+) -> Result<(), String> {
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
@@ -3640,13 +3854,16 @@ pub fn run_chat_turn(
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
+        if budget_exhausted() {
+            return Ok(());
+        }
         maybe_compact(p, &mut msgs);
         let reply = request_reply(p, &msgs, &defs, "thinking")?;
         let reply = normalize_text_tool_calls(reply, &defs, question);
 
         if reply.calls.is_empty() {
             if !reply.text.trim().is_empty() && !report::is_json() {
-                tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+                tui::context_meter(context_used(&msgs), p.context_tokens);
             }
             return Ok(());
         }
@@ -3745,7 +3962,7 @@ pub fn run_chat_turn(
         });
         msgs.push(Msg::Tool(results));
         if !report::is_json() {
-            tui::context_meter(estimate_tokens(&msgs), p.context_tokens);
+            tui::context_meter(context_used(&msgs), p.context_tokens);
             tui::poll_typeahead();
         }
         if let Some(loop_msg) = loop_summary {
@@ -3852,6 +4069,7 @@ mod tests {
             text: text.to_string(),
             calls: vec![],
             stop_reason: Some("stop".into()),
+            ..Default::default()
         };
         // Truncated tagged call: intent to act, nothing parseable.
         assert!(malformed_tool_markup(&broken(
@@ -3874,6 +4092,7 @@ mod tests {
                 input: serde_json::json!({"path": "x"}),
             }],
             stop_reason: Some("stop".into()),
+            ..Default::default()
         };
         assert!(!malformed_tool_markup(&parsed));
     }
@@ -4319,6 +4538,182 @@ mod tests {
     }
 
     #[test]
+    fn gate_readonly_refuses_catastrophic_command_without_prompting() {
+        // Before the fix the catastrophic-command confirmation ran first, and
+        // an approved `y` let `rm -rf /` execute in read-only mode. Now the
+        // mutation is refused outright — the reason is the read-only message,
+        // never a confirmation outcome.
+        let cwd = Path::new("/proj");
+        let r = gate(
+            Permission::ReadOnly,
+            "run_command",
+            &json!({"command": "rm -rf /"}),
+            cwd,
+        )
+        .unwrap();
+        assert!(r.contains("read-only"), "{r}");
+        assert!(!r.contains("dangerous") && !r.contains("blocked"), "{r}");
+    }
+
+    #[test]
+    fn gate_readonly_refuses_sensitive_write_without_prompting() {
+        let cwd = Path::new("/proj");
+        let r = gate(
+            Permission::ReadOnly,
+            "write_file",
+            &json!({"path": "/proj/.env", "content": "SECRET=1"}),
+            cwd,
+        )
+        .unwrap();
+        assert!(r.contains("read-only"), "{r}");
+        assert!(!r.contains("sensitive"), "{r}");
+    }
+
+    #[test]
+    fn gate_readonly_refuses_every_mutating_tool() {
+        let cwd = Path::new("/proj");
+        for (name, input) in [
+            ("edit_file", json!({"path": "a.rs", "old": "x", "new": "y"})),
+            ("spawn_subagent", json!({"task": "do it"})),
+            ("check_work", json!({})),
+            ("run_command", json!({"command": "npm install"})),
+            ("run_command", json!({"command": "cat x; rm -rf ~"})),
+        ] {
+            let r = gate(Permission::ReadOnly, name, &input, cwd);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("read-only")),
+                "{name} {input}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_readonly_still_allows_readonly_shell_commands() {
+        let cwd = Path::new("/proj");
+        for cmd in [
+            "ls -la",
+            "git status",
+            "grep -rn foo src",
+            "find . -name '*.rs'",
+        ] {
+            let r = gate(
+                Permission::ReadOnly,
+                "run_command",
+                &json!({"command": cmd}),
+                cwd,
+            );
+            assert!(r.is_none(), "{cmd}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn gate_readonly_sensitive_read_still_confirms() {
+        // Reads are allowed in read-only mode, but a sensitive path keeps its
+        // confirmation (denied here: no terminal) — not the read-only refusal.
+        let cwd = Path::new("/proj");
+        let r = gate(
+            Permission::ReadOnly,
+            "read_file",
+            &json!({"path": "/proj/.env"}),
+            cwd,
+        );
+        assert!(
+            r.as_deref()
+                .is_some_and(|r| r.contains("sensitive") && !r.contains("read-only")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn gate_ask_honours_per_project_always_allow() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-agent-gate-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        crate::config::save_settings(&crate::config::Settings::default());
+        let proj_a = home.join("a");
+        let proj_b = home.join("b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        let input = json!({"path": "out.txt", "content": "x"});
+
+        // Not allowed anywhere yet: Ask prompts, which without a terminal is a denial.
+        let r = gate(Permission::Ask, "write_file", &input, &proj_a);
+        assert!(r.as_deref().is_some_and(|r| r.contains("blocked")), "{r:?}");
+
+        // "Always allow" in project A silences the gate there only.
+        crate::config::add_project_allowed(&proj_a, "write_file");
+        assert!(gate(Permission::Ask, "write_file", &input, &proj_a).is_none());
+        assert!(gate(Permission::Ask, "write_file", &input, &proj_b).is_some());
+        // The legacy global list keeps working too.
+        let mut s = crate::config::load_settings().unwrap();
+        s.allowed_commands.push("npm".into());
+        crate::config::save_settings(&s);
+        assert!(gate(
+            Permission::Ask,
+            "run_command",
+            &json!({"command": "npm test"}),
+            &proj_b
+        )
+        .is_none());
+        // Reset forgets project A's answer.
+        assert_eq!(crate::config::reset_project_allowed(&proj_a), 1);
+        assert!(gate(Permission::Ask, "write_file", &input, &proj_a).is_some());
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn auto_check_work_only_when_files_changed_at_top_level_once() {
+        // Baseline: depth 0, a file changed, model skipped check_work, first time.
+        assert!(should_auto_check_work(Permission::Auto, 0, 1, false, 0));
+        assert!(should_auto_check_work(Permission::Ask, 0, 3, false, 0));
+        // Subagents never trigger it (the parent will).
+        assert!(!should_auto_check_work(Permission::Auto, 1, 1, false, 0));
+        // Nothing written: nothing to check.
+        assert!(!should_auto_check_work(Permission::Auto, 0, 0, false, 0));
+        // The model already checked its work.
+        assert!(!should_auto_check_work(Permission::Auto, 0, 1, true, 0));
+        // Read-only turns can't have changed files, and never run checks.
+        assert!(!should_auto_check_work(
+            Permission::ReadOnly,
+            0,
+            1,
+            false,
+            0
+        ));
+        // At most one automatic round per turn.
+        assert!(!should_auto_check_work(Permission::Auto, 0, 1, false, 1));
+    }
+
+    #[test]
+    fn check_work_no_project_is_recognised() {
+        assert!(check_work_found_no_project(
+            "check_work: no build/test/lint commands detected for this project. Pass `command`…"
+        ));
+        assert!(check_work_found_no_project(
+            "check_work: nothing ran (every checker was missing)."
+        ));
+        assert!(!check_work_found_no_project(
+            "check_work: FAILED — fix what's below and run check_work again."
+        ));
+        assert!(!check_work_found_no_project(
+            "check_work: all checks passed."
+        ));
+    }
+
+    #[test]
+    fn permission_name_matches_hook_wire_values() {
+        assert_eq!(permission_name(Permission::Ask), "ask");
+        assert_eq!(permission_name(Permission::Auto), "auto");
+        assert_eq!(permission_name(Permission::ReadOnly), "readonly");
+    }
+
+    #[test]
     fn gate_readonly_allows_reads_everywhere() {
         // Reads outside CWD are now allowed — full filesystem access.
         let cwd = Path::new("/proj/work");
@@ -4450,6 +4845,45 @@ mod tests {
         assert!(!super::is_session_allowed_tool("custom_test_tool"));
         super::add_session_allowed_tool("custom_test_tool");
         assert!(super::is_session_allowed_tool("custom_test_tool"));
+    }
+
+    #[test]
+    fn context_prefix_injects_instructions_before_memory_and_agents() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("bwn-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        std::fs::write(home.join("memory.md"), "- MEMORY-MARKER").unwrap();
+        std::fs::write(home.join("Agents.md"), "## Engineer\nROLES-MARKER").unwrap();
+        let cwd = base.join("repo").join("src");
+        std::fs::create_dir_all(base.join("repo").join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(base.join("repo").join("AGENTS.md"), "ROOT-INSTRUCTIONS").unwrap();
+        std::fs::write(cwd.join("CLAUDE.md"), "SRC-INSTRUCTIONS").unwrap();
+
+        let prefix = context_prefix(&cwd, 200_000);
+        let instr = prefix.find("[Project instructions").unwrap();
+        let root = prefix.find("ROOT-INSTRUCTIONS").unwrap();
+        let src = prefix.find("SRC-INSTRUCTIONS").unwrap();
+        let mem = prefix.find("[Memory from previous sessions]").unwrap();
+        let roles = prefix.find("[Agent knowledge — Agents.md]").unwrap();
+        assert!(instr < root && root < src && src < mem && mem < roles);
+        assert!(prefix.contains("MEMORY-MARKER") && prefix.contains("ROLES-MARKER"));
+
+        // Small contexts keep the section but cap it.
+        let big = "x".repeat(10_000);
+        std::fs::write(base.join("repo").join("AGENTS.md"), &big).unwrap();
+        let compact = context_prefix(&cwd, 8_000);
+        let start = compact.find("[Project instructions").unwrap();
+        let section = &compact[start..compact[start..].find("\n\n[").unwrap() + start];
+        assert!(section.len() < 2_100 && section.ends_with('…'));
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

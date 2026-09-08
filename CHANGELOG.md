@@ -4,6 +4,96 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-09-08
+
+The audit release: every claim on buildwithnexus.dev was checked against the
+code, the gaps against other terminal agents were closed where they were
+closable, and twelve bugs found along the way were fixed.
+
+### Added
+- **Full MCP client.** Servers under `mcp_servers` connect over stdio or
+  Streamable HTTP, complete the `initialize` handshake, and discover tools
+  with `tools/list`. Discovered tools are offered to the model as
+  `mcp__<server>__<tool>` with the server's schema, pass through the
+  permission gate (read-only when the server says `readOnlyHint`), and answer
+  over a persistent connection. `/mcp`, `/mcp <name>`, `/mcp add|remove|reload`
+  and `buildwithnexus mcp …` manage them; `doctor` connects to each.
+- **Project instructions.** `AGENTS.md` (or `CLAUDE.md`) files from the git
+  root down to the cwd, plus `~/.buildwithnexus/AGENTS.md`, are injected into
+  every mode, sub-agent and headless run (32 KiB per file, 96 KiB total).
+  `instruction_files` in settings changes the names. `/init` offers a starter.
+- **Agent Skills.** `<name>/SKILL.md` folders with `name`/`description`
+  frontmatter are discovered in `.buildwithnexus/skills`, `.claude/skills` and
+  `.agents/skills` (project and home) and via `skill_dirs`; flat `.md` skills
+  still work. Only name and description enter the context until loaded.
+- **Token and cost accounting.** Server-reported usage from all three wire
+  protocols feeds a session ledger: `/cost` shows tokens and an estimated
+  price for known models (never a made-up one), `/context` uses measured
+  prompt sizes, and `--max-budget-usd` / `max_budget_usd` stops the agent
+  before the next request once the estimate passes the limit.
+- **Reasoning depth.** `reasoning_effort` (`off` by default), `--effort`, and
+  `/effort` map to adaptive thinking or thinking budgets on Claude,
+  `reasoning_effort` on OpenAI reasoning models, and `think` on Ollama.
+- **Opt-in OS sandbox for shell commands.** `"sandbox": "auto"|"require"`,
+  `--sandbox`, `/sandbox`: `bwrap` on Linux, `sandbox-exec` on macOS; the
+  filesystem is read-only outside the workspace and `/tmp`,
+  `sandbox_network: false` cuts the network. Sandboxed commands are marked.
+- **Headless plan.** `plan --yes|-y` auto-approves; without a TTY and without
+  `--yes` it exits 2 at once. `--json` emits a `plan` event before executing.
+- **check_work is enforced.** A BUILD turn that mutated files cannot finish
+  without a build/test/lint pass; failures go back to the model for one more
+  round. The verifier also runs for `--json` runs and emits a `verify` event.
+- **Hooks.** Glob matchers (`*_file`, `mcp__*`), real `session_id`,
+  `transcript_path` and `permission_mode` in every payload, `PrePrompt` and
+  `SubagentStop` events, `Stop` in every mode, `SessionStart`/`SessionEnd`
+  once per process.
+- **Workflows** run while you are idle (a 1 s scheduler), up to
+  `max_concurrent_workflows` (default 2) at once, and keep their logs in
+  `~/.buildwithnexus/workflows/` across restarts.
+- **Windows.** Clipboard image paste and text via PowerShell, `icacls` on the
+  key file, `tasklist`/`taskkill` for background servers, Ctrl+Break and
+  console-close terminal restore, PowerShell/cmd/Python/Git Bash hook scripts.
+- `--` , `--yes`, `--effort`, `--max-budget-usd`, `--sandbox` in `--help`.
+
+### Changed
+- **BRAINSTORM is read-only**, as documented: it gets the read-only tool set
+  and refuses mutations under every permission level; action requests still
+  switch you to BUILD.
+- **"Always allow" is per project** (`project_allowed` in user settings);
+  `/permissions reset` forgets the current project's answers.
+- **Local OpenAI-compatible servers get native tool schemas** (llama.cpp,
+  LM Studio, vLLM, Ollama `/v1`); a 400 that names tools or templates triggers
+  one tool-less retry that is remembered for the session.
+- `auto_update: "install"` only applies to npm installs; cargo and source
+  builds are capped to `notify`.
+- Text attachments are capped at 256 KiB with a visible truncation marker and
+  a warning instead of silently pasting the `@` token.
+- `/verify` runs `check_work` and reports the test verdict explicitly.
+- The `effort` settings key is retired (it was never read); reasoning depth
+  lives in `reasoning_effort`.
+
+### Fixed
+- Readonly mode could execute an approved destructive command through the
+  confirmation path.
+- Ctrl+Q / Ctrl+X edited the newest queued message while auto-send took the
+  oldest; both now act on the message that sends next.
+- Ctrl+G flattened newlines from `$EDITOR`; multi-line results submit as a
+  multi-line prompt.
+- `/model http://host/v1 model` was routed to OpenRouter; URLs now select the
+  custom endpoint.
+- Unknown `--options` launched the TUI; they now exit 2 with a message.
+- `/rules` claimed YAML support; JSON only, and unreadable rule files warn.
+- Selection copy confirmation names OSC 52 and is suppressed on terminals
+  known to drop it.
+- Slash-command popup shows descriptions for skills and custom commands.
+- Checkpoint directory comment named the wrong path.
+
+### Documentation
+- README and buildwithnexus.dev corrected: ~4 MB binary, incremental wrap
+  cache (not incremental rendering), changed-span diffs, three wire
+  protocols, update notices by default, first-run download install story,
+  and the new features above.
+
 ## [0.12.15] - 2026-09-08
 
 ### Fixed

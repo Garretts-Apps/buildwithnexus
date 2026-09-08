@@ -27,11 +27,13 @@
 //! | [`agent`] | the ReAct loop: planning, tool calls, recovery, compaction |
 //! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
 //! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
+//! | [`mcp`] | Model Context Protocol client: stdio / HTTP servers, discovery, `mcp__*` dispatch |
 //! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
 //! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
 //! | [`session`] | save/resume of conversations |
 //! | [`workflow`] | background `/schedule` and `/loop` runs, persisted across restarts |
 //! | [`config`] | provider presets, settings files, key store, bundled skills |
+//! | [`usage`] | session token ledger, price table, `--max-budget-usd` guard |
 //! | [`hooks`] | Claude-Code-style lifecycle hooks (deny-capable, never grant) |
 //!
 //! Performance is the project's primary design lever; every claim is
@@ -46,16 +48,19 @@ pub mod config;
 pub mod hooks;
 pub mod knowledge;
 pub mod local;
+pub mod mcp;
 pub mod media;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
 pub mod rules;
+pub mod sandbox;
 pub mod session;
 pub mod tools;
 pub mod trace;
 pub mod tui;
 pub mod update;
+pub mod usage;
 pub mod verifier;
 pub mod workflow;
 
@@ -68,28 +73,44 @@ use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_ATTACHED_FILE_BYTES: u64 = 48 * 1024;
+const MAX_ATTACHED_FILE_BYTES: u64 = 256 * 1024;
 
 #[derive(Default, Clone, Debug)]
 struct CliOptions {
     provider: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    sandbox: Option<String>,
     prompt: Option<String>,
+    /// `--effort off|low|medium|high`, validated when the provider is built.
+    effort: Option<String>,
+    /// `--max-budget-usd <n>`: session spend ceiling, already parsed and > 0.
+    max_budget_usd: Option<f64>,
     json: bool,
+    // True once `--` was seen: everything after it is literal text, even
+    // words that start with '-'.
+    args_literal: bool,
+    /// `--yes` / `-y`: auto-approve a plan and execute it (headless `plan`).
+    yes: bool,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
     let mut opts = CliOptions::default();
     let mut rest = Vec::new();
+    let mut budget_raw: Option<String> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "--" {
+            opts.args_literal = true;
             rest.extend(it);
             break;
         }
         if arg == "--json" {
             opts.json = true;
+            continue;
+        }
+        if arg == "--yes" || arg == "-y" {
+            opts.yes = true;
             continue;
         }
         let (flag, inline) = arg
@@ -99,7 +120,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--provider" => &mut opts.provider,
             "--model" => &mut opts.model,
             "--permission-mode" | "--permission" => &mut opts.permission_mode,
+            "--sandbox" => &mut opts.sandbox,
             "--prompt" => &mut opts.prompt,
+            "--effort" => &mut opts.effort,
+            "--max-budget-usd" => &mut budget_raw,
             _ => {
                 rest.push(arg);
                 continue;
@@ -113,6 +137,18 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| format!("{flag} requires a value; see `buildwithnexus --help`"))?,
         );
+    }
+    if let Some(raw) = budget_raw {
+        let usd = raw
+            .trim()
+            .trim_start_matches('$')
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite() && *n > 0.0)
+            .ok_or_else(|| {
+                format!("--max-budget-usd expects a positive dollar amount (got '{raw}')")
+            })?;
+        opts.max_budget_usd = Some(usd);
     }
     Ok((opts, rest))
 }
@@ -136,6 +172,8 @@ pub fn run() {
         "" => interactive(opts.prompt.clone(), opts),
         "init" | "da-init" | "setup" => {
             onboarding::run();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            offer_starter_agents_md(&cwd);
         }
         "providers" => {
             for p in config::PRESETS {
@@ -148,9 +186,20 @@ pub fn run() {
                 agent::run_build(p, perm, "engineer", &rest(), &cwd)
             })
         }
-        "plan" => headless(&opts, |p, perm, cwd| {
-            agent::run_plan(p, perm, &rest(), &cwd)
-        }),
+        "plan" => {
+            // Approving a plan needs a terminal; without one (and without
+            // --yes) fail fast instead of hanging on the selector.
+            if !opts.yes && !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "buildwithnexus: `plan` needs an interactive terminal to approve the plan — \
+                     pass --yes (-y) to auto-approve and execute"
+                );
+                std::process::exit(2);
+            }
+            headless(&opts, |p, perm, cwd| {
+                agent::run_plan(p, perm, &rest(), &cwd, opts.yes)
+            })
+        }
         "brainstorm" => headless(&opts, |p, perm, cwd| {
             agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
         }),
@@ -185,6 +234,23 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
+        "mcp" => match mcp::manage(&args[1..], false) {
+            Ok(lines) => {
+                for l in lines {
+                    println!("  {l}");
+                }
+            }
+            Err(e) => {
+                eprintln!("buildwithnexus mcp: {e}");
+                std::process::exit(2);
+            }
+        },
+        // A stray flag must not become an interactive prompt: `bwn --modle x`
+        // silently launching the TUI hides the typo.
+        other if !opts.args_literal && is_unknown_option(other) => {
+            eprintln!("buildwithnexus: unknown option '{other}'; see --help");
+            std::process::exit(2);
+        }
         _ if !args.is_empty() => {
             interactive(opts.prompt.clone().or_else(|| Some(args.join(" "))), opts)
         }
@@ -194,6 +260,27 @@ pub fn run() {
             std::process::exit(2);
         }
     }
+}
+
+// Options and flag-spelled subcommands the top-level match accepts. Anything
+// else that looks like a flag (`-x`, `--foo`) is a typo, not a prompt; a lone
+// `-` is left alone so it can still be a plain word.
+fn is_unknown_option(arg: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "-v",
+        "-V",
+        "--version",
+        "-h",
+        "--help",
+        "--headless",
+        "-p",
+        "--print",
+        "-c",
+        "--continue",
+        "-r",
+        "--resume",
+    ];
+    arg.len() > 1 && arg.starts_with('-') && !KNOWN.contains(&arg)
 }
 
 fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), String> {
@@ -214,10 +301,27 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     if let Some(model) = &opts.model {
         provider.model = model.clone();
     }
+    if let Some(level) = &opts.effort {
+        provider.effort = config::Effort::parse(level).ok_or_else(|| {
+            format!("--effort must be one of off, low, medium, high (got '{level}')")
+        })?;
+    }
+    // The CLI flag wins over the settings key; either arms the pre-request
+    // guard in the agent loop.
+    usage::set_budget(opts.max_budget_usd.or(settings.max_budget_usd));
     let perm_name = opts
         .permission_mode
         .as_deref()
         .unwrap_or(&settings.permission);
+    // A bad --sandbox flag is a hard error; a bad settings value only warns
+    // (and leaves the sandbox off) so a typo can't lock the user out.
+    let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
+    if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
+        if opts.sandbox.is_some() {
+            return Err(e);
+        }
+        eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
+    }
     Ok((provider, agent::permission(perm_name)))
 }
 
@@ -372,6 +476,9 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
         context_tokens,
         temperature: s.temperature,
         max_tokens: s.max_tokens,
+        // An unrecognized level behaves like the default rather than
+        // rejecting the whole settings file.
+        effort: config::Effort::parse(&s.effort).unwrap_or_default(),
         ollama_ctx: std::sync::OnceLock::new(),
     };
     if provider.protocol == config::Protocol::OllamaNative {
@@ -402,6 +509,7 @@ fn headless(
     provider::prewarm(&provider);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
+    hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
 
     if !report::is_json() {
@@ -420,11 +528,19 @@ fn headless(
             ))
         );
         println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
+        for note in config::startup_context_notices(&cwd) {
+            println!("{}", tui::dim(&format!("  {note}")));
+        }
         println!();
         // Off the critical path: five `which` probes cost real startup latency,
         // and with interactive=false this only prints when something is missing.
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
+
+    // MCP tools must be on the surface before the first request; discovery
+    // is bounded by each server's timeout, and every outcome is a notice.
+    mcp::ensure_ready();
+    report_mcp_notices();
 
     let start_time = std::time::Instant::now();
     let r = f(&provider, perm, cwd.clone());
@@ -443,6 +559,17 @@ fn headless(
     if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
         std::process::exit(1);
+    }
+}
+
+// Connected / failed / disconnected lines from background discovery.
+fn report_mcp_notices() {
+    for (msg, ok) in mcp::drain_notices() {
+        if ok {
+            report::info(&format!("  {msg}"));
+        } else {
+            report::notice(&format!("  {msg}"));
+        }
     }
 }
 
@@ -473,10 +600,14 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
 
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     hooks::init(&cwd, raw);
+    hooks::set_permission_mode(agent::permission_name(perm));
+    // Once per process: the session id is fixed here so SessionStart, every
+    // turn's hooks, and the saved transcript all agree on it.
     hooks::notify("SessionStart", &cwd);
     tui::enter_alt(raw);
     let result = repl(provider, perm, &cwd, raw, initial_prompt);
     kill_local_server();
+    mcp::shutdown();
     tui::leave_alt();
     hooks::notify("SessionEnd", &cwd);
     if let Err(e) = result {
@@ -507,7 +638,14 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    for note in config::startup_context_notices(cwd) {
+        tui::line(&tui::dim(&format!("  {note}")));
+    }
     let restored = workflow::restore();
+    workflow::set_max_concurrent(settings.max_concurrent_workflows);
+    // Background scheduler: due workflows start while the user is idle at the
+    // prompt; their completion notices are shown at the next prompt.
+    workflow::start_scheduler();
     if restored > 0 {
         tui::line(&tui::green(&format!(
             "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
@@ -523,7 +661,9 @@ fn repl(
     update::spawn_check(&settings.auto_update);
 
     let mut transcript: Vec<provider::Msg> = Vec::new();
-    let mut sid = session::new_id();
+    // The REPL owns the id SessionStart already announced.
+    let mut sid = session::current_or_new();
+    session::set_current(&sid);
     trace::set_session(&sid);
     let mut mode = Mode::Brainstorm;
     let mut last_suggested_mode: Option<&'static str> = None;
@@ -532,9 +672,12 @@ fn repl(
     let mut pending_prompt = initial_prompt;
 
     loop {
-        // Tick background workflows and surface any completion notifications.
+        // Tick background workflows and surface any completion notifications
+        // (both those queued by the scheduler thread and this tick's own).
         // Color by outcome — a "✗ workflow failed" line must not render green.
-        if let Some(note) = workflow::tick() {
+        let mut notes = workflow::take_notices();
+        notes.extend(workflow::tick());
+        for note in notes {
             if note.contains('✗') {
                 tui::line(&tui::red(&note));
             } else {
@@ -543,6 +686,16 @@ fn repl(
         }
         // Prune old done/cancelled workflows, keep last 20.
         workflow::prune(20);
+
+        // MCP servers connect in the background after the first prompt; their
+        // one-line outcomes surface here so they never interleave with a turn.
+        for (msg, ok) in mcp::drain_notices() {
+            if ok {
+                tui::line(&tui::dim(&format!("  {msg}")));
+            } else {
+                tui::line(&tui::yellow(&format!("  {msg}")));
+            }
+        }
 
         // Show workflow activity badge if any are pending/running.
         let active = workflow::active_count();
@@ -602,6 +755,9 @@ fn repl(
                     tui::line(&tui::red(&format!("  {reason}")));
                     tui::bell();
                     continue;
+                }
+                if sandbox::would_confine() {
+                    tui::line(&tui::dim("  [sandboxed]"));
                 }
                 let out = tools::run("run_command", &tool_input, cwd);
                 for l in out.content.lines() {
@@ -677,6 +833,19 @@ fn repl(
             continue;
         }
 
+        // /mcp with arguments: `/mcp <name>`, `/mcp add …`, `/mcp remove …`, `/mcp reload`.
+        if let Some(mcp_arg) = t.strip_prefix("/mcp ") {
+            handle_mcp(mcp_arg);
+            continue;
+        }
+
+        // /effort with an inline level, e.g. `/effort high` (bare /effort is
+        // in the match below).
+        if let Some(level) = t.strip_prefix("/effort ") {
+            handle_effort(&mut provider, level);
+            continue;
+        }
+
         // /permissions with an inline argument, e.g. `/permissions auto`.
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
             let arg = perm_arg.trim();
@@ -687,11 +856,18 @@ fn repl(
                     "ask" | "1" => apply_permission(&mut perm, "ask"),
                     "auto" | "2" => apply_permission(&mut perm, "auto"),
                     "readonly" | "3" => apply_permission(&mut perm, "readonly"),
+                    "reset" => handle_permissions_reset(cwd),
                     other => tui::line(&tui::red(&format!(
-                        "  unknown permission '{other}' — try: ask, auto, readonly"
+                        "  unknown permission '{other}' — try: ask, auto, readonly, reset"
                     ))),
                 }
             }
+            continue;
+        }
+
+        // /sandbox off|auto|require|status — OS-level shell sandbox.
+        if let Some(arg) = t.strip_prefix("/sandbox ") {
+            handle_sandbox(arg.trim());
             continue;
         }
 
@@ -709,7 +885,11 @@ fn repl(
         // /model with an inline argument — hot-swap the model mid-session.
         if let Some(model_arg) = t.strip_prefix("/model ") {
             let new_model = model_arg.trim();
-            if !new_model.is_empty() {
+            if let Some((url, m)) = parse_model_endpoint(new_model) {
+                // `/model http://host:port/v1 <model>`: a custom endpoint,
+                // persisted the same way the picker's custom entry does it.
+                swap_model(&mut provider, "custom", &m, Some(url));
+            } else if !new_model.is_empty() {
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
                 swap_model(&mut provider, &prov, &m, None);
@@ -793,7 +973,7 @@ fn repl(
 
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
-            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd) {
+            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd, false) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
             tui::bell();
@@ -828,7 +1008,9 @@ fn repl(
             "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
             "/clear" => {
                 transcript.clear();
+                usage::forget_last();
                 sid = session::new_id();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 tui::clear();
                 tui::line(&tui::dim("  ✓ context cleared — fresh session"));
@@ -836,13 +1018,17 @@ fn repl(
             }
             "/new" => {
                 transcript.clear();
+                usage::forget_last();
                 sid = session::new_id();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 tui::line(&tui::dim("  started a fresh session"));
                 continue;
             }
             "/resume" => {
                 handle_resume(&mut transcript, &mut sid);
+                usage::forget_last();
+                session::set_current(&sid);
                 trace::set_session(&sid);
                 continue;
             }
@@ -857,6 +1043,7 @@ fn repl(
             "/init" => {
                 tui::leave_alt();
                 onboarding::run();
+                offer_starter_agents_md(cwd);
                 tui::enter_alt(raw);
                 continue;
             }
@@ -946,6 +1133,14 @@ fn repl(
                 handle_context(&transcript, provider.context_tokens);
                 continue;
             }
+            "/cost" => {
+                handle_cost(&provider);
+                continue;
+            }
+            "/effort" => {
+                handle_effort(&mut provider, "");
+                continue;
+            }
             "/agents" => {
                 handle_agents();
                 continue;
@@ -1010,6 +1205,10 @@ fn repl(
                 handle_permissions(&mut perm);
                 continue;
             }
+            "/sandbox" => {
+                handle_sandbox("status");
+                continue;
+            }
             "/mouse" => {
                 handle_mouse(None);
                 continue;
@@ -1027,7 +1226,7 @@ fn repl(
                 continue;
             }
             "/skills" => {
-                handle_skills();
+                handle_skills(cwd);
                 continue;
             }
             "/tools" => {
@@ -1035,7 +1234,7 @@ fn repl(
                 continue;
             }
             "/mcp" => {
-                handle_mcp();
+                handle_mcp("");
                 continue;
             }
             "/vim" => {
@@ -1227,12 +1426,16 @@ fn repl(
         };
         let t = effective_task.as_str();
 
+        // Lazy MCP connect: kicked off by the first real prompt, never at
+        // startup, so servers only spawn once the session is actually used.
+        mcp::start_background();
+
         tui::line("");
         let r = if should_answer_conversationally(t, &mode) {
             agent::run_chat_turn(&provider, perm, cwd, t)
         } else {
             match &mode {
-                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd) {
+                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd, false) {
                     Ok(()) => {
                         mode = Mode::Build;
                         tui::show_mode_change("BUILD");
@@ -1541,19 +1744,30 @@ fn handle_memory(
     }
 }
 
-fn handle_skills() {
-    let skills = config::load_skills();
+fn handle_skills(cwd: &std::path::Path) {
+    let skills = config::discover_skills(cwd);
     if skills.is_empty() {
         tui::line(&tui::dim("  No skills found."));
         tui::line(&tui::dim(&format!(
-            "  Add .md files to {}/skills/",
+            "  Add <name>.md files or <name>/SKILL.md folders to {}/skills/",
             config::home().display()
         )));
         return;
     }
+    // First detail line is what the list shows: source + description.
     let mut items: Vec<(String, String)> = skills
-        .into_iter()
-        .map(|(name, content)| (format!("/{name}"), content))
+        .iter()
+        .map(|s| {
+            (
+                format!("/{}", s.name),
+                format!(
+                    "[{}] {}\n\n{}",
+                    s.source.label(),
+                    s.description_or_default(),
+                    s.loaded_text()
+                ),
+            )
+        })
         .collect();
     for cmd in config::load_custom_commands()
         .into_iter()
@@ -1584,25 +1798,44 @@ fn handle_tools() {
     tui::browse_items("tools", &items);
 }
 
-fn handle_mcp() {
-    let mut items = Vec::new();
-    if let Some(s) = config::load_settings() {
-        for (name, val) in &s.mcp_servers {
-            let desc = serde_json::to_string_pretty(val).unwrap_or_else(|_| val.to_string());
-            items.push((name.clone(), format!("MCP Server Configuration:\n{desc}")));
+fn handle_mcp(arg: &str) {
+    let args = shlex::split(arg.trim()).unwrap_or_default();
+    match mcp::manage(&args, true) {
+        Ok(lines) => {
+            for l in lines {
+                tui::line(&format!("  {l}"));
+            }
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {e}")));
+            tui::bell();
         }
     }
-    if items.is_empty() {
-        tui::line(&tui::dim(
-            "  No MCP servers configured in settings.json (mcp_servers).",
-        ));
-        tui::line(&tui::dim(
-            "  Add servers to settings.json to enable enterprise tool dispatch via `mcp_call`.",
-        ));
+}
+
+/// `/init` step: offer a starter AGENTS.md when the cwd has no instruction file.
+fn offer_starter_agents_md(cwd: &std::path::Path) {
+    if cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists() {
         return;
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    tui::browse_items("mcp servers", &items);
+    tui::line("");
+    tui::line(&tui::dim(&format!(
+        "  No AGENTS.md in {} — it tells the agent your build/test commands, conventions, and do-nots.",
+        cwd.display()
+    )));
+    let answer =
+        tui::ask("  create a starter AGENTS.md here? [Y/n] ").unwrap_or_else(|| "n".into());
+    if matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
+        match config::create_starter_agents_md(cwd) {
+            Ok(p) => tui::line(&tui::green(&format!(
+                "  ✓ created {} — fill in the placeholders",
+                p.display()
+            ))),
+            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+        }
+    } else {
+        tui::line(&tui::dim("  skipped"));
+    }
 }
 
 fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
@@ -1711,6 +1944,19 @@ fn handle_model(provider: &mut Provider) {
     }
 }
 
+/// `/model <http(s)://url> [model]` → (base_url, model). A URL first token
+/// always means the custom OpenAI-compatible preset; it must never fall into
+/// the org/model → OpenRouter inference below.
+fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
+    let pick = pick.trim();
+    let (first, rest) = pick.split_once(char::is_whitespace).unwrap_or((pick, ""));
+    let lower = first.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return None;
+    }
+    Some((first.to_string(), rest.trim().to_string()))
+}
+
 /// Maps a typed model name to the provider that serves it. Anything
 /// unrecognized stays on the current provider — the swap then validates it.
 fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
@@ -1737,8 +1983,9 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
     if lower.starts_with("gemini") {
         return ("openrouter".into(), format!("google/{lower}"));
     }
-    // org/model naming is OpenRouter's scheme.
-    if pick.contains('/') {
+    // org/model naming is OpenRouter's scheme — but a URL is not a model
+    // name (see parse_model_endpoint).
+    if pick.contains('/') && !pick.contains("://") {
         return ("openrouter".into(), pick.to_string());
     }
     (current_provider.to_string(), pick.to_string())
@@ -2085,6 +2332,11 @@ fn swap_model(
                     }
                 }
             }
+            // The probe's one-token usage mustn't pose as the live prompt
+            // size, and a `--effort` given on the command line outlives the swap.
+            usage::forget_last();
+            let mut p = p;
+            p.effort = provider.effort;
             *provider = p;
             config::save_settings(&s);
             provider::prewarm(provider);
@@ -2215,16 +2467,14 @@ fn handle_rules(cwd: &std::path::Path) {
     ));
     let mut engine = crate::rules::RuleEngine::load_defaults();
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
-    if let Ok(rd) = std::fs::read_dir(&rules_dir) {
-        for e in rd.flatten() {
-            if let Ok(loaded) =
-                crate::rules::RuleEngine::load_from_file(&e.path().to_string_lossy())
-            {
-                for r in loaded.rules {
-                    engine.add_rule(r);
-                }
-            }
-        }
+    let (loaded, failures) = load_workspace_rule_files(&rules_dir);
+    for r in loaded {
+        engine.add_rule(r);
+    }
+    for (name, err) in failures {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ skipped rules file {name}: {err}"
+        )));
     }
     tui::line(&format!(
         "  {} active rules loaded for workspace:",
@@ -2243,7 +2493,50 @@ fn handle_rules(cwd: &std::path::Path) {
             r.description
         ));
     }
-    tui::line(&tui::dim("  Tip: Add custom JSON/YAML rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt"));
+    tui::line(&tui::dim(
+        "  Tip: Add custom JSON rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt",
+    ));
+}
+
+// Every file in the workspace rules dir, plus one (file name, error) per
+// file that failed to load — a broken rules file used to vanish silently.
+fn load_workspace_rule_files(
+    rules_dir: &std::path::Path,
+) -> (Vec<crate::rules::Rule>, Vec<(String, String)>) {
+    let mut rules = Vec::new();
+    let mut failures = Vec::new();
+    let Ok(rd) = std::fs::read_dir(rules_dir) else {
+        return (rules, failures);
+    };
+    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if !path.is_file() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path_str = path.to_string_lossy();
+        match crate::rules::RuleEngine::load_from_file(&path_str) {
+            Ok(loaded) => rules.extend(loaded.rules),
+            Err(e) => {
+                // load_from_file already prefixes the path; keep the message
+                // to the reason so the line stays short.
+                let reason = [
+                    format!("Failed to parse rules file {path_str}: "),
+                    format!("Failed to read rules file {path_str}: "),
+                ]
+                .iter()
+                .find_map(|prefix| e.strip_prefix(prefix.as_str()))
+                .unwrap_or(&e)
+                .to_string();
+                failures.push((name, reason));
+            }
+        }
+    }
+    (rules, failures)
 }
 
 fn handle_kb_index(cwd: &std::path::Path) {
@@ -2451,6 +2744,17 @@ fn handle_verify_audit(cwd: &std::path::Path) {
         }
     }
 
+    // Actually run the project's checks (build/test/lint) and feed the
+    // verdict into the verifier's tests dimension instead of inferring it.
+    let check_input = serde_json::json!({});
+    let check = tools::run("check_work", &check_input, cwd);
+    let tests_passed = if verify_check_had_nothing_to_run(&check.content) {
+        None
+    } else {
+        Some(!check.is_error)
+    };
+    tui::line(&tui::render_md(&check.content));
+
     let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
     let ctx = crate::verifier::VerificationContext {
         task_description: "Interactive workspace verification and operational audit".to_string(),
@@ -2461,6 +2765,7 @@ fn handle_verify_audit(cwd: &std::path::Path) {
         tests_added: vec![],
         dependencies_changed: vec![],
         git_diff: None,
+        tests_passed,
     };
 
     let report = verifier.verify(&ctx);
@@ -2472,6 +2777,12 @@ fn handle_verify_audit(cwd: &std::path::Path) {
     ));
 }
 
+// check_work found no project checks to run (or every checker was missing):
+// no verdict, rather than a false "tests passed".
+fn verify_check_had_nothing_to_run(report: &str) -> bool {
+    report.contains("no build/test/lint commands detected") || report.contains("nothing ran")
+}
+
 fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
     if transcript.is_empty() {
         tui::line(&tui::dim("  nothing to compact (empty transcript)"));
@@ -2480,6 +2791,7 @@ fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
     let before = transcript.len();
     let taken = std::mem::take(transcript);
     *transcript = agent::compact_msgs(provider, taken);
+    usage::forget_last();
     let after = transcript.len();
     tui::line(&tui::green(&format!(
         "  ✓ compacted: {before} → {after} messages"
@@ -2655,6 +2967,7 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
 // Apply a permission string, update the in-session value, and persist to settings.json.
 fn apply_permission(perm: &mut Permission, ps: &str) {
     *perm = agent::permission(ps);
+    hooks::set_permission_mode(agent::permission_name(*perm));
     if let Some(mut settings) = config::load_settings() {
         settings.permission = ps.to_string();
         config::save_settings(&settings);
@@ -2668,6 +2981,21 @@ fn permission_label(perm: &Permission) -> &'static str {
         Permission::Ask => "ask",
         Permission::Auto => "auto",
         Permission::ReadOnly => "readonly",
+    }
+}
+
+// `/permissions reset`: forget every "always allow" answer given in this
+// project (the per-project map in the user settings file).
+fn handle_permissions_reset(cwd: &std::path::Path) {
+    let n = config::reset_project_allowed(cwd);
+    if n == 0 {
+        tui::line(&tui::dim("  no \"always allow\" entries for this project"));
+    } else {
+        tui::line(&tui::green(&format!(
+            "  ✓ cleared {n} \"always allow\" entr{} for {}",
+            if n == 1 { "y" } else { "ies" },
+            cwd.display()
+        )));
     }
 }
 
@@ -2695,6 +3023,34 @@ fn handle_permissions(perm: &mut Permission) {
             2 => apply_permission(perm, "readonly"),
             _ => {}
         }
+    }
+}
+
+// `/sandbox`: bare or `status` reports; a mode switches the session and
+// persists to settings.json, like /permissions.
+fn handle_sandbox(arg: &str) {
+    match arg {
+        "" | "status" => {
+            for l in sandbox::status_lines() {
+                tui::line(&format!("  {l}"));
+            }
+        }
+        other => match sandbox::Mode::parse(other) {
+            Some(mode) => {
+                sandbox::set_mode(mode);
+                if let Some(mut settings) = config::load_settings() {
+                    settings.sandbox = mode.as_str().to_string();
+                    config::save_settings(&settings);
+                }
+                tui::line(&tui::green(&format!("  ✓ sandbox: {}", mode.as_str())));
+                for l in sandbox::status_lines().into_iter().skip(1) {
+                    tui::line(&tui::dim(&format!("  {l}")));
+                }
+            }
+            None => tui::line(&tui::red(&format!(
+                "  unknown sandbox mode '{other}' — try: off, auto, require, status"
+            ))),
+        },
     }
 }
 
@@ -2775,12 +3131,59 @@ fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
 }
 
 fn handle_context(transcript: &[provider::Msg], total: usize) {
-    let used = msg_token_estimate(transcript);
-    tui::context_meter(used, total);
+    let estimate = msg_token_estimate(transcript);
+    // The server's own count for the last request beats the chars/4 guess,
+    // but only while the transcript it measured is still the live one.
+    let measured = if transcript.is_empty() {
+        None
+    } else {
+        usage::last_context_tokens()
+    };
+    tui::context_meter(measured.unwrap_or(estimate), total);
+    tui::line(&tui::dim(&match measured {
+        Some(_) => {
+            format!("  measured from the last request's usage (chars/4 estimate: {estimate})")
+        }
+        None => "  estimated (chars/4) — no usage reported yet".to_string(),
+    }));
     tui::line(&tui::dim(&format!(
         "  {} messages in session",
         transcript.len()
     )));
+}
+
+fn handle_cost(provider: &Provider) {
+    tui::line(&tui::accent("  session usage"));
+    for l in usage::render(&usage::snapshot(), &provider.model) {
+        tui::line(&tui::dim(&l));
+    }
+}
+
+// `/effort` shows the level; `/effort <level>` applies it to the live
+// provider and persists it to settings.json.
+fn handle_effort(provider: &mut Provider, arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        tui::line(&tui::dim(&format!(
+            "  effort: {} — /effort off|low|medium|high",
+            provider.effort
+        )));
+        return;
+    }
+    match config::Effort::parse(arg) {
+        Some(level) => {
+            provider.effort = level;
+            let mut s = config::load_settings().unwrap_or_default();
+            s.effort = level.as_str().to_string();
+            config::save_settings(&s);
+            tui::line(&tui::green(&format!(
+                "  ✓ effort → {level} (saved to settings)"
+            )));
+        }
+        None => tui::line(&tui::red(&format!(
+            "  unknown effort '{arg}' — try: off, low, medium, high"
+        ))),
+    }
 }
 
 fn handle_checkpoints(cwd: &std::path::Path) {
@@ -3003,6 +3406,36 @@ fn handle_agents() {
     }
 }
 
+// One line per configured MCP server, after a bounded connection attempt.
+fn doctor_mcp_lines() -> Vec<String> {
+    mcp::ensure_ready();
+    let reports = mcp::report();
+    if reports.is_empty() {
+        return vec!["  ·  mcp          no servers configured".into()];
+    }
+    reports
+        .into_iter()
+        .map(|r| {
+            let name = format!("mcp:{}", r.name);
+            match r.status {
+                mcp::Status::Connected => format!(
+                    "  ✓ {name:<14} {} · {} tool{}",
+                    r.transport,
+                    r.tools.len(),
+                    if r.tools.len() == 1 { "" } else { "s" }
+                ),
+                mcp::Status::Disabled => format!("  ·  {name:<13} disabled"),
+                mcp::Status::Connecting => {
+                    format!("  ✗ {name:<14} still connecting after the timeout")
+                }
+                mcp::Status::Failed(e) | mcp::Status::Invalid(e) => {
+                    format!("  ✗ {name:<14} {}", e.chars().take(160).collect::<String>())
+                }
+            }
+        })
+        .collect()
+}
+
 fn handle_doctor_tui() {
     tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));
     match config::load_settings() {
@@ -3013,7 +3446,12 @@ fn handle_doctor_tui() {
         }
         None => tui::line(&tui::yellow("  settings: not configured")),
     }
+    let (glyph, text) = sandbox::doctor_summary();
+    tui::line(&format!("  {glyph} sandbox: {text}"));
     tui::line(&format!("  home: {}", config::home().display()));
+    for line in doctor_mcp_lines() {
+        tui::line(&line);
+    }
     tui::line(&format!(
         "  rust: {}",
         std::process::Command::new("rustc")
@@ -3062,11 +3500,21 @@ fn print_help() {
                 ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
                 (
                     "/permissions",
-                    "[ask|auto|readonly]",
-                    "tool permission level",
+                    "[ask|auto|readonly|reset]",
+                    "tool permission level (reset: forget always-allow)",
                 ),
-                ("/model", "[name]", "hot-swap the AI model mid-session"),
-                ("/local", "", "local model server & GGUF/Ollama management"),
+                (
+                    "/sandbox",
+                    "[off|auto|require|status]",
+                    "OS sandbox for shell commands",
+                ),
+                (
+                    "/model",
+                    "[name | <url> <model>]",
+                    "hot-swap the AI model mid-session",
+                ),
+                ("/effort", "[off|low|medium|high]", "reasoning depth"),
+                ("/local", "", "probe local servers and list GGUF models"),
             ],
         ),
         (
@@ -3074,6 +3522,7 @@ fn print_help() {
             &[
                 ("/compact", "", "compress context to free token budget"),
                 ("/context", "", "show context window usage"),
+                ("/cost", "", "session tokens and estimated cost"),
                 ("/diff", "", "show current git diff summary"),
                 ("/review", "", "AI code review of staged git diff"),
                 ("/commit", "", "AI-drafted conventional commit message"),
@@ -3111,7 +3560,11 @@ fn print_help() {
                     "verify codebase against rules and tests",
                 ),
                 ("/agents", "", "show loaded Agents.md context"),
-                ("/mcp", "", "inspect configured MCP servers"),
+                (
+                    "/mcp",
+                    "[name|add|remove|reload]",
+                    "MCP servers and their tools",
+                ),
                 ("/trace", "", "inspect hooks, tools, skills, subagents"),
             ],
         ),
@@ -3420,13 +3873,27 @@ fn extract_attachments(
                         p.display()
                     )));
                 }
-            } else if let Some(text) = read_text_attachment(&p, range) {
-                text_attachments.push(format!("[file: {}]\n{}", p.display(), text));
+            } else if let Some(att) = read_text_attachment(&p, range) {
+                if let Some(total_kib) = att.truncated_from_kib {
+                    tui::line(&tui::yellow(&format!(
+                        "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
+                        p.display(),
+                        MAX_ATTACHED_FILE_BYTES / 1024
+                    )));
+                }
+                text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
                 if !clean.is_empty() {
                     clean.push(' ');
                 }
                 clean.push_str(&format!("[file: {}]", p.display()));
                 continue;
+            } else if p.is_file() {
+                // Never drop an attachment silently: the token stays in the
+                // prompt as typed, and the user is told why.
+                tui::line(&tui::yellow(&format!(
+                    "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
+                    p.display()
+                )));
             }
         }
         if !clean.is_empty() {
@@ -3456,17 +3923,65 @@ fn split_attachment_range(raw: &str) -> (&str, Option<(usize, usize)>) {
     (raw, None)
 }
 
-fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -> Option<String> {
+struct TextAttachment {
+    text: String,
+    // Total file size in KiB when only the first MAX_ATTACHED_FILE_BYTES
+    // were attached; None when the whole file fit.
+    truncated_from_kib: Option<u64>,
+}
+
+// Oversized files are attached up to the cap with a visible marker rather
+// than dropped: a silently missing attachment sends the model a bare path.
+fn read_text_attachment(
+    path: &std::path::Path,
+    range: Option<(usize, usize)>,
+) -> Option<TextAttachment> {
     let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_ATTACHED_FILE_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    let Some((start, end)) = range else {
-        return Some(text);
+    let (text, truncated_from_kib) = if meta.len() > MAX_ATTACHED_FILE_BYTES {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = vec![0u8; MAX_ATTACHED_FILE_BYTES as usize];
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match f.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(filled);
+        // Cut at a char boundary so a split multi-byte sequence doesn't
+        // turn a valid UTF-8 file into garbage.
+        let mut text = match String::from_utf8(buf) {
+            Ok(t) => t,
+            Err(e) => {
+                let valid = e.utf8_error().valid_up_to();
+                if valid == 0 {
+                    return None;
+                }
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).ok()?
+            }
+        };
+        let total_kib = meta.len().div_ceil(1024);
+        text.push_str(&format!(
+            "\n[truncated: file is {total_kib} KiB, first {} KiB attached]",
+            MAX_ATTACHED_FILE_BYTES / 1024
+        ));
+        (text, Some(total_kib))
+    } else {
+        (std::fs::read_to_string(path).ok()?, None)
     };
-    Some(
-        text.lines()
+    let Some((start, end)) = range else {
+        return Some(TextAttachment {
+            text,
+            truncated_from_kib,
+        });
+    };
+    Some(TextAttachment {
+        text: text
+            .lines()
             .enumerate()
             .filter_map(|(i, line)| {
                 let line_no = i + 1;
@@ -3478,7 +3993,8 @@ fn read_text_attachment(path: &std::path::Path, range: Option<(usize, usize)>) -
             })
             .collect::<Vec<_>>()
             .join("\n"),
-    )
+        truncated_from_kib,
+    })
 }
 
 // Suggest a mode from the task phrasing (used for the "tip" hint, not a gate).
@@ -3549,23 +4065,32 @@ fn usage() {
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
          \x20 buildwithnexus version | help\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
          \x20 --model <name>                override the configured model\n\
          \x20 --permission-mode <mode>      ask, auto, or readonly\n\
+         \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
          \x20 --prompt <text>               initial interactive prompt\n\
+         \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
+         \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
          \x20 --json                        structured headless output\n\
+         \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
          \x20 /model [name]                    hot-swap the AI model\n\
-         \x20 /permissions [ask|auto|readonly] show or switch tool permission level\n\
+         \x20 /effort [off|low|medium|high]    show or set reasoning depth\n\
+         \x20 /permissions [ask|auto|readonly|reset] show or switch tool permission level\n\
+         \x20                                  (reset forgets this project's always-allow answers)\n\
+         \x20 /sandbox [off|auto|require|status] OS sandbox for shell commands\n\
          \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
          \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
          \x20 /compact               compress context to free up token budget\n\
          \x20 /context               show current context usage\n\
+         \x20 /cost                  session tokens and estimated cost\n\
          \x20 /diff                  show current git diff summary\n\
          \x20 /review                AI code review of staged git diff\n\
          \x20 /commit                AI-drafted conventional commit message\n\
@@ -3578,6 +4103,7 @@ fn usage() {
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                browse available skills and custom commands\n\
          \x20 /tools                 browse callable tools\n\
+         \x20 /mcp [name|add|remove|reload]  MCP servers and their tools\n\
          \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
          \x20 /agents /checkpoints /undo /doctor\n\
          \x20 /help /clear /new /resume /init /exit\n\
@@ -3596,7 +4122,7 @@ fn run_doctor() {
     for i in &load.issues {
         println!("  ✗ settings       {}: {}", i.source, i.error);
     }
-    match load.settings {
+    match load.settings.as_ref() {
         None if load.any_present => {
             println!("  ✗ settings       present but unusable — fix the file(s) above");
         }
@@ -3616,7 +4142,7 @@ fn run_doctor() {
             // key presence says nothing about whether the provider answers.
             // Ollama is probed via its free /api/tags; everything else pays
             // one output token, which is what a diagnostic command is for.
-            match build_provider(&s) {
+            match build_provider(s) {
                 Ok(p) => {
                     if config::preset(&s.provider).is_some_and(|pr| pr.id == "ollama") {
                         let models = provider::ollama_models(&p.base_url);
@@ -3652,6 +4178,16 @@ fn run_doctor() {
         }
     }
 
+    // Sandbox: the probe runs the real backend once, so this reports whether
+    // shell commands would actually be confined on this machine.
+    if let Some(s) = &load.settings {
+        if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
+            println!("  ✗ sandbox        {e}");
+        }
+    }
+    let (glyph, text) = sandbox::doctor_summary();
+    println!("  {glyph} sandbox        {text}");
+
     // API key
     for preset in config::PRESETS
         .iter()
@@ -3670,6 +4206,11 @@ fn run_doctor() {
     match config::load_memory() {
         None => println!("  ·  memory.md     (empty)"),
         Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
+    }
+
+    // MCP servers: a real connect + handshake each, bounded by their timeouts.
+    for line in doctor_mcp_lines() {
+        println!("{line}");
     }
 
     // External tools
@@ -4146,6 +4687,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_options_extracts_sandbox_mode() {
+        let (opts, rest) = parse_cli_options(
+            ["--sandbox", "require", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(opts.sandbox.as_deref(), Some("require"));
+        assert_eq!(rest, ["run", "x"]);
+        let (opts, _) = parse_cli_options(["--sandbox=auto"].map(str::to_string).to_vec()).unwrap();
+        assert_eq!(opts.sandbox.as_deref(), Some("auto"));
+        assert!(parse_cli_options(
+            ["run", "--", "--sandbox", "auto"]
+                .map(str::to_string)
+                .to_vec()
+        )
+        .unwrap()
+        .0
+        .sandbox
+        .is_none());
+    }
+
+    #[test]
+    fn parse_cli_options_effort_and_budget() {
+        let (opts, rest) = parse_cli_options(
+            ["--effort", "high", "--max-budget-usd=1.50", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(opts.effort.as_deref(), Some("high"));
+        assert_eq!(opts.max_budget_usd, Some(1.5));
+        assert_eq!(rest, ["run", "x"]);
+        // Defaults: no level, no budget.
+        let (opts, _) = parse_cli_options(vec![]).unwrap();
+        assert!(opts.effort.is_none());
+        assert!(opts.max_budget_usd.is_none());
+    }
+
+    #[test]
+    fn parse_cli_options_budget_rejects_missing_or_non_positive_values() {
+        let err = parse_cli_options(["--max-budget-usd"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("--max-budget-usd requires a value"), "{err}");
+        let err = parse_cli_options(["--max-budget-usd", "abc"].map(str::to_string).to_vec())
+            .unwrap_err();
+        assert!(err.contains("positive dollar amount"), "{err}");
+        let err =
+            parse_cli_options(["--max-budget-usd", "0"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("positive dollar amount"), "{err}");
+        // Effort values are validated when the provider is built, but the
+        // missing-value rule applies here like every other option.
+        let err =
+            parse_cli_options(["--effort", "--json"].map(str::to_string).to_vec()).unwrap_err();
+        assert!(err.contains("--effort requires a value"), "{err}");
+        // After `--` the flags are literal task words.
+        let (opts, rest) =
+            parse_cli_options(["--", "--max-budget-usd", "5"].map(str::to_string).to_vec())
+                .unwrap();
+        assert!(opts.max_budget_usd.is_none());
+        assert_eq!(rest, ["--max-budget-usd", "5"]);
+    }
+
+    #[test]
     fn cli_separator_preserves_literal_option_names() {
         let (opts, rest) = parse_cli_options(
             ["--json", "run", "--", "explain", "--model", "--json"]
@@ -4170,6 +4774,7 @@ mod tests {
             "--model",
             "--permission-mode",
             "--permission",
+            "--sandbox",
             "--prompt",
         ] {
             for args in [
@@ -4214,6 +4819,143 @@ mod tests {
             split_attachment_range("src/lib.rs:nope"),
             ("src/lib.rs:nope", None)
         );
+    }
+
+    #[test]
+    fn model_endpoint_pick_is_a_custom_url_not_openrouter() {
+        // `/model http://localhost:8000/v1 my-model` → custom preset with
+        // that base URL — never an OpenRouter "org/model" swap.
+        assert_eq!(
+            parse_model_endpoint("http://localhost:8000/v1 my-model"),
+            Some(("http://localhost:8000/v1".into(), "my-model".into()))
+        );
+        assert_eq!(
+            parse_model_endpoint("HTTPS://api.example.com/v1   gpt-x"),
+            Some(("HTTPS://api.example.com/v1".into(), "gpt-x".into()))
+        );
+        // URL only: swap_model asks for the model name.
+        assert_eq!(
+            parse_model_endpoint("http://localhost:8000/v1"),
+            Some(("http://localhost:8000/v1".into(), String::new()))
+        );
+        // Not a URL: the regular picker handles it.
+        assert_eq!(parse_model_endpoint("custom my-model"), None);
+        assert_eq!(parse_model_endpoint("meta-llama/llama-3.3-70b"), None);
+        assert_eq!(parse_model_endpoint(""), None);
+        // A stray URL reaching parse_model_pick stays on the current
+        // provider instead of being misread as an OpenRouter org/model.
+        assert_eq!(
+            parse_model_pick("http://localhost:8000/v1", "anthropic"),
+            ("anthropic".into(), "http://localhost:8000/v1".into())
+        );
+        // `/model custom <model>` keeps working.
+        assert_eq!(
+            parse_model_pick("custom my-model", "anthropic"),
+            ("custom".into(), "my-model".into())
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_flags_are_rejected_not_prompts() {
+        assert!(is_unknown_option("--modle"));
+        assert!(is_unknown_option("-x"));
+        assert!(is_unknown_option("--json=yes"));
+        // Known flag spellings of subcommands and options pass through.
+        for known in [
+            "-v",
+            "--version",
+            "-h",
+            "--help",
+            "-p",
+            "--print",
+            "-c",
+            "-r",
+            "--resume",
+        ] {
+            assert!(!is_unknown_option(known), "{known}");
+        }
+        // Plain words still become the interactive prompt (`bwn fix the bug`).
+        assert!(!is_unknown_option("fix"));
+        assert!(!is_unknown_option(""));
+        assert!(!is_unknown_option("-"));
+        // Everything after `--` is literal text, even if it looks like a flag.
+        let (opts, rest) =
+            parse_cli_options(vec!["--".into(), "-weird".into(), "task".into()]).unwrap();
+        assert!(opts.args_literal);
+        assert_eq!(rest, vec!["-weird".to_string(), "task".to_string()]);
+        let (opts, _) = parse_cli_options(vec!["fix".into(), "the".into(), "bug".into()]).unwrap();
+        assert!(!opts.args_literal);
+    }
+
+    #[test]
+    fn oversized_text_attachment_is_truncated_with_marker() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.log");
+        // 300 KiB of short lines, ending with a multi-byte char run so the
+        // cut lands mid-sequence and must be repaired.
+        let mut body = "0123456789abcde\n".repeat(300 * 1024 / 16);
+        body.push_str("éééé");
+        std::fs::write(&big, &body).unwrap();
+
+        let att = read_text_attachment(&big, None).expect("big files attach truncated");
+        assert_eq!(att.truncated_from_kib, Some(301));
+        assert!(att
+            .text
+            .ends_with("\n[truncated: file is 301 KiB, first 256 KiB attached]"));
+        let attached = att.text.split("\n[truncated").next().unwrap();
+        assert!(attached.len() <= MAX_ATTACHED_FILE_BYTES as usize);
+        assert!(attached.len() > MAX_ATTACHED_FILE_BYTES as usize - 32);
+        assert!(attached.starts_with("0123456789abcde\n"));
+
+        // Line ranges still apply on top of the truncated text.
+        let ranged = read_text_attachment(&big, Some((2, 2))).unwrap();
+        assert_eq!(ranged.text, "0123456789abcde");
+        assert_eq!(ranged.truncated_from_kib, Some(301));
+
+        // Small files are untouched.
+        let small = dir.join("small.txt");
+        std::fs::write(&small, "hi\n").unwrap();
+        let att = read_text_attachment(&small, None).unwrap();
+        assert_eq!(att.text, "hi\n");
+        assert_eq!(att.truncated_from_kib, None);
+
+        // The prompt carries the marker so the model knows the file is cut.
+        let (text, _) = extract_attachments("look at @big.log", &dir, false);
+        assert!(text.contains("[file: "));
+        assert!(text.contains("[truncated: file is 301 KiB, first 256 KiB attached]"));
+        assert!(!text.contains(" @big.log"), "token must not be pasted raw");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_rule_files_report_parse_failures() {
+        let dir = std::env::temp_dir().join(format!("bwn-rules-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.json"),
+            r#"{"rules":[{"id":"x","description":"d","severity":"low","message":"m"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.yaml"), "rules:\n  - id: nope\n").unwrap();
+
+        let (rules, failures) = load_workspace_rule_files(&dir);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "x");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "bad.yaml");
+        assert!(!failures[0].1.is_empty());
+        assert!(
+            !failures[0].1.contains("Failed to parse rules file"),
+            "reason only: {}",
+            failures[0].1
+        );
+        // No rules dir at all is not an error.
+        let (rules, failures) = load_workspace_rule_files(&dir.join("missing"));
+        assert!(rules.is_empty() && failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

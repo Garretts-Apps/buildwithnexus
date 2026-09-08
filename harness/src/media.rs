@@ -280,13 +280,32 @@ pub fn decode_thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32
 
 /// Grabs an image from the system clipboard into a temp PNG, if one is there.
 /// Best effort across Wayland (wl-paste), X11 (xclip), macOS (pngpaste /
-/// osascript) and WSL (powershell.exe).
+/// osascript), native Windows and WSL (both powershell.exe).
 pub fn clipboard_image_to_temp() -> Option<PathBuf> {
     let dest = std::env::temp_dir().join(format!(
         "bwn-paste-{}-{}.png",
         std::process::id(),
         temp_seq()
     ));
+
+    // Native Windows: PowerShell can write straight into the temp dir.
+    if cfg!(windows) {
+        let ps = ps_clipboard_image_script(Some(&dest));
+        if let Ok(o) = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+        {
+            if o.status.success() {
+                if let Ok(m) = std::fs::metadata(&dest) {
+                    if m.len() > 0 {
+                        return Some(dest);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&dest);
+        return None;
+    }
 
     // Wayland
     if have_quick("wl-paste") {
@@ -353,12 +372,9 @@ pub fn clipboard_image_to_temp() -> Option<PathBuf> {
     // WSL: powershell can't write into the Linux fs directly — round-trip
     // the PNG bytes as base64 over stdout.
     if crate::tools::is_wsl() {
-        let ps = "$img = Get-Clipboard -Format Image; if ($img) { \
-                  $ms = New-Object System.IO.MemoryStream; \
-                  $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); \
-                  [Convert]::ToBase64String($ms.ToArray()) }";
+        let ps = ps_clipboard_image_script(None);
         if let Ok(o) = Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", ps])
+            .args(["-NoProfile", "-Command", &ps])
             .output()
         {
             let b64 = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -391,23 +407,48 @@ pub fn clipboard_text() -> Option<String> {
             }
         }
     }
-    if crate::tools::is_wsl() {
+    // Native Windows and WSL: `-Raw` returns the clipboard as one string
+    // instead of an array of lines (which would drop the trailing newline
+    // and re-join with CRLF).
+    if cfg!(windows) || crate::tools::is_wsl() {
         if let Ok(o) = Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", "Get-Clipboard"])
+            .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
             .output()
         {
             if o.status.success() && !o.stdout.is_empty() {
-                return Some(String::from_utf8_lossy(&o.stdout).into_owned());
+                return Some(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"));
             }
         }
     }
     None
 }
 
+// PowerShell snippet that pulls a PNG off the Windows clipboard. With a
+// destination the image is saved straight to that path (native Windows);
+// without one the bytes are emitted as base64 on stdout, for WSL where
+// powershell.exe can't write into the Linux filesystem. `Get-Clipboard
+// -Format Image` needs Windows PowerShell (powershell.exe), which is exactly
+// what both callers invoke.
+fn ps_clipboard_image_script(dest: Option<&Path>) -> String {
+    match dest {
+        Some(p) => format!(
+            "$img = Get-Clipboard -Format Image; if ($img) {{ \
+             $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png) }}",
+            // Single-quoted PowerShell strings only need `'` doubled.
+            p.to_string_lossy().replace('\'', "''")
+        ),
+        None => "$img = Get-Clipboard -Format Image; if ($img) { \
+                 $ms = New-Object System.IO.MemoryStream; \
+                 $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); \
+                 [Convert]::ToBase64String($ms.ToArray()) }"
+            .to_string(),
+    }
+}
+
 // `which`-style existence check that doesn't run the binary (clipboard tools
 // hang without a display when run with no args).
 fn have_quick(bin: &str) -> bool {
-    Command::new("which")
+    Command::new(if cfg!(windows) { "where" } else { "which" })
         .arg(bin)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -493,6 +534,7 @@ mod tests {
             context_tokens: 0,
             temperature: None,
             max_tokens: None,
+            effort: crate::config::Effort::Off,
             ollama_ctx: std::sync::OnceLock::new(),
         }
     }
@@ -600,5 +642,23 @@ mod tests {
         assert!(att.summary.contains("320x240"), "{}", att.summary);
         assert!(att.summary.contains("frames sampled"), "{}", att.summary);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn powershell_clipboard_script_saves_to_quoted_path_or_emits_base64() {
+        let direct = ps_clipboard_image_script(Some(Path::new(r"C:\Temp\it's.png")));
+        assert!(direct.contains("Get-Clipboard -Format Image"));
+        // Single-quoted PowerShell literal: only `'` needs escaping (doubled),
+        // backslashes are left alone.
+        assert!(
+            direct.contains(r"$img.Save('C:\Temp\it''s.png'"),
+            "{direct}"
+        );
+        assert!(!direct.contains("ToBase64String"));
+
+        let wsl = ps_clipboard_image_script(None);
+        assert!(wsl.contains("Get-Clipboard -Format Image"));
+        assert!(wsl.contains("ToBase64String"));
+        assert!(!wsl.contains(".Save('"));
     }
 }

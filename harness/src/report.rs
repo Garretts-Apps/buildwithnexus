@@ -19,7 +19,7 @@ static MODE: OnceLock<Mode> = OnceLock::new();
 pub fn set(m: Mode) {
     let _ = MODE.set(m);
 }
-fn mode() -> Mode {
+pub fn mode() -> Mode {
     *MODE.get().unwrap_or(&Mode::Human)
 }
 pub fn is_json() -> bool {
@@ -94,6 +94,11 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
                 Some(p) if !p.trim().is_empty() => tui::file_link(p, &tui::yellow(preview)),
                 _ => tui::yellow(preview),
             },
+        ),
+        // The OS sandbox (sandbox.rs) confines this one — say so on the header.
+        "bash" | "run_command" if crate::sandbox::would_confine() => (
+            "⚡",
+            format!("{} {}", tui::blue(preview), tui::dim("[sandboxed]")),
         ),
         "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
             ("⚡", tui::blue(preview))
@@ -576,6 +581,23 @@ pub fn finish(summary: &str) {
             tui::line(&tui::render_md(summary));
         }
         Mode::Json => emit(json!({"type": "finish", "summary": summary})),
+    }
+}
+
+// A produced plan (headless `plan`): the steps as a structured event so an
+// orchestrator can see what will run before execution starts. Human mode
+// already renders the numbered plan.
+pub fn plan(steps: &[String]) {
+    if mode() == Mode::Json {
+        emit(json!({"type": "plan", "steps": steps}));
+    }
+}
+
+// End-of-turn verifier result (JSON mode only; human mode renders the
+// violations inline).
+pub fn verify(status: &str, report: &Value) {
+    if mode() == Mode::Json {
+        emit(json!({"type": "verify", "status": status, "report": report}));
     }
 }
 
