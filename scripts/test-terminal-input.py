@@ -24,7 +24,27 @@ import unittest
 BINARY = str(Path(sys.argv.pop(1)).resolve())
 
 
-class TerminalInputTests(unittest.TestCase):
+def tiny_png(path, width=4, height=2):
+    """Write a valid RGB PNG without any imaging library."""
+    import struct as st
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return st.pack(">I", len(data)) + body + st.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = b"".join(b"\x00" + bytes([255, 0, 0] * width) for _ in range(height))
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", st.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(raw))
+    png += chunk(b"IEND", b"")
+    path.write_bytes(png)
+
+
+class TerminalHarness(unittest.TestCase):
+    def extra_env(self):
+        return {}
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="bwn-terminal-test-")
         self.root = Path(self.temp.name)
@@ -45,6 +65,13 @@ class TerminalInputTests(unittest.TestCase):
                "TERM": "xterm-256color", "NO_COLOR": "1",
                "EDITOR": str(self.editor)}
         env.pop("VISUAL", None)
+        for key in ("TMUX", "KITTY_WINDOW_ID", "GHOSTTY_RESOURCES_DIR", "BWN_IMAGES"):
+            env.pop(key, None)
+        for key, value in self.extra_env().items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         self.proc = subprocess.Popen(
@@ -105,6 +132,20 @@ class TerminalInputTests(unittest.TestCase):
             ]
         self.wait_for(saved, f"submitted prompt {expected!r}")
 
+
+class TerminalInputTests(TerminalHarness):
+    def test_pasted_image_path_becomes_attachment_token(self):
+        # Drag-and-drop / paste of a screenshot path (with a space, as macOS
+        # names them) → a quoted @token in the composer, ready to send.
+        shot = self.root / "Screenshot 1.png"
+        tiny_png(shot)
+        self.send(f"\x1b[200~'{shot}'\x1b[201~")
+        token = f'@"{shot}" '.encode()
+        self.wait_for(lambda: token in self.output, "attachment token in composer")
+        # Ordinary pasted text is left alone.
+        self.send("\x1b[200~plain words\x1b[201~")
+        self.wait_for(lambda: b"plain words" in self.output, "plain paste")
+
     def test_mode_change_preserves_draft_and_cursor(self):
         self.send("/mouse statuz")
         self.send("\x1b[D")  # put the cursor before the final z
@@ -138,6 +179,35 @@ class TerminalInputTests(unittest.TestCase):
         # The transcript echoes the prompt as two rows, never flattened.
         self.wait_for(lambda: b"line two" in self.output, "multi-line echo")
         self.assertNotIn(b"line one line two", bytes(self.output))
+
+
+class InlineImageTests(TerminalHarness):
+    """The kitty graphics path, forced on: the PNG is uploaded once as a
+    virtual placement and the transcript row carries Unicode placeholders."""
+
+    def extra_env(self):
+        return {"NO_COLOR": None, "COLORTERM": "truecolor", "BWN_IMAGES": "kitty"}
+
+    def test_pasted_png_is_transmitted_with_placeholders(self):
+        shot = self.root / "shot.png"
+        tiny_png(shot, width=4, height=2)
+        self.send(f"\x1b[200~{shot}\x1b[201~")
+        self.wait_for(
+            lambda: b"\x1b_Ga=T,f=100,t=d,q=2,U=1,i=1,c=" in self.output,
+            "kitty transmit command",
+        )
+        out = bytes(self.output)
+        self.assertIn("\U0010EEEE".encode(), out)  # placeholder cells
+        self.assertIn("\u0305".encode(), out)  # row/column diacritic 0
+        self.assertIn(b"shot.png", out)  # the header line names the file
+        self.assertIn(b"4\xc3\x972", out)  # "4×2" pixel size
+        # A 4×2 px image in one cell: c=1,r=1 (never upscaled).
+        self.assertIn(b",c=1,r=1,m=0;", out)
+        # Leaving the screen frees the upload (Esc first: clear the draft).
+        self.send("\x1b")
+        self.pump(0.2)
+        self.send("/exit\r")
+        self.wait_for(lambda: b"\x1b_Ga=d,d=A,q=2\x1b\\" in self.output, "delete-all on exit")
 
 
 class CliArgumentTests(unittest.TestCase):

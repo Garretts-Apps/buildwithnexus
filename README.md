@@ -58,9 +58,22 @@ once you're ready to let it loose on a real project.
   changes.
 - **Clickable everything** — file paths and links are OSC 8 hyperlinks: click
   a path in an edit header and it opens in your OS default app.
-- **Multimodal input** — `Ctrl+V` pastes clipboard screenshots; `@clip.mp4`
-  runs ffmpeg to sample frames + metadata for vision models (text-only models
-  get a clear "not multimodal" notice instead of silent drops).
+- **Images you can actually see** — `Ctrl+V` pastes a clipboard screenshot
+  and it appears *right there in the transcript* before you send it: at real
+  pixel resolution on kitty, Ghostty and WezTerm (kitty graphics protocol,
+  Unicode placeholders — works through tmux), as terminal-sized half-block
+  art everywhere else. Drop a file onto the terminal and its path becomes an
+  `@attachment` with the same preview. `@clip.mp4` runs ffmpeg to sample
+  frames + metadata for vision models (text-only models get a clear "not
+  multimodal" notice instead of silent drops).
+- **Code that looks like code** — fenced blocks are syntax-highlighted for 20+
+  languages by a zero-dependency lexer; markdown tables are drawn aligned,
+  with header rules and column alignment; `---`, task lists and
+  `~~strikethrough~~` render too.
+- **Know what it's doing** — the footer shows the model, a spinner, elapsed
+  time and streamed tokens/s while the agent works; when a long turn ends
+  while you're in another window you get a desktop notification (OSC 99/777/9)
+  and a taskbar progress state on terminals that have one.
 - **Claude-Code-grade ergonomics** — `Esc` interrupts the agent; messages
   typed while it works queue and auto-send; ↑ history is prefix-filtered and
   never destroys your draft; double-click selects a word, triple-click a
@@ -216,6 +229,26 @@ unchanged; it only limits what an approved command can touch. Sandboxed
 commands are marked `[sandboxed]` on the tool header; `/sandbox status` and
 `buildwithnexus doctor` show backend availability and whether commands would
 be confined. To escape for one command, switch with `/sandbox off` and back.
+
+## Inline images
+
+Attach an image three ways — `Ctrl+V` with a screenshot on the clipboard,
+drag a file onto the terminal (or paste its path), or type `@shot.png` — and
+it is drawn inside the transcript, above the composer, before you send it:
+
+| Terminal | What you see |
+|---|---|
+| kitty ≥ 0.28, Ghostty, WezTerm (placeholder support) | the real pixels, at up to the full width of the window, scrolling with the text; works inside tmux with `set -g allow-passthrough on` |
+| any other truecolor terminal (iTerm2, Alacritty, Windows Terminal, foot, VS Code…) | half-block art sized to the terminal (needs `ffmpeg` on PATH to decode) |
+| `NO_COLOR`, non-truecolor | no preview, never garbage |
+
+A pasted PNG needs no external tool at all. JPEG, WebP, GIF and a video's
+first frame are converted with ffmpeg when it is installed. Control it with
+the `images` settings key (`"auto"` default, `"kitty"`, `"blocks"`, `"off"`)
+or `BWN_IMAGES=…` for one run. Uploads are freed when you `/clear` or exit.
+
+Two related settings: `notify` (`"auto"` — desktop notification when a turn
+of 8 s or longer ends while the window is unfocused; `"always"`; `"off"`).
 
 ## Hooks
 
@@ -381,7 +414,8 @@ Works on native Windows:
   restore the terminal before the process ends; panics restore it too.
 - Ctrl+V paste of a clipboard **image** (PNG via `powershell.exe`
   `Get-Clipboard -Format Image`) and clipboard text (`Get-Clipboard -Raw`).
-  WSL uses the same PowerShell path with a base64 round-trip.
+  WSL uses the same PowerShell path with a base64 round-trip. Windows
+  Terminal shows the half-block preview and the OSC 9;4 taskbar progress.
 - `~/.buildwithnexus/.env.keys` and `settings.json` are restricted to the
   current user with `icacls /inheritance:r /grant:r` — the ACL equivalent of
   the `0600` mode used on Unix. A failure is reported as a dim warning and

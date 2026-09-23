@@ -250,6 +250,19 @@ pub struct Settings {
     /// Whether sandboxed commands may reach the network (default true).
     #[serde(default = "default_true")]
     pub sandbox_network: bool,
+    /// Inline images in the transcript: "auto" (default; pixel-perfect on
+    /// kitty/Ghostty, half-block art elsewhere), "kitty" (force the graphics
+    /// protocol), "blocks" (always half-block art), or "off".
+    #[serde(default = "default_auto")]
+    pub images: String,
+    /// Desktop notification when a long turn finishes: "auto" (default;
+    /// only while the terminal window is unfocused), "always", or "off".
+    #[serde(default = "default_auto")]
+    pub notify: String,
+}
+
+fn default_auto() -> String {
+    "auto".into()
 }
 
 fn default_sandbox() -> String {
@@ -289,6 +302,8 @@ impl Default for Settings {
             instruction_files: default_instruction_files(),
             skill_dirs: Vec::new(),
             sandbox: default_sandbox(),
+            images: default_auto(),
+            notify: default_auto(),
             sandbox_network: true,
         }
     }

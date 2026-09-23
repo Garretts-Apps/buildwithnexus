@@ -1,5 +1,7 @@
 {
   "//": "Copy to ~/.buildwithnexus/settings.json (user) or .buildwithnexus/settings.json (project). Both are merged. Hook commands get the event as JSON on stdin.",
+  "images": "auto",
+  "notify": "auto",
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "echo \"session in $BWN_PROJECT_DIR\"" }] }

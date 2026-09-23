@@ -45,6 +45,8 @@
 pub mod agent;
 pub mod checkpoint;
 pub mod config;
+pub mod graphics;
+pub mod highlight;
 pub mod hooks;
 pub mod knowledge;
 pub mod local;
@@ -624,7 +626,9 @@ fn repl(
     initial_prompt: Option<String>,
 ) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
+    tui::configure_ui(&settings.images, &settings.notify);
     tui::set_permission_mode(permission_label(&perm));
+    tui::set_model_label(&provider.model);
 
     // Show the full-screen header banner.
     let mode_name = "BRAINSTORM"; // default starting mode
@@ -2300,6 +2304,7 @@ fn swap_model(
                 match provider::validate(&p) {
                     Ok(Some(new_model)) => {
                         s.model = new_model.clone();
+                        tui::set_model_label(&new_model);
                         provider.model = new_model;
                     }
                     Ok(None) => {}
@@ -3816,14 +3821,11 @@ fn extract_attachments(
                             _ => "image/png",
                         };
                         images.push((media_type.to_string(), media::b64_encode(&buf)));
-                        // Show the attachment in the transcript: a half-block
-                        // thumbnail rendered inline (any truecolor terminal).
-                        if let Some((tw, th, rgb)) = media::decode_thumbnail(&p, 64, 36) {
-                            let rows = tui::image_preview(&rgb, tw, th);
-                            if !rows.is_empty() {
-                                tui::line(&rows.join("\n"));
-                            }
-                        }
+                        // Show the attachment in the transcript (pixel-perfect
+                        // or half-block, see tui::show_image_file); a pasted
+                        // screenshot already previewed at paste time is not
+                        // drawn twice.
+                        tui::show_image_file(&p, true);
                         if !clean.is_empty() {
                             clean.push(' ');
                         }
@@ -3852,13 +3854,8 @@ fn extract_attachments(
                         let n = v.frames.len();
                         images.extend(v.frames);
                         text_attachments.push(v.summary);
-                        // First frame as an inline thumbnail.
-                        if let Some((tw, th, rgb)) = media::decode_thumbnail(&p, 64, 36) {
-                            let rows = tui::image_preview(&rgb, tw, th);
-                            if !rows.is_empty() {
-                                tui::line(&rows.join("\n"));
-                            }
-                        }
+                        // First frame inline.
+                        tui::show_image_file(&p, true);
                         if !clean.is_empty() {
                             clean.push(' ');
                         }
