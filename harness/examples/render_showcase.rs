@@ -37,9 +37,8 @@ fn header_stays_on_top() {\n\
     );
     println!("[[IMAGE]]");
     println!(
-        "{} {}",
-        tui::accent("›"),
-        "why does the dropdown overlap the header? @\"Screenshot 2026-09-23 at 14.02.11.png\""
+        "{} why does the dropdown overlap the header? @\"Screenshot 2026-09-23 at 14.02.11.png\"",
+        tui::accent("›")
     );
     println!();
     println!("{}", tui::render_md(reply));
