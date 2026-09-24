@@ -4,8 +4,6 @@ name: labels
 # (.github/dependabot.yml). Manual: run it once after adding a label here.
 on:
   workflow_dispatch:
-  push:
-    branches: [claude/optimistic-brown-bq4tbz-labels]
 
 permissions: {}
 
