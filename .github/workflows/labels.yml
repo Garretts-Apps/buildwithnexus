@@ -1,0 +1,29 @@
+name: labels
+
+# Creates or refreshes the repository labels Dependabot applies
+# (.github/dependabot.yml). Manual: run it once after adding a label here.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Create or update labels
+        run: |
+          set -euo pipefail
+          create() {
+            gh label create "$1" --color "$2" --description "$3" --force
+          }
+          create dependencies   0366d6 "Dependency updates"
+          create github-actions 000000 "GitHub Actions workflow dependencies"
+          create npm            cb3837 "npm package dependencies"
+          gh label list --limit 50
