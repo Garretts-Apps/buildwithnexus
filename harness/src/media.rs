@@ -276,6 +276,64 @@ pub fn decode_thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32
     Some((w, h, out.stdout))
 }
 
+// ── pixel-perfect images ─────────────────────────────────────────────────────
+// The kitty graphics path wants PNG bytes plus the pixel size. PNGs are read
+// straight from disk (the IHDR chunk carries the size, so a pasted screenshot
+// needs no external tool at all); anything else — JPEG, WebP, GIF, or a
+// video's first frame — is converted with ffmpeg when it is installed.
+
+/// Width × height from a PNG's IHDR chunk, or None when `bytes` isn't a PNG.
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.len() < 24 || bytes[..8] != SIG || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let (w, h) = (be(16), be(20));
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+/// PNG bytes and pixel size for `path`, no wider than `max_w` pixels. A PNG
+/// that already fits is returned as-is; larger or non-PNG inputs go through
+/// ffmpeg (`-frames:v 1`, so a video yields its first frame). None when the
+/// file can't be decoded with what's installed.
+pub fn png_for_terminal(path: &Path, max_w: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let have_ffmpeg = ffmpeg_available();
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Some((w, h)) = png_dimensions(&bytes) {
+            // Oversized PNGs are downscaled when ffmpeg is around (smaller
+            // upload); without it the terminal scales the full image itself.
+            if w <= max_w || !have_ffmpeg {
+                return Some((bytes, w, h));
+            }
+        }
+    }
+    if !have_ffmpeg {
+        return None;
+    }
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!("scale='min(iw,{max_w})':-2"),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let (w, h) = png_dimensions(&out.stdout)?;
+    Some((out.stdout, w, h))
+}
+
 // ── clipboard capture ────────────────────────────────────────────────────────
 
 /// Grabs an image from the system clipboard into a temp PNG, if one is there.
@@ -578,6 +636,19 @@ mod tests {
                 "{m}"
             );
         }
+    }
+
+    #[test]
+    fn png_dimensions_reads_ihdr() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1280u32.to_be_bytes());
+        png.extend_from_slice(&720u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert_eq!(png_dimensions(&png), Some((1280, 720)));
+        assert_eq!(png_dimensions(b"not a png at all, definitely not"), None);
+        assert_eq!(png_dimensions(&png[..20]), None);
     }
 
     #[test]

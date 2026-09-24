@@ -4,6 +4,67 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-09-23
+
+The "see it" release: the terminal shows you the actual pixels of what you
+attach, code and tables render the way an editor would, and the footer tells
+you what the agent is doing while it works — without giving up a microsecond
+of the streaming path.
+
+### Added
+- **Pixel-perfect inline images.** On kitty, Ghostty, and WezTerm builds with
+  Unicode-placeholder support, an attached screenshot is uploaded once through
+  the kitty graphics protocol and drawn at real resolution inside the
+  transcript. The image rows are ordinary text (U+10EEEE placeholder cells),
+  so they scroll, wrap, and repaint like any other line, work through tmux
+  (`allow-passthrough on`), and are freed when you leave the screen. Every
+  other truecolor terminal gets the half-block preview, now sized to the
+  terminal (up to 160 columns × 48 rows) instead of a 64×36 thumbnail. PNGs
+  are read natively — no ffmpeg needed for a pasted screenshot; JPEG, WebP,
+  GIF and a video's first frame go through ffmpeg when it is installed.
+  Settings key `images`: `auto` (default), `kitty`, `blocks`, `off`;
+  `BWN_IMAGES` overrides it.
+- **Images show the moment you paste.** `Ctrl+V` renders the clipboard
+  screenshot immediately, above the composer, so you see what the model will
+  see before you send — and it is not drawn a second time on submit.
+- **Drop a file onto the terminal.** A pasted or drag-and-dropped path to an
+  image or video (quoted, `file://`, `~/`, or shell-escaped, as macOS, iTerm2,
+  and WezTerm produce) becomes an `@attachment` token and previews at once.
+  Paths with spaces are quoted for you.
+- **Syntax highlighting in code blocks.** Streamed and replied fenced blocks
+  are highlighted for Rust, C/C++, JavaScript/TypeScript, Python, Go,
+  Java/Kotlin/Swift, shell, Ruby/PHP/Lua, SQL, JSON, YAML, TOML, CSS, HTML
+  and diffs — a zero-dependency lexer that runs once per block when the
+  closing fence lands, never per token.
+- **Markdown tables.** `| a | b |` blocks are collected while streaming and
+  drawn as one aligned table: bold header, `─┼─` rule, `:--`/`:-:`/`--:`
+  alignment, and columns that shrink with `…` instead of wrapping.
+- **More markdown.** `---` rules, `####` headings, `- [ ]`/`- [x]` task
+  lists, and `~~strikethrough~~`.
+- **Live footer while the agent works.** A spinner, elapsed time, streamed
+  tokens per second, and `Esc to interrupt` replace the idle footer text for
+  the duration of a turn; the model name is always shown.
+- **Desktop notification when a long turn ends.** After a turn of 8 s or
+  more finishes while the terminal window is unfocused, buildwithnexus emits
+  OSC 99 (kitty), OSC 777 (urxvt, VTE, WezTerm) and OSC 9 (iTerm2, WezTerm,
+  Windows Terminal) plus BEL. Settings key `notify`: `auto` (default),
+  `always`, `off`. Focus is tracked with CSI ?1004.
+- **Taskbar progress.** Windows Terminal, Ghostty and ConEmu show an
+  indeterminate progress state while the agent runs (OSC 9;4).
+
+### Fixed
+- **Scrolling back stays put.** Reading earlier output while the model
+  streams no longer yanks the view: new rows raise the scroll offset by the
+  same amount, so the row you were reading stays where it is.
+- **Colour survives wrapping.** A styled span that wrapped onto a second row
+  lost its colour on that row; the active SGR state is now replayed at each
+  continuation row (this also keeps image rows intact on narrow terminals).
+- The escape-sequence scanner understands APC, DCS, PM and SOS strings, so a
+  graphics payload or a tmux passthrough never counts as visible width.
+- Selection copy across an image row yields spaces, not placeholder bytes.
+- The Ctrl+V attachment token is quoted when the temp path contains spaces
+  (Windows).
+
 ## [0.13.0] - 2026-09-08
 
 The audit release: every claim on buildwithnexus.dev was checked against the

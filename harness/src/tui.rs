@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
-    poll, read, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-    EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    poll, read, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
+    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -34,6 +35,137 @@ pub enum InterruptKind {
 
 static INTERRUPT_KIND_VAL: AtomicU8 = AtomicU8::new(0);
 static AGENT_RUNNING: AtomicBool = AtomicBool::new(false);
+// Live "working" readout: when the current turn started, how many streamed
+// characters have landed since (→ tokens/s), and when the footer last
+// repainted its elapsed-time tick.
+static WORK_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+static STREAM_CHARS: AtomicUsize = AtomicUsize::new(0);
+static LAST_STATUS_TICK_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
+// Terminal focus (CSI ?1004 reports); assumed focused until told otherwise,
+// so a terminal that never reports focus never gets a stray notification.
+static FOCUSED: AtomicBool = AtomicBool::new(true);
+// `notify` setting: 0 off, 1 auto (only while unfocused), 2 always.
+static NOTIFY_MODE: AtomicU8 = AtomicU8::new(1);
+// `images` setting: 0 off, 1 auto, 2 kitty (force placeholders), 3 blocks.
+static IMAGES_MODE: AtomicU8 = AtomicU8::new(1);
+// kitty image ids handed out this session; whether any were uploaded (so
+// leaving the screen frees them).
+static NEXT_IMAGE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static IMAGES_SENT: AtomicBool = AtomicBool::new(false);
+
+fn model_label() -> &'static Mutex<String> {
+    static M: OnceLock<Mutex<String>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn previewed_paths() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static P: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Model name shown in the footer (set at startup and on `/model`).
+pub fn set_model_label(model: &str) {
+    if let Ok(mut m) = model_label().lock() {
+        *m = model.to_string();
+    }
+    render_footer();
+}
+
+/// Apply the `images` and `notify` settings keys.
+pub fn configure_ui(images: &str, notify: &str) {
+    IMAGES_MODE.store(
+        match images.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" => 0,
+            "kitty" => 2,
+            "blocks" | "half" => 3,
+            _ => 1,
+        },
+        Ordering::Relaxed,
+    );
+    NOTIFY_MODE.store(
+        match notify.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" => 0,
+            "always" => 2,
+            _ => 1,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether the terminal window currently has focus (per CSI ?1004 reports).
+pub fn is_focused() -> bool {
+    FOCUSED.load(Ordering::Relaxed)
+}
+
+// ── desktop notifications ────────────────────────────────────────────────────
+// Fired when a long turn ends while the window is unfocused: OSC 99 (kitty),
+// OSC 777 (urxvt, VTE, WezTerm), OSC 9 (iTerm2, WezTerm, Windows Terminal —
+// where OSC 9 isn't a progress code), plus BEL so terminals without any
+// notification protocol still badge or bounce. Terminals ignore what they
+// don't know.
+fn osc9_is_notification() -> bool {
+    let tp = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    tp == "iTerm.app" || tp == "WezTerm" || std::env::var_os("WT_SESSION").is_some()
+}
+
+fn osc9_4_is_progress() -> bool {
+    let tp = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    tp == "ghostty"
+        || std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("ConEmuANSI").is_some()
+}
+
+/// Send a desktop notification if the `notify` setting and focus state allow.
+pub fn notify(title: &str, body: &str) {
+    // Interactive TUI only: a headless/--json run must never emit chrome.
+    if !ALT_SCREEN.load(Ordering::Relaxed) || !io::stdout().is_terminal() {
+        return;
+    }
+    match NOTIFY_MODE.load(Ordering::Relaxed) {
+        0 => return,
+        1 if is_focused() => return,
+        _ => {}
+    }
+    let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).take(200).collect() };
+    let (title, body) = (clean(title), clean(body));
+    let mut out = io::stdout();
+    let _ = write!(
+        out,
+        "\x1b]99;i=1:d=0:p=title;{title}\x1b\\\x1b]99;i=1:d=1:p=body;{body}\x1b\\"
+    );
+    let _ = write!(out, "\x1b]777;notify;{title};{body}\x1b\\");
+    if osc9_is_notification() {
+        let _ = write!(out, "\x1b]9;{title}: {body}\x1b\\");
+    }
+    let _ = write!(out, "\x07");
+    let _ = out.flush();
+}
+
+// Taskbar / dock progress (OSC 9;4): indeterminate while the agent works,
+// cleared when it stops. Only on terminals where OSC 9;4 means progress.
+fn taskbar_progress(on: bool) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) || !io::stdout().is_terminal() || !osc9_4_is_progress() {
+        return;
+    }
+    let _ = write!(
+        io::stdout(),
+        "{}",
+        if on {
+            "\x1b]9;4;3\x1b\\"
+        } else {
+            "\x1b]9;4;0\x1b\\"
+        }
+    );
+    flush();
+}
 static CONTEXT_USED: AtomicUsize = AtomicUsize::new(0);
 static CONTEXT_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
@@ -301,6 +433,11 @@ const DIFF_DEL_BG: Rgb = Rgb(0x37, 0x22, 0x2c);
 const DIFF_ADD_EMPH_BG: Rgb = Rgb(0x2c, 0x4d, 0x38);
 const DIFF_DEL_EMPH_BG: Rgb = Rgb(0x5a, 0x2e, 0x40);
 
+/// True when colour output is off (`NO_COLOR`); highlighters skip work.
+pub fn color_disabled() -> bool {
+    no_color()
+}
+
 fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some()
 }
@@ -505,6 +642,158 @@ pub fn diff_del_emph_span(s: &str) -> String {
     on_bg(DIFF_DEL_EMPH_BG, TEXT, s)
 }
 
+// ── inline images ────────────────────────────────────────────────────────────
+// Two tiers. Terminals that render kitty Unicode placeholders (kitty,
+// Ghostty, WezTerm with placeholder support) get the real pixels: the PNG
+// is uploaded once and the transcript carries placeholder rows that scroll,
+// wrap and repaint like text (see graphics.rs). Everywhere else the image
+// is drawn as truecolor half-block cells sized to the terminal, which needs
+// ffmpeg for the decode. Both paths are gated by the `images` setting.
+
+const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+fn images_enabled() -> bool {
+    IMAGES_MODE.load(Ordering::Relaxed) != 0
+}
+
+fn use_placeholders() -> bool {
+    match IMAGES_MODE.load(Ordering::Relaxed) {
+        2 => true,
+        3 | 0 => false,
+        _ => crate::graphics::placeholders_supported(),
+    }
+}
+
+// Cell budget for an inline image: most of the width, and enough rows to
+// fit above the composer without pushing the header off screen.
+fn image_cell_budget() -> (usize, usize) {
+    let (w, h) = term_size();
+    let cols = (w as usize).saturating_sub(4).clamp(8, 160);
+    let rows = (h as usize)
+        .saturating_sub(reserved_rows() as usize + 4)
+        .clamp(4, 48);
+    (cols, rows)
+}
+
+fn free_images() {
+    if IMAGES_SENT.swap(false, Ordering::Relaxed) {
+        let _ = write!(io::stdout(), "{}", crate::graphics::delete_all());
+        flush();
+    }
+}
+
+/// Show `path` (an image, or a video's first frame via ffmpeg) inline in
+/// the transcript. With `once`, a path already shown this session is
+/// skipped (a pasted screenshot previews at paste time and must not repeat
+/// on submit). Returns whether anything was drawn.
+pub fn show_image_file(path: &std::path::Path, once: bool) -> bool {
+    if !images_enabled() || no_color() {
+        return false;
+    }
+    if let Ok(mut seen) = previewed_paths().lock() {
+        if !seen.insert(path.to_path_buf()) && once {
+            return true;
+        }
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let link = file_link(&path.display().to_string(), &name);
+    let (max_cols, max_rows) = image_cell_budget();
+    if ALT_SCREEN.load(Ordering::Relaxed) && use_placeholders() {
+        if let Some((png, iw, ih)) = crate::media::png_for_terminal(path, 1600) {
+            let cell = crate::graphics::cell_pixels();
+            let (cols, rows) = crate::graphics::fit_cells(iw, ih, max_cols, max_rows, cell);
+            let id = NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let _ = write!(
+                io::stdout(),
+                "{}",
+                crate::graphics::transmit(&png, id, cols, rows)
+            );
+            flush();
+            IMAGES_SENT.store(true, Ordering::Relaxed);
+            let mut rows_out = vec![format!(
+                "  {} {} {}",
+                dim("⎘"),
+                link,
+                dim(&format!("· {iw}×{ih}"))
+            )];
+            rows_out.extend(crate::graphics::placeholder_rows(id, cols, rows, 2));
+            line(&rows_out.join("\n"));
+            return true;
+        }
+    }
+    // Half-block fallback: one text row shows two pixel rows.
+    if !truecolor() {
+        return false;
+    }
+    let px_rows = ((max_rows * 2) as u32).max(2);
+    if let Some((tw, th, rgb)) = crate::media::decode_thumbnail(path, max_cols as u32, px_rows) {
+        let rows = image_preview_cells(&rgb, tw, th);
+        if !rows.is_empty() {
+            let mut out = vec![format!("  {} {}", dim("⎘"), link)];
+            out.extend(rows);
+            line(&out.join("\n"));
+            return true;
+        }
+    }
+    false
+}
+
+/// `@path` token for the composer, quoted when the path needs it (shlex
+/// splits the prompt at submit time).
+pub fn attachment_token(path: &std::path::Path) -> String {
+    let p = path.display().to_string();
+    if p.chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+    {
+        format!("@\"{}\" ", p.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("@{p} ")
+    }
+}
+
+/// A pasted (or drag-and-dropped) single file path to an image or video:
+/// quotes, `file://`, shell escapes and `~` stripped; must exist. Anything
+/// else — prose, multi-line text, non-media files — is None.
+pub fn pasted_media_path(text: &str) -> Option<std::path::PathBuf> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 4096 || t.contains('\n') || t.contains('\r') {
+        return None;
+    }
+    let mut t = t.to_string();
+    for q in ['"', '\''] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            t = t[1..t.len() - 1].to_string();
+        }
+    }
+    if let Some(rest) = t.strip_prefix("file://") {
+        t = rest.to_string();
+    }
+    // Shell-escaped spaces from a drag-and-drop (`My\ Shot.png`).
+    if t.contains("\\ ") {
+        t = t.replace("\\ ", " ");
+    }
+    if let Some(rest) = t.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            t = std::path::PathBuf::from(home)
+                .join(rest)
+                .display()
+                .to_string();
+        }
+    }
+    let path = std::path::PathBuf::from(&t);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !IMAGE_EXTS.contains(&ext.as_str()) && !crate::media::VIDEO_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    path.is_file().then_some(path)
+}
+
 // ── inline image preview ─────────────────────────────────────────────────────
 // Renders RGB pixels as half-block cells: each character shows two vertically
 // stacked pixels ('▀' with fg = top pixel, bg = bottom pixel). Works in every
@@ -570,6 +859,9 @@ enum StreamState {
     Normal,
     InCode { lang: String, lines: Vec<String> },
     MaybeJson { lines: Vec<String> },
+    // A pipe table being collected; rendered as one aligned block when the
+    // first non-table line (or the end of the stream) arrives.
+    InTable { rows: Vec<String> },
 }
 
 pub struct StreamRenderer {
@@ -694,6 +986,15 @@ impl StreamRenderer {
                     let lines = vec![text.to_string()];
                     self.state = StreamState::MaybeJson { lines };
                     self.try_flush_maybe_json(false);
+                } else if is_table_row(text) {
+                    // The raw row was echoed live; it is replaced by the
+                    // aligned table once the block is complete.
+                    if had_partial {
+                        retract_stream_line();
+                    }
+                    self.state = StreamState::InTable {
+                        rows: vec![text.to_string()],
+                    };
                 } else {
                     // Regular text: preserve blank lines; render markdown
                     // formatting. If the raw partial was echoed live, swap it
@@ -724,6 +1025,22 @@ impl StreamRenderer {
                 self.state = StreamState::MaybeJson { lines };
                 self.try_flush_maybe_json(false);
             }
+            StreamState::InTable { mut rows } => {
+                if is_table_row(text) {
+                    rows.push(text.to_string());
+                    self.state = StreamState::InTable { rows };
+                } else {
+                    // The line that ends the table was echoed raw as the
+                    // open stream line; pull it back so the table lands
+                    // first, then render that line normally.
+                    if had_partial {
+                        retract_stream_line();
+                    }
+                    self.emit(&render_table(&rows, self.w).join("\n"));
+                    self.state = StreamState::Normal;
+                    self.process_line(text, false);
+                }
+            }
         }
     }
 
@@ -740,6 +1057,9 @@ impl StreamRenderer {
             StreamState::MaybeJson { lines } => {
                 self.state = StreamState::MaybeJson { lines };
                 self.try_flush_maybe_json(true);
+            }
+            StreamState::InTable { rows } => {
+                self.emit(&render_table(&rows, self.w).join("\n"));
             }
         }
     }
@@ -780,10 +1100,176 @@ impl StreamRenderer {
         // call means one repaint instead of one per code row.
         let mut rows = Vec::with_capacity(lines.len() + 2);
         rows.push(code_box_header(lang, self.w));
-        rows.extend(lines.iter().map(|text| code_box_line(text)));
+        let lit = crate::highlight::highlight_block(lang, lines);
+        rows.extend(lit.iter().map(|text| code_box_line(text)));
         rows.push(code_box_footer(self.w));
         self.emit(&rows.join("\n"));
     }
+}
+
+// ── markdown pipe tables ─────────────────────────────────────────────────────
+// `| a | b |` rows are collected and drawn as one aligned block: bold header,
+// a `─┼─` rule where the `|---|` separator was, dim column bars, and cell
+// alignment from `:--` / `:-:` / `--:`. Columns shrink (widest first, cut
+// with `…`) rather than wrap when the table is wider than the terminal, so
+// every row stays exactly one terminal row.
+
+fn is_table_row(l: &str) -> bool {
+    let t = l.trim();
+    t.len() > 1 && t.starts_with('|') && t[1..].contains('|')
+}
+
+fn split_table_cells(l: &str) -> Vec<String> {
+    let t = l.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = t.chars().peekable();
+    let mut in_code = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cur.push('|');
+                chars.next();
+            }
+            '`' => {
+                in_code = !in_code;
+                cur.push(c);
+            }
+            '|' if !in_code => cells.push(std::mem::take(&mut cur).trim().to_string()),
+            _ => cur.push(c),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+// `|---|:--:|--:|` → per-column alignment, or None when this isn't a separator.
+fn table_separator(cells: &[String]) -> Option<Vec<Align>> {
+    if cells.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cells.len());
+    for c in cells {
+        let c = c.trim();
+        let body = c.trim_start_matches(':').trim_end_matches(':');
+        if body.is_empty() || !body.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        out.push(match (c.starts_with(':'), c.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        });
+    }
+    Some(out)
+}
+
+fn render_table(rows: &[String], w: usize) -> Vec<String> {
+    let parsed: Vec<Vec<String>> = rows.iter().map(|r| split_table_cells(r)).collect();
+    let mut aligns: Option<Vec<Align>> = None;
+    let mut sep_at: Option<usize> = None;
+    for (i, cells) in parsed.iter().enumerate() {
+        if i <= 1 {
+            if let Some(a) = table_separator(cells) {
+                aligns = Some(a);
+                sep_at = Some(i);
+                break;
+            }
+        }
+    }
+    let ncols = parsed.iter().map(|c| c.len()).max().unwrap_or(0);
+    if ncols == 0 {
+        return rows.iter().map(|r| render_md_line(r)).collect();
+    }
+    // Format cells once; measure their visible width.
+    let fmt: Vec<Vec<(String, usize)>> = parsed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != sep_at)
+        .map(|(_, cells)| {
+            (0..ncols)
+                .map(|j| {
+                    let raw = cells.get(j).map(String::as_str).unwrap_or("");
+                    let styled = format_inline_md(raw);
+                    let width = str_width(&strip_ansi(&styled));
+                    (styled, width)
+                })
+                .collect()
+        })
+        .collect();
+    let mut widths: Vec<usize> = (0..ncols)
+        .map(|j| fmt.iter().map(|r| r[j].1).max().unwrap_or(0).max(1))
+        .collect();
+    // Fit: indent 2 + "│ " … " │ " separators (3 per gap) must stay ≤ w.
+    let chrome = 2 + 3 * ncols.saturating_sub(1);
+    let avail = w.saturating_sub(chrome).max(ncols * 3);
+    while widths.iter().sum::<usize>() > avail {
+        let (idx, _) = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, wd)| **wd)
+            .unwrap_or((0, &0));
+        if widths[idx] <= 3 {
+            break;
+        }
+        widths[idx] -= 1;
+    }
+    let has_header = sep_at.is_some();
+    let aligns = aligns.unwrap_or_else(|| vec![Align::Left; ncols]);
+    let bar = dim("│");
+    let mut out = Vec::with_capacity(fmt.len() + 1);
+    for (ri, row) in fmt.iter().enumerate() {
+        let mut line = String::from("  ");
+        for (j, (styled, width)) in row.iter().enumerate() {
+            let target = widths[j];
+            let (cell, cw) = if *width > target {
+                let cut = clip_ansi_line(styled, target.saturating_sub(1));
+                (format!("{cut}…"), target)
+            } else {
+                (styled.clone(), *width)
+            };
+            let cell = if has_header && ri == 0 {
+                bold(&cell)
+            } else {
+                cell
+            };
+            let pad = target - cw;
+            let (l, r) = match aligns.get(j).copied().unwrap_or(Align::Left) {
+                Align::Left => (0, pad),
+                Align::Right => (pad, 0),
+                Align::Center => (pad / 2, pad - pad / 2),
+            };
+            if j > 0 {
+                line.push(' ');
+                line.push_str(&bar);
+                line.push(' ');
+            }
+            line.push_str(&" ".repeat(l));
+            line.push_str(&cell);
+            line.push_str(&" ".repeat(r));
+        }
+        out.push(line);
+        if has_header && ri == 0 {
+            let mut rule = String::from("  ");
+            for (j, wd) in widths.iter().enumerate() {
+                if j > 0 {
+                    rule.push_str("─┼─");
+                }
+                rule.push_str(&"─".repeat(*wd));
+            }
+            out.push(dim(&rule));
+        }
+    }
+    out
 }
 
 // Bordered code-block chrome, shared by the streaming renderer and render_md().
@@ -1198,16 +1684,27 @@ pub fn poll_typeahead() {
                 }
             }
             Ok(Event::Paste(s)) => {
+                // A dropped/pasted image or video path becomes an @attachment
+                // token (and previews at once, even mid-turn).
+                let media = pasted_media_path(&s);
+                let text = match &media {
+                    Some(p) => attachment_token(p),
+                    None => s.clone(),
+                };
                 let mut ta = match typeahead().lock() {
                     Ok(g) => g,
                     Err(_) => continue,
                 };
-                for c in s.chars() {
+                for c in text.chars() {
                     if c != '\r' && c != '\n' {
                         let i = ta.cursor;
                         ta.buf.insert(i, c);
                         ta.cursor += 1;
                     }
+                }
+                drop(ta);
+                if let Some(p) = media {
+                    show_image_file(&p, false);
                 }
             }
             Ok(Event::Mouse(m)) => match m.kind {
@@ -1226,7 +1723,8 @@ pub fn poll_typeahead() {
                     render_queued_composer();
                 }
             }
-            Ok(_) => {}
+            Ok(Event::FocusGained) => FOCUSED.store(true, Ordering::Relaxed),
+            Ok(Event::FocusLost) => FOCUSED.store(false, Ordering::Relaxed),
             Err(_) => break,
         }
     }
@@ -1355,6 +1853,7 @@ pub fn char_width(c: char) -> usize {
         || u == 0x200B
         || u == 0x200C
         || u == 0x200D
+        || (u > 0x036F && u < 0x1000 && crate::graphics::is_diacritic(c))
     {
         return 0;
     }
@@ -1458,6 +1957,25 @@ fn format_inline_md(text: &str) -> String {
             i += 1;
             continue;
         }
+        if c == '~' && i + 1 < n && chars[i + 1] == '~' {
+            // ~~strike~~: styled only when a closing pair follows.
+            if let Some(rel) = chars[i + 2..]
+                .windows(2)
+                .position(|w| w[0] == '~' && w[1] == '~')
+            {
+                if rel > 0 {
+                    flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
+                    let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
+                    out.push_str(&format!("\x1b[9m{}\x1b[29m", dim(&inner)));
+                    i += rel + 4;
+                    continue;
+                }
+            }
+            buf.push('~');
+            buf.push('~');
+            i += 2;
+            continue;
+        }
         if c == '*' && i + 1 < n && chars[i + 1] == '*' {
             let toggles = if bold_on {
                 i > 0 && !chars[i - 1].is_whitespace()
@@ -1521,6 +2039,22 @@ pub fn render_md_line(s: &str) -> String {
     }
     let trimmed = s.trim_start();
     let indent = &s[..s.len().saturating_sub(trimmed.len())];
+    // Thematic break: three or more of the same rule character.
+    if trimmed.len() >= 3 {
+        let mut it = trimmed.chars().filter(|c| !c.is_whitespace());
+        if let Some(first) = it.next() {
+            if matches!(first, '-' | '*' | '_')
+                && it.all(|c| c == first)
+                && trimmed.chars().filter(|c| *c == first).count() >= 3
+            {
+                let wd = term_size().0 as usize;
+                return format!("  {}", dim(&"─".repeat(wd.saturating_sub(4).clamp(8, 72))));
+            }
+        }
+    }
+    if let Some(header) = trimmed.strip_prefix("#### ") {
+        return format!("{}{}", indent, bold(&format_inline_md(header)));
+    }
     if let Some(header) = trimmed.strip_prefix("### ") {
         return format!("{}{}", indent, bold(&blue(&format_inline_md(header))));
     }
@@ -1538,7 +2072,18 @@ pub fn render_md_line(s: &str) -> String {
             italic(&dim(&format_inline_md(quote)))
         );
     }
-    let (prefix_span, rest) = if let Some(r) = trimmed.strip_prefix("- ") {
+    let (prefix_span, rest) = if let Some(r) = trimmed
+        .strip_prefix("- [x] ")
+        .or_else(|| trimmed.strip_prefix("* [x] "))
+        .or_else(|| trimmed.strip_prefix("- [X] "))
+    {
+        (Some(green("☑")), r)
+    } else if let Some(r) = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("* [ ] "))
+    {
+        (Some(dim("☐")), r)
+    } else if let Some(r) = trimmed.strip_prefix("- ") {
         (Some(dim("•")), r)
     } else if let Some(r) = trimmed.strip_prefix("* ") {
         (Some(dim("•")), r)
@@ -1667,17 +2212,33 @@ pub fn render_md(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     // Some(lang) while inside a fenced code block.
     let mut fence: Option<String> = None;
+    let mut code: Vec<String> = Vec::new();
+    let mut table: Vec<String> = Vec::new();
+    let flush_code = |lang: &str, code: &mut Vec<String>, out: &mut Vec<String>| {
+        let lit = crate::highlight::highlight_block(lang, code);
+        out.extend(lit.iter().map(|l| code_box_line(l)));
+        out.push(code_box_footer(w));
+        code.clear();
+    };
     for l in text.lines() {
         match fence {
-            Some(_) => {
+            Some(ref lang) => {
                 if l.trim() == "```" {
-                    out.push(code_box_footer(w));
+                    flush_code(lang, &mut code, &mut out);
                     fence = None;
                 } else {
-                    out.push(code_box_line(l));
+                    code.push(l.to_string());
                 }
             }
             None => {
+                if is_table_row(l) {
+                    table.push(l.to_string());
+                    continue;
+                }
+                if !table.is_empty() {
+                    out.extend(render_table(&table, w));
+                    table.clear();
+                }
                 if let Some(rest) = l.trim_start().strip_prefix("```") {
                     let lang = rest.trim().to_string();
                     out.push(code_box_header(&lang, w));
@@ -1688,9 +2249,12 @@ pub fn render_md(text: &str) -> String {
             }
         }
     }
+    if !table.is_empty() {
+        out.extend(render_table(&table, w));
+    }
     // Unclosed fence: close the border so the block doesn't bleed on.
-    if fence.is_some() {
-        out.push(code_box_footer(w));
+    if let Some(lang) = fence {
+        flush_code(&lang, &mut code, &mut out);
     }
     out.join("\n")
 }
@@ -1705,20 +2269,31 @@ fn eat_escape(chars: &mut std::iter::Peekable<std::str::Chars>, mut out: Option<
             o.push(c);
         }
     };
-    if chars.peek() == Some(&']') {
-        // OSC: terminated by BEL or ST (ESC \).
+    // OSC (ESC ]) strings end at BEL or ST (ESC \); APC (ESC _, kitty
+    // graphics), DCS (ESC P, tmux passthrough / sixel), PM and SOS end at
+    // ST only. Treating them as CSI would stop at the first letter and leak
+    // a base64 payload into the visible text.
+    let string_start = matches!(
+        chars.peek(),
+        Some(']') | Some('_') | Some('P') | Some('^') | Some('X')
+    );
+    if string_start {
+        let osc = chars.peek() == Some(&']');
         while let Some(d) = chars.next() {
             push(d);
-            if d == '\x07' {
+            if osc && d == '\x07' {
                 break;
             }
-            if d == '\x1b' {
-                if chars.peek() == Some(&'\\') {
-                    push(chars.next().unwrap_or('\\'));
-                }
+            // Only a real ST ends the string; an ESC followed by anything
+            // else (tmux doubles ESCs inside its passthrough) is payload.
+            if d == '\x1b' && chars.peek() == Some(&'\\') {
+                push(chars.next().unwrap_or('\\'));
                 break;
             }
         }
+    } else if chars.peek() == Some(&'\\') {
+        // A bare ST (ESC \) outside any string: two bytes, nothing more.
+        push(chars.next().unwrap_or('\\'));
     } else {
         for d in chars.by_ref() {
             push(d);
@@ -1735,6 +2310,12 @@ fn strip_ansi(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             eat_escape(&mut chars, None);
+        } else if c == crate::graphics::PLACEHOLDER {
+            // An inline-image cell has no text: copy it as a space so a
+            // selection across a picture stays column-aligned.
+            out.push(' ');
+        } else if !c.is_ascii() && crate::graphics::is_diacritic(c) {
+            // Row/column marks of an image cell — zero width, no text.
         } else {
             out.push(c);
         }
@@ -1864,15 +2445,50 @@ fn queue_footer(out: &mut io::Stdout) {
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
 
     let footer = footer_text().lock().map(|f| f.clone()).unwrap_or_default();
-    let base_text = if footer.is_empty() {
+    let model = model_label().lock().map(|m| m.clone()).unwrap_or_default();
+    let model_badge = if model.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", dim(&model))
+    };
+    let base_text = if is_agent_running() {
+        // Live readout: braille spinner, elapsed, streamed tokens/s.
+        let started = WORK_STARTED_MS.load(Ordering::Relaxed);
+        let elapsed_ms = now_ms().saturating_sub(started).max(1);
+        let secs = elapsed_ms / 1000;
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = frames[((elapsed_ms / 100) % frames.len() as u64) as usize];
+        let chars = STREAM_CHARS.load(Ordering::Relaxed);
+        let tps = if chars > 0 && elapsed_ms >= 500 {
+            format!(
+                " · {:.0} tok/s",
+                (chars as f64 / 4.0) / (elapsed_ms as f64 / 1000.0)
+            )
+        } else {
+            String::new()
+        };
+        let clock = if secs >= 60 {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
         format!(
-            "{} {} {}",
+            "{}{} {} {}",
+            model_badge,
+            accent(frame),
+            bold("working"),
+            dim(&format!("· {clock}{tps} · Esc to interrupt"))
+        )
+    } else if footer.is_empty() {
+        format!(
+            "{}{} {} {}",
+            model_badge,
             dim("permission:"),
             bold("ask"),
             dim("· /permissions · wheel/PgUp · /mouse")
         )
     } else {
-        footer
+        format!("{model_badge}{footer}")
     };
 
     let used = CONTEXT_USED.load(Ordering::Relaxed);
@@ -2734,7 +3350,7 @@ pub fn enter_alt(raw: bool) {
     }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
-        let _ = execute!(io::stdout(), EnableBracketedPaste);
+        let _ = execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange);
         set_mouse_capture(true);
         // Accent-colored blinking bar cursor for the composer.
         cursor_color_accent();
@@ -2767,10 +3383,16 @@ pub fn leave_alt() {
         cursor_show();
     }
     if RAW.swap(false, Ordering::Relaxed) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            DisableMouseCapture
+        );
         MOUSE_CAPTURED.store(false, Ordering::Relaxed);
         let _ = disable_raw_mode();
     }
+    free_images();
     if ALT_SCREEN.swap(false, Ordering::Relaxed) {
         let _ = write!(io::stdout(), "\x1b[0m");
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
@@ -2781,6 +3403,7 @@ pub fn clear() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         SCROLL_OFFSET.store(0, Ordering::Relaxed);
         invalidate_stream_line();
+        free_images();
         if let Ok(mut t) = transcript().lock() {
             t.clear();
         }
@@ -2946,11 +3569,25 @@ fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut visible = 0usize;
+    // SGR sequences in force at the wrap point, replayed at the start of
+    // the continuation row: a terminal repaints rows independently, so a
+    // colour or tint that started on row 1 would otherwise vanish on row 2
+    // (and an image row's id colour would break its placeholder cells).
+    let mut active = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
+            let start = current.len();
             current.push(c);
             eat_escape(&mut chars, Some(&mut current));
+            let seq = &current[start..];
+            if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                if seq == "\x1b[0m" || seq == "\x1b[m" {
+                    active.clear();
+                } else {
+                    active.push_str(seq);
+                }
+            }
             continue;
         }
         let w = char_width(c);
@@ -2958,6 +3595,7 @@ fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
         // gets a row of its own instead of an infinite run of empty rows.
         if visible + w > max_cols && visible > 0 {
             out.push(std::mem::take(&mut current));
+            current.push_str(&active);
             visible = 0;
         }
         current.push(c);
@@ -3018,13 +3656,32 @@ fn retract_stream_line() {
     clear_composer();
 }
 
+// Keep a scrolled-back view pinned to what the reader is looking at: rows
+// appended at the bottom push the bottom-relative offset up by the same
+// amount. (Rows dropped from the front don't move the view — the offset is
+// measured from the end.)
+fn pin_scroll(before_rows: usize, t: &Transcript) {
+    if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
+        let added = t.total_rows().saturating_sub(before_rows);
+        if added > 0 {
+            SCROLL_OFFSET.fetch_add(added, Ordering::Relaxed);
+        }
+    }
+}
+
 pub fn line(s: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
         invalidate_stream_line();
         if let Ok(mut t) = transcript().lock() {
+            let before = if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
+                t.total_rows()
+            } else {
+                0
+            };
             for part in s.replace('\r', "").split('\n') {
                 t.push(part.to_string());
             }
+            pin_scroll(before, &t);
             const MAX_LINES: usize = 2_000;
             if t.len() > MAX_LINES {
                 let extra = t.len() - MAX_LINES;
@@ -3042,8 +3699,14 @@ pub fn line(s: &str) {
 }
 
 pub fn write_stream(chunk: &str) {
+    STREAM_CHARS.fetch_add(chunk.chars().count(), Ordering::Relaxed);
     if ALT_SCREEN.load(Ordering::Relaxed) {
         if let Ok(mut t) = transcript().lock() {
+            let before = if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
+                t.total_rows()
+            } else {
+                0
+            };
             let normalized = chunk.replace('\r', "");
             let mut parts = normalized.split('\n');
             if let Some(first) = parts.next() {
@@ -3059,6 +3722,7 @@ pub fn write_stream(chunk: &str) {
                 t.push(part.to_string());
                 OPEN_STREAM_LINE.store(t.len() - 1, Ordering::Relaxed);
             }
+            pin_scroll(before, &t);
             const MAX_LINES: usize = 2_000;
             if t.len() > MAX_LINES {
                 let extra = t.len() - MAX_LINES;
@@ -3104,6 +3768,13 @@ fn start_typeahead_thread() {
         std::thread::spawn(|| loop {
             if is_raw() && is_agent_running() {
                 poll_typeahead();
+                // Elapsed-time / tokens-per-second readout: repaint the
+                // footer row a few times a second while the agent works.
+                let now = now_ms();
+                if now.saturating_sub(LAST_STATUS_TICK_MS.load(Ordering::Relaxed)) >= 250 {
+                    LAST_STATUS_TICK_MS.store(now, Ordering::Relaxed);
+                    render_footer();
+                }
             }
             std::thread::sleep(Duration::from_millis(15));
         });
@@ -3112,10 +3783,37 @@ fn start_typeahead_thread() {
 
 // Non-blocking: drain pending key events and report whether Ctrl-C or Esc was pressed.
 pub fn set_agent_running(running: bool) {
-    AGENT_RUNNING.store(running, Ordering::Relaxed);
+    let was = AGENT_RUNNING.swap(running, Ordering::Relaxed);
     if running {
         INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
+        if !was {
+            WORK_STARTED_MS.store(now_ms(), Ordering::Relaxed);
+            STREAM_CHARS.store(0, Ordering::Relaxed);
+            taskbar_progress(true);
+        }
         start_typeahead_thread();
+    } else if was {
+        taskbar_progress(false);
+        let started = WORK_STARTED_MS.load(Ordering::Relaxed);
+        let elapsed = now_ms().saturating_sub(started);
+        // A turn long enough to have walked away from, and not a burst of
+        // nested start/stop pairs (sub-agents) re-announcing the same turn.
+        if elapsed >= 8_000
+            && now_ms().saturating_sub(LAST_NOTIFY_MS.load(Ordering::Relaxed)) > 5_000
+        {
+            LAST_NOTIFY_MS.store(now_ms(), Ordering::Relaxed);
+            let secs = elapsed / 1000;
+            let took = if secs >= 60 {
+                format!("{}m {:02}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            };
+            notify(
+                "buildwithnexus",
+                &format!("done after {took} — ready for your next prompt"),
+            );
+        }
+        render_footer();
     }
 }
 
@@ -4220,6 +4918,18 @@ fn read_line_raw_prefill(
         let ev = match read() {
             Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
             Ok(Event::Paste(s)) => {
+                // Drag a screenshot onto the terminal (or paste its path):
+                // the path becomes an @attachment token and the image shows
+                // in the transcript immediately — no need to submit first.
+                if let Some(p) = pasted_media_path(&s) {
+                    for ch in attachment_token(&p).chars() {
+                        buf.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                    show_image_file(&p, false);
+                    redraw(prompt, start, &buf, cursor, &mut scroll);
+                    continue;
+                }
                 for raw in s.chars() {
                     let c = match raw {
                         '\n' | '\r' | '\t' => ' ',
@@ -4294,6 +5004,14 @@ fn read_line_raw_prefill(
                     scroll = 0;
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
+                continue;
+            }
+            Ok(Event::FocusGained) => {
+                FOCUSED.store(true, Ordering::Relaxed);
+                continue;
+            }
+            Ok(Event::FocusLost) => {
+                FOCUSED.store(false, Ordering::Relaxed);
                 continue;
             }
             Ok(_) => continue,
@@ -4398,10 +5116,15 @@ fn read_line_raw_prefill(
                 // inserts at the cursor (for terminals that pass Ctrl+V
                 // through instead of translating it to a Paste event).
                 if let Some(img) = crate::media::clipboard_image_to_temp() {
-                    line(&dim(&format!("  ⎘ clipboard image → {}", img.display())));
-                    for ch in format!("@{} ", img.display()).chars() {
+                    for ch in attachment_token(&img).chars() {
                         buf.insert(cursor, ch);
                         cursor += 1;
+                    }
+                    // Show the screenshot right now — pixel-perfect on
+                    // kitty/Ghostty, half-block art elsewhere — so you can
+                    // see what the model will see before you send it.
+                    if !show_image_file(&img, false) {
+                        line(&dim(&format!("  ⎘ clipboard image → {}", img.display())));
                     }
                 } else if let Some(text) = crate::media::clipboard_text() {
                     for raw in text.chars() {
@@ -5522,6 +6245,144 @@ mod tests {
                 assert_eq!(got, want, "start={start} count={count}");
             }
         }
+    }
+
+    #[test]
+    fn eat_escape_handles_apc_and_dcs_strings() {
+        // kitty APC and tmux DCS payloads must be invisible to width math.
+        let apc = "\x1b_Ga=T,f=100,i=1;QUJDRA==\x1b\\x";
+        assert_eq!(strip_ansi(apc), "x");
+        assert_eq!(str_width(&strip_ansi(apc)), 1);
+        let dcs = "\x1bPtmux;\x1b\x1b_Ga=d\x1b\x1b\\\x1b\\y";
+        assert_eq!(strip_ansi(dcs), "y");
+        // OSC still terminates at BEL.
+        assert_eq!(strip_ansi("\x1b]8;;http://x\x07lbl\x1b]8;;\x07"), "lbl");
+        // Placeholder cells copy as spaces; their diacritics vanish.
+        let row = crate::graphics::placeholder_rows(3, 2, 1, 0).remove(0);
+        assert_eq!(strip_ansi(&row), "  ");
+        assert_eq!(char_width('\u{0483}'), 0);
+        assert_eq!(char_width(crate::graphics::PLACEHOLDER), 1);
+    }
+
+    #[test]
+    fn wrap_carries_sgr_onto_continuation_rows() {
+        let s = format!("{}abcdef", "\x1b[31m");
+        let rows = wrap_ansi_line(&s, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], "\x1b[31mabc");
+        assert_eq!(rows[1], "\x1b[31mdef");
+        // A reset clears the carried state.
+        let s = "\x1b[31mab\x1b[0mcdef";
+        let rows = wrap_ansi_line(s, 3);
+        assert_eq!(rows[1], "def");
+        // An image row wrapped in a narrow terminal keeps its id colour.
+        let row = crate::graphics::placeholder_rows(9, 4, 1, 0).remove(0);
+        let rows = wrap_ansi_line(&row, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].starts_with("\x1b[38;5;9m"));
+    }
+
+    #[test]
+    fn pipe_tables_render_aligned() {
+        std::env::remove_var("NO_COLOR");
+        let rows = vec![
+            "| Name | Qty | Price |".to_string(),
+            "|:-----|:---:|------:|".to_string(),
+            "| apple | 3 | 1.50 |".to_string(),
+            "| **kiwi** | 12 | 0.25 |".to_string(),
+        ];
+        let out = render_table(&rows, 80);
+        assert_eq!(out.len(), 4); // header, rule, two rows
+        let plain: Vec<String> = out.iter().map(|l| strip_ansi(l)).collect();
+        assert_eq!(plain[0], "  Name  │ Qty │ Price");
+        assert_eq!(plain[1], "  ──────┼─────┼──────");
+        assert_eq!(plain[2], "  apple │  3  │  1.50");
+        assert_eq!(plain[3], "  kiwi  │ 12  │  0.25");
+        // Every row is exactly one terminal row.
+        assert!(plain.iter().all(|l| str_width(l) == str_width(&plain[0])));
+        // Too wide: the widest column is cut with an ellipsis, never wrapped.
+        let wide = vec![
+            "| a | b |".to_string(),
+            "|---|---|".to_string(),
+            format!("| {} | x |", "y".repeat(100)),
+        ];
+        let out = render_table(&wide, 40);
+        assert!(out.iter().all(|l| str_width(&strip_ansi(l)) <= 40));
+        assert!(strip_ansi(&out[2]).contains('…'));
+        assert!(is_table_row("| a | b |"));
+        assert!(!is_table_row("|"));
+        assert!(!is_table_row("a | b"));
+        assert_eq!(
+            split_table_cells("| a \\| b | `c|d` |"),
+            vec!["a | b", "`c|d`"]
+        );
+    }
+
+    #[test]
+    fn stream_renderer_collects_tables() {
+        std::env::remove_var("NO_COLOR");
+        let mut r = StreamRenderer::new();
+        r.push("| h1 | h2 |\n|--|--|\n| 1 | 2 |\nafter\n");
+        r.flush();
+        let plain: Vec<String> = r.sink.iter().map(|l| strip_ansi(l)).collect();
+        // One emit for the whole table (three rows joined), then the line.
+        assert_eq!(plain.len(), 2);
+        assert!(plain[0].starts_with("  h1 │ h2\n"));
+        assert_eq!(plain[1], "after");
+    }
+
+    #[test]
+    fn markdown_extras() {
+        std::env::remove_var("NO_COLOR");
+        assert!(strip_ansi(&render_md_line("---")).trim().starts_with('─'));
+        assert!(strip_ansi(&render_md_line("* * *")).trim().starts_with('─'));
+        assert_eq!(strip_ansi(&render_md_line("#### Deep")), "Deep");
+        assert_eq!(strip_ansi(&render_md_line("- [ ] todo")), "  ☐ todo");
+        assert_eq!(strip_ansi(&render_md_line("- [x] done")), "  ☑ done");
+        let s = render_md_line("a ~~gone~~ b");
+        assert!(s.contains("\x1b[9m"));
+        assert_eq!(strip_ansi(&s), "a gone b");
+        assert_eq!(
+            strip_ansi(&render_md_line("~~ not closed")),
+            "~~ not closed"
+        );
+    }
+
+    #[test]
+    fn pasted_media_paths_become_tokens() {
+        let dir = std::env::temp_dir().join(format!("bwn-paste-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("shot one.png");
+        std::fs::write(&img, b"png").unwrap();
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"t").unwrap();
+        let p = img.display().to_string();
+        assert_eq!(pasted_media_path(&p).as_deref(), Some(img.as_path()));
+        assert_eq!(
+            pasted_media_path(&format!("'{p}'")).as_deref(),
+            Some(img.as_path())
+        );
+        assert_eq!(
+            pasted_media_path(&format!("\"{p}\"\n")).as_deref(),
+            Some(img.as_path())
+        );
+        assert_eq!(
+            pasted_media_path(&format!("file://{p}")).as_deref(),
+            Some(img.as_path())
+        );
+        assert_eq!(
+            pasted_media_path(&p.replace(' ', "\\ ")).as_deref(),
+            Some(img.as_path())
+        );
+        assert!(pasted_media_path(&txt.display().to_string()).is_none());
+        assert!(pasted_media_path("just some words about a .png file").is_none());
+        assert!(pasted_media_path(&format!("{p}\nsecond line")).is_none());
+        assert!(pasted_media_path(&dir.join("missing.png").display().to_string()).is_none());
+        // Token quoting: spaces get double quotes, plain paths don't.
+        assert_eq!(attachment_token(&img), format!("@\"{p}\" "));
+        let plain = std::path::Path::new("/tmp/a.png");
+        assert_eq!(attachment_token(plain), "@/tmp/a.png ");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
