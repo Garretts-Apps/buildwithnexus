@@ -4,6 +4,15 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-09-24
+
+### Security
+- **rustls 0.23.41 → 0.23.45** (and rustls-webpki 0.103.13 → 0.103.15):
+  fixes RUSTSEC-2026-0285, where TLS 1.3 handshake messages were accepted
+  across encryption level boundaries (CVSS 5.3, medium). buildwithnexus
+  talks to every hosted model provider over this TLS stack, so the fix is
+  shipped as a patch release. No code changes.
+
 ## [0.14.0] - 2026-09-23
 
 The "see it" release: the terminal shows you the actual pixels of what you
