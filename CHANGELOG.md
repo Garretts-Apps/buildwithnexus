@@ -15,8 +15,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of coloured block characters, which made text in screenshots
   unreadable at thumbnail size. bwn asks the terminal at startup whether it
   supports Sixel and how large a character cell is, so the image fills
-  exactly the rows it reserves. Set `BWN_IMAGES=sixel` to force it on, or
-  `BWN_IMAGES=blocks` to keep block art. Needs ffmpeg, like block previews.
+  exactly the rows it reserves. Works for native Windows (`bwn.exe` in
+  Windows Terminal) as well as Linux, macOS and WSL. Set `BWN_IMAGES=sixel` to
+  force it on, or `BWN_IMAGES=blocks` to keep block art. Needs ffmpeg, like
+  block previews.
 
 ### Changed
 - **Image previews follow the terminal size.** Resizing the window re-fits
@@ -24,6 +26,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   An image partly scrolled out of view is drawn cropped rather than
   overlapping the composer, and block previews shrink with area averaging so
   small text stays legible.
+- Dependencies: crossterm 0.29, libc 0.2.189, serde 1.0.229, serde_json
+  1.0.151, and criterion 0.8 for the benchmarks (which now use
+  `std::hint::black_box`).
 
 ## [0.14.6] - 2026-09-29
 

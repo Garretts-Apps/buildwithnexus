@@ -85,11 +85,18 @@ pub fn probe() {
             break;
         }
     }
-    let (sixel, mut cell) = parse_probe(&buf);
+    record_probe(&buf);
+}
+
+// Store what the terminal said: Sixel support and the cell size, from the
+// `16t` reply or else the `14t` window size divided by the grid.
+#[cfg(any(unix, windows))]
+fn record_probe(buf: &[u8]) {
+    let (sixel, mut cell) = parse_probe(buf);
     // No cell-size answer: derive it from the window's pixel size.
     if cell.is_none() {
         if let (Some((ww, wh)), Ok((cols, rows))) =
-            (parse_window_px(&buf), crossterm::terminal::size())
+            (parse_window_px(buf), crossterm::terminal::size())
         {
             if cols > 0 && rows > 0 {
                 cell = Some((ww / u32::from(cols), wh / u32::from(rows)));
@@ -106,8 +113,106 @@ pub fn probe() {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: the same query, read as console key events. VT input is turned
+/// on only for the probe, so the terminal's reply arrives as characters, and
+/// the console mode is restored before crossterm starts reading.
+#[cfg(windows)]
+pub fn probe() {
+    use std::io::Write;
+    if SUPPORT.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    SUPPORT.store(1, Ordering::Relaxed);
+    let buf = win::query(
+        b"\x1b[16t\x1b[14t\x1b[c",
+        std::time::Duration::from_millis(400),
+    );
+    let _ = std::io::stdout().flush();
+    record_probe(&buf);
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn probe() {}
+
+#[cfg(windows)]
+mod win {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    type Handle = *mut core::ffi::c_void;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const KEY_EVENT: u16 = 0x0001;
+    const WAIT_OBJECT_0: u32 = 0;
+
+    // INPUT_RECORD: a u16 event type, padding, then a 16-byte union whose
+    // KEY_EVENT_RECORD holds bKeyDown at 0 and the UTF-16 char at 10.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct InputRecord {
+        event_type: u16,
+        _pad: u16,
+        event: [u8; 16],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+        fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+        fn ReadConsoleInputW(h: Handle, buf: *mut InputRecord, len: u32, read: *mut u32) -> i32;
+    }
+
+    pub fn query(q: &[u8], timeout: Duration) -> Vec<u8> {
+        let mut reply = Vec::new();
+        // SAFETY: plain kernel32 calls on the process's own console handle,
+        // with buffers owned here and lengths that match them.
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode = 0u32;
+            if h.is_null() || GetConsoleMode(h, &mut mode) == 0 {
+                return reply;
+            }
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
+            let mut out = std::io::stdout();
+            if out.write_all(q).is_ok() && out.flush().is_ok() {
+                let deadline = Instant::now() + timeout;
+                let mut records = [InputRecord {
+                    event_type: 0,
+                    _pad: 0,
+                    event: [0; 16],
+                }; 64];
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero()
+                        || WaitForSingleObject(h, left.as_millis() as u32) != WAIT_OBJECT_0
+                    {
+                        break;
+                    }
+                    let mut n = 0u32;
+                    if ReadConsoleInputW(h, records.as_mut_ptr(), records.len() as u32, &mut n) == 0
+                    {
+                        break;
+                    }
+                    for r in &records[..n as usize] {
+                        let down =
+                            i32::from_le_bytes([r.event[0], r.event[1], r.event[2], r.event[3]]);
+                        let ch = u16::from_le_bytes([r.event[10], r.event[11]]);
+                        if r.event_type == KEY_EVENT && down != 0 && ch != 0 && ch < 0x80 {
+                            reply.push(ch as u8);
+                        }
+                    }
+                    if super::da1_complete(&reply) {
+                        break;
+                    }
+                }
+            }
+            SetConsoleMode(h, mode);
+        }
+        reply
+    }
+}
 
 fn da1_complete(buf: &[u8]) -> bool {
     let s = String::from_utf8_lossy(buf);
