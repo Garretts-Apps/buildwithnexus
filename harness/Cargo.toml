@@ -27,7 +27,7 @@ doc = false
 
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
-crossterm = "0.28"
+crossterm = "0.29"
 # Blocking HTTP with rustls — no async runtime, fast cold start, one TLS stack.
 ureq = { version = "2.10", features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
