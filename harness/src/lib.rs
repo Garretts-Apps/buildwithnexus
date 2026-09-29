@@ -71,7 +71,6 @@ use std::path::PathBuf;
 
 use agent::Permission;
 use config::Settings;
-use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -545,6 +544,8 @@ fn headless(
     opts: &CliOptions,
     f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>,
 ) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    hooks::trust_project(&cwd, false);
     let (provider, perm) = match provider_or_onboard(opts) {
         Ok(v) => v,
         Err(e) => {
@@ -553,7 +554,6 @@ fn headless(
         }
     };
     provider::prewarm(&provider);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
     hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
@@ -656,6 +656,11 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
             return;
         }
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // Before the provider is built: base_url, permission and sandbox may
+    // come from the project only once the user trusts it.
+    hooks::trust_project(&cwd, raw);
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
         Err(e) => {
@@ -664,9 +669,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
         }
     };
     provider::prewarm(&provider);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     hooks::init(&cwd, raw);
     hooks::set_permission_mode(agent::permission_name(perm));
     // Once per process: the session id is fixed here so SessionStart, every
@@ -1477,20 +1480,8 @@ fn repl(
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
-        // its own Msg::User push and uses this multimodal turn instead.
         let vision = media::model_supports_vision(&provider);
-        let (clean_task, image_data) = extract_attachments(t, cwd, vision);
-        let n_images = image_data.len();
-        if n_images > 0 {
-            transcript.push(Msg::UserImages {
-                text: clean_task.clone(),
-                images: image_data,
-            });
-            tui::line(&tui::dim(&format!(
-                "  ⎘ attached {n_images} image{}",
-                if n_images == 1 { "" } else { "s" }
-            )));
-        }
+        let (clean_task, mut image_data) = extract_attachments(t, cwd, vision);
 
         // Merge any /btw context queued since the last turn.
         let effective_task = if let Some(ctx) = btw_ctx.take() {
@@ -1504,8 +1495,25 @@ fn repl(
         // startup, so servers only spawn once the session is actually used.
         mcp::start_background();
 
+        // Only a BUILD turn sends images; the build session puts them on its
+        // own user message after the system prompt. Chat, PLAN and BRAINSTORM
+        // take text only, so say so rather than dropping them silently.
+        let conversational = should_answer_conversationally(t, &mode);
+        let n_images = image_data.len();
+        if n_images > 0 {
+            let plural = if n_images == 1 { "" } else { "s" };
+            if !conversational && matches!(mode, Mode::Build) {
+                tui::line(&tui::dim(&format!("  ⎘ attached {n_images} image{plural}")));
+            } else {
+                image_data.clear();
+                tui::line(&tui::yellow(&format!(
+                    "  {n_images} image{plural} not sent: only BUILD mode tasks take images"
+                )));
+            }
+        }
+
         tui::line("");
-        let r = if should_answer_conversationally(t, &mode) {
+        let r = if conversational {
             agent::run_chat_turn(&provider, perm, cwd, t)
         } else {
             match &mode {
@@ -1517,7 +1525,7 @@ fn repl(
                     }
                     Err(e) => Err(e),
                 },
-                Mode::Build => agent::run_build_session(
+                Mode::Build => agent::run_build_session_with_images(
                     &provider,
                     perm,
                     "engineer",
@@ -1525,6 +1533,7 @@ fn repl(
                     cwd,
                     &mut transcript,
                     &sid,
+                    std::mem::take(&mut image_data),
                 ),
                 Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
                     Err(e) => Err(e),
@@ -1690,7 +1699,7 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
         tui::line(&format!(
             "  {}  {}",
             tui::bold(&(i + 1).to_string()),
-            s.title
+            tui::sanitize_terminal(&s.title)
         ));
     }
     let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
@@ -1703,15 +1712,21 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
             let title = s.title.clone();
             *transcript = s.msgs;
             *sid = s.id;
-            tui::line(&tui::green(&format!("  ✓ resumed: {title}")));
+            tui::line(&tui::green(&format!(
+                "  ✓ resumed: {}",
+                tui::sanitize_terminal(&title)
+            )));
             tui::line(&tui::dim("  ── restored history ──"));
             for msg in transcript.iter() {
                 match msg {
-                    provider::Msg::User(text) => {
-                        tui::line(&format!("{} {}", tui::accent("›"), text));
-                    }
-                    provider::Msg::UserImages { text, .. } => {
-                        tui::line(&format!("{} {}", tui::accent("›"), text));
+                    // Saved sessions are files on disk: replay them through
+                    // the same sanitizer as live model and tool output.
+                    provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
+                        tui::line(&format!(
+                            "{} {}",
+                            tui::accent("›"),
+                            tui::sanitize_terminal(text)
+                        ));
                     }
                     provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
                         tui::line(&tui::render_md(text));
@@ -2356,11 +2371,15 @@ fn swap_model(
         }
     }
 
-    // A custom base_url belongs to the provider it was set for.
-    if preset.id != "custom" && custom_url.is_none() {
-        s.base_url = None;
-    } else if let Some(u) = custom_url {
-        s.base_url = Some(u);
+    // A custom base_url belongs to the provider it was set for. `None`
+    // leaves the saved value alone.
+    let base_url_change = if preset.id != "custom" && custom_url.is_none() {
+        Some(None)
+    } else {
+        custom_url.map(Some)
+    };
+    if let Some(u) = &base_url_change {
+        s.base_url = u.clone();
     }
     s.provider = preset.id.to_string();
     s.model = model.to_string();
@@ -2417,7 +2436,14 @@ fn swap_model(
             let mut p = p;
             p.effort = provider.effort;
             *provider = p;
-            config::save_settings(&s);
+            let mut changes = vec![
+                ("provider", Some(s.provider.as_str().into())),
+                ("model", Some(s.model.as_str().into())),
+            ];
+            if let Some(u) = base_url_change {
+                changes.push(("base_url", u.map(Into::into)));
+            }
+            save_user_settings(&changes);
             provider::prewarm(provider);
             tui::line(&tui::green(&format!(
                 "  ✓ active model hot-swapped → {} on {} (validated)",
@@ -3043,14 +3069,19 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
     None
 }
 
+// Writes only the changed keys into the user settings file. Saving the merged
+// settings would copy a project's own settings into the user's global file.
+fn save_user_settings(changes: &[(&str, Option<serde_json::Value>)]) {
+    if let Err(e) = config::save_user_settings(changes) {
+        tui::line(&tui::yellow(&format!("  ⚠ not saved: {e}")));
+    }
+}
+
 // Apply a permission string, update the in-session value, and persist to settings.json.
 fn apply_permission(perm: &mut Permission, ps: &str) {
     *perm = agent::permission(ps);
     hooks::set_permission_mode(agent::permission_name(*perm));
-    if let Some(mut settings) = config::load_settings() {
-        settings.permission = ps.to_string();
-        config::save_settings(&settings);
-    }
+    save_user_settings(&[("permission", Some(ps.into()))]);
     tui::set_permission_mode(permission_label(perm));
     tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
 }
@@ -3066,6 +3097,7 @@ fn permission_label(perm: &Permission) -> &'static str {
 // `/permissions reset`: forget every "always allow" answer given in this
 // project (the per-project map in the user settings file).
 fn handle_permissions_reset(cwd: &std::path::Path) {
+    agent::clear_session_allowed(cwd);
     let n = config::reset_project_allowed(cwd);
     if n == 0 {
         tui::line(&tui::dim("  no \"always allow\" entries for this project"));
@@ -3117,10 +3149,7 @@ fn handle_sandbox(arg: &str) {
         other => match sandbox::Mode::parse(other) {
             Some(mode) => {
                 sandbox::set_mode(mode);
-                if let Some(mut settings) = config::load_settings() {
-                    settings.sandbox = mode.as_str().to_string();
-                    config::save_settings(&settings);
-                }
+                save_user_settings(&[("sandbox", Some(mode.as_str().into()))]);
                 tui::line(&tui::green(&format!("  ✓ sandbox: {}", mode.as_str())));
                 for l in sandbox::status_lines().into_iter().skip(1) {
                     tui::line(&tui::dim(&format!("  {l}")));
@@ -3252,9 +3281,7 @@ fn handle_effort(provider: &mut Provider, arg: &str) {
     match config::Effort::parse(arg) {
         Some(level) => {
             provider.effort = level;
-            let mut s = config::load_settings().unwrap_or_default();
-            s.effort = level.as_str().to_string();
-            config::save_settings(&s);
+            save_user_settings(&[("reasoning_effort", Some(level.as_str().into()))]);
             tui::line(&tui::green(&format!(
                 "  ✓ effort → {level} (saved to settings)"
             )));

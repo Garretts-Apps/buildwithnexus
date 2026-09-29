@@ -74,6 +74,9 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
     if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
     }
+    // The preview quotes model-supplied arguments: neutralize escapes before
+    // styling (render_diff_block does the same for the diff body).
+    let preview = &*tui::sanitize_terminal(preview);
     // A role-colored header line (icon + what it's about to do).
     let (icon, head) = match name {
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
@@ -172,6 +175,7 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
     }
     // Human mode previously showed nothing here — the user couldn't see command
     // output or errors. Surface results compactly, indented under the call.
+    let content = &*tui::sanitize_terminal(content);
     if is_error {
         let rows: Vec<String> = clip_head(content, 12)
             .into_iter()
@@ -220,11 +224,17 @@ const LCS_MAX_CELLS: usize = 250_000;
 /// In JSON mode emits `{"type":"diff","path":…,"added":N,"removed":M}`
 /// instead. Call from the edit/write tool paths right after the change lands.
 pub fn diff(path: &str, old: &str, new: &str) {
-    let (rows, added, removed) = diff_rows(old, new);
     if mode() == Mode::Json {
+        let (_, added, removed) = diff_rows(old, new);
         emit(json!({"type": "diff", "path": path, "added": added, "removed": removed}));
         return;
     }
+    let (path, old, new) = (
+        &*tui::sanitize_terminal(path),
+        &*tui::sanitize_terminal(old),
+        &*tui::sanitize_terminal(new),
+    );
+    let (rows, added, removed) = diff_rows(old, new);
     let (verb, stat) = if old.is_empty() {
         ("write", format!("+{added}"))
     } else {
@@ -249,7 +259,7 @@ pub fn diff(path: &str, old: &str, new: &str) {
 /// edit/write tool announcements share the exact visual language of applied
 /// diffs.
 pub fn render_diff_block(old: &str, new: &str) -> String {
-    let (rows, _, _) = diff_rows(old, new);
+    let (rows, _, _) = diff_rows(&tui::sanitize_terminal(old), &tui::sanitize_terminal(new));
     paint_diff_rows(&rows)
 }
 
@@ -568,7 +578,10 @@ fn lcs_ops<'a>(o: &[&'a str], n: &[&'a str]) -> Vec<(char, &'a str)> {
 
 pub fn tool_denied(reason: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!("  ✗ {reason}"))),
+        Mode::Human => tui::line(&tui::red(&format!(
+            "  ✗ {}",
+            tui::sanitize_terminal(reason)
+        ))),
         Mode::Json => emit(json!({"type": "tool_denied", "reason": reason})),
     }
 }
@@ -603,7 +616,7 @@ pub fn verify(status: &str, report: &Value) {
 
 pub fn error(msg: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!("  ✗ {msg}"))),
+        Mode::Human => tui::line(&tui::red(&format!("  ✗ {}", tui::sanitize_terminal(msg)))),
         Mode::Json => emit(json!({"type": "error", "message": msg})),
     }
 }
@@ -611,7 +624,7 @@ pub fn error(msg: &str) {
 // Warnings: things the user should notice (truncation, fallbacks, retries).
 pub fn notice(msg: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::yellow(msg)),
+        Mode::Human => tui::line(&tui::yellow(&tui::sanitize_terminal(msg))),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }
@@ -620,7 +633,7 @@ pub fn notice(msg: &str) {
 // warnings for attention.
 pub fn info(msg: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::dim(msg)),
+        Mode::Human => tui::line(&tui::dim(&tui::sanitize_terminal(msg))),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }
@@ -628,6 +641,13 @@ pub fn info(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_preview_neutralizes_model_escapes() {
+        let body = render_diff_block("x = 1\n", "x = \x1b]52;c;AA\x07\x1b[2J\n");
+        assert!(!body.contains("\x1b]52") && !body.contains("\x1b[2J") && !body.contains('\x07'));
+        assert!(body.contains("␛]52;c;AA␛[2J"), "{body:?}");
+    }
 
     #[test]
     fn test_clip_head_short_and_exact() {

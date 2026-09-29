@@ -4,6 +4,177 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Project settings need your trust before they can change anything that
+  matters.** A repository's `.buildwithnexus/settings.json` and
+  `settings.local.json` used to be merged over your own settings with no
+  prompt, so a cloned repo could send your API key to its own `base_url`,
+  switch to `permission: auto` and `sandbox: off`, or start an MCP server
+  command. Without trust, a project file may now set only `model`,
+  `reasoning_effort`, `temperature`, `max_tokens`, `context_tokens`,
+  `instruction_files`, `images` and `notify`, may tighten `permission` and
+  `sandbox`, and may lower `max_budget_usd`. Every other key is ignored until
+  you answer one prompt that lists the keys the project wants. Headless runs
+  never prompt: they ignore those keys and print one warning naming them.
+  A trusted project can add MCP servers but can never change one defined in
+  your own settings.
+- **Hook trust covers the scripts hooks run.** Trust is recorded per project
+  folder and per file name (settings.json and settings.local.json no longer
+  share one entry) as a SHA-256 digest of the file plus every script inside
+  the project that its hooks reference. Editing any of them asks again. The
+  prompt appears only when a file defines hooks or other security keys, and
+  names the right file.
+- **"Always allow", `/permissions`, `/sandbox`, `/effort` and `/model` no
+  longer copy project settings into your global settings.** They used to save
+  the merged settings to `~/.buildwithnexus/settings.json`. They now change
+  only their own keys in that file.
+- Release workflow: permissions are now granted per job instead of
+  workflow-wide, and checkouts no longer store the token in `.git/config`,
+  so the Rust build (including dependencies' build scripts and proc-macros)
+  has no token on disk to read. Releases run one at a time, a manual release is refused unless it starts
+  from `main`, and a new tag points at the commit the workflow built.
+- Every third-party GitHub Action is pinned to a full commit SHA. The
+  publish workflow installs a pinned npm version instead of `npm@latest`,
+  and CI downloads a pinned actionlint release and checks its SHA-256
+  instead of piping an install script into bash.
+- The publish workflow no longer places the `version_bump` input directly
+  into a shell script, and it keeps the push token on disk only when it has
+  to push a version bump.
+- Dependabot now proposes weekly updates for the Rust crates as well as for
+  Actions and npm.
+- SECURITY.md no longer promises a `[y/N]` prompt before the first-run
+  download. It now describes what actually happens (automatic in a
+  terminal, opt-in with `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1` elsewhere),
+  the full download host allowlist, and the optional OS sandbox.
+- **Model text and tool output can no longer drive the terminal.** Escape
+  sequences in assistant replies, thinking, tool output, tool-call previews,
+  edit/write diffs and selection menus used to reach the terminal intact, so
+  a reply could overwrite the clipboard (OSC 52), move the cursor to fake an
+  `allow?` prompt, or disguise a link. ESC now shows as a visible `␛` and
+  other control characters are dropped before the harness adds its own
+  styling. Control characters are also stripped from OSC 8 link targets,
+  the `allow?` approval line, and saved sessions replayed by `/resume`.
+- **Ask mode no longer auto-approves compound commands.** A command whose
+  binary was in `allowed_commands`, the project's "always allow" list or the
+  session's approvals used to run without a prompt even when it chained,
+  piped, redirected or substituted another command (`cat x; rm -rf ~`). Only
+  a single plain command now skips the prompt: no `;`, `&`, `|`, `<`, `>`,
+  backticks, `$(`, variable expansion, control characters or newlines. New
+  "always allow" and "allow this session" answers are stored per binary and
+  subcommand for multi-verb tools (`git status`, `npm test`); an existing
+  single-word entry still covers plain commands of that binary. Session
+  approvals are scoped to the project and `/permissions reset` clears them.
+- **Read-only commands reject write and exec flags.** `rg --pre`,
+  `sort -o`, `find -exec`/`-delete`/`-fprint`, `git -c`/`--output`/
+  `--ext-diff`, `tree -o`, `uniq IN OUT` and similar no longer count as
+  read-only in PLAN and BRAINSTORM, and are never auto-approved.
+- **Secrets are harder to reach without a prompt.** The sensitive-path list
+  now covers `.kube`, `.docker/config.json`, `.config/gh`, `.netrc`,
+  `.npmrc`, `.pypirc`, `.git-credentials` and more, matches by path
+  component (so `~/.ssh` itself counts), and follows symlinks. It applies to
+  every path of `read_many_files` and to path arguments of shell commands, so
+  `cat ~/.aws/credentials` always asks. `grep_files`, `list_tree` and
+  `find_paths` skip credential directories.
+- **Fetch tools refuse link-local and cloud metadata addresses.**
+  `fetch_url`, `webfetch`, `headless_browser`, `wait_for_url` and web search
+  never connect to 169.254.0.0/16, fe80::/10 or metadata hostnames, including
+  through DNS or a redirect. Localhost still works for dev servers.
+- **Hooks can no longer approve writes in read-only phases.** In PLAN,
+  BRAINSTORM and readonly sessions a PreToolUse hook may deny a call but
+  never allow past the read-only gate. Hooks see `plan` or `readonly` as the
+  permission mode during those phases.
+- **Harness recovery calls go through hooks and the gate.** The `write_file`
+  and HTML artifact recoveries and the automatic `check_work` round are
+  checked like model calls; a denied call is skipped and reported.
+- **The sandbox protects `.git` and `.buildwithnexus`.** Under bubblewrap
+  they are bound read-only inside the workspace and `/run` is a fresh tmpfs;
+  under Seatbelt writes to them and Apple Events are denied. Sandboxed
+  children no longer inherit `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`,
+  `*_API_KEY` or `HF_TOKEN`. `start_server` and `python_tool` now run under
+  the sandbox policy, and `sandbox: require` refuses them without a backend.
+  `start_server` commands also get the dangerous-command check.
+### Fixed
+- **`bwn init` keeps your existing settings.** Setup used to rewrite
+  `settings.json` from defaults, dropping `allowed_commands`,
+  `project_allowed`, `max_budget_usd`, `auto_update`, hooks and any other
+  keys. It now changes only the provider, model, permission and base URL,
+  and reports a failed save instead of printing "ready".
+- **Long replies are no longer cut off at three minutes.** The HTTP client had
+  a 180 second deadline that also covered the streamed reply, so a slow or long
+  generation was dropped part way. There is now a 15 second connect timeout and
+  a 300 second idle read timeout (set `BWN_READ_TIMEOUT_SECS` to change it).
+  Model listing and warm-up probes keep their short timeouts.
+- **A request is no longer sent twice after a read timeout.** Only failures to
+  connect (refused connection, DNS) and HTTP 429 or 5xx are retried. A timeout
+  or reset after the request went out is reported instead, since the server
+  may still be working on the first one. Retry delays now carry 20% jitter.
+- **API keys are never sent to a redirect target.** Redirects are no longer
+  followed; a 3xx reply is an error that names where the server tried to send
+  the request.
+- **Truncated streams are errors.** A stream that ends without its finish
+  marker (`message_stop`, `[DONE]`, a finish reason, or Ollama's `done`) now
+  fails with "stream ended before completion" instead of returning a partial
+  reply as if it were whole.
+- **OpenAI-compatible servers' error payloads surface.** An `{"error": ...}`
+  chunk in a stream, or an error body with HTTP 200, is now reported (redacted
+  and truncated) instead of being read as an empty reply.
+- **`/undo` no longer half-restores.** When any checkpoint in the set cannot
+  be restored, nothing is touched and every blocking file is named. Write
+  failures are reported per file, and real errors are no longer reported as
+  "made no file changes". Restores keep the file's original permissions and
+  write through a symlink to its target instead of replacing the link.
+- **`/undo git` only runs `git checkout -- .`**, as its prompt says. It no
+  longer runs `git clean -fd`, which deleted untracked files, and a failing
+  git command is now reported as an error.
+- **An image in the first prompt no longer drops the system prompt.** Images
+  are attached to the build turn's own message after the system prompt, with
+  `/btw` and hook context included. Chat, PLAN and BRAINSTORM turns say the
+  images were not sent instead of leaking them into a later turn.
+- **Keys typed while the agent streams are no longer lost.** The interrupt
+  check read pending key events and kept only Ctrl+C and Esc. It now goes
+  through the same reader as type-ahead, which buffers every other key.
+- **The composer and footer no longer get stray text.** The type-ahead and
+  spinner threads painted at the same time as the main thread. Each frame is
+  now drawn under one render lock and written in one piece.
+- **A crash or a kill signal restores the terminal fully.** Mouse tracking,
+  focus reporting, bracketed paste, scroll margins and the cursor shape are
+  now reset too, so the shell no longer prints `^[[<35;...M` on every mouse
+  move afterwards. The panic hook is installed once instead of once per
+  screen switch.
+- **Pasting mid-turn cleans text the same way as at the prompt.** Pasted
+  line breaks become spaces and control characters are dropped in all three
+  paste paths, which now share one function.
+- **Symlinks followed by `..` can no longer escape the workspace.** Paths
+  are resolved through the deepest existing directory before `..` is folded,
+  so `link/../file` is checked where the OS would write it.
+
+### Changed
+- crates.io publishing in the release workflow now fails the run when it
+  cannot get an OIDC token or a publish fails, instead of passing with a
+  warning. Versions already on crates.io are still skipped.
+- A failed push of a manual version bump now stops the publish workflow
+  instead of publishing a version that has no commit or tag on `main`.
+- The published npm manifest lists a per-platform package in
+  `optionalDependencies` only when that exact version exists on npm, and
+  the run warns with the one-time command that publishes the missing ones
+  (`scripts/first-publish-platform-packages.sh`, which now accepts
+  `NPM_TOKEN`). The committed `package.json` no longer pins them to 0.12.7,
+  a version that was never published. Installs are unaffected: the launcher
+  downloads the checksum-verified binary on first run.
+- CI runs the Rust test suite on macOS as well as Linux, compiles the tests
+  on Windows, and caches Rust builds.
+- README: added Requirements, local model setup, and a Headless and CI
+  section with flags and exit codes, and corrected how the Linux sandbox
+  treats `/tmp`. RECOVERY.md now describes the optional sandbox.
+- Removed `docs/AGENT_DEFINITIONS.md`, `docs/DEEP_AGENTS_CLI_UX.md` and
+  `.env.example`, which described code that no longer exists, and stopped
+  tracking the `.omc/` tool state directory.
+
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.2...HEAD
+
+
 ## [0.14.2] - 2026-09-29
 
 The "first hour" release: fixes from walking the first run, the TUI and
@@ -52,6 +223,8 @@ headless runs as a new user would.
   none and how to resume one; the footer drops the context gauge instead of
   cutting it off on narrow terminals.
 
+[0.14.2]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.2
+
 ## [0.14.1] - 2026-09-24
 
 ### Security
@@ -60,6 +233,8 @@ headless runs as a new user would.
   across encryption level boundaries (CVSS 5.3, medium). buildwithnexus
   talks to every hosted model provider over this TLS stack, so the fix is
   shipped as a patch release. No code changes.
+
+[0.14.1]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.1
 
 ## [0.14.0] - 2026-09-23
 
@@ -121,6 +296,8 @@ of the streaming path.
 - Selection copy across an image row yields spaces, not placeholder bytes.
 - The Ctrl+V attachment token is quoted when the temp path contains spaces
   (Windows).
+
+[0.14.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.0
 
 ## [0.13.0] - 2026-09-08
 
@@ -212,6 +389,8 @@ closable, and twelve bugs found along the way were fixed.
   protocols, update notices by default, first-run download install story,
   and the new features above.
 
+[0.13.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.13.0
+
 ## [0.12.15] - 2026-09-08
 
 ### Fixed
@@ -243,6 +422,8 @@ closable, and twelve bugs found along the way were fixed.
   completion, and selection helpers; a Node test for the npm launcher; and a
   PTY test that drives the real TUI. All three run in CI.
 
+[0.12.15]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.15
+
 ## [0.12.14] - 2026-07-30
 
 ### Fixed
@@ -265,12 +446,16 @@ closable, and twelve bugs found along the way were fixed.
 - A full TUI audit pass closed 35 rendering, cursor, and input-handling
   findings.
 
+[0.12.14]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.14
+
 ## [0.12.13] - 2026-07-29
 
 ### Fixed
 - **Slash Commands Trailing Whitespace Guard (`/model`, `/mode`, `/permissions`):**
   Fixed whitespace handling so typing `/model ` (with trailing spaces) opens the interactive
   model selection dialog instead of skipping execution.
+
+[0.12.13]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.13
 
 ## [0.12.12] - 2026-07-29
 
@@ -282,6 +467,8 @@ closable, and twelve bugs found along the way were fixed.
   Selecting a local GGUF model automatically checks ports 8080/1234/11434/8000. If no server is running, it finds `llama-server` on the host machine and launches it automatically in the background.
 - **Cloud Provider Base URL Reset:**
   Swapping between cloud model providers automatically resets `base_url` to the target provider's default API endpoint.
+
+[0.12.12]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.12
 
 ## [0.12.11] - 2026-07-29
 
@@ -297,6 +484,8 @@ closable, and twelve bugs found along the way were fixed.
 - **Clean Footer Statusline:** Context & token usage (`ctx: 25% 32k/128k`) move to the footer
   statusline below the composer box, eliminating log clutter in the chat thread.
 
+[0.12.11]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.11
+
 ## [0.12.10] - 2026-07-29
 
 ### Changed
@@ -307,6 +496,8 @@ closable, and twelve bugs found along the way were fixed.
   prompting `[y/N]`. The user already opted in by running
   `npm install -g buildwithnexus`. Non-TTY environments (CI, scripts, pipes)
   are unaffected — they still require `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`.
+
+[0.12.10]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.10
 
 ## [0.12.9] - 2026-07-29
 
@@ -320,6 +511,8 @@ closable, and twelve bugs found along the way were fixed.
 - **Sessions no longer start in Build mode.** The default mode is now
   Brainstorm, so launching bwn and typing a casual message no longer kicks
   off an agentic build run.
+
+[0.12.9]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.9
 
 ## [0.12.8] - 2026-07-29
 
@@ -354,6 +547,8 @@ closable, and twelve bugs found along the way were fixed.
   still going it ends with an honest summary of what got done and the exact
   next step — never a scary error for simply doing a lot.
 
+[0.12.8]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.8
+
 ## [0.12.7] - 2026-07-21
 
 ### Changed
@@ -373,6 +568,8 @@ closable, and twelve bugs found along the way were fixed.
   Ghostty) and occasionally scroll the whole screen (a visible flash). The
   region is now re-asserted whenever the reserved-row count changes, and the
   queued-composer row paints as one atomic frame.
+
+[0.12.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.7
 
 ## [0.12.6] - 2026-07-18
 
@@ -424,6 +621,8 @@ closable, and twelve bugs found along the way were fixed.
   filesystems), and the destination's permissions are copied onto the
   replacement, so editing a script no longer risks silently stripping its
   executable bit.
+
+[0.12.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.6
 
 ## [0.12.5] - 2026-07-19
 
@@ -492,6 +691,8 @@ closable, and twelve bugs found along the way were fixed.
   column, refuses to re-onboard while broken files exist, and
   `buildwithnexus doctor` lists every settings file with its parse status.
 
+[0.12.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.5
+
 ## [0.12.4] - 2026-07-16
 
 ### Fixed
@@ -500,6 +701,8 @@ closable, and twelve bugs found along the way were fixed.
   threw `EAGAIN` and fell through to "native binary not found" before you
   could answer. The prompt now reads from a fresh blocking `/dev/tty` handle
   (falling back to stdin where `/dev/tty` doesn't exist, e.g. Windows).
+
+[0.12.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.4
 
 ## [0.12.3] - 2026-07-14
 

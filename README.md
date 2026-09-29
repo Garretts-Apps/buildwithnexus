@@ -12,7 +12,7 @@ GitHub-grade diffs, clickable files and links, and multimodal input straight
 from your clipboard.
 
 ```bash
-npm install -g buildwithnexus     # prebuilt binary via platform packages
+npm install -g buildwithnexus     # fetches the checksum-verified binary on first run
 # or, with a Rust toolchain:
 cargo install buildwithnexus --locked   # installs `buildwithnexus` + the `bwn` alias
 buildwithnexus
@@ -22,6 +22,19 @@ The first launch walks you through choosing a model. Then describe a task.
 A daily background check tells you when a new version is out; set
 `auto_update: "install"` in settings to apply updates automatically, or
 `"off"` to silence the check.
+
+## Requirements
+
+- **npm install:** Node.js 18 or later.
+- **cargo install / source build:** Rust 1.94 or later (`rust-version` in
+  `harness/Cargo.toml`).
+- **Prebuilt binaries:** Linux x64 and arm64 (glibc), macOS x64 and arm64,
+  Windows x64. Other platforms (for example musl/Alpine or Windows on Arm)
+  need a source build pointed to by `BWN_BIN`.
+- **Optional tools:** `ffmpeg` for video attachments and image previews,
+  `bwrap` (bubblewrap) for the Linux [sandbox](#sandbox), `tmux` for
+  background dev servers, and `git`, `rg` and `python3` for the tools that
+  use them. `buildwithnexus doctor` reports what is missing.
 
 ## Try it in a sandbox
 
@@ -133,6 +146,29 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600).
 
+**Local models.** No key is needed. Start the server, then pick it in
+`bwn init`, or pass `--provider` on a headless run:
+
+```bash
+ollama serve                 # listens on http://localhost:11434
+ollama pull llama3.2         # the default Ollama model
+bwn init                     # choose Ollama
+bwn run --provider ollama --model llama3.2 "summarize this repo"
+```
+
+Default endpoints: Ollama `http://localhost:11434`, llama.cpp server
+`http://localhost:8080/v1`, LM Studio `http://localhost:1234/v1`. For any
+other OpenAI-compatible server (vLLM, TGI, LiteLLM, a gateway), choose the
+`custom` provider (default `http://localhost:8000/v1`) and set
+`CUSTOM_API_KEY` if it needs a key. To change where any provider connects,
+set `base_url` in `~/.buildwithnexus/settings.json`:
+
+```json
+{ "provider": "ollama", "model": "qwen2.5-coder", "base_url": "http://gpu-box:11434" }
+```
+
+A configured key is only sent over HTTPS or to a loopback address.
+
 **Reasoning.** `reasoning_effort` in settings (`off` by default, or `low` / `medium` /
 `high`; `--effort <level>` per run, `/effort` in-session) maps to each API's
 native control: Claude 4.6+ gets adaptive thinking with `output_config.effort`,
@@ -186,6 +222,38 @@ Inside the interactive session:
 /trace                    inspect hooks, tools, skills, and subagents
 ```
 
+## Headless and CI
+
+`run`, `plan`, `brainstorm`, `continue` and `resume` run without the TUI. With
+no settings file, a headless run uses `--provider`, or the first provider
+whose API key is in the environment, and writes nothing.
+
+| Flag | Effect |
+|---|---|
+| `--provider <id>` | provider for this run (`buildwithnexus providers` lists ids) |
+| `--model <name>` | model for this run |
+| `--permission-mode <ask\|auto\|readonly>` | permission gate; with no terminal, `ask` blocks every change, so CI usually wants `auto` or `readonly` |
+| `--sandbox <off\|auto\|require>` | OS sandbox for shell commands (see [Sandbox](#sandbox)) |
+| `--effort <off\|low\|medium\|high>` | reasoning depth |
+| `--max-budget-usd <n>` | stop before the next request once the estimated cost exceeds `n` |
+| `--json` | machine-readable events on stdout instead of text |
+| `--yes`, `-y` | `plan` only: approve the plan and execute it |
+| `--` | everything after it is task text, even if it looks like a flag |
+
+| Exit code | Meaning |
+|---|---|
+| 0 | the task finished |
+| 1 | the run failed, or no provider could be set up |
+| 2 | usage error: unknown option, a flag missing its value, or `plan` with no terminal and no `--yes` |
+| 3 | the run finished but changes were blocked for lack of approval (`ask` with no terminal); nothing was applied |
+
+```bash
+ANTHROPIC_API_KEY=... bwn run --permission-mode auto --json "fix the failing test"
+```
+
+On npm installs in CI, add `--bootstrap` or set `BWN_ALLOW_BOOTSTRAP=1` so the
+launcher can fetch the binary on first run.
+
 ## Permissions
 
 Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
@@ -217,8 +285,11 @@ Backends are external binaries, probed once per session: `bwrap` (bubblewrap)
 on Linux and `sandbox-exec` (Seatbelt) on macOS. Windows and WSL have none.
 
 **Confined:** filesystem writes anywhere except the working directory and the
-temp dirs (`/tmp`, `$TMPDIR`); everything else — including
-`~/.buildwithnexus` and tool caches such as `~/.cargo` or `~/.npm` — is
+temp dirs. On Linux, `/tmp` is a fresh private tmpfs (with `TMPDIR=/tmp`)
+that is discarded when the command exits, so files written there are not
+visible to the host or to the next command. On macOS, `/tmp` and `$TMPDIR`
+are the real, shared directories. Everything else, including
+`~/.buildwithnexus` and tool caches such as `~/.cargo` or `~/.npm`, is
 read-only to the command. Set `"sandbox_network": false` to also block the
 network inside the sandbox (default `true`, allowed).
 
