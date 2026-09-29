@@ -48,6 +48,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   download. It now describes what actually happens (automatic in a
   terminal, opt-in with `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1` elsewhere),
   the full download host allowlist, and the optional OS sandbox.
+- **Model text and tool output can no longer drive the terminal.** Escape
+  sequences in assistant replies, thinking, tool output, tool-call previews,
+  edit/write diffs and selection menus used to reach the terminal intact, so
+  a reply could overwrite the clipboard (OSC 52), move the cursor to fake an
+  `allow?` prompt, or disguise a link. ESC now shows as a visible `␛` and
+  other control characters are dropped before the harness adds its own
+  styling. Control characters are also stripped from OSC 8 link targets.
 ### Fixed
 - **`bwn init` keeps your existing settings.** Setup used to rewrite
   `settings.json` from defaults, dropping `allowed_commands`,
@@ -85,6 +92,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are attached to the build turn's own message after the system prompt, with
   `/btw` and hook context included. Chat, PLAN and BRAINSTORM turns say the
   images were not sent instead of leaking them into a later turn.
+- **Keys typed while the agent streams are no longer lost.** The interrupt
+  check read pending key events and kept only Ctrl+C and Esc. It now goes
+  through the same reader as type-ahead, which buffers every other key.
+- **The composer and footer no longer get stray text.** The type-ahead and
+  spinner threads painted at the same time as the main thread. Each frame is
+  now drawn under one render lock and written in one piece.
+- **A crash or a kill signal restores the terminal fully.** Mouse tracking,
+  focus reporting, bracketed paste, scroll margins and the cursor shape are
+  now reset too, so the shell no longer prints `^[[<35;...M` on every mouse
+  move afterwards. The panic hook is installed once instead of once per
+  screen switch.
+- **Pasting mid-turn cleans text the same way as at the prompt.** Pasted
+  line breaks become spaces and control characters are dropped in all three
+  paste paths, which now share one function.
 
 ### Changed
 - crates.io publishing in the release workflow now fails the run when it
