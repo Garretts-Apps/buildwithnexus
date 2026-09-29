@@ -2545,7 +2545,8 @@ mod tests {
         let b = prompt.find("root agents").unwrap();
         let c = prompt.find("leaf dot").unwrap();
         assert!(a < b && b < c);
-        assert!(prompt.contains(&format!("--- {} ---", leaf.join("AGENTS.md").display())));
+        let leaf_agents = leaf.canonicalize().unwrap().join("AGENTS.md");
+        assert!(prompt.contains(&format!("--- {} ---", leaf_agents.display())));
         assert!(instructions_prompt(&[]).is_none());
         assert!(instructions_notice(&[]).is_none());
 
