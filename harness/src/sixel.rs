@@ -301,7 +301,7 @@ pub fn encode(rgb: &[u8], w: usize, h: usize) -> String {
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut index: HashMap<[u8; 3], u8> = HashMap::new();
     let mut pixels = Vec::with_capacity(w * h);
-    for px in rgb[..w * h * 3].chunks_exact(3) {
+    for px in rgb[..w * h * 3].as_chunks::<3>().0 {
         let c = [px[0], px[1], px[2]];
         let i = match index.get(&c) {
             Some(&i) => i,
