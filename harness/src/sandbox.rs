@@ -1,9 +1,9 @@
 //! Opt-in OS-level sandbox for shell commands.
 //!
 //! An extra layer *under* the permission gate: once a `run_command` / `bash`
-//! / `check_work` call has been approved, the child process is confined so
-//! that filesystem writes outside the working directory (and, optionally,
-//! network access) fail at the OS level. Backends are external binaries —
+//! / `check_work` / `start_server` / `python_tool` call has been approved,
+//! the child process is confined so that filesystem writes outside the
+//! working directory (and, optionally, network access) fail at the OS level. Backends are external binaries —
 //! `bwrap` (bubblewrap) on Linux and `sandbox-exec` (Seatbelt) on macOS — so
 //! no crate dependency is added. Windows and WSL have no backend.
 //!
@@ -195,10 +195,18 @@ fn detect() -> Result<Backend, String> {
 }
 
 // ── argv / profile construction (pure, unit-tested) ───────────────────────────
-/// bubblewrap argv: everything read-only, fresh /dev, /proc and /tmp, the
-/// workspace bound read-write at its own path. `~/.buildwithnexus` stays
-/// read-only — checkpoints are written in-process, never by the child.
+/// bubblewrap argv: everything read-only, fresh /dev, /proc, /tmp and /run,
+/// the workspace bound read-write at its own path. `~/.buildwithnexus` stays
+/// read-only — checkpoints are written in-process, never by the child — and
+/// so do the workspace's `.git` and `.buildwithnexus`, where a planted hook or
+/// settings file would run later outside the sandbox.
 pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
+    let protected: Vec<String> = PROTECTED_IN_WORKSPACE
+        .iter()
+        .map(|d| cwd.join(d))
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     let cwd = cwd.to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["--unshare-all".into()];
     if network {
@@ -217,22 +225,39 @@ pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
             "/proc",
             "--tmpfs",
             "/tmp",
+            "--tmpfs",
+            "/run",
             "--setenv",
             "TMPDIR",
             "/tmp",
             "--bind",
             &cwd,
             &cwd,
-            "--chdir",
-            &cwd,
-            "--",
-            "sh",
-            "-c",
-            cmd,
         ]
         .map(str::to_string),
     );
+    for p in &protected {
+        a.extend(["--ro-bind".to_string(), p.clone(), p.clone()]);
+    }
+    a.extend(["--chdir", &cwd, "--", "sh", "-c", cmd].map(str::to_string));
     a
+}
+
+/// Workspace entries a sandboxed command may read but never write.
+const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
+
+/// Environment a sandboxed child never inherits: session buses and agent
+/// sockets reach outside the sandbox, and provider keys are the agent's.
+pub fn scrubbed_env<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| {
+            matches!(
+                n.as_str(),
+                "DBUS_SESSION_BUS_ADDRESS" | "SSH_AUTH_SOCK" | "HF_TOKEN"
+            ) || n.ends_with("_API_KEY")
+        })
+        .collect()
 }
 
 fn sbpl_quote(p: &Path) -> String {
@@ -267,6 +292,11 @@ pub fn seatbelt_profile(cwd: &Path, tmpdir: Option<&Path>, network: bool) -> Str
         p.push_str(&format!("\n  (subpath {})", sbpl_quote(dir)));
     }
     p.push_str(")\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (regex #\"^/dev/tty\"))\n");
+    p.push_str("(deny file-write*");
+    for d in PROTECTED_IN_WORKSPACE {
+        p.push_str(&format!("\n  (subpath {})", sbpl_quote(&cwd.join(d))));
+    }
+    p.push_str(")\n(deny appleevent-send)\n");
     if !network {
         p.push_str("(deny network*)\n");
     }
@@ -292,6 +322,9 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
         }
     };
     c.current_dir(&cwd);
+    for k in scrubbed_env(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+        c.env_remove(k);
+    }
     c
 }
 
@@ -299,7 +332,11 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
 /// `Ok(None)` = run it unsandboxed (mode off, or auto without a backend —
 /// the latter says so once per session); `Err` = `require` with no backend.
 pub fn wrap(cmd: &str, cwd: &Path) -> Result<Option<Command>, String> {
-    let mode = mode();
+    wrap_in(mode(), cmd, cwd)
+}
+
+/// `wrap` under an explicit policy (tests, and callers that already read it).
+pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, String> {
     if mode == Mode::Off {
         return Ok(None);
     }
@@ -362,7 +399,7 @@ pub fn status_lines() -> Vec<String> {
         .to_string(),
     );
     v.push(
-        "scope: run_command/bash/check_work only; reads, file tools, and hooks are never sandboxed"
+        "scope: run_command/bash/check_work/start_server/python_tool; reads, file tools, and hooks are never sandboxed"
             .to_string(),
     );
     v
@@ -447,6 +484,57 @@ mod tests {
     }
 
     #[test]
+    fn bwrap_argv_keeps_git_and_settings_read_only() {
+        let ws = std::env::temp_dir().join(format!("bwn-sandbox-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        std::fs::create_dir_all(ws.join(".buildwithnexus")).unwrap();
+        let a = bwrap_args("true", &ws, false);
+        let s = a.join(" ");
+        let w = ws.display();
+        assert!(s.contains("--tmpfs /run"), "{s}");
+        // After the read-write workspace bind, so they win.
+        let rw = format!("--bind {w} {w} ");
+        let git = format!("--ro-bind {w}/.git {w}/.git");
+        let bwn = format!("--ro-bind {w}/.buildwithnexus {w}/.buildwithnexus");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {s}"))
+        };
+        assert!(at(&rw) < at(&git) && at(&rw) < at(&bwn));
+        assert!(at(&git) < at("--chdir"));
+        let _ = std::fs::remove_dir_all(&ws);
+        // Absent entries are not bound (bwrap would fail on a missing source).
+        assert!(!bwrap_args("true", Path::new("/work/none"), true)
+            .join(" ")
+            .contains(".git"));
+    }
+
+    #[test]
+    fn sandboxed_children_lose_sockets_and_provider_keys() {
+        let names = [
+            "PATH",
+            "HOME",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_AUTH_SOCK",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "HF_TOKEN",
+        ]
+        .map(String::from);
+        assert_eq!(
+            scrubbed_env(names),
+            [
+                "DBUS_SESSION_BUS_ADDRESS",
+                "SSH_AUTH_SOCK",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "HF_TOKEN"
+            ]
+        );
+    }
+
+    #[test]
     fn seatbelt_profile_denies_writes_except_workspace_and_tmp() {
         let p = seatbelt_profile(
             Path::new("/private/var/w/my \"proj\""),
@@ -459,6 +547,11 @@ mod tests {
         assert!(p.contains("(subpath \"/tmp\")"));
         assert!(p.contains("(subpath \"/private/var/folders/xy/T\")"));
         assert!(p.contains("(literal \"/dev/null\")"));
+        assert!(
+            p.contains("(deny file-write*\n  (subpath \"/private/var/w/my \\\"proj\\\"/.git\")")
+        );
+        assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
+        assert!(p.contains("(deny appleevent-send)"));
         assert!(!p.contains("network"));
         let no_net = seatbelt_profile(Path::new("/w"), None, false);
         assert!(no_net.ends_with("(deny network*)\n"));
