@@ -30,7 +30,13 @@ fn tmp(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("bwn-it-{tag}-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
-    p
+    // The binary reports canonical paths; on macOS the temp dir is a
+    // symlink (/var -> /private/var), so hand tests the resolved form.
+    if cfg!(unix) {
+        p.canonicalize().unwrap_or(p)
+    } else {
+        p
+    }
 }
 
 // ── mock OpenAI server ──────────────────────────────────────────────────────
