@@ -672,7 +672,11 @@ fn finish_ollama(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     if streaming {
-        ollama_stream(resp.into_reader(), on_text, on_thinking)
+        ollama_stream(
+            InterruptibleReader::new(resp.into_reader()),
+            on_text,
+            on_thinking,
+        )
     } else {
         let v = resp
             .into_json::<Value>()
@@ -688,7 +692,11 @@ fn finish_openai(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     if streaming {
-        openai_stream(resp.into_reader(), on_text, on_thinking)
+        openai_stream(
+            InterruptibleReader::new(resp.into_reader()),
+            on_text,
+            on_thinking,
+        )
     } else {
         let v = resp
             .into_json::<Value>()
@@ -728,7 +736,11 @@ fn request_inner(
             let (req, mut body) = anthropic_request(p, msgs, tools)?;
             if streaming {
                 body["stream"] = json!(true);
-                anthropic_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
+                anthropic_stream(
+                    InterruptibleReader::new(send_raw(req, body)?.into_reader()),
+                    on_text,
+                    on_thinking,
+                )
             } else {
                 anthropic_parse(send(req, body)?)
             }
@@ -770,7 +782,105 @@ fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
         .map_err(|e| format!("bad JSON from server: {e}"))
 }
 
+// Esc and Ctrl-C only raise a flag; a socket read on the calling thread can't
+// be cancelled. So the request runs on a worker thread and this thread waits
+// in 50 ms slices, checking the flag. Without it an interrupt waited for the
+// server's reply, which for a local model loading or reading an image takes
+// minutes. An abandoned worker's response is dropped when it arrives, which
+// closes the connection and stops the server's generation.
+fn interruptible<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(v) => return Ok(v),
+            Err(RecvTimeoutError::Timeout) => {
+                if crate::tui::interrupted() {
+                    return Err("interrupted".to_string());
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("request failed: worker thread exited".to_string())
+            }
+        }
+    }
+}
+
+// A streamed response body read on a worker thread, so a stream that goes
+// quiet (a local model still thinking) can still be interrupted. Dropping the
+// reader ends the worker at its next chunk, closing the connection.
+struct InterruptibleReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl InterruptibleReader {
+    fn new(mut inner: Box<dyn Read + Send + Sync>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            let mut chunk = vec![0u8; 16 * 1024];
+            match inner.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(Vec::new()));
+                    break;
+                }
+                Ok(n) => {
+                    chunk.truncate(n);
+                    if tx.send(Ok(chunk)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        });
+        Self {
+            rx,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for InterruptibleReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::mpsc::RecvTimeoutError;
+        while self.pos >= self.buf.len() {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(chunk)) if chunk.is_empty() => return Ok(0),
+                Ok(Ok(chunk)) => {
+                    self.buf = chunk;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(RecvTimeoutError::Timeout) => {
+                    if crate::tui::interrupted() {
+                        return Err(std::io::Error::other("interrupted"));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
 fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
+    interruptible(move || send_raw_blocking(req, body))?
+}
+
+fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
     let mut attempts = 0;
     let max_attempts = if is_local_url(req.url()) { 15 } else { 5 };
     let mut delay_ms = 500;
@@ -2535,6 +2645,17 @@ mod tests {
             .map(|x| x["role"].as_str().unwrap())
             .collect();
         assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    #[test]
+    fn interruptible_reader_passes_a_stream_through_unchanged() {
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let mut r = InterruptibleReader::new(Box::new(Cursor::new(data.clone())));
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+        // A worker's result comes back through `interruptible` as-is.
+        assert_eq!(interruptible(|| 7).unwrap(), 7);
     }
 
     #[test]

@@ -6,6 +6,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-09-29
+
+### Fixed
+- **Esc and Ctrl+C stop the agent while it waits on the model.** The request
+  ran on the UI thread, so an interrupt only took effect once the server sent
+  data, and on Ollama not until the reply finished. With a local model loading
+  or reading an image that meant minutes of an unresponsive Esc. Requests and
+  streamed replies are now read on a worker thread, and an interrupt returns
+  to the prompt within about 50 ms. Dropping the abandoned connection stops
+  the server's generation once it starts sending.
+
 ## [0.14.4] - 2026-09-29
 
 ### Fixed
@@ -198,7 +209,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.4...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.5...HEAD
+[0.14.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.5
 [0.14.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.4
 [0.14.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.3
 
