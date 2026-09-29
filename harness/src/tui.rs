@@ -439,7 +439,16 @@ pub fn color_disabled() -> bool {
 }
 
 fn no_color() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
+    std::env::var_os("NO_COLOR").is_some() || !stdout_wants_color()
+}
+
+// Piped or redirected output (CI logs, `bwn run … > out.txt`) gets plain text
+// unless FORCE_COLOR is set. Decided once: stdout does not change mid-run.
+fn stdout_wants_color() -> bool {
+    static WANTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTS.get_or_init(|| {
+        cfg!(test) || std::env::var_os("FORCE_COLOR").is_some() || io::stdout().is_terminal()
+    })
 }
 
 fn truecolor() -> bool {
@@ -2537,6 +2546,15 @@ fn queue_footer(out: &mut io::Stdout) {
             _ => green("[VIM]"),
         };
         format!("{} ", bold(&colored))
+    } else {
+        String::new()
+    };
+
+    // The context gauge is the least urgent part of the footer: on a narrow
+    // terminal drop it whole rather than cut it off mid-number.
+    let fits = |s: &str| strip_ansi(s).chars().count() <= width as usize;
+    let ctx_badge = if fits(&format!("{vim_badge}{base_text}{ctx_badge}")) {
+        ctx_badge
     } else {
         String::new()
     };
@@ -5513,7 +5531,13 @@ fn read_line_raw_prefill(
                 // Accept the highlighted autocomplete entry first: a
                 // line-start /command submits immediately; any other token
                 // (sub-argument, @path) is inserted and editing continues.
-                if !sug.is_empty() {
+                // A word already typed in full (`/mode build`, `/exit`) is
+                // not a request to complete it: Enter submits as typed.
+                let typed_in_full = {
+                    let (_, token) = token_at(&buf, cursor);
+                    sug.iter().any(|c| c.trim_end() == token)
+                };
+                if !sug.is_empty() && !typed_in_full {
                     let cand = sug[sug_idx].clone();
                     let (tok_start, token) = token_at(&buf, cursor);
                     let is_cmd = token.starts_with('/')
