@@ -86,6 +86,7 @@ pub fn configure_ui(images: &str, notify: &str) {
             "off" | "false" | "0" => 0,
             "kitty" => 2,
             "blocks" | "half" => 3,
+            "sixel" => 4,
             _ => 1,
         },
         Ordering::Relaxed,
@@ -228,6 +229,7 @@ struct Transcript {
     lines: Vec<String>,
     wrapped: Vec<Vec<String>>, // parallel to `lines`, wrapped at `width`
     width: usize,              // 0 = not yet sized
+    height: usize,             // terminal rows the wrap was made for (images)
 }
 
 /// Bench-only surface for the transcript wrap cache — criterion can't reach
@@ -268,6 +270,7 @@ impl Transcript {
             lines: Vec::new(),
             wrapped: Vec::new(),
             width: 0,
+            height: 0,
         }
     }
 
@@ -333,6 +336,15 @@ impl Transcript {
             self.width = w;
             self.wrapped = self.lines.iter().map(|l| wrap_ansi_line(l, w)).collect();
         }
+    }
+
+    // Also rewrap when only the height changed: inline images size to both.
+    fn ensure_size(&mut self, w: usize, h: usize) {
+        if h != self.height {
+            self.height = h;
+            self.width = 0;
+        }
+        self.ensure_width(w);
     }
 
     fn total_rows(&self) -> usize {
@@ -668,10 +680,181 @@ fn images_enabled() -> bool {
 fn use_placeholders() -> bool {
     match IMAGES_MODE.load(Ordering::Relaxed) {
         2 => true,
-        3 | 0 => false,
+        3 | 4 | 0 => false,
         _ => crate::graphics::placeholders_supported(),
     }
 }
+
+// Sixel previews: the `images` setting picks them explicitly, or `auto`
+// follows BWN_IMAGES and the startup probe.
+fn use_sixel() -> bool {
+    match IMAGES_MODE.load(Ordering::Relaxed) {
+        4 => true,
+        2 | 3 | 0 => false,
+        _ => crate::sixel::supported(),
+    }
+}
+
+// ── inline images that follow the terminal size ───────────────────────────────
+// An attached image is one transcript line holding `IMG_MARK` and an id.
+// Wrapping expands it to as many rows as the image needs at the current
+// terminal size, so a resize re-fits it. Block art renders straight into
+// those rows. A Sixel image leaves them as `IMG_MARK id:row` placeholders
+// and render_output draws the pixels over them.
+const IMG_MARK: &str = "\u{F8FF}bwn-img:";
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ImageTier {
+    Blocks,
+    Sixel,
+}
+
+struct InlineImage {
+    path: std::path::PathBuf,
+    native: (u32, u32),
+    tier: ImageTier,
+    // The terminal size and cell size the renderings below were made for.
+    made_for: (usize, usize, (u32, u32)),
+    rows: usize,
+    blocks: Vec<String>,
+    sixel: String,
+    // Decoded pixels (width, height, rgb) and cell height behind `sixel`, kept
+    // so an image partly scrolled out of view can be drawn cropped.
+    pixels: (u32, u32, Vec<u8>),
+    cell_h: u32,
+    crop: Option<((usize, usize), String)>,
+}
+
+impl InlineImage {
+    // Re-render for a new terminal size; a no-op when nothing changed.
+    fn ensure(&mut self, term_w: usize, term_h: usize) {
+        let cell = crate::sixel::cell_pixels();
+        if self.made_for == (term_w, term_h, cell) && self.rows > 0 {
+            return;
+        }
+        self.made_for = (term_w, term_h, cell);
+        let (max_cols, max_rows) = image_cell_budget_for(term_w, term_h, 4);
+        if self.tier == ImageTier::Sixel {
+            let (cw, ch) = (cell.0.max(1), cell.1.max(1));
+            let (nw, nh) = (self.native.0.max(1), self.native.1.max(1));
+            let scale = (f64::from(max_cols as u32 * cw) / f64::from(nw))
+                .min(f64::from(max_rows as u32 * ch) / f64::from(nh))
+                .min(1.0);
+            let w = ((f64::from(nw) * scale).round() as u32).max(1);
+            let h = ((f64::from(nh) * scale).round() as u32).max(1);
+            if let Some(rgb) = crate::sixel::decode(&self.path, w, h) {
+                self.sixel = crate::sixel::encode(&rgb, w as usize, h as usize);
+                self.rows = h.div_ceil(ch) as usize;
+                self.pixels = (w, h, rgb);
+                self.cell_h = ch;
+                self.crop = None;
+                return;
+            }
+            self.tier = ImageTier::Blocks;
+        }
+        let px_rows = ((max_rows * 2) as u32).max(2);
+        self.blocks = crate::media::decode_thumbnail(&self.path, max_cols as u32, px_rows)
+            .map(|(w, h, rgb)| image_preview_cells(&rgb, w, h))
+            .unwrap_or_default();
+        self.rows = self.blocks.len().max(1);
+    }
+}
+
+impl InlineImage {
+    // Sixel for image rows `first..first + count`: the whole image, or the
+    // visible slice of one partly scrolled out of view.
+    fn sixel_rows(&mut self, first: usize, count: usize) -> String {
+        if first == 0 && count >= self.rows {
+            return self.sixel.clone();
+        }
+        if let Some((key, data)) = &self.crop {
+            if *key == (first, count) {
+                return data.clone();
+            }
+        }
+        let (w, h, rgb) = (&self.pixels.0, &self.pixels.1, &self.pixels.2);
+        let (w, h) = (*w as usize, *h as usize);
+        let ch = self.cell_h.max(1) as usize;
+        let top = (first * ch).min(h);
+        let bottom = ((first + count) * ch).min(h);
+        if bottom <= top || rgb.len() < w * h * 3 {
+            return String::new();
+        }
+        let data = crate::sixel::encode(&rgb[top * w * 3..bottom * w * 3], w, bottom - top);
+        self.crop = Some(((first, count), data.clone()));
+        data
+    }
+}
+
+fn inline_images() -> &'static Mutex<Vec<InlineImage>> {
+    static IMAGES: OnceLock<Mutex<Vec<InlineImage>>> = OnceLock::new();
+    IMAGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// Set when something other than render_output may have drawn over the
+// output rows (a popup, a clear, a resize): the next frame redraws every
+// Sixel image instead of keeping the ones that did not move.
+static SIXEL_DIRTY: AtomicBool = AtomicBool::new(true);
+
+fn invalidate_inline_pixels() {
+    SIXEL_DIRTY.store(true, Ordering::Relaxed);
+}
+
+// Sixel images drawn by the last frame.
+fn drawn_sixels() -> &'static Mutex<Vec<Placement>> {
+    static DRAWN: OnceLock<Mutex<Vec<Placement>>> = OnceLock::new();
+    DRAWN.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// Rows for an image marker line at the current size, or None when `line`
+// is not a registered image (a row placeholder, or an unknown id).
+fn inline_image_rows(line: &str, width: usize) -> Option<Vec<String>> {
+    let id: usize = line.strip_prefix(IMG_MARK)?.parse().ok()?;
+    let height = term_size().1 as usize;
+    let mut images = inline_images().lock().ok()?;
+    let img = images.get_mut(id)?;
+    img.ensure(width, height);
+    Some(match img.tier {
+        ImageTier::Blocks if img.blocks.is_empty() => vec![String::new()],
+        ImageTier::Blocks => img.blocks.clone(),
+        ImageTier::Sixel => (0..img.rows)
+            .map(|r| format!("{IMG_MARK}{id}:{r}"))
+            .collect(),
+    })
+}
+
+// A Sixel row placeholder: (image id, row within the image).
+fn sixel_row(line: &str) -> Option<(usize, usize)> {
+    let (id, row) = line.strip_prefix(IMG_MARK)?.split_once(':')?;
+    Some((id.parse().ok()?, row.parse().ok()?))
+}
+
+// The visible part of each Sixel image: (id, first screen row, first image
+// row, rows). An image partly scrolled out of view is drawn cropped.
+fn sixel_placements(visible: &[&String], rows: usize) -> Vec<Placement> {
+    let mut out = Vec::new();
+    let mut screen_row = 0;
+    while screen_row < visible.len().min(rows) {
+        let Some((id, first)) = sixel_row(visible[screen_row]) else {
+            screen_row += 1;
+            continue;
+        };
+        let mut n = 1;
+        while screen_row + n < rows
+            && visible
+                .get(screen_row + n)
+                .and_then(|l| sixel_row(l))
+                .is_some_and(|(i, r)| i == id && r == first + n)
+        {
+            n += 1;
+        }
+        out.push((id, screen_row, first, n));
+        screen_row += n;
+    }
+    out
+}
+
+type Placement = (usize, usize, usize, usize);
 
 // Cell budget for an inline image: a thumbnail, not a full-screen picture.
 // At most half the width (80 columns) and a third of the rows above the
@@ -689,6 +872,7 @@ fn image_cell_budget_for(width: usize, height: usize, reserved: usize) -> (usize
 }
 
 fn free_images() {
+    invalidate_inline_pixels();
     if IMAGES_SENT.swap(false, Ordering::Relaxed) {
         let _ = write!(io::stdout(), "{}", crate::graphics::delete_all());
         flush();
@@ -736,6 +920,57 @@ pub fn show_image_file(path: &std::path::Path, once: bool) -> bool {
             rows_out.extend(crate::graphics::placeholder_rows(id, cols, rows, 2));
             line(&rows_out.join("\n"));
             return true;
+        }
+    }
+    // Real pixels over Sixel where the terminal has it, else block art. In
+    // the TUI the image is one marker line that re-renders at every terminal
+    // size; outside it, the image is printed once at the current size.
+    let sixel = use_sixel() && crate::media::ffmpeg_available();
+    if sixel || (ALT_SCREEN.load(Ordering::Relaxed) && truecolor()) {
+        if let Some(native) = crate::media::probe_dims(path) {
+            let mut img = InlineImage {
+                path: path.to_path_buf(),
+                native,
+                tier: if sixel {
+                    ImageTier::Sixel
+                } else {
+                    ImageTier::Blocks
+                },
+                made_for: (0, 0, (0, 0)),
+                rows: 0,
+                blocks: Vec::new(),
+                sixel: String::new(),
+                pixels: (0, 0, Vec::new()),
+                cell_h: 0,
+                crop: None,
+            };
+            let (w, h) = term_size();
+            img.ensure(w as usize, h as usize);
+            let header = format!(
+                "  {} {} {}",
+                dim("⎘"),
+                link,
+                dim(&format!("· {}×{}", native.0, native.1))
+            );
+            let drawable = match img.tier {
+                ImageTier::Sixel => !img.sixel.is_empty(),
+                ImageTier::Blocks => !img.blocks.is_empty(),
+            };
+            if drawable && ALT_SCREEN.load(Ordering::Relaxed) {
+                let id = inline_images().lock().ok().map(|mut imgs| {
+                    imgs.push(img);
+                    imgs.len() - 1
+                });
+                if let Some(id) = id {
+                    line(&format!("{header}\n{IMG_MARK}{id}"));
+                    return true;
+                }
+            } else if drawable && img.tier == ImageTier::Sixel {
+                line(&header);
+                print!("  {}{}", img.sixel, if is_raw() { "\r\n" } else { "\n" });
+                flush();
+                return true;
+            }
         }
     }
     // Half-block fallback: one text row shows two pixel rows.
@@ -1760,6 +1995,7 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
         Event::Resize(_, _) => {
             if ALT_SCREEN.load(Ordering::Relaxed) {
                 set_output_region();
+                invalidate_inline_pixels();
                 render_output();
                 render_footer();
                 render_queued_composer();
@@ -2823,7 +3059,7 @@ fn render_output() {
     let Ok(mut t) = transcript().lock() else {
         return;
     };
-    t.ensure_width(width);
+    t.ensure_size(width, height as usize);
     let total = t.total_rows();
     let max_offset = total.saturating_sub(rows);
     let offset = SCROLL_OFFSET.load(Ordering::Relaxed).min(max_offset);
@@ -2832,6 +3068,25 @@ fn render_output() {
     }
     let start = total.saturating_sub(rows + offset);
     let visible = t.rows_range(start, rows);
+    // Sixel images are pixels over blank rows. One that is on screen at the
+    // same place as last frame, with nothing drawn over it since, is left
+    // alone: rewriting its rows would erase it, and re-sending it every
+    // streamed frame would be slow.
+    let placements = sixel_placements(&visible, rows);
+    let kept: Vec<Placement> = if SIXEL_DIRTY.swap(false, Ordering::Relaxed) {
+        Vec::new()
+    } else {
+        let drawn = drawn_sixels().lock().map(|d| d.clone()).unwrap_or_default();
+        placements
+            .iter()
+            .filter(|p| drawn.contains(p))
+            .copied()
+            .collect()
+    };
+    let in_kept = |row: usize| {
+        kept.iter()
+            .any(|&(_, top, _, n)| row >= top && row < top + n)
+    };
     let mut out: Vec<u8> = Vec::with_capacity(rows * (width + 16));
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
@@ -2840,8 +3095,17 @@ fn render_output() {
     let sel = selection().lock().ok().and_then(|g| *g);
     let mut plain_rows = Vec::with_capacity(rows);
     for row in 0..rows {
+        if in_kept(row) {
+            plain_rows.push(String::new());
+            continue;
+        }
         let _ = queue!(out, MoveTo(0, row as u16));
         if let Some(line) = visible.get(row) {
+            if line.starts_with(IMG_MARK) {
+                let _ = write!(out, "{}", pad_ansi_line("", width));
+                plain_rows.push(String::new());
+                continue;
+            }
             let plain = strip_ansi(line);
             if let Some(sel) = sel {
                 if let Some(range) = selection_range_for(sel, row as u16, &plain) {
@@ -2863,6 +3127,35 @@ fn render_output() {
         }
     }
     drop(t);
+    // Drawing a Sixel leaves the cursor on the row below the image; with the
+    // scroll region's bottom margin there, the terminal would scroll the
+    // transcript. The margins are lifted while images are drawn: the rows
+    // below the output are the composer's, so nothing scrolls.
+    let redraw: Vec<_> = placements.iter().filter(|p| !kept.contains(p)).collect();
+    if !redraw.is_empty() {
+        let _ = write!(out, "\x1b[r");
+    }
+    for p in &redraw {
+        let data = inline_images()
+            .lock()
+            .ok()
+            .and_then(|mut imgs| imgs.get_mut(p.0).map(|img| img.sixel_rows(p.2, p.3)));
+        if let Some(data) = data {
+            let _ = queue!(out, MoveTo(2, p.1 as u16));
+            let _ = write!(out, "{data}");
+        }
+    }
+    if !redraw.is_empty() {
+        let _ = write!(
+            out,
+            "\x1b[1;{}r",
+            LAST_REGION_BOTTOM.load(Ordering::Relaxed).max(1)
+        );
+    }
+    drop(redraw);
+    if let Ok(mut drawn) = drawn_sixels().lock() {
+        *drawn = placements;
+    }
     if let Ok(mut rows) = visible_rows().lock() {
         *rows = plain_rows;
     }
@@ -3481,6 +3774,7 @@ pub fn enter_alt(raw: bool) {
         let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
         let _ = out.flush();
         ALT_SCREEN.store(true, Ordering::Relaxed);
+        invalidate_inline_pixels();
         set_output_region();
         let _ = execute!(io::stdout(), MoveTo(0, 0));
         // Never show a black frame: paint the composer box and footer right
@@ -3497,6 +3791,11 @@ pub fn enter_alt(raw: bool) {
     }
     if raw && enable_raw_mode().is_ok() {
         RAW.store(true, Ordering::Relaxed);
+        // Ask for Sixel support and the cell size once, before any other
+        // reader of stdin starts and before focus reports can interleave.
+        if io::stdin().is_terminal() && io::stdout().is_terminal() && images_enabled() {
+            crate::sixel::probe();
+        }
         let _ = execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange);
         set_mouse_capture(true);
         // Accent-colored blinking bar cursor for the composer.
@@ -3719,6 +4018,11 @@ fn pad_ansi_line(s: &str, width: usize) -> String {
 fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
     if max_cols == 0 {
         return vec![String::new()];
+    }
+    if s.starts_with(IMG_MARK) {
+        if let Some(rows) = inline_image_rows(s, max_cols) {
+            return rows;
+        }
     }
     if s.is_empty() {
         return vec![String::new()];
@@ -4740,6 +5044,7 @@ fn render_suggestions(sug: &[String], sel: usize) {
         .map(|c| str_width(c))
         .max()
         .unwrap_or(0);
+    invalidate_inline_pixels();
     let mut out = io::stdout();
     let _ = execute!(out, SavePosition);
     // Sit just above the composer box's top border.
@@ -6295,6 +6600,51 @@ mod tests {
         assert!(joined.contains("╭") && joined.contains("╰"), "{joined}");
         assert!(!joined.contains("```"), "{joined}");
         assert!(joined.contains("after"), "{joined}");
+    }
+
+    #[test]
+    fn sixel_placements_follow_the_visible_rows() {
+        let m = |id: usize, r: usize| format!("{IMG_MARK}{id}:{r}");
+        let rows = [
+            "text".to_string(),
+            m(3, 0),
+            m(3, 1),
+            m(3, 2),
+            "after".to_string(),
+        ];
+        let visible: Vec<&String> = rows.iter().collect();
+        // Whole image on screen.
+        assert_eq!(sixel_placements(&visible, 5), vec![(3, 1, 0, 3)]);
+        // Output area ends mid-image: only the rows that fit.
+        assert_eq!(sixel_placements(&visible, 3), vec![(3, 1, 0, 2)]);
+        // Scrolled so the image's first rows are above the screen.
+        let top = [m(3, 2), m(3, 3), "after".to_string()];
+        let visible: Vec<&String> = top.iter().collect();
+        assert_eq!(sixel_placements(&visible, 3), vec![(3, 0, 2, 2)]);
+        // A registered-image marker line is not a row placeholder.
+        assert_eq!(sixel_row(&format!("{IMG_MARK}3")), None);
+    }
+
+    #[test]
+    fn sixel_rows_crop_to_the_visible_slice() {
+        // 2 x 40 pixels at 10-pixel cells: 4 rows.
+        let rgb = vec![200u8; 2 * 40 * 3];
+        let mut img = InlineImage {
+            path: std::path::PathBuf::new(),
+            native: (2, 40),
+            tier: ImageTier::Sixel,
+            made_for: (0, 0, (0, 0)),
+            rows: 4,
+            blocks: Vec::new(),
+            sixel: "FULL".into(),
+            pixels: (2, 40, rgb),
+            cell_h: 10,
+            crop: None,
+        };
+        assert_eq!(img.sixel_rows(0, 4), "FULL");
+        assert!(img.sixel_rows(1, 2).contains("\"1;1;2;20"));
+        assert!(img.sixel_rows(3, 5).contains("\"1;1;2;10"));
+        assert!(img.sixel_rows(9, 1).is_empty());
     }
 
     #[test]

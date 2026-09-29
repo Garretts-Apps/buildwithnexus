@@ -58,6 +58,7 @@ pub mod report;
 pub mod rules;
 pub mod sandbox;
 pub mod session;
+pub mod sixel;
 pub mod tools;
 pub mod trace;
 pub mod tui;

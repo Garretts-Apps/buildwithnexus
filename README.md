@@ -75,8 +75,9 @@ once you're ready to let it loose on a real project.
 - **Images you can actually see** — `Ctrl+V` pastes a clipboard screenshot
   and it appears *right there in the transcript* before you send it: at real
   pixel resolution on kitty, Ghostty and WezTerm (kitty graphics protocol,
-  Unicode placeholders — works through tmux), as terminal-sized half-block
-  art everywhere else. Drop a file onto the terminal and its path becomes an
+  Unicode placeholders — works through tmux), over Sixel on Windows
+  Terminal 1.22+, foot, mlterm and xterm, as half-block art everywhere else.
+  Previews re-fit when you resize the window. Drop a file onto the terminal and its path becomes an
   `@attachment` with the same preview. `@clip.mp4` runs ffmpeg to sample
   frames + metadata for vision models (text-only models get a clear "not
   multimodal" notice instead of silent drops).
@@ -311,13 +312,16 @@ it is drawn inside the transcript, above the composer, before you send it:
 | Terminal | What you see |
 |---|---|
 | kitty ≥ 0.28, Ghostty, WezTerm (placeholder support) | the real pixels, at up to the full width of the window, scrolling with the text; works inside tmux with `set -g allow-passthrough on` |
-| any other truecolor terminal (iTerm2, Alacritty, Windows Terminal, foot, VS Code…) | half-block art sized to the terminal (needs `ffmpeg` on PATH to decode) |
+| Sixel terminals: Windows Terminal 1.22+, WezTerm, foot, mlterm, xterm `-ti vt340` | the real pixels, detected at startup; needs `ffmpeg` on PATH |
+| any other truecolor terminal (iTerm2, Alacritty, older Windows Terminal, VS Code…) | half-block art (needs `ffmpeg` on PATH to decode) |
 | `NO_COLOR`, non-truecolor | no preview, never garbage |
 
 A pasted PNG needs no external tool at all. JPEG, WebP, GIF and a video's
 first frame are converted with ffmpeg when it is installed. Control it with
-the `images` settings key (`"auto"` default, `"kitty"`, `"blocks"`, `"off"`)
-or `BWN_IMAGES=…` for one run. Uploads are freed when you `/clear` or exit.
+the `images` settings key (`"auto"` default, `"kitty"`, `"sixel"`, `"blocks"`,
+`"off"`) or `BWN_IMAGES=…` for one run. Sixel and block previews take at most
+half the window's width and a third of its height, and re-fit when the
+window is resized. Uploads are freed when you `/clear` or exit.
 
 Two related settings: `notify` (`"auto"` — desktop notification when a turn
 of 8 s or longer ends while the window is unfocused; `"always"`; `"off"`).
