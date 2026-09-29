@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.14.7"
+version = "0.14.8"
 edition = "2021"
 rust-version = "1.94"
 description = "A hilariously fast agentic AI coding CLI — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
@@ -11,6 +11,7 @@ readme = "../README.md"
 keywords = ["ai", "agent", "cli", "tui", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 default-run = "buildwithnexus"
+build = "build.rs"
 
 # `cargo install buildwithnexus` installs BOTH binaries: the full name and
 # the short `bwn` alias (same entry point).
@@ -40,6 +41,12 @@ shlex = "2.0"
 # async-signal-safe functions — raw write(2), tcsetattr(2), _exit(2).
 # Already in the tree transitively via crossterm; this makes it direct.
 libc = "0.2"
+
+# Windows builds embed a version resource and an application manifest, so the
+# .exe names its product, publisher and version like other signed software.
+# build.rs does nothing for other targets.
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 # Integration tests construct mock-server JSON and parse the --json event stream.

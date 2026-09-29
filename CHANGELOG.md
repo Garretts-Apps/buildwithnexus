@@ -6,6 +6,29 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.8] - 2026-09-29
+
+### Added
+- **Easier to approve on managed Windows machines.** The Windows `.exe` now
+  carries a version resource (product name, publisher, version, original
+  file name) and an application manifest that runs it with the caller's own
+  rights (`asInvoker`) and never asks for elevation. Security tools and IT
+  teams no longer see an anonymous binary. The release workflow fails if the
+  resource is missing.
+- **CycloneDX SBOM with every release** (`buildwithnexus.cdx.json`), listing
+  every crate compiled into the binary.
+- **Code signing, ready to switch on.** The release workflow can
+  Authenticode-sign the Windows `.exe` through SignPath (free for open-source
+  projects via the SignPath Foundation). It stays off until the project's
+  SignPath account is configured; releases until then are unsigned, as
+  before. Checksums and attestations are now computed after signing.
+- **A guide for IT and security teams** in
+  [SECURITY.md](SECURITY.md#for-it-and-security-teams): what bwn launches,
+  which hosts it connects to, which files it writes, why EDR tools may block
+  it, how to allowlist it by hash, signer or path, and a request an employee
+  can send. Also a code signing policy and a README note for corporate
+  machines.
+
 ## [0.14.7] - 2026-09-29
 
 ### Added
@@ -242,7 +265,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.7...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.8...HEAD
+[0.14.8]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.8
 [0.14.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.7
 [0.14.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.6
 [0.14.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.5

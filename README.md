@@ -524,6 +524,18 @@ Still Unix-only:
 - `xdg-open`-style helpers, `/proc`-based WSL detection and Unix signal
   handling (`SIGTERM`/`SIGHUP`) have no Windows equivalent beyond the above.
 
+### Managed and corporate machines
+
+Endpoint protection such as CrowdStrike Falcon or Microsoft Defender may
+block or quarantine the Windows binary: it is new, has few installs, and the
+npm launcher downloads it on first run and then executes it. The file itself
+matches the release checksum and attestation. On a managed machine, ask IT to
+allowlist it. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
+bwn runs, which hosts it connects to and which files it writes, explains how
+to verify a release, and includes a request you can send. Each Windows `.exe`
+carries a version resource and an `asInvoker` manifest, and each release has
+a CycloneDX SBOM (`buildwithnexus.cdx.json`).
+
 ## Safety
 
 - Default permission is **ask** — every file write, edit, and command is
