@@ -54,12 +54,14 @@ jobs:
             github.event.workflow_run.head_branch == 'main' ||
             github.event.workflow_run.event == 'workflow_dispatch')) }}
     permissions:
+      # write only for the manual version-bump path, which pushes a commit and
+      # tag; every other path just reads. (Permissions can't be conditional.)
       contents: write
       id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           # On the release-triggered path, publish exactly the tagged commit the
@@ -69,10 +71,11 @@ jobs:
           # needs read access to this public repo, so the default GITHUB_TOKEN is
           # enough — do NOT require a secret here, or an unset secret makes
           # checkout fail with "could not read Username" before publish runs.
-          persist-credentials: true
+          # The token stays on disk only when the bump step has to push.
+          persist-credentials: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none' }}
           submodules: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           # Note: registry-url *intentionally omitted* — when a Trusted Publisher
@@ -82,23 +85,27 @@ jobs:
 
       # Node 22 ships npm 10.x, which has no OIDC Trusted Publishing support, so
       # `npm publish` falls back to token auth, finds none, and fails ENEEDAUTH.
-      # OIDC trusted publishing requires npm >= 11.5.1 — install it explicitly.
+      # OIDC trusted publishing requires npm >= 11.5.1 — install it explicitly,
+      # pinned so a new npm release can't change the publish path unreviewed.
       - name: Upgrade npm for OIDC trusted publishing
+        env:
+          NPM_VERSION: "12.1.0"
         run: |
-          npm install -g npm@latest
+          npm install -g "npm@${NPM_VERSION}"
           npm --version
 
       - name: Bump version + tag
         # Only the manual path bumps; the release-triggered path publishes the
         # already-tagged version as-is.
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none' }}
+        env:
+          BUMP: ${{ github.event.inputs.version_bump }}
         run: |
-          set -e
-          BUMP="${{ github.event.inputs.version_bump || 'patch' }}"
-          if [ "$BUMP" = "none" ]; then
-            echo "Skipping bump (workflow_dispatch with none)"
-            exit 0
-          fi
+          set -euo pipefail
+          case "$BUMP" in
+            patch|minor|major) ;;
+            *) echo "::error::unexpected version_bump '$BUMP'"; exit 1 ;;
+          esac
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # No package-lock.json in the wrapper — only package.json changes.
@@ -107,8 +114,11 @@ jobs:
           git add package.json
           git commit -m "chore(release): $NEW_VERSION [skip ci]"
           git tag "$NEW_VERSION"
+          # A version on npm with no matching commit and tag on main can't be
+          # reproduced or released with binaries, so a failed push stops here.
           if ! git push origin HEAD:main --follow-tags; then
-            echo "::warning::Could not push bump+tag to main. Publishing to npm anyway."
+            echo "::error::Could not push the bump commit and tag to main. Nothing was published."
+            exit 1
           fi
 
       # Guard the launch path: a syntax error in the wrapper or bootstrap
@@ -142,25 +152,29 @@ jobs:
       # at install time via optionalDependencies — so the main tarball needs
       # no install scripts and no network code at all.
       #
-      # FIRST-TIME SETUP: each platform package needs its own npm Trusted
-      # Publisher entry (same repo/workflow) at
+      # FIRST-TIME SETUP: npm OIDC cannot CREATE a package, so each platform
+      # package's first version has to be published with a token:
+      #   NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh <version>
+      # (or store NPM_TOKEN as a repo secret and re-run this workflow). Then
+      # attach a Trusted Publisher (this repo, publish.yml) to each package at
       #   https://www.npmjs.com/package/buildwithnexus-<platform>/access
-      # A brand-new package can't use OIDC before it exists — publish each
-      # once manually (npm publish --access public from npm/<platform>) or
-      # create them via a granular token, then add the trusted publishers.
+      # and delete the token; later versions publish via OIDC.
+      #
+      # Until then this step does NOT fail the run: installs work without
+      # the platform packages (the launcher downloads the checksum-verified
+      # release binary on first run). Instead, optionalDependencies in the
+      # published manifest list only the platform packages whose exact version
+      # is on the registry, so npm never resolves a version that doesn't
+      # exist, and the run carries a warning naming the fix.
       # Runs on every invocation (not gated on the main-package check) and
-      # skips versions that already exist — so tokens can be added later and
-      # the workflow simply re-run to fill in whatever is missing.
+      # skips versions that already exist, so re-running fills in the gaps.
       - name: Publish platform binary packages
         env:
-          # One-time bootstrap only: npm OIDC cannot CREATE a package, so the
-          # five platform packages' first publish uses this granular token
-          # (created in the npmjs.com UI, pasted as a repo secret). After the
-          # first release: attach Trusted Publishers to each package and
-          # DELETE this secret — later versions publish via OIDC.
+          # One-time bootstrap only (see above). Delete the secret once every
+          # platform package has a Trusted Publisher.
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           V=$(node -p "require('./package.json').version")
           declare -A T=(
             [linux-x64]=x86_64-unknown-linux-gnu
@@ -170,48 +184,82 @@ jobs:
             [win32-x64]=x86_64-pc-windows-msvc
           )
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${V}"
+          sumfile=$(mktemp)
+          present=()
           for p in "${!T[@]}"; do
             t=${T[$p]}; ext=""; [[ "$t" == *windows* ]] && ext=".exe"
             if npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
               echo "buildwithnexus-${p}@${V} already published — skipping."
+              present+=("$p")
               continue
             fi
             mkdir -p "npm/${p}/bin"
             curl -fsSL -o "npm/${p}/bin/buildwithnexus${ext}" "${BASE}/buildwithnexus-${t}${ext}"
-            curl -fsSL -o /tmp/expected.sha256 "${BASE}/buildwithnexus-${t}${ext}.sha256"
-            expected=$(cut -d' ' -f1 /tmp/expected.sha256)
+            curl -fsSL -o "$sumfile" "${BASE}/buildwithnexus-${t}${ext}.sha256"
+            expected=$(cut -d' ' -f1 "$sumfile")
             got=$(sha256sum "npm/${p}/bin/buildwithnexus${ext}" | cut -d' ' -f1)
             [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
             chmod +x "npm/${p}/bin/buildwithnexus${ext}"
-            node -e "const fs=require('fs'),f='npm/${p}/package.json',j=require('./'+f);j.version='${V}';fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
+            PKG_FILE="npm/${p}/package.json" V="$V" node -e "const fs=require('fs'),f=process.env.PKG_FILE,j=JSON.parse(fs.readFileSync(f,'utf8'));j.version=process.env.V;fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
             # OIDC first; bootstrap-token fallback for the first publish of
             # a brand-new package (see env comment above).
             # NOTE: --provenance requires an OIDC token. The NPM_TOKEN fallback
             # uses a classic token, so we intentionally omit --provenance here —
             # passing it causes npm to return 404 on new packages.
-            if ! (cd "npm/${p}" && npm publish --access public --provenance); then
-              if [ -n "${NPM_TOKEN}" ]; then
-                echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token (no provenance)"
-                (cd "npm/${p}" && npm publish --access public \
-                  --//registry.npmjs.org/:_authToken="${NPM_TOKEN}") \
-                  || echo "::warning::bootstrap-token publish of buildwithnexus-${p} also failed"
+            if (cd "npm/${p}" && npm publish --access public --provenance); then
+              present+=("$p")
+            elif [ -n "${NPM_TOKEN}" ]; then
+              echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token (no provenance)"
+              if (cd "npm/${p}" && npm publish --access public \
+                    --//registry.npmjs.org/:_authToken="${NPM_TOKEN}"); then
+                present+=("$p")
               else
-                echo "OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set — skipping."
-                echo "- \`buildwithnexus-${p}@${V}\` not published (no NPM_TOKEN; expected until the one-time bootstrap)" >> "$GITHUB_STEP_SUMMARY"
+                echo "bootstrap-token publish of buildwithnexus-${p} also failed"
               fi
+            else
+              echo "OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set."
             fi
           done
-          # Installs stay safe even if platform packages are missing: the
-          # launcher falls back to a checksum-verified first-run download
-          # from the GitHub release. Surface what's missing, loudly.
+          missing=()
           for p in "${!T[@]}"; do
-            if ! npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
-              echo "buildwithnexus-${p}@${V} is not on the registry — installs use the first-run download fallback until it is published."
-              echo "- \`buildwithnexus-${p}@${V}\` missing from the registry — installs fall back to the first-run download (add NPM_TOKEN and re-run to fill in)" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            [[ " ${present[*]} " == *" $p "* ]] || missing+=("$p")
           done
-          # Pin the main package's optionalDependencies to this exact version.
-          node -e "const fs=require('fs'),j=require('./package.json');for(const k of Object.keys(j.optionalDependencies||{}))j.optionalDependencies[k]='${V}';fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')"
+
+          # Pin optionalDependencies to this exact version, but only for the
+          # platform packages that exist on the registry. Listing a version
+          # that doesn't exist makes npm's resolver hunt for it on every
+          # install; leaving it out sends that platform to the launcher's
+          # first-run download instead.
+          PRESENT="${present[*]}" V="$V" node -e '
+            const fs = require("fs");
+            const j = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const deps = {};
+            for (const p of (process.env.PRESENT || "").split(" ").filter(Boolean).sort()) {
+              deps["buildwithnexus-" + p] = process.env.V;
+            }
+            if (Object.keys(deps).length) j.optionalDependencies = deps;
+            else delete j.optionalDependencies;
+            fs.writeFileSync("package.json", JSON.stringify(j, null, 2) + "\n");
+            console.log("optionalDependencies:", JSON.stringify(j.optionalDependencies || {}));
+          '
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            list=""
+            for p in "${missing[@]}"; do list+="buildwithnexus-${p}@${V} "; done
+            echo "::warning title=Platform packages not on npm::${list}are not published, so those platforms install through the first-run download. One-time fix: NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh ${V}, then attach a Trusted Publisher to each package."
+            {
+              echo "### Platform packages missing from npm"
+              echo ""
+              for p in "${missing[@]}"; do echo "- \`buildwithnexus-${p}@${V}\`"; done
+              echo ""
+              echo "These were left out of the published \`optionalDependencies\`; installs on those platforms use the checksum-verified first-run download."
+              echo "One-time fix, from a maintainer machine:"
+              echo ""
+              echo "    NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh ${V}"
+              echo ""
+              echo "Then attach a Trusted Publisher (Garretts-Apps/buildwithnexus, publish.yml) to each package so later versions publish via OIDC."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
@@ -243,13 +291,13 @@ jobs:
       # the step skips crate versions that already exist.
       - name: Install Rust for crates.io publish
         if: github.event_name == 'workflow_dispatch'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
 
       - name: Get crates.io token via OIDC
         if: github.event_name == 'workflow_dispatch'
         id: cratesio
         continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish to crates.io
         if: github.event_name == 'workflow_dispatch'

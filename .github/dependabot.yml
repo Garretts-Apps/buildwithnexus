@@ -23,6 +23,25 @@ updates:
         update-types:
           - patch
 
+  # The Rust workspace (harness + bwn) is the shipped product; one grouped
+  # PR a week for compatible bumps, separate PRs for major versions.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Los_Angeles
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

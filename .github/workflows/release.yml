@@ -8,48 +8,69 @@ name: release
 # releases only when package.json's version has no v<version> tag yet. So
 # merging a PR that bumps the version ships everything — binaries, GitHub
 # release, crates.io, then npm via the chained publish — with zero clicks,
-# while docs-only merges do nothing. Tag pushes and manual dispatches always
-# release. (The tag this workflow creates is made with GITHUB_TOKEN, which
-# never triggers workflows — no recursion.)
+# while docs-only merges do nothing. Tag pushes and manual dispatches from
+# main always release. (The tag this workflow creates is made with
+# GITHUB_TOKEN, which never triggers workflows — no recursion.)
 on:
   push:
     tags: ["v*"]
     branches: ["main"]
   workflow_dispatch:
 
-permissions:
-  contents: write
-  id-token: write      # for build provenance attestation
-  attestations: write
+# Nothing by default; each job asks for exactly what it uses.
+permissions: {}
+
+# One release at a time. Two quick merges must not interleave their tag,
+# asset and checksum uploads; a running release is never cancelled.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       release: ${{ steps.check.outputs.release }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
       - name: Release only unreleased versions on main pushes
         id: check
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
         run: |
+          # A manual release must come from main; dispatching from a feature
+          # branch would publish unreviewed code under a real version.
+          if [[ "$EVENT" == workflow_dispatch && "$REF" != refs/heads/main ]]; then
+            echo "::error::release can only be dispatched from main (got $REF)"
+            exit 1
+          fi
           if [[ "$REF" == refs/tags/* || "$EVENT" == workflow_dispatch ]]; then
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           V=$(node -p "require('./package.json').version")
-          if git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1; then
-            echo "v${V} is already tagged — nothing to release."
-            echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "v${V} is not tagged yet — releasing."
-            echo "release=true" >> "$GITHUB_OUTPUT"
-          fi
+          # --exit-code: 0 = tag exists, 2 = no such tag, anything else is a
+          # lookup failure. Never treat a failed lookup as "untagged", which
+          # would re-release (and overwrite the assets of) a shipped version.
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1 || rc=$?
+          case $rc in
+            0)
+              echo "v${V} is already tagged — nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT" ;;
+            2)
+              echo "v${V} is not tagged yet — releasing."
+              echo "release=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::could not list tags on origin (git ls-remote exit $rc)"
+              exit 1 ;;
+          esac
 
   # Creates (or refreshes) the tag + release ONCE, with the CHANGELOG section
   # as the body and GitHub's auto-generated notes appended. The build matrix
@@ -61,10 +82,14 @@ jobs:
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write   # create the tag and the release
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The release tag is the pushed v* tag; otherwise it is derived from
       # package.json so it always matches the version npm will publish.
@@ -105,10 +130,14 @@ jobs:
           fi
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
+      # target_commitish ties a newly created tag to the commit this run
+      # checked out, not to whatever main points at when the API call lands.
+      # (An existing tag is left where it is.)
       - name: Create or update release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body_path: ${{ steps.notes.outputs.path }}
           append_body: false
           generate_release_notes: true
@@ -116,6 +145,11 @@ jobs:
   build:
     needs: [gate, release]
     if: needs.gate.outputs.release == 'true'
+    timeout-minutes: 60
+    permissions:
+      contents: write       # upload release assets
+      id-token: write       # build provenance attestation
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -133,10 +167,14 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      # No credentials on disk while dependency build scripts and proc-macros
+      # run; the upload step gets its token as an input.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
         with:
           targets: ${{ matrix.target }}
 
@@ -167,16 +205,17 @@ jobs:
           else shasum -a 256 "$asset" > "$asset.sha256"; fi
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
 
       # Asset upload only — the `release` job created the release and owns
       # the body (softprops leaves unspecified fields untouched).
       - name: Upload assets to release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: buildwithnexus-${{ matrix.target }}*
 
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
@@ -185,8 +224,10 @@ jobs:
   # could never authenticate without a stored token. This workflow's triggers
   # (v* tag push, workflow_dispatch) are both accepted. Requires a Trusted
   # Publishing entry on BOTH crates pointing at workflow file `release.yml`.
-  # Idempotent: versions already on the registry index are skipped, so
-  # re-dispatching a release is safe.
+  # Idempotent: versions already on the registry are skipped, so
+  # re-dispatching a release is safe. Anything else that goes wrong (no OIDC
+  # token, a publish error) fails the job, so a half-published release shows
+  # up red instead of green-with-a-warning.
   crates:
     needs: [gate, build]
     if: needs.gate.outputs.release == 'true'
@@ -194,55 +235,85 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write
+      id-token: write   # crates.io Trusted Publishing
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Get crates.io token via OIDC
-        id: cratesio
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token }}
+      # `cargo info <name>` resolves workspace members LOCALLY, so from
+      # inside this repo it always says our crates exist — ask the
+      # registry's sparse index instead.
+      - name: Check what is already on crates.io
+        id: need
         run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::no crates.io OIDC token — add a Trusted Publishing entry for workflow release.yml on both crates. Skipping."
-            exit 0
-          fi
-          set -e
+          set -euo pipefail
           V=$(node -p "require('./package.json').version")
-          # `cargo info <name>` resolves workspace members LOCALLY, so from
-          # inside this repo it always says our crates exist — ask the
-          # registry's sparse index instead.
           on_registry() {
-            local n=$1 p
+            local n=$1 p body
             case ${#n} in
               1) p="1/$n" ;;
               2) p="2/$n" ;;
               3) p="3/${n:0:1}/$n" ;;
               *) p="${n:0:2}/${n:2:2}/$n" ;;
             esac
-            curl -sf "https://index.crates.io/$p" | grep -q "\"vers\":\"$V\""
+            body=$(curl -fsS --retry 3 "https://index.crates.io/$p")
+            grep -q "\"vers\":\"$V\"" <<<"$body"
           }
-          if on_registry buildwithnexus; then
-            echo "buildwithnexus ${V} already on crates.io — skipping."
-          else
-            cargo publish -p buildwithnexus --locked
+          for c in buildwithnexus bwn; do
+            if on_registry "$c"; then
+              echo "$c ${V} already on crates.io — skipping."
+              echo "$c=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "$c=true" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
+        if: steps.need.outputs.buildwithnexus == 'true' || steps.need.outputs.bwn == 'true'
+
+      - name: Get crates.io token via OIDC
+        if: steps.need.outputs.buildwithnexus == 'true' || steps.need.outputs.bwn == 'true'
+        id: cratesio
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        if: steps.need.outputs.buildwithnexus == 'true' || steps.need.outputs.bwn == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token }}
+          NEED_MAIN: ${{ steps.need.outputs.buildwithnexus }}
+          NEED_BWN: ${{ steps.need.outputs.bwn }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::no crates.io OIDC token. Add a Trusted Publishing entry for workflow release.yml on both crates, then re-run this job."
+            exit 1
           fi
-          if on_registry bwn; then
-            echo "bwn ${V} already on crates.io — done."
+          # A version that is already uploaded (a race with a manual publish,
+          # or a stale index read) counts as done, not as a failure.
+          publish() {
+            local out
+            if out=$(cargo publish -p "$1" --locked 2>&1); then
+              echo "$out"; return 0
+            fi
+            echo "$out"
+            if grep -qiE 'already (uploaded|exists)' <<<"$out"; then
+              echo "$1 is already on crates.io — treating as published."
+              return 0
+            fi
+            return 1
+          }
+          if [ "$NEED_MAIN" = true ]; then
+            publish buildwithnexus
+          fi
+          if [ "$NEED_BWN" != true ]; then
             exit 0
           fi
           # bwn depends on the crate above; wait out index propagation.
           for i in 1 2 3 4 5; do
-            if cargo publish -p bwn --locked; then exit 0; fi
+            if publish bwn; then exit 0; fi
             echo "bwn publish attempt ${i} failed (index propagation?) — retrying in 30s"
             sleep 30
           done
-          echo "::warning::bwn alias crate did not publish — re-run this workflow or dispatch 'Publish to npm' manually."
+          echo "::error::bwn alias crate did not publish after 5 attempts. Re-run this job; buildwithnexus itself is already published."
+          exit 1

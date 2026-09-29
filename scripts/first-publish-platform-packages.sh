@@ -9,7 +9,10 @@
 # publish.yml) and CI publishes every future version via OIDC — no tokens.
 #
 # Usage: scripts/first-publish-platform-packages.sh <version>
+#        NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh <version>
 #        (release assets for v<version> must already exist on GitHub)
+# Auth: NPM_TOKEN when set (a granular token with publish rights for new
+# packages), otherwise whatever `npm login` stored.
 set -euo pipefail
 V="${1:?usage: $0 <version>   e.g. $0 0.12.1}"
 BASE="https://github.com/Garretts-Apps/buildwithnexus/releases/download/v${V}"
@@ -21,6 +24,15 @@ declare -A T=(
   [win32-x64]=x86_64-pc-windows-msvc
 )
 cd "$(dirname "$0")/.."
+if [[ -n "${NPM_TOKEN:-}" ]]; then
+  # npm expands ${NPM_TOKEN} from the environment when it reads the file, so
+  # the token itself never lands on disk or on a command line.
+  rc=$(mktemp)
+  trap 'rm -f "$rc"' EXIT
+  # shellcheck disable=SC2016
+  printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$rc"
+  export NPM_CONFIG_USERCONFIG="$rc"
+fi
 for p in "${!T[@]}"; do
   t=${T[$p]}; ext=""; [[ "$t" == *windows* ]] && ext=".exe"
   if npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then

@@ -26,4 +26,5 @@ jobs:
           create dependencies   0366d6 "Dependency updates"
           create github-actions 000000 "GitHub Actions workflow dependencies"
           create npm            cb3837 "npm package dependencies"
+          create rust           dea584 "Rust (cargo) dependencies"
           gh label list --limit 50
