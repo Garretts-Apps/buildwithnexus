@@ -255,16 +255,86 @@ pub fn run() -> Option<Settings> {
     }
     .to_string();
 
-    let settings = Settings {
-        provider: pick.id.to_string(),
-        model,
-        permission,
-        base_url,
-        allowed_commands: Vec::new(),
-        ..Default::default()
-    };
-    config::save_settings(&settings);
+    let saved = save_setup(pick.id, model, permission, base_url);
     tui::line("");
-    tui::line(&tui::green("  ✓ ready"));
-    Some(settings)
+    match saved {
+        Ok(settings) => {
+            tui::line(&tui::green("  ✓ ready"));
+            Some(settings)
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!("  ✗ settings not saved: {e}")));
+            None
+        }
+    }
+}
+
+// Only the four answered keys change: allowed_commands, project_allowed,
+// budget, hooks and anything else already in the user file are kept.
+fn save_setup(
+    provider: &str,
+    model: String,
+    permission: String,
+    base_url: Option<String>,
+) -> Result<Settings, String> {
+    let mut settings = config::load_user_settings().unwrap_or_default();
+    settings.provider = provider.to_string();
+    settings.model = model;
+    settings.permission = permission;
+    settings.base_url = base_url;
+    config::save_user_settings(&[
+        ("provider", Some(settings.provider.as_str().into())),
+        ("model", Some(settings.model.as_str().into())),
+        ("permission", Some(settings.permission.as_str().into())),
+        ("base_url", settings.base_url.as_deref().map(Into::into)),
+    ])?;
+    Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_keeps_existing_user_settings() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-onboard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        std::fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"custom","model":"m","permission":"ask","base_url":"http://old/v1","allowed_commands":["make"],
+                "max_budget_usd":5.0,"auto_update":"off","hooks":{"Stop":[]},"custom_key":1}"#,
+        )
+        .unwrap();
+
+        let s = save_setup("openai", "gpt-4o".into(), "readonly".into(), None).unwrap();
+        assert_eq!(s.allowed_commands, ["make"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(h.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["provider"], "openai");
+        assert_eq!(v["model"], "gpt-4o");
+        assert_eq!(v["permission"], "readonly");
+        assert!(v.get("base_url").is_none());
+        assert_eq!(v["allowed_commands"][0], "make");
+        assert_eq!(v["max_budget_usd"], 5.0);
+        assert_eq!(v["auto_update"], "off");
+        assert!(v["hooks"]["Stop"].is_array());
+        assert_eq!(v["custom_key"], 1);
+
+        // A malformed file is reported, never overwritten.
+        std::fs::write(h.join("settings.json"), "{oops").unwrap();
+        assert!(save_setup("openai", "m".into(), "ask".into(), None).is_err());
+        assert_eq!(
+            std::fs::read_to_string(h.join("settings.json")).unwrap(),
+            "{oops"
+        );
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+    }
 }

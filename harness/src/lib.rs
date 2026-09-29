@@ -545,6 +545,8 @@ fn headless(
     opts: &CliOptions,
     f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>,
 ) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    hooks::trust_project(&cwd, false);
     let (provider, perm) = match provider_or_onboard(opts) {
         Ok(v) => v,
         Err(e) => {
@@ -553,7 +555,6 @@ fn headless(
         }
     };
     provider::prewarm(&provider);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     hooks::init(&cwd, false);
     hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
@@ -656,6 +657,11 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
             return;
         }
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // Before the provider is built: base_url, permission and sandbox may
+    // come from the project only once the user trusts it.
+    hooks::trust_project(&cwd, raw);
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
         Err(e) => {
@@ -664,9 +670,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
         }
     };
     provider::prewarm(&provider);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     hooks::init(&cwd, raw);
     hooks::set_permission_mode(agent::permission_name(perm));
     // Once per process: the session id is fixed here so SessionStart, every
@@ -2356,11 +2360,15 @@ fn swap_model(
         }
     }
 
-    // A custom base_url belongs to the provider it was set for.
-    if preset.id != "custom" && custom_url.is_none() {
-        s.base_url = None;
-    } else if let Some(u) = custom_url {
-        s.base_url = Some(u);
+    // A custom base_url belongs to the provider it was set for. `None`
+    // leaves the saved value alone.
+    let base_url_change = if preset.id != "custom" && custom_url.is_none() {
+        Some(None)
+    } else {
+        custom_url.map(Some)
+    };
+    if let Some(u) = &base_url_change {
+        s.base_url = u.clone();
     }
     s.provider = preset.id.to_string();
     s.model = model.to_string();
@@ -2417,7 +2425,14 @@ fn swap_model(
             let mut p = p;
             p.effort = provider.effort;
             *provider = p;
-            config::save_settings(&s);
+            let mut changes = vec![
+                ("provider", Some(s.provider.as_str().into())),
+                ("model", Some(s.model.as_str().into())),
+            ];
+            if let Some(u) = base_url_change {
+                changes.push(("base_url", u.map(Into::into)));
+            }
+            save_user_settings(&changes);
             provider::prewarm(provider);
             tui::line(&tui::green(&format!(
                 "  ✓ active model hot-swapped → {} on {} (validated)",
@@ -3043,14 +3058,19 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
     None
 }
 
+// Writes only the changed keys into the user settings file. Saving the merged
+// settings would copy a project's own settings into the user's global file.
+fn save_user_settings(changes: &[(&str, Option<serde_json::Value>)]) {
+    if let Err(e) = config::save_user_settings(changes) {
+        tui::line(&tui::yellow(&format!("  ⚠ not saved: {e}")));
+    }
+}
+
 // Apply a permission string, update the in-session value, and persist to settings.json.
 fn apply_permission(perm: &mut Permission, ps: &str) {
     *perm = agent::permission(ps);
     hooks::set_permission_mode(agent::permission_name(*perm));
-    if let Some(mut settings) = config::load_settings() {
-        settings.permission = ps.to_string();
-        config::save_settings(&settings);
-    }
+    save_user_settings(&[("permission", Some(ps.into()))]);
     tui::set_permission_mode(permission_label(perm));
     tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
 }
@@ -3117,10 +3137,7 @@ fn handle_sandbox(arg: &str) {
         other => match sandbox::Mode::parse(other) {
             Some(mode) => {
                 sandbox::set_mode(mode);
-                if let Some(mut settings) = config::load_settings() {
-                    settings.sandbox = mode.as_str().to_string();
-                    config::save_settings(&settings);
-                }
+                save_user_settings(&[("sandbox", Some(mode.as_str().into()))]);
                 tui::line(&tui::green(&format!("  ✓ sandbox: {}", mode.as_str())));
                 for l in sandbox::status_lines().into_iter().skip(1) {
                     tui::line(&tui::dim(&format!("  {l}")));
@@ -3252,9 +3269,7 @@ fn handle_effort(provider: &mut Provider, arg: &str) {
     match config::Effort::parse(arg) {
         Some(level) => {
             provider.effort = level;
-            let mut s = config::load_settings().unwrap_or_default();
-            s.effort = level.as_str().to_string();
-            config::save_settings(&s);
+            save_user_settings(&[("reasoning_effort", Some(level.as_str().into()))]);
             tui::line(&tui::green(&format!(
                 "  ✓ effort → {level} (saved to settings)"
             )));

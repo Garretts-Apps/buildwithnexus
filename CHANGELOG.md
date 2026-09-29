@@ -4,6 +4,40 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Project settings need your trust before they can change anything that
+  matters.** A repository's `.buildwithnexus/settings.json` and
+  `settings.local.json` used to be merged over your own settings with no
+  prompt, so a cloned repo could send your API key to its own `base_url`,
+  switch to `permission: auto` and `sandbox: off`, or start an MCP server
+  command. Without trust, a project file may now set only `model`,
+  `reasoning_effort`, `temperature`, `max_tokens`, `context_tokens`,
+  `instruction_files`, `images` and `notify`, may tighten `permission` and
+  `sandbox`, and may lower `max_budget_usd`. Every other key is ignored until
+  you answer one prompt that lists the keys the project wants. Headless runs
+  never prompt: they ignore those keys and print one warning naming them.
+  A trusted project can add MCP servers but can never change one defined in
+  your own settings.
+- **Hook trust covers the scripts hooks run.** Trust is recorded per project
+  folder and per file name (settings.json and settings.local.json no longer
+  share one entry) as a SHA-256 digest of the file plus every script inside
+  the project that its hooks reference. Editing any of them asks again. The
+  prompt appears only when a file defines hooks or other security keys, and
+  names the right file.
+- **"Always allow", `/permissions`, `/sandbox`, `/effort` and `/model` no
+  longer copy project settings into your global settings.** They used to save
+  the merged settings to `~/.buildwithnexus/settings.json`. They now change
+  only their own keys in that file.
+
+### Fixed
+- **`bwn init` keeps your existing settings.** Setup used to rewrite
+  `settings.json` from defaults, dropping `allowed_commands`,
+  `project_allowed`, `max_budget_usd`, `auto_update`, hooks and any other
+  keys. It now changes only the provider, model, permission and base URL,
+  and reports a failed save instead of printing "ready".
+
 ## [0.14.2] - 2026-09-29
 
 The "first hour" release: fixes from walking the first run, the TUI and
