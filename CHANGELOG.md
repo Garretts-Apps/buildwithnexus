@@ -4,6 +4,21 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Headless first run no longer hangs on setup.** With no settings file and
+  no terminal (CI, pipes, `docker run` without `-t`), `bwn run` used to print
+  the interactive provider menu into the pipe and exit with "setup
+  cancelled", even when `ANTHROPIC_API_KEY` was set or `--provider` was
+  passed. It now uses `--provider`, or the first provider whose API key is in
+  the environment, without writing any settings. With neither, it exits with
+  a message that names the three ways to fix it.
+- **The launcher's missing-binary message leads with the fix that works.**
+  In a non-interactive shell it now points to `bwn --bootstrap` first,
+  instead of telling you to reinstall a platform package that may not be
+  published.
+
 ## [0.14.1] - 2026-09-24
 
 ### Security
