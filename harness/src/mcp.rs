@@ -51,6 +51,10 @@ pub struct ServerConfig {
     pub transport: Transport,
     pub timeout: Duration,
     pub enabled: bool,
+    /// Let the server's `readOnlyHint` annotations skip the permission gate.
+    /// Off by default: the hint is the server's own claim, and a malicious
+    /// or compromised server can mark a destructive tool read-only.
+    pub trust_read_only_hints: bool,
 }
 
 impl ServerConfig {
@@ -160,11 +164,16 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         },
     };
     let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let trust_read_only_hints = obj
+        .get("trust_read_only_hints")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(ServerConfig {
         name: name.to_string(),
         transport,
         timeout: Duration::from_secs(timeout),
         enabled,
+        trust_read_only_hints,
     })
 }
 
@@ -997,9 +1006,17 @@ pub fn find_tool(mangled: &str) -> Option<McpTool> {
     None
 }
 
-/// Read-only under the permission gate only when the server says so.
+/// Read-only under the permission gate only when the server says so AND the
+/// user opted in to trusting that server's hints (`trust_read_only_hints`).
 pub fn is_read_only(mangled: &str) -> bool {
-    find_tool(mangled).is_some_and(|t| t.read_only)
+    for (_, state) in server_states() {
+        let st = lock_state(&state);
+        if let Some(t) = st.tools.iter().find(|t| t.mangled == mangled) {
+            let trusted = st.config.as_ref().is_some_and(|c| c.trust_read_only_hints);
+            return t.read_only && trusted;
+        }
+    }
+    false
 }
 
 /// Calls `tool` on `server` over its persistent connection. A transport
@@ -1902,7 +1919,7 @@ mod tests {
         let mut servers = BTreeMap::new();
         servers.insert(
             "fake".to_string(),
-            json!({"command": "python3", "args": [FIXTURE], "timeout_secs": 20}),
+            json!({"command": "python3", "args": [FIXTURE], "timeout_secs": 20, "trust_read_only_hints": true}),
         );
         servers.insert("off".to_string(), json!({"command": "x", "enabled": false}));
         servers.insert("bad".to_string(), json!({"type": "grpc"}));

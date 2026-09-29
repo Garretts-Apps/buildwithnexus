@@ -24,15 +24,36 @@ function platformPackage() {
   return PLATFORM_PACKAGES[`${process.platform} ${process.arch}`] || null;
 }
 
-// Binary installed by the platform optionalDependency, if present.
+// Binary installed by the platform optionalDependency, if present. Only a
+// package installed next to this one (or nested inside it) counts: Node's
+// lookup also walks every parent `node_modules` and NODE_PATH, where another
+// user could plant a package (`C:\node_modules\buildwithnexus-win32-x64`).
 function packagedBinary() {
   const name = platformPackage();
   if (!name) return null;
+  let found;
   try {
-    return require.resolve(`${name}/bin/buildwithnexus${ext()}`);
+    found = require.resolve(`${name}/bin/buildwithnexus${ext()}`, { paths: [ROOT] });
   } catch {
     return null;
   }
+  const allowed = [
+    path.join(path.dirname(ROOT), name) + path.sep,
+    path.join(ROOT, 'node_modules', name) + path.sep,
+  ];
+  return allowed.some((dir) => found.startsWith(dir)) ? found : null;
+}
+
+// BWN_BIN, if it is an absolute path. A relative value would resolve against
+// whatever directory `bwn` is run in, so an untrusted checkout could supply it.
+function overrideBinary() {
+  const p = process.env.BWN_BIN;
+  if (!p) return null;
+  if (!path.isAbsolute(p)) {
+    process.stderr.write(`buildwithnexus: ignoring BWN_BIN=${p}: it must be an absolute path.\n`);
+    return null;
+  }
+  return p;
 }
 
 // Rust target triple for the current platform (used in docs/error messages).
@@ -60,7 +81,7 @@ function devBinary() {
 
 // First existing binary: explicit override, platform package, legacy, dev.
 function existing() {
-  const candidates = [process.env.BWN_BIN, packagedBinary(), installedBinary(), devBinary()].filter(Boolean);
+  const candidates = [overrideBinary(), packagedBinary(), installedBinary(), devBinary()].filter(Boolean);
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 

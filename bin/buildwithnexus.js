@@ -50,7 +50,7 @@ if (!bin) {
         `  "${pkg}" package is available.\n`
       : `  No prebuilt binary exists for this platform (${process.platform} ${process.arch}).\n`) +
     (t
-      ? '  Or build from source and point BWN_BIN at the result:\n' +
+      ? '  Or build from source and point BWN_BIN at the result (an absolute path):\n' +
         '    git clone https://github.com/Garretts-Apps/buildwithnexus\n' +
         '    cargo build --release --manifest-path buildwithnexus/harness/Cargo.toml\n'
       : '') +

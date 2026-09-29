@@ -183,7 +183,12 @@ pub fn run() -> Option<Settings> {
         } else {
             tui::line(&tui::dim("  detected local models:"));
             for (i, m) in found.iter().take(20).enumerate() {
-                tui::line(&format!("    {}  {}", tui::bold(&(i + 1).to_string()), m));
+                // Names come from whatever answers on the local port.
+                tui::line(&format!(
+                    "    {}  {}",
+                    tui::bold(&(i + 1).to_string()),
+                    tui::sanitize_terminal(m)
+                ));
             }
         }
         found

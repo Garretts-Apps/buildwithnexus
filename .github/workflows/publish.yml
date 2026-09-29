@@ -58,6 +58,7 @@ jobs:
       # tag; every other path just reads. (Permissions can't be conditional.)
       contents: write
       id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
+      attestations: read  # verify the release binaries' build provenance
 
     steps:
       - name: Checkout
@@ -121,6 +122,38 @@ jobs:
             exit 1
           fi
 
+      # Release assets can be replaced after publishing, so their .sha256
+      # files only catch corruption. Before anything reaches npm, check each
+      # binary against its build-provenance attestation (Sigstore, tied to
+      # release.yml in this repo), then record the verified hashes in
+      # checksums.json inside the immutable npm tarball. The launcher's
+      # first-run download and the platform packages below trust only these.
+      - name: Verify release binaries and record checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${V}"
+          mkdir -p verified
+          echo '{}' > checksums.json
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
+            asset="buildwithnexus-${t}${ext}"
+            curl -fsSL --retry 3 -o "verified/${asset}" "${BASE}/${asset}"
+            gh attestation verify "verified/${asset}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+            sum=$(sha256sum "verified/${asset}" | cut -d' ' -f1)
+            ASSET="$asset" SUM="$sum" node -e '
+              const fs = require("fs");
+              const j = JSON.parse(fs.readFileSync("checksums.json", "utf8"));
+              j[process.env.ASSET] = process.env.SUM;
+              fs.writeFileSync("checksums.json", JSON.stringify(j, null, 2) + "\n");
+            '
+          done
+          cat checksums.json
+
       # Guard the launch path: a syntax error in the wrapper or bootstrap
       # would break `npm install` for every user. Cheap to check, expensive to miss.
       - name: Syntax-check wrapper scripts
@@ -183,8 +216,6 @@ jobs:
             [darwin-arm64]=aarch64-apple-darwin
             [win32-x64]=x86_64-pc-windows-msvc
           )
-          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${V}"
-          sumfile=$(mktemp)
           present=()
           for p in "${!T[@]}"; do
             t=${T[$p]}; ext=""; [[ "$t" == *windows* ]] && ext=".exe"
@@ -194,9 +225,9 @@ jobs:
               continue
             fi
             mkdir -p "npm/${p}/bin"
-            curl -fsSL -o "npm/${p}/bin/buildwithnexus${ext}" "${BASE}/buildwithnexus-${t}${ext}"
-            curl -fsSL -o "$sumfile" "${BASE}/buildwithnexus-${t}${ext}.sha256"
-            expected=$(cut -d' ' -f1 "$sumfile")
+            # The attestation-verified copy from the step above.
+            cp "verified/buildwithnexus-${t}${ext}" "npm/${p}/bin/buildwithnexus${ext}"
+            expected=$(A="buildwithnexus-${t}${ext}" node -p "require('./checksums.json')[process.env.A]")
             got=$(sha256sum "npm/${p}/bin/buildwithnexus${ext}" | cut -d' ' -f1)
             [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
             chmod +x "npm/${p}/bin/buildwithnexus${ext}"

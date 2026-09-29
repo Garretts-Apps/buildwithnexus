@@ -520,6 +520,22 @@ pub fn append_memory(entry: &str) {
 }
 
 // ── agents + skills ───────────────────────────────────────────────────────────
+/// Reads a file that came from the project tree (instructions, `Agents.md`,
+/// `system.md`, skills). A cloned repo controls these, and they go into the
+/// model's context unprompted, so a symlink must not smuggle in a file from
+/// outside `bound` (`AGENTS.md -> /proc/self/environ`, `-> ~/.aws/…`): the
+/// resolved file has to be a regular file inside `bound` and not a sensitive
+/// path. In-tree links (`CLAUDE.md -> AGENTS.md`) still work.
+pub(crate) fn read_project_file(p: &Path, bound: &Path) -> Option<String> {
+    let real = fs::canonicalize(p).ok()?;
+    let root = fs::canonicalize(bound).ok()?;
+    let rel = real.strip_prefix(&root).ok()?;
+    if !fs::metadata(&real).ok()?.is_file() || crate::tools::is_sensitive_in_project(rel) {
+        return None;
+    }
+    fs::read_to_string(&real).ok()
+}
+
 // `Agents.md` (mixed case, harness-specific) defines roles/capabilities the
 // model can adopt. It is distinct from the cross-harness project instruction
 // files `AGENTS.md` / `CLAUDE.md` handled by `load_instructions` below, which
@@ -530,7 +546,7 @@ pub fn load_agents() -> Option<String> {
     // Project-local Agents.md takes precedence over the home one.
     let cwd = std::env::current_dir().ok()?;
     let proj = cwd.join(".buildwithnexus").join("Agents.md");
-    if let Ok(t) = fs::read_to_string(&proj) {
+    if let Some(t) = read_project_file(&proj, &cwd) {
         if !t.trim().is_empty() {
             return Some(t.trim().to_string());
         }
@@ -547,7 +563,7 @@ pub fn load_agents() -> Option<String> {
 pub fn load_system_prompt() -> Option<String> {
     if let Ok(cwd) = std::env::current_dir() {
         let proj = cwd.join(".buildwithnexus").join("system.md");
-        if let Ok(t) = fs::read_to_string(&proj) {
+        if let Some(t) = read_project_file(&proj, &cwd) {
             if !t.trim().is_empty() {
                 return Some(t.trim().to_string());
             }
@@ -646,12 +662,13 @@ pub fn load_instructions_with(cwd: &Path, names: &[String]) -> Vec<InstructionFi
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let root = find_git_root(&cwd);
 
-    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    // The bound is None for the user's own ~/.buildwithnexus/AGENTS.md.
+    let mut candidates: Vec<(PathBuf, String, Option<PathBuf>)> = Vec::new();
     let h = home();
     if dir_names(&h).contains("AGENTS.md") {
         let p = h.join("AGENTS.md");
         let label = tilde(&p);
-        candidates.push((p, label));
+        candidates.push((p, label, None));
     }
     let label_for = |p: &Path| -> String {
         match &root {
@@ -672,23 +689,23 @@ pub fn load_instructions_with(cwd: &Path, names: &[String]) -> Vec<InstructionFi
         if let Some(n) = names.iter().find(|n| listing.contains(n.as_str())) {
             let p = dir.join(n);
             let label = label_for(&p);
-            candidates.push((p, label));
+            candidates.push((p, label, Some(dir.to_path_buf())));
         }
         let dot = dir.join(".buildwithnexus");
         if dir_names(&dot).contains("AGENTS.md") {
             let p = dot.join("AGENTS.md");
             let label = label_for(&p);
-            candidates.push((p, label));
+            candidates.push((p, label, Some(dir.to_path_buf())));
         }
     }
 
     let mut total = 0usize;
-    for (path, label) in candidates {
-        let Some(raw) = fs::read_to_string(&path)
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-        else {
+    for (path, label, dir) in candidates {
+        let text = match &dir {
+            Some(d) => read_project_file(&path, d),
+            None => fs::read_to_string(&path).ok(),
+        };
+        let Some(raw) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) else {
             continue;
         };
         let remaining = INSTRUCTION_TOTAL_CAP.saturating_sub(total);
@@ -998,6 +1015,20 @@ fn scan_skill_root(dir: &Path, source: SkillSource, out: &mut Vec<Skill>) {
     let Ok(rd) = fs::read_dir(dir) else {
         return;
     };
+    // Skills inside the working tree come from the repo: keep their files
+    // inside the skill root. The user's own roots may link anywhere.
+    let in_project = std::env::current_dir()
+        .and_then(fs::canonicalize)
+        .ok()
+        .zip(fs::canonicalize(dir).ok())
+        .is_some_and(|(cwd, root)| root.starts_with(cwd));
+    let read = |p: &Path| {
+        if in_project {
+            read_project_file(p, dir)
+        } else {
+            fs::read_to_string(p).ok()
+        }
+    };
     let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     entries.sort();
     let mut folders = Vec::new();
@@ -1014,7 +1045,7 @@ fn scan_skill_root(dir: &Path, source: SkillSource, out: &mut Vec<Skill>) {
                 folders.push(path);
             }
         } else if path.extension().is_some_and(|x| x == "md") {
-            if let Ok(text) = fs::read_to_string(&path) {
+            if let Some(text) = read(&path) {
                 if let Some(s) = skill_from_text(&stem, &text, source, None) {
                     push_skill(out, s);
                 }
@@ -1026,7 +1057,7 @@ fn scan_skill_root(dir: &Path, source: SkillSource, out: &mut Vec<Skill>) {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if let Ok(text) = fs::read_to_string(folder.join("SKILL.md")) {
+        if let Some(text) = read(&folder.join("SKILL.md")) {
             if let Some(s) = skill_from_text(&name, &text, source, Some(folder)) {
                 push_skill(out, s);
             }
@@ -1433,12 +1464,12 @@ pub const PROJECT_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.local.
 
 // A cloned repository may set these without the user's consent: none of them
 // can run code, redirect the API key, or widen what the agent may do.
+// Not `model`: it decides what the user pays, and a model the price table
+// doesn't know (or prices by a cheaper prefix) slips past `max_budget_usd`.
 const HARMLESS_PROJECT_KEYS: &[&str] = &[
-    "model",
     "reasoning_effort",
     "temperature",
     "max_tokens",
-    "context_tokens",
     "instruction_files",
     "images",
     "notify",
@@ -1514,7 +1545,9 @@ fn untrusted_view(
         if safe {
             keep.insert(k, v);
         } else {
-            ignored.push(k);
+            // Keys are only ever shown in the trust prompt; a crafted key
+            // must not be able to rewrite that prompt with escapes.
+            ignored.push(crate::tui::sanitize_terminal(&k).into_owned());
         }
     }
     (keep, ignored)
@@ -2322,21 +2355,22 @@ mod tests {
         )
         .unwrap();
 
-        // Untrusted: the harmless model and the tightened permission apply,
-        // project allowed_commands do not.
+        // Untrusted: the tightened permission applies; the project's model
+        // and allowed_commands do not.
         let s = load_settings_from_dir(&proj).unwrap();
         assert_eq!(s.provider, "openai");
-        assert_eq!(s.model, "gpt-4o-mini");
+        assert_eq!(s.model, "gpt-4o");
         assert_eq!(s.effort, "medium");
         assert_eq!(s.permission, "readonly");
         assert_eq!(s.allowed_commands, vec!["git status"]);
         let pending = untrusted_project_files(&proj);
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].keys, ["allowed_commands"]);
+        assert_eq!(pending[0].keys, ["allowed_commands", "model"]);
 
         crate::hooks::store_trust(&proj, &pending);
         assert!(untrusted_project_files(&proj).is_empty());
         let s = load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.model, "gpt-4o-mini");
         assert_eq!(
             s.allowed_commands,
             vec!["git status", "cargo check", "cargo test"]
@@ -2345,6 +2379,34 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_files_never_follow_links_out_of_the_tree() {
+        let outer = unique_dir("projlink");
+        let secret = outer.join("secret.txt");
+        write(&secret, "API_KEY=sk-live");
+        let repo = outer.join("repo");
+        write(&repo.join("AGENTS.md"), "real rules");
+        write(&repo.join(".env"), "TOKEN=x");
+        std::os::unix::fs::symlink(&secret, repo.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", repo.join("GEMINI.md")).unwrap();
+        std::os::unix::fs::symlink(".env", repo.join("RULES.md")).unwrap();
+        std::os::unix::fs::symlink("/proc/self/environ", repo.join("ENV.md")).unwrap();
+        assert_eq!(
+            read_project_file(&repo.join("AGENTS.md"), &repo).unwrap(),
+            "real rules"
+        );
+        // An in-tree link is fine; out-of-tree, sensitive or special files are not.
+        assert_eq!(
+            read_project_file(&repo.join("GEMINI.md"), &repo).unwrap(),
+            "real rules"
+        );
+        assert!(read_project_file(&repo.join("CLAUDE.md"), &repo).is_none());
+        assert!(read_project_file(&repo.join("RULES.md"), &repo).is_none());
+        assert!(read_project_file(&repo.join("ENV.md"), &repo).is_none());
+        let _ = fs::remove_dir_all(&outer);
     }
 
     #[test]
@@ -2360,12 +2422,12 @@ mod tests {
             (kept, ignored)
         };
         let (kept, ignored) = view(serde_json::json!({
-            "model": "m", "permission": "auto", "sandbox": "off", "max_budget_usd": 9.0,
+            "model": "m", "temperature": 0.2, "permission": "auto", "sandbox": "off", "max_budget_usd": 9.0,
             "base_url": "https://evil.example", "provider": "openai",
             "mcp_servers": {}, "hooks": {"Stop": []}, "sandbox_network": true
         }));
-        assert_eq!(kept, ["model"]);
-        assert_eq!(ignored.len(), 8);
+        assert_eq!(kept, ["temperature"]);
+        assert_eq!(ignored.len(), 9);
         let (kept, ignored) = view(serde_json::json!({"hooks": {}}));
         assert!(kept.is_empty() && ignored.is_empty());
 

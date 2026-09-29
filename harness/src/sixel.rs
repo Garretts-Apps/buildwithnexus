@@ -273,8 +273,11 @@ pub fn decode(path: &Path, w: u32, h: u32) -> Option<Vec<u8>> {
          [b][p]paletteuse=dither=sierra2_4a"
     );
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args(["-v", "error"])
+        .args({
+            let [w, f, url] = crate::media::ffmpeg_input(path);
+            [w, f, "-i".into(), url]
+        })
         .args([
             "-frames:v",
             "1",

@@ -146,10 +146,11 @@ jobs:
     needs: [gate, release]
     if: needs.gate.outputs.release == 'true'
     timeout-minutes: 60
+    # Read-only: this job compiles third-party code (build scripts,
+    # proc-macros), so it gets no token that can write releases or mint
+    # OIDC credentials. The `assets` job attests and uploads.
     permissions:
-      contents: write       # upload release assets
-      id-token: write       # build provenance attestation
-      attestations: write
+      contents: read
       actions: read         # SignPath reads this job and its artifact
     strategy:
       fail-fast: false
@@ -171,7 +172,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       # No credentials on disk while dependency build scripts and proc-macros
-      # run; the upload step gets its token as an input.
+      # run (and this job's token can only read).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -290,10 +291,51 @@ jobs:
             exit 1
           fi
 
+      - name: Hand the asset to the assets job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: asset-${{ matrix.target }}
+          path: buildwithnexus-${{ matrix.target }}*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Attests and uploads what the build jobs produced. It compiles nothing,
+  # so the write and OIDC permissions live only here.
+  assets:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write       # upload release assets
+      id-token: write       # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: asset-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check every platform is present
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
+            test -f "buildwithnexus-$t$ext" && test -f "buildwithnexus-$t$ext.sha256"
+            sha256sum -c "buildwithnexus-$t$ext.sha256"
+          done
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ steps.stage.outputs.asset }}
+          subject-path: |
+            dist/buildwithnexus-x86_64-unknown-linux-gnu
+            dist/buildwithnexus-aarch64-unknown-linux-gnu
+            dist/buildwithnexus-x86_64-apple-darwin
+            dist/buildwithnexus-aarch64-apple-darwin
+            dist/buildwithnexus-x86_64-pc-windows-msvc.exe
 
       # Asset upload only — the `release` job created the release and owns
       # the body (softprops leaves unspecified fields untouched).
@@ -302,7 +344,7 @@ jobs:
         with:
           tag_name: ${{ needs.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          files: buildwithnexus-${{ matrix.target }}*
+          files: dist/buildwithnexus-*
 
   # CycloneDX SBOM of every crate compiled into the binary, for teams that
   # review third-party software before allowing it.
@@ -346,7 +388,7 @@ jobs:
   # token, a publish error) fails the job, so a half-published release shows
   # up red instead of green-with-a-warning.
   crates:
-    needs: [gate, build]
+    needs: [gate, assets]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15

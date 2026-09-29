@@ -476,14 +476,17 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     let listing: Vec<String> = pending
         .iter()
         .map(|f| format!(".buildwithnexus/{}: {}", f.name, f.keys.join(", ")))
+        .map(|l| tui::sanitize_terminal(&l).into_owned())
         .collect();
+    // The folder name comes from whoever made the checkout.
+    let shown_cwd = tui::sanitize_terminal(&cwd.display().to_string()).into_owned();
     if !interactive {
         eprintln!(
             "{}",
             tui::yellow(&format!(
                 "buildwithnexus: warning: ignoring untrusted project settings in {} ({}). \
                  Run bwn in a terminal there to review and trust them.",
-                cwd.display(),
+                shown_cwd,
                 listing.join("; ")
             ))
         );
@@ -494,7 +497,7 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     tui::line("");
     tui::line(&tui::yellow(&format!(
         "  ⚠ {} has project settings that can run commands, send your API key elsewhere, or loosen approvals:",
-        cwd.display()
+        shown_cwd
     )));
     for l in &listing {
         tui::line(&format!("    {l}"));
@@ -672,13 +675,27 @@ fn run_rust_hook(
             timeout,
         );
     }
-    let temp_dir = std::env::temp_dir().join("bwn_rust_hooks");
-    let _ = std::fs::create_dir_all(&temp_dir);
-    let bin_name = path
+    // Compiled into the user's own ~/.buildwithnexus (0700), not a shared
+    // temp dir where another user could swap the binary before it runs. The
+    // name carries a hash of the source, so two hooks with the same file
+    // name never overwrite each other.
+    let cache_dir = crate::config::home().join("cache").join("rust-hooks");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "hook".into());
-    let bin_path = temp_dir.join(&bin_name);
+    let digest = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::fs::read(path).unwrap_or_default().hash(&mut h);
+        path.hash(&mut h);
+        h.finish()
+    };
+    let bin_path = cache_dir.join(format!(
+        "{stem}-{digest:016x}{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     let compile_status = Command::new("rustc")
         .args(["--edition=2021", "-O"])
         .arg(path)

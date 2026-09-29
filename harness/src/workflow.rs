@@ -528,7 +528,9 @@ pub fn tick() -> Vec<String> {
         let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let buf2 = buf.clone();
         let child_res = Command::new(&bin)
-            .args(["run", "--json", &task])
+            // `--` so a task like "--permission auto …" stays the task text
+            // instead of becoming flags on the child run.
+            .args(["run", "--json", "--", &task])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();

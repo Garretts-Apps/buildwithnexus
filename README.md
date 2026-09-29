@@ -263,10 +263,20 @@ Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
 `readonly`, mutations are refused outright — never prompted — so an approved
 sensitive-path or dangerous-command confirmation can't slip one through.
 
-Answering `a` (always allow) at a prompt remembers that tool **for the current
-project only** (`project_allowed` in `~/.buildwithnexus/settings.json`, keyed by
-directory). `/permissions reset` forgets those answers for the project you're in.
-The legacy global `allowed_commands` list keeps working.
+The prompt shows the whole command, with line breaks marked `⏎`, and names
+what `s` / `a` would allow from then on: a binary (`cargo`), a subcommand
+(`git status`), a host, or, for shells and interpreters (`sh`, `python3`,
+`node`, …), only that exact command. Answering `a` (always allow) remembers it
+**for the current project only** (`project_allowed` in
+`~/.buildwithnexus/settings.json`, keyed by directory). `/permissions reset`
+forgets those answers for the project you're in. The legacy global
+`allowed_commands` list keeps working.
+
+Network tools (`fetch_url`, `headless_browser`, `wait_for_url`,
+`open_browser`) ask once per host and port under `ask` and `readonly`, since a
+fetch can carry data out or reach services on your network. `s` / `a` allow
+that host; an `allowed_commands` entry `"fetch *"` allows every host. Web
+search does not ask.
 
 Headless `plan` needs a terminal to approve the plan; pass `--yes` / `-y` to
 auto-approve and execute (in `--json` mode the plan is emitted as a `plan` event
@@ -441,7 +451,9 @@ headless runs connect before the first request); each one logs
 to the model as **`mcp__<server>__<tool>`** with the server's own description
 and input schema, and answer over the persistent connection. They count as
 mutating under the permission gate (prompted under `ask`, blocked under
-`readonly`) unless the server annotates them `readOnlyHint: true`. The older
+`readonly`). A server's `readOnlyHint: true` annotations are only honoured
+when you set `"trust_read_only_hints": true` on that server, because the hint
+is the server's own claim. The older
 `mcp_call` tool (`server`, `tool`, `arguments`) still works over the same
 connection.
 

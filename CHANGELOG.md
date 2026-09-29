@@ -6,6 +6,81 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.9] - 2026-09-29
+
+A full security audit of the harness, the npm launcher and the release
+pipeline. Every finding below is fixed and covered by a test.
+
+### Security
+- **A cloned repo can no longer leak secrets through its instruction files.**
+  `AGENTS.md`, `CLAUDE.md`, `.buildwithnexus/Agents.md`, `system.md` and
+  project skills are read only when they resolve to a regular file inside the
+  project. A symlink to `/proc/self/environ`, `~/.buildwithnexus/.env.keys` or
+  anything else outside the tree (or to a sensitive file inside it) is
+  skipped. In-tree links such as `CLAUDE.md -> AGENTS.md` still work.
+- **The permission prompt shows the whole command.** It used to show an
+  80-character, single-line preview, so a harmful tail or second line could
+  hide behind `…`. Line breaks now show as `⏎`, and the prompt names what
+  `s` / `a` would allow from then on.
+- **"Allow this session" no longer covers every shell or interpreter call.**
+  For `sh`, `bash`, `python3`, `node`, `env`, `xargs` and similar, an approval
+  covers only that exact command.
+- **Network tools ask per host.** `fetch_url`, `headless_browser`,
+  `wait_for_url` and `open_browser` ask once per host and port under `ask`
+  and `readonly`, because a fetch can send data out or reach local services
+  (a Docker API on `127.0.0.1:2375`, a router). `"fetch *"` in
+  `allowed_commands` restores the old behaviour. `open_browser` now opens
+  only `http(s)` URLs and viewer file types, and no longer goes through
+  `cmd /C start` on Windows.
+- **Terminal escape sequences from untrusted text are neutralised** in the
+  project-trust prompt, startup skill warnings, the completion popup, MCP
+  notices and `/mcp`, `!cmd` and custom-script output, traces, and model
+  lists from local servers. Bidi and invisible format characters now show as
+  `<U+202E>`-style markers, so a command cannot be visually reordered.
+- **The read-only command check sees the binary the OS runs**: `RG --pre …`
+  or `find.exe -exec …` on a case-insensitive filesystem no longer pass as
+  read-only. `git -C`, `--git-dir` and `--work-tree` are refused, and
+  `git branch` counts as read-only only when it lists branches.
+- **Git commands ask again when the repository's own config can run
+  programs** (`core.fsmonitor`, `core.pager`, `diff.external`, filter or
+  textconv drivers, `include.path`), since a repo that arrives with its
+  `.git` could turn `git status` into code execution.
+- **The Linux sandbox protects `.git` and `.buildwithnexus` even before they
+  exist**, so a sandboxed command cannot create a `.git/config` or hook that
+  runs later outside the sandbox.
+- **MCP `readOnlyHint` is ignored unless you trust the server's hints**
+  (`"trust_read_only_hints": true` on that server). A malicious server could
+  otherwise mark a destructive tool read-only and skip the prompt.
+- **A project settings file can no longer change the model** without being
+  trusted. The model decides what you pay, and an unpriced model slipped past
+  `max_budget_usd`.
+- `/verify` and `/audit` go through the permission gate and hooks, so a
+  read-only session no longer runs the project's build and test commands.
+- `@url:` attachments only fetch `http(s)` URLs and pass them after `--`, and
+  `@symbol:` passes the query as a pattern, so neither can inject curl or
+  grep options. `@` paths to sensitive files are not attached.
+- ffmpeg and ffprobe open only local files (`file:` input, file protocol
+  only), so a repo file named like a URL cannot make them reach the network.
+- Checkpoint undo refuses to write through a link that now points outside
+  the working tree.
+- Crafted web pages no longer crash the web tools (Unicode case folding
+  shifted string offsets).
+- Rust hooks compile into `~/.buildwithnexus/cache` instead of a shared temp
+  directory, and temp media files are created exclusively.
+- Workflow child runs pass the task after `--`, so a task cannot be read as
+  a flag.
+
+### Supply chain
+- **The first-run download checks against checksums shipped in the npm
+  package.** `publish.yml` verifies each release binary's build-provenance
+  attestation before publishing and records the hashes in `checksums.json`;
+  the platform packages are built from the same verified files. An asset
+  replaced on the GitHub Release later is refused.
+- The launcher ignores a platform package found in a parent directory's
+  `node_modules` (another user could plant one) and a relative `BWN_BIN`.
+- Release build jobs, which run dependency build scripts, now hold a
+  read-only token. A separate job attests and uploads the binaries.
+
 ## [0.14.8] - 2026-09-29
 
 ### Added
@@ -265,7 +340,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.8...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.9...HEAD
+[0.14.9]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.9
 [0.14.8]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.8
 [0.14.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.7
 [0.14.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.6

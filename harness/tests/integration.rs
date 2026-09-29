@@ -451,9 +451,16 @@ fn json_events_are_one_object_per_line() {
 
 // ── MCP ─────────────────────────────────────────────────────────────────────
 fn write_mcp_settings(home: &Path) {
+    write_mcp_settings_with(home, false);
+}
+
+fn write_mcp_settings_with(home: &Path, trust_hints: bool) {
     let settings = json!({
         "mcp_servers": {
-            "fake": { "command": "python3", "args": [FAKE_MCP], "timeout_secs": 20 }
+            "fake": {
+                "command": "python3", "args": [FAKE_MCP], "timeout_secs": 20,
+                "trust_read_only_hints": trust_hints
+            }
         }
     });
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
@@ -498,12 +505,34 @@ fn mcp_tools_are_discovered_and_called_over_stdio() {
 }
 
 #[test]
-fn mcp_read_only_hint_gates_under_readonly() {
+fn mcp_read_only_hint_is_ignored_unless_trusted() {
     let home = tmp("home");
     let cwd = tmp("proj");
     write_mcp_settings(&home);
+    // The server marks `add` readOnlyHint, but nobody opted in to trusting
+    // its hints: it is gated like any other MCP tool.
+    let port = serve(vec![
+        tool_call("c1", "mcp__fake__add", json!({"a": 20, "b": 22})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "readonly", port);
+
+    let r = run(&home, &cwd, "try add");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(r.text_of("tool_denied").contains("read-only"));
+    assert!(!r
+        .events
+        .iter()
+        .any(|e| e["type"] == "tool_result" && e["name"] == "mcp__fake__add"));
+}
+
+#[test]
+fn mcp_read_only_hint_gates_under_readonly() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_mcp_settings_with(&home, true);
     // `echo` carries no annotation → mutating → denied; `add` is
-    // readOnlyHint → allowed.
+    // readOnlyHint on a server whose hints are trusted → allowed.
     let port = serve(vec![
         tool_call("c1", "mcp__fake__echo", json!({"text": "nope"})),
         tool_call("c2", "mcp__fake__add", json!({"a": 20, "b": 22})),
@@ -1056,12 +1085,12 @@ fn untrusted_project_settings_cannot_redirect_loosen_or_spawn() {
     .unwrap();
 
     let r = run(&home, &cwd, "write a file");
-    // The requests reached the local mock (not evil.example), with the
-    // project's harmless model key applied.
+    // The requests reached the local mock (not evil.example), and the
+    // project's model was ignored too (it decides what the user pays).
     let posts = posts.lock().unwrap();
     assert!(!posts.is_empty(), "stderr: {}", r.stderr);
     assert!(
-        posts[0].contains("\"project-model\""),
+        !posts[0].contains("\"project-model\""),
         "request: {}",
         posts[0]
     );
@@ -1081,10 +1110,9 @@ fn untrusted_project_settings_cannot_redirect_loosen_or_spawn() {
         .lines()
         .find(|l| l.contains("untrusted project settings"))
         .unwrap_or_else(|| panic!("no warning in stderr: {}", r.stderr));
-    for key in ["base_url", "permission", "sandbox", "mcp_servers"] {
+    for key in ["base_url", "permission", "sandbox", "mcp_servers", "model"] {
         assert!(warn.contains(key), "{key} missing from: {warn}");
     }
-    assert!(!warn.contains("model,") && !warn.contains("model)"));
 }
 
 #[test]

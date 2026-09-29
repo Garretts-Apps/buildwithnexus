@@ -231,10 +231,31 @@ fn write_target(path: &Path) -> PathBuf {
     fs::canonicalize(&target).unwrap_or(target)
 }
 
+// A link swapped in after the checkpoint (by an approved command) must not
+// carry the restore outside the working tree.
+fn inside_tree(target: &Path, cwd: &Path) -> bool {
+    let Ok(root) = fs::canonicalize(cwd) else {
+        return false;
+    };
+    let real = fs::canonicalize(target).or_else(|_| {
+        let parent = target.parent().ok_or(std::io::ErrorKind::NotFound)?;
+        let name = target.file_name().ok_or(std::io::ErrorKind::NotFound)?;
+        fs::canonicalize(parent).map(|p| p.join(name))
+    });
+    real.is_ok_and(|r| r.starts_with(root))
+}
+
 fn restore_one(cp: &Checkpoint) -> Result<(), String> {
     check_restorable(cp)?;
     if cp.existed {
         let target = write_target(&cp.path);
+        if target.parent().is_some_and(Path::exists) && !inside_tree(&target, &cp.cwd) {
+            return Err(format!(
+                "cannot restore {}: it now resolves outside the working tree ({})",
+                cp.path.display(),
+                target.display()
+            ));
+        }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -551,6 +572,27 @@ mod tests {
             .is_symlink());
         assert_eq!(fs::read_to_string(&real).unwrap(), "original");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_a_link_that_now_points_outside_the_tree() {
+        let d = scratch("escape");
+        let outside = scratch("escape-target");
+        let victim = outside.join("victim.txt");
+        fs::write(&victim, "keep me").unwrap();
+        let file = d.join("notes.txt");
+        fs::write(&file, "original").unwrap();
+        record(&d, &file, "edit_file");
+        // An approved command later swaps the file for a link out of the tree.
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+
+        let err = undo_latest(&d).unwrap_err();
+        assert!(err.contains("outside the working tree"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     fn git(d: &Path, args: &[&str]) {
