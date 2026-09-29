@@ -1865,11 +1865,38 @@ pub fn run_build_session(
     transcript: &mut Vec<Msg>,
     sid: &str,
 ) -> Result<(), String> {
+    run_build_session_with_images(p, perm, role_id, task, cwd, transcript, sid, Vec::new())
+}
+
+/// A build turn whose user message carries `images` as (media_type, base64)
+/// pairs alongside the task text.
+#[allow(clippy::too_many_arguments)]
+pub fn run_build_session_with_images(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    transcript: &mut Vec<Msg>,
+    sid: &str,
+    images: Vec<(String, String)>,
+) -> Result<(), String> {
     // SessionStart/SessionEnd fire once per process (lib.rs); a build turn
     // only records which session and gate it runs under, then fires Stop.
     crate::session::set_current(sid);
     hooks::set_permission_mode(permission_name(perm));
-    let r = build_inner(p, perm, role_id, task, cwd, 0, transcript, Some(sid)).map(|_| ());
+    let r = build_turn(
+        p,
+        perm,
+        role_id,
+        task,
+        cwd,
+        0,
+        transcript,
+        Some(sid),
+        images,
+    )
+    .map(|_| ());
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
@@ -1890,6 +1917,28 @@ impl Drop for AgentRunningGuard {
     }
 }
 
+// A fresh transcript gets the system prompt first; then the turn's user
+// message, multimodal when images are attached, so a first-prompt image never
+// displaces the system prompt.
+fn open_turn(
+    msgs: &mut Vec<Msg>,
+    system: impl FnOnce() -> String,
+    task: &str,
+    images: Vec<(String, String)>,
+) {
+    if msgs.is_empty() {
+        msgs.push(Msg::System(system()));
+    }
+    if images.is_empty() {
+        msgs.push(Msg::User(task.to_string()));
+    } else {
+        msgs.push(Msg::UserImages {
+            text: task.to_string(),
+            images,
+        });
+    }
+}
+
 // `sid` is Some for the top-level session (per-round transcript saves) and
 // None for subagents, whose transcripts live inside the parent's results.
 #[allow(clippy::too_many_arguments)]
@@ -1902,6 +1951,21 @@ fn build_inner(
     depth: usize,
     msgs: &mut Vec<Msg>,
     sid: Option<&str>,
+) -> Result<String, String> {
+    build_turn(p, perm, role_id, task, cwd, depth, msgs, sid, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_turn(
+    p: &Provider,
+    perm: Permission,
+    role_id: &str,
+    task: &str,
+    cwd: &Path,
+    depth: usize,
+    msgs: &mut Vec<Msg>,
+    sid: Option<&str>,
+    images: Vec<(String, String)>,
 ) -> Result<String, String> {
     let _running_guard = (depth == 0).then(AgentRunningGuard::new);
     // Top-level runs mark a turn boundary so bare /undo can revert exactly
@@ -1923,24 +1987,23 @@ fn build_inner(
     } else {
         tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
     };
-    if msgs.is_empty() {
-        // Role identity and the current-mode contract come FIRST; the
-        // environment/tool-manifest/skills/memory sections follow.
-        let mut sys = String::from(role(role_id).system);
-        if let Some(guidance) = artifact_guidance(&task_for_recovery) {
+    open_turn(
+        msgs,
+        || {
+            // Role identity and the current-mode contract come FIRST; the
+            // environment/tool-manifest/skills/memory sections follow.
+            let mut sys = String::from(role(role_id).system);
+            if let Some(guidance) = artifact_guidance(&task_for_recovery) {
+                sys.push_str("\n\n");
+                sys.push_str(&guidance);
+            }
             sys.push_str("\n\n");
-            sys.push_str(&guidance);
-        }
-        sys.push_str("\n\n");
-        sys.push_str(&context_prefix(cwd, p.context_tokens));
-        msgs.push(Msg::System(sys));
-    }
-    // If the caller already pushed a UserImages message (multimodal input), use its
-    // text as the task without pushing another User turn; otherwise push normally.
-    let already_pushed = matches!(msgs.last(), Some(Msg::UserImages { .. }));
-    if !already_pushed {
-        msgs.push(Msg::User(task.clone()));
-    }
+            sys.push_str(&context_prefix(cwd, p.context_tokens));
+            sys
+        },
+        &task,
+        images,
+    );
 
     // Track which files have been read this session so we can enforce read-before-write.
     let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
@@ -4057,6 +4120,28 @@ mod tests {
         let d = answer_input_prompt("yes");
         assert!(!d.contains('\n'));
         assert!(d.contains("yes"));
+    }
+
+    #[test]
+    fn first_turn_image_keeps_the_system_prompt() {
+        let img = vec![("image/png".to_string(), "AAAA".to_string())];
+        let mut msgs = Vec::new();
+        open_turn(
+            &mut msgs,
+            || "SYS".into(),
+            "look at this [btw: x]",
+            img.clone(),
+        );
+        assert!(matches!(&msgs[0], Msg::System(s) if s == "SYS"));
+        assert!(matches!(&msgs[1], Msg::UserImages { text, images }
+            if text == "look at this [btw: x]" && images.len() == 1));
+        assert_eq!(msgs.len(), 2);
+
+        // A later text-only turn gets its own user message and no images,
+        // even though the transcript ends in the earlier multimodal turn.
+        open_turn(&mut msgs, || unreachable!(), "next", Vec::new());
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[2], Msg::User(t) if t == "next"));
     }
 
     #[test]

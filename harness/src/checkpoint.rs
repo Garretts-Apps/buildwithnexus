@@ -30,6 +30,11 @@ pub struct Checkpoint {
     /// files written before this field existed keep restoring as before.
     #[serde(default = "default_snapshotted")]
     pub snapshotted: bool,
+    /// Unix permission bits of the original file, so restore does not leave an
+    /// executable script non-executable. None on other platforms and in
+    /// checkpoints written before this field existed.
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 fn default_snapshotted() -> bool {
@@ -68,10 +73,17 @@ pub fn undo_last_turn(cwd: &Path) -> Result<Vec<Checkpoint>, String> {
                 .into(),
         );
     }
-    undo_all_since(cwd, since as u128).map_err(|_| {
-        "the last agent turn made no file changes — use /undo latest, /undo <id>, or /undo all"
-            .to_string()
-    })
+    let set: Vec<Checkpoint> = list(cwd)
+        .into_iter()
+        .filter(|cp| cp.created_ms >= since as u128)
+        .collect();
+    if set.is_empty() {
+        return Err(
+            "the last agent turn made no file changes — use /undo latest, /undo <id>, or /undo all"
+                .into(),
+        );
+    }
+    restore_set(cwd, set)
 }
 
 /// Returns the current Unix timestamp in milliseconds.
@@ -105,6 +117,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
     } else {
         (String::new(), true)
     };
+    let mode = if existed { file_mode(path) } else { None };
     let created_ms = now_ms();
     // A fast multi-file batch records several checkpoints in one millisecond;
     // a timestamp-only id made them overwrite each other on disk.
@@ -121,6 +134,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         content,
         snapshotted,
         seq,
+        mode,
     };
     let checkpoint_dir = dir(cwd);
     let _ = fs::create_dir_all(&checkpoint_dir);
@@ -131,8 +145,36 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
     }
 }
 
+#[cfg(unix)]
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 // Same-directory temp + rename; a crash mid-write never leaves a partial file.
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, contents, None)
+}
+
+fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let mut name = match path.file_name() {
         Some(n) => n.to_os_string(),
         None => return Err(std::io::Error::other("path has no file name")),
@@ -140,6 +182,11 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     name.push(format!(".tmp-{}", std::process::id()));
     let tmp = path.with_file_name(name);
     fs::write(&tmp, contents)?;
+    if let Some(m) = mode {
+        set_mode(&tmp, m).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+    }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
@@ -160,21 +207,42 @@ pub fn list(cwd: &Path) -> Vec<Checkpoint> {
     items
 }
 
+fn check_restorable(cp: &Checkpoint) -> Result<(), String> {
+    if cp.existed && !cp.snapshotted {
+        return Err(format!(
+            "cannot restore {}: original contents were not snapshotted (file was too large or not valid UTF-8); refusing to overwrite",
+            cp.path.display()
+        ));
+    }
+    Ok(())
+}
+
+// Where a restore writes: a symlink's target, so the rename in write_atomic
+// does not replace the link itself with a regular file. canonicalize follows
+// the whole chain; for a dangling link the literal target is still right.
+fn write_target(path: &Path) -> PathBuf {
+    let Ok(link) = fs::read_link(path) else {
+        return path.to_path_buf();
+    };
+    let target = match path.parent() {
+        Some(dir) if link.is_relative() => dir.join(link),
+        _ => link,
+    };
+    fs::canonicalize(&target).unwrap_or(target)
+}
+
 fn restore_one(cp: &Checkpoint) -> Result<(), String> {
+    check_restorable(cp)?;
     if cp.existed {
-        if !cp.snapshotted {
-            return Err(format!(
-                "cannot restore {}: original contents were not snapshotted (file was too large or not valid UTF-8); refusing to overwrite",
-                cp.path.display()
-            ));
-        }
-        if let Some(parent) = cp.path.parent() {
+        let target = write_target(&cp.path);
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        write_atomic(&cp.path, cp.content.as_bytes())
+        let mode = cp.mode.or_else(|| file_mode(&target));
+        write_atomic_mode(&target, cp.content.as_bytes(), mode)
             .map_err(|e| format!("cannot restore {}: {e}", cp.path.display()))?;
-    } else if cp.path.exists() {
+    } else if cp.path.symlink_metadata().is_ok() {
         fs::remove_file(&cp.path)
             .map_err(|e| format!("cannot remove {}: {e}", cp.path.display()))?;
     }
@@ -204,41 +272,78 @@ pub fn undo_by_id(cwd: &Path, id: &str) -> Result<Checkpoint, String> {
 
 /// Restores all checkpoints recorded at or after `since_ms`, rolling back multiple edits in reverse chronological order.
 pub fn undo_all_since(cwd: &Path, since_ms: u128) -> Result<Vec<Checkpoint>, String> {
-    let all = list(cwd);
+    let set: Vec<Checkpoint> = list(cwd)
+        .into_iter()
+        .filter(|cp| cp.created_ms >= since_ms)
+        .collect();
+    if set.is_empty() {
+        return Err("no checkpoints found in that timeframe".into());
+    }
+    restore_set(cwd, set)
+}
+
+// All or nothing where it can be known up front: one unrestorable checkpoint
+// refuses the whole set before any file is touched, so an undo never leaves
+// the tree half old, half new. A write that still fails midway is reported
+// per file rather than stopping the rest.
+fn restore_set(cwd: &Path, set: Vec<Checkpoint>) -> Result<Vec<Checkpoint>, String> {
+    let blocked: Vec<String> = set
+        .iter()
+        .filter_map(|cp| check_restorable(cp).err())
+        .collect();
+    if !blocked.is_empty() {
+        return Err(format!(
+            "nothing restored — {} checkpoint{} cannot be restored:\n  {}",
+            blocked.len(),
+            if blocked.len() == 1 { "" } else { "s" },
+            blocked.join("\n  ")
+        ));
+    }
     let mut restored = Vec::new();
-    for cp in all {
-        if cp.created_ms >= since_ms {
-            restore_one(&cp)?;
-            let _ = fs::remove_file(dir(cwd).join(format!("{}.json", cp.id)));
-            restored.push(cp);
+    let mut failed = Vec::new();
+    for cp in set {
+        match restore_one(&cp) {
+            Ok(()) => {
+                let _ = fs::remove_file(dir(cwd).join(format!("{}.json", cp.id)));
+                restored.push(cp);
+            }
+            Err(e) => failed.push(e),
         }
     }
-    if restored.is_empty() {
-        Err("no checkpoints found in that timeframe".into())
-    } else {
-        Ok(restored)
+    if failed.is_empty() {
+        return Ok(restored);
     }
+    let mut msg = format!(
+        "{} restore{} failed:",
+        failed.len(),
+        if failed.len() == 1 { "" } else { "s" }
+    );
+    for e in &failed {
+        msg.push_str(&format!("\n  ✗ {e}"));
+    }
+    for cp in &restored {
+        msg.push_str(&format!(
+            "\n  ✓ restored {} ({})",
+            cp.path.display(),
+            cp.action
+        ));
+    }
+    Err(msg)
 }
 
 /// Performs a hard rollback of the workspace using `git checkout -- .`, discarding all unstaged working directory changes.
+/// Untracked files are left alone: the confirmation prompt promises only
+/// `git checkout -- .`, and `git clean` would delete work bwn never recorded.
 pub fn git_rollback(cwd: &Path) -> Result<String, String> {
-    let mut out = String::new();
-    let st = std::process::Command::new("git")
+    let o = std::process::Command::new("git")
         .args(["checkout", "--", "."])
         .current_dir(cwd)
-        .output();
-    if let Ok(o) = st {
-        out.push_str(&String::from_utf8_lossy(&o.stdout));
-        out.push_str(&String::from_utf8_lossy(&o.stderr));
-    } else {
-        return Err("git checkout failed".into());
-    }
-    let st2 = std::process::Command::new("git")
-        .args(["clean", "-fd"])
-        .current_dir(cwd)
-        .output();
-    if let Ok(o) = st2 {
-        out.push_str(&String::from_utf8_lossy(&o.stdout));
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+    out.push_str(&String::from_utf8_lossy(&o.stderr));
+    if !o.status.success() {
+        return Err(format!("git checkout -- . failed: {}", out.trim()));
     }
     Ok(if out.trim().is_empty() {
         "working tree reset cleanly".to_string()
@@ -378,6 +483,120 @@ mod tests {
         assert!(undo_by_id(&d, &cps[0].id).is_ok());
         assert!(!file_path.exists());
         let _ = fs::remove_dir_all(&d);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-cp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(dir(&d));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn undo_set_with_an_unrestorable_checkpoint_touches_nothing() {
+        let d = scratch("partial");
+        let text = d.join("a.txt");
+        fs::write(&text, "original").unwrap();
+        record(&d, &text, "edit_file");
+        fs::write(&text, "edited").unwrap();
+        let blob = d.join("b.bin");
+        fs::write(&blob, [0xFF, 0xFE]).unwrap();
+        record(&d, &blob, "edit_file");
+        fs::write(&blob, b"edited").unwrap();
+
+        let err = undo_all_since(&d, 0).unwrap_err();
+        assert!(err.contains("nothing restored"), "got: {err}");
+        assert!(err.contains("b.bin"), "names the blocker: {err}");
+        assert_eq!(fs::read_to_string(&text).unwrap(), "edited");
+        assert_eq!(list(&d).len(), 2, "no checkpoint consumed");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_the_original_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("mode");
+        let f = d.join("run.sh");
+        fs::write(&f, "#!/bin/sh\necho hi\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o750)).unwrap();
+        record(&d, &f, "edit_file");
+        fs::write(&f, "broken").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let cp = undo_latest(&d).unwrap();
+        assert_eq!(cp.mode, Some(0o750));
+        assert_eq!(fs::read_to_string(&f).unwrap(), "#!/bin/sh\necho hi\n");
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_writes_through_a_symlink_to_its_target() {
+        let d = scratch("link");
+        let real = d.join("real.txt");
+        let link = d.join("link.txt");
+        fs::write(&real, "original").unwrap();
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+        record(&d, &link, "edit_file");
+        fs::write(&link, "edited").unwrap();
+
+        undo_latest(&d).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "original");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn git(d: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(d)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn git_rollback_keeps_untracked_files_and_reports_failure() {
+        let d = scratch("git");
+        git(&d, &["init", "-q"]);
+        fs::write(d.join("tracked.txt"), "committed").unwrap();
+        git(&d, &["add", "."]);
+        git(&d, &["commit", "-qm", "init"]);
+        fs::write(d.join("tracked.txt"), "edited").unwrap();
+        fs::write(d.join("untracked.txt"), "new work").unwrap();
+
+        git_rollback(&d).unwrap();
+        assert_eq!(
+            fs::read_to_string(d.join("tracked.txt")).unwrap(),
+            "committed"
+        );
+        assert!(d.join("untracked.txt").exists(), "no git clean");
+
+        // Not a repository (a .git pointing nowhere, so no parent repo is
+        // found either): git exits non-zero and that must surface as Err.
+        let outside = scratch("nogit");
+        fs::write(outside.join(".git"), "gitdir: /nonexistent/bwn-test\n").unwrap();
+        let err = git_rollback(&outside).unwrap_err();
+        assert!(err.contains("failed"), "got: {err}");
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]

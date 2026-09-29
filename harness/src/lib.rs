@@ -71,7 +71,6 @@ use std::path::PathBuf;
 
 use agent::Permission;
 use config::Settings;
-use provider::Msg;
 use provider::Provider;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1477,20 +1476,8 @@ fn repl(
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
-        // its own Msg::User push and uses this multimodal turn instead.
         let vision = media::model_supports_vision(&provider);
-        let (clean_task, image_data) = extract_attachments(t, cwd, vision);
-        let n_images = image_data.len();
-        if n_images > 0 {
-            transcript.push(Msg::UserImages {
-                text: clean_task.clone(),
-                images: image_data,
-            });
-            tui::line(&tui::dim(&format!(
-                "  ⎘ attached {n_images} image{}",
-                if n_images == 1 { "" } else { "s" }
-            )));
-        }
+        let (clean_task, mut image_data) = extract_attachments(t, cwd, vision);
 
         // Merge any /btw context queued since the last turn.
         let effective_task = if let Some(ctx) = btw_ctx.take() {
@@ -1504,8 +1491,25 @@ fn repl(
         // startup, so servers only spawn once the session is actually used.
         mcp::start_background();
 
+        // Only a BUILD turn sends images; the build session puts them on its
+        // own user message after the system prompt. Chat, PLAN and BRAINSTORM
+        // take text only, so say so rather than dropping them silently.
+        let conversational = should_answer_conversationally(t, &mode);
+        let n_images = image_data.len();
+        if n_images > 0 {
+            let plural = if n_images == 1 { "" } else { "s" };
+            if !conversational && matches!(mode, Mode::Build) {
+                tui::line(&tui::dim(&format!("  ⎘ attached {n_images} image{plural}")));
+            } else {
+                image_data.clear();
+                tui::line(&tui::yellow(&format!(
+                    "  {n_images} image{plural} not sent: only BUILD mode tasks take images"
+                )));
+            }
+        }
+
         tui::line("");
-        let r = if should_answer_conversationally(t, &mode) {
+        let r = if conversational {
             agent::run_chat_turn(&provider, perm, cwd, t)
         } else {
             match &mode {
@@ -1517,7 +1521,7 @@ fn repl(
                     }
                     Err(e) => Err(e),
                 },
-                Mode::Build => agent::run_build_session(
+                Mode::Build => agent::run_build_session_with_images(
                     &provider,
                     perm,
                     "engineer",
@@ -1525,6 +1529,7 @@ fn repl(
                     cwd,
                     &mut transcript,
                     &sid,
+                    std::mem::take(&mut image_data),
                 ),
                 Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
                     Err(e) => Err(e),

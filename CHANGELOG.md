@@ -4,6 +4,41 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Long replies are no longer cut off at three minutes.** The HTTP client had
+  a 180 second deadline that also covered the streamed reply, so a slow or long
+  generation was dropped part way. There is now a 15 second connect timeout and
+  a 300 second idle read timeout (set `BWN_READ_TIMEOUT_SECS` to change it).
+  Model listing and warm-up probes keep their short timeouts.
+- **A request is no longer sent twice after a read timeout.** Only failures to
+  connect (refused connection, DNS) and HTTP 429 or 5xx are retried. A timeout
+  or reset after the request went out is reported instead, since the server
+  may still be working on the first one. Retry delays now carry 20% jitter.
+- **API keys are never sent to a redirect target.** Redirects are no longer
+  followed; a 3xx reply is an error that names where the server tried to send
+  the request.
+- **Truncated streams are errors.** A stream that ends without its finish
+  marker (`message_stop`, `[DONE]`, a finish reason, or Ollama's `done`) now
+  fails with "stream ended before completion" instead of returning a partial
+  reply as if it were whole.
+- **OpenAI-compatible servers' error payloads surface.** An `{"error": ...}`
+  chunk in a stream, or an error body with HTTP 200, is now reported (redacted
+  and truncated) instead of being read as an empty reply.
+- **`/undo` no longer half-restores.** When any checkpoint in the set cannot
+  be restored, nothing is touched and every blocking file is named. Write
+  failures are reported per file, and real errors are no longer reported as
+  "made no file changes". Restores keep the file's original permissions and
+  write through a symlink to its target instead of replacing the link.
+- **`/undo git` only runs `git checkout -- .`**, as its prompt says. It no
+  longer runs `git clean -fd`, which deleted untracked files, and a failing
+  git command is now reported as an error.
+- **An image in the first prompt no longer drops the system prompt.** Images
+  are attached to the build turn's own message after the system prompt, with
+  `/btw` and hook context included. Chat, PLAN and BRAINSTORM turns say the
+  images were not sent instead of leaking them into a later turn.
+
 ## [0.14.2] - 2026-09-29
 
 The "first hour" release: fixes from walking the first run, the TUI and

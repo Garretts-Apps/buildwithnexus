@@ -9,7 +9,7 @@
 // knows each vendor's JSON shape.
 
 use std::io::{BufRead, BufReader, Read};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -86,14 +86,29 @@ pub struct Reply {
 // One process-wide agent so the TLS connection is pooled and kept alive across
 // every ReAct step — each agent iteration is an HTTP round-trip, and skipping the
 // handshake after the first call is a free latency win on multi-step tasks.
+//
+// No overall deadline: it would also cover the streamed body and cut off any
+// reply that takes longer to generate. The read timeout is per read, so it only
+// fires on a stalled stream. Probes set their own short per-request timeouts.
+// Redirects are off because ureq forwards custom headers such as x-api-key to
+// whatever host a 3xx names; send_raw turns a 3xx into an error instead.
 fn agent() -> &'static ureq::Agent {
     static A: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     A.get_or_init(|| {
         ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(180))
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(read_timeout_secs()))
+            .redirects(0)
             .build()
     })
+}
+
+fn read_timeout_secs() -> u64 {
+    std::env::var("BWN_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300)
 }
 
 fn url(p: &Provider, path: &str) -> String {
@@ -556,6 +571,14 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
         let body_clone = body.clone();
 
         match req_clone.send_json(body_clone) {
+            Ok(resp) if (300..400).contains(&resp.status()) => {
+                let to = resp.header("location").unwrap_or("?").to_string();
+                return Err(format!(
+                    "HTTP {}: server redirected to {} (not followed, so the API key is never sent to another host); point base_url at the final address",
+                    resp.status(),
+                    redact(&to)
+                ));
+            }
             Ok(resp) => return Ok(resp),
             Err(ureq::Error::Status(code, resp)) => {
                 // The status code alone decides retryability — the body is
@@ -566,7 +589,7 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
                 let server_wait = retry_after_ms(resp.header("retry-after"));
                 let detail = resp.into_string().unwrap_or_default();
                 if is_transient && attempts < max_attempts {
-                    let wait = server_wait.unwrap_or(delay_ms);
+                    let wait = server_wait.unwrap_or_else(|| jitter(delay_ms));
                     // Say what's happening — a silent 10s backoff reads as a
                     // frozen UI.
                     let why = if code == 429 {
@@ -596,13 +619,18 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
                 if refused_locally && attempts >= 2 {
                     return Err(local_server_down_msg(req.url()));
                 }
-                if attempts < max_attempts {
+                // Only failures before the request went out are safe to
+                // resend. A read timeout or reset after the POST body was
+                // delivered may mean the server is still generating (and
+                // billing) the first attempt.
+                if transport_retryable(&e) && attempts < max_attempts {
+                    let wait = jitter(delay_ms);
                     crate::report::info(&format!(
                         "  ⟳ connection error — retrying in {:.1}s ({attempts}/{})",
-                        delay_ms as f64 / 1000.0,
+                        wait as f64 / 1000.0,
                         max_attempts - 1
                     ));
-                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    std::thread::sleep(Duration::from_millis(wait));
                     delay_ms = (delay_ms * 2).min(10_000);
                     continue;
                 }
@@ -610,6 +638,21 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
             }
         }
     }
+}
+
+fn transport_retryable(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Transport(t)
+        if matches!(t.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns))
+}
+
+// ±20% so clients that failed together don't all retry in the same instant.
+fn jitter(ms: u64) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let pct = 80 + u64::from(nanos % 41);
+    ms * pct / 100
 }
 
 fn local_server_down_msg(url: &str) -> String {
@@ -690,8 +733,9 @@ fn parse_args(args: &str) -> Value {
 // streaming parsers are unit-testable against an in-memory byte slice.
 // A transport error mid-stream is surfaced as Err rather than treated as a
 // clean end — otherwise a dropped connection silently truncates the reply.
-// Natural EOF (or a terminal event before one) is still success.
-fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<(), String> {
+// Returns whether `f` stopped the stream; false means it hit EOF first, which
+// callers treat as truncation unless they already saw a finish marker.
+fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<bool, String> {
     // Reuse one buffer across lines instead of allocating a String per line.
     let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
@@ -699,7 +743,7 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<()
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(false),
             Err(e) => return Err(format!("stream read failed: {}", redact(&e.to_string()))),
             Ok(_) => {
                 if last_poll.elapsed() >= Duration::from_millis(50) {
@@ -711,7 +755,7 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<()
                 }
                 if let Some(payload) = line.strip_prefix("data:") {
                     if f(payload.trim()) {
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
             }
@@ -1014,7 +1058,7 @@ fn anthropic_stream(
     // index → thinking/redacted_thinking block, assembled from its deltas so
     // it can be replayed verbatim (signature included) on the next request.
     let mut thinking: Vec<(usize, Value)> = Vec::new();
-    for_each_sse(reader, |data| {
+    let stopped = for_each_sse(reader, |data| {
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
@@ -1100,6 +1144,11 @@ fn anthropic_stream(
     })?;
     if let Some(e) = stream_err {
         return Err(e);
+    }
+    // message_delta carries the stop reason, so a stream that got that far has
+    // all its content even if message_stop itself was lost.
+    if !stopped && stop_reason.is_none() {
+        return Err(STREAM_TRUNCATED.to_string());
     }
     // Same INVALID_ARGS flagging as the OpenAI path: a truncated tool call must
     // reach the agent loop as malformed, not silently execute with empty input.
@@ -1288,7 +1337,26 @@ fn strip_think(text: &str) -> String {
     out.trim().to_string()
 }
 
+const STREAM_TRUNCATED: &str = "stream ended before completion";
+
+// An {"error": …} payload (in a 200 body or a stream chunk), redacted and
+// truncated like HTTP error bodies.
+fn openai_error(v: &Value) -> Option<String> {
+    let e = v.get("error").filter(|e| !e.is_null())?;
+    let detail = e["message"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| e.to_string());
+    Some(format!(
+        "server error: {}",
+        redact(&detail).chars().take(400).collect::<String>()
+    ))
+}
+
 fn openai_parse(v: Value) -> Result<Reply, String> {
+    if let Some(e) = openai_error(&v) {
+        return Err(e);
+    }
     let msg = &v["choices"][0]["message"];
     let text = strip_think(msg["content"].as_str().unwrap_or_default());
     let mut calls = Vec::new();
@@ -1421,13 +1489,20 @@ fn openai_stream(
     let mut usage = Usage::default();
     // index → (id, name, accumulated args)
     let mut pending: Vec<(String, String, String)> = Vec::new();
-    for_each_sse(reader, |data| {
+    let mut stream_err: Option<String> = None;
+    let stopped = for_each_sse(reader, |data| {
         if data == "[DONE]" {
             return true;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
+        // vLLM, LiteLLM, OpenRouter and friends report mid-stream failures as
+        // an {"error": …} chunk rather than an HTTP status.
+        if let Some(e) = openai_error(&v) {
+            stream_err = Some(e);
+            return true;
+        }
         // With stream_options.include_usage the final chunk (empty choices)
         // carries the totals; some servers put usage on every chunk instead.
         if let Some(u) = openai_usage(&v) {
@@ -1478,6 +1553,12 @@ fn openai_stream(
         }
         false
     })?;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    if !stopped && stop_reason.is_none() {
+        return Err(STREAM_TRUNCATED.to_string());
+    }
     flush_think_carry(&think_carry, in_think, &mut text, on_text);
     let calls = pending
         .into_iter()
@@ -1790,6 +1871,7 @@ fn ollama_stream(
     let mut stream_err: Option<String> = None;
     let mut usage = Usage::default();
     let mut calls: Vec<ToolCall> = Vec::new();
+    let mut done = false;
     for_each_ndjson(reader, |v| {
         // A mid-stream server error rides on an "error" field.
         if let Some(e) = v["error"].as_str() {
@@ -1827,6 +1909,7 @@ fn ollama_stream(
             }
         }
         if v["done"].as_bool() == Some(true) {
+            done = true;
             stop_reason = v["done_reason"].as_str().map(normalize_stop_reason);
             ollama_usage_into(v, &mut usage);
             return true;
@@ -1835,6 +1918,9 @@ fn ollama_stream(
     })?;
     if let Some(e) = stream_err {
         return Err(e);
+    }
+    if !done {
+        return Err(STREAM_TRUNCATED.to_string());
     }
     flush_think_carry(&think_carry, in_think, &mut text, on_text);
     Ok(Reply {
@@ -2450,10 +2536,165 @@ mod tests {
     }
 
     #[test]
-    fn openai_stream_empty_stream_is_empty_reply() {
-        let r = drain_openai("");
+    fn openai_stream_done_only_is_empty_reply() {
+        let r = drain_openai("data: [DONE]\n");
         assert!(r.text.is_empty());
         assert!(r.calls.is_empty());
+    }
+
+    #[test]
+    fn stream_eof_without_terminal_event_is_err() {
+        let run_openai = |sse: &str| {
+            openai_stream(
+                Cursor::new(sse.as_bytes().to_vec()),
+                &mut |_| {},
+                &mut |_| {},
+            )
+        };
+        assert_eq!(run_openai("").unwrap_err(), STREAM_TRUNCATED);
+        let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"Hal\"}}]}\n";
+        assert_eq!(run_openai(partial).unwrap_err(), STREAM_TRUNCATED);
+        // A finish_reason is as good as [DONE]: the content is all there.
+        let finished =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n";
+        assert_eq!(run_openai(finished).unwrap().text, "Hi");
+
+        let a = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hal\"}}\n";
+        let r = anthropic_stream(Cursor::new(a.as_bytes().to_vec()), &mut |_| {}, &mut |_| {});
+        assert_eq!(r.unwrap_err(), STREAM_TRUNCATED);
+
+        let o = "{\"message\":{\"content\":\"Hal\"},\"done\":false}\n";
+        let r = ollama_stream(Cursor::new(o.as_bytes().to_vec()), &mut |_| {}, &mut |_| {});
+        assert_eq!(r.unwrap_err(), STREAM_TRUNCATED);
+    }
+
+    #[test]
+    fn openai_error_chunk_and_error_body_surface_as_err() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\
+                   data: {\"error\":{\"message\":\"upstream overloaded, key sk-abcdefghijklmnop\"}}\n\
+                   data: [DONE]\n";
+        let err = openai_stream(
+            Cursor::new(sse.as_bytes().to_vec()),
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(err.contains("upstream overloaded"), "got: {err}");
+        assert!(
+            !err.contains("sk-abcdefghijklmnop"),
+            "must be redacted: {err}"
+        );
+
+        let err = openai_parse(json!({"error": {"message": "model not loaded"}})).unwrap_err();
+        assert!(err.contains("model not loaded"), "got: {err}");
+        let long = "x ".repeat(1000);
+        let err = openai_parse(json!({ "error": long })).unwrap_err();
+        assert!(err.len() < 500, "truncated: {}", err.len());
+        // A null error field is not an error.
+        assert!(openai_parse(json!({"error": null, "choices": []})).is_ok());
+    }
+
+    // ── transport: timeouts, retries, redirects ────────────────────────────
+    #[test]
+    fn shared_agent_has_no_overall_deadline_and_follows_no_redirects() {
+        let dbg = format!("{:?}", agent());
+        assert!(dbg.contains("timeout: None"), "{dbg}");
+        assert!(dbg.contains("timeout_read: Some("), "{dbg}");
+        assert!(dbg.contains("timeout_connect: Some(15s)"), "{dbg}");
+        assert!(dbg.contains("redirects: 0"), "{dbg}");
+    }
+
+    // Accepts connections for `window`, reading each request but never
+    // answering. Returns how many connections arrived.
+    fn silent_server(window: std::time::Duration) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            let end = std::time::Instant::now() + window;
+            let mut held = Vec::new();
+            while std::time::Instant::now() < end {
+                match listener.accept() {
+                    Ok((sock, _)) => held.push(sock),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            }
+            held.len()
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn read_timeout_after_post_is_not_retried() {
+        let (base, handle) = silent_server(std::time::Duration::from_millis(2_000));
+        let req = agent()
+            .post(&format!("{base}/v1/chat/completions"))
+            .timeout(Duration::from_millis(300));
+        let err = send_raw(req, json!({"model": "m"})).unwrap_err();
+        assert!(err.contains("connection failed"), "got: {err}");
+        assert_eq!(handle.join().unwrap(), 1, "the POST must be sent once");
+    }
+
+    #[test]
+    fn connect_failure_is_retried() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let e = agent().post(&url).send_json(json!({})).unwrap_err();
+        assert!(transport_retryable(&e), "{e}");
+        // The local-server hint is only given on the second refused attempt,
+        // so seeing it proves send_raw retried.
+        let err = send_raw(agent().post(&url), json!({})).unwrap_err();
+        assert!(err.contains("nothing is answering"), "got: {err}");
+    }
+
+    #[test]
+    fn redirect_is_refused_and_key_never_reaches_the_other_host() {
+        use std::io::{Read, Write};
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other_addr = other.local_addr().unwrap();
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", first.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = first.accept().unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{other_addr}/v1/messages\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        let p = Provider {
+            protocol: Protocol::Anthropic,
+            base_url: base,
+            api_key: Some("sk-ant-test-key".into()),
+            model: "claude-test".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let err = complete(&p, &[Msg::User("hi".into())], &[]).unwrap_err();
+        handle.join().unwrap();
+        assert!(err.contains("redirected"), "got: {err}");
+        other.set_nonblocking(true).unwrap();
+        assert!(
+            other.accept().is_err(),
+            "redirect target must not be contacted"
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        for _ in 0..50 {
+            let j = jitter(1_000);
+            assert!((800..=1_200).contains(&j), "{j}");
+        }
     }
 
     // ── anthropic_stream ────────────────────────────────────────────────────
