@@ -708,6 +708,7 @@ pub fn show_image_file(path: &std::path::Path, once: bool) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
+    let name = sanitize_terminal(&name).into_owned();
     let link = file_link(&path.display().to_string(), &name);
     let (max_cols, max_rows) = image_cell_budget();
     if ALT_SCREEN.load(Ordering::Relaxed) && use_placeholders() {
@@ -914,7 +915,7 @@ impl StreamRenderer {
     }
 
     pub fn push(&mut self, chunk: &str) {
-        self.pending.push_str(chunk);
+        self.pending.push_str(&sanitize_terminal(chunk));
         self.drain(false);
     }
 
@@ -1497,247 +1498,328 @@ pub fn poll_typeahead() {
     if !is_raw() {
         return;
     }
+    drain_typeahead();
+    render_queued_composer();
+}
+
+// Returns whether any event was read. The typeahead thread and the main
+// thread (via interrupted()) both drain; one at a time, so typed keys can't
+// be applied out of order. A busy drain means the other side has the events.
+fn drain_typeahead() -> bool {
+    static DRAIN: Mutex<()> = Mutex::new(());
+    let _drain = match DRAIN.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    let mut any = false;
     while poll(Duration::ZERO).unwrap_or(false) {
         match read() {
-            Ok(Event::Key(k)) => {
-                if k.kind == KeyEventKind::Release {
-                    continue;
+            Ok(ev) => {
+                typeahead_event(ev, is_agent_running());
+            }
+            Err(_) => break,
+        }
+        any = true;
+    }
+    any
+}
+
+// Applies one terminal event read by poll_typeahead: Ctrl-C/Esc raise the
+// interrupt flag, everything else edits the type-ahead buffer. Split out so
+// the buffering is testable without a terminal.
+fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
+    let mut raised = InterruptKind::None;
+    match ev {
+        Event::Key(k) => {
+            if k.kind == KeyEventKind::Release {
+                return raised;
+            }
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = k.modifiers.contains(KeyModifiers::ALT);
+            match k.code {
+                KeyCode::PageUp => {
+                    scroll_page_up();
+                    return raised;
                 }
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                let alt = k.modifiers.contains(KeyModifiers::ALT);
-                match k.code {
-                    KeyCode::PageUp => {
-                        scroll_page_up();
-                        continue;
-                    }
-                    KeyCode::PageDown => {
-                        scroll_page_down();
-                        continue;
-                    }
-                    KeyCode::Up if alt => {
-                        scroll_output(1);
-                        continue;
-                    }
-                    KeyCode::Down if alt => {
-                        scroll_output(-1);
-                        continue;
-                    }
-                    KeyCode::Home if alt => {
-                        scroll_output(isize::MAX / 4);
-                        continue;
-                    }
-                    KeyCode::End if alt => {
-                        scroll_to_bottom();
-                        clear_composer();
-                        render_footer();
-                        continue;
-                    }
-                    _ => {}
+                KeyCode::PageDown => {
+                    scroll_page_down();
+                    return raised;
                 }
-                let mut ta = match typeahead().lock() {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                match k.code {
-                    KeyCode::Enter => {
-                        let text: String = ta.buf.iter().collect();
-                        let trimmed = text.trim();
-                        if !trimmed.is_empty() {
-                            if let Ok(mut mq) = message_queue().lock() {
-                                if ta.from_queue {
-                                    queue_put_back(&mut mq, trimmed.to_string());
-                                } else {
-                                    mq.push(trimmed.to_string());
-                                }
+                KeyCode::Up if alt => {
+                    scroll_output(1);
+                    return raised;
+                }
+                KeyCode::Down if alt => {
+                    scroll_output(-1);
+                    return raised;
+                }
+                KeyCode::Home if alt => {
+                    scroll_output(isize::MAX / 4);
+                    return raised;
+                }
+                KeyCode::End if alt => {
+                    scroll_to_bottom();
+                    clear_composer();
+                    render_footer();
+                    return raised;
+                }
+                _ => {}
+            }
+            let mut ta = match typeahead().lock() {
+                Ok(g) => g,
+                Err(_) => return raised,
+            };
+            match k.code {
+                KeyCode::Enter => {
+                    let text: String = ta.buf.iter().collect();
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if let Ok(mut mq) = message_queue().lock() {
+                            if ta.from_queue {
+                                queue_put_back(&mut mq, trimmed.to_string());
+                            } else {
+                                mq.push(trimmed.to_string());
                             }
-                            ta.buf.clear();
-                            ta.cursor = 0;
-                            ta.from_queue = false;
-                            // Drop the guard before rendering: render_output /
-                            // render_queued_composer re-lock typeahead and the
-                            // message queue, and std Mutex is not reentrant.
-                            drop(ta);
-                            render_output();
-                            clear_composer();
-                            render_footer();
-                            render_queued_composer();
                         }
-                        continue;
-                    }
-                    // Plain Up is intentionally a no-op for the queue: queue
-                    // editing is Ctrl+Q (as the queued-row hint says), so a
-                    // stray Up can't destructively pop the newest message.
-                    KeyCode::Up if !alt => {
-                        continue;
-                    }
-                    KeyCode::Char('q') if ctrl => {
-                        // Take the NEXT message (front) under a short-lived
-                        // lock, then render with no guards held (see deadlock
-                        // note on Enter above).
-                        let next = message_queue()
-                            .lock()
-                            .ok()
-                            .and_then(|mut mq| queue_take_next(&mut mq));
-                        if let Some(next) = next {
-                            ta.buf = next.chars().collect();
-                            ta.cursor = ta.buf.len();
-                            ta.from_queue = true;
-                            drop(ta);
-                            render_output();
-                            clear_composer();
-                            render_footer();
-                            render_queued_composer();
-                        }
-                        continue;
-                    }
-                    KeyCode::Char('x') if ctrl => {
-                        let removed = message_queue()
-                            .lock()
-                            .ok()
-                            .and_then(|mut mq| queue_take_next(&mut mq))
-                            .is_some();
-                        if removed {
-                            drop(ta);
-                            render_output();
-                            clear_composer();
-                            render_footer();
-                            render_queued_composer();
-                        }
-                        continue;
-                    }
-                    KeyCode::Char('c') if ctrl => {
-                        trigger_interrupt(InterruptKind::CtrlC);
                         ta.buf.clear();
                         ta.cursor = 0;
                         ta.from_queue = false;
+                        // Drop the guard before rendering: render_output /
+                        // render_queued_composer re-lock typeahead and the
+                        // message queue, and std Mutex is not reentrant.
+                        drop(ta);
+                        render_output();
+                        clear_composer();
+                        render_footer();
+                        render_queued_composer();
                     }
-                    KeyCode::Char('u') if ctrl => {
-                        let d = ta.cursor;
-                        ta.buf.drain(..d);
-                        ta.cursor = 0;
-                    }
-                    KeyCode::Esc => {
-                        if is_agent_running() {
-                            trigger_interrupt(InterruptKind::Escape);
-                        } else if ta.from_queue && !ta.buf.is_empty() {
-                            let msg: String = ta.buf.iter().collect();
-                            if let Ok(mut mq) = message_queue().lock() {
-                                queue_put_back(&mut mq, msg);
-                            }
-                            ta.buf.clear();
-                            ta.cursor = 0;
-                            ta.from_queue = false;
-                            drop(ta);
-                            render_output();
-                            clear_composer();
-                            render_footer();
-                            render_queued_composer();
-                            continue;
-                        } else if !ta.buf.is_empty() {
-                            ta.buf.clear();
-                            ta.cursor = 0;
-                            ta.from_queue = false;
-                        } else {
-                            trigger_interrupt(InterruptKind::Escape);
-                        }
-                    }
-                    KeyCode::Home | KeyCode::Char('a') if ctrl => {
-                        ta.cursor = 0;
-                    }
-                    KeyCode::End | KeyCode::Char('e') if ctrl => {
+                    return raised;
+                }
+                // Plain Up is intentionally a no-op for the queue: queue
+                // editing is Ctrl+Q (as the queued-row hint says), so a
+                // stray Up can't destructively pop the newest message.
+                KeyCode::Up if !alt => {
+                    return raised;
+                }
+                KeyCode::Char('q') if ctrl => {
+                    // Take the NEXT message (front) under a short-lived
+                    // lock, then render with no guards held (see deadlock
+                    // note on Enter above).
+                    let next = message_queue()
+                        .lock()
+                        .ok()
+                        .and_then(|mut mq| queue_take_next(&mut mq));
+                    if let Some(next) = next {
+                        ta.buf = next.chars().collect();
                         ta.cursor = ta.buf.len();
+                        ta.from_queue = true;
+                        drop(ta);
+                        render_output();
+                        clear_composer();
+                        render_footer();
+                        render_queued_composer();
                     }
-                    KeyCode::Char('w') if ctrl => {
-                        let d = ta.cursor;
-                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] == ' ' {
-                            ta.cursor -= 1;
+                    return raised;
+                }
+                KeyCode::Char('x') if ctrl => {
+                    let removed = message_queue()
+                        .lock()
+                        .ok()
+                        .and_then(|mut mq| queue_take_next(&mut mq))
+                        .is_some();
+                    if removed {
+                        drop(ta);
+                        render_output();
+                        clear_composer();
+                        render_footer();
+                        render_queued_composer();
+                    }
+                    return raised;
+                }
+                KeyCode::Char('c') if ctrl => {
+                    raised = InterruptKind::CtrlC;
+                    ta.buf.clear();
+                    ta.cursor = 0;
+                    ta.from_queue = false;
+                }
+                KeyCode::Char('u') if ctrl => {
+                    let d = ta.cursor;
+                    ta.buf.drain(..d);
+                    ta.cursor = 0;
+                }
+                KeyCode::Esc => {
+                    if agent_running {
+                        raised = InterruptKind::Escape;
+                    } else if ta.from_queue && !ta.buf.is_empty() {
+                        let msg: String = ta.buf.iter().collect();
+                        if let Ok(mut mq) = message_queue().lock() {
+                            queue_put_back(&mut mq, msg);
                         }
-                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] != ' ' {
-                            ta.cursor -= 1;
-                        }
-                        let cur = ta.cursor;
-                        ta.buf.drain(cur..d);
+                        ta.buf.clear();
+                        ta.cursor = 0;
+                        ta.from_queue = false;
+                        drop(ta);
+                        render_output();
+                        clear_composer();
+                        render_footer();
+                        render_queued_composer();
+                        return raised;
+                    } else if !ta.buf.is_empty() {
+                        ta.buf.clear();
+                        ta.cursor = 0;
+                        ta.from_queue = false;
+                    } else {
+                        raised = InterruptKind::Escape;
                     }
-                    KeyCode::Char('k') if ctrl => {
-                        let cur = ta.cursor;
-                        ta.buf.truncate(cur);
+                }
+                KeyCode::Home | KeyCode::Char('a') if ctrl => {
+                    ta.cursor = 0;
+                }
+                KeyCode::End | KeyCode::Char('e') if ctrl => {
+                    ta.cursor = ta.buf.len();
+                }
+                KeyCode::Char('w') if ctrl => {
+                    let d = ta.cursor;
+                    while ta.cursor > 0 && ta.buf[ta.cursor - 1] == ' ' {
+                        ta.cursor -= 1;
                     }
-                    KeyCode::Backspace if !ctrl => {
-                        if ta.cursor > 0 {
-                            let i = ta.cursor - 1;
-                            ta.buf.remove(i);
-                            ta.cursor = i;
-                        }
+                    while ta.cursor > 0 && ta.buf[ta.cursor - 1] != ' ' {
+                        ta.cursor -= 1;
                     }
-                    KeyCode::Delete => {
-                        let i = ta.cursor;
-                        if i < ta.buf.len() {
-                            ta.buf.remove(i);
-                        }
+                    let cur = ta.cursor;
+                    ta.buf.drain(cur..d);
+                }
+                KeyCode::Char('k') if ctrl => {
+                    let cur = ta.cursor;
+                    ta.buf.truncate(cur);
+                }
+                KeyCode::Backspace if !ctrl => {
+                    if ta.cursor > 0 {
+                        let i = ta.cursor - 1;
+                        ta.buf.remove(i);
+                        ta.cursor = i;
                     }
-                    KeyCode::Left => {
-                        ta.cursor = ta.cursor.saturating_sub(1);
+                }
+                KeyCode::Delete => {
+                    let i = ta.cursor;
+                    if i < ta.buf.len() {
+                        ta.buf.remove(i);
                     }
-                    KeyCode::Right => {
-                        let i = ta.cursor;
-                        if i < ta.buf.len() {
-                            ta.cursor += 1;
-                        }
-                    }
-                    KeyCode::Char(c) if !ctrl && !alt => {
-                        let i = ta.cursor;
-                        ta.buf.insert(i, c);
+                }
+                KeyCode::Left => {
+                    ta.cursor = ta.cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    let i = ta.cursor;
+                    if i < ta.buf.len() {
                         ta.cursor += 1;
                     }
-                    _ => {}
                 }
-            }
-            Ok(Event::Paste(s)) => {
-                // A dropped/pasted image or video path becomes an @attachment
-                // token (and previews at once, even mid-turn).
-                let media = pasted_media_path(&s);
-                let text = match &media {
-                    Some(p) => attachment_token(p),
-                    None => s.clone(),
-                };
-                let mut ta = match typeahead().lock() {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                for c in text.chars() {
-                    if c != '\r' && c != '\n' {
-                        let i = ta.cursor;
-                        ta.buf.insert(i, c);
-                        ta.cursor += 1;
-                    }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    let i = ta.cursor;
+                    ta.buf.insert(i, c);
+                    ta.cursor += 1;
                 }
-                drop(ta);
-                if let Some(p) = media {
-                    show_image_file(&p, false);
-                }
-            }
-            Ok(Event::Mouse(m)) => match m.kind {
-                MouseEventKind::ScrollUp => scroll_output(3),
-                MouseEventKind::ScrollDown => scroll_output(-3),
-                MouseEventKind::Down(MouseButton::Left) => selection_start(m.row, m.column),
-                MouseEventKind::Drag(MouseButton::Left) => selection_drag(m.row, m.column),
-                MouseEventKind::Up(MouseButton::Left) => selection_finish(m.row, m.column),
                 _ => {}
-            },
-            Ok(Event::Resize(_, _)) => {
-                if ALT_SCREEN.load(Ordering::Relaxed) {
-                    set_output_region();
-                    render_output();
-                    render_footer();
-                    render_queued_composer();
-                }
             }
-            Ok(Event::FocusGained) => FOCUSED.store(true, Ordering::Relaxed),
-            Ok(Event::FocusLost) => FOCUSED.store(false, Ordering::Relaxed),
-            Err(_) => break,
+        }
+        Event::Paste(s) => {
+            // A dropped/pasted image or video path becomes an @attachment
+            // token (and previews at once, even mid-turn).
+            let media = pasted_media_path(&s);
+            let text = match &media {
+                Some(p) => attachment_token(p),
+                None => s.clone(),
+            };
+            let mut ta = match typeahead().lock() {
+                Ok(g) => g,
+                Err(_) => return raised,
+            };
+            let chars = sanitize_paste(&text);
+            let i = ta.cursor;
+            ta.buf.splice(i..i, chars.iter().copied());
+            ta.cursor += chars.len();
+            drop(ta);
+            if let Some(p) = media {
+                show_image_file(&p, false);
+            }
+        }
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => scroll_output(3),
+            MouseEventKind::ScrollDown => scroll_output(-3),
+            MouseEventKind::Down(MouseButton::Left) => selection_start(m.row, m.column),
+            MouseEventKind::Drag(MouseButton::Left) => selection_drag(m.row, m.column),
+            MouseEventKind::Up(MouseButton::Left) => selection_finish(m.row, m.column),
+            _ => {}
+        },
+        Event::Resize(_, _) => {
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                set_output_region();
+                render_output();
+                render_footer();
+                render_queued_composer();
+            }
+        }
+        Event::FocusGained => FOCUSED.store(true, Ordering::Relaxed),
+        Event::FocusLost => FOCUSED.store(false, Ordering::Relaxed),
+    }
+    if raised != InterruptKind::None {
+        trigger_interrupt(raised);
+    }
+    raised
+}
+
+// ── render lock ──────────────────────────────────────────────────────────────
+// The typeahead and spinner threads paint while the main thread streams, so
+// every frame (render_output, render_queued_composer, render_footer,
+// render_composer) runs under one process-wide lock. Re-entrant per thread,
+// since render_output ends with render_queued_composer, which calls
+// render_composer. Lock order: RENDER → typeahead → message_queue → the leaf
+// locks (transcript, selection, visible_rows, footer/model/flash text). Never
+// call a render function while holding typeahead or message_queue.
+static RENDER: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static RENDER_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct RenderGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+impl Drop for RenderGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            RENDER_HELD.with(|h| h.set(false));
         }
     }
-    render_queued_composer();
+}
+
+fn render_lock() -> RenderGuard {
+    if RENDER_HELD.with(|h| h.get()) {
+        return RenderGuard(None);
+    }
+    let g = RENDER.lock().unwrap_or_else(|e| e.into_inner());
+    RENDER_HELD.with(|h| h.set(true));
+    RenderGuard(Some(g))
+}
+
+// Hand a fully built frame to the terminal in one write.
+fn write_frame(frame: &[u8]) {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(frame);
+    let _ = out.flush();
+}
+
+// The composer is one line: pasted line breaks and tabs become spaces, and
+// every other control char (C0, DEL, C1, so no escape sequences) is dropped.
+fn sanitize_paste(s: &str) -> Vec<char> {
+    s.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 // Only the front row (sent next) carries the edit/remove hint: Ctrl+Q and
@@ -1754,13 +1836,14 @@ pub fn render_queued_composer() {
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    let _frame = render_lock();
     // The queued rows live just above the composer, inside the reserved area —
     // make sure the scroll region already excludes them so they can't be
     // scrolled away between now and the next stream frame.
     ensure_output_region();
     if let Ok(ta) = typeahead().lock() {
         let has_queued = if let Ok(mq) = message_queue().lock() {
-            let mut out = io::stdout();
+            let mut out: Vec<u8> = Vec::new();
             // One atomic frame (DEC 2026): the queued rows paint together with
             // no intermediate state a fast terminal could show mid-repaint.
             let _ = write!(out, "\x1b[?2026h");
@@ -1779,7 +1862,7 @@ pub fn render_queued_composer() {
                 );
             }
             let _ = write!(out, "\x1b[?2026l");
-            let _ = out.flush();
+            write_frame(&out);
             !mq.is_empty()
         } else {
             false
@@ -2190,6 +2273,7 @@ fn find_closer(chars: &[char], from: usize, marker: &str) -> Option<usize> {
 /// bullets, quotes) and inline styling become real formatting, all kept in the
 /// muted thinking palette so the reasoning stays visually quiet.
 pub fn render_md_dim_line(s: &str) -> String {
+    let s = &*sanitize_terminal(s);
     if no_color() {
         return s.to_string();
     }
@@ -2217,6 +2301,7 @@ pub fn render_md_dim_line(s: &str) -> String {
 }
 
 pub fn render_md(text: &str) -> String {
+    let text = &*sanitize_terminal(text);
     let w = term_size().0 as usize;
     let mut out: Vec<String> = Vec::new();
     // Some(lang) while inside a fenced code block.
@@ -2339,7 +2424,44 @@ pub fn hyperlink(url: &str, label: &str) -> String {
     if no_color() || !io::stdout().is_terminal() {
         return label.to_string();
     }
-    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+    format!("\x1b]8;;{}\x1b\\{label}\x1b]8;;\x1b\\", osc8_url(url))
+}
+
+// Any control char inside the OSC 8 URL could terminate the sequence early and
+// smuggle the rest to the terminal as live escapes.
+fn osc8_url(url: &str) -> String {
+    url.chars().filter(|&c| !c.is_control()).collect()
+}
+
+fn is_unsafe_control(c: char) -> bool {
+    c != '\n' && c != '\t' && c.is_control()
+}
+
+/// Neutralizes terminal control sequences in untrusted text (model output,
+/// tool output, model-supplied paths) before the harness styles it: ESC shows
+/// as a visible `␛`, every other C0 (except `\n` and `\t`), DEL and C1 char
+/// is dropped. Apply where text enters, never to already-styled strings.
+pub fn sanitize_terminal(s: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path for the streaming hot loop: all unsafe chars are either a
+    // byte below 0x20, DEL, or a C1 char encoded as 0xC2 0x80..=0x9F.
+    if !s
+        .bytes()
+        .any(|b| (b < 0x20 && b != b'\n' && b != b'\t') || b == 0x7f || b == 0xc2)
+    {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if !s.chars().any(is_unsafe_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\x1b' {
+            out.push('␛');
+        } else if !is_unsafe_control(c) {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 // Clickable file link: resolves to an absolute file:// URL so terminals can
@@ -2413,7 +2535,7 @@ fn clear_composer() {
 
 // Draw the composer box borders and return with the cursor ready at the
 // start of the input row's content area. The caller writes the inner line.
-fn queue_composer_box(out: &mut io::Stdout) {
+fn queue_composer_box(out: &mut impl Write) {
     let (width, _) = term_size();
     let w = width as usize;
     let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
@@ -2440,13 +2562,13 @@ fn queue_composer_box(out: &mut io::Stdout) {
 
 // Close the input row with the right-hand border, clipping anything that
 // would collide with it.
-fn queue_composer_right_border(out: &mut io::Stdout) {
+fn queue_composer_right_border(out: &mut impl Write) {
     let (width, _) = term_size();
     let _ = queue!(out, MoveTo(width.saturating_sub(1), composer_row()));
     let _ = write!(out, "{}", dim("│"));
 }
 
-fn queue_footer(out: &mut io::Stdout) {
+fn queue_footer(out: &mut impl Write) {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
@@ -2581,13 +2703,14 @@ fn render_footer() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    let mut out = io::stdout();
+    let _frame = render_lock();
+    let mut out: Vec<u8> = Vec::new();
     let _ = write!(out, "\x1b[?2026h");
-    let _ = execute!(out, SavePosition);
+    let _ = queue!(out, SavePosition);
     queue_footer(&mut out);
-    let _ = execute!(out, RestorePosition);
+    let _ = queue!(out, RestorePosition);
     let _ = write!(out, "\x1b[?2026l");
-    let _ = out.flush();
+    write_frame(&out);
 }
 
 // ── footer flash ─────────────────────────────────────────────────────────────
@@ -2686,6 +2809,7 @@ fn render_output() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    let _frame = render_lock();
     // Keep the scroll region matched to the current reserved rows before we
     // repaint — a just-queued prompt must not be scrolled over.
     ensure_output_region();
@@ -2704,7 +2828,7 @@ fn render_output() {
     }
     let start = total.saturating_sub(rows + offset);
     let visible = t.rows_range(start, rows);
-    let mut out = io::stdout();
+    let mut out: Vec<u8> = Vec::with_capacity(rows * (width + 16));
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
     // — zero tearing/flicker. Ignored elsewhere.
@@ -2739,7 +2863,7 @@ fn render_output() {
         *rows = plain_rows;
     }
     let _ = write!(out, "\x1b[?2026l");
-    let _ = out.flush();
+    write_frame(&out);
     render_queued_composer();
 }
 
@@ -3055,6 +3179,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    let _frame = render_lock();
     let (width, _) = term_size();
     let pwidth = prompt_width(prompt);
     // Room inside the box: left border "│ " + prompt … text … " │" right border.
@@ -3076,7 +3201,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         .copied()
         .map(char_width)
         .sum::<usize>();
-    let mut out = io::stdout();
+    let mut out: Vec<u8> = Vec::new();
     queue_composer_box(&mut out);
     let _ = write!(out, "{prompt}{shown}");
     queue_composer_right_border(&mut out);
@@ -3090,7 +3215,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
             composer_row()
         )
     );
-    let _ = out.flush();
+    write_frame(&out);
 }
 
 fn echo_submitted(prompt: &str, text: &str) {
@@ -3241,9 +3366,16 @@ pub fn context_meter(used: usize, total: usize) {
 // on ("typing shows nothing") until they run `reset`. Signal handlers may only
 // use async-signal-safe calls, so this is raw write(2) + tcsetattr(2) +
 // _exit(2), nothing else.
+// Constant bytes (async-signal-safe to write): reset the scroll margins and
+// colors, show the cursor, turn off every mouse mode (1000/1002/1003 plus the
+// 1015/1006 encodings), focus reporting and bracketed paste, restore the
+// default cursor shape, then leave the alternate screen.
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
+const RESTORE: &[u8] = b"\x1b[r\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[0 q\x1b[?1049l";
+
 #[cfg(unix)]
 mod signal_restore {
-    use super::{ALT_SCREEN, RAW};
+    use super::{ALT_SCREEN, RAW, RESTORE};
     use std::sync::atomic::Ordering;
     use std::sync::OnceLock;
 
@@ -3267,10 +3399,6 @@ mod signal_restore {
     extern "C" fn handler(sig: libc::c_int) {
         unsafe {
             if ALT_SCREEN.load(Ordering::Relaxed) {
-                // Reset colors, show the cursor, drop mouse/bracketed-paste
-                // reporting, leave the alternate screen.
-                const RESTORE: &[u8] =
-                    b"\x1b[0m\x1b[?25h\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
                 let _ = libc::write(
                     libc::STDOUT_FILENO,
                     RESTORE.as_ptr() as *const libc::c_void,
@@ -3296,7 +3424,7 @@ mod signal_restore {
 // always linked on Windows and this avoids a Windows API crate.
 #[cfg(windows)]
 mod signal_restore {
-    use super::{ALT_SCREEN, RAW};
+    use super::{ALT_SCREEN, RAW, RESTORE};
     use std::io::Write;
     use std::sync::atomic::Ordering;
     use std::sync::Once;
@@ -3317,9 +3445,6 @@ mod signal_restore {
 
     unsafe extern "system" fn handler(_ctrl_type: u32) -> i32 {
         if ALT_SCREEN.swap(false, Ordering::Relaxed) {
-            // Reset colors, show the cursor, drop mouse/bracketed-paste
-            // reporting, leave the alternate screen.
-            const RESTORE: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l";
             let mut out = std::io::stdout();
             let _ = out.write_all(RESTORE);
             let _ = out.flush();
@@ -3374,23 +3499,33 @@ pub fn enter_alt(raw: bool) {
         cursor_color_accent();
         set_cursor_shape(CursorShape::Bar);
     }
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        reset_output_region();
-        cursor_reset_style();
-        cursor_show();
-        let _ = write!(io::stdout(), "\x1b[0m");
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-        MOUSE_CAPTURED.store(false, Ordering::Relaxed);
-        ALT_SCREEN.store(false, Ordering::Relaxed);
-        let _ = disable_raw_mode();
-        prev(info);
-    }));
+    install_panic_hook();
+}
+
+// Once per process: enter_alt runs again after every suspend/editor round
+// trip, and re-wrapping the previous hook each time would stack restores.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            reset_output_region();
+            cursor_reset_style();
+            cursor_show();
+            let _ = write!(io::stdout(), "\x1b[0m");
+            let _ = execute!(
+                io::stdout(),
+                DisableBracketedPaste,
+                DisableFocusChange,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
+            MOUSE_CAPTURED.store(false, Ordering::Relaxed);
+            ALT_SCREEN.store(false, Ordering::Relaxed);
+            let _ = disable_raw_mode();
+            prev(info);
+        }));
+    });
 }
 
 pub fn leave_alt() {
@@ -3852,33 +3987,22 @@ pub fn get_interrupt_kind() -> InterruptKind {
     if !is_raw() {
         return InterruptKind::None;
     }
-    let cur = match INTERRUPT_KIND_VAL.load(Ordering::Relaxed) {
+    // poll_typeahead is the single event reader: it raises the flag for
+    // Ctrl-C/Esc and buffers every other key, so reading events here would
+    // drop what the user types while the agent streams. Repaint only when
+    // something was read: this runs once per streamed chunk.
+    if drain_typeahead() {
+        render_queued_composer();
+    }
+    interrupt_kind()
+}
+
+fn interrupt_kind() -> InterruptKind {
+    match INTERRUPT_KIND_VAL.load(Ordering::Relaxed) {
         1 => InterruptKind::Escape,
         2 => InterruptKind::CtrlC,
         _ => InterruptKind::None,
-    };
-    if cur != InterruptKind::None {
-        return cur;
     }
-    let mut hit = InterruptKind::None;
-    while poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(k)) = read() {
-            if k.kind != KeyEventKind::Press {
-                continue;
-            }
-            let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C'));
-            if ctrl_c {
-                hit = InterruptKind::CtrlC;
-            } else if k.code == KeyCode::Esc {
-                hit = InterruptKind::Escape;
-            }
-        }
-    }
-    if hit != InterruptKind::None {
-        trigger_interrupt(hit);
-    }
-    hit
 }
 
 pub fn interrupted() -> bool {
@@ -3933,14 +4057,16 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         return None;
     }
     let _pause_guard = PauseAgentRunningGuard::new();
+    // Titles and items can carry model-supplied text (the question tool).
+    let title = &*sanitize_terminal(title);
     if !is_raw() {
         line(&accent(&format!("  {title}")));
         for (i, item) in items.iter().enumerate() {
             line(&format!(
                 "  {:>2}. {} — {}",
                 i + 1,
-                bold(&item.label),
-                dim(&item.detail)
+                bold(&sanitize_terminal(&item.label)),
+                dim(&sanitize_terminal(&item.detail))
             ));
         }
         let ans = ask("  Select number: ").unwrap_or_default();
@@ -3994,14 +4120,14 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
                 format!(
                     "  │  {} {} {}",
                     accent("❯"),
-                    bold(&item.label),
-                    green(&format!("({})", item.detail))
+                    bold(&sanitize_terminal(&item.label)),
+                    green(&format!("({})", sanitize_terminal(&item.detail)))
                 )
             } else {
                 format!(
                     "  │    {} {}",
-                    dim(&item.label),
-                    dim(&format!("({})", item.detail))
+                    dim(&sanitize_terminal(&item.label)),
+                    dim(&format!("({})", sanitize_terminal(&item.detail)))
                 )
             };
             let row = base + 1 + (i - scroll_offset) as u16;
@@ -4948,15 +5074,9 @@ fn read_line_raw_prefill(
                     redraw(prompt, start, &buf, cursor, &mut scroll);
                     continue;
                 }
-                for raw in s.chars() {
-                    let c = match raw {
-                        '\n' | '\r' | '\t' => ' ',
-                        c if c.is_control() => continue,
-                        c => c,
-                    };
-                    buf.insert(cursor, c);
-                    cursor += 1;
-                }
+                let chars = sanitize_paste(&s);
+                buf.splice(cursor..cursor, chars.iter().copied());
+                cursor += chars.len();
                 redraw(prompt, start, &buf, cursor, &mut scroll);
                 continue;
             }
@@ -5145,15 +5265,9 @@ fn read_line_raw_prefill(
                         line(&dim(&format!("  ⎘ clipboard image → {}", img.display())));
                     }
                 } else if let Some(text) = crate::media::clipboard_text() {
-                    for raw in text.chars() {
-                        let ch = match raw {
-                            '\n' | '\r' | '\t' => ' ',
-                            c if c.is_control() => continue,
-                            c => c,
-                        };
-                        buf.insert(cursor, ch);
-                        cursor += 1;
-                    }
+                    let chars = sanitize_paste(&text);
+                    buf.splice(cursor..cursor, chars.iter().copied());
+                    cursor += chars.len();
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
@@ -5658,6 +5772,7 @@ pub fn spinner_start(label: &str) -> Spinner {
         let mut i = 0usize;
         while r2.load(Ordering::Relaxed) {
             if ALT_SCREEN.load(Ordering::Relaxed) {
+                let _frame = render_lock();
                 let mut out = io::stdout();
                 let _ = execute!(out, SavePosition);
                 queue_composer_box(&mut out);
@@ -6570,5 +6685,112 @@ mod tests {
         // @mentions and unknown commands stay blank.
         assert_eq!(popup_desc("@src/lib.rs"), "");
         assert_eq!(popup_desc("/no-such-command-xyz"), "");
+    }
+
+    #[test]
+    fn sanitize_terminal_neutralizes_escapes_but_keeps_newlines_and_tabs() {
+        let evil = "hi\x1b]52;c;ZXZpbA==\x07 \x1b[2J\x1b[1;1H\u{9b}31m\u{85}x\x7f\x00\r\n\tend";
+        let out = sanitize_terminal(evil);
+        assert!(!out.contains('\x1b'));
+        assert!(!out
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t'));
+        assert_eq!(out, "hi␛]52;c;ZXZpbA== ␛[2J␛[1;1H31mx\n\tend");
+        // No control chars: borrowed, no allocation on the streaming path.
+        let clean = "plain ✓ text\n\twith ünïcode";
+        assert!(matches!(
+            sanitize_terminal(clean),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Idempotent, so sanitizing at several entry points is harmless.
+        assert_eq!(sanitize_terminal(&out), out);
+    }
+
+    #[test]
+    fn untrusted_markdown_keeps_harness_styling_only() {
+        let md = "**bold** \x1b]52;c;AAAA\x07 \x1b[31mred\n\n| a | b |\n|---|---|\n| \x1b[2J | 2 |\n\n```rust\nlet x = \"\x1b[1A\";\n```";
+        let out = render_md(md);
+        for bad in ["\x1b]52", "\x1b[31m", "\x1b[2J", "\x1b[1A", "\x07"] {
+            assert!(!out.contains(bad), "{bad:?} leaked: {out:?}");
+        }
+        let p = plain(&out);
+        assert!(p.contains("␛]52;c;AAAA ␛[31mred"), "{p}");
+        assert!(p.contains("␛[2J"), "{p}");
+        assert!(p.contains("let x = \"␛[1A\";"), "{p}");
+        if !no_color() {
+            // Bold, table borders and the highlighted code block still style.
+            assert!(out.contains('\x1b'));
+        }
+        let mut r = StreamRenderer::new();
+        r.push("ok \x1b]52;c;QQ");
+        r.push("==\x07\u{9d} done\n");
+        r.flush();
+        let joined = r.sink.join("\n");
+        assert!(!joined.contains("\x1b]52") && !joined.contains('\x07'));
+        assert!(plain(&joined).contains("ok ␛]52;c;QQ== done"));
+    }
+
+    #[test]
+    fn osc8_url_drops_control_chars() {
+        let url = "https://example.test/\x1b\\\x1b]52;c;AA\x07x\u{9c}y\n";
+        let clean = osc8_url(url);
+        assert_eq!(clean, "https://example.test/\\]52;c;AAxy");
+        assert!(!clean.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn typeahead_keys_survive_an_interrupt_poll() {
+        use crossterm::event::KeyEvent;
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let _ = take_typeahead();
+        for c in "good point".chars() {
+            assert_eq!(
+                typeahead_event(key(KeyCode::Char(c)), true),
+                InterruptKind::None
+            );
+        }
+        // Esc while the agent works raises the interrupt without dropping
+        // the keys buffered around it.
+        assert_eq!(
+            typeahead_event(key(KeyCode::Esc), true),
+            InterruptKind::Escape
+        );
+        typeahead_event(key(KeyCode::Char('!')), true);
+        typeahead_event(Event::Paste("\x1b[31m more\n".into()), true);
+        let (buf, cursor) = take_typeahead();
+        INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
+        assert_eq!(buf.iter().collect::<String>(), "good point![31m more ");
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn restore_resets_every_terminal_mode() {
+        let restore = std::str::from_utf8(RESTORE).unwrap();
+        for seq in [
+            "\x1b[r",
+            "\x1b[0m",
+            "\x1b[?25h",
+            "\x1b[?1000l",
+            "\x1b[?1002l",
+            "\x1b[?1003l",
+            "\x1b[?1015l",
+            "\x1b[?1006l",
+            "\x1b[?1004l",
+            "\x1b[?2004l",
+            "\x1b[0 q",
+        ] {
+            assert!(restore.contains(seq), "RESTORE lacks {seq:?}");
+        }
+        // Margins reset before leaving the alternate screen, which comes last.
+        assert!(restore.ends_with("\x1b[?1049l"));
+    }
+
+    #[test]
+    fn sanitize_paste_flattens_lines_and_drops_controls() {
+        let got: String = sanitize_paste("a\r\nb\tc\x1b[31m\u{9b}d\x07\x7f ✓")
+            .into_iter()
+            .collect();
+        assert_eq!(got, "a  b c[31md ✓");
+        assert!(sanitize_paste("").is_empty());
     }
 }
