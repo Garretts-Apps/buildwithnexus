@@ -28,7 +28,8 @@ A daily background check tells you when a new version is out; set
 - **npm install:** Node.js 18 or later.
 - **cargo install / source build:** Rust 1.94 or later (`rust-version` in
   `harness/Cargo.toml`).
-- **Prebuilt binaries:** Linux x64 and arm64 (glibc), macOS x64 and arm64,
+- **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.35 or later: Ubuntu
+  22.04+, Debian 12+), macOS x64 and arm64,
   Windows x64. Other platforms (for example musl/Alpine or Windows on Arm)
   need a source build pointed to by `BWN_BIN`.
 - **Optional tools:** `ffmpeg` for video attachments and image previews,

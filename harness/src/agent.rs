@@ -1905,9 +1905,10 @@ pub fn run_build(
     role_id: &str,
     task: &str,
     cwd: &Path,
+    images: Vec<(String, String)>,
 ) -> Result<(), String> {
     let mut transcript: Vec<Msg> = Vec::new();
-    run_build_session(
+    run_build_session_with_images(
         p,
         perm,
         role_id,
@@ -1915,6 +1916,7 @@ pub fn run_build(
         cwd,
         &mut transcript,
         &crate::session::claim_or_new(),
+        images,
     )
 }
 
@@ -2003,13 +2005,15 @@ fn open_turn(
     if msgs.is_empty() {
         msgs.push(Msg::System(system()));
     }
+    msgs.push(user_msg(task.to_string(), images));
+}
+
+// A user message, multimodal when images are attached.
+fn user_msg(text: String, images: Vec<(String, String)>) -> Msg {
     if images.is_empty() {
-        msgs.push(Msg::User(task.to_string()));
+        Msg::User(text)
     } else {
-        msgs.push(Msg::UserImages {
-            text: task.to_string(),
-            images,
-        });
+        Msg::UserImages { text, images }
     }
 }
 
@@ -3412,6 +3416,7 @@ pub fn run_plan(
     task: &str,
     cwd: &Path,
     auto_approve: bool,
+    images: Vec<(String, String)>,
 ) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
     // Hooks see the phase's real gate, not the session permission.
@@ -3429,7 +3434,9 @@ pub fn run_plan(
     );
 
     let defs = tools::defs_readonly(); // planning inspects context but never writes
-    let mut msgs = vec![Msg::System(sys), Msg::User(task.into())];
+                                       // The approved plan executes with the same images the plan was made from.
+    let exec_images = images.clone();
+    let mut msgs = vec![Msg::System(sys), user_msg(task.into(), images)];
     let mut loop_guard = ToolLoopGuard::default();
     let mut tool_rounds = 0usize;
     let mut plan_format_recovery_count = 0usize;
@@ -3744,7 +3751,7 @@ pub fn run_plan(
         .collect::<Vec<_>>()
         .join("\n");
     let full = approved_plan_build_task(task, &plan);
-    run_build(p, perm, "engineer", &full, cwd)
+    run_build(p, perm, "engineer", &full, cwd, exec_images)
 }
 
 fn approved_plan_build_task(task: &str, plan: &str) -> String {
@@ -3773,6 +3780,7 @@ pub fn run_brainstorm(
     _perm: Permission,
     cwd: &Path,
     first: &str,
+    images: Vec<(String, String)>,
 ) -> Result<Option<ModeHint>, String> {
     // Held only while the model works: the footer's "working · Esc to
     // interrupt" must not stay up while the follow-up prompt waits on you.
@@ -3792,10 +3800,12 @@ pub fn run_brainstorm(
     let defs = tools::defs_readonly(); // brainstorm inspects but never writes
     let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
     let mut question = first.to_string();
+    let mut images = images;
     let mut loop_guard = ToolLoopGuard::default();
 
     loop {
-        msgs.push(Msg::User(question.clone()));
+        // Attached images ride on the first question only.
+        msgs.push(user_msg(question.clone(), std::mem::take(&mut images)));
         maybe_compact(p, &mut msgs);
 
         // Keep consuming tool calls until the model gives a text response.
@@ -4015,10 +4025,11 @@ pub fn run_chat_turn(
     perm: Permission,
     cwd: &Path,
     question: &str,
+    images: Vec<(String, String)>,
 ) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
     hooks::set_permission_mode(permission_name(perm));
-    let r = chat_turn_inner(p, perm, cwd, question);
+    let r = chat_turn_inner(p, perm, cwd, question, images);
     hooks::notify("Stop", cwd);
     r
 }
@@ -4028,6 +4039,7 @@ fn chat_turn_inner(
     perm: Permission,
     cwd: &Path,
     question: &str,
+    images: Vec<(String, String)>,
 ) -> Result<(), String> {
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
@@ -4039,7 +4051,7 @@ fn chat_turn_inner(
     );
 
     let defs = tools::defs_for_context(false, p.context_tokens);
-    let mut msgs: Vec<Msg> = vec![Msg::System(sys), Msg::User(question.to_string())];
+    let mut msgs: Vec<Msg> = vec![Msg::System(sys), user_msg(question.to_string(), images)];
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
