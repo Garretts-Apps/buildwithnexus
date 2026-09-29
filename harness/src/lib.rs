@@ -294,6 +294,13 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         // to onboarding, which would overwrite them. Broken config is a fix,
         // not a first run.
         None if load.any_present => return Err(broken_settings_msg()),
+        // No settings yet. Without a terminal there is nobody to answer the
+        // setup questions, so take the provider from --provider or from the
+        // first API key in the environment, and fail with the fix otherwise.
+        None if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
+            unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some())
+                .ok_or_else(no_setup_headless_msg)?
+        }
         None => onboarding::run().ok_or("setup cancelled")?,
     };
     if let Some(p) = &opts.provider {
@@ -339,6 +346,32 @@ fn warn_settings_issues(load: &config::SettingsLoad) {
             ))
         );
     }
+}
+
+/// Settings for a first run with no terminal: the `--provider` preset if
+/// one was named, else the first remote preset whose key is set. Nothing is
+/// written to disk; `buildwithnexus init` still owns the saved setup.
+fn unattended_settings(provider: Option<&str>, has_key: impl Fn(&str) -> bool) -> Option<Settings> {
+    // An unknown --provider is kept so build_provider reports it by name.
+    let id = match provider {
+        Some(id) => id.to_string(),
+        None => config::PRESETS
+            .iter()
+            .find(|p| !p.local && !p.env_key.is_empty() && has_key(p.env_key))?
+            .id
+            .to_string(),
+    };
+    Some(Settings {
+        provider: id,
+        ..Default::default()
+    })
+}
+
+fn no_setup_headless_msg() -> String {
+    "no provider is set up, and there is no terminal to run setup in.\n  \
+     Set an API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY or HF_TOKEN),\n  \
+     pass --provider (e.g. --provider ollama), or run `buildwithnexus init` once in a terminal."
+        .to_string()
 }
 
 fn broken_settings_msg() -> String {
@@ -4968,6 +5001,30 @@ mod tests {
         assert!(text.contains("two\nthree"));
         assert!(!text.contains("\none\n"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unattended_settings_prefers_flag_then_first_env_key() {
+        let none = |_: &str| false;
+        assert!(unattended_settings(None, none).is_none());
+        let openai_only = |k: &str| k == "OPENAI_API_KEY";
+        assert_eq!(
+            unattended_settings(None, openai_only).unwrap().provider,
+            "openai"
+        );
+        let both = |k: &str| k == "OPENAI_API_KEY" || k == "ANTHROPIC_API_KEY";
+        assert_eq!(
+            unattended_settings(None, both).unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(
+            unattended_settings(Some("ollama"), none).unwrap().provider,
+            "ollama"
+        );
+        assert_eq!(
+            unattended_settings(Some("nope"), none).unwrap().provider,
+            "nope"
+        );
     }
 
     #[test]

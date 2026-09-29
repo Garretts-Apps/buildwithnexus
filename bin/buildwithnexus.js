@@ -43,11 +43,11 @@ if (!bin) {
   process.stderr.write(
     'buildwithnexus: native binary not found.\n' +
     (pkg
-      ? `  The platform package "${pkg}" is missing — it installs as an optionalDependency,\n` +
-        '  so re-install without --omit=optional / --no-optional:\n' +
-        '    npm install -g buildwithnexus\n' +
-        '  Or download the checksum-verified release binary explicitly:\n' +
-        '    bwn --bootstrap        (or BWN_ALLOW_BOOTSTRAP=1 bwn)\n'
+      ? '  Download the checksum-verified release binary once (no terminal here, so the\n' +
+        '  launcher will not download it on its own):\n' +
+        '    bwn --bootstrap        (or BWN_ALLOW_BOOTSTRAP=1 bwn)\n' +
+        `  If you installed with --omit=optional, reinstalling without it also works once the\n` +
+        `  "${pkg}" package is available.\n`
       : `  No prebuilt binary exists for this platform (${process.platform} ${process.arch}).\n`) +
     (t
       ? '  Or build from source and point BWN_BIN at the result:\n' +
