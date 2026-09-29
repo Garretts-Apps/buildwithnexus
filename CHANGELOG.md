@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-09-29
+
 ### Security
 - **Project settings need your trust before they can change anything that
   matters.** A repository's `.buildwithnexus/settings.json` and
@@ -172,7 +174,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.3...HEAD
+[0.14.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.3
 
 
 ## [0.14.2] - 2026-09-29
