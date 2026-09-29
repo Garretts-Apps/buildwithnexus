@@ -54,7 +54,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a reply could overwrite the clipboard (OSC 52), move the cursor to fake an
   `allow?` prompt, or disguise a link. ESC now shows as a visible `␛` and
   other control characters are dropped before the harness adds its own
-  styling. Control characters are also stripped from OSC 8 link targets.
+  styling. Control characters are also stripped from OSC 8 link targets,
+  the `allow?` approval line, and saved sessions replayed by `/resume`.
 - **Ask mode no longer auto-approves compound commands.** A command whose
   binary was in `allowed_commands`, the project's "always allow" list or the
   session's approvals used to run without a prompt even when it chained,

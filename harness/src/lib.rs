@@ -1699,7 +1699,7 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
         tui::line(&format!(
             "  {}  {}",
             tui::bold(&(i + 1).to_string()),
-            s.title
+            tui::sanitize_terminal(&s.title)
         ));
     }
     let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
@@ -1712,15 +1712,21 @@ fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
             let title = s.title.clone();
             *transcript = s.msgs;
             *sid = s.id;
-            tui::line(&tui::green(&format!("  ✓ resumed: {title}")));
+            tui::line(&tui::green(&format!(
+                "  ✓ resumed: {}",
+                tui::sanitize_terminal(&title)
+            )));
             tui::line(&tui::dim("  ── restored history ──"));
             for msg in transcript.iter() {
                 match msg {
-                    provider::Msg::User(text) => {
-                        tui::line(&format!("{} {}", tui::accent("›"), text));
-                    }
-                    provider::Msg::UserImages { text, .. } => {
-                        tui::line(&format!("{} {}", tui::accent("›"), text));
+                    // Saved sessions are files on disk: replay them through
+                    // the same sanitizer as live model and tool output.
+                    provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
+                        tui::line(&format!(
+                            "{} {}",
+                            tui::accent("›"),
+                            tui::sanitize_terminal(text)
+                        ));
                     }
                     provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
                         tui::line(&tui::render_md(text));

@@ -1683,7 +1683,11 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     }
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
-    tui::line(&format!("  {} {}", tui::yellow("➤"), tui::bold(label)));
+    tui::line(&format!(
+        "  {} {}",
+        tui::yellow("➤"),
+        tui::bold(&tui::sanitize_terminal(label))
+    ));
     tui::line(&tui::dim(
         "    y yes · n no · s allow this session · a always allow · d <reason> deny",
     ));
