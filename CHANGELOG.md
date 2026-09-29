@@ -6,6 +6,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-09-29
+
+### Changed
+- **Image previews are thumbnails.** An attached image was drawn across
+  nearly the whole terminal (up to 160 columns by 48 rows), pushing the
+  conversation off screen. Previews now fit in half the terminal width (at
+  most 80 columns) and a third of its height (at most 16 rows), keeping the
+  image's proportions. The model still gets the full-size image.
+
 ## [0.14.5] - 2026-09-29
 
 ### Fixed
@@ -209,7 +218,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.5...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.6...HEAD
+[0.14.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.6
 [0.14.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.5
 [0.14.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.4
 [0.14.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.3

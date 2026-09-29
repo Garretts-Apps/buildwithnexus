@@ -673,14 +673,18 @@ fn use_placeholders() -> bool {
     }
 }
 
-// Cell budget for an inline image: most of the width, and enough rows to
-// fit above the composer without pushing the header off screen.
+// Cell budget for an inline image: a thumbnail, not a full-screen picture.
+// At most half the width (80 columns) and a third of the rows above the
+// composer (16 rows), so the conversation stays in view; the image keeps its
+// aspect ratio inside that box.
 fn image_cell_budget() -> (usize, usize) {
     let (w, h) = term_size();
-    let cols = (w as usize).saturating_sub(4).clamp(8, 160);
-    let rows = (h as usize)
-        .saturating_sub(reserved_rows() as usize + 4)
-        .clamp(4, 48);
+    image_cell_budget_for(w as usize, h as usize, reserved_rows() as usize)
+}
+
+fn image_cell_budget_for(width: usize, height: usize, reserved: usize) -> (usize, usize) {
+    let cols = (width.saturating_sub(4) / 2).clamp(8, 80);
+    let rows = (height.saturating_sub(reserved + 4) / 3).clamp(4, 16);
     (cols, rows)
 }
 
@@ -6291,6 +6295,16 @@ mod tests {
         assert!(joined.contains("╭") && joined.contains("╰"), "{joined}");
         assert!(!joined.contains("```"), "{joined}");
         assert!(joined.contains("after"), "{joined}");
+    }
+
+    #[test]
+    fn image_budget_is_a_thumbnail_on_any_terminal_size() {
+        // A wide, tall terminal caps at 80 columns by 16 rows.
+        assert_eq!(image_cell_budget_for(240, 60, 4), (80, 16));
+        // A standard 80x24 terminal gets half the width, a third of the rows.
+        assert_eq!(image_cell_budget_for(80, 24, 4), (38, 5));
+        // A tiny terminal still gets a readable minimum.
+        assert_eq!(image_cell_budget_for(10, 8, 4), (8, 4));
     }
 
     #[test]
