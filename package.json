@@ -57,12 +57,5 @@
     "registry": "https://registry.npmjs.org/",
     "provenance": true
   },
-  "optionalDependencies": {
-    "buildwithnexus-linux-x64": "0.12.7",
-    "buildwithnexus-linux-arm64": "0.12.7",
-    "buildwithnexus-darwin-x64": "0.12.7",
-    "buildwithnexus-darwin-arm64": "0.12.7",
-    "buildwithnexus-win32-x64": "0.12.7"
-  },
   "browser": "./index.browser.js"
 }

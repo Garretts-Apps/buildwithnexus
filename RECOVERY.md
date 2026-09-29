@@ -97,5 +97,11 @@ sandbox:
   by hand too.
 - **Non-UTF-8 and >2 MiB files** are guarded (restore refuses to clobber
   them) but not restorable from checkpoints — use git for those.
-- Process isolation, network egress control, and OS-level sandboxing are not
-  provided. Run untrusted tasks in a container; see SECURITY.md.
+- OS-level confinement is opt-in and partial. With `"sandbox": "auto"` or
+  `"require"`, shell commands run under `bwrap` on Linux or `sandbox-exec` on
+  macOS and can write only to the working directory and temp directories
+  (Windows and WSL have no backend). Reads, the network (unless
+  `"sandbox_network": false`), hooks, MCP servers and `start_server` are
+  not confined, and with the default `"off"` nothing is. Run untrusted tasks
+  in a container; see [SECURITY.md](SECURITY.md) and the Sandbox section of
+  the [README](README.md#sandbox).

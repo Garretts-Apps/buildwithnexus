@@ -30,7 +30,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer copy project settings into your global settings.** They used to save
   the merged settings to `~/.buildwithnexus/settings.json`. They now change
   only their own keys in that file.
-
+- Release workflow: permissions are now granted per job instead of
+  workflow-wide, and checkouts no longer store the token in `.git/config`,
+  so the Rust build (including dependencies' build scripts and proc-macros)
+  has no token on disk to read. Releases run one at a time, a manual release is refused unless it starts
+  from `main`, and a new tag points at the commit the workflow built.
+- Every third-party GitHub Action is pinned to a full commit SHA. The
+  publish workflow installs a pinned npm version instead of `npm@latest`,
+  and CI downloads a pinned actionlint release and checks its SHA-256
+  instead of piping an install script into bash.
+- The publish workflow no longer places the `version_bump` input directly
+  into a shell script, and it keeps the push token on disk only when it has
+  to push a version bump.
+- Dependabot now proposes weekly updates for the Rust crates as well as for
+  Actions and npm.
+- SECURITY.md no longer promises a `[y/N]` prompt before the first-run
+  download. It now describes what actually happens (automatic in a
+  terminal, opt-in with `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1` elsewhere),
+  the full download host allowlist, and the optional OS sandbox.
 ### Fixed
 - **`bwn init` keeps your existing settings.** Setup used to rewrite
   `settings.json` from defaults, dropping `allowed_commands`,
@@ -68,6 +85,31 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are attached to the build turn's own message after the system prompt, with
   `/btw` and hook context included. Chat, PLAN and BRAINSTORM turns say the
   images were not sent instead of leaking them into a later turn.
+
+### Changed
+- crates.io publishing in the release workflow now fails the run when it
+  cannot get an OIDC token or a publish fails, instead of passing with a
+  warning. Versions already on crates.io are still skipped.
+- A failed push of a manual version bump now stops the publish workflow
+  instead of publishing a version that has no commit or tag on `main`.
+- The published npm manifest lists a per-platform package in
+  `optionalDependencies` only when that exact version exists on npm, and
+  the run warns with the one-time command that publishes the missing ones
+  (`scripts/first-publish-platform-packages.sh`, which now accepts
+  `NPM_TOKEN`). The committed `package.json` no longer pins them to 0.12.7,
+  a version that was never published. Installs are unaffected: the launcher
+  downloads the checksum-verified binary on first run.
+- CI runs the Rust test suite on macOS as well as Linux, compiles the tests
+  on Windows, and caches Rust builds.
+- README: added Requirements, local model setup, and a Headless and CI
+  section with flags and exit codes, and corrected how the Linux sandbox
+  treats `/tmp`. RECOVERY.md now describes the optional sandbox.
+- Removed `docs/AGENT_DEFINITIONS.md`, `docs/DEEP_AGENTS_CLI_UX.md` and
+  `.env.example`, which described code that no longer exists, and stopped
+  tracking the `.omc/` tool state directory.
+
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.2...HEAD
+
 
 ## [0.14.2] - 2026-09-29
 
@@ -117,6 +159,8 @@ headless runs as a new user would.
   none and how to resume one; the footer drops the context gauge instead of
   cutting it off on narrow terminals.
 
+[0.14.2]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.2
+
 ## [0.14.1] - 2026-09-24
 
 ### Security
@@ -125,6 +169,8 @@ headless runs as a new user would.
   across encryption level boundaries (CVSS 5.3, medium). buildwithnexus
   talks to every hosted model provider over this TLS stack, so the fix is
   shipped as a patch release. No code changes.
+
+[0.14.1]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.1
 
 ## [0.14.0] - 2026-09-23
 
@@ -186,6 +232,8 @@ of the streaming path.
 - Selection copy across an image row yields spaces, not placeholder bytes.
 - The Ctrl+V attachment token is quoted when the temp path contains spaces
   (Windows).
+
+[0.14.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.0
 
 ## [0.13.0] - 2026-09-08
 
@@ -277,6 +325,8 @@ closable, and twelve bugs found along the way were fixed.
   protocols, update notices by default, first-run download install story,
   and the new features above.
 
+[0.13.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.13.0
+
 ## [0.12.15] - 2026-09-08
 
 ### Fixed
@@ -308,6 +358,8 @@ closable, and twelve bugs found along the way were fixed.
   completion, and selection helpers; a Node test for the npm launcher; and a
   PTY test that drives the real TUI. All three run in CI.
 
+[0.12.15]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.15
+
 ## [0.12.14] - 2026-07-30
 
 ### Fixed
@@ -330,12 +382,16 @@ closable, and twelve bugs found along the way were fixed.
 - A full TUI audit pass closed 35 rendering, cursor, and input-handling
   findings.
 
+[0.12.14]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.14
+
 ## [0.12.13] - 2026-07-29
 
 ### Fixed
 - **Slash Commands Trailing Whitespace Guard (`/model`, `/mode`, `/permissions`):**
   Fixed whitespace handling so typing `/model ` (with trailing spaces) opens the interactive
   model selection dialog instead of skipping execution.
+
+[0.12.13]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.13
 
 ## [0.12.12] - 2026-07-29
 
@@ -347,6 +403,8 @@ closable, and twelve bugs found along the way were fixed.
   Selecting a local GGUF model automatically checks ports 8080/1234/11434/8000. If no server is running, it finds `llama-server` on the host machine and launches it automatically in the background.
 - **Cloud Provider Base URL Reset:**
   Swapping between cloud model providers automatically resets `base_url` to the target provider's default API endpoint.
+
+[0.12.12]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.12
 
 ## [0.12.11] - 2026-07-29
 
@@ -362,6 +420,8 @@ closable, and twelve bugs found along the way were fixed.
 - **Clean Footer Statusline:** Context & token usage (`ctx: 25% 32k/128k`) move to the footer
   statusline below the composer box, eliminating log clutter in the chat thread.
 
+[0.12.11]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.11
+
 ## [0.12.10] - 2026-07-29
 
 ### Changed
@@ -372,6 +432,8 @@ closable, and twelve bugs found along the way were fixed.
   prompting `[y/N]`. The user already opted in by running
   `npm install -g buildwithnexus`. Non-TTY environments (CI, scripts, pipes)
   are unaffected — they still require `--bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`.
+
+[0.12.10]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.10
 
 ## [0.12.9] - 2026-07-29
 
@@ -385,6 +447,8 @@ closable, and twelve bugs found along the way were fixed.
 - **Sessions no longer start in Build mode.** The default mode is now
   Brainstorm, so launching bwn and typing a casual message no longer kicks
   off an agentic build run.
+
+[0.12.9]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.9
 
 ## [0.12.8] - 2026-07-29
 
@@ -419,6 +483,8 @@ closable, and twelve bugs found along the way were fixed.
   still going it ends with an honest summary of what got done and the exact
   next step — never a scary error for simply doing a lot.
 
+[0.12.8]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.8
+
 ## [0.12.7] - 2026-07-21
 
 ### Changed
@@ -438,6 +504,8 @@ closable, and twelve bugs found along the way were fixed.
   Ghostty) and occasionally scroll the whole screen (a visible flash). The
   region is now re-asserted whenever the reserved-row count changes, and the
   queued-composer row paints as one atomic frame.
+
+[0.12.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.7
 
 ## [0.12.6] - 2026-07-18
 
@@ -489,6 +557,8 @@ closable, and twelve bugs found along the way were fixed.
   filesystems), and the destination's permissions are copied onto the
   replacement, so editing a script no longer risks silently stripping its
   executable bit.
+
+[0.12.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.6
 
 ## [0.12.5] - 2026-07-19
 
@@ -557,6 +627,8 @@ closable, and twelve bugs found along the way were fixed.
   column, refuses to re-onboard while broken files exist, and
   `buildwithnexus doctor` lists every settings file with its parse status.
 
+[0.12.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.5
+
 ## [0.12.4] - 2026-07-16
 
 ### Fixed
@@ -565,6 +637,8 @@ closable, and twelve bugs found along the way were fixed.
   threw `EAGAIN` and fell through to "native binary not found" before you
   could answer. The prompt now reads from a fresh blocking `/dev/tty` handle
   (falling back to stdin where `/dev/tty` doesn't exist, e.g. Windows).
+
+[0.12.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.12.4
 
 ## [0.12.3] - 2026-07-14
 
