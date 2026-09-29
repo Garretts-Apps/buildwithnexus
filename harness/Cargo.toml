@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.14.6"
+version = "0.14.7"
 edition = "2021"
 rust-version = "1.94"
 description = "A hilariously fast agentic AI coding CLI — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
@@ -27,7 +27,7 @@ doc = false
 
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
-crossterm = "0.28"
+crossterm = "0.29"
 # Blocking HTTP with rustls — no async runtime, fast cold start, one TLS stack.
 ureq = { version = "2.10", features = ["json", "tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,7 +46,7 @@ libc = "0.2"
 serde_json = "1"
 # Performance suite. Drop default features (rayon/plotters/html) but keep the
 # bits `cargo bench` needs to actually run the harness.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "perf"

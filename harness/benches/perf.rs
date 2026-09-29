@@ -9,7 +9,8 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 
 use buildwithnexus::config;
 use buildwithnexus::provider::bench as pbench;

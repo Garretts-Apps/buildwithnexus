@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.7] - 2026-09-29
+
+### Added
+- **Sharp, full-resolution image previews over Sixel.** On terminals that
+  support Sixel graphics (Windows Terminal 1.22+, WezTerm, foot, mlterm,
+  xterm with `-ti vt340`), an attached image is drawn with its real pixels
+  instead of coloured block characters, which made text in screenshots
+  unreadable at thumbnail size. bwn asks the terminal at startup whether it
+  supports Sixel and how large a character cell is, so the image fills
+  exactly the rows it reserves. Works for native Windows (`bwn.exe` in
+  Windows Terminal) as well as Linux, macOS and WSL. Set `BWN_IMAGES=sixel` to
+  force it on, or `BWN_IMAGES=blocks` to keep block art. Needs ffmpeg, like
+  block previews.
+
+### Changed
+- **Image previews follow the terminal size.** Resizing the window re-fits
+  every image already in the transcript, for both Sixel and block previews.
+  An image partly scrolled out of view is drawn cropped rather than
+  overlapping the composer, and block previews shrink with area averaging so
+  small text stays legible.
+- Dependencies: crossterm 0.29, libc 0.2.189, serde 1.0.229, serde_json
+  1.0.151, and criterion 0.8 for the benchmarks (which now use
+  `std::hint::black_box`).
+
 ## [0.14.6] - 2026-09-29
 
 ### Changed
@@ -218,7 +242,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.6...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.7...HEAD
+[0.14.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.7
 [0.14.6]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.6
 [0.14.5]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.5
 [0.14.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.4

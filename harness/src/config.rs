@@ -251,8 +251,9 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub sandbox_network: bool,
     /// Inline images in the transcript: "auto" (default; pixel-perfect on
-    /// kitty/Ghostty, half-block art elsewhere), "kitty" (force the graphics
-    /// protocol), "blocks" (always half-block art), or "off".
+    /// kitty/Ghostty and on terminals that report Sixel, half-block art
+    /// elsewhere), "kitty" (force the graphics protocol), "sixel" (force
+    /// Sixel), "blocks" (always half-block art), or "off".
     #[serde(default = "default_auto")]
     pub images: String,
     /// Desktop notification when a long turn finishes: "auto" (default;

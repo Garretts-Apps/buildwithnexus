@@ -219,7 +219,7 @@ pub fn attach_video(path: &Path) -> Option<VideoAttachment> {
 // ffmpeg — no image-decoding dependencies in the binary. The TUI renders it
 // as half-block cells so attached screenshots are visible in the transcript.
 
-fn probe_dims(path: &Path) -> Option<(u32, u32)> {
+pub fn probe_dims(path: &Path) -> Option<(u32, u32)> {
     let out = Command::new("ffprobe")
         .args([
             "-v",
@@ -261,7 +261,8 @@ pub fn decode_thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32
             "-frames:v",
             "1",
             "-vf",
-            &format!("scale={w}:{h}"),
+            // Area averaging keeps small text legible when shrinking a lot.
+            &format!("scale={w}:{h}:flags=area"),
             "-f",
             "rawvideo",
             "-pix_fmt",
