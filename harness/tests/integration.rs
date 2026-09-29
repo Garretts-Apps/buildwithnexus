@@ -1120,3 +1120,45 @@ fn untrusted_project_settings_may_tighten_the_gate() {
         r.stderr
     );
 }
+
+// An @image in a headless BRAINSTORM (or any mode) reaches a vision model.
+#[test]
+fn headless_brainstorm_sends_attached_image() {
+    // 1x1 transparent PNG.
+    const PNG: [u8; 67] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let (port, posts) = serve_recording(vec![text("a single transparent pixel")]);
+    let cfg = json!({
+        "provider": "llamacpp",
+        "model": "gemma3:4b",
+        "permission": "ask",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "brainstorm", "what is in @pic.png"],
+    );
+    let posts = posts.lock().unwrap();
+    assert!(!posts.is_empty(), "stderr: {}", r.stderr);
+    assert!(
+        posts[0].contains("data:image/png;base64,iVBOR"),
+        "request: {}",
+        posts[0]
+    );
+    assert!(
+        r.stderr.contains("attached 1 image"),
+        "stderr: {}",
+        r.stderr
+    );
+}

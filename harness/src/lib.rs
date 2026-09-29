@@ -184,7 +184,8 @@ pub fn run() {
         }
         "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
             headless(&opts, |p, perm, cwd| {
-                agent::run_build(p, perm, "engineer", &rest(), &cwd)
+                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                agent::run_build(p, perm, "engineer", &task, &cwd, images)
             })
         }
         "plan" => {
@@ -198,11 +199,13 @@ pub fn run() {
                 std::process::exit(2);
             }
             headless(&opts, |p, perm, cwd| {
-                agent::run_plan(p, perm, &rest(), &cwd, opts.yes)
+                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                agent::run_plan(p, perm, &task, &cwd, opts.yes, images)
             })
         }
         "brainstorm" => headless(&opts, |p, perm, cwd| {
-            agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
+            let (task, images) = headless_attachments(p, &rest(), &cwd);
+            agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
         }),
         "sessions" => {
             let all = session::list();
@@ -1050,7 +1053,9 @@ fn repl(
 
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
-            if let Err(e) = agent::run_plan(&provider, perm, task.trim(), cwd, false) {
+            let vision = media::model_supports_vision(&provider);
+            let (task, images) = extract_attachments(task.trim(), cwd, vision);
+            if let Err(e) = agent::run_plan(&provider, perm, &task, cwd, false, images) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
             tui::bell();
@@ -1058,14 +1063,17 @@ fn repl(
         }
         if let Some(task) = t.strip_prefix("/build ") {
             tui::line("");
-            if let Err(e) = agent::run_build_session(
+            let vision = media::model_supports_vision(&provider);
+            let (task, images) = extract_attachments(task.trim(), cwd, vision);
+            if let Err(e) = agent::run_build_session_with_images(
                 &provider,
                 perm,
                 "engineer",
-                task.trim(),
+                &task,
                 cwd,
                 &mut transcript,
                 &sid,
+                images,
             ) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
@@ -1074,7 +1082,9 @@ fn repl(
         }
         if let Some(task) = t.strip_prefix("/brainstorm ") {
             tui::line("");
-            if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, task.trim()).map(|_| ()) {
+            let vision = media::model_supports_vision(&provider);
+            let (task, images) = extract_attachments(task.trim(), cwd, vision);
+            if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, &task, images).map(|_| ()) {
                 tui::line(&tui::red(&format!("  {e}")));
             }
             tui::bell();
@@ -1495,29 +1505,28 @@ fn repl(
         // startup, so servers only spawn once the session is actually used.
         mcp::start_background();
 
-        // Only a BUILD turn sends images; the build session puts them on its
-        // own user message after the system prompt. Chat, PLAN and BRAINSTORM
-        // take text only, so say so rather than dropping them silently.
+        // Every mode sends attached images, on its own user message after the
+        // system prompt.
         let conversational = should_answer_conversationally(t, &mode);
         let n_images = image_data.len();
         if n_images > 0 {
             let plural = if n_images == 1 { "" } else { "s" };
-            if !conversational && matches!(mode, Mode::Build) {
-                tui::line(&tui::dim(&format!("  ⎘ attached {n_images} image{plural}")));
-            } else {
-                image_data.clear();
-                tui::line(&tui::yellow(&format!(
-                    "  {n_images} image{plural} not sent: only BUILD mode tasks take images"
-                )));
-            }
+            tui::line(&tui::dim(&format!("  ⎘ attached {n_images} image{plural}")));
         }
 
         tui::line("");
         let r = if conversational {
-            agent::run_chat_turn(&provider, perm, cwd, t)
+            agent::run_chat_turn(&provider, perm, cwd, t, std::mem::take(&mut image_data))
         } else {
             match &mode {
-                Mode::Plan => match agent::run_plan(&provider, perm, t, cwd, false) {
+                Mode::Plan => match agent::run_plan(
+                    &provider,
+                    perm,
+                    t,
+                    cwd,
+                    false,
+                    std::mem::take(&mut image_data),
+                ) {
                     Ok(()) => {
                         mode = Mode::Build;
                         tui::show_mode_change("BUILD");
@@ -1535,7 +1544,13 @@ fn repl(
                     &sid,
                     std::mem::take(&mut image_data),
                 ),
-                Mode::Brainstorm => match agent::run_brainstorm(&provider, perm, cwd, t) {
+                Mode::Brainstorm => match agent::run_brainstorm(
+                    &provider,
+                    perm,
+                    cwd,
+                    t,
+                    std::mem::take(&mut image_data),
+                ) {
                     Err(e) => Err(e),
                     Ok(None) => Ok(()),
                     Ok(Some(agent::ModeHint::Build)) => {
@@ -1786,7 +1801,7 @@ fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
     );
 
     tui::line("");
-    if let Err(e) = agent::run_build(provider, perm, "engineer", &full_task, cwd) {
+    if let Err(e) = agent::run_build(provider, perm, "engineer", &full_task, cwd, Vec::new()) {
         tui::line(&tui::red(&format!("  {e}")));
     }
 }
@@ -3748,6 +3763,22 @@ impl Mode {
 // are parsed with ffmpeg into sampled frames + a metadata block; readable
 // text files are appended to the prompt. Unreadable tokens are left
 // unchanged. `vision` gates image/video attachment to multimodal models.
+// Headless runs take the same @path attachments as the TUI; a model that
+// can't see images gets a stderr warning instead of a silent drop.
+fn headless_attachments(
+    p: &Provider,
+    task: &str,
+    cwd: &std::path::Path,
+) -> (String, Vec<(String, String)>) {
+    let vision = media::model_supports_vision(p);
+    let (task, images) = extract_attachments(task, cwd, vision);
+    if !images.is_empty() {
+        let n = images.len();
+        eprintln!("⎘ attached {n} image{}", if n == 1 { "" } else { "s" });
+    }
+    (task, images)
+}
+
 fn extract_attachments(
     task: &str,
     cwd: &std::path::Path,
@@ -3761,7 +3792,9 @@ fn extract_attachments(
     let words: Vec<String> = shlex::split(task)
         .unwrap_or_else(|| task.split_whitespace().map(|s| s.to_string()).collect());
     for word_str in &words {
-        let word = word_str.as_str();
+        // Sentence punctuation after a path ("what is in @shot.png?") is not
+        // part of the file name.
+        let word = word_str.trim_end_matches(['?', '!', '.', ',', ';', ':']);
         let is_at = word.starts_with('@');
         let clean_word = word.trim_matches(|c| {
             c == '\'' || c == '"' || c == ',' || c == ';' || c == '(' || c == ')' || c == '`'
@@ -3773,7 +3806,7 @@ fn extract_attachments(
             if !clean.is_empty() {
                 clean.push(' ');
             }
-            clean.push_str(word);
+            clean.push_str(word_str);
             continue;
         }
         if let Some(raw_path) = if is_at {
@@ -5068,6 +5101,31 @@ mod tests {
         assert!(text.contains("[file:"));
         assert!(text.contains("two\nthree"));
         assert!(!text.contains("\none\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_path_before_sentence_punctuation_attaches() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-punct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1x1 PNG.
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82u8,
+        ];
+        std::fs::write(dir.join("shot.png"), png).unwrap();
+        for prompt in [
+            "what is in @shot.png?",
+            "describe shot.png.",
+            "see @shot.png, then fix it",
+        ] {
+            let (_, images) = extract_attachments(prompt, &dir, true);
+            assert_eq!(images.len(), 1, "{prompt}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -312,31 +312,52 @@ fn message_text(content: &Value) -> String {
     String::new()
 }
 
-// Rewrite the request body's messages into the shape restrictive templates
-// accept: strictly alternating user/assistant with no `system`/`tool` roles.
-// System and tool-result content fold into user turns, an assistant turn's
-// tool_calls render as text, consecutive same-role turns merge, and the native
-// `tools` field is dropped — the model then emits tool_code/text calls, which
-// the agent's recovery parser handles.
-fn flatten_openai_messages(body: &mut Value) {
-    let Some(msgs) = body["messages"].as_array() else {
-        return;
-    };
-    let mut folded: Vec<(String, String)> = Vec::new();
+// One turn of a flattened transcript: text plus the images it carried, in
+// the wire shape of whichever protocol the body uses.
+struct FlatTurn {
+    role: &'static str,
+    text: String,
+    images: Vec<Value>,
+}
+
+// Image parts of an OpenAI message: the `image_url` entries of a content array.
+fn openai_images(m: &Value) -> Vec<Value> {
+    m["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p["type"] == "image_url")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// Images of an Ollama message: the bare base64 strings in `images`.
+fn ollama_images(m: &Value) -> Vec<Value> {
+    m["images"].as_array().cloned().unwrap_or_default()
+}
+
+// Fold a transcript into strictly alternating user/assistant turns with no
+// `system`/`tool` roles: system and tool-result content become user turns, an
+// assistant turn's tool_calls render as text, and consecutive same-role turns
+// merge (keeping every image). The first turn is always `user`.
+fn fold_turns(msgs: &[Value], images_of: fn(&Value) -> Vec<Value>) -> Vec<FlatTurn> {
+    let mut folded: Vec<FlatTurn> = Vec::new();
     for m in msgs {
-        let role = m["role"].as_str().unwrap_or("user");
         let text = message_text(&m["content"]);
-        match role {
-            // Keep only the assistant's own prose. A prior tool_call is NOT
-            // rendered as text — a small model will imitate whatever call-shaped
-            // marker it sees and stop making real calls. The following "Tool
-            // result:" user turn already conveys what happened.
+        match m["role"].as_str().unwrap_or("user") {
             "assistant" => {
                 let mut content = text;
                 if let Some(calls) = m["tool_calls"].as_array() {
                     for c in calls {
                         let name = c["function"]["name"].as_str().unwrap_or("");
-                        let args = c["function"]["arguments"].as_str().unwrap_or("");
+                        // OpenAI sends a JSON string, Ollama a JSON object.
+                        let args = match &c["function"]["arguments"] {
+                            Value::String(a) => a.clone(),
+                            other => other.to_string(),
+                        };
                         if !content.is_empty() {
                             content.push('\n');
                         }
@@ -344,41 +365,178 @@ fn flatten_openai_messages(body: &mut Value) {
                     }
                 }
                 if !content.is_empty() {
-                    folded.push(("assistant".into(), content));
+                    folded.push(FlatTurn {
+                        role: "assistant",
+                        text: content,
+                        images: Vec::new(),
+                    });
                 }
             }
             "tool" => {
                 if !text.is_empty() {
-                    folded.push(("user".into(), format!("Tool result:\n{text}")));
+                    folded.push(FlatTurn {
+                        role: "user",
+                        text: format!("Tool result:\n{text}"),
+                        images: Vec::new(),
+                    });
                 }
             }
-            _ => folded.push(("user".into(), text)),
+            _ => folded.push(FlatTurn {
+                role: "user",
+                text,
+                images: images_of(m),
+            }),
         }
     }
-    // Merge consecutive same-role turns so roles strictly alternate.
-    let mut merged: Vec<(String, String)> = Vec::new();
-    for (role, text) in folded {
+    let mut merged: Vec<FlatTurn> = Vec::new();
+    for turn in folded {
         if let Some(last) = merged.last_mut() {
-            if last.0 == role {
-                if !text.is_empty() {
-                    if !last.1.is_empty() {
-                        last.1.push_str("\n\n");
+            if last.role == turn.role {
+                if !turn.text.is_empty() {
+                    if !last.text.is_empty() {
+                        last.text.push_str("\n\n");
                     }
-                    last.1.push_str(&text);
+                    last.text.push_str(&turn.text);
                 }
+                last.images.extend(turn.images);
                 continue;
             }
         }
-        merged.push((role, text));
+        merged.push(turn);
     }
-    // These templates require the first turn to be `user`.
-    if merged.first().is_some_and(|(r, _)| r == "assistant") {
-        merged.insert(0, ("user".into(), String::new()));
+    if merged.first().is_some_and(|t| t.role == "assistant") {
+        merged.insert(
+            0,
+            FlatTurn {
+                role: "user",
+                text: String::new(),
+                images: Vec::new(),
+            },
+        );
     }
-    body["messages"] = json!(merged
-        .iter()
-        .map(|(r, t)| json!({"role": r, "content": t}))
+    merged
+}
+
+// Instructions for calling tools in plain text, built from the native `tools`
+// field that a flattened request drops. Without it the model would not know
+// which tools exist. The JSON shape is the one the agent's text-call parser
+// reads; `None` when the request had no tools.
+fn text_tool_guide(tools: &Value) -> Option<String> {
+    let tools = tools.as_array().filter(|t| !t.is_empty())?;
+    let mut guide = String::from(
+        "This server has no native tool calling. To use a tool, reply with only \
+         a JSON object and nothing else:\n\
+         {\"name\": \"<tool>\", \"arguments\": {\"<param>\": <value>}}\n\
+         The result comes back in the next message. When the task is done, \
+         answer in plain text.\n\nTools (a ? marks an optional parameter):\n",
+    );
+    for t in tools {
+        let f = &t["function"];
+        let Some(name) = f["name"].as_str() else {
+            continue;
+        };
+        let required: Vec<&str> = f["parameters"]["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // Required parameters first, in schema order, then the optional ones.
+        let mut params: Vec<String> = required.iter().map(|r| r.to_string()).collect();
+        if let Some(props) = f["parameters"]["properties"].as_object() {
+            for k in props.keys() {
+                if !required.contains(&k.as_str()) {
+                    params.push(format!("{k}?"));
+                }
+            }
+        }
+        let desc = f["description"].as_str().unwrap_or("");
+        let first = desc
+            .split(". ")
+            .next()
+            .unwrap_or(desc)
+            .trim_end_matches('.');
+        let first: String = first.chars().take(160).collect();
+        guide.push_str(&format!("- {name}({}): {first}\n", params.join(", ")));
+    }
+    Some(guide)
+}
+
+// Rewrite an OpenAI request body into the shape restrictive templates accept
+// (notably Gemma's on llama.cpp): strictly alternating user/assistant turns,
+// no `system`/`tool` roles, and no native `tools` field. The tools are
+// described in text at the top of the first turn instead. Images stay on the
+// user turns that carried them unless `keep_images` is false (the server
+// rejected them).
+fn flatten_openai_messages(body: &mut Value, keep_images: bool) {
+    let Some(msgs) = body["messages"].as_array() else {
+        return;
+    };
+    let images_of: fn(&Value) -> Vec<Value> = if keep_images {
+        openai_images
+    } else {
+        |_| Vec::new()
+    };
+    let mut turns = fold_turns(msgs, images_of);
+    if let Some(guide) = text_tool_guide(&body["tools"]) {
+        if let Some(first) = turns.first_mut() {
+            first.text = if first.text.is_empty() {
+                guide
+            } else {
+                format!("{guide}\n{}", first.text)
+            };
+        }
+    }
+    body["messages"] = json!(turns
+        .into_iter()
+        .map(|t| {
+            if t.images.is_empty() {
+                json!({"role": t.role, "content": t.text})
+            } else {
+                let mut parts = t.images;
+                parts.push(json!({"type": "text", "text": t.text}));
+                json!({"role": t.role, "content": parts})
+            }
+        })
         .collect::<Vec<_>>());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("tools");
+    }
+}
+
+// The same rewrite for Ollama's native /api/chat body, for models whose
+// template has no tool support (gemma3, for one). The system message stays,
+// with the text tool guide appended; tool traffic folds into user/assistant
+// turns and images stay in each user turn's `images` array.
+fn flatten_ollama_messages(body: &mut Value) {
+    let Some(msgs) = body["messages"].as_array() else {
+        return;
+    };
+    let mut system = String::new();
+    let mut rest: Vec<Value> = Vec::new();
+    for m in msgs {
+        if m["role"] == "system" {
+            system = message_text(&m["content"]);
+        } else {
+            rest.push(m.clone());
+        }
+    }
+    if let Some(guide) = text_tool_guide(&body["tools"]) {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str(&guide);
+    }
+    let mut out: Vec<Value> = Vec::new();
+    if !system.is_empty() {
+        out.push(json!({"role": "system", "content": system}));
+    }
+    for t in fold_turns(&rest, ollama_images) {
+        let mut m = json!({"role": t.role, "content": t.text});
+        if !t.images.is_empty() {
+            m["images"] = json!(t.images);
+        }
+        out.push(m);
+    }
+    body["messages"] = json!(out);
     if let Some(obj) = body.as_object_mut() {
         obj.remove("tools");
     }
@@ -448,7 +606,7 @@ fn openai_exchange(
     }
     let url = req.url().to_string();
     if flatten_remembered(&url) {
-        flatten_openai_messages(&mut body);
+        flatten_openai_messages(&mut body, true);
         let resp = send_raw(req, body)?;
         return finish_openai(resp, streaming, on_text, on_thinking);
     }
@@ -461,11 +619,65 @@ fn openai_exchange(
                     "  ⟳ server rejected native tools/roles — using flattened prompts for the rest of the session",
                 );
             }
-            flatten_openai_messages(&mut body);
+            // A one-off image rejection retries without the images.
+            flatten_openai_messages(&mut body, !e.to_lowercase().contains("image"));
             let resp = send_raw(req, body)?;
             finish_openai(resp, streaming, on_text, on_thinking)
         }
         Err(e) => Err(e),
+    }
+}
+
+// Send an Ollama /api/chat request. Native tools go first; a model whose
+// template has no tool support ("<model> does not support tools", gemma3 for
+// one) gets one retry with the flattened body, and the model is remembered so
+// the rest of the session skips the failing attempt.
+fn ollama_exchange(
+    p: &Provider,
+    req: ureq::Request,
+    mut body: Value,
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    let key = format!("{}#{}", req.url(), p.model);
+    if flatten_remembered(&key) {
+        flatten_ollama_messages(&mut body);
+        return finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking);
+    }
+    match send_raw(req.clone(), body.clone()) {
+        Ok(resp) => finish_ollama(resp, streaming, on_text, on_thinking),
+        Err(e) if ollama_rejects_tools(&e) => {
+            remember_flatten(&key);
+            crate::report::info(&format!(
+                "  ⟳ {} has no native tool calling — describing tools in the prompt instead",
+                p.model
+            ));
+            flatten_ollama_messages(&mut body);
+            finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// Ollama's 400 for a model without tool support.
+fn ollama_rejects_tools(e: &str) -> bool {
+    e.starts_with("HTTP 400") && e.to_lowercase().contains("does not support tools")
+}
+
+fn finish_ollama(
+    resp: ureq::Response,
+    streaming: bool,
+    on_text: &mut dyn FnMut(&str),
+    on_thinking: &mut dyn FnMut(&str),
+) -> Result<Reply, String> {
+    if streaming {
+        ollama_stream(resp.into_reader(), on_text, on_thinking)
+    } else {
+        let v = resp
+            .into_json::<Value>()
+            .map_err(|e| format!("bad JSON from server: {e}"))?;
+        ollama_parse(v)
     }
 }
 
@@ -537,10 +749,8 @@ fn request_inner(
                     let (req, mut body) = ollama_request(p, msgs, tools, num_ctx);
                     if streaming {
                         body["stream"] = json!(true);
-                        ollama_stream(send_raw(req, body)?.into_reader(), on_text, on_thinking)
-                    } else {
-                        ollama_parse(send(req, body)?)
                     }
+                    ollama_exchange(p, req, body, streaming, on_text, on_thinking)
                 }
                 None => {
                     warn_ollama_fallback();
@@ -2291,7 +2501,7 @@ mod tests {
                 {"role": "tool", "tool_call_id": "1", "content": "wrote a"}
             ]
         });
-        flatten_openai_messages(&mut body);
+        flatten_openai_messages(&mut body, true);
         let m = body["messages"].as_array().unwrap();
         // The empty tool-call-only assistant turn is dropped (no call-shaped
         // text for a small model to imitate), so the remaining turns are all
@@ -2317,7 +2527,7 @@ mod tests {
         let mut body = json!({
             "messages": [{"role": "assistant", "content": "hi"}]
         });
-        flatten_openai_messages(&mut body);
+        flatten_openai_messages(&mut body, true);
         let roles: Vec<&str> = body["messages"]
             .as_array()
             .unwrap()
@@ -2325,6 +2535,132 @@ mod tests {
             .map(|x| x["role"].as_str().unwrap())
             .collect();
         assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    #[test]
+    fn flatten_openai_keeps_images_and_describes_tools_in_text() {
+        let mut body = json!({
+            "tools": [{"type": "function", "function": {
+                "name": "write_file",
+                "description": "Write a file. Overwrites it.",
+                "parameters": {"type": "object", "required": ["path"],
+                    "properties": {"path": {}, "content": {}}}
+            }}],
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                    {"type": "text", "text": "read this"}
+                ]}
+            ]
+        });
+        flatten_openai_messages(&mut body, true);
+        let m = body["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 1, "system folds into the first user turn");
+        let parts = m[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["image_url"]["url"], "data:image/png;base64,AAA");
+        let text = parts.last().unwrap()["text"].as_str().unwrap();
+        assert!(
+            text.contains("- write_file(path, content?): Write a file"),
+            "{text}"
+        );
+        assert!(text.contains(r#"{"name": "<tool>""#), "{text}");
+        assert!(text.contains("Be brief.") && text.contains("read this"));
+        assert!(body.get("tools").is_none());
+
+        // A server that rejected the image gets the same turns without it.
+        let mut again = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            {"type": "text", "text": "read this"}
+        ]}]});
+        flatten_openai_messages(&mut again, false);
+        assert_eq!(again["messages"][0]["content"], "read this");
+    }
+
+    #[test]
+    fn flatten_ollama_folds_tool_traffic_and_keeps_system_and_images() {
+        let mut body = json!({
+            "tools": [{"type": "function", "function": {
+                "name": "read_file", "description": "Read a file.",
+                "parameters": {"type": "object", "required": ["path"],
+                    "properties": {"path": {}}}
+            }}],
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "look", "images": ["QUJD"]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "read_file", "arguments": {"path": "a"}}}
+                ]},
+                {"role": "tool", "content": "file body", "tool_name": "read_file"}
+            ]
+        });
+        flatten_ollama_messages(&mut body);
+        let m = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
+        let sys = m[0]["content"].as_str().unwrap();
+        assert!(sys.starts_with("sys") && sys.contains("- read_file(path): Read a file"));
+        assert_eq!(m[1]["images"], json!(["QUJD"]));
+        assert!(m[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains(r#"read_file({"path":"a"})"#));
+        assert!(m[3]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Tool result:\nfile body"));
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn ollama_retries_without_tools_when_the_model_has_none_and_remembers() {
+        let ok =
+            r#"{"message":{"role":"assistant","content":"y"},"done":true,"done_reason":"stop"}"#;
+        let reject = r#"{"error":"registry.ollama.ai/library/gemma3:4b does not support tools"}"#;
+        let (base, handle, bodies) = mock_server_capture(vec![(400, reject), (200, ok), (200, ok)]);
+        let p = Provider {
+            protocol: Protocol::OllamaNative,
+            base_url: base,
+            api_key: None,
+            model: "gemma3:4b".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            // Pre-seeded so no /api/show probe consumes a scripted reply.
+            ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        };
+        let tools = vec![ToolDef {
+            name: "read_file",
+            description: "Read a file.",
+            schema: json!({"type": "object", "properties": {"path": {}}}),
+        }];
+        let msgs = [
+            Msg::System("be brief".into()),
+            Msg::UserImages {
+                text: "what is this".into(),
+                images: vec![("image/png".into(), "QUJD".into())],
+            },
+        ];
+        complete(&p, &msgs, &tools).unwrap();
+        complete(&p, &msgs, &tools).unwrap();
+        handle.join().unwrap();
+        let sent: Vec<Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 3, "400 → retry, then one remembered call");
+        assert!(sent[0].get("tools").is_some());
+        for retry in &sent[1..] {
+            assert!(retry.get("tools").is_none());
+            assert_eq!(retry["messages"][1]["images"], json!(["QUJD"]));
+            assert!(retry["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("- read_file(path?)"));
+        }
     }
 
     #[test]

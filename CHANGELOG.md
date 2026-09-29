@@ -6,6 +6,30 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-09-29
+
+### Fixed
+- **Images work in every mode.** An attached image used to reach the model
+  only in a BUILD task; chat answers, PLAN and BRAINSTORM dropped it with
+  "only BUILD mode tasks take images". Every mode now sends it, including
+  the `/plan`, `/build` and `/brainstorm` commands and headless `bwn run`,
+  `bwn plan` and `bwn brainstorm`. An approved plan carries the images into
+  the build that executes it.
+- **Ollama vision models without tool support work.** Models such as
+  `gemma3` failed every task with `HTTP 400: … does not support tools`. bwn
+  now retries without native tools, lists the tools in the system prompt with
+  the JSON shape to call them, and parses the calls from the reply. The
+  model is remembered, so later requests skip the failed attempt.
+- **The same fallback on OpenAI-compatible servers keeps images** and
+  describes the tools in text. It used to strip both, so a vision model
+  behind llama.cpp or LM Studio lost the image and the tool list.
+- **A path followed by punctuation attaches.** `what is in @shot.png?` read
+  the file name as `shot.png?` and attached nothing.
+- **The Linux binaries run on Ubuntu 22.04.** They were built on Ubuntu 24.04
+  and needed glibc 2.39, so installs on 22.04 and Debian 12 failed with
+  "GLIBC_2.39 not found". They are now built on 22.04 (glibc 2.35), and the
+  release fails if a binary needs anything newer.
+
 ## [0.14.3] - 2026-09-29
 
 ### Security
@@ -174,7 +198,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.3...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.4...HEAD
+[0.14.4]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.4
 [0.14.3]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.3
 
 
