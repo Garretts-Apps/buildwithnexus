@@ -106,6 +106,113 @@ cd buildwithnexus
 cargo build --release --locked --manifest-path harness/Cargo.toml
 ```
 
+## For IT and Security Teams
+
+This section is for anyone deciding whether to allow `buildwithnexus` on
+managed machines, and for the endpoint-protection teams asked to allowlist
+it. `buildwithnexus` is an MIT-licensed, open-source CLI; every release is
+built by the public GitHub Actions workflow in this repository.
+
+### What is in a release
+
+Each [GitHub Release](https://github.com/Garretts-Apps/buildwithnexus/releases)
+carries, per platform:
+
+- `buildwithnexus-<target>[.exe]`, the binary, with a `.sha256` file.
+- A build-provenance attestation (see *Verifying a Release* above).
+- `buildwithnexus.cdx.json`, a CycloneDX SBOM of every crate compiled in.
+
+The Windows `.exe` carries a version resource (ProductName `buildwithnexus`,
+OriginalFilename `buildwithnexus.exe`) and a manifest that requests
+`asInvoker`: it never asks for elevation. Windows releases are
+Authenticode-signed once code signing through the SignPath Foundation is
+enabled for the project; `Get-AuthenticodeSignature buildwithnexus.exe`
+shows whether a given file is signed.
+
+### What it does when it runs
+
+- **Processes it starts:** the shell commands the user approves (or that
+  the user's `auto` mode allows), through `cmd.exe /C` on Windows; `git`,
+  and `ffmpeg`/`ffprobe` when present; on Windows, `powershell.exe
+  -NoProfile` to read the clipboard (`Get-Clipboard`, for image paste),
+  `icacls` to restrict its settings and key files to the current user, and `tasklist`/`taskkill` for dev servers it started; the user's own
+  hook scripts, with
+  `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
+  -File <script>`; and `npm install -g buildwithnexus` only when the user
+  sets `auto_update` to `"install"`.
+- **Network:** the model provider the user configures (for example
+  `api.anthropic.com`, `api.openai.com`, or a local Ollama on
+  `localhost:11434`); `lite.duckduckgo.com` and the pages the agent fetches,
+  when the model uses the web tools; MCP servers the user configures; and a
+  daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
+  There is no telemetry or analytics.
+- **Files:** its settings, sessions and checkpoints under
+  `~/.buildwithnexus` (or `NEXUS_HOME`); pasted images as `bwn-paste-*.png`
+  in the temp directory; and the files the user asks it to edit in the
+  working directory.
+- **Not done:** no services, scheduled tasks, startup entries, registry
+  writes, drivers, or elevation.
+
+Controls an organization can set: `"auto_update": "off"`,
+`"permission": "ask"` or `"readonly"`, `BWN_SKIP_INSTALL=1` (no first-run
+download), and `BWN_BIN` (run a binary IT placed and verified itself).
+
+### Why endpoint protection may block it
+
+EDR products such as CrowdStrike Falcon and Microsoft Defender score
+unknown executables on reputation and behavior. `buildwithnexus` is new and
+has few installs, and until Authenticode signing is enabled its `.exe` is
+unsigned. The npm launcher also downloads the binary on first run and then
+executes it, which is the same shape as a malware loader even though the
+download is checksum-verified from this repository's GitHub Release. An
+agent that starts shells and PowerShell adds to the score. A block therefore
+does not by itself indicate a problem with the file: compare its SHA-256 and
+attestation with the release.
+
+### Allowlisting
+
+- **By hash:** allow the SHA-256 of the exact release binary (from its
+  `.sha256` file or `Get-FileHash`). In CrowdStrike Falcon this is a custom
+  IOC with action *Allow*. Each release has a new hash.
+- **By signer:** once releases are signed, allow the signing certificate
+  instead, so updates keep working (AppLocker or WDAC publisher rules, or an
+  EDR certificate exclusion).
+- **By path:** if policy allows, place the verified binary in a fixed
+  location (for example `C:\Program Files\buildwithnexus\buildwithnexus.exe`)
+  and set `BWN_BIN` to it, so nothing is downloaded to the user profile.
+
+A request an employee can send to their IT team:
+
+```text
+Please review and allowlist buildwithnexus <version>, an open-source (MIT)
+coding CLI.
+- File: buildwithnexus-x86_64-pc-windows-msvc.exe (installed as buildwithnexus.exe)
+- SHA-256: <from the .sha256 file in the release>
+- Source and release: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v<version>
+- Provenance: gh attestation verify <file> --repo Garretts-Apps/buildwithnexus
+- SBOM: buildwithnexus.cdx.json in the same release
+- What it does: https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#for-it-and-security-teams
+```
+
+## Code Signing Policy
+
+Windows release binaries are to be Authenticode-signed through
+[SignPath.io](https://signpath.io), with a free code-signing certificate
+from the [SignPath Foundation](https://signpath.org) for open-source
+projects. Signing is being set up; until it is active, releases ship
+unsigned and are verified with their checksum and attestation instead.
+
+- Only binaries built by `.github/workflows/release.yml` from this
+  repository's `main` branch are submitted for signing, and each signing
+  request is approved by hand.
+- Committers and reviewers: [@geaglin](https://github.com/geaglin).
+  Approver: [@geaglin](https://github.com/geaglin).
+- Signed binaries are built only from this repository's source and
+  third-party crates listed in the release SBOM.
+- Privacy: see *What it does when it runs* above. The program sends nothing
+  to the project; it talks only to the services the user configures, and
+  to the npm registry for the update check unless that is turned off.
+
 ## Auto-updates
 
 Update behavior is controlled by the `auto_update` setting in

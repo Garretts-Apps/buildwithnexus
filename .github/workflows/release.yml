@@ -150,6 +150,7 @@ jobs:
       contents: write       # upload release assets
       id-token: write       # build provenance attestation
       attestations: write
+      actions: read         # SignPath reads this job and its artifact
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +194,8 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Stage asset + checksum
+      - name: Stage asset
+        id: stage
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -203,8 +205,78 @@ jobs:
           [[ ! -f "$src" ]] && src="harness/target/$TARGET/release/buildwithnexus${ext}"
           asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
-          if command -v sha256sum >/dev/null; then sha256sum "$asset" > "$asset.sha256";
-          else shasum -a 256 "$asset" > "$asset.sha256"; fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      # IT teams and security tools read these fields; an .exe without them
+      # looks anonymous. harness/build.rs embeds them, and only warns if it
+      # can't, so check here that the release binary really has them.
+      - name: Check the Windows version resource
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+        run: |
+          $v = (Get-Item $env:ASSET).VersionInfo
+          $v | Format-List ProductName, CompanyName, FileDescription, ProductVersion, OriginalFilename
+          if ($v.ProductName -ne 'buildwithnexus' -or -not $v.ProductVersion) {
+            Write-Error "$env:ASSET has no version resource"
+            exit 1
+          }
+
+      # Authenticode signing through SignPath (free for open source projects
+      # via the SignPath Foundation). Off until the repository variable
+      # SIGNPATH_ORGANIZATION_ID and the secret SIGNPATH_API_TOKEN exist;
+      # until then the .exe ships unsigned, as before. Project and policy
+      # slugs default to "buildwithnexus" and "release-signing". Foundation
+      # signing waits for a maintainer to approve the request in SignPath,
+      # hence the long timeout.
+      - name: Upload the unsigned exe for signing
+        id: unsigned
+        if: contains(matrix.target, 'windows') && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: ${{ steps.stage.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign the exe (SignPath)
+        if: contains(matrix.target, 'windows') && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'buildwithnexus' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+
+      - name: Use the signed exe
+        if: contains(matrix.target, 'windows') && vars.SIGNPATH_ORGANIZATION_ID != ''
+        shell: pwsh
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+        run: |
+          Copy-Item "signed/$env:ASSET" $env:ASSET -Force
+          $sig = Get-AuthenticodeSignature $env:ASSET
+          $sig | Format-List Status, StatusMessage
+          $sig.SignerCertificate | Format-List Subject, Issuer, NotAfter
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "$env:ASSET signature is $($sig.Status)"
+            exit 1
+          }
+
+      # Checksum last, so it covers the signed file.
+      - name: Checksum
+        shell: bash
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+        run: |
+          if command -v sha256sum >/dev/null; then sha256sum "$ASSET" > "$ASSET.sha256";
+          else shasum -a 256 "$ASSET" > "$ASSET.sha256"; fi
+          cat "$ASSET.sha256"
 
       - name: Check the glibc floor
         if: contains(matrix.target, 'linux')
@@ -221,7 +293,7 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: buildwithnexus-${{ matrix.target }}${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+          subject-path: ${{ steps.stage.outputs.asset }}
 
       # Asset upload only — the `release` job created the release and owns
       # the body (softprops leaves unspecified fields untouched).
@@ -231,6 +303,37 @@ jobs:
           tag_name: ${{ needs.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: buildwithnexus-${{ matrix.target }}*
+
+  # CycloneDX SBOM of every crate compiled into the binary, for teams that
+  # review third-party software before allowing it.
+  sbom:
+    needs: [gate, release]
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # upload the release asset
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
+
+      - name: Generate the SBOM
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --manifest-path harness/Cargo.toml -f json --target all \
+            --override-filename buildwithnexus.cdx
+          mv harness/buildwithnexus.cdx.json buildwithnexus.cdx.json
+
+      - name: Upload the SBOM to the release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: buildwithnexus.cdx.json
 
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
   # Publishing refuses OIDC tokens for workflow_run-triggered jobs, and
