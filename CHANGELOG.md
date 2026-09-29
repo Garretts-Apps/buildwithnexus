@@ -4,7 +4,10 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.2] - 2026-09-29
+
+The "first hour" release: fixes from walking the first run, the TUI and
+headless runs as a new user would.
 
 ### Fixed
 - **Headless first run no longer hangs on setup.** With no settings file and
