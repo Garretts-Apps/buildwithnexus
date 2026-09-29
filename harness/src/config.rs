@@ -349,39 +349,82 @@ pub fn project_key(cwd: &std::path::Path) -> String {
 
 /// Tools approved with "always allow" for this project only.
 pub fn load_project_allowed(cwd: &std::path::Path) -> Vec<String> {
-    load_settings()
+    load_user_settings()
         .and_then(|s| s.project_allowed.get(&project_key(cwd)).cloned())
         .unwrap_or_default()
 }
 
 /// Persist an "always allow" answer for `tool` scoped to this project.
+// Edits the user file in place: saving the merged settings would copy the
+// project's own settings into the user's global file.
 pub fn add_project_allowed(cwd: &std::path::Path, tool: &str) {
-    if tool.is_empty() {
+    // No user settings yet: writing one here would hide first-run setup.
+    if tool.is_empty() || !load_layers(None).0.any_present {
         return;
     }
-    let Some(mut s) = load_settings() else {
-        return;
-    };
-    let list = s.project_allowed.entry(project_key(cwd)).or_default();
-    if !list.iter().any(|t| t == tool) {
-        list.push(tool.to_string());
-        save_settings(&s);
-    }
+    let key = project_key(cwd);
+    let _ = update_settings_json(|obj| {
+        let map = obj
+            .entry("project_allowed")
+            .or_insert_with(|| serde_json::json!({}));
+        if !map.is_object() {
+            *map = serde_json::json!({});
+        }
+        let list = map
+            .as_object_mut()
+            .expect("object")
+            .entry(key)
+            .or_insert_with(|| serde_json::json!([]));
+        if !list.is_array() {
+            *list = serde_json::json!([]);
+        }
+        let list = list.as_array_mut().expect("array");
+        if !list.iter().any(|t| t.as_str() == Some(tool)) {
+            list.push(tool.into());
+        }
+    });
 }
 
 /// Drop every per-project "always allow" entry for this project. Returns how
 /// many entries were cleared.
 pub fn reset_project_allowed(cwd: &std::path::Path) -> usize {
-    let Some(mut s) = load_settings() else {
+    if !load_layers(None).0.any_present {
         return 0;
-    };
-    match s.project_allowed.remove(&project_key(cwd)) {
-        Some(list) => {
-            save_settings(&s);
-            list.len()
-        }
-        None => 0,
     }
+    let key = project_key(cwd);
+    let mut n = 0;
+    let _ = update_settings_json(|obj| {
+        if let Some(map) = obj
+            .get_mut("project_allowed")
+            .and_then(|m| m.as_object_mut())
+        {
+            n = map
+                .remove(&key)
+                .and_then(|l| l.as_array().map(Vec::len))
+                .unwrap_or(0);
+            if map.is_empty() {
+                obj.remove("project_allowed");
+            }
+        }
+    });
+    n
+}
+
+/// Sets (`Some`) or removes (`None`) top-level keys in the user settings
+/// file, leaving every other key as it is on disk.
+pub fn save_user_settings(changes: &[(&str, Option<serde_json::Value>)]) -> Result<(), String> {
+    update_settings_json(|obj| {
+        for (k, v) in changes {
+            match v {
+                Some(v) => {
+                    obj.insert(k.to_string(), v.clone());
+                }
+                None => {
+                    obj.remove(*k);
+                }
+            }
+        }
+    })
 }
 
 pub fn home() -> PathBuf {
@@ -1374,51 +1417,191 @@ pub fn load_settings_diag() -> SettingsLoad {
 }
 
 pub fn load_settings_from_dir_diag(workdir: &std::path::Path) -> SettingsLoad {
-    let dot = workdir.join(".buildwithnexus");
-    let paths = [
+    load_layers(Some(workdir)).0
+}
+
+/// Settings from the user-level files only (home config.json, settings.json,
+/// settings.local.json): what persistence code starts from, so a project
+/// file's values are never written back into the user's own settings.
+pub fn load_user_settings() -> Option<Settings> {
+    load_layers(None).0.settings
+}
+
+/// Project settings files, in merge order.
+pub const PROJECT_SETTINGS_FILES: [&str; 2] = ["settings.json", "settings.local.json"];
+
+// A cloned repository may set these without the user's consent: none of them
+// can run code, redirect the API key, or widen what the agent may do.
+const HARMLESS_PROJECT_KEYS: &[&str] = &[
+    "model",
+    "reasoning_effort",
+    "temperature",
+    "max_tokens",
+    "context_tokens",
+    "instruction_files",
+    "images",
+    "notify",
+];
+
+/// A project settings file the user hasn't trusted, with the keys that were
+/// ignored because of it.
+pub struct UntrustedProjectFile {
+    pub name: &'static str,
+    pub text: String,
+    pub keys: Vec<String>,
+}
+
+/// Project settings files under `workdir` whose security-relevant keys are
+/// being ignored until the user trusts them.
+pub fn untrusted_project_files(workdir: &Path) -> Vec<UntrustedProjectFile> {
+    load_layers(Some(workdir)).1
+}
+
+fn permission_rank(v: &serde_json::Value) -> Option<u8> {
+    let p = crate::agent::permission(v.as_str()?);
+    Some(match crate::agent::permission_name(p) {
+        "auto" => 0,
+        "ask" => 1,
+        _ => 2,
+    })
+}
+
+fn sandbox_rank(v: &serde_json::Value) -> Option<u8> {
+    match v.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(0),
+        "auto" => Some(1),
+        "require" => Some(2),
+        _ => None,
+    }
+}
+
+fn positive(v: Option<&serde_json::Value>) -> Option<f64> {
+    v.and_then(|v| v.as_f64()).filter(|b| *b > 0.0)
+}
+
+// Splits an untrusted project file into what it may apply on top of `base`
+// (harmless keys, and permission/sandbox/budget only when they tighten) and
+// the names of the keys that need the user's trust.
+fn untrusted_view(
+    base: &serde_json::Map<String, serde_json::Value>,
+    proj: serde_json::Map<String, serde_json::Value>,
+) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let mut keep = serde_json::Map::new();
+    let mut ignored = Vec::new();
+    for (k, v) in proj {
+        // An empty hooks block runs nothing, so it isn't worth a prompt.
+        if k == "hooks" && v.as_object().is_none_or(|m| m.is_empty()) {
+            continue;
+        }
+        let safe = match k.as_str() {
+            k if HARMLESS_PROJECT_KEYS.contains(&k) => true,
+            "permission" => {
+                let cur = base.get(&k).and_then(permission_rank).unwrap_or(1);
+                permission_rank(&v).is_some_and(|r| r >= cur)
+            }
+            "sandbox" => {
+                let cur = base.get(&k).and_then(sandbox_rank).unwrap_or(0);
+                sandbox_rank(&v).is_some_and(|r| r >= cur)
+            }
+            "max_budget_usd" => match (positive(Some(&v)), positive(base.get(&k))) {
+                (Some(new), Some(cur)) => new <= cur,
+                (Some(_), None) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if safe {
+            keep.insert(k, v);
+        } else {
+            ignored.push(k);
+        }
+    }
+    (keep, ignored)
+}
+
+// `workdir: None` loads the user-level files only.
+fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFile>) {
+    let user_paths = [
         home().join("config.json"), // legacy base
         settings_path(),
         home().join("settings.local.json"),
-        dot.join("settings.json"),
-        dot.join("settings.local.json"),
     ];
 
-    let mut sources = Vec::new();
+    let mut merged = serde_json::Map::new();
+    let mut any_source = false;
     let mut issues = Vec::new();
     let mut any_present = false;
-    for p in &paths {
-        let Ok(text) = fs::read_to_string(p) else {
-            continue;
-        };
+    let mut untrusted = Vec::new();
+
+    let mut read = |p: &Path, issues: &mut Vec<SettingsIssue>| {
+        let text = fs::read_to_string(p).ok()?;
         any_present = true;
         // serde_json's Display includes line and column — keep it verbatim.
         match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(val) if val.is_object() => sources.push(val),
-            Ok(_) => issues.push(SettingsIssue {
-                source: p.display().to_string(),
-                error: "top level must be a JSON object — file ignored".into(),
-            }),
-            Err(e) => issues.push(SettingsIssue {
-                source: p.display().to_string(),
-                error: format!("{e} — file ignored"),
-            }),
+            Ok(serde_json::Value::Object(m)) => Some((text, m)),
+            Ok(_) => {
+                issues.push(SettingsIssue {
+                    source: p.display().to_string(),
+                    error: "top level must be a JSON object — file ignored".into(),
+                });
+                None
+            }
+            Err(e) => {
+                issues.push(SettingsIssue {
+                    source: p.display().to_string(),
+                    error: format!("{e} — file ignored"),
+                });
+                None
+            }
+        }
+    };
+
+    for p in &user_paths {
+        if let Some((_, m)) = read(p, &mut issues) {
+            any_source = true;
+            merge_objects(&mut merged, m);
+        }
+    }
+    // A project may add MCP servers once trusted, but never edit one the
+    // user defined: that entry can carry the user's own tokens in `env`.
+    let home_servers: HashSet<String> = merged
+        .get("mcp_servers")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+
+    if let Some(workdir) = workdir {
+        let dot = workdir.join(".buildwithnexus");
+        for name in PROJECT_SETTINGS_FILES {
+            let Some((text, mut m)) = read(&dot.join(name), &mut issues) else {
+                continue;
+            };
+            any_source = true;
+            if crate::hooks::project_file_trusted(workdir, name, &text) {
+                if let Some(serde_json::Value::Object(servers)) = m.get_mut("mcp_servers") {
+                    servers.retain(|n, _| !home_servers.contains(n));
+                }
+                merge_objects(&mut merged, m);
+            } else {
+                let (keep, keys) = untrusted_view(&merged, m);
+                merge_objects(&mut merged, keep);
+                if !keys.is_empty() {
+                    untrusted.push(UntrustedProjectFile { name, text, keys });
+                }
+            }
         }
     }
 
-    if sources.is_empty() {
-        return SettingsLoad {
+    if !any_source {
+        let load = SettingsLoad {
             settings: None,
             issues,
             any_present,
         };
+        return (load, untrusted);
     }
 
-    let mut merged = sources.remove(0);
-    for source in sources {
-        merge_json_values(&mut merged, source);
-    }
-
-    match serde_json::from_value(merged) {
+    let load = match serde_json::from_value(serde_json::Value::Object(merged)) {
         Ok(s) => SettingsLoad {
             settings: Some(s),
             issues,
@@ -1437,6 +1620,18 @@ pub fn load_settings_from_dir_diag(workdir: &std::path::Path) -> SettingsLoad {
                 any_present,
             }
         }
+    };
+    (load, untrusted)
+}
+
+fn merge_objects(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    source: serde_json::Map<String, serde_json::Value>,
+) {
+    let mut t = serde_json::Value::Object(std::mem::take(target));
+    merge_json_values(&mut t, serde_json::Value::Object(source));
+    if let serde_json::Value::Object(m) = t {
+        *target = m;
     }
 }
 
@@ -2126,11 +2321,21 @@ mod tests {
         )
         .unwrap();
 
+        // Untrusted: the harmless model and the tightened permission apply,
+        // project allowed_commands do not.
         let s = load_settings_from_dir(&proj).unwrap();
         assert_eq!(s.provider, "openai");
         assert_eq!(s.model, "gpt-4o-mini");
         assert_eq!(s.effort, "medium");
         assert_eq!(s.permission, "readonly");
+        assert_eq!(s.allowed_commands, vec!["git status"]);
+        let pending = untrusted_project_files(&proj);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].keys, ["allowed_commands"]);
+
+        crate::hooks::store_trust(&proj, &pending);
+        assert!(untrusted_project_files(&proj).is_empty());
+        let s = load_settings_from_dir(&proj).unwrap();
         assert_eq!(
             s.allowed_commands,
             vec!["git status", "cargo check", "cargo test"]
@@ -2139,6 +2344,108 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn untrusted_project_keys_only_tighten() {
+        let base = serde_json::json!({
+            "permission": "ask", "sandbox": "auto", "max_budget_usd": 5.0
+        });
+        let base = base.as_object().unwrap();
+        let view = |proj: serde_json::Value| {
+            let (keep, ignored) = untrusted_view(base, proj.as_object().unwrap().clone());
+            let mut kept: Vec<String> = keep.keys().cloned().collect();
+            kept.sort();
+            (kept, ignored)
+        };
+        let (kept, ignored) = view(serde_json::json!({
+            "model": "m", "permission": "auto", "sandbox": "off", "max_budget_usd": 9.0,
+            "base_url": "https://evil.example", "provider": "openai",
+            "mcp_servers": {}, "hooks": {"Stop": []}, "sandbox_network": true
+        }));
+        assert_eq!(kept, ["model"]);
+        assert_eq!(ignored.len(), 8);
+        let (kept, ignored) = view(serde_json::json!({"hooks": {}}));
+        assert!(kept.is_empty() && ignored.is_empty());
+
+        let (kept, ignored) = view(serde_json::json!({
+            "permission": "readonly", "sandbox": "require", "max_budget_usd": 1.0
+        }));
+        assert_eq!(kept, ["max_budget_usd", "permission", "sandbox"]);
+        assert!(ignored.is_empty());
+
+        // Unknown values and "no limit" budgets never pass as tightening.
+        let (kept, _) = view(serde_json::json!({"sandbox": "bogus", "max_budget_usd": 0}));
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn trusted_project_never_edits_home_mcp_servers() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"m","permission":"ask","mcp_servers":{"gh":{"command":"gh-mcp","env":{"T":"secret"}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            r#"{"mcp_servers":{"gh":{"command":"evil"},"lint":{"command":"lint-mcp"}}}"#,
+        )
+        .unwrap();
+
+        assert!(!load_settings_from_dir(&proj)
+            .unwrap()
+            .mcp_servers
+            .contains_key("lint"));
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        let s = load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.mcp_servers["gh"]["command"], "gh-mcp");
+        assert_eq!(s.mcp_servers["lint"]["command"], "lint-mcp");
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn persistence_writes_only_the_user_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","model":"m","permission":"ask","x_unknown":1}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            r#"{"model":"proj-model","allowed_commands":["rm"],"permission":"readonly"}"#,
+        )
+        .unwrap();
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        add_project_allowed(&proj, "npm");
+        save_user_settings(&[("reasoning_effort", Some("high".into()))]).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(h.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(v["x_unknown"], 1);
+        assert_eq!(v["reasoning_effort"], "high");
+        assert_eq!(v["project_allowed"][project_key(&proj)][0], "npm");
+        assert_eq!(v["model"], "m");
+        assert_eq!(v["permission"], "ask");
+        assert!(v.get("allowed_commands").is_none());
+        assert_eq!(load_project_allowed(&proj), ["npm"]);
+        assert_eq!(reset_project_allowed(&proj), 1);
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
     }
 
     #[test]
