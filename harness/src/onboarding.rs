@@ -148,7 +148,14 @@ pub fn run() -> Option<Settings> {
         } else if pick.id == "ollama" {
             provider::ollama_models(base_url.as_deref().unwrap_or(pick.base_url))
         } else {
-            local::scan_gguf()
+            // Ask the running server first; GGUF files on disk are only a
+            // hint for a server that is not up yet.
+            let served = provider::openai_models(base_url.as_deref().unwrap_or(pick.base_url));
+            if served.is_empty() {
+                local::scan_gguf()
+            } else {
+                served
+            }
         };
         tui::line("");
         if found.is_empty() {

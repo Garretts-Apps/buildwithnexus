@@ -206,10 +206,21 @@ pub fn run() {
             agent::run_brainstorm(p, perm, &cwd, &rest()).map(|_| ())
         }),
         "sessions" => {
-            for s in session::list() {
+            let all = session::list();
+            if all.is_empty() {
+                // Empty output reads as "broken"; say why the list is empty.
+                println!("no saved sessions yet — BUILD sessions are saved as they run.");
+                return;
+            }
+            for s in &all {
                 let title: String = s.title.chars().take(48).collect();
                 println!("  {}  {:<48}  {}", s.id, title, s.cwd);
             }
+            println!();
+            println!(
+                "{}",
+                tui::dim("resume one:  buildwithnexus resume <id> <task>  ·  the latest:  buildwithnexus continue <task>")
+            );
         }
         "continue" | "-c" | "--continue" => {
             headless(&opts, |p, perm, cwd| match session::latest() {
@@ -577,10 +588,32 @@ fn headless(
     mcp::ensure_ready();
     report_mcp_notices();
 
+    // Nobody can answer an approval prompt here, so `ask` blocks every edit
+    // and command. Say so before the run, not after it looks successful.
+    let unattended = report::is_json() || !std::io::stdin().is_terminal();
+    if unattended && agent::permission_name(perm) == "ask" {
+        eprintln!(
+            "{}",
+            tui::yellow(
+                "buildwithnexus: no terminal to approve changes, so edits and commands will be blocked.\n  \
+                 Pass --permission-mode auto to allow them, or --permission-mode readonly to only read."
+            )
+        );
+    }
+
     let start_time = std::time::Instant::now();
-    let r = f(&provider, perm, cwd.clone());
+    let mut r = f(&provider, perm, cwd.clone());
     let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
+    let blocked = agent::blocked_without_terminal();
+    if r.is_ok() && blocked > 0 {
+        r = Err(format!(
+            "{blocked} change{} blocked for lack of approval; nothing was applied for {}. \
+             Re-run with --permission-mode auto to allow changes.",
+            if blocked == 1 { " was" } else { "s were" },
+            if blocked == 1 { "it" } else { "them" }
+        ));
+    }
 
     if !report::is_json() {
         println!();
@@ -593,7 +626,7 @@ fn headless(
 
     if let Err(e) = r {
         eprintln!("{}", tui::red(&e));
-        std::process::exit(1);
+        std::process::exit(if blocked > 0 { 3 } else { 1 });
     }
 }
 
@@ -774,6 +807,10 @@ fn repl(
         let mut t = task.trim();
         if t.is_empty() {
             continue;
+        }
+        // Someone typing "help" wants the command list, not a model's guess.
+        if t.eq_ignore_ascii_case("help") || t == "?" {
+            t = "/help";
         }
 
         // Shell passthrough: `!cmd` runs in the shell directly.
@@ -1505,6 +1542,10 @@ fn repl(
                     Ok(Some(agent::ModeHint::CycleMode)) => {
                         mode = mode.next();
                         tui::show_mode_change(mode_label(&mode));
+                        Ok(())
+                    }
+                    Ok(Some(agent::ModeHint::Handoff(line))) => {
+                        pending_prompt = Some(line);
                         Ok(())
                     }
                 },

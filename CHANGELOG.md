@@ -18,6 +18,36 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   In a non-interactive shell it now points to `bwn --bootstrap` first,
   instead of telling you to reinstall a platform package that may not be
   published.
+- **Slash commands typed after a BRAINSTORM answer run instead of going to
+  the model.** BRAINSTORM (the starting mode) kept its own follow-up prompt
+  open after each answer, so `/exit`, `/help`, `/model`, `/undo` and `!cmd`
+  typed there were sent to the model as questions, and `/exit` did not exit.
+  They now go to the main prompt.
+- **The footer no longer says "working · Esc to interrupt" while it waits
+  for you.** The spinner stayed up after every BRAINSTORM answer.
+- **Enter runs a command you typed in full.** With the autocomplete popup
+  open, `/mode build` + Enter inserted the highlighted suggestion and waited
+  for a second Enter.
+- **A local model server that is not running fails in about a second.** A
+  refused connection to localhost used to be retried 14 times over roughly
+  two minutes; it now stops after one retry and names the fix
+  (`ollama serve`, start LM Studio's server, or `/model` for a new address).
+- **Setup lists the models an OpenAI-compatible server offers.** For LM
+  Studio, llama.cpp and custom endpoints, setup asked for a model name and
+  suggested pulling Ollama models even when the server was running; it now
+  reads the server's `/models` first.
+- **Headless runs that could not apply changes no longer report success.**
+  With `--permission-mode ask` and no terminal, every edit and command is
+  blocked; the run now warns before it starts and exits with code 3 instead
+  of printing "done" and exiting 0.
+- **Piped output is plain text.** Colour codes are dropped when stdout is not
+  a terminal (CI logs, redirects); set `FORCE_COLOR=1` to keep them.
+- **PLAN and BRAINSTORM say why an edit was skipped.** The model and the
+  user saw "read-only mode: mutation skipped" even with `ask` permission; the
+  message now names the mode and how to leave it.
+- `help` or `?` on its own opens `/help`; `bwn sessions` says when there are
+  none and how to resume one; the footer drops the context gauge instead of
+  cutting it off on narrow terminals.
 
 ## [0.14.1] - 2026-09-24
 

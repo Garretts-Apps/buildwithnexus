@@ -1653,8 +1653,18 @@ fn confirm(label: &str) -> Option<String> {
     confirm_tool(label, "", Path::new("."))
 }
 
+/// Confirmations refused because nobody was there to answer them. Headless
+/// runs fail instead of reporting "done" when this is non-zero.
+static BLOCKED_WITHOUT_TERMINAL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn blocked_without_terminal() -> usize {
+    BLOCKED_WITHOUT_TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
+        BLOCKED_WITHOUT_TERMINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some(format!(
             "blocked (no interactive terminal to confirm: {label})"
         ));
@@ -1700,6 +1710,19 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
 // Permission gate — returns Some(reason) when blocked.
 // Read operations outside CWD are allowed in all modes (no CWD confinement for
 // reads); the user specifically asked for full filesystem access.
+const READONLY_SKIP: &str = "read-only mode: mutation skipped";
+
+/// PLAN and BRAINSTORM gate as read-only whatever the session permission is,
+/// so "read-only mode" would name a setting the user never chose. Say which
+/// mode is read-only and how to get out of it instead.
+fn phase_readonly_reason(reason: String, phase_msg: &str) -> String {
+    if reason == READONLY_SKIP {
+        phase_msg.to_string()
+    } else {
+        reason
+    }
+}
+
 pub(crate) fn gate(
     perm: Permission,
     name: &str,
@@ -1725,7 +1748,7 @@ pub(crate) fn gate(
         let readonly_shell =
             tools::command_arg_for(name, input).is_some_and(tools::is_readonly_command);
         if !readonly_shell {
-            return Some("read-only mode: mutation skipped".into());
+            return Some(READONLY_SKIP.into());
         }
     }
 
@@ -3411,7 +3434,8 @@ pub fn run_plan(
             let reason = match hooks::pre_tool_use(&call.name, &call_input, cwd) {
                 PreDecision::Deny(r) => Some(r),
                 PreDecision::Allow => None,
-                PreDecision::Continue => gate(Permission::ReadOnly, &call.name, &call_input, cwd),
+                PreDecision::Continue => gate(Permission::ReadOnly, &call.name, &call_input, cwd)
+                    .map(|r| phase_readonly_reason(r, "planning is read-only: changes run in BUILD after you approve the plan")),
             };
             if let Some(reason) = reason {
                 trace::record_visible(
@@ -3591,7 +3615,9 @@ pub fn run_brainstorm(
     cwd: &Path,
     first: &str,
 ) -> Result<Option<ModeHint>, String> {
-    let _running_guard = AgentRunningGuard::new();
+    // Held only while the model works: the footer's "working · Esc to
+    // interrupt" must not stay up while the follow-up prompt waits on you.
+    let mut running = Some(AgentRunningGuard::new());
     hooks::set_permission_mode(permission_name(perm));
     // Role identity + mode contract come first; environment sections follow.
     let prefix = context_prefix(cwd, p.context_tokens);
@@ -3703,7 +3729,9 @@ pub fn run_brainstorm(
                     PreDecision::Allow => None,
                     // Read-only regardless of the session gate, like run_plan.
                     PreDecision::Continue => {
-                        gate(Permission::ReadOnly, &call.name, &call_input, cwd)
+                        gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
+                            phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
+                        })
                     }
                 };
                 if let Some(reason) = reason {
@@ -3782,6 +3810,8 @@ pub fn run_brainstorm(
         // The reply is complete — the agent stopped responding for this turn.
         hooks::notify("Stop", cwd);
 
+        drop(running.take());
+
         // Check for mode-transition suggestion embedded in the reply.
         let hint = if reply_text.contains("[SUGGEST:BUILD]") {
             Some(ModeHint::Build)
@@ -3796,7 +3826,7 @@ pub fn run_brainstorm(
             let suggestion = match h {
                 ModeHint::Build => "switch to BUILD mode and implement this?",
                 ModeHint::Plan => "switch to PLAN mode and break this down?",
-                ModeHint::CycleMode => "cycle to the next mode?",
+                ModeHint::CycleMode | ModeHint::Handoff(_) => "cycle to the next mode?",
             };
             tui::line(&tui::yellow(&format!("  ↪ AI suggests: {suggestion}")));
             tui::line(&tui::dim("  (y to switch, anything else to keep chatting)"));
@@ -3815,7 +3845,13 @@ pub fn run_brainstorm(
                 if t.is_empty() || t == "exit" || t == "done" {
                     return Ok(None);
                 }
+                // Commands belong to the REPL, not the model: /exit, /model,
+                // /undo and `!ls` typed here used to be sent as questions.
+                if t.starts_with('/') || t.starts_with('!') {
+                    return Ok(Some(ModeHint::Handoff(t.to_string())));
+                }
                 question = t.to_string();
+                running.get_or_insert_with(AgentRunningGuard::new);
             }
         }
     }
@@ -4001,6 +4037,9 @@ pub enum ModeHint {
     Build,
     Plan,
     CycleMode,
+    /// A slash command or `!shell` line typed at the follow-up prompt; the
+    /// REPL runs it as if it had been typed there.
+    Handoff(String),
 }
 
 #[cfg(test)]

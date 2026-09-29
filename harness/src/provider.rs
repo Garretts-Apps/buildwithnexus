@@ -185,6 +185,31 @@ pub fn ollama_models(base_url: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// Models a running OpenAI-compatible server offers (GET {base}/models): LM
+// Studio, llama.cpp, vLLM and friends. Empty on any failure.
+pub fn openai_models(base_url: &str) -> Vec<String> {
+    let resp = match agent()
+        .get(&format!("{}/models", base_url.trim_end_matches('/')))
+        .timeout(Duration::from_secs(2))
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let v: Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ── public entry points ────────────────────────────────────────────────────
 pub fn complete(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> Result<Reply, String> {
     let mut sink = |_: &str| {};
@@ -564,6 +589,13 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
                 ));
             }
             Err(e) => {
+                // Nothing is listening on a local port: retrying for two
+                // minutes will not start the server, so say what to do.
+                let refused_locally = is_local_url(req.url())
+                    && matches!(&e, ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ConnectionFailed);
+                if refused_locally && attempts >= 2 {
+                    return Err(local_server_down_msg(req.url()));
+                }
                 if attempts < max_attempts {
                     crate::report::info(&format!(
                         "  ⟳ connection error — retrying in {:.1}s ({attempts}/{})",
@@ -578,6 +610,19 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
             }
         }
     }
+}
+
+fn local_server_down_msg(url: &str) -> String {
+    // scheme://host:port only; the request path means nothing to the user.
+    let base = match url.find("://") {
+        Some(i) => url[i + 3..].find('/').map_or(url, |j| &url[..i + 3 + j]),
+        None => url,
+    };
+    format!(
+        "nothing is answering at {base} — is the model server running?\n  \
+         Ollama: `ollama serve` · LM Studio / llama.cpp: start its server\n  \
+         Wrong address? /model <name> or `buildwithnexus init` sets a new one."
+    )
 }
 
 // Retryable status codes: rate limits (429), Anthropic's overloaded (529), and
@@ -1805,6 +1850,14 @@ fn ollama_stream(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn local_server_down_msg_names_host_not_path() {
+        let m = local_server_down_msg("http://127.0.0.1:11434/v1/chat/completions");
+        assert!(m.contains("http://127.0.0.1:11434 "));
+        assert!(!m.contains("/v1/"));
+        assert!(m.contains("ollama serve"));
+    }
 
     type Captured = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
