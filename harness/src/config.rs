@@ -2492,8 +2492,13 @@ mod tests {
         fs::create_dir_all(&h).unwrap();
         std::env::set_var("NEXUS_HOME", &h);
         write(&h.join("AGENTS.md"), "global rules");
-        // The roles file must never be mistaken for an instruction file.
-        write(&h.join("Agents.md"), "## Engineer\nrole text");
+        // The roles file must never be mistaken for an instruction file. On a
+        // case-insensitive filesystem (macOS) it would overwrite AGENTS.md,
+        // so only write it where the two names are distinct files.
+        let case_sensitive = !h.join("agents.md").exists();
+        if case_sensitive {
+            write(&h.join("Agents.md"), "## Engineer\nrole text");
+        }
 
         let outer = unique_dir("instr");
         write(&outer.join("AGENTS.md"), "ABOVE THE GIT ROOT");
@@ -2505,7 +2510,9 @@ mod tests {
         let leaf = root.join("sub").join("leaf");
         write(&leaf.join("AGENTS.md"), "leaf agents");
         write(&leaf.join(".buildwithnexus").join("AGENTS.md"), "leaf dot");
-        write(&leaf.join(".buildwithnexus").join("Agents.md"), "## Roles");
+        if case_sensitive {
+            write(&leaf.join(".buildwithnexus").join("Agents.md"), "## Roles");
+        }
         write(&leaf.join("deeper").join("AGENTS.md"), "below cwd");
 
         let files = load_instructions_with(&leaf, &default_instruction_files());
@@ -2830,6 +2837,8 @@ mod tests {
         assert!(text.contains("## Build & test") && text.contains("## Do not"));
         assert!(create_starter_agents_md(&d).is_err());
         let files = load_instructions_with(&d, &default_instruction_files());
+        // Paths come back canonical (/var is /private/var on macOS).
+        let p = p.canonicalize().unwrap();
         assert!(files.iter().any(|f| f.path == p));
         let _ = fs::remove_dir_all(&d);
     }
