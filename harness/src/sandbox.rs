@@ -162,11 +162,7 @@ fn detect() -> Result<Backend, String> {
             Backend::SandboxExec,
         )
     } else if cfg!(target_os = "linux") {
-        (
-            "bwrap",
-            bwrap_args("true", Path::new("/"), true),
-            Backend::Bwrap,
-        )
+        ("bwrap", bwrap_probe_args(), Backend::Bwrap)
     } else {
         return Err("no sandbox backend on this platform".into());
     };
@@ -200,12 +196,31 @@ fn detect() -> Result<Backend, String> {
 /// read-only — checkpoints are written in-process, never by the child — and
 /// so do the workspace's `.git` and `.buildwithnexus`, where a planted hook or
 /// settings file would run later outside the sandbox.
+///
+/// A protected entry that does not exist yet gets a read-only empty tmpfs at
+/// its path, so the command cannot create it either (a new `.git/config`
+/// with `core.fsmonitor` would run on the next git call). bwrap leaves an
+/// empty directory behind as the mount point. It is not removed afterwards:
+/// a background server may still be using it, and git ignores an empty
+/// `.git` directory.
 pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
-    let protected: Vec<String> = PROTECTED_IN_WORKSPACE
+    bwrap_argv(cmd, cwd, network, true)
+}
+
+// The availability probe runs at `/` and must not mount anything there.
+fn bwrap_probe_args() -> Vec<String> {
+    bwrap_argv("true", Path::new("/"), true, false)
+}
+
+fn bwrap_argv(cmd: &str, cwd: &Path, network: bool, protect: bool) -> Vec<String> {
+    let protected: Vec<(String, bool)> = PROTECTED_IN_WORKSPACE
         .iter()
+        .filter(|_| protect)
         .map(|d| cwd.join(d))
-        .filter(|p| p.exists())
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            let exists = p.symlink_metadata().is_ok();
+            (p.to_string_lossy().into_owned(), exists)
+        })
         .collect();
     let cwd = cwd.to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["--unshare-all".into()];
@@ -236,8 +251,17 @@ pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
         ]
         .map(str::to_string),
     );
-    for p in &protected {
-        a.extend(["--ro-bind".to_string(), p.clone(), p.clone()]);
+    for (p, exists) in &protected {
+        if *exists {
+            a.extend(["--ro-bind".to_string(), p.clone(), p.clone()]);
+        } else {
+            a.extend([
+                "--tmpfs".to_string(),
+                p.clone(),
+                "--remount-ro".to_string(),
+                p.clone(),
+            ]);
+        }
     }
     a.extend(["--chdir", &cwd, "--", "sh", "-c", cmd].map(str::to_string));
     a
@@ -473,7 +497,8 @@ mod tests {
         assert!(s.starts_with("--unshare-all --share-net --die-with-parent --new-session "));
         assert!(s.contains("--ro-bind / /"));
         assert!(s.contains("--tmpfs /tmp"));
-        assert!(s.contains("--bind /work/proj /work/proj --chdir /work/proj"));
+        assert!(s.contains("--bind /work/proj /work/proj --tmpfs /work/proj/.git"));
+        assert!(s.contains("--remount-ro /work/proj/.buildwithnexus --chdir /work/proj"));
         // Exactly one read-write bind, and it is the workspace.
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 1);
         assert_eq!(&a[a.len() - 4..], ["--", "sh", "-c", "echo hi"]);
@@ -504,10 +529,16 @@ mod tests {
         assert!(at(&rw) < at(&git) && at(&rw) < at(&bwn));
         assert!(at(&git) < at("--chdir"));
         let _ = std::fs::remove_dir_all(&ws);
-        // Absent entries are not bound (bwrap would fail on a missing source).
-        assert!(!bwrap_args("true", Path::new("/work/none"), true)
-            .join(" ")
-            .contains(".git"));
+        // Absent entries get a read-only tmpfs instead, so they cannot be
+        // created from inside the sandbox.
+        let absent = bwrap_args("true", Path::new("/work/none"), true).join(" ");
+        assert!(
+            absent.contains("--tmpfs /work/none/.git --remount-ro /work/none/.git"),
+            "{absent}"
+        );
+        assert!(absent.contains(
+            "--tmpfs /work/none/.buildwithnexus --remount-ro /work/none/.buildwithnexus"
+        ));
     }
 
     #[test]
@@ -577,7 +608,7 @@ mod tests {
             return;
         }
         let probe = Command::new("bwrap")
-            .args(bwrap_args("true", Path::new("/"), true))
+            .args(bwrap_probe_args())
             .stdin(Stdio::null())
             .output();
         match probe {

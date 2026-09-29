@@ -15,6 +15,28 @@ use crate::provider::Provider;
 // Whether the active model can accept image parts. Attachments are gated on
 // this: sending images to a text-only model either errors or silently drops
 // them, both worse than telling the user up front.
+/// How every ffmpeg/ffprobe call names its input: an absolute `file:` URL
+/// with only the file protocol allowed. A repo file named
+/// `http:/169.254.169.254/x.png` (or a playlist posing as an image) must not
+/// make ffmpeg reach the network.
+// Writes a new temp file, refusing to follow or reuse anything already at
+// `dest` (a symlink planted in a shared /tmp).
+fn write_new(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?
+        .write_all(bytes)
+}
+
+pub(crate) fn ffmpeg_input(path: &Path) -> [std::ffi::OsString; 3] {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut url = std::ffi::OsString::from("file:");
+    url.push(abs.as_os_str());
+    ["-protocol_whitelist".into(), "file".into(), url]
+}
+
 pub fn model_supports_vision(p: &Provider) -> bool {
     let m = p.model.to_lowercase();
     match p.protocol {
@@ -114,7 +136,7 @@ fn ffprobe(path: &Path) -> Option<Probe> {
             "-of",
             "json",
         ])
-        .arg(path)
+        .args(ffmpeg_input(path))
         .output()
         .ok()?;
     if !out.status.success() {
@@ -165,13 +187,18 @@ pub fn attach_video(path: &Path) -> Option<VideoAttachment> {
     let probe = ffprobe(path)?;
     let dir =
         std::env::temp_dir().join(format!("bwn-frames-{}-{}", std::process::id(), temp_seq()));
-    std::fs::create_dir_all(&dir).ok()?;
+    // create_dir, not create_dir_all: a directory someone else planted at
+    // this predictable name in a shared /tmp must not be reused.
+    std::fs::create_dir(&dir).ok()?;
     // Evenly sample across the whole clip. For very short clips the fps
     // filter simply yields fewer frames, which is fine.
     let sample_fps = MAX_VIDEO_FRAMES as f64 / probe.duration_secs.max(0.5);
     let status = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args(["-v", "error"])
+        .args({
+            let [w, f, url] = ffmpeg_input(path);
+            [w, f, "-i".into(), url]
+        })
         .args([
             "-vf",
             &format!("fps={sample_fps:.6},scale='min(768,iw)':-2"),
@@ -231,7 +258,7 @@ pub fn probe_dims(path: &Path) -> Option<(u32, u32)> {
             "-of",
             "json",
         ])
-        .arg(path)
+        .args(ffmpeg_input(path))
         .output()
         .ok()?;
     if !out.status.success() {
@@ -255,8 +282,11 @@ pub fn decode_thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<(u32, u32
     // Even height: half-block cells show two rows of pixels per text line.
     let h = (((ih as f64 * scale) as u32).max(2) / 2) * 2;
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args(["-v", "error"])
+        .args({
+            let [w, f, url] = ffmpeg_input(path);
+            [w, f, "-i".into(), url]
+        })
         .args([
             "-frames:v",
             "1",
@@ -313,8 +343,11 @@ pub fn png_for_terminal(path: &Path, max_w: u32) -> Option<(Vec<u8>, u32, u32)> 
         return None;
     }
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
+        .args(["-v", "error"])
+        .args({
+            let [w, f, url] = ffmpeg_input(path);
+            [w, f, "-i".into(), url]
+        })
         .args([
             "-frames:v",
             "1",
@@ -375,7 +408,7 @@ pub fn clipboard_image_to_temp() -> Option<PathBuf> {
                     .output()
                 {
                     if o.status.success() && !o.stdout.is_empty() {
-                        std::fs::write(&dest, &o.stdout).ok()?;
+                        write_new(&dest, &o.stdout).ok()?;
                         return Some(dest);
                     }
                 }
@@ -394,7 +427,7 @@ pub fn clipboard_image_to_temp() -> Option<PathBuf> {
                     .output()
                 {
                     if o.status.success() && !o.stdout.is_empty() {
-                        std::fs::write(&dest, &o.stdout).ok()?;
+                        write_new(&dest, &o.stdout).ok()?;
                         return Some(dest);
                     }
                 }
@@ -439,7 +472,7 @@ pub fn clipboard_image_to_temp() -> Option<PathBuf> {
             let b64 = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if o.status.success() && !b64.is_empty() {
                 if let Some(bytes) = b64_decode(&b64) {
-                    std::fs::write(&dest, bytes).ok()?;
+                    write_new(&dest, &bytes).ok()?;
                     return Some(dest);
                 }
             }

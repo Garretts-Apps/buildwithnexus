@@ -94,7 +94,8 @@ pub fn record_visible(kind: &str, title: impl Into<String>, detail: Value) -> u6
                 "  {} {} {}",
                 tui::dim("•"),
                 tui::accent(kind),
-                tui::dim(&title)
+                // Titles embed tool args, paths and hook names.
+                tui::dim(&tui::sanitize_terminal(&title))
             ));
         }
     }
@@ -130,7 +131,7 @@ pub fn render_list(limit: usize) {
             "  {} {:<14} {}",
             tui::bold(&format!("#{}", e.id)),
             e.kind,
-            e.title
+            tui::sanitize_terminal(&e.title)
         ));
     }
     tui::line(&tui::dim("  use /trace <id> to inspect event details"));
@@ -145,16 +146,20 @@ pub fn render_detail(id: u64) {
         "  {} {} {}",
         tui::bold(&format!("#{}", e.id)),
         tui::accent(&e.kind),
-        e.title
+        tui::sanitize_terminal(&e.title)
     ));
     tui::line(&tui::dim(&format!("  created_ms: {}", e.created_ms)));
+    // JSON escapes C0 controls but leaves bidi/format chars raw.
     match serde_json::to_string_pretty(&e.detail) {
         Ok(s) => {
-            for l in s.lines() {
+            for l in tui::sanitize_terminal(&s).lines() {
                 tui::line(&format!("  {l}"));
             }
         }
-        Err(_) => tui::line(&format!("  {}", e.detail)),
+        Err(_) => tui::line(&format!(
+            "  {}",
+            tui::sanitize_terminal(&e.detail.to_string())
+        )),
     }
 }
 

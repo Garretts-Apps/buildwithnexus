@@ -61,6 +61,15 @@ function download(url, dest) {
   });
 }
 
+function pinnedChecksum(asset) {
+  try {
+    const sums = JSON.parse(fs.readFileSync(path.join(ROOT, 'checksums.json'), 'utf8'));
+    return typeof sums[asset] === 'string' ? sums[asset] : null;
+  } catch {
+    return null;
+  }
+}
+
 function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
@@ -76,8 +85,13 @@ async function obtain() {
     const tmp = installedBinary() + '.download';
     try {
       log('buildwithnexus: downloading prebuilt binary…');
-      // Fetch the expected hash first; refuse to install anything that doesn't match.
-      const expected = (await fetchText(`${base}/${asset}.sha256`)).trim().split(/\s+/)[0];
+      // The expected hash comes from checksums.json in this npm package:
+      // publish.yml writes it only after checking each binary's build
+      // attestation, and the tarball cannot change after publishing. Release
+      // assets can, so the release's own .sha256 is only a fallback for
+      // checkouts that have no checksums.json.
+      const expected = pinnedChecksum(asset) ??
+        (await fetchText(`${base}/${asset}.sha256`)).trim().split(/\s+/)[0];
       if (!/^[0-9a-f]{64}$/i.test(expected || '')) throw new Error('missing/invalid checksum');
       await download(`${base}/${asset}`, tmp);
       const got = sha256(tmp);
@@ -108,7 +122,7 @@ function walkthrough(ok) {
     log('  \x1b[33mbuildwithnexus: native binary not available yet.\x1b[0m');
     log('  Build from source: git clone https://github.com/Garretts-Apps/buildwithnexus');
     log('  then: cargo build --release --manifest-path harness/Cargo.toml');
-    log('  and point BWN_BIN at the built binary.');
+    log('  and point BWN_BIN at the built binary (an absolute path).');
   }
   log('');
 }

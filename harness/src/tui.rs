@@ -2677,26 +2677,48 @@ fn is_unsafe_control(c: char) -> bool {
     c != '\n' && c != '\t' && c.is_control()
 }
 
+// Bidi overrides/isolates and zero-width format chars render invisibly but
+// can reorder or hide what the user reads (Trojan Source style spoofing).
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{FEFF}'
+            | '\u{061C}'
+    )
+}
+
 /// Neutralizes terminal control sequences in untrusted text (model output,
 /// tool output, model-supplied paths) before the harness styles it: ESC shows
 /// as a visible `␛`, every other C0 (except `\n` and `\t`), DEL and C1 char
-/// is dropped. Apply where text enters, never to already-styled strings.
+/// is dropped, and bidi/invisible format chars show as `<U+XXXX>`. Apply
+/// where text enters, never to already-styled strings.
 pub fn sanitize_terminal(s: &str) -> std::borrow::Cow<'_, str> {
     // Fast path for the streaming hot loop: all unsafe chars are either a
-    // byte below 0x20, DEL, or a C1 char encoded as 0xC2 0x80..=0x9F.
+    // byte below 0x20, DEL, a C1 char encoded as 0xC2 0x80..=0x9F, or a
+    // format char whose UTF-8 lead byte is 0xE2 (U+2xxx), 0xD8 (U+061C) or
+    // 0xEF (U+FEFF).
+    if !s.bytes().any(|b| {
+        (b < 0x20 && b != b'\n' && b != b'\t') || matches!(b, 0x7f | 0xc2 | 0xd8 | 0xe2 | 0xef)
+    }) {
+        return std::borrow::Cow::Borrowed(s);
+    }
     if !s
-        .bytes()
-        .any(|b| (b < 0x20 && b != b'\n' && b != b'\t') || b == 0x7f || b == 0xc2)
+        .chars()
+        .any(|c| is_unsafe_control(c) || is_invisible_format(c))
     {
         return std::borrow::Cow::Borrowed(s);
     }
-    if !s.chars().any(is_unsafe_control) {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         if c == '\x1b' {
             out.push('␛');
+        } else if is_invisible_format(c) {
+            out.push_str(&format!("<U+{:04X}>", c as u32));
         } else if !is_unsafe_control(c) {
             out.push(c);
         }
@@ -5055,8 +5077,9 @@ fn render_suggestions(sug: &[String], sel: usize) {
         let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
         let cand = &sug[idx];
         let padded = format!("{cand:<pad$}");
+        // Skill and command descriptions are read from project files.
         let desc = popup_desc(cand);
-        let desc = desc.as_str();
+        let desc = &*sanitize_terminal(&desc);
         let counter = if sug.len() > show && idx == sel {
             dim(&format!(" ({}/{})", sel + 1, sug.len()))
         } else {
@@ -5209,7 +5232,19 @@ fn history_search(hist: &[String], query: &str, skip: usize) -> Option<String> {
         .cloned()
 }
 
+// Candidates come from file names, skill folders and rule ids in the
+// checkout. One with escapes or bidi chars would be echoed raw by the popup
+// and then by the composer once completed, so it is never offered.
 fn completions(buf: &[char], start: usize, token: &str) -> Vec<String> {
+    drop_unsafe_candidates(completions_unfiltered(buf, start, token))
+}
+
+fn drop_unsafe_candidates(mut cands: Vec<String>) -> Vec<String> {
+    cands.retain(|c| matches!(sanitize_terminal(c), std::borrow::Cow::Borrowed(_)));
+    cands
+}
+
+fn completions_unfiltered(buf: &[char], start: usize, token: &str) -> Vec<String> {
     let at_line_start = buf[..start].iter().all(|c| c.is_whitespace());
     if at_line_start && token.starts_with('/') {
         let cmds = load_slash_commands();
@@ -6458,6 +6493,21 @@ mod tests {
     }
 
     #[test]
+    fn completion_skips_names_with_escapes_or_bidi() {
+        use std::fs;
+        let d = std::env::temp_dir().join(format!("bwn-comp-evil-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("ok.txt"), "").unwrap();
+        fs::write(d.join("o\x1b]0;pwned\x07.txt"), "").unwrap();
+        fs::write(d.join("o\u{202E}txt.exe"), "").unwrap();
+        let raw = path_candidates("o", &d);
+        assert_eq!(raw.len(), 3);
+        assert_eq!(drop_unsafe_candidates(raw), vec!["ok.txt".to_string()]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn no_color_strips_escapes() {
         assert_eq!(plain("\x1b[31mhi\x1b[0m"), "hi");
     }
@@ -7068,6 +7118,25 @@ mod tests {
         ));
         // Idempotent, so sanitizing at several entry points is harmless.
         assert_eq!(sanitize_terminal(&out), out);
+    }
+
+    #[test]
+    fn sanitize_terminal_marks_bidi_and_invisible_format_chars() {
+        let evil = "a\u{202E}b\u{2066}c\u{200B}d\u{2028}e\u{FEFF}f\u{061C}g\u{200F}";
+        let out = sanitize_terminal(evil);
+        assert_eq!(
+            out,
+            "a<U+202E>b<U+2066>c<U+200B>d<U+2028>e<U+FEFF>f<U+061C>g<U+200F>"
+        );
+        assert_eq!(sanitize_terminal(&out), out);
+        // Neighbours sharing a lead byte (Arabic, dashes, full-width forms)
+        // are untouched and stay borrowed.
+        for ok in ["\u{0627}\u{061B}", "\u{2014}\u{2026}\u{2070}", "\u{FF21}"] {
+            assert!(matches!(
+                sanitize_terminal(ok),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
     }
 
     #[test]

@@ -578,7 +578,9 @@ fn headless(
             ))
         );
         println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
+        // Skill names and paths come from files in the checkout.
         for note in config::startup_context_notices(&cwd) {
+            let note = tui::sanitize_terminal(&note);
             println!("{}", tui::dim(&format!("  {note}")));
         }
         println!();
@@ -715,7 +717,9 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    // Skill names and paths come from files in the checkout.
     for note in config::startup_context_notices(cwd) {
+        let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
     }
     let restored = workflow::restore();
@@ -767,6 +771,8 @@ fn repl(
         // MCP servers connect in the background after the first prompt; their
         // one-line outcomes surface here so they never interleave with a turn.
         for (msg, ok) in mcp::drain_notices() {
+            // Notices carry server names and error text from the server.
+            let msg = tui::sanitize_terminal(&msg);
             if ok {
                 tui::line(&tui::dim(&format!("  {msg}")));
             } else {
@@ -841,7 +847,8 @@ fn repl(
                     tui::line(&tui::dim("  [sandboxed]"));
                 }
                 let out = tools::run("run_command", &tool_input, cwd);
-                for l in out.content.lines() {
+                // Command output is arbitrary bytes; keep its escapes inert.
+                for l in tui::sanitize_terminal(&out.content).lines() {
                     tui::line(&tui::dim(&format!("  {l}")));
                 }
             }
@@ -1350,7 +1357,7 @@ fn repl(
                 continue;
             }
             "/verify" | "/audit" => {
-                handle_verify_audit(cwd);
+                handle_verify_audit(perm, cwd);
                 continue;
             }
             _ => {}
@@ -1420,7 +1427,7 @@ fn repl(
                         continue;
                     }
                     let out = tools::run("run_command", &tool_input, cwd);
-                    for l in out.content.lines() {
+                    for l in tui::sanitize_terminal(&out.content).lines() {
                         tui::line(&format!("  {l}"));
                     }
                 } else {
@@ -1909,14 +1916,15 @@ fn handle_tools() {
 
 fn handle_mcp(arg: &str) {
     let args = shlex::split(arg.trim()).unwrap_or_default();
+    // Server names, server_info and errors are server- or config-supplied.
     match mcp::manage(&args, true) {
         Ok(lines) => {
             for l in lines {
-                tui::line(&format!("  {l}"));
+                tui::line(&format!("  {}", tui::sanitize_terminal(&l)));
             }
         }
         Err(e) => {
-            tui::line(&tui::red(&format!("  {e}")));
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
             tui::bell();
         }
     }
@@ -2353,7 +2361,12 @@ fn swap_model(
                 "  ✗ Ollama is running but '{model}' isn't installed."
             )));
             let shown: Vec<&str> = installed.iter().take(8).map(String::as_str).collect();
-            tui::line(&tui::dim(&format!("    installed: {}", shown.join(", "))));
+            // Model names come from whatever answers on the Ollama port.
+            let shown = shown.join(", ");
+            tui::line(&tui::dim(&format!(
+                "    installed: {}",
+                tui::sanitize_terminal(&shown)
+            )));
             tui::line(&tui::dim(&format!(
                 "    pull it with  ollama pull {model}  — keeping the current model."
             )));
@@ -2576,7 +2589,7 @@ fn handle_local(_provider: &mut Provider) {
     if !ggufs.is_empty() {
         tui::line("  Local GGUF models found:");
         for m in ggufs {
-            tui::line(&format!("    - {}", tui::bold(&m)));
+            tui::line(&format!("    - {}", tui::bold(&tui::sanitize_terminal(&m))));
         }
     }
     tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
@@ -2829,7 +2842,15 @@ fn handle_kb_index(cwd: &std::path::Path) {
     }
 }
 
-fn handle_verify_audit(cwd: &std::path::Path) {
+/// Returns false when the permission gate or a PreToolUse hook refused the
+/// project checks (which run the project's own build/test commands).
+fn handle_verify_audit(perm: Permission, cwd: &std::path::Path) -> bool {
+    let check_input = serde_json::json!({});
+    if let Some(reason) = agent::hook_gate(perm, "check_work", &check_input, cwd) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&reason))));
+        tui::bell();
+        return false;
+    }
     tui::line(&tui::accent(
         "  verifying workspace against rules and tests",
     ));
@@ -2867,7 +2888,6 @@ fn handle_verify_audit(cwd: &std::path::Path) {
 
     // Actually run the project's checks (build/test/lint) and feed the
     // verdict into the verifier's tests dimension instead of inferring it.
-    let check_input = serde_json::json!({});
     let check = tools::run("check_work", &check_input, cwd);
     let tests_passed = if verify_check_had_nothing_to_run(&check.content) {
         None
@@ -2896,6 +2916,7 @@ fn handle_verify_audit(cwd: &std::path::Path) {
     tui::line(&tui::dim(
         "  tip: @rules:<id> or /rules inspects specific constraints",
     ));
+    true
 }
 
 // check_work found no project checks to run (or every checker was missing):
@@ -3555,6 +3576,7 @@ fn doctor_mcp_lines() -> Vec<String> {
                 }
             }
         })
+        .map(|l| tui::sanitize_terminal(&l).into_owned())
         .collect()
 }
 
@@ -3894,8 +3916,15 @@ fn extract_attachments(
                 .strip_prefix("url:")
                 .or_else(|| raw_path.strip_prefix("web:"))
             {
-                if let Ok(o) = std::process::Command::new("curl")
-                    .args(["-sL", "--max-time", "5", url])
+                // Only real web URLs, and `--` so a value like `-K file` or
+                // `file:///…` can't become curl options or a local read.
+                if !is_web_url(url) {
+                    tui::line(&tui::yellow(&format!(
+                        "  ⚠ @{} not fetched — only http:// and https:// URLs are attached",
+                        tui::sanitize_terminal(raw_path)
+                    )));
+                } else if let Ok(o) = std::process::Command::new("curl")
+                    .args(["-sL", "--max-time", "5", "--", url])
                     .output()
                 {
                     let web_text = String::from_utf8_lossy(&o.stdout);
@@ -3911,7 +3940,7 @@ fn extract_attachments(
                 }
             } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
                 if let Ok(o) = std::process::Command::new("grep")
-                    .args(["-rnI", sym_query, "."])
+                    .args(["-rnI", "-e", sym_query, "--", "."])
                     .current_dir(cwd)
                     .output()
                 {
@@ -3941,7 +3970,14 @@ fn extract_attachments(
             } else {
                 cwd.join(raw_path)
             };
-            if image_exts.contains(&ext.as_str()) && p.exists() {
+            // Credentials must never ride along in a prompt unnoticed; the
+            // token stays as typed and nothing is read.
+            if p.exists() && tools::is_sensitive(&p) {
+                tui::line(&tui::yellow(&format!(
+                    "  ⚠ {} not attached — it is a sensitive file (keys, credentials, secrets)",
+                    tui::sanitize_terminal(&p.display().to_string())
+                )));
+            } else if image_exts.contains(&ext.as_str()) && p.exists() {
                 if !vision {
                     tui::line(&tui::yellow(
                         "  ⚠ current model is not multimodal — image not attached",
@@ -4038,6 +4074,11 @@ fn extract_attachments(
         clean.push_str(&text_attachments.join("\n\n"));
     }
     (clean, images)
+}
+
+fn is_web_url(url: &str) -> bool {
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 fn split_attachment_range(raw: &str) -> (&str, Option<(usize, usize)>) {
@@ -4897,6 +4938,16 @@ mod tests {
             parse_cli_options(["run", "--", "--json"].map(str::to_string).to_vec()).unwrap();
         assert!(!opts.json);
         assert_eq!(rest, ["run", "--json"]);
+
+        // The shape workflow.rs spawns: a flag-like task stays the task.
+        let (opts, rest) = parse_cli_options(
+            ["run", "--json", "--", "--permission auto rm it"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(opts.json && opts.permission_mode.is_none());
+        assert_eq!(rest, ["run", "--permission auto rm it"]);
     }
 
     #[test]
@@ -5106,6 +5157,53 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_attachment_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-secret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env.local"), "API_KEY=sk-live-secret\n").unwrap();
+        std::fs::write(dir.join("id_rsa.png"), "not an image").unwrap();
+        let (text, images) =
+            extract_attachments("check @.env.local and id_rsa.png please", &dir, true);
+        assert!(images.is_empty());
+        assert!(!text.contains("sk-live-secret"), "{text}");
+        assert!(!text.contains("[attached files]"), "{text}");
+        assert!(text.contains("@.env.local"), "token stays as typed: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn url_attachment_requires_web_scheme() {
+        assert!(is_web_url("https://example.com/x"));
+        assert!(is_web_url("HTTP://example.com"));
+        for bad in [
+            "-K/etc/passwd",
+            "file:///etc/passwd",
+            "--config=x",
+            "ftp://h",
+            "",
+        ] {
+            assert!(!is_web_url(bad), "{bad}");
+        }
+        // Rejected values are never handed to curl, so nothing is attached.
+        let (text, _) = extract_attachments("@url:-K/etc/passwd", &std::env::temp_dir(), false);
+        assert!(!text.contains("[web:"), "{text}");
+    }
+
+    #[test]
+    fn symbol_attachment_treats_query_as_pattern() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.sh"), "rm --files-from list\n").unwrap();
+        // A leading dash is a pattern, not a grep option.
+        let (text, _) = extract_attachments("@symbol:--files-from", &dir, false);
+        assert!(text.contains("[symbol search: --files-from]"), "{text}");
+        assert!(text.contains("rm --files-from list"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn image_path_before_sentence_punctuation_attaches() {
         let dir = std::env::temp_dir().join(format!("bwn-attach-punct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5240,7 +5338,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test_file.rs");
         std::fs::write(&file_path, "fn main() {}\n").unwrap();
-        super::handle_verify_audit(&dir);
+        assert!(super::handle_verify_audit(
+            crate::agent::Permission::Auto,
+            &dir
+        ));
+        // Read-only sessions must not run the project's build/test commands.
+        assert!(!super::handle_verify_audit(
+            crate::agent::Permission::ReadOnly,
+            &dir
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

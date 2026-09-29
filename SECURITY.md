@@ -72,11 +72,17 @@ including each redirect target, must be on `github.com` or any
 `*.githubusercontent.com` host (which covers
 `objects.githubusercontent.com`, where release assets are served, but also
 hosts such as `raw.githubusercontent.com`). Other hosts are refused. The
-SHA-256 checksum is read from the `.sha256` file published in the same
-GitHub Release, and a binary that does not match is deleted instead of being
-installed. Because the checksum and the binary come from the same release,
-the check catches corruption and a swapped asset, not a compromised release;
-use the attestations below for that.
+expected SHA-256 comes from `checksums.json` inside the npm package: before
+publishing, `publish.yml` checks every release binary against its
+build-provenance attestation and records the verified hashes there, and a
+published npm tarball cannot change. A binary that does not match is deleted
+instead of being installed, so an asset swapped on the GitHub Release after
+publishing is refused. (A checkout without `checksums.json` falls back to the
+release's own `.sha256` file, which only catches corruption.)
+
+The launcher only uses a platform package installed next to the main package,
+never one found in a parent directory's `node_modules`, and ignores a relative
+`BWN_BIN`.
 
 To avoid the download, set `BWN_BIN` to a binary you built or verified
 yourself.
@@ -142,8 +148,9 @@ shows whether a given file is signed.
   sets `auto_update` to `"install"`.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
-  `localhost:11434`); `lite.duckduckgo.com` and the pages the agent fetches,
-  when the model uses the web tools; MCP servers the user configures; and a
+  `localhost:11434`); `lite.duckduckgo.com`, and the pages the agent fetches
+  when the model uses the web tools (each new host needs the user's approval
+  outside `auto` mode); MCP servers the user configures; and a
   daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
   There is no telemetry or analytics.
 - **Files:** its settings, sessions and checkpoints under
@@ -247,6 +254,9 @@ never auto-updated.
   with npm and crates.io. Checkouts do not keep the `GITHUB_TOKEN` in
   `.git/config`, except in the manual publish path that pushes a version
   bump.
+- The release jobs that compile code (and so run dependency build scripts)
+  hold a read-only token; a separate job that compiles nothing attests the
+  binaries and uploads them.
 - Releases run one at a time, a manual release can only be started from
   `main`, and a newly created tag points at the commit the workflow built.
 - Inside the harness itself: mutating file tools are gated by the permission
@@ -276,7 +286,10 @@ macOS. Windows and WSL have no backend, so `auto` runs unconfined there and
 
 Inside the sandbox, the command can write only to the working directory and
 the temp directories; the rest of the filesystem, including
-`~/.buildwithnexus`, is read-only. On Linux, `/tmp` is a fresh private
+`~/.buildwithnexus`, is read-only, and so are the workspace's `.git` and
+`.buildwithnexus` (on Linux an empty read-only placeholder stands in when
+they don't exist yet, so a command cannot create a `.git/config` that runs
+later outside the sandbox). On Linux, `/tmp` is a fresh private
 directory that is discarded when the command exits. On macOS, `/tmp` and
 `$TMPDIR` are the real, shared directories. Network access stays on unless
 you set `"sandbox_network": false`.
