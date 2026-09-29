@@ -3091,6 +3091,7 @@ fn permission_label(perm: &Permission) -> &'static str {
 // `/permissions reset`: forget every "always allow" answer given in this
 // project (the per-project map in the user settings file).
 fn handle_permissions_reset(cwd: &std::path::Path) {
+    agent::clear_session_allowed(cwd);
     let n = config::reset_project_allowed(cwd);
     if n == 0 {
         tui::line(&tui::dim("  no \"always allow\" entries for this project"));

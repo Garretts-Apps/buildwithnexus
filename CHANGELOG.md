@@ -55,6 +55,45 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `allow?` prompt, or disguise a link. ESC now shows as a visible `␛` and
   other control characters are dropped before the harness adds its own
   styling. Control characters are also stripped from OSC 8 link targets.
+- **Ask mode no longer auto-approves compound commands.** A command whose
+  binary was in `allowed_commands`, the project's "always allow" list or the
+  session's approvals used to run without a prompt even when it chained,
+  piped, redirected or substituted another command (`cat x; rm -rf ~`). Only
+  a single plain command now skips the prompt: no `;`, `&`, `|`, `<`, `>`,
+  backticks, `$(`, variable expansion, control characters or newlines. New
+  "always allow" and "allow this session" answers are stored per binary and
+  subcommand for multi-verb tools (`git status`, `npm test`); an existing
+  single-word entry still covers plain commands of that binary. Session
+  approvals are scoped to the project and `/permissions reset` clears them.
+- **Read-only commands reject write and exec flags.** `rg --pre`,
+  `sort -o`, `find -exec`/`-delete`/`-fprint`, `git -c`/`--output`/
+  `--ext-diff`, `tree -o`, `uniq IN OUT` and similar no longer count as
+  read-only in PLAN and BRAINSTORM, and are never auto-approved.
+- **Secrets are harder to reach without a prompt.** The sensitive-path list
+  now covers `.kube`, `.docker/config.json`, `.config/gh`, `.netrc`,
+  `.npmrc`, `.pypirc`, `.git-credentials` and more, matches by path
+  component (so `~/.ssh` itself counts), and follows symlinks. It applies to
+  every path of `read_many_files` and to path arguments of shell commands, so
+  `cat ~/.aws/credentials` always asks. `grep_files`, `list_tree` and
+  `find_paths` skip credential directories.
+- **Fetch tools refuse link-local and cloud metadata addresses.**
+  `fetch_url`, `webfetch`, `headless_browser`, `wait_for_url` and web search
+  never connect to 169.254.0.0/16, fe80::/10 or metadata hostnames, including
+  through DNS or a redirect. Localhost still works for dev servers.
+- **Hooks can no longer approve writes in read-only phases.** In PLAN,
+  BRAINSTORM and readonly sessions a PreToolUse hook may deny a call but
+  never allow past the read-only gate. Hooks see `plan` or `readonly` as the
+  permission mode during those phases.
+- **Harness recovery calls go through hooks and the gate.** The `write_file`
+  and HTML artifact recoveries and the automatic `check_work` round are
+  checked like model calls; a denied call is skipped and reported.
+- **The sandbox protects `.git` and `.buildwithnexus`.** Under bubblewrap
+  they are bound read-only inside the workspace and `/run` is a fresh tmpfs;
+  under Seatbelt writes to them and Apple Events are denied. Sandboxed
+  children no longer inherit `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`,
+  `*_API_KEY` or `HF_TOKEN`. `start_server` and `python_tool` now run under
+  the sandbox policy, and `sandbox: require` refuses them without a backend.
+  `start_server` commands also get the dangerous-command check.
 ### Fixed
 - **`bwn init` keeps your existing settings.** Setup used to rewrite
   `settings.json` from defaults, dropping `allowed_commands`,
@@ -106,6 +145,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Pasting mid-turn cleans text the same way as at the prompt.** Pasted
   line breaks become spaces and control characters are dropped in all three
   paste paths, which now share one function.
+- **Symlinks followed by `..` can no longer escape the workspace.** Paths
+  are resolved through the deepest existing directory before `..` is folded,
+  so `link/../file` is checked where the OS would write it.
 
 ### Changed
 - crates.io publishing in the release workflow now fails the run when it

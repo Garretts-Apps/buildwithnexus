@@ -454,19 +454,143 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
     }
 }
 
+// Shell composition, redirection, substitution, expansion and control
+// characters can smuggle a mutating tail behind a harmless first token
+// (`cat x; rm -rf ~`, `cat x\nrm -rf ~`), so any of them disqualifies a
+// command from every no-prompt path. `|` also covers `||`, `&` covers `&&`.
+fn has_shell_metachars(cmd: &str) -> bool {
+    let b = cmd.as_bytes();
+    cmd.chars()
+        .any(|c| c.is_control() || matches!(c, ';' | '|' | '&' | '>' | '<' | '`'))
+        || b.windows(2).any(|w| {
+            w[0] == b'$'
+                && (w[1] == b'(' || w[1] == b'{' || w[1] == b'_' || w[1].is_ascii_alphabetic())
+        })
+}
+
+// Flags that turn a "read-only" binary into a writer or a program launcher.
+// Long flags match exactly or as `--flag=value`; single-letter flags also
+// match inside a cluster (`sort -uo out`); longer single-dash flags (find's
+// predicates) match exactly.
+fn dangerous_flags_for(bin: &str) -> &'static [&'static str] {
+    match bin {
+        "rg" => &["--pre", "--pre-glob"],
+        "sort" => &["-o", "--output", "--compress-program"],
+        "find" => &[
+            "-fprint", "-fprint0", "-fls", "-fprintf", "-exec", "-execdir", "-ok", "-okdir",
+            "-delete",
+        ],
+        "git" => &[
+            "-c",
+            "--config-env",
+            "--exec-path",
+            "--output",
+            "--ext-diff",
+            "-O",
+            "--open-files-in-pager",
+            "--upload-pack",
+            "--receive-pack",
+        ],
+        "tree" => &["-o", "-R"],
+        "file" => &["-C", "--compile"],
+        _ => &[],
+    }
+}
+
+fn flag_matches(tok: &str, flag: &str) -> bool {
+    if tok == flag {
+        return true;
+    }
+    if flag.starts_with("--") {
+        return tok.strip_prefix(flag).is_some_and(|r| r.starts_with('='));
+    }
+    let letter = flag.strip_prefix('-').filter(|l| l.len() == 1);
+    match letter {
+        Some(l) => tok.starts_with('-') && !tok.starts_with("--") && tok[1..].contains(l),
+        None => false,
+    }
+}
+
+fn command_words(cmd: &str) -> (String, Vec<&str>) {
+    let mut words = cmd.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first).to_string();
+    (base, words.collect())
+}
+
+/// True when a command uses a write/exec flag of its binary (`rg --pre`,
+/// `sort -o`, `find -exec`, `git -c`, `tree -o`, …) or `uniq`'s output
+/// operand.
+pub fn has_dangerous_flags(cmd: &str) -> bool {
+    let (bin, args) = command_words(cmd);
+    let flags = dangerous_flags_for(&bin);
+    if args
+        .iter()
+        .take_while(|a| **a != "--")
+        .any(|a| flags.iter().any(|f| flag_matches(a, f)))
+    {
+        return true;
+    }
+    // `uniq IN OUT` writes OUT.
+    bin == "uniq" && args.iter().filter(|a| !a.starts_with('-')).count() > 1
+}
+
+/// A single simple command with no shell metacharacters, control characters
+/// or dangerous flags: the only shape that may skip a permission prompt.
+pub fn is_plain_command(cmd: &str) -> bool {
+    !has_shell_metachars(cmd.trim()) && !has_dangerous_flags(cmd.trim())
+}
+
+// Tools whose second word names a different action (`git status` vs
+// `git push`); approvals for them are stored per subcommand.
+const MULTI_VERB: &[&str] = &[
+    "git",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "cargo",
+    "docker",
+    "podman",
+    "kubectl",
+    "helm",
+    "go",
+    "dotnet",
+    "pip",
+    "pip3",
+    "uv",
+    "poetry",
+    "gh",
+    "brew",
+    "apt",
+    "apt-get",
+    "terraform",
+    "make",
+    "just",
+    "rustup",
+    "gcloud",
+    "aws",
+    "az",
+];
+
+/// The key an "allow this session" / "always allow" answer is stored under:
+/// the binary, plus its subcommand for multi-verb tools (`git status`).
+pub fn approval_key(cmd: &str) -> String {
+    let (bin, args) = command_words(cmd);
+    if MULTI_VERB.contains(&bin.as_str()) {
+        if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
+            return format!("{bin} {sub}");
+        }
+    }
+    bin
+}
+
 // Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
 // even in ReadOnly permission mode despite run_command being generically mutating.
 pub fn is_readonly_command(cmd: &str) -> bool {
     let trimmed = cmd.trim();
-    // Shell composition, redirection, and substitution can smuggle a mutating
-    // tail behind a read-only first token (`cat x; rm -rf ~`), so any
-    // metacharacter disqualifies the fast path. `|` also covers `||` and `&`
-    // covers `&&`.
-    if trimmed
-        .chars()
-        .any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '`'))
-        || trimmed.contains("$(")
-    {
+    if !is_plain_command(trimmed) {
         return false;
     }
     let lower = trimmed.to_lowercase();
@@ -474,10 +598,10 @@ pub fn is_readonly_command(cmd: &str) -> bool {
     let first = words.next().unwrap_or("");
     let base = first.rsplit('/').next().unwrap_or(first);
     match base {
-        // `find -delete`/`-exec` mutate; plain lookups are reads. Note that
+        // `find -delete`/`-exec` are refused by has_dangerous_flags. Note that
         // `sed` is deliberately absent (sed -i edits in place), as are `xargs`
         // and `tee` (they exist to run/write things).
-        "find" => !words.any(|w| matches!(w, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")),
+        "find" => true,
         // Only known-readonly git subcommands; `git clean`, `git tag <name>`,
         // and branch delete/rename mutate.
         "git" => match words.next().unwrap_or("") {
@@ -710,7 +834,31 @@ pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
         "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
             Some(resolve(cwd, root_arg(input)))
         }
+        "read_many_files" => touched_paths(name, input, cwd).into_iter().next(),
         _ => None,
+    }
+}
+
+/// Every path a call touches: all of read_many_files' paths, both ends of a
+/// move, otherwise touched_path.
+pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
+    match name {
+        "read_many_files" => input["paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| resolve(cwd, p))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "move_path" => ["from", "to"]
+            .iter()
+            .filter_map(|k| input[*k].as_str())
+            .map(|p| resolve(cwd, p))
+            .collect(),
+        _ => touched_path(name, input, cwd).into_iter().collect(),
     }
 }
 
@@ -904,6 +1052,22 @@ fn write_server_record(name: &str, record: &Value) -> Result<(), String> {
         .map_err(|e| format!("cannot write server record {}: {e}", path.display()))
 }
 
+// The sandboxed launcher for a server command, per `mode`: Ok(None) runs it
+// unsandboxed as before, Err is `require` without a backend. Writes are
+// confined to the workspace even when the server runs from a subdirectory.
+fn server_sandbox(
+    mode: crate::sandbox::Mode,
+    command: &str,
+    run_cwd: &Path,
+    cwd: &Path,
+) -> Result<Option<Command>, String> {
+    let script = format!(
+        "cd {} && {command}",
+        shell_quote(&run_cwd.to_string_lossy())
+    );
+    crate::sandbox::wrap_in(mode, &script, cwd)
+}
+
 fn start_server(input: &Value, cwd: &Path) -> Outcome {
     let command = input["command"].as_str().unwrap_or("").trim();
     if command.is_empty() {
@@ -931,6 +1095,10 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
         .filter(|s| !s.trim().is_empty())
         .map(|p| resolve(cwd, p))
         .unwrap_or_else(|| cwd.to_path_buf());
+    let sandboxed = match server_sandbox(crate::sandbox::mode(), command, &run_cwd, cwd) {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
     let log_path = server_logs_dir().join(format!("{name}.log"));
     let port = input["port"].as_u64();
 
@@ -943,7 +1111,9 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
         "started_ms": now_ms(),
     });
 
-    if command_available("tmux") {
+    // A tmux server would run the command outside the sandbox, so a
+    // sandboxed server is spawned directly (and dies with the session).
+    if sandboxed.is_none() && command_available("tmux") {
         let session = format!("bwn-{}", safe_name(&name));
         let shell = format!(
             "cd {} && {} 2>&1 | tee {}",
@@ -997,17 +1167,18 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
             Ok(f) => f,
             Err(e) => return err(format!("cannot clone server log handle: {e}")),
         };
-        let mut cmd = if cfg!(windows) {
+        let mut cmd = if let Some(c) = sandboxed {
+            c
+        } else if cfg!(windows) {
             let mut c = Command::new("cmd");
-            c.args(["/C", command]);
+            c.args(["/C", command]).current_dir(&run_cwd);
             c
         } else {
             let mut c = Command::new("sh");
-            c.args(["-lc", command]);
+            c.args(["-lc", command]).current_dir(&run_cwd);
             c
         };
         match cmd
-            .current_dir(&run_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log))
@@ -1145,11 +1316,15 @@ fn wait_for_url(input: &Value) -> Outcome {
         .clamp(1, 120);
     let expect_status = input["expect_status"].as_u64().map(|s| s as u16);
     let expect_text = input["expect_text"].as_str().filter(|s| !s.is_empty());
+    if let Some(why) = blocked_url(url) {
+        return err(why);
+    }
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(timeout);
 
     loop {
-        let last_error = match ureq::get(url)
+        let last_error = match web_agent()
+            .get(url)
             .set("User-Agent", "buildwithnexus/1.0")
             .call()
         {
@@ -1447,29 +1622,41 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-// Canonicalize the deepest existing ancestor and re-append the remainder, so
-// symlinked prefixes (macOS `/tmp` → `/private/tmp`) compare consistently even
-// for paths that don't exist yet (e.g. write targets).
+// Canonicalize the deepest existing ancestor of the raw path and re-append
+// the remainder, so symlinked prefixes (macOS `/tmp` → `/private/tmp`)
+// compare consistently even for paths that don't exist yet (e.g. write
+// targets). `..` is folded only in the non-existent remainder: folding it
+// first would turn `link/../x` into `x` while the OS resolves it through
+// the symlink's target.
 fn canonicalize_lenient(p: &Path) -> PathBuf {
-    let normed = normalize(p);
-    if let Ok(c) = normed.canonicalize() {
+    use std::path::Component;
+    if let Ok(c) = p.canonicalize() {
         return c;
     }
-    let mut rest = Vec::new();
-    let mut cur = normed.as_path();
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            rest.push(name.to_os_string());
-        }
-        if let Ok(mut out) = parent.canonicalize() {
-            for name in rest.iter().rev() {
-                out.push(name);
+    let comps: Vec<Component> = p.components().collect();
+    for i in (1..comps.len()).rev() {
+        let prefix: PathBuf = comps[..i].iter().collect();
+        let Ok(mut out) = prefix.canonicalize() else {
+            continue;
+        };
+        for c in &comps[i..] {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => {
+                    out.push(other.as_os_str());
+                    // Reached again after a `..`: resolve it like the OS would.
+                    if let Ok(r) = out.canonicalize() {
+                        out = r;
+                    }
+                }
             }
-            return out;
         }
-        cur = parent;
+        return out;
     }
-    normed
+    normalize(p)
 }
 
 // True if the path resolves outside the working directory. Both sides go
@@ -1517,24 +1704,143 @@ pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<Path
     }
 }
 
+// Credential stores and key material, matched by path component (never by
+// substring, so `~/.ssh` itself counts and `notes.sshx` does not).
+const SENSITIVE_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".azure",
+    ".buildwithnexus",
+];
+const SENSITIVE_SUBPATHS: &[[&str; 2]] = &[
+    [".docker", "config.json"],
+    [".config", "gh"],
+    [".config", "gcloud"],
+];
+const SENSITIVE_FILES: &[&str] = &[
+    ".netrc",
+    "_netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".pgpass",
+    ".env",
+];
+
+fn is_sensitive_dir_name(name: &str) -> bool {
+    SENSITIVE_DIRS.contains(&name)
+}
+
+fn is_sensitive_file_name(name: &str) -> bool {
+    SENSITIVE_FILES.contains(&name)
+        || name.starts_with(".env.")
+        || ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+            .iter()
+            .any(|k| name.starts_with(k))
+        || [".pem", ".p12", ".pfx"].iter().any(|e| name.ends_with(e))
+}
+
+fn sensitive_components(p: &Path) -> bool {
+    let names: Vec<String> = p
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    names.iter().any(|n| is_sensitive_dir_name(n))
+        || names.windows(2).any(|w| {
+            SENSITIVE_SUBPATHS
+                .iter()
+                .any(|s| w[0] == s[0] && w[1] == s[1])
+        })
+        || names.last().is_some_and(|n| is_sensitive_file_name(n))
+}
+
 // Paths that should never be read/written without explicit confirmation, even in
 // auto mode — credential stores and key material are the prime exfil targets.
+// Checked on the lexical path and on the symlink-resolved one, so a link in
+// the workspace pointing at ~/.ssh is caught too.
 pub fn is_sensitive(p: &Path) -> bool {
-    let s = normalize(p).to_string_lossy().to_lowercase();
-    let name = p
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    s.contains("/.ssh/")
-        || s.contains("/.buildwithnexus/")
-        || s.contains("/.aws/")
-        || s.contains("/.gnupg/")
-        || name == ".env.keys"
-        || name == ".env"
-        || name.starts_with(".env.")
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.ends_with(".pem")
+    sensitive_components(&normalize(p)) || sensitive_components(&canonicalize_lenient(p))
+}
+
+// Shell glob match for one path component (`*`, `?`, `[...]` as any one
+// char). Like the shell, a leading wildcard never matches a leading dot.
+fn component_glob_match(pat: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pat.starts_with('.') {
+        return false;
+    }
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|i| go(&p[1..], &n[i..])),
+            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
+            Some('[') => {
+                let close = p.iter().position(|c| *c == ']').unwrap_or(p.len() - 1);
+                !n.is_empty() && go(&p[close + 1..], &n[1..])
+            }
+            Some(c) => n.first() == Some(c) && go(&p[1..], &n[1..]),
+        }
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    go(&p, &n)
+}
+
+fn glob_component_is_sensitive(comp: &str) -> bool {
+    SENSITIVE_DIRS
+        .iter()
+        .chain(SENSITIVE_FILES)
+        .chain([".docker", ".config"].iter())
+        .filter(|name| name.starts_with('.'))
+        .any(|name| component_glob_match(comp, name))
+}
+
+/// The first path-like argument of a shell command that names a sensitive
+/// path (`cat ~/.aws/credentials`, `--file=$HOME/.netrc`). Quotes and
+/// backslashes are stripped and `~`/`$HOME` expanded first; glob components
+/// are matched against the sensitive names.
+pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| h.to_string_lossy().into_owned());
+    for raw in cmd.split(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`')
+    }) {
+        let tok: String = raw
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        // `--file=path` / `-fpath`-style values: check what follows `=`.
+        let tok = tok.rsplit('=').next().unwrap_or("").to_string();
+        if tok.is_empty() || tok.starts_with('-') {
+            continue;
+        }
+        let tok = match &home {
+            Some(h) => tok.replacen("${HOME}", h, 1).replacen("$HOME", h, 1),
+            None => tok,
+        };
+        let p = resolve(cwd, &tok);
+        if is_sensitive(&p) {
+            return Some(p);
+        }
+        if tok.contains(['*', '?', '[']) {
+            let hit = p.components().any(|c| match c {
+                std::path::Component::Normal(n) => {
+                    let n = n.to_string_lossy().to_lowercase();
+                    n.contains(['*', '?', '[']) && glob_component_is_sensitive(&n)
+                }
+                _ => false,
+            });
+            if hit {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 // ── WSL2 filesystem boundary guard ───────────────────────────────────────────
@@ -2061,7 +2367,7 @@ fn skip_dir(path: &Path) -> bool {
             | ".cache"
             | "vendor"
             | "__pycache__"
-    )
+    ) || is_sensitive_dir_name(&name.to_lowercase())
 }
 
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
@@ -2080,7 +2386,7 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
             if !skip_dir(&path) {
                 collect_files(&path, out, seen);
             }
-        } else if path.is_file() {
+        } else if path.is_file() && !is_sensitive(&path) {
             *seen += 1;
             out.push(path);
         }
@@ -2217,6 +2523,26 @@ fn find_python_tool(cwd: &Path, raw: &str) -> PathBuf {
 
 // `python3` on a stock Windows install is a Microsoft Store alias that opens
 // the Store instead of running; prefer `python` there when `python3` fails.
+// python_tool runs project code like run_command does, so it gets the same
+// sandbox policy; `require` without a backend refuses it.
+fn python_tool_command(
+    mode: crate::sandbox::Mode,
+    script: &Path,
+    cwd: &Path,
+) -> Result<Command, String> {
+    let line = format!(
+        "{} {}",
+        python_interpreter(),
+        shell_quote(&script.to_string_lossy())
+    );
+    if let Some(c) = crate::sandbox::wrap_in(mode, &line, cwd)? {
+        return Ok(c);
+    }
+    let mut command = Command::new(python_interpreter());
+    command.arg(script).current_dir(cwd);
+    Ok(command)
+}
+
 fn python_interpreter() -> &'static str {
     static PY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     PY.get_or_init(|| {
@@ -3791,7 +4117,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if url.is_empty() {
                 return err("url is required");
             }
-            match http_get_with_retry(ureq::get(url)) {
+            if let Some(why) = blocked_url(url) {
+                return err(why);
+            }
+            match http_get_with_retry(web_agent().get(url)) {
                 Ok(resp) => match resp.into_string() {
                     Ok(body) => ok(truncate(body, MAX_OUT)),
                     Err(e) => err(format!("failed to read response body: {e}")),
@@ -3807,7 +4136,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let encoded = url_encode(query);
             let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
             match http_get_with_retry(
-                ureq::get(&search_url)
+                web_agent()
+                    .get(&search_url)
                     .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
@@ -3835,9 +4165,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if url.is_empty() {
                 return err("url is required");
             }
+            if let Some(why) = blocked_url(url) {
+                return err(why);
+            }
             let extract_links = input["extract_links"].as_bool().unwrap_or(false);
             match http_get_with_retry(
-                ureq::get(url).set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+                web_agent()
+                    .get(url)
+                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
@@ -3961,8 +4296,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let path = find_python_tool(cwd, raw);
             let payload = input.get("input").cloned().unwrap_or_else(|| json!({}));
-            let mut command = Command::new(python_interpreter());
-            command.arg(&path).current_dir(cwd);
+            let command = match python_tool_command(crate::sandbox::mode(), &path, cwd) {
+                Ok(c) => c,
+                Err(e) => return err(e),
+            };
             match run_with_timeout(
                 command,
                 Some(payload.to_string().into_bytes()),
@@ -4510,6 +4847,76 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
 
 // Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
+// ── network guard ─────────────────────────────────────────────────────────────
+// Link-local addresses and cloud metadata endpoints hand out instance
+// credentials, so the fetch tools never reach them: not by literal, not by a
+// hostname that resolves there, not through a redirect. Loopback stays
+// usable for dev servers.
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.octets() == [100, 100, 100, 200],
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
+        }
+    }
+}
+
+const METADATA_HOSTS: &[&str] = &[
+    "metadata",
+    "metadata.google.internal",
+    "metadata.goog",
+    "instance-data",
+    "instance-data.ec2.internal",
+];
+
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    let host = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split(']').next()?
+    } else {
+        hostport.split(':').next()?
+    };
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Why a fetch tool must not request `url`, if it must not.
+pub fn blocked_url(url: &str) -> Option<String> {
+    let host = url_host(url)?;
+    let literal = host.parse::<std::net::IpAddr>().is_ok_and(is_blocked_ip);
+    (literal || METADATA_HOSTS.contains(&host.as_str())).then(|| {
+        format!("refusing to fetch {url}: link-local and cloud metadata addresses are blocked")
+    })
+}
+
+struct GuardedResolver;
+
+impl ureq::Resolver for GuardedResolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        let addrs: Vec<_> = netloc.to_socket_addrs()?.collect();
+        if addrs.iter().any(|a| is_blocked_ip(a.ip())) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{netloc} resolves to a link-local or metadata address"),
+            ));
+        }
+        Ok(addrs)
+    }
+}
+
+// The agent every fetch tool uses; redirects re-resolve through the guard.
+fn web_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().resolver(GuardedResolver).build())
+}
+
 fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::Error>> {
     let mut attempts = 0;
     let max_attempts = 4;
@@ -6018,6 +6425,256 @@ print("hello " + data.get("name", "world"))
         ] {
             assert!(is_readonly_command(c), "{c} should be readonly");
         }
+    }
+
+    #[test]
+    fn plain_command_rejects_control_chars_and_expansion() {
+        for c in [
+            "ls\nrm -rf ~",
+            "ls\rrm -rf ~",
+            "cat a\u{0}b",
+            "cat\tREADME.md",
+            "cat ${HOME}/x",
+            "cat $HOME/x",
+        ] {
+            assert!(!is_plain_command(c), "{c:?} must not be plain");
+            assert!(!is_readonly_command(c), "{c:?} must not be readonly");
+        }
+        assert!(is_plain_command("rg 'fn main$' src"));
+        assert!(is_plain_command("ls -la\n"), "trailing newline is trimmed");
+    }
+
+    #[test]
+    fn dangerous_flags_disqualify_readonly_binaries() {
+        for c in [
+            "rg --pre ./x pat",
+            "rg --pre=./x pat",
+            "rg --pre-glob '*.pdf' --pre x pat",
+            "sort -o out f",
+            "sort -ofile f",
+            "sort -uo out f",
+            "sort --output=out f",
+            "find . -fprint out",
+            "find . -fprint0 out",
+            "find . -fls out",
+            "find . -fprintf out %p",
+            "find . -exec rm {} +",
+            "find . -execdir rm {} +",
+            "find . -ok rm {} ;",
+            "find . -delete",
+            "git -c core.pager=sh log",
+            "git --exec-path=/tmp status",
+            "git diff --output=/tmp/x",
+            "git diff --ext-diff",
+            "git grep -O foo",
+            "tree -o out",
+            "tree -R",
+            "uniq in out",
+            "file -C -m magic",
+        ] {
+            assert!(has_dangerous_flags(c), "{c} should be flagged");
+            assert!(!is_readonly_command(c), "{c} must not be readonly");
+            assert!(!is_plain_command(c), "{c} must not be plain");
+        }
+        for c in [
+            "rg -n pat src",
+            "sort -n f",
+            "find . -name '*.rs' -print",
+            "git -C sub status",
+            "git log --oneline",
+            "tree -L 2",
+            "uniq -c f",
+        ] {
+            assert!(!has_dangerous_flags(c), "{c} should not be flagged");
+        }
+    }
+
+    #[test]
+    fn approval_key_adds_the_subcommand_for_multi_verb_tools() {
+        assert_eq!(approval_key("git status -s"), "git status");
+        assert_eq!(approval_key("/usr/bin/git --no-pager log"), "git log");
+        assert_eq!(approval_key("npm test"), "npm test");
+        assert_eq!(approval_key("cargo"), "cargo");
+        assert_eq!(approval_key("cat README.md"), "cat");
+    }
+
+    #[test]
+    fn sensitive_paths_match_by_component() {
+        let home = Path::new("/home/u");
+        for p in [
+            ".ssh",
+            ".ssh/id_ed25519",
+            ".aws",
+            ".aws/credentials",
+            ".gnupg/pubring.kbx",
+            ".kube/config",
+            ".docker/config.json",
+            ".config/gh/hosts.yml",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            ".git-credentials",
+            ".buildwithnexus/.env.keys",
+            "proj/.env",
+            "proj/.env.local",
+            "keys/id_rsa.pub",
+            "certs/server.pem",
+        ] {
+            assert!(is_sensitive(&home.join(p)), "{p} should be sensitive");
+        }
+        for p in [
+            "notes.sshx",
+            "proj/src/main.rs",
+            ".docker/other.json",
+            ".config/nvim/init.lua",
+        ] {
+            assert!(!is_sensitive(&home.join(p)), "{p} should not be sensitive");
+        }
+    }
+
+    #[test]
+    fn touched_paths_covers_every_read_many_files_path() {
+        let cwd = Path::new("/w");
+        let input = json!({"paths": ["a.txt", "/home/u/.ssh/id_rsa"]});
+        let all = touched_paths("read_many_files", &input, cwd);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|p| is_sensitive(p)));
+        assert_eq!(
+            touched_path("read_many_files", &input, cwd),
+            Some(cwd.join("a.txt"))
+        );
+    }
+
+    #[test]
+    fn command_sensitive_path_finds_secret_arguments() {
+        // Matching is by component, so this holds whatever $HOME is.
+        let cwd = Path::new("/w");
+        for c in [
+            "cat ~/.aws/credentials",
+            "cat $HOME/.netrc",
+            "cat \"${HOME}/.ssh/id_rsa\"",
+            "cat ~/.a\\ws/credentials",
+            "cat ~/.a*/credentials",
+            "curl --netrc-file=/home/u/.netrc x",
+            "grep token .env",
+            "ls ~/.ssh",
+        ] {
+            assert!(
+                command_sensitive_path(c, cwd).is_some(),
+                "{c} should be flagged"
+            );
+        }
+        for c in ["grep foo *", "ls src", "cat README.md", "rg -n token src"] {
+            assert!(command_sensitive_path(c, cwd).is_none(), "{c} should pass");
+        }
+    }
+
+    #[test]
+    fn walkers_skip_sensitive_dirs_and_files() {
+        let d = tempdir();
+        fs::create_dir_all(d.join(".ssh")).unwrap();
+        fs::write(d.join(".ssh/id_rsa"), "needle-secret").unwrap();
+        fs::write(d.join(".env"), "needle-secret").unwrap();
+        fs::write(d.join("a.txt"), "needle-secret").unwrap();
+        let r = run("grep_files", &json!({"pattern": "needle-secret"}), &d);
+        assert!(r.content.contains("a.txt"), "{}", r.content);
+        assert!(
+            !r.content.contains("id_rsa") && !r.content.contains(".env"),
+            "{}",
+            r.content
+        );
+        let r = run("find_paths", &json!({"pattern": "id_rsa"}), &d);
+        assert!(!r.content.contains(".ssh"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fetch_tools_refuse_link_local_and_metadata_hosts() {
+        for u in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://169.254.1.1:8080/",
+            "http://[fe80::1]/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[fd00:ec2::254]/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://user@METADATA.google.internal./",
+            "http://100.100.100.200/",
+        ] {
+            assert!(blocked_url(u).is_some(), "{u} should be blocked");
+        }
+        for u in [
+            "http://localhost:3000/",
+            "http://127.0.0.1:8080/health",
+            "http://[::1]:5173/",
+            "https://docs.rs/ureq",
+        ] {
+            assert!(blocked_url(u).is_none(), "{u} should be allowed");
+        }
+        let d = tempdir();
+        for tool in ["fetch_url", "webfetch", "headless_browser", "wait_for_url"] {
+            let r = run(tool, &json!({"url": "http://169.254.169.254/"}), &d);
+            assert!(
+                r.is_error && r.content.contains("refusing"),
+                "{tool}: {}",
+                r.content
+            );
+        }
+        // A hostname that resolves to link-local is caught at connect time.
+        use ureq::Resolver;
+        assert!(GuardedResolver.resolve("169.254.169.254:80").is_err());
+        assert!(GuardedResolver.resolve("127.0.0.1:80").is_ok());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn server_and_python_tool_follow_the_sandbox_policy() {
+        use crate::sandbox::Mode;
+        let d = tempdir();
+        let program = |c: &Command| c.get_program().to_string_lossy().into_owned();
+        match crate::sandbox::backend() {
+            // `require` without a backend refuses instead of running bare.
+            None => {
+                assert!(server_sandbox(Mode::Require, "npm run dev", &d, &d).is_err());
+                assert!(python_tool_command(Mode::Require, &d.join("t.py"), &d).is_err());
+            }
+            Some(_) => {
+                let c = server_sandbox(Mode::Require, "npm run dev", &d, &d)
+                    .unwrap()
+                    .expect("wrapped");
+                assert!(matches!(program(&c).as_str(), "bwrap" | "sandbox-exec"));
+                let c = python_tool_command(Mode::Require, &d.join("t.py"), &d).unwrap();
+                assert!(matches!(program(&c).as_str(), "bwrap" | "sandbox-exec"));
+            }
+        }
+        assert!(server_sandbox(Mode::Off, "npm run dev", &d, &d)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dotdot_write_escape_is_refused() {
+        let d = tempdir();
+        let ws = d.join("ws");
+        let deep = d.join("outside/a/b");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&deep).unwrap();
+        std::os::unix::fs::symlink(&deep, ws.join("link")).unwrap();
+        // Folded lexically `link/../pwned.txt` is `ws/pwned.txt`, but the OS
+        // resolves `link/..` to outside/a.
+        let rel = "link/../pwned.txt";
+        assert!(escapes_cwd(&ws.join(rel), &ws));
+        let r = run("write_file", &json!({"path": rel, "content": "x"}), &ws);
+        assert!(r.is_error, "{}", r.content);
+        assert!(!d.join("outside/a/pwned.txt").exists());
+        assert!(!escapes_cwd(&ws.join("sub/../ok.txt"), &ws));
+        // A link into a secret store is sensitive through its target.
+        let ssh = d.join("home/.ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        std::os::unix::fs::symlink(&ssh, ws.join("keys")).unwrap();
+        assert!(is_sensitive(&ws.join("keys/id_rsa")));
+        let _ = fs::remove_dir_all(&d);
     }
 
     // ── catastrophic additions ──────────────────────────────────────────────
