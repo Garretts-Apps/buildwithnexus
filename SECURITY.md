@@ -56,10 +56,11 @@ binary comes from the first-run download below.
 **Reserved platform package names.** Versions 0.12.1 to 0.14.2 listed
 `buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies` before any
 such package existed, so anyone could have registered the names and had their
-code installed with those versions. From 0.14.10 the publish workflow owns all
-five names as empty placeholders (no code, no `bin`), none at a version those
-pins match, and fails if any name is owned by someone else. Those versions are
-deprecated on npm.
+code installed with those versions. The publish workflow reserves all five
+names as empty placeholders (no code, no `bin`), none at a version those pins
+match, and fails while any name is missing or owned by someone else. Creating
+them needs an npm token allowed to create packages; until one is set the names
+are still unregistered, so avoid installing 0.12.1 to 0.14.2.
 
 **First-run download.** If no binary is found, the launcher runs
 `scripts/bootstrap.js`, which downloads the release asset for your platform
