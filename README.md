@@ -271,12 +271,15 @@ sensitive-path or dangerous-command confirmation can't slip one through.
 
 The prompt shows the whole command, with line breaks marked `⏎`, and names
 what `s` / `a` would allow from then on: a binary (`cargo`), a subcommand
-(`git status`), a host, or, for shells and interpreters (`sh`, `python3`,
-`node`, …), only that exact command. Answering `a` (always allow) remembers it
+(`git status`), a host, or, for shells, interpreters and other programs that
+run what they are given (`sh`, `python3`, `python3.12`, `node`, `awk`, `sed`,
+`env`, …), only that exact command. Answering `a` (always allow) remembers it
 **for the current project only** (`project_allowed` in
 `~/.buildwithnexus/settings.json`, keyed by directory). `/permissions reset`
 forgets those answers for the project you're in. The legacy global
-`allowed_commands` list keeps working.
+`allowed_commands` list keeps working, except for a shell or interpreter saved
+by name alone (`python3`, as 0.14.3–0.14.8 stored them): those are ignored,
+and bwn lists them at startup and in `/permissions`.
 
 Network tools (`fetch_url`, `headless_browser`, `wait_for_url`,
 `open_browser`) ask once per host and port under `ask` and `readonly`, since a
@@ -361,9 +364,14 @@ the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`).
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
 `permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
-prompt; otherwise the normal gate applies. Matchers are `*`, an exact tool name,
-or a `|`-separated list; each segment may use `*` and `?` wildcards
-(`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
+prompt; otherwise the normal gate applies. A `PreToolUse` hook that gives no
+answer also blocks the call, with a message naming it: one that times out
+(`"timeout"` in seconds, default 10), cannot start (missing script or
+interpreter, not executable, a `.rs` hook that does not compile) or is killed by
+a signal. Any other non-zero exit is shown and does not block. Other events
+never block on a failed hook, but the failure is shown. Matchers are `*`, an
+exact tool name, or a `|`-separated list; each segment may use `*` and `?`
+wildcards (`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
 [`examples/settings.json`](./examples/settings.json).
 
 ```json

@@ -804,50 +804,122 @@ const MULTI_VERB: &[&str] = &[
 ];
 
 // Programs that run whatever code their arguments carry (`sh -c …`,
-// `python3 -c …`, `env X=1 anything`). Approving one call must not approve
-// every later call, so their approvals are stored per exact command.
+// `python3 -c …`, `awk 'BEGIN{system(…)}'`, `env X=1 anything`). Approving
+// one call must not approve every later call, so their approvals are stored
+// per exact command. Versioned names (`python3.12`, `node18`, `tclsh8.6`)
+// count as their family; see `runs_arbitrary_code`.
 const RUNS_ARBITRARY_CODE: &[&str] = &[
+    // Shells.
     "sh",
     "bash",
     "zsh",
     "fish",
     "dash",
     "ksh",
+    "mksh",
+    "ash",
     "csh",
     "tcsh",
+    "nu",
+    "busybox",
     "cmd",
     "powershell",
     "pwsh",
+    "wsl",
+    // Interpreters and script runners.
     "python",
-    "python2",
-    "python3",
+    "pythonw",
     "py",
+    "pypy",
+    "ipython",
     "node",
+    "nodejs",
     "deno",
+    "tsx",
+    "ts-node",
+    "bunx",
+    "pnpx",
+    "uvx",
     "perl",
     "ruby",
     "php",
     "lua",
+    "luajit",
+    "tclsh",
+    "wish",
+    "expect",
+    "rscript",
+    "r",
+    "julia",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    // GNU sed runs shell commands with `e`.
+    "sed",
+    "gsed",
     "osascript",
+    "wscript",
+    "cscript",
+    "mshta",
+    // Wrappers that run the command they are given.
     "env",
+    "command",
+    "builtin",
     "xargs",
+    "parallel",
     "nohup",
     "nice",
+    "ionice",
+    "chrt",
+    "taskset",
+    "stdbuf",
+    "setsid",
+    "unbuffer",
+    "script",
+    "flock",
     "timeout",
     "time",
+    "watch",
+    "watchexec",
+    "entr",
+    "hyperfine",
+    "strace",
+    "ltrace",
+    "gdb",
+    "valgrind",
     "sudo",
     "doas",
+    "su",
+    "runuser",
+    "pkexec",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "systemd-run",
+    "caffeinate",
+    "start",
     "eval",
     "exec",
-    "watch",
 ];
+
+/// Whether `bin` (a normalized binary name) is in `RUNS_ARBITRARY_CODE`,
+/// itself or as a versioned name: `python3.12`, `python3.6m`, `node18` and
+/// `ruby-3.2` all run code as their family does.
+fn runs_arbitrary_code(bin: &str) -> bool {
+    let family = match bin.find(|c: char| c.is_ascii_digit()) {
+        Some(i) => bin[..i].trim_end_matches(['-', '_', '.']),
+        None => bin,
+    };
+    RUNS_ARBITRARY_CODE.contains(&family)
+}
 
 /// The key an "allow this session" / "always allow" answer is stored under:
 /// the binary, plus its subcommand for multi-verb tools (`git status`), or
 /// the whole command for shells and interpreters.
 pub fn approval_key(cmd: &str) -> String {
     let (bin, args) = command_words(cmd);
-    if RUNS_ARBITRARY_CODE.contains(&bin.as_str()) {
+    if runs_arbitrary_code(&bin) {
         return cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     // Keep the path in the key for a path-qualified program, so an approval
@@ -864,6 +936,17 @@ pub fn approval_key(cmd: &str) -> String {
         }
     }
     ident
+}
+
+/// A saved approval naming a shell or interpreter on its own (`python3`), as
+/// 0.14.3–0.14.8 stored them. It would approve any code the program is
+/// handed, so it never pre-approves anything; the settings file is left as is.
+pub fn is_bare_interpreter_approval(key: &str) -> bool {
+    let mut words = key.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some(bin), None) => runs_arbitrary_code(&normalized_bin(bin)),
+        _ => false,
+    }
 }
 
 // Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
@@ -6946,8 +7029,83 @@ print("hello " + data.get("name", "world"))
             "python3 scripts/test.py"
         );
         assert_eq!(approval_key("sh -c 'make lint'"), "sh -c 'make lint'");
+        // Answering `a` to one awk or versioned-python call must not save a
+        // bare name that approves every later one.
+        for cmd in [
+            r#"awk 'BEGIN{system("id")}'"#,
+            "python3.12 -c print(1)",
+            "nodejs -e 1",
+            "sed '1e id' README.md",
+        ] {
+            assert_eq!(approval_key(cmd), cmd);
+        }
         assert_eq!(approval_key("cargo test --all"), "cargo test");
         assert_eq!(approval_key("ls -la"), "ls");
+    }
+
+    #[test]
+    fn bare_interpreter_approvals_are_recognised() {
+        for bin in RUNS_ARBITRARY_CODE {
+            assert!(is_bare_interpreter_approval(bin), "{bin}");
+            assert!(!is_bare_interpreter_approval(&approval_key(&format!(
+                "{bin} -c x"
+            ))));
+        }
+        assert!(is_bare_interpreter_approval(" Python3.exe "));
+        assert!(is_bare_interpreter_approval("/usr/bin/node"));
+        // Code runners and versioned interpreter names, as 0.14.3–0.14.8
+        // saved them.
+        for key in [
+            "awk",
+            "gawk",
+            "mawk",
+            "nawk",
+            "sed",
+            "nodejs",
+            "node18",
+            "tsx",
+            "ts-node",
+            "bunx",
+            "python3.12",
+            "python2.7",
+            "python3.6m",
+            "/usr/local/bin/python3.11",
+            "Python3.12.exe",
+            "pypy3",
+            "ruby3.2",
+            "perl5.36",
+            "lua5.4",
+            "tclsh",
+            "tclsh8.6",
+            "wish",
+            "expect",
+            "rscript",
+            "julia",
+            "ksh93",
+            "busybox",
+            "stdbuf",
+            "setsid",
+            "flock",
+            "strace",
+            "su",
+        ] {
+            assert!(is_bare_interpreter_approval(key), "{key}");
+        }
+        for key in [
+            "cargo",
+            "cargo test",
+            "git status",
+            "make",
+            "ls",
+            "write_file",
+            "sha256sum",
+            "pip3",
+            "7z",
+            "shellcheck",
+            "",
+        ] {
+            assert!(!is_bare_interpreter_approval(key), "{key}");
+        }
     }
 
     #[test]

@@ -42,12 +42,59 @@ enum HookCmd {
 // Watchdog defaults: a hung hook would otherwise freeze the single-threaded
 // TUI forever. Overridable per hook via a `"timeout"` (seconds) settings field.
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 10;
-// Distinct nonzero codes for hooks that never produced a real exit status, so
-// a deny-capable hook that could not run is never mistaken for "exit 0, allow".
-// (2 is reserved: it means "deny" to PreToolUse/UserPromptSubmit.)
+// Exit codes recorded for hooks that never produced a real exit status. The
+// outcome itself travels in `HookFailure`, so a hook's own `exit 124` is still
+// an ordinary exit. (2 is reserved: it means "deny" to PreToolUse/UserPromptSubmit.)
 const HOOK_TIMEOUT_CODE: i32 = 124; // matches timeout(1) convention
 const HOOK_SPAWN_FAILED_CODE: i32 = 126;
-const HOOK_SIGNAL_CODE: i32 = 128; // terminated by a signal
+const HOOK_SIGNAL_CODE: i32 = 128; // plus the signal number, like a shell
+
+// Why a hook has no exit status of its own. PreToolUse blocks the call on any
+// of these: a guard that never ran, or died midway, must not read as "allow".
+enum HookFailure {
+    TimedOut(Duration),
+    NotStarted(String),
+    Signal(Option<i32>),
+    WaitFailed(String),
+}
+
+impl HookFailure {
+    fn describe(&self) -> String {
+        match self {
+            HookFailure::TimedOut(d) => format!("timed out after {}", fmt_duration(*d)),
+            HookFailure::NotStarted(e) => format!("could not start: {e}"),
+            HookFailure::Signal(Some(n)) => format!("was killed by signal {n}"),
+            HookFailure::Signal(None) => "was killed by a signal".into(),
+            HookFailure::WaitFailed(e) => format!("could not be waited for: {e}"),
+        }
+    }
+}
+
+struct HookRun {
+    code: i32,
+    stdout: String,
+    stderr: String,
+    failure: Option<HookFailure>,
+}
+
+impl HookRun {
+    fn not_started(err: String) -> Self {
+        HookRun {
+            code: HOOK_SPAWN_FAILED_CODE,
+            stdout: String::new(),
+            stderr: err.clone(),
+            failure: Some(HookFailure::NotStarted(err)),
+        }
+    }
+
+    // Trace title: "exit 0", or what went wrong.
+    fn status(&self) -> String {
+        match &self.failure {
+            Some(f) => f.describe(),
+            None => format!("exit {}", self.code),
+        }
+    }
+}
 
 struct Hook {
     event: String,
@@ -250,12 +297,33 @@ fn with_fields(mut payload: Value, extra: Value) -> Value {
     payload
 }
 
+#[cfg(test)]
+thread_local! {
+    // Hooks for one test thread, in place of the process-wide list.
+    static TEST_HOOKS: std::cell::RefCell<Option<Vec<Hook>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String, Duration)> {
+    #[cfg(test)]
+    if let Some(found) = TEST_HOOKS.with(|t| {
+        t.borrow()
+            .as_ref()
+            .map(|list| select_hooks(list, event, tool))
+    }) {
+        return found;
+    }
     let Some(h) = HOOKS.get() else {
         return Vec::new();
     };
-    h.list
-        .iter()
+    select_hooks(&h.list, event, tool)
+}
+
+fn select_hooks(
+    list: &[Hook],
+    event: &str,
+    tool: Option<&str>,
+) -> Vec<(HookCmd, Source, String, Duration)> {
+    list.iter()
         .filter(|hk| hk.event == event)
         .filter(|hk| tool.is_none_or(|t| matches(&hk.matcher, t)))
         .map(|hk| (hk.cmd.clone(), hk.source, hk.matcher.clone(), hk.timeout))
@@ -530,10 +598,7 @@ fn interpreter_for(path: &Path) -> Result<(&'static str, Vec<&'static str>), Str
         } else {
             ""
         };
-        format!(
-            "hook {}: interpreter `{missing}` not found on PATH{hint}",
-            path.display()
-        )
+        format!("interpreter `{missing}` not found on PATH{hint}")
     })
 }
 
@@ -600,19 +665,31 @@ fn interpreter_for_ext(
     }
 }
 
-fn run_hook_cmd(
-    cmd: &HookCmd,
-    payload: &Value,
-    cwd: &Path,
-    timeout: Duration,
-) -> (i32, String, String) {
+fn run_hook_cmd(cmd: &HookCmd, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
     match cmd {
         HookCmd::Shell(s) => run_shell(s, payload, cwd, timeout),
         HookCmd::Script(path) => run_script(path, payload, cwd, timeout),
     }
 }
 
-fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> (i32, String, String) {
+// The shell reports a command it could not find (127) or could not execute
+// (126) as an ordinary exit status; `cmd /C` uses 9009 for "not recognized".
+fn shell_could_not_start(code: i32) -> bool {
+    if cfg!(windows) {
+        code == 9009
+    } else {
+        code == 126 || code == 127
+    }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+}
+
+fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
     let mut c = if cfg!(windows) {
         let mut x = Command::new("cmd");
         x.args(["/C", cmd]);
@@ -622,25 +699,36 @@ fn run_shell(cmd: &str, payload: &Value, cwd: &Path, timeout: Duration) -> (i32,
         x.args(["-c", cmd]);
         x
     };
-    run_child(
+    let mut run = run_child(
         c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
         payload,
         timeout,
-    )
+    );
+    if run.failure.is_none() && shell_could_not_start(run.code) {
+        let why = match first_line(&run.stderr) {
+            "" => format!("the shell exited {}", run.code),
+            l => trace::preview(l, 200),
+        };
+        run.failure = Some(HookFailure::NotStarted(why));
+    }
+    run
 }
 
-fn run_script(
-    path: &Path,
-    payload: &Value,
-    cwd: &Path,
-    timeout: Duration,
-) -> (i32, String, String) {
+fn run_script(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
+    // Checked here: the interpreter would report a missing or unreadable
+    // script as an ordinary exit status (bash 127, dash 2).
+    let full = cwd.join(path);
+    match std::fs::File::open(&full).and_then(|f| f.metadata()) {
+        Err(e) => return HookRun::not_started(e.to_string()),
+        Ok(m) if !m.is_file() => return HookRun::not_started("not a file".into()),
+        Ok(_) => {}
+    }
     if path.extension().is_some_and(|e| e == "rs" || e == "rust") {
-        return run_rust_hook(path, payload, cwd, timeout);
+        return run_rust_hook(&full, payload, cwd, timeout);
     }
     let (interp, interp_args) = match interpreter_for(path) {
         Ok(i) => i,
-        Err(e) => return (HOOK_SPAWN_FAILED_CODE, String::new(), e),
+        Err(e) => return HookRun::not_started(e),
     };
     let mut c = Command::new(interp);
     for a in interp_args {
@@ -654,12 +742,7 @@ fn run_script(
     )
 }
 
-fn run_rust_hook(
-    path: &Path,
-    payload: &Value,
-    cwd: &Path,
-    timeout: Duration,
-) -> (i32, String, String) {
+fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) -> HookRun {
     if Command::new("rust-script")
         .arg("--version")
         .stdout(Stdio::null())
@@ -696,14 +779,17 @@ fn run_rust_hook(
         "{stem}-{digest:016x}{}",
         std::env::consts::EXE_SUFFIX
     ));
-    let compile_status = Command::new("rustc")
+    // Diagnostics are captured, not printed over the TUI; the first one
+    // explains the failure. A hook that does not compile never ran.
+    let compiled = Command::new("rustc")
         .args(["--edition=2021", "-O"])
         .arg(path)
         .arg("-o")
         .arg(&bin_path)
-        .status();
-    match compile_status {
-        Ok(s) if s.success() => {
+        .stdin(Stdio::null())
+        .output();
+    match compiled {
+        Ok(o) if o.status.success() => {
             let mut c = Command::new(&bin_path);
             run_child(
                 c.current_dir(cwd).env("BWN_PROJECT_DIR", cwd),
@@ -711,23 +797,77 @@ fn run_rust_hook(
                 timeout,
             )
         }
-        Ok(s) => (
-            s.code().unwrap_or(1),
-            String::new(),
-            format!("rustc compilation failed with status: {s}"),
-        ),
-        Err(e) => (1, String::new(), format!("failed to invoke rustc: {e}")),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            HookRun::not_started(format!(
+                "rustc failed to compile it ({})",
+                trace::preview(first_line(&stderr), 200)
+            ))
+        }
+        Err(e) => HookRun::not_started(format!("rustc: {e}")),
     }
 }
 
-// Loud, unmissable warning for hooks that failed to run at all — a
+// Loud, unmissable warning for a hook that failed or exited non-zero — a
 // deny-capable hook that silently never fires would bypass its policy.
 fn hook_warn(msg: &str) {
+    // Commands and stderr come from settings files and hook output.
+    let msg = tui::sanitize_terminal(msg);
     if report::is_json() {
         eprintln!("[hook] warning: {msg}");
     } else {
         tui::line(&tui::yellow(&format!("  [hook] ⚠ {msg}")));
     }
+}
+
+// What to do about a hook that failed, for the message that names it.
+fn fix_hint(source: Source, cmd: &HookCmd, failure: &HookFailure) -> String {
+    let discovered = matches!(cmd, HookCmd::Script(p)
+        if source == Source::Home && p.starts_with(config::home().join("hooks")));
+    let fix = match failure {
+        HookFailure::TimedOut(_) if !discovered => {
+            "Make it finish sooner or raise its \"timeout\" (seconds)"
+        }
+        HookFailure::TimedOut(_) => "Make it finish sooner",
+        _ => "Fix it",
+    };
+    let file = match source {
+        _ if discovered => return format!("{fix}, or delete the script."),
+        Source::Home => config::home().join("settings.json").display().to_string(),
+        Source::Project => ".buildwithnexus/settings.json".to_string(),
+    };
+    format!("{fix}, or remove it from \"hooks\" in {file} (or settings.local.json).")
+}
+
+// Shows a hook that failed or exited non-zero without blocking anything (the
+// Claude Code "non-blocking error"). Only PreToolUse turns a failure into a
+// block; for every other event a hook that stops working must still be seen.
+fn report_problem(event: &str, source: Source, cmd: &HookCmd, run: &HookRun) {
+    if let Some(msg) = problem_message(event, source, cmd, run) {
+        hook_warn(&msg);
+    }
+}
+
+fn problem_message(event: &str, source: Source, cmd: &HookCmd, run: &HookRun) -> Option<String> {
+    let label = cmd_label(cmd);
+    if let Some(f) = &run.failure {
+        return Some(format!(
+            "{event} hook `{label}` {}. {}",
+            f.describe(),
+            fix_hint(source, cmd, f)
+        ));
+    }
+    if run.code == 0 {
+        return None;
+    }
+    let detail = match first_line(&run.stderr) {
+        "" => String::new(),
+        l => format!(": {}", trace::preview(l, 200)),
+    };
+    Some(format!(
+        "{event} hook `{label}` exited {}{detail}",
+        run.code
+    ))
 }
 
 // Drain a pipe on its own thread and deliver the bytes over a channel. A
@@ -767,23 +907,16 @@ fn join_pipe(rx: Option<mpsc::Receiver<Vec<u8>>>, grace: Duration) -> String {
         .unwrap_or_default()
 }
 
-fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, String, String) {
-    let label = c.get_program().to_string_lossy().into_owned();
+// Runs one hook process. Failures are returned, not reported: the caller
+// names the hook and decides whether the failure blocks.
+fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> HookRun {
+    let program = c.get_program().to_string_lossy().into_owned();
     c.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match c.spawn() {
         Ok(ch) => ch,
-        Err(e) => {
-            hook_warn(&format!(
-                "hook `{label}` failed to launch ({e}) — it did NOT run"
-            ));
-            return (
-                HOOK_SPAWN_FAILED_CODE,
-                String::new(),
-                format!("hook spawn failed: {e}"),
-            );
-        }
+        Err(e) => return HookRun::not_started(format!("{program}: {e}")),
     };
     // Feed stdin and drain both output pipes on threads so a hook that never
     // reads its input (or floods a pipe) can't wedge the single-threaded TUI.
@@ -801,21 +934,20 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, Strin
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
+            Ok(Some(st)) => break Ok(st),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     timed_out = true;
                     let _ = child.kill();
                     let _ = child.wait();
-                    break None;
+                    break Err(HookFailure::TimedOut(timeout));
                 }
                 thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                hook_warn(&format!("hook `{label}` wait failed ({e})"));
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                break Err(HookFailure::WaitFailed(e.to_string()));
             }
         }
     };
@@ -831,30 +963,29 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> (i32, Strin
     };
     let stdout = join_pipe(stdout_h, grace);
     let stderr = join_pipe(stderr_h, grace);
-    match status {
-        Some(st) => match st.code() {
-            Some(code) => (code, stdout, stderr),
+    let (code, failure) = match status {
+        Ok(st) => match st.code() {
+            Some(code) => (code, None),
+            // Signal-killed: never report exit 0 for a hook that died.
             None => {
-                // Signal-killed: never report exit 0 for a hook that died.
-                hook_warn(&format!("hook `{label}` was killed by a signal"));
-                (HOOK_SIGNAL_CODE, stdout, stderr)
+                #[cfg(unix)]
+                let sig = std::os::unix::process::ExitStatusExt::signal(&st);
+                #[cfg(not(unix))]
+                let sig = None;
+                (
+                    HOOK_SIGNAL_CODE + sig.unwrap_or(0),
+                    Some(HookFailure::Signal(sig)),
+                )
             }
         },
-        None if timed_out => {
-            let dur = fmt_duration(timeout);
-            hook_warn(&format!(
-                "hook `{label}` timed out after {dur} and was killed"
-            ));
-            (
-                HOOK_TIMEOUT_CODE,
-                stdout,
-                format!("{stderr}\nhook timed out after {dur}")
-                    .trim()
-                    .to_string(),
-            )
-        }
-        // try_wait failed (already warned): report as a launch/run failure.
-        None => (HOOK_SPAWN_FAILED_CODE, stdout, stderr),
+        Err(f @ HookFailure::TimedOut(_)) => (HOOK_TIMEOUT_CODE, Some(f)),
+        Err(f) => (HOOK_SPAWN_FAILED_CODE, Some(f)),
+    };
+    HookRun {
+        code,
+        stdout,
+        stderr,
+        failure,
     }
 }
 
@@ -886,30 +1017,42 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
+        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
-            format!("PreToolUse:{tool} exit {code}"),
+            format!("PreToolUse:{tool} {}", run.status()),
             json!({
                 "event": "PreToolUse",
                 "tool": tool,
                 "matcher": matcher,
                 "source": source_label(source),
                 "command": cmd_label(&cmd),
-                "exit_code": code,
-                "stdout": stdout,
-                "stderr": stderr,
+                "exit_code": run.code,
+                "error": run.failure.as_ref().map(HookFailure::describe),
+                "stdout": run.stdout,
+                "stderr": run.stderr,
             }),
         );
-        if code == 2 {
-            let r = stderr.trim();
+        // Fail closed: a guard that timed out, never started or was killed
+        // gave no answer, and no answer must not let the call through.
+        if let Some(f) = &run.failure {
+            return PreDecision::Deny(format!(
+                "PreToolUse hook `{}` {}, so this {tool} call was blocked. {}",
+                cmd_label(&cmd),
+                f.describe(),
+                fix_hint(source, &cmd, f)
+            ));
+        }
+        if run.code == 2 {
+            let r = run.stderr.trim();
             return PreDecision::Deny(if r.is_empty() {
                 "blocked by PreToolUse hook".into()
             } else {
                 r.to_string()
             });
         }
-        if let Ok(j) = serde_json::from_str::<Value>(&stdout) {
+        report_problem("PreToolUse", source, &cmd, &run);
+        if let Ok(j) = serde_json::from_str::<Value>(&run.stdout) {
             match decision_field(&j) {
                 Some("deny") | Some("block") => {
                     let reason = j["hookSpecificOutput"]["permissionDecisionReason"]
@@ -951,21 +1094,23 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
+        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
-            format!("PostToolUse:{tool} exit {code}"),
+            format!("PostToolUse:{tool} {}", run.status()),
             json!({
                 "event": "PostToolUse",
                 "tool": tool,
                 "matcher": matcher,
                 "source": source_label(source),
                 "command": cmd_label(&cmd),
-                "exit_code": code,
-                "stdout": stdout,
-                "stderr": stderr,
+                "exit_code": run.code,
+                "error": run.failure.as_ref().map(HookFailure::describe),
+                "stdout": run.stdout,
+                "stderr": run.stderr,
             }),
         );
+        report_problem("PostToolUse", source, &cmd, &run);
     }
 }
 
@@ -987,30 +1132,32 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
+        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
-            format!("UserPromptSubmit exit {code}"),
+            format!("UserPromptSubmit {}", run.status()),
             json!({
                 "event": "UserPromptSubmit",
                 "matcher": matcher,
                 "source": source_label(source),
                 "command": cmd_label(&cmd),
-                "exit_code": code,
-                "stdout": stdout,
-                "stderr": stderr,
+                "exit_code": run.code,
+                "error": run.failure.as_ref().map(HookFailure::describe),
+                "stdout": run.stdout,
+                "stderr": run.stderr,
             }),
         );
-        if code == 2 {
-            let r = stderr.trim();
+        if run.failure.is_none() && run.code == 2 {
+            let r = run.stderr.trim();
             return Err(if r.is_empty() {
                 "blocked by UserPromptSubmit hook".into()
             } else {
                 r.to_string()
             });
         }
-        if !stdout.trim().is_empty() {
-            ctx.push_str(&cap_hook_context(stdout.trim()));
+        report_problem("UserPromptSubmit", source, &cmd, &run);
+        if !run.stdout.trim().is_empty() {
+            ctx.push_str(&cap_hook_context(run.stdout.trim()));
             ctx.push('\n');
         }
     }
@@ -1070,20 +1217,22 @@ pub fn notify_with(event: &str, cwd: &Path, extra: Value) {
                 "trigger": payload,
             }),
         );
-        let (code, stdout, stderr) = run_hook_cmd(&cmd, &payload, cwd, timeout);
+        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
         trace::record_visible(
             "hook_result",
-            format!("{event} exit {code}"),
+            format!("{event} {}", run.status()),
             json!({
                 "event": event,
                 "matcher": matcher,
                 "source": source_label(source),
                 "command": cmd_label(&cmd),
-                "exit_code": code,
-                "stdout": stdout,
-                "stderr": stderr,
+                "exit_code": run.code,
+                "error": run.failure.as_ref().map(HookFailure::describe),
+                "stdout": run.stdout,
+                "stderr": run.stderr,
             }),
         );
+        report_problem(event, source, &cmd, &run);
     }
 }
 
@@ -1350,10 +1499,14 @@ mod tests {
     #[test]
     fn run_child_spawn_failure_returns_distinct_nonzero_code() {
         let mut c = Command::new("/definitely/not/a/real/binary-bwn-test");
-        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(1));
-        assert_eq!(code, HOOK_SPAWN_FAILED_CODE);
-        assert!(stdout.is_empty());
-        assert!(stderr.contains("spawn failed"), "{stderr}");
+        let run = run_child(&mut c, &json!({}), Duration::from_secs(1));
+        assert_eq!(run.code, HOOK_SPAWN_FAILED_CODE);
+        assert!(run.stdout.is_empty());
+        assert!(
+            matches!(&run.failure, Some(HookFailure::NotStarted(e)) if e.contains("binary-bwn-test")),
+            "{}",
+            run.status()
+        );
     }
 
     #[test]
@@ -1362,9 +1515,9 @@ mod tests {
         let mut c = Command::new("sh");
         c.args(["-c", "sleep 30"]);
         let start = Instant::now();
-        let (code, _stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_millis(300));
-        assert_eq!(code, HOOK_TIMEOUT_CODE);
-        assert!(stderr.contains("timed out"), "{stderr}");
+        let run = run_child(&mut c, &json!({}), Duration::from_millis(300));
+        assert_eq!(run.code, HOOK_TIMEOUT_CODE);
+        assert_eq!(run.status(), "timed out after 300ms");
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "watchdog must not wait for the full sleep"
@@ -1376,8 +1529,9 @@ mod tests {
     fn run_child_signal_death_is_not_exit_zero() {
         let mut c = Command::new("sh");
         c.args(["-c", "kill -9 $$"]);
-        let (code, _stdout, _stderr) = run_child(&mut c, &json!({}), Duration::from_secs(5));
-        assert_eq!(code, HOOK_SIGNAL_CODE);
+        let run = run_child(&mut c, &json!({}), Duration::from_secs(5));
+        assert_eq!(run.code, HOOK_SIGNAL_CODE + 9);
+        assert_eq!(run.status(), "was killed by signal 9");
     }
 
     #[test]
@@ -1387,10 +1541,207 @@ mod tests {
         c.args(["-c", "echo out; echo err >&2; exit 7"]);
         // Generous: the whole suite runs in parallel and spawns many children,
         // so a tight deadline turns into a load-dependent flake.
-        let (code, stdout, stderr) = run_child(&mut c, &json!({}), Duration::from_secs(60));
-        assert_eq!(code, 7);
-        assert_eq!(stdout.trim(), "out");
-        assert_eq!(stderr.trim(), "err");
+        let run = run_child(&mut c, &json!({}), Duration::from_secs(60));
+        assert_eq!(run.code, 7);
+        assert!(run.failure.is_none());
+        assert_eq!(run.stdout.trim(), "out");
+        assert_eq!(run.stderr.trim(), "err");
+    }
+
+    // Makes `settings` (a settings.json with a "hooks" block) the only hooks
+    // this thread sees while `f` runs.
+    fn with_hooks<T>(settings: &str, f: impl FnOnce() -> T) -> T {
+        let mut list = Vec::new();
+        parse_into(settings, Source::Home, &mut list);
+        assert!(!list.is_empty(), "no hooks parsed from {settings}");
+        TEST_HOOKS.with(|t| *t.borrow_mut() = Some(list));
+        let out = f();
+        TEST_HOOKS.with(|t| *t.borrow_mut() = None);
+        out
+    }
+
+    fn pre_settings(hook: Value) -> String {
+        json!({"hooks": {"PreToolUse": [{"matcher": "run_command", "hooks": [hook]}]}}).to_string()
+    }
+
+    fn run_pre(hook: Value, dir: &Path) -> PreDecision {
+        with_hooks(&pre_settings(hook), || {
+            pre_tool_use("run_command", &json!({"command": "echo hi"}), dir)
+        })
+    }
+
+    fn deny_reason(d: PreDecision) -> String {
+        match d {
+            PreDecision::Deny(r) => r,
+            PreDecision::Allow => panic!("hook allowed the call"),
+            PreDecision::Continue => panic!("hook let the call through"),
+        }
+    }
+
+    fn hook_test_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-hookrun-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_tool_use_blocks_when_the_hook_times_out() {
+        let dir = hook_test_dir("timeout");
+        let hook = json!({"type": "command", "command": "sleep 5", "timeout": 1});
+        let r = deny_reason(run_pre(hook, &dir));
+        assert!(r.contains("`sleep 5` timed out after 1s"), "{r}");
+        assert!(r.contains("blocked") && r.contains("\"timeout\""), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_when_the_hook_cannot_start() {
+        let dir = hook_test_dir("nostart");
+        let missing = dir.join("no-such-guard.sh");
+        let r = deny_reason(run_pre(
+            json!({"type": "script", "path": missing.to_string_lossy()}),
+            &dir,
+        ));
+        assert!(r.contains("could not start"), "{r}");
+        assert!(
+            r.contains("no-such-guard.sh") && r.contains("blocked"),
+            "{r}"
+        );
+        assert!(r.contains("settings.json"), "says where to remove it: {r}");
+
+        // A command hook naming a missing or non-executable script: the shell
+        // exits 127 / 126 instead of running it.
+        #[cfg(unix)]
+        {
+            let r = deny_reason(run_pre(
+                json!({"type": "command", "command": "./no-such-guard.sh"}),
+                &dir,
+            ));
+            assert!(r.contains("could not start"), "{r}");
+            std::fs::write(dir.join("guard.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+            let r = deny_reason(run_pre(
+                json!({"type": "command", "command": "./guard.sh"}),
+                &dir,
+            ));
+            assert!(r.contains("could not start"), "{r}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_tool_use_blocks_when_the_hook_is_killed() {
+        let dir = hook_test_dir("killed");
+        let script = dir.join("guard.sh");
+        std::fs::write(&script, "kill -9 $$\n").unwrap();
+        let r = deny_reason(run_pre(
+            json!({"type": "script", "path": script.to_string_lossy()}),
+            &dir,
+        ));
+        assert!(r.contains("was killed by signal 9"), "{r}");
+        assert!(r.contains("guard.sh") && r.contains("blocked"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_tool_use_keeps_exit_code_semantics() {
+        let dir = hook_test_dir("exits");
+        let cmd = |c: &str| json!({"type": "command", "command": c});
+        assert!(matches!(
+            run_pre(cmd("exit 0"), &dir),
+            PreDecision::Continue
+        ));
+        assert_eq!(
+            deny_reason(run_pre(cmd("echo no rm >&2; exit 2"), &dir)),
+            "no rm"
+        );
+        // Any other exit is a non-blocking error, even one that happens to
+        // equal an internal failure code.
+        assert!(matches!(
+            run_pre(cmd("exit 1"), &dir),
+            PreDecision::Continue
+        ));
+        assert!(matches!(
+            run_pre(cmd("exit 124"), &dir),
+            PreDecision::Continue
+        ));
+        assert!(matches!(
+            run_pre(cmd(r#"echo '{"permissionDecision":"allow"}'"#), &dir),
+            PreDecision::Allow
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn other_events_report_failed_hooks_without_blocking() {
+        let dir = hook_test_dir("other");
+        let missing = dir.join("gone.py");
+        let settings = json!({"hooks": {"UserPromptSubmit": [{"hooks": [
+            {"type": "script", "path": missing.to_string_lossy()}
+        ]}]}})
+        .to_string();
+        let r = with_hooks(&settings, || user_prompt_submit("hi", &dir));
+        assert_eq!(r, Ok(String::new()));
+
+        let cmd = HookCmd::Script(missing.clone());
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        let msg = problem_message("PostToolUse", Source::Home, &cmd, &run).unwrap();
+        assert!(
+            msg.contains("PostToolUse hook") && msg.contains("could not start"),
+            "{msg}"
+        );
+        let ok = HookRun {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            failure: None,
+        };
+        assert_eq!(problem_message("Stop", Source::Home, &cmd, &ok), None);
+        let failed = HookRun {
+            code: 1,
+            stderr: "lint failed\n".into(),
+            ..ok
+        };
+        assert_eq!(
+            problem_message(
+                "Stop",
+                Source::Project,
+                &HookCmd::Shell("lint".into()),
+                &failed
+            )
+            .as_deref(),
+            Some("Stop hook `lint` exited 1: lint failed")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_tool_use_blocks_when_a_rust_hook_does_not_compile() {
+        let rustc = Command::new("rustc").arg("--version").output();
+        let rust_script = Command::new("rust-script").arg("--version").output();
+        if !rustc.is_ok_and(|o| o.status.success()) || rust_script.is_ok() {
+            return; // needs rustc, and the compile path is skipped under rust-script
+        }
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = hook_test_dir("rust");
+        std::env::set_var("NEXUS_HOME", dir.join("home"));
+        let src = dir.join("guard.rs");
+        std::fs::write(&src, "fn main() { this is not rust }\n").unwrap();
+        let r = deny_reason(run_pre(
+            json!({"type": "script", "path": src.to_string_lossy()}),
+            &dir,
+        ));
+        std::env::remove_var("NEXUS_HOME");
+        assert!(
+            r.contains("could not start: rustc failed to compile it"),
+            "{r}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

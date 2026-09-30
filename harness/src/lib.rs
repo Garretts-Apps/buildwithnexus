@@ -589,6 +589,9 @@ fn headless(
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
+    if let Some(n) = agent::ignored_approvals_notice(&cwd) {
+        report::notice(&format!("  {n}"));
+    }
     // MCP tools must be on the surface before the first request; discovery
     // is bounded by each server's timeout, and every outcome is a notice.
     mcp::ensure_ready();
@@ -721,6 +724,9 @@ fn repl(
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
+    }
+    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+        report::notice(&format!("  {n}"));
     }
     let restored = workflow::restore();
     workflow::set_max_concurrent(settings.max_concurrent_workflows);
@@ -938,7 +944,7 @@ fn repl(
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
             let arg = perm_arg.trim();
             if arg.is_empty() {
-                handle_permissions(&mut perm);
+                handle_permissions(&mut perm, cwd);
             } else {
                 match arg {
                     "ask" | "1" => apply_permission(&mut perm, "ask"),
@@ -1297,7 +1303,7 @@ fn repl(
                 continue;
             }
             "/permissions" => {
-                handle_permissions(&mut perm);
+                handle_permissions(&mut perm, cwd);
                 continue;
             }
             "/sandbox" => {
@@ -3147,7 +3153,10 @@ fn handle_permissions_reset(cwd: &std::path::Path) {
     }
 }
 
-fn handle_permissions(perm: &mut Permission) {
+fn handle_permissions(perm: &mut Permission, cwd: &std::path::Path) {
+    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+        report::notice(&format!("  {n}"));
+    }
     let current = permission_label(perm);
     let items = vec![
         tui::SelectItem {
