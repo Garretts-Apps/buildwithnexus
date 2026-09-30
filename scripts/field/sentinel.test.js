@@ -265,7 +265,7 @@ test('a failure resets the streak and comments once; a muted signature stays clo
   assert.equal(state.writes.length, 0);
 
   state.issues[0].state_reason = 'completed';
-  r = await run(t, state, ['--checks', 'release-gap']);
+  await run(t, state, ['--checks', 'release-gap']);
   assert.equal(state.issues[0].state, 'open');
   assert.equal(state.issues.length, 1);
   assert.match(state.comments.at(-1).body, /reopened/);
@@ -393,7 +393,7 @@ test('main-red dispatches ci.yml once when HEAD has no run, and ignores [skip ci
   assert.match(state.issues[0].body, new RegExp(`sig="main-red/no-run" .*dispatched="ci\\.yml:${SHA}@`));
   assert.match(state.issues[0].body, /The sentinel dispatched ci\.yml for `aaaaaaa`/);
 
-  r = await run(t, state, ['--checks', 'main-red']);
+  await run(t, state, ['--checks', 'main-red']);
   assert.equal(state.dispatches.length, 1, 'not dispatched twice for one commit');
   assert.equal(state.issues.length, 1);
 

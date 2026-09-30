@@ -83,7 +83,7 @@ function fenceBlocks(text) {
     // An HTML comment on the line(s) just above the fence can escape a rule.
     let k = i - 1;
     let above = '';
-    while (k >= 0 && /^\s*<!--.*-->\s*$/.test(lines[k])) above = `${lines[k--]}\n${above}`;
+    while (k >= 0 && /^\s*<!--[\s\S]*?-->\s*$/.test(lines[k])) above = `${lines[k--]}\n${above}`;
     blocks.push({
       label: info.toLowerCase().replace(/^\{?\.?/, '').replace(/\}$/, ''),
       info: `${info}${rest}`.trim(),
@@ -98,6 +98,17 @@ function fenceBlocks(text) {
 }
 
 const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+// Markup inside a <pre><code> block (highlighting spans), removed until none
+// is left so a tag split around another (`<sp<b>an>`) cannot survive.
+function stripTags(html) {
+  let out = html;
+  for (let prev = ''; out !== prev; ) {
+    prev = out;
+    out = out.replace(/<[^>]*>/g, '');
+  }
+  return out;
+}
 
 export function decodeEntities(s) {
   return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
@@ -138,7 +149,7 @@ function htmlBlocks(text) {
       label: ((lang && lang[1]) || (dataLang && dataLang[1]) || '').toLowerCase(),
       info: '',
       startLine,
-      code: decodeEntities(raw.replace(/<[^>]*>/g, '')),
+      code: decodeEntities(stripTags(raw)),
       source: 'html',
       escapes: escapesIn(comment),
     });

@@ -515,7 +515,7 @@ test('first run: a verified download that runs is "ready" and then runs', { skip
   const r = launchFake(pkg, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /installed prebuilt binary \(sha256 verified\)[\s\S]*is ready/);
-  assert.match(r.stdout, new RegExp(`buildwithnexus ${VERSION.replace(/\./g, '\\.')}\\n$`));
+  assert.ok(r.stdout.endsWith(`buildwithnexus ${VERSION}\n`), r.stdout);
   assert.deepEqual(r.requests.map((u) => u.split('/').pop()), [ASSET]);
   assert.equal(JSON.parse(fs.readFileSync(pkg.marker, 'utf8')).sha256, sha256(asset));
   assert.equal(sha256(pkg.bin), sha256(asset));
