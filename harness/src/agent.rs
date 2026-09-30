@@ -2894,19 +2894,20 @@ fn spawn_subagent(
     let role = input["role"].as_str().unwrap_or("engineer");
     let isolate = input["isolate"].as_bool().unwrap_or(false);
 
-    let (run_cwd, note) = if isolate {
+    let (run_cwd, note, worktree) = if isolate {
         match make_worktree(cwd) {
             Some(wt) => {
-                let n = format!("[isolated worktree: {}]\n", wt.display());
-                (wt, n)
+                let n = format!("[isolated worktree: {}]\n", wt.path.display());
+                (wt.path.clone(), n, Some(wt))
             }
             None => (
                 cwd.to_path_buf(),
                 "[worktree unavailable — ran in place]\n".into(),
+                None,
             ),
         }
     } else {
-        (cwd.to_path_buf(), String::new())
+        (cwd.to_path_buf(), String::new(), None)
     };
 
     report::info(&format!("  ↳ subagent: {}", trace::preview(task, 80)));
@@ -2927,9 +2928,10 @@ fn spawn_subagent(
             Ok(r) => (r, false),
             Err(e) => (format!("subagent error: {e}"), true),
         };
-    if isolate {
-        cleanup_worktree(cwd, &run_cwd);
-    }
+    let result = match &worktree {
+        Some(wt) => format!("{result}\n{}", finish_worktree(cwd, wt)),
+        None => result,
+    };
     hooks::notify_with(
         "SubagentStop",
         cwd,
@@ -2955,25 +2957,101 @@ fn spawn_subagent(
     (format!("{note}{result}"), is_error)
 }
 
-fn make_worktree(cwd: &Path) -> Option<PathBuf> {
+struct Worktree {
+    path: PathBuf,
+    branch: String,
+    base: String,
+}
+
+fn make_worktree(cwd: &Path) -> Option<Worktree> {
     let id = SUB_SEQ.fetch_add(1, Ordering::Relaxed);
-    let wt = cwd.join(format!(".bwn/worktrees/sub-{}-{id}", std::process::id()));
+    let path = cwd.join(format!(".bwn/worktrees/sub-{}-{id}", std::process::id()));
     let branch = format!("bwn-sub-{}-{id}", std::process::id());
+    let base = git_out(cwd, &["rev-parse", "HEAD"])?;
     let out = Command::new("git")
         .current_dir(cwd)
         .args(["worktree", "add", "-b", &branch])
-        .arg(&wt)
+        .arg(&path)
+        .arg(&base)
         .output()
         .ok()?;
-    out.status.success().then_some(wt)
+    out.status
+        .success()
+        .then_some(Worktree { path, branch, base })
 }
 
-fn cleanup_worktree(cwd: &Path, wt: &Path) {
-    let _ = Command::new("git")
-        .current_dir(cwd)
-        .args(["worktree", "remove", "--force"])
-        .arg(wt)
-        .output();
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+// Close an isolated subagent's worktree without losing its work, and say
+// what became of it. Uncommitted edits are committed to the worktree's
+// branch first; if that fails the worktree stays where it is. A branch with
+// no new commits is deleted, one with commits is kept and named.
+fn finish_worktree(cwd: &Path, wt: &Worktree) -> String {
+    let dirty = git_out(&wt.path, &["status", "--porcelain"]).map(|s| !s.is_empty());
+    let mut saved = false;
+    if dirty != Some(false) {
+        let add = git_out(&wt.path, &["add", "-A"]);
+        // The user's identity when git has one, a local one otherwise; no
+        // hooks or signing, which could fail or prompt with no one to answer.
+        let named = git_out(&wt.path, &["config", "user.email"]).is_some();
+        let mut args = vec!["-c", "commit.gpgsign=false"];
+        if !named {
+            args.extend(["-c", "user.name=bwn", "-c", "user.email=bwn@localhost"]);
+        }
+        args.extend([
+            "commit",
+            "--no-verify",
+            "-q",
+            "-m",
+            "bwn: uncommitted work from an isolated subagent",
+        ]);
+        if add.is_none() || git_out(&wt.path, &args).is_none() {
+            return format!(
+                "[isolated worktree kept: the subagent left uncommitted changes that could \
+                 not be committed; they are in {} (branch {})]",
+                wt.path.display(),
+                wt.branch
+            );
+        }
+        saved = true;
+    }
+    let range = format!("{}..{}", wt.base, wt.branch);
+    let commits = git_out(cwd, &["rev-list", "--count", &range])
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let removed = git_out(cwd, &["worktree", "remove", &wt.path.to_string_lossy()]).is_some();
+    if !removed {
+        return format!(
+            "[isolated worktree kept: {} could not be removed; its work is on branch {}]",
+            wt.path.display(),
+            wt.branch
+        );
+    }
+    if commits == 0 {
+        let _ = git_out(cwd, &["branch", "-D", &wt.branch]);
+        return "[isolated worktree removed: the subagent changed no files]".into();
+    }
+    let how = if saved {
+        "including its uncommitted changes, committed for it"
+    } else {
+        "as the subagent committed it"
+    };
+    format!(
+        "[isolated worktree removed; its work is NOT in this checkout. {commits} commit(s) \
+         on branch {} ({how}). Review with `git log -p {range}`, bring in with \
+         `git merge {}`]",
+        wt.branch, wt.branch
+    )
 }
 
 fn parse_plan_steps(plan_text: &str) -> Vec<String> {
@@ -5840,5 +5918,99 @@ mod tests {
         std::env::set_current_dir(old_cwd).unwrap();
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn git_repo(name: &str) -> (PathBuf, impl Fn(&[&str]) -> String) {
+        let repo = std::env::temp_dir().join(format!("bwn-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let dir = repo.clone();
+        let git = move |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "old").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        (repo, git)
+    }
+
+    #[test]
+    fn isolated_subagent_uncommitted_edit_is_kept_and_reported() {
+        let (repo, git) = git_repo("wt-dirty");
+        let wt = make_worktree(&repo).unwrap();
+        // The subagent edits a tracked file and adds one, committing neither.
+        std::fs::write(wt.path.join("a.txt"), "subagent edit").unwrap();
+        std::fs::write(wt.path.join("new.txt"), "added").unwrap();
+        let report = finish_worktree(&repo, &wt);
+        let a = git(&["show", &format!("{}:a.txt", wt.branch)]);
+        let new = git(&["show", &format!("{}:new.txt", wt.branch)]);
+        let head = git(&["show", "HEAD:a.txt"]);
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!((a.as_str(), new.as_str()), ("subagent edit", "added"));
+        assert_eq!(head, "old", "the parent's checkout is left alone");
+        assert!(report.contains(&wt.branch), "{report}");
+        assert!(report.contains("NOT in this checkout"), "{report}");
+        assert!(
+            report.contains("uncommitted changes, committed for it"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn isolated_subagent_commits_are_named_and_no_change_is_cleaned_up() {
+        let (repo, git) = git_repo("wt-commit");
+        let wt = make_worktree(&repo).unwrap();
+        std::fs::write(wt.path.join("a.txt"), "committed").unwrap();
+        let wgit = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&wt.path)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        wgit(&["commit", "-qam", "sub"]);
+        let report = finish_worktree(&repo, &wt);
+        assert!(report.contains("1 commit(s)"), "{report}");
+        assert!(report.contains("as the subagent committed it"), "{report}");
+        assert!(!wt.path.exists());
+
+        let idle = make_worktree(&repo).unwrap();
+        let report = finish_worktree(&repo, &idle);
+        let branches = git(&["branch", "--list", &idle.branch]);
+        let _ = std::fs::remove_dir_all(&repo);
+        assert!(report.contains("changed no files"), "{report}");
+        assert!(!idle.path.exists());
+        assert!(branches.is_empty(), "empty branch left behind: {branches}");
+    }
+
+    #[test]
+    fn isolated_subagent_worktree_is_kept_when_its_changes_cannot_be_committed() {
+        let (repo, git) = git_repo("wt-keep");
+        let wt = make_worktree(&repo).unwrap();
+        std::fs::write(wt.path.join("a.txt"), "unsaved").unwrap();
+        // A lock git cannot take makes `git add` fail.
+        let index = git(&["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+        let wt_index = Command::new("git")
+            .current_dir(&wt.path)
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+            .output()
+            .unwrap();
+        let wt_index = String::from_utf8_lossy(&wt_index.stdout).trim().to_string();
+        assert_ne!(index, wt_index);
+        std::fs::write(format!("{wt_index}.lock"), "").unwrap();
+        let report = finish_worktree(&repo, &wt);
+        let kept = std::fs::read_to_string(wt.path.join("a.txt")).ok();
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(kept.as_deref(), Some("unsaved"));
+        assert!(report.contains("isolated worktree kept"), "{report}");
+        assert!(report.contains(&wt.path.display().to_string()), "{report}");
     }
 }

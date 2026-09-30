@@ -2198,56 +2198,107 @@ const SENSITIVE_FILES: &[&str] = &[
     ".env",
 ];
 
-fn is_sensitive_dir_name(name: &str) -> bool {
-    SENSITIVE_DIRS.contains(&name)
+fn is_sensitive_dir_name(name: &str, windows: bool) -> bool {
+    SENSITIVE_DIRS.iter().any(|d| name_is(name, d, windows))
 }
 
-fn is_sensitive_file_name(name: &str) -> bool {
-    SENSITIVE_FILES.contains(&name)
+fn is_sensitive_file_name(name: &str, windows: bool) -> bool {
+    SENSITIVE_FILES.iter().any(|f| name_is(name, f, windows))
         || name.starts_with(".env.")
         || ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
             .iter()
-            .any(|k| name.starts_with(k))
+            .any(|k| name.starts_with(k) || (windows && is_short_name_of(name, k)))
         || [".pem", ".p12", ".pfx"].iter().any(|e| name.ends_with(e))
 }
 
-fn sensitive_components(p: &Path) -> bool {
-    let names: Vec<String> = p
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
-        .collect();
-    names.iter().any(|n| is_sensitive_dir_name(n))
-        || names.windows(2).any(|w| {
-            SENSITIVE_SUBPATHS
-                .iter()
-                .any(|s| w[0] == s[0] && w[1] == s[1])
-        })
-        || names.last().is_some_and(|n| is_sensitive_file_name(n))
+// `name` is `long`, or on Windows its 8.3 short name (`SSH~1` for `.ssh`,
+// `GIT-CR~1` for `.git-credentials`), which opens the same file.
+fn name_is(name: &str, long: &str, windows: bool) -> bool {
+    name == long || (windows && is_short_name_of(name, long))
+}
+
+// A short name keeps up to six characters of the long name's base (leading
+// dots and embedded dots dropped), then `~N` and up to three of its extension.
+fn is_short_name_of(name: &str, long: &str) -> bool {
+    let Some((stem, tail)) = name.split_once('~') else {
+        return false;
+    };
+    let digits = tail.split('.').next().unwrap_or("");
+    if stem.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let long = long.trim_start_matches('.');
+    let base = long.rsplit_once('.').map_or(long, |(b, _)| b);
+    let base: String = base.chars().filter(|c| !matches!(c, '.' | ' ')).collect();
+    base.starts_with(stem)
+}
+
+// A path's lowercased component names. With `windows` the path is read as
+// Windows reads it, whatever the host: `\` and `/` both separate, a drive,
+// UNC or device prefix (`C:`, `\\?\`, `\\.\`, `\??\`) is dropped,
+// trailing dots and spaces are ignored (`.ssh.` opens `.ssh`) and a stream
+// suffix names its file (`.env::$DATA`).
+fn path_names(p: &Path, windows: bool) -> Vec<String> {
+    if !windows {
+        return p
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+                _ => None,
+            })
+            .collect();
+    }
+    let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let mut rest = s.as_str();
+    for prefix in ["//?/unc/", "//?/", "//./", "/??/"] {
+        if let Some(r) = rest.strip_prefix(prefix) {
+            rest = r;
+            break;
+        }
+    }
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        rest = &rest[2..];
+    }
+    let mut names: Vec<String> = Vec::new();
+    for comp in rest.split('/') {
+        let comp = comp.split(':').next().unwrap_or("");
+        match comp {
+            "" | "." => {}
+            ".." => {
+                names.pop();
+            }
+            _ => {
+                let comp = comp.trim_end_matches(['.', ' ']);
+                if !comp.is_empty() {
+                    names.push(comp.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn sensitive_names(names: &[String], windows: bool, in_project: bool) -> bool {
+    names.iter().any(|n| {
+        // A project's own `.buildwithnexus` (instructions, skills) is
+        // ordinary repo content.
+        !(in_project && n == ".buildwithnexus") && is_sensitive_dir_name(n, windows)
+    }) || names.windows(2).any(|w| {
+        SENSITIVE_SUBPATHS
+            .iter()
+            .any(|s| name_is(&w[0], s[0], windows) && name_is(&w[1], s[1], windows))
+    }) || names
+        .last()
+        .is_some_and(|n| is_sensitive_file_name(n, windows))
 }
 
 /// Sensitivity of a path inside a project tree, relative to its root: the
 /// same credential names as `is_sensitive`, except that the project's own
 /// `.buildwithnexus` (instructions, skills) is ordinary repo content.
 pub fn is_sensitive_in_project(rel: &Path) -> bool {
-    let names: Vec<String> = rel
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
-        .collect();
-    names
-        .iter()
-        .any(|n| n != ".buildwithnexus" && is_sensitive_dir_name(n))
-        || names.windows(2).any(|w| {
-            SENSITIVE_SUBPATHS
-                .iter()
-                .any(|s| w[0] == s[0] && w[1] == s[1])
-        })
-        || names.last().is_some_and(|n| is_sensitive_file_name(n))
+    let windows = cfg!(windows);
+    sensitive_names(&path_names(rel, windows), windows, true)
 }
 
 // Paths that should never be read/written without explicit confirmation, even in
@@ -2255,7 +2306,14 @@ pub fn is_sensitive_in_project(rel: &Path) -> bool {
 // Checked on the lexical path and on the symlink-resolved one, so a link in
 // the workspace pointing at ~/.ssh is caught too.
 pub fn is_sensitive(p: &Path) -> bool {
-    sensitive_components(&normalize(p)) || sensitive_components(&canonicalize_lenient(p))
+    is_sensitive_for(p, cfg!(windows))
+}
+
+/// `is_sensitive` with the platform passed in, so tests can run the Windows
+/// path rules anywhere.
+fn is_sensitive_for(p: &Path, windows: bool) -> bool {
+    let check = |q: &Path| sensitive_names(&path_names(q, windows), windows, false);
+    check(&normalize(p)) || check(&canonicalize_lenient(p))
 }
 
 // Shell glob match for one path component (`*`, `?`, `[...]` as any one
@@ -2293,14 +2351,37 @@ fn glob_component_is_sensitive(comp: &str) -> bool {
 /// The first path-like argument of a shell command that names a sensitive
 /// path (`cat ~/.aws/credentials`, `--file=$HOME/.netrc`). Quotes and
 /// backslashes are stripped and `~`/`$HOME` expanded first; glob components
-/// are matched against the sensitive names.
+/// are matched against the sensitive names. A word is also read as a Windows
+/// path, with `\` separating, on Windows or when it has a backslash
+/// (`C:\Users\me\.ssh\id_rsa` passed to cmd or PowerShell from anywhere).
 pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    command_sensitive_path_for(cmd, cwd, cfg!(windows))
+}
+
+fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| h.to_string_lossy().into_owned());
     for raw in cmd.split(|c: char| {
         c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`')
     }) {
+        let unquoted: String = raw.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
+        let win = unquoted.rsplit('=').next().unwrap_or("");
+        // PowerShell's `-Path:value`.
+        let win = match win.strip_prefix('-') {
+            Some(p) => p.split_once(':').map_or("", |(_, v)| v),
+            None => win,
+        };
+        if (windows || win.contains('\\')) && !win.is_empty() {
+            let names = path_names(Path::new(win), true);
+            if sensitive_names(&names, true, false)
+                || names
+                    .iter()
+                    .any(|n| n.contains(['*', '?', '[']) && glob_component_is_sensitive(n))
+            {
+                return Some(PathBuf::from(win));
+            }
+        }
         let tok: String = raw
             .chars()
             .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -2315,7 +2396,7 @@ pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
             None => tok,
         };
         let p = resolve(cwd, &tok);
-        if is_sensitive(&p) {
+        if is_sensitive_for(&p, windows) {
             return Some(p);
         }
         if tok.contains(['*', '?', '[']) {
@@ -2796,12 +2877,131 @@ pub fn catastrophic(cmd: &str) -> bool {
             if arg.starts_with('-') {
                 continue;
             }
-            if matches!(*arg, "~" | "~/" | "*" | "." | "..") || arg.starts_with('/') {
+            if matches!(*arg, "~" | "~/" | "~\\" | "*" | "." | "..")
+                || arg.starts_with(['/', '\\'])
+                || is_drive_path(arg)
+            {
                 return true;
             }
         }
     }
+    windows_destructive(&lower)
+}
+
+// Windows commands that destroy data or weaken the system whatever their
+// target: cmd's recursive or unconfirmed deletes, PowerShell's recursive
+// forced Remove-Item under any alias, disk, boot and registry tools,
+// ownership or ACL changes on system paths, execution-policy changes, and
+// encoded PowerShell, whose script no check here can read. Matched on every
+// word, so a call wrapped in `cmd /c` or `powershell -Command` counts too.
+fn windows_destructive(lower: &str) -> bool {
+    let toks: Vec<&str> = lower
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '{' | '}' | '"' | '\'' | '`' | ','
+                )
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // cmd reads `rd/s/q` as `rd /s /q`.
+        let (name, glued) = match tok.split_once('/') {
+            Some((n, g)) if matches!(n, "rd" | "rmdir" | "del" | "erase" | "cipher") => {
+                (n.to_string(), g)
+            }
+            _ => (normalized_bin(tok), ""),
+        };
+        let rest = &toks[i + 1..];
+        let switch = |want: &dyn Fn(&str) -> bool| {
+            glued.split('/').any(&want)
+                || rest
+                    .iter()
+                    .filter_map(|t| t.strip_prefix('/'))
+                    .any(|t| t.split('/').any(&want))
+        };
+        // PowerShell parameters take any unambiguous prefix and `:value`.
+        let param = |full: &str, min: usize| {
+            rest.iter().any(|t| {
+                let p = t.strip_prefix('-').unwrap_or("");
+                let p = p.split(':').next().unwrap_or(p);
+                p.len() >= min && full.starts_with(p)
+            })
+        };
+        let remove_item = matches!(name.as_str(), "remove-item" | "ri");
+        let hit = match name.as_str() {
+            "rd" | "rmdir" if switch(&|s| s == "s") => true,
+            "del" | "erase" if switch(&|s| s == "s" || s == "q") => true,
+            "cipher" => switch(&|s| s.starts_with('w')),
+            "format" => rest.iter().any(|t| is_drive_root(t)),
+            "diskpart" | "bcdedit" | "set-executionpolicy" | "format-volume" | "clear-disk" => true,
+            "reg" => rest.first() == Some(&"delete"),
+            "takeown" | "icacls" => rest.iter().any(|t| is_windows_system_path(t)),
+            "powershell" | "pwsh" => rest.iter().any(|t| {
+                let p = t.strip_prefix(['-', '/']).unwrap_or("");
+                let p = p.split(':').next().unwrap_or(p);
+                p == "ec" || (!p.is_empty() && "encodedcommand".starts_with(p))
+            }),
+            _ => false,
+        };
+        // Remove-Item and its aliases. `-fo` is not a Unix rm flag, so next
+        // to it `-r` is PowerShell's -Recurse.
+        let hit = hit
+            || (remove_item || matches!(name.as_str(), "rm" | "rd" | "rmdir" | "del" | "erase"))
+                && param("recurse", 1)
+                && param("force", 2);
+        if hit {
+            return true;
+        }
+    }
     false
+}
+
+// An absolute Windows path: `c:\...` or `c:/...`.
+fn is_drive_path(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+// `c:`, `c:\` or `c:/`.
+fn is_drive_root(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && t[2..].chars().all(|c| matches!(c, '\\' | '/'))
+}
+
+// A drive root or the Windows, Program Files or Users tree, lowercased.
+fn is_windows_system_path(t: &str) -> bool {
+    if [
+        "%systemroot%",
+        "%windir%",
+        "%programfiles",
+        "$env:systemroot",
+        "$env:windir",
+    ]
+    .iter()
+    .any(|v| t.contains(v))
+        || t.starts_with("$env:programfiles")
+    {
+        return true;
+    }
+    let t = t.replace('\\', "/");
+    let t = t
+        .strip_prefix("//?/")
+        .or_else(|| t.strip_prefix("//./"))
+        .unwrap_or(&t);
+    let b = t.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return false;
+    }
+    let r = t[2..].trim_matches('/');
+    r.is_empty()
+        || r == "*"
+        || r == "users"
+        || ["windows", "program"].iter().any(|d| r.starts_with(d))
 }
 
 fn truncate(s: String, max: usize) -> String {
@@ -2922,7 +3122,7 @@ fn skip_dir(path: &Path) -> bool {
             | ".cache"
             | "vendor"
             | "__pycache__"
-    ) || is_sensitive_dir_name(&name.to_lowercase())
+    ) || is_sensitive_dir_name(&name.to_lowercase(), cfg!(windows))
 }
 
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
@@ -7475,10 +7675,71 @@ print("hello " + data.get("name", "world"))
             ".\\cat.exe x",
             "C:\\evil\\ls.exe",
         ];
-        for c in corpus {
+        // Windows commands that destroy data or weaken the system: never
+        // read-only, and dangerous, so they prompt even in auto mode and
+        // past a saved approval.
+        let windows_destructive = [
+            "rd /s /q C:\\proj",
+            "RD /S build",
+            "rmdir /s /q build",
+            "cmd /c rd/s/q build",
+            "del /s /q *",
+            "del /q C:\\proj\\*.rs",
+            "erase /s *.txt",
+            "format D: /q",
+            "format.com C:",
+            "Remove-Item -Recurse -Force C:\\proj",
+            "remove-item build -r -fo",
+            "ri -Recurse:$true -Force build",
+            "rm -Recurse -Force build",
+            "del -recurse -force build",
+            "rmdir -Rec -Fo build",
+            "powershell -Command \"Remove-Item -Recurse -Force build\"",
+            "cipher /w:C:\\",
+            "diskpart /s script.txt",
+            "reg delete HKCU\\Software\\X /f",
+            "reg.exe delete HKLM\\SYSTEM\\X",
+            "bcdedit /set {default} recoveryenabled No",
+            "takeown /f C:\\Windows\\System32 /r",
+            "icacls C:\\ /grant Everyone:F",
+            "icacls \"C:\\Program Files\\X\" /reset",
+            "icacls %SystemRoot%\\System32 /grant x:F",
+            "Set-ExecutionPolicy Unrestricted -Scope CurrentUser",
+            "powershell -EncodedCommand ZQBjAGgAbwA=",
+            "pwsh -enc ZQBjAGgAbwA=",
+            "powershell.exe -e ZQBjAGgAbwA=",
+            "powershell /ec ZQBjAGgAbwA=",
+        ];
+        for c in corpus.iter().chain(&windows_destructive) {
             assert!(
                 !is_readonly_command(c),
                 "bypass classified read-only: {c:?}"
+            );
+        }
+        for c in windows_destructive {
+            assert!(
+                catastrophic(c),
+                "Windows destructive command skips the prompt: {c:?}"
+            );
+        }
+        for c in [
+            "rm -rf ./build",
+            "rm -r -f build",
+            "rd build",
+            "del notes.txt",
+            "Remove-Item build",
+            "rm -Force stale.log",
+            "reg query HKCU\\Software\\X",
+            "icacls C:\\proj\\out.txt",
+            "takeown /f C:\\proj\\out.txt",
+            "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+            "cargo fmt --all",
+            "git log --format=%H",
+            "cipher /e secret",
+        ] {
+            assert!(
+                !catastrophic(c),
+                "ordinary command counted destructive: {c:?}"
             );
         }
         // A bare-name approval must not cover a path-qualified invocation.
@@ -7632,6 +7893,89 @@ print("hello " + data.get("name", "world"))
         }
         for c in ["grep foo *", "ls src", "cat README.md", "rg -n token src"] {
             assert!(command_sensitive_path(c, cwd).is_none(), "{c} should pass");
+        }
+    }
+
+    #[test]
+    fn windows_forms_of_sensitive_paths_are_sensitive() {
+        for p in [
+            "C:\\Users\\me\\.ssh\\id_rsa",
+            "c:/users/me/.SSH/config",
+            "C:\\Users\\me\\.aws\\credentials",
+            "\\\\?\\C:\\Users\\me\\.ssh\\id_rsa",
+            "\\\\.\\C:\\Users\\me\\.gnupg",
+            "\\??\\C:\\Users\\me\\.kube\\config",
+            "\\\\?\\UNC\\host\\share\\me\\.netrc",
+            "\\\\host\\share\\proj\\.env",
+            "C:\\Users\\me\\.ssh.\\id_ed25519",
+            "C:\\proj\\.env. ",
+            "C:\\proj\\.env::$DATA",
+            "C:\\Users\\me\\SSH~1\\config",
+            "C:\\Users\\me\\GIT-CR~1",
+            "C:\\Users\\me\\.docker\\CONFIG~1.JSO",
+            "C:\\Users\\me\\keys\\ID_ED2~1",
+            "C:\\proj\\src\\..\\.env.local",
+        ] {
+            assert!(
+                is_sensitive_for(Path::new(p), true),
+                "{p} should be sensitive"
+            );
+        }
+        for p in [
+            "C:\\Users\\me\\proj\\src\\main.rs",
+            "C:\\Users\\me\\.ssh\\..\\notes.txt",
+            "C:\\Users\\me\\PROGRA~1\\x",
+            "C:\\Users\\me\\.docker\\other.json",
+        ] {
+            assert!(
+                !is_sensitive_for(Path::new(p), true),
+                "{p} should not be sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn command_sensitive_path_reads_windows_paths() {
+        let cwd = Path::new("/w");
+        // Any host: a backslash path is handed to cmd or PowerShell as is.
+        for c in [
+            "rg . C:\\Users\\me\\.ssh\\id_rsa",
+            "type \"C:\\Users\\me\\.aws\\credentials\"",
+            "powershell.exe -c 'Get-Content $env:USERPROFILE\\.ssh\\id_rsa'",
+            "cmd.exe /c type \\\\?\\C:\\Users\\me\\.netrc",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, false).is_some(),
+                "{c} should be flagged"
+            );
+        }
+        // On Windows, forward slashes, relative paths and short names too.
+        for c in [
+            "rg . C:/Users/me/.ssh/id_rsa",
+            "type .ssh/id_rsa",
+            "Get-Content C:/Users/me/SSH~1/id_rsa",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, true).is_some(),
+                "{c} should be flagged on Windows"
+            );
+        }
+        // PowerShell wildcards and `-Param:value` on any host.
+        for c in [
+            "Get-Content C:\\Users\\me\\.ss?\\config",
+            "type C:\\Users\\me\\.a*\\credentials",
+            "Get-Content -Path:C:\\Users\\me\\.ssh\\id_rsa",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, false).is_some(),
+                "{c} should be flagged"
+            );
+        }
+        assert!(
+            command_sensitive_path_for("gc -Path:C:/Users/me/.ssh/id_rsa", cwd, true).is_some()
+        );
+        for c in ["rg -n token src", "type C:\\proj\\README.md"] {
+            assert!(command_sensitive_path_for(c, cwd, true).is_none(), "{c}");
         }
     }
 
@@ -7882,6 +8226,26 @@ print("hello " + data.get("name", "world"))
             "rm --recursive --force /",
         ] {
             assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+    }
+
+    #[test]
+    fn catastrophic_windows_drive_targets_and_powershell_forms() {
+        for c in [
+            "rm -rf C:\\",
+            "rm -rf C:/",
+            "rm -rf c:\\Users\\me",
+            "rm -r -f D:/data",
+            "rm -rf ~\\",
+            "rm -r -fo build",
+            "rm -r -Force C:\\proj",
+            "Format-Volume -DriveLetter D",
+            "Clear-Disk -Number 1 -RemoveData",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+        for c in ["rm -rf .\\build", "rm -r -f build", "rm -rf cache:x"] {
+            assert!(!catastrophic(c), "{c} should be allowed");
         }
     }
 
