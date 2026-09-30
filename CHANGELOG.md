@@ -6,7 +6,103 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - Unreleased
+
+An install IT can approve, and trust you grant explicitly. This minor release
+changes some defaults; every change and the setting that restores the old
+behavior is listed in [docs/UPGRADING-0.15.md](docs/UPGRADING-0.15.md).
+
+### Security
+- **Repo prompts and skills need folder trust.** A project's
+  `.buildwithnexus/system.md` takes effect only after you trust the folder, and
+  is added after your own `~/.buildwithnexus/system.md` instead of replacing it.
+  A project skill can no longer replace a bundled or user skill of the same name
+  (such as `security-review`); it loads as `/project:<name>` with a notice. A
+  `skill_dirs` entry from project settings counts as the project's own, even as
+  an absolute path.
+- **The trust prompt shows what will run.** Each hook's command line, each
+  project MCP server's command and arguments (the way bwn actually starts it, so
+  a stdio server can't hide behind a harmless `url`), and a preview of the
+  project system.md, all sanitized for the terminal.
+- **Trust covers the files that run.** Scripts a hook or MCP server runs from
+  the repo, files named by a bare word, and the `package.json`, `Makefile` or
+  `justfile` a runner uses (including `make -C sub`, `cd web && npm test`,
+  `npm --prefix api`) are pinned; editing one asks again.
+- **Windows paths get the same protection.** Sensitive-path checks understand
+  backslashes, drive letters, UNC and `\\?\` prefixes, any case, trailing dots,
+  `::$DATA` streams, 8.3 short names, wildcards and PowerShell's `-Path:value`,
+  so `rg . C:\Users\me\.ssh\id_rsa` asks first.
+- **Windows destructive commands always prompt,** even in auto mode or with a
+  saved approval: rd/rmdir /s, del/erase /s or /q, format, Format-Volume,
+  Clear-Disk, diskpart, Remove-Item -Recurse -Force and its aliases (including
+  `rm -r -fo`), `rm -rf` on a drive path, cipher /w, reg delete, bcdedit,
+  takeown/icacls on system paths, Set-ExecutionPolicy and
+  `powershell -EncodedCommand`.
+
+### Added
+- **Corporate proxies and TLS inspection.** bwn's own HTTP (providers, web
+  tools, MCP over HTTP, update check, local server probes) honors
+  `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` (hosts, subdomains,
+  IPs, CIDR blocks, `*`); local model servers on loopback are always reached
+  directly. HTTPS trusts the operating system's certificate store as well as
+  the bundled roots, and `SSL_CERT_FILE`/`SSL_CERT_DIR`. An untrusted
+  certificate fails at once with a message naming `SSL_CERT_FILE`.
+- **Distinct exit codes for headless runs.** `bwn run`, `plan` and
+  `brainstorm` exit 4 when a hook blocked the task, 5 when `--max-budget-usd`
+  stopped it, 6 when it ran out of steps, 7 when `check_work` still failed and
+  8 when the verifier still blocked. They used to exit 0 and print "done". The
+  last `--json` event is now `{"type":"result","outcome":…,"exit_code":…}`.
+- **A versioning contract.** [docs/VERSIONING.md](docs/VERSIONING.md) says
+  what a minor and a patch release may change before 1.0 for CLI flags,
+  settings keys, `--json` events, session files and exit codes. Every `--json`
+  event and session file carries `"schema_version": 1`; older session files
+  still load.
+
 ### Changed
+- **The binary lives outside the npm package,** in
+  `~/.buildwithnexus/bin/<version>/` (or `$NEXUS_HOME/bin/<version>/`), so
+  `npm update` no longer deletes it and the same version is not downloaded
+  again. Binaries earlier releases put in the package still run.
+- **Auto-update stays within your minor version.** `"auto_update": "install"`
+  installs patch releases only; a new minor or major is announced with its
+  install command. `"install-any"` installs any newer release.
+- **The Windows exe no longer needs the Visual C++ runtime.** It links the C
+  runtime statically, and CI fails if it imports a VC++ runtime DLL.
+- **Isolated subagents keep their work.** Uncommitted edits were force-deleted
+  when a subagent finished; they are now committed to its `bwn-sub-*` branch,
+  and the result names the branch and how to review or merge it.
+- The OpenRouter preset's default model is a current one; the retired default
+  is gone. All built-in model ids live in one preset table.
+
+### Fixed
+- `/model` on the same provider keeps its saved `base_url`, so a remote Ollama
+  host or a LAN llama.cpp/LM Studio server stays in use; llama.cpp and LM
+  Studio swaps probe the saved URL; a server that only answers as
+  `local-model` is reported as such.
+- Windows: `llama-server.exe` is found on PATH, so the `/model` picker and
+  llama.cpp auto-start work.
+- Compacting a conversation keeps earlier images while they fit the context
+  window (at most 4, most recent first) and notes how many were dropped.
+- Ollama models that don't support thinking are retried without it instead of
+  failing with HTTP 400.
+- `auto_update` recognises the downloaded binary when the home directory goes
+  through a symlink.
+- A proxy URL's error message no longer shows part of a password.
+
+### Release process
+- Releases are drafts until every binary, checksum and the SBOM are uploaded
+  and attested and crates.io is published. v0.14.9 was public for about three
+  minutes with no binaries.
+- Before npm publish, the exact tarball is installed in clean containers
+  (Ubuntu 22.04, Debian bookworm, Debian bullseye below the glibc floor,
+  Alpine); any failure stops the publish, and the tested file is the one
+  published.
+- CI fails when the version differs between package.json, both Cargo.toml
+  files and Cargo.lock, or when an untagged version has no CHANGELOG section.
+- publish.yml no longer has a version-bump input, which could tag a version
+  release.yml never built.
+
+### Changed (after 0.14.10)
 - **npm publishing is OIDC only.** The steps that tried to register the
   `buildwithnexus-<os>-<cpu>` names and deprecate old versions are removed:
   both need a long-lived npm token, and npm's OIDC publishing can do neither.
