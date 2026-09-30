@@ -1,0 +1,45 @@
+Reconstructed Windows Server 2022 install steps showing the patterns behind
+U25-U28 and U30 in the field-testing issue list. Written for the lint tests;
+not the original chat text. Each fence is meant to be pasted on its own.
+
+1. Windows Terminal:
+```powershell
+winget install --id Microsoft.WindowsTerminal -e
+```
+
+2. Find the current Node LTS:
+```powershell
+$v = (Invoke-RestMethod https://nodejs.org/dist/index.json | Where-Object lts | Select-Object -First 1).version; $v
+```
+
+3. Download it:
+```powershell
+Invoke-WebRequest "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile node.msi
+```
+
+4. Install it and check:
+```powershell
+Start-Process msiexec.exe -ArgumentList '/i','node.msi','/qn' -Wait
+node -v
+```
+
+5. Add ripgrep to PATH:
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','Machine') + ';C:\tools\ripgrep', 'Machine')
+```
+
+6. Start Ollama, then pull a model:
+```powershell
+Start-Process ollama -ArgumentList serve -WindowStyle Hidden
+```
+```powershell
+ollama pull qwen3-vl:2b
+```
+
+7. Find out why buildwithnexus.exe disappeared:
+```powershell
+Get-MpThreatDetection | Select-Object -Last 3 InitialDetectionTime, Resources
+```
+```powershell
+Add-MpPreference -ExclusionPath "$env:APPDATA\npm\node_modules\buildwithnexus\bin"
+```

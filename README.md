@@ -151,11 +151,14 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600).
 
-**Local models.** No key is needed. Start the server, then pick it in
-`bwn init`, or pass `--provider` on a headless run:
+**Local models.** No key is needed. The Ollama app and its Linux service
+start the server for you; without them (WSL without systemd, for example),
+run `ollama serve` in a second terminal. Check that it answers, then pick it
+in `bwn init`, or pass `--provider` on a headless run. These lines work the
+same in bash, zsh and PowerShell:
 
 ```bash
-ollama serve                 # listens on http://localhost:11434
+ollama list                  # lists your models; "could not connect" means no server
 ollama pull llama3.2         # the default Ollama model
 bwn init                     # choose Ollama
 bwn run --provider ollama --model llama3.2 "summarize this repo"

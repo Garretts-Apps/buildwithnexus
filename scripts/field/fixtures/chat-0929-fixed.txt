@@ -1,0 +1,96 @@
+Corrected versions of the blocks in chat-0929-wsl.txt and chat-0929-windows.txt
+that failed on the user's machines. Each section is linted on its own and must
+come back with no findings, so every block works pasted into a new window.
+
+### U07: the one-paste setup script, without exec, ending in a check
+
+bwn opens as its own step afterwards, so a failing step is the last thing on
+screen and the shell is still there:
+```bash
+cat > ~/bwn-vision-setup.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+MODEL=gemma3:4b
+sudo apt-get update -y
+sudo apt-get install -y curl ca-certificates zstd imagemagick fonts-dejavu-core
+command -v ollama >/dev/null || curl -fsSL https://ollama.com/install.sh | sh
+curl -sf http://localhost:11434/api/version || { echo 'Ollama is not answering: start it with ollama serve'; exit 1; }
+ollama pull "$MODEL"
+ollama list
+EOF
+chmod +x ~/bwn-vision-setup.sh && ~/bwn-vision-setup.sh
+```
+```bash
+cd /devsafe/vision-test && bwn --provider ollama --model gemma3:4b --prompt "Read @test.png and write every piece of text you can see in it, plus the shapes and colours, to image-notes.md"
+```
+
+### U08: start the server in the background and fail loudly if it never answers
+
+```bash
+nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+for _ in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 1; done
+curl -sf http://localhost:11434/api/version || tail -n 20 /devsafe/ollama/serve.log
+```
+
+### U10: leave npm's prefix alone
+
+With nvm, fnm or volta `npm install -g` needs no sudo and no prefix; with a
+system Node, put sudo in front:
+```bash
+node -v && npm config get prefix
+```
+```bash
+npm install -g buildwithnexus@latest
+BWN_ALLOW_BOOTSTRAP=1 bwn --version
+```
+
+### U25: winget where it exists, the release zip where it does not
+
+```powershell
+if (Get-Command winget -ErrorAction SilentlyContinue) {
+  winget install --id Microsoft.WindowsTerminal -e --accept-source-agreements --accept-package-agreements
+} else {
+  $a = (Invoke-RestMethod https://api.github.com/repos/microsoft/terminal/releases/latest).assets | Where-Object name -like 'Microsoft.WindowsTerminal_*_x64.zip' | Select-Object -First 1
+  Invoke-WebRequest -UseBasicParsing $a.browser_download_url -OutFile "$env:TEMP\wt.zip"
+  Expand-Archive "$env:TEMP\wt.zip" C:\tools\wt -Force
+}
+(Get-Command wt.exe -ErrorAction SilentlyContinue).Source, (Get-ChildItem C:\tools\wt -Recurse -Filter wt.exe -ErrorAction SilentlyContinue).FullName
+```
+
+### U26: read the version, download and check in one block
+
+```powershell
+$v = ((Invoke-RestMethod https://nodejs.org/dist/index.json) | Where-Object lts | Select-Object -First 1).version
+if (-not $v) { throw 'Could not read the current Node LTS version.' }
+Invoke-WebRequest -UseBasicParsing "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile C:\dev\installers\node.msi
+Get-Item C:\dev\installers\node.msi | Select-Object Name, Length
+```
+
+### U27: the user's own PATH, which needs no admin
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';C:\tools\ffmpeg\bin;C:\tools\ripgrep', 'User')
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+Get-Command ffmpeg, rg | Select-Object Source
+```
+
+### U28: check for admin, wait for msiexec, read its exit code, refresh PATH
+
+```powershell
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { throw 'The Node MSI installs for all users: open PowerShell with Run as administrator.' }
+$p = Start-Process msiexec.exe -ArgumentList '/i','C:\dev\installers\node.msi','/qn','/norestart' -Wait -PassThru
+if ($p.ExitCode -notin 0, 3010) { throw "The Node MSI failed with exit code $($p.ExitCode)" }
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+node -v
+```
+
+### U30: find out which security product is installed before any Defender cmdlet
+
+```powershell
+Get-Service | Where-Object DisplayName -match 'CrowdStrike|Falcon|SentinelOne|Sophos|Carbon Black|Cylance|Symantec|McAfee|Trellix|Trend Micro|Cortex|Defender' | Select-Object Status, DisplayName
+```
+Only if that lists Defender and nothing else:
+```powershell
+Get-MpThreatDetection | Sort-Object InitialDetectionTime | Select-Object -Last 3 InitialDetectionTime, ThreatID, Resources | Format-List
+```

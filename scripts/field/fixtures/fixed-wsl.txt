@@ -1,0 +1,47 @@
+Fixed versions of bad-wsl-setup.sh: numbered blocks that each end in a check,
+no exec, a readiness wait that fails loudly, and npm's prefix left alone.
+
+1. Start Ollama if nothing answers, and wait for it:
+```bash
+mkdir -p /devsafe/ollama/models && export OLLAMA_MODELS=/devsafe/ollama/models
+curl -sf http://localhost:11434/api/version || nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+for _ in $(seq 1 60); do curl -sf http://localhost:11434/api/version && break; sleep 1; done
+curl -sf http://localhost:11434/api/version || tail -n 20 /devsafe/ollama/serve.log
+```
+
+2. The same as a script you can re-run; `set -e` is fine here because the
+wait ends in a check that fails:
+```bash
+cat > ~/start-ollama.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+export OLLAMA_MODELS=/devsafe/ollama/models
+if ! curl -sf http://localhost:11434/api/version >/dev/null; then
+  nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+fi
+for _ in $(seq 1 60); do curl -sf http://localhost:11434/api/version >/dev/null && break; sleep 1; done
+curl -sf http://localhost:11434/api/version || { tail -n 20 /devsafe/ollama/serve.log; exit 1; }
+ollama list
+EOF
+chmod +x ~/start-ollama.sh && ~/start-ollama.sh
+```
+
+3. Pull a model:
+```bash
+ollama pull qwen3-vl:2b && ollama list
+```
+
+4. How is Node installed? (nvm, fnm, volta or a system package):
+```bash
+node -v && npm config get prefix
+```
+
+5. Install and check buildwithnexus (with a system Node, add sudo):
+```bash
+npm install -g buildwithnexus@latest && bwn --version
+```
+
+6. Open bwn on the test image, as its own step:
+```bash
+cd /devsafe/vision-test && bwn --provider ollama --model qwen3-vl:2b --prompt "What is in @test.png?"
+```

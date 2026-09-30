@@ -1,0 +1,64 @@
+Fixed versions of bad-windows-server.txt. Each block works pasted on its own
+into a new Windows PowerShell 5.1 window, does not need winget, avoids admin
+where it can, checks for it where it can't, and ends in a check.
+
+0. What is on this machine (before any Defender cmdlet):
+```powershell
+$PSVersionTable.PSVersion.ToString()
+Get-Service | Where-Object DisplayName -match 'CrowdStrike|Falcon|SentinelOne|Sophos|Carbon Black|Cylance|Symantec|McAfee|Trellix|Trend Micro|Cortex|Defender' | Select-Object Status, DisplayName
+```
+
+1. ripgrep: winget where it exists, the release zip where it does not:
+```powershell
+if (Get-Command winget -ErrorAction SilentlyContinue) {
+  winget install --id BurntSushi.ripgrep.MSVC -e --accept-source-agreements --accept-package-agreements
+} else {
+  $a = (Invoke-RestMethod https://api.github.com/repos/BurntSushi/ripgrep/releases/latest).assets | Where-Object name -like '*x86_64-pc-windows-msvc.zip' | Select-Object -First 1
+  Invoke-WebRequest -UseBasicParsing $a.browser_download_url -OutFile "$env:TEMP\rg.zip"
+  Expand-Archive "$env:TEMP\rg.zip" C:\tools -Force
+  $dir = (Get-ChildItem C:\tools -Recurse -Filter rg.exe | Select-Object -First 1).DirectoryName
+  [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$dir", 'User')
+}
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+rg --version
+```
+
+2. Node LTS in one block: version, download, install, exit code, PATH, check.
+The MSI installs for all users, so this block checks for admin first:
+```powershell
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) { throw 'The Node MSI installs for all users: open PowerShell with Run as administrator.' }
+New-Item -ItemType Directory -Force C:\dev\installers | Out-Null
+$v = ((Invoke-RestMethod https://nodejs.org/dist/index.json) | Where-Object lts | Select-Object -First 1).version
+Invoke-WebRequest -UseBasicParsing "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile C:\dev\installers\node.msi
+$p = Start-Process msiexec.exe -ArgumentList '/i', 'C:\dev\installers\node.msi', '/qn', '/norestart' -Wait -PassThru
+if ($p.ExitCode -ne 0) { throw "Node MSI failed with exit code $($p.ExitCode)" }
+$env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+node -v
+```
+
+3. Tools on your own PATH (no admin needed):
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';C:\tools\ffmpeg\bin', 'User')
+$env:Path += ';C:\tools\ffmpeg\bin'
+Get-Command ffmpeg | Select-Object Source
+```
+
+4. Start Ollama only if nothing answers, wait for it, then pull:
+```powershell
+try { Invoke-RestMethod http://localhost:11434/api/version } catch { Start-Process ollama -ArgumentList serve -WindowStyle Hidden }
+for ($i = 0; $i -lt 60; $i++) { try { Invoke-RestMethod http://localhost:11434/api/version; break } catch { Start-Sleep 1 } }
+ollama pull qwen3-vl:2b
+ollama list
+```
+
+5. Only if step 0 listed Defender and nothing else:
+```powershell
+Get-MpComputerStatus | Select-Object AMRunningMode, RealTimeProtectionEnabled
+```
+
+6. buildwithnexus:
+```powershell
+npm install -g buildwithnexus
+bwn --version
+```

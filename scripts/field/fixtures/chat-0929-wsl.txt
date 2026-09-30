@@ -1,0 +1,255 @@
+Command blocks from real setup replies on 2026-09-29: WSL and Linux setup, with the follow-up fixes for U07, U08 and U10.
+They are in their original order, with the surrounding prose removed. Each
+block failed or misled on a real machine, and the lint must keep flagging it.
+
+
+#### 2026-09-29T17:02
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+```bash
+ps -p 1 -o comm=
+```
+```bash
+sudo mkdir -p /devsafe/ollama/models
+sudo chown -R ollama:ollama /devsafe/ollama
+sudo chmod o+x /devsafe
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+printf '[Service]\nEnvironment="OLLAMA_MODELS=/devsafe/ollama/models"\n' | sudo tee /etc/systemd/system/ollama.service.d/models.conf
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+```bash
+mkdir -p /devsafe/ollama/models
+OLLAMA_MODELS=/devsafe/ollama/models nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+```
+```bash
+ollama pull gemma3:4b
+ollama list
+du -sh /devsafe/ollama/models
+```
+```bash
+mkdir -p /devsafe/vision-test && cd /devsafe/vision-test
+cp "$(ls -t /mnt/c/Users/*/Pictures/Screenshots/*.png | head -1)" ./test.png
+ls -lh test.png
+```
+```bash
+ollama run gemma3:4b "Describe this image and read out any text in it: ./test.png"
+```
+```bash
+node -v
+mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global
+echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+npm install -g buildwithnexus
+bwn --version
+```
+```bash
+cd /devsafe/vision-test
+bwn
+```
+```
+Read @test.png and write every piece of text you can see in it, plus a one-line description, to image-notes.md
+```
+
+#### 2026-09-29T17:02
+
+#### 2026-09-29T17:03
+
+#### 2026-09-29T17:03
+```bash
+cat > ~/bwn-vision-setup.sh <<'EOF'
+#!/usr/bin/env bash
+# Sets up Ollama + Gemma 3 4B (models stored in /devsafe) and buildwithnexus in WSL,
+# makes a test image, checks vision with Ollama directly, then opens bwn on it.
+set -euo pipefail
+MODEL=gemma3:4b
+ROOT=/devsafe
+MODELS=$ROOT/ollama/models
+TEST=$ROOT/vision-test
+
+echo "==> 1/7 system packages"
+sudo apt-get update -y
+sudo apt-get install -y curl ca-certificates zstd imagemagick fonts-dejavu-core
+
+echo "==> 2/7 $ROOT"
+sudo mkdir -p "$ROOT" "$MODELS"
+sudo chown "$USER:$USER" "$ROOT"
+sudo chmod 755 "$ROOT"
+mkdir -p "$TEST"
+
+echo "==> 3/7 Ollama (models in $MODELS)"
+command -v ollama >/dev/null || curl -fsSL https://ollama.com/install.sh | sh
+if [ "$(ps -p 1 -o comm=)" = systemd ] && systemctl cat ollama >/dev/null 2>&1; then
+  sudo chown -R ollama:ollama "$ROOT/ollama"
+  sudo mkdir -p /etc/systemd/system/ollama.service.d
+  printf '[Service]\nEnvironment="OLLAMA_MODELS=%s"\n' "$MODELS" \
+    | sudo tee /etc/systemd/system/ollama.service.d/models.conf >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl enable ollama >/dev/null
+  sudo systemctl restart ollama
+else
+  sudo chown -R "$USER:$USER" "$ROOT/ollama"
+  pkill -x ollama 2>/dev/null || true
+  OLLAMA_MODELS="$MODELS" nohup ollama serve >"$ROOT/ollama/serve.log" 2>&1 &
+  grep -q 'OLLAMA_MODELS=' ~/.bashrc || echo "export OLLAMA_MODELS=$MODELS" >> ~/.bashrc
+fi
+for _ in $(seq 1 30); do curl -sf http://localhost:11434/api/version >/dev/null && break; sleep 1; done
+curl -sf http://localhost:11434/api/version && echo
+
+echo "==> 4/7 download $MODEL"
+ollama pull "$MODEL"
+du -sh "$MODELS"
+
+echo "==> 5/7 Node.js + buildwithnexus"
+NODE_MAJOR=0
+command -v node >/dev/null && NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
+if [ "$NODE_MAJOR" -lt 18 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+fi
+mkdir -p ~/.npm-global
+npm config set prefix ~/.npm-global
+export PATH="$HOME/.npm-global/bin:$PATH"
+grep -q '.npm-global/bin' ~/.bashrc || echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+npm install -g buildwithnexus@latest
+BWN_ALLOW_BOOTSTRAP=1 bwn --version
+mkdir -p ~/.buildwithnexus
+[ -f ~/.buildwithnexus/settings.json ] || \
+  printf '{ "provider": "ollama", "model": "%s", "permission": "ask" }\n' "$MODEL" > ~/.buildwithnexus/settings.json
+
+echo "==> 6/7 test image + direct vision check"
+cd "$TEST"
+convert -size 800x300 xc:white -font DejaVu-Sans -pointsize 56 -fill black \
+  -annotate +40+120 'NEXUS VISION TEST' -pointsize 40 -fill blue -annotate +40+200 'code 4217' \
+  -fill red -draw 'circle 700,150 700,90' test.png
+ls -lh test.png
+ollama run "$MODEL" "Read all the text in this image and name the shapes and colours you see: $TEST/test.png"
+
+echo "==> 7/7 opening bwn with an image task (approve the file write with y)"
+exec bwn --provider ollama --model "$MODEL" \
+  --prompt "Read @test.png and write every piece of text you can see in it, plus the shapes and colours, to image-notes.md"
+EOF
+chmod +x ~/bwn-vision-setup.sh && ~/bwn-vision-setup.sh
+```
+
+#### 2026-09-29T17:06
+```bash
+# 1. Model folder in /devsafe, and make OLLAMA_MODELS stick for new shells
+sudo mkdir -p /devsafe/ollama/models
+sudo chown -R "$USER:$USER" /devsafe/ollama
+grep -q 'OLLAMA_MODELS=' ~/.bashrc || echo 'export OLLAMA_MODELS=/devsafe/ollama/models' >> ~/.bashrc
+export OLLAMA_MODELS=/devsafe/ollama/models
+
+# 2. Start the server (stop any old one first) and wait until it answers
+pkill -x ollama 2>/dev/null; sleep 1
+nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+for _ in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 1; done; echo
+
+# 3. Download the model and confirm it landed in /devsafe
+ollama pull gemma3:4b
+ollama list
+du -sh /devsafe/ollama/models
+```
+```bash
+nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+```
+
+#### 2026-09-29T17:06
+```bash
+sudo mkdir -p /devsafe/ollama/models
+```
+```bash
+sudo chown -R "$USER:$USER" /devsafe/ollama
+```
+```bash
+echo 'export OLLAMA_MODELS=/devsafe/ollama/models' >> ~/.bashrc
+```
+```bash
+source ~/.bashrc
+```
+```bash
+echo $OLLAMA_MODELS
+```
+```bash
+pkill -x ollama
+```
+```bash
+nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+```
+```bash
+curl http://localhost:11434/api/version
+```
+```bash
+ollama pull gemma3:4b
+```
+```bash
+ollama list
+```
+```bash
+du -sh /devsafe/ollama/models
+```
+```bash
+sudo apt-get install -y imagemagick fonts-dejavu-core
+```
+```bash
+mkdir -p /devsafe/vision-test
+```
+```bash
+cd /devsafe/vision-test
+```
+```bash
+convert -size 800x300 xc:white -font DejaVu-Sans -pointsize 56 -fill black -annotate +40+120 'NEXUS VISION TEST' -pointsize 40 -fill blue -annotate +40+200 'code 4217' -fill red -draw 'circle 700,150 700,90' test.png
+```
+```bash
+ls -lh test.png
+```
+```bash
+ollama run gemma3:4b "Read all the text in this image and name the shapes and colours you see: /devsafe/vision-test/test.png"
+```
+```bash
+node -v
+```
+```bash
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+```
+```bash
+sudo apt-get install -y nodejs
+```
+```bash
+mkdir -p ~/.npm-global
+```
+```bash
+npm config set prefix ~/.npm-global
+```
+```bash
+echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.bashrc
+```
+```bash
+source ~/.bashrc
+```
+```bash
+npm install -g buildwithnexus@latest
+```
+```bash
+BWN_ALLOW_BOOTSTRAP=1 bwn --version
+```
+```bash
+mkdir -p ~/.buildwithnexus
+```
+```bash
+echo '{ "provider": "ollama", "model": "gemma3:4b", "permission": "ask" }' > ~/.buildwithnexus/settings.json
+```
+```bash
+cd /devsafe/vision-test
+```
+```bash
+bwn --prompt "Read @test.png and write every piece of text you can see in it, plus the shapes and colours, to image-notes.md"
+```
+```
+!cat image-notes.md
+```
+```
+/exit
+```
+```bash
+nohup ollama serve > /devsafe/ollama/serve.log 2>&1 &
+```

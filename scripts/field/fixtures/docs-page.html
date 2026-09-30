@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<body>
+  <h2>Install</h2>
+  <pre><code>npm install -g buildwithnexus
+bwn --version</code></pre>
+  <pre><code class="language-powershell">$v = ((Invoke-RestMethod https://nodejs.org/dist/index.json) | Where-Object lts | Select-Object -First 1).version
+Write-Output &quot;Node $v&quot;</code></pre>
+  <pre><code>{ "auto_update": "notify" }</code></pre>
+  <pre><code>&gt; what is in @screenshot.png?</code></pre>
+  <!-- lint-ok: npm-prefix shown only as the command that breaks nvm -->
+  <pre><code>npm config set prefix ~/.npm-global</code></pre>
+  <pre class="term-pre">$ not a code block, a rendered transcript</pre>
+  <pre><code class="language-powershell">
+Invoke-WebRequest "https://example.invalid/$missing.zip" -OutFile tools.zip
+</code></pre>
+</body>
+</html>
