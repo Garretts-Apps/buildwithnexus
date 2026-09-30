@@ -189,8 +189,7 @@ jobs:
       #        - Environment: (blank)
       #   2. id-token: write permission on this job (set above).
       #
-      # This step reads no NPM_TOKEN (only the reserve and deprecate steps
-      # below do, because npm OIDC cannot create packages or deprecate).
+      # No NPM_TOKEN is read anywhere in this workflow: npm is OIDC only.
       #
       # Configure here:
       #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
@@ -198,120 +197,6 @@ jobs:
         id: npm-publish
         if: steps.published.outputs.already == 'false'
         run: npm publish --access public --provenance
-
-      # 0.12.1-0.14.2 pin buildwithnexus-<os>-<cpu>@<their version> in
-      # optionalDependencies, but those packages were never published, so
-      # anyone could register the names and ship code into those installs.
-      # This reserves each name with an empty placeholder (no code, no bin)
-      # at the current version, which none of those pins match. The launcher
-      # never uses these packages: it downloads the release binary. A name
-      # that exists but is owned by someone else fails the run.
-      # npm OIDC cannot create a package, so creating one uses NPM_TOKEN
-      # (without provenance, which needs OIDC). The token must be allowed to
-      # create packages: a PUT answered with E404 means it is not (0.14.10
-      # failed this way with --provenance=false too). Once all five exist
-      # this step needs no token and changes nothing.
-      - name: Reserve the platform package names
-        id: reserve
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          V=$(node -p "require('./package.json').version")
-          owners=$(npm view buildwithnexus maintainers --json | node -e '
-            const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            console.log([].concat(m).map((x) => String(x).split(" ")[0]).join(" "));')
-          npmrc="$RUNNER_TEMP/reserve.npmrc"
-          trap 'rm -f "$npmrc"' EXIT
-          failed=0
-          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-            name="buildwithnexus-${p}"
-            if got=$(npm view "$name" maintainers --json 2>/dev/null); then
-              mine=$(OWNERS="$owners" node -e '
-                const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
-                const own = new Set(process.env.OWNERS.split(" "));
-                console.log([].concat(m).some((x) => own.has(String(x).split(" ")[0])));' <<< "$got")
-              if [[ "$mine" == true ]]; then
-                echo "$name is reserved."
-              else
-                echo "::error title=Platform package name taken::$name exists on npm and is not owned by this package's maintainers. Installs of buildwithnexus 0.12.1-0.14.2 may pull it."
-                failed=1
-              fi
-              continue
-            fi
-            if [[ -z "$NPM_TOKEN" ]]; then
-              echo "::error title=Cannot reserve $name::$name is not on npm and the NPM_TOKEN secret is not set."
-              failed=1
-              continue
-            fi
-            printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npmrc"
-            dir="$RUNNER_TEMP/$name"
-            mkdir -p "$dir"
-            NAME="$name" V="$V" DIR="$dir" node -e '
-              const fs = require("fs");
-              const { NAME, V, DIR } = process.env;
-              fs.writeFileSync(DIR + "/package.json", JSON.stringify({
-                name: NAME,
-                version: V,
-                description: "Reserved name with no code. Install the buildwithnexus package instead.",
-                license: "MIT",
-                repository: { type: "git", url: "git+https://github.com/Garretts-Apps/buildwithnexus.git" },
-                homepage: "https://buildwithnexus.dev",
-              }, null, 2) + "\n");
-              fs.writeFileSync(DIR + "/README.md", "# " + NAME + "\n\nThis name is reserved by the buildwithnexus project, and the package contains no code.\nInstall [buildwithnexus](https://www.npmjs.com/package/buildwithnexus) instead.\n");
-            '
-            if (cd "$dir" && npm publish --access public --provenance=false --userconfig "$npmrc"); then
-              echo "Reserved $name@$V."
-            else
-              echo "::error title=Cannot reserve $name::npm publish failed for the placeholder; see the log above."
-              failed=1
-            fi
-          done
-          exit "$failed"
-
-      # Mark versions users should not install. npm OIDC cannot deprecate, so
-      # this uses NPM_TOKEN, and only for a range not yet marked with the
-      # current message (one version per range is checked first).
-      #  - <0.10.0: the earlier VM and Docker products that shared this name.
-      #    Their `destroy` command is the only way to remove what `init` set up.
-      #  - 0.10.0-0.14.8: security fixes landed in 0.14.3 and 0.14.9.
-      - name: Deprecate unsupported versions
-        id: deprecate
-        # Independent of the reserve step, so a token that cannot create
-        # packages still deprecates.
-        if: ${{ !cancelled() && steps.npm-publish.outcome != 'failure' }}
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          legacy="Unmaintained: this is the old VM/Docker-based buildwithnexus, a different product from current releases. If you ran 'buildwithnexus init', run 'buildwithnexus destroy' with this version first (it deletes its VM or containers and their data), then install buildwithnexus@latest."
-          security="This version has security issues fixed in 0.14.3 and 0.14.9. Update with: npm install -g buildwithnexus@latest"
-          npmrc="$RUNNER_TEMP/deprecate.npmrc"
-          trap 'rm -f "$npmrc"' EXIT
-          failed=0
-          while IFS='|' read -r range probe msg; do
-            now=$(npm view "buildwithnexus@${probe}" deprecated 2>/dev/null || true)
-            if [[ "$now" == "$msg" ]]; then
-              echo "buildwithnexus@${range} is already deprecated."
-              continue
-            fi
-            if [[ -z "$NPM_TOKEN" ]]; then
-              echo "::error title=Cannot deprecate::buildwithnexus@${range} is not deprecated and the NPM_TOKEN secret is not set."
-              failed=1
-              continue
-            fi
-            printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npmrc"
-            if npm deprecate "buildwithnexus@${range}" "$msg" --userconfig "$npmrc"; then
-              echo "Deprecated buildwithnexus@${range}."
-            else
-              echo "::error title=Cannot deprecate::npm deprecate failed for buildwithnexus@${range}; see the log above."
-              failed=1
-            fi
-          done <<EOF
-          <0.10.0|0.8.11|${legacy}
-          >=0.10.0 <0.14.9|0.14.8|${security}
-          EOF
-          exit "$failed"
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
       # `cargo install bwn` (alias crate). OIDC only — the auth action
@@ -386,8 +271,6 @@ jobs:
         env:
           ALREADY: ${{ steps.published.outputs.already }}
           NPM_PUBLISH: ${{ steps.npm-publish.outcome }}
-          RESERVE: ${{ steps.reserve.outcome }}
-          DEPRECATE: ${{ steps.deprecate.outcome }}
           CRATES: ${{ steps.crates.outcome }}
         run: |
           PKG_VERSION=$(node -e 'console.log(require("./package.json").version)')
@@ -401,7 +284,5 @@ jobs:
             echo ""
             echo "- Version: \`$PKG_VERSION\`"
             echo "- npm: ${npm_line}"
-            echo "- Platform package names reserved: ${RESERVE:-not run}"
-            echo "- Deprecations: ${DEPRECATE:-not run}"
             echo "- crates.io: ${CRATES:-not run}"
           } >> "$GITHUB_STEP_SUMMARY"
