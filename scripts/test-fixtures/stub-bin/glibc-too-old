@@ -1,0 +1,8 @@
+#!/bin/sh
+# What the 0.14.9 Linux binary prints on Debian 11 (glibc 2.31) before main
+# runs; the loader exits 1.
+me="$0"
+echo "$me: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.32' not found (required by $me)" >&2
+echo "$me: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.33' not found (required by $me)" >&2
+echo "$me: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.34' not found (required by $me)" >&2
+exit 1

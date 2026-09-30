@@ -50,10 +50,16 @@ The native binary is not in the npm tarball. The launcher
 (`bin/buildwithnexus.js`) looks for it in this order: `BWN_BIN`, then a
 per-platform package (`buildwithnexus-<os>-<cpu>`) if one is installed, then
 a binary downloaded on an earlier run, then a local `cargo build` in a repo
-checkout. The per-platform packages are listed in the published
-`optionalDependencies` only for platforms whose package exists on npm for
-that version. A platform without a published package uses the first-run
-download below.
+checkout. No per-platform package carries a binary, so in practice the
+binary comes from the first-run download below.
+
+**Reserved platform package names.** Versions 0.12.1 to 0.14.2 listed
+`buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies` before any
+such package existed, so anyone could have registered the names and had their
+code installed with those versions. From 0.14.10 the publish workflow owns all
+five names as empty placeholders (no code, no `bin`), none at a version those
+pins match, and fails if any name is owned by someone else. Those versions are
+deprecated on npm.
 
 **First-run download.** If no binary is found, the launcher runs
 `scripts/bootstrap.js`, which downloads the release asset for your platform
@@ -79,6 +85,28 @@ published npm tarball cannot change. A binary that does not match is deleted
 instead of being installed, so an asset swapped on the GitHub Release after
 publishing is refused. (A checkout without `checksums.json` falls back to the
 release's own `.sha256` file, which only catches corruption.)
+
+**Before it says "ready".** A matching checksum only shows the download is
+intact. The launcher then runs the new binary once with `--version` (15 s
+limit, output captured) and reports it ready only if it answers with the
+expected version. Otherwise it explains the failure and exits 1. On Linux the
+prebuilt binaries need glibc 2.34 or later (Ubuntu 22.04+, Debian 12+,
+RHEL/Rocky/AlmaLinux 9+, Amazon Linux 2023, Fedora 35+) and do not run on
+musl (Alpine). A binary that endpoint protection blocks or removes gets its
+path, its SHA-256 and a pointer to [For IT and Security
+Teams](#for-it-and-security-teams). A later run that cannot start the binary
+gets the same explanation.
+
+Each verified download is recorded in `bin/.installed.json` (version and
+SHA-256) as soon as its checksum matches, before it is moved into place, so a
+file that security software quarantines on write counts too. If that record
+is there but the binary is not, the launcher does not download it again on its
+own, because whatever removed it would remove the next copy too. Once the file
+is allowed, `bwn --bootstrap` downloads it again.
+
+A request that gets no data for 30 s fails with the reason. Node's `https`
+module ignores `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY=1` is set, which Node
+22.21+ and 24.5+ support; a failed download says so and prints the command.
 
 The launcher only uses a platform package installed next to the main package,
 never one found in a parent directory's `node_modules`, and ignores a relative
@@ -175,6 +203,16 @@ download is checksum-verified from this repository's GitHub Release. An
 agent that starts shells and PowerShell adds to the score. A block therefore
 does not by itself indicate a problem with the file: compare its SHA-256 and
 attestation with the release.
+
+When the binary cannot start, the npm launcher (Node, not the binary) prints
+the file's path and SHA-256 for the request below. On Windows it also names
+the product that most likely blocked it by checking whether these folders
+exist: `%ProgramFiles%\CrowdStrike`, `%SystemRoot%\System32\drivers\CrowdStrike`,
+`%ProgramFiles%\SentinelOne`, `%ProgramFiles%\Cylance`, `%ProgramFiles%\Confer`
+and `%SystemRoot%\CarbonBlack` (Carbon Black), and `%ProgramFiles%\Windows
+Defender Advanced Threat Protection` and `%ProgramFiles%\Windows Defender`. It
+only reads their attributes, only after a failed start, and starts no process
+and queries no service.
 
 ### Allowlisting
 

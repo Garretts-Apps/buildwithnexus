@@ -12,6 +12,7 @@ harness/vendor/
 harness/.cargo/
 /bin/buildwithnexus
 /bin/buildwithnexus.exe
+/bin/.installed.json
 /buildwithnexus
 /buildwithnexus.exe
 *.tar.gz

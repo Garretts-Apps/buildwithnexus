@@ -6,6 +6,126 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.10] - 2026-09-30
+
+Fixes for the security problems reproduced on 0.14.9, a first run that says
+why the binary can't start, the npm names old versions pointed at now
+reserved, and release checks that test what users actually install.
+
+### Security
+- **Broken hooks block instead of allowing.** A PreToolUse hook that times
+  out, cannot start (missing script or interpreter, permission denied, a Rust
+  hook that does not compile) or is killed now blocks the tool call, with a
+  message naming the hook, what happened and how to fix or remove it. Exit
+  codes keep their Claude Code meaning. Other hook events show a failure but
+  never block.
+- **Old approvals for interpreters no longer run code.** 0.14.3-0.14.8 saved
+  "always allow" for a program that runs the code it is given by its bare
+  name, so a saved `python3` approved `python3 -c ...`. Such approvals are now
+  ignored (listed at startup and in `/permissions`; the settings file is left
+  as is), and new ones cover one exact command. The list now also includes
+  awk and its variants, sed, nodejs, tsx, ts-node, bunx, uvx, tclsh, Rscript,
+  julia, versioned names such as `python3.12` and `node18`, and wrappers such
+  as stdbuf, setsid, flock, su and strace.
+- **Read-only mode closes more ways to write or run programs.**
+  - Abbreviated long options, down to one letter (`sort --compress-prog=./x`,
+    `sort --o out`).
+  - Quoted or escaped flags (`rg "--pre" ./x`), and globs or braces that the
+    shell can expand into a flag (`sort *` beside a file named `-o`).
+  - A program run by path (`./cat`, `/tmp/x/ls`, `.\cat.exe`) is never
+    treated as the allowlisted binary, and an approval for `cat` does not
+    cover `./cat`.
+  - `rg --hostname-bin`, and find actions written after `--`.
+  - On Windows, commands using cmd.exe's `^` escape or `%VAR%` expansion, and
+    sort.exe's `/O` output switch.
+  - One test table holds every bypass found so far; each future fix adds its
+    case there.
+- **Text from repos, models and servers can't drive your terminal in more
+  places.** Terminal escape codes (such as an OSC 52 clipboard write) are shown
+  as visible markers in `/rules`, `/skills`, `/tools`, `/checkpoints`,
+  `/undo`, `/workflows`, `/diff`, the plan approval list, question prompts
+  and their default answers, menu selections, `buildwithnexus mcp`,
+  `buildwithnexus sessions`, `doctor`, settings warnings, hook messages and
+  the project folder name.
+- **The knowledge base is never written or read through a symlink.** A linked
+  `entities.json`, knowledge folder or `.buildwithnexus` folder let
+  `kb_record`, `/kb` and `/grill-me` overwrite a file outside the project;
+  `kb_record` now returns an error instead. `publish_artifact` also refuses to
+  write through a symlink.
+- **The npm names 0.12.1-0.14.2 pointed at are reserved.** Those versions list
+  `buildwithnexus-<os>-<cpu>` packages that were never published, so anyone
+  could have registered the names and had their code installed. The publish
+  workflow now owns all five as empty placeholders and fails if any belongs to
+  someone else. It also deprecates 0.10.0-0.14.8 (security fixes in 0.14.3
+  and 0.14.9) and everything before 0.10.0 (the earlier VM/Docker products,
+  with their `destroy` command).
+- **CI scans for committed secrets** (gitleaks, redacted) in the tree and in
+  every commit a pull request or push adds.
+
+### Fixed
+- **The first run says "ready" only when the binary runs.** After the
+  checksum check, the npm launcher now runs the new binary with `--version`.
+  On a glibc older than 2.34 (Debian 11, Ubuntu 20.04, RHEL 8), on musl
+  (Alpine), or when the file cannot be executed, it prints what to do and
+  exits 1. It used to print "buildwithnexus is ready" and then a raw
+  `GLIBC_2.34 not found` or `spawnSync ... ENOENT`.
+- **A binary blocked by endpoint protection gets guidance, not a bare
+  `EPERM`.** The launcher names the security products it finds on Windows
+  (CrowdStrike Falcon, Microsoft Defender, SentinelOne, Cylance, Carbon
+  Black) from their install and driver folders, without starting a process,
+  prints the file's path and SHA-256 for IT, and links the IT guide in
+  SECURITY.md.
+- **No re-download loop.** Once a verified binary has been downloaded and then
+  removed, the launcher no longer downloads it again on every run; it
+  explains the removal instead. This includes security software that
+  quarantines the file as soon as it is written, before it is moved into
+  place. `bwn --bootstrap` downloads it again.
+- **A failed first-run download says why.** It used to print "prebuilt
+  unavailable" and then "no terminal here, so the launcher will not download
+  it", even when the download had been allowed. It now prints the error, and
+  on a network or TLS error explains `NODE_USE_ENV_PROXY=1` (Node's `https`
+  ignores `HTTPS_PROXY` without it; Node 22.21+ and 24.5+) and
+  `NODE_EXTRA_CA_CERTS`. A request that gets no data for 30 s fails instead of
+  hanging.
+- **No `--bootstrap` advice where the binary cannot run.** Without a
+  terminal on musl or on a glibc older than 2.34, the launcher explains the
+  platform instead of suggesting a download.
+- **Tool checks work on stock Windows.** `bwn doctor` and the start-up
+  "Missing ... tool(s)" notice searched with `which`, which Windows does not
+  have, so without Git's Unix tools on PATH every tool showed as missing.
+  They now search PATH directly and honour PATHEXT.
+- **The documented glibc floor is the real one: 2.34**, not 2.35, which adds
+  RHEL/Rocky/AlmaLinux 9, Amazon Linux 2023 and Fedora 35+. CI builds the
+  x86_64 release binary on every PR and fails if it needs a newer glibc than
+  the floor the launcher and docs state; the release checks each Linux binary
+  again.
+
+- **The `bwn` crate's install block no longer installs both crates.** Both
+  provide a `bwn` binary, so the second install failed.
+
+### Release process
+- **A release runs the full CI on its own commit first,** with a blocking
+  dependency audit, and tags, builds and publishes nothing unless it passes.
+  CI no longer cancels runs on main.
+- **Field testing.**
+  - An install matrix installs the published package, or a packed tarball
+    before release, in clean Linux containers (Debian, Ubuntu, RHEL family,
+    Amazon Linux, Fedora, Alpine, nvm, no terminal), natively on x64 and
+    arm64. A row passes only if bwn runs or the launcher explains why it
+    can't. It runs after each publish and daily, with Windows Server 2022
+    (PowerShell 5.1) and macOS jobs.
+  - A lint for command blocks in docs catches the mistakes that broke real
+    setups (Windows PowerShell 5.1 syntax, unguarded winget, msiexec without
+    an exit-code check, Machine-scope PATH from an unelevated shell, and more).
+  - A scheduled sentinel checks every 15 minutes that main's version reached
+    npm and that CI on main is green, re-dispatching workflows GitHub dropped,
+    and daily runs the dependency audit and checks labels and runner images.
+    Failures open issues.
+  - A rehearsal skill has every command handed to the maintainer run first in
+    a matching clean machine (`field-adhoc.yml`), so nobody tests for us.
+- macOS builds and tests moved from `macos-14` to `macos-15`.
+- The publish summary reports what each step actually did.
+
 ## [0.14.9] - 2026-09-29
 
 A full security audit of the harness, the npm launcher and the release

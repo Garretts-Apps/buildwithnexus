@@ -1220,10 +1220,12 @@ fn text_tool_call(name: &str, input: serde_json::Value) -> provider::ToolCall {
 // The single-line composer prompt for reading a question answer. Kept on one
 // line (no `\n`) so the alt-screen composer positions the cursor correctly and
 // echoes typed input; the question text itself is printed separately above.
+// The default is model-supplied, like the question.
 fn answer_input_prompt(default: &str) -> String {
     if default.is_empty() {
         "  Answer: ".to_string()
     } else {
+        let default = tui::sanitize_terminal(default);
         format!("  Answer {}: ", tui::dim(&format!("[{default}]")))
     }
 }
@@ -1280,11 +1282,12 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
     // Render the question on its own transcript line, then read the answer with
     // a SINGLE-LINE composer prompt. A multi-line prompt string mis-positions
     // the alt-screen composer cursor (prompt_width counts across the newline),
-    // which hides what the user types.
+    // which hides what the user types. The question and options are
+    // model-supplied, so their escapes are neutralized.
     tui::line(&format!(
         "  {} {}",
         tui::yellow("?"),
-        tui::bold(&full_prompt)
+        tui::bold(&tui::sanitize_terminal(&full_prompt))
     ));
     let ans = tui::ask(&answer_input_prompt(default)).unwrap_or_default();
     let out = if ans.trim().is_empty() && !default.is_empty() {
@@ -1872,6 +1875,8 @@ fn is_pre_approved(shell: Option<&str>, tool_key: &str, cwd: &Path) -> bool {
             }
         }
     }
+    // Saved bare interpreter approvals (`python3`) are ignored, not rewritten.
+    keys.retain(|k| !tools::is_bare_interpreter_approval(k));
     let allowed = config::load_allowed_commands();
     let project = config::load_project_allowed(cwd);
     keys.iter().any(|k| {
@@ -1879,6 +1884,32 @@ fn is_pre_approved(shell: Option<&str>, tool_key: &str, cwd: &Path) -> bool {
             || project.iter().any(|a| a == k)
             || is_session_allowed_tool(cwd, k)
     })
+}
+
+/// Saved approvals that `is_pre_approved` ignores: a shell or interpreter
+/// approved by name (see `tools::is_bare_interpreter_approval`).
+pub fn ignored_approvals(cwd: &Path) -> Vec<String> {
+    let mut keys: Vec<String> = config::load_allowed_commands()
+        .into_iter()
+        .chain(config::load_project_allowed(cwd))
+        .filter(|k| tools::is_bare_interpreter_approval(k))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// One line naming the ignored approvals and why, or None when there are none.
+pub fn ignored_approvals_notice(cwd: &Path) -> Option<String> {
+    let keys = ignored_approvals(cwd);
+    if keys.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "ignoring saved approval{} for {}: a shell or interpreter approved by name could run any code, so each of its commands is approved on its own",
+        if keys.len() == 1 { "" } else { "s" },
+        keys.join(", ")
+    ))
 }
 
 /// Run the PreToolUse hook, then the gate. A hook may deny anything, but it
@@ -3715,8 +3746,9 @@ pub fn run_plan(
         loop {
             tui::line("");
             tui::line(&tui::accent("  Plan"));
+            // Steps are the model's plan text.
             for (i, s) in steps.iter().enumerate() {
-                tui::line(&format!("  {}. {}", i + 1, s));
+                tui::line(&format!("  {}. {}", i + 1, tui::sanitize_terminal(s)));
             }
             tui::line("");
             let items = vec![
@@ -4238,6 +4270,23 @@ mod tests {
         let d = answer_input_prompt("yes");
         assert!(!d.contains('\n'));
         assert!(d.contains("yes"));
+    }
+
+    #[test]
+    fn answer_input_prompt_neutralizes_model_default() {
+        // The question tool's `default` is model-supplied and was printed raw
+        // in the Answer prompt; OSC 52 wrote "rm -rf ~" to the clipboard.
+        for (default, shown) in [
+            ("a\x1b]52;c;cm0gLXJmIH4=\x07", "[a␛]52;c;cm0gLXJmIH4=]"),
+            ("b\x1b[2J\x1b[1;1H", "[b␛[2J␛[1;1H]"),
+            ("c\x1b[8m", "[c␛[8m]"),
+            ("d\u{202E}txt", "[d<U+202E>txt]"),
+        ] {
+            let p = answer_input_prompt(default);
+            assert!(p.contains(shown), "{p:?}");
+            assert!(!p.contains("\x1b]") && !p.contains('\x07'), "{p:?}");
+            assert!(!p.contains(&default[1..]), "{p:?}");
+        }
     }
 
     #[test]
@@ -4918,6 +4967,129 @@ mod tests {
         assert_eq!(crate::config::reset_project_allowed(&proj_a), 1);
         assert!(gate(Permission::Ask, "write_file", &input, &proj_a).is_some());
 
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gate_ask_ignores_bare_interpreter_approvals() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-agent-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        // As 0.14.3–0.14.8 saved them: the interpreter alone, globally and
+        // for this project, next to ordinary binary and subcommand keys.
+        crate::config::save_settings(&crate::config::Settings {
+            allowed_commands: [
+                "python3",
+                "node",
+                "cargo test",
+                "awk",
+                "gawk",
+                "nodejs",
+                "python3.12",
+                "tclsh",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..Default::default()
+        });
+        let proj = home.join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        for key in [
+            "bash",
+            "sh",
+            "ruby",
+            "perl",
+            "env",
+            "make",
+            "sed",
+            "stdbuf",
+            "rscript",
+            "sha256sum",
+        ] {
+            crate::config::add_project_allowed(&proj, key);
+        }
+        super::add_session_allowed_tool(&proj, "python3");
+        let run = |c: &str| {
+            gate(
+                Permission::Ask,
+                "run_command",
+                &json!({ "command": c }),
+                &proj,
+            )
+        };
+
+        for c in [
+            "python3 -c print(1)",
+            "python3 script.py",
+            "python3",
+            "node -e 1",
+            "bash -c ls",
+            "sh deploy.sh",
+            "ruby -e 1",
+            "perl -e 1",
+            "env X=1 cargo publish",
+            r#"awk 'BEGIN{system("id")}'"#,
+            r#"gawk 'BEGIN{system("id")}'"#,
+            "awk -f prog.awk data.txt",
+            "nodejs -e 1",
+            "python3.12 -c print(1)",
+            "/usr/bin/python3.12 -c print(1)",
+            "tclsh script.tcl",
+            "sed '1e id' README.md",
+            "stdbuf -o0 python3 -c print(1)",
+            r#"Rscript -e 'system("id")'"#,
+        ] {
+            let r = run(c);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("blocked")),
+                "{c}: {r:?}"
+            );
+        }
+        // A command approved exactly still skips the prompt.
+        crate::config::add_project_allowed(&proj, "python3 scripts/test.py");
+        assert!(run("python3 scripts/test.py").is_none());
+        assert!(run("python3 scripts/other.py").is_some());
+        // Other bare and subcommand approvals behave as before.
+        assert!(run("cargo test --all").is_none());
+        assert!(run("make lint").is_none());
+        assert!(run("sha256sum README.md").is_none());
+        assert!(run("cargo build").is_some());
+
+        assert_eq!(
+            ignored_approvals(&proj),
+            [
+                "awk",
+                "bash",
+                "env",
+                "gawk",
+                "node",
+                "nodejs",
+                "perl",
+                "python3",
+                "python3.12",
+                "rscript",
+                "ruby",
+                "sed",
+                "sh",
+                "stdbuf",
+                "tclsh"
+            ]
+        );
+        let notice = ignored_approvals_notice(&proj).unwrap();
+        assert!(
+            notice.contains("python3") && notice.contains("any code"),
+            "{notice}"
+        );
+        // The settings file is read, never rewritten.
+        let saved = crate::config::load_project_allowed(&proj);
+        assert!(saved.iter().any(|k| k == "bash"), "{saved:?}");
+
+        super::clear_session_allowed(&proj);
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

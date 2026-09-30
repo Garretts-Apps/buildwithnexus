@@ -5,12 +5,22 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # sentinel.yml dispatches this on main when GitHub dropped the push event
+  # for main's head commit (2bb2a27 got no run at all).
+  workflow_dispatch:
+  # release.yml runs this whole workflow on the commit it is about to release
+  # and builds nothing unless it passes (0.14.6 shipped from a commit that
+  # never had a CI run).
+  workflow_call:
 
 permissions: {}
 
+# github.workflow is the caller's name inside a workflow_call, so a release's
+# CI run never shares a group with (or cancels) the push run on main. Only
+# superseded PR runs are cancelled; a run on main always finishes.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -56,6 +66,34 @@ jobs:
       - name: Compile benchmarks
         run: cargo bench --no-run --locked
 
+  # The glibc floor the launcher and docs state, checked on the x86_64 binary
+  # built exactly as release.yml builds it (release profile, ubuntu-22.04),
+  # so a change that needs a newer glibc fails here instead of after the
+  # GitHub Release exists. From clean this build takes about 70 s, so no cache.
+  glibc-floor:
+    name: glibc floor (x86_64 Linux release build)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build release
+        working-directory: harness
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Check the glibc floor
+        run: scripts/check-glibc-floor.sh target/x86_64-unknown-linux-gnu/release/buildwithnexus
+
   # The other release platforms. The `rust` job above is the Linux leg (and
   # keeps its check name). macOS runs the full suite. On Windows the tests
   # only compile: many of them drive `run_command` with POSIX shell syntax
@@ -75,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,8 +154,73 @@ jobs:
       - name: Check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
-      - name: Test launcher arguments
+      # Arguments, plus what the launcher says when the binary cannot start
+      # (old glibc, musl, EACCES, removed after install), against stub binaries.
+      - name: Test launcher
         run: node --test scripts/launcher.test.js
+
+  # The launcher is the first thing to fail on a user's machine, so its tests
+  # also run on macOS and on Windows Server 2022 (what managed machines run;
+  # windows-latest is 2025) under Windows PowerShell 5.1. On Windows they deny
+  # execute on the binary with icacls, as endpoint protection would.
+  launcher:
+    name: npm launcher (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            shell: bash
+          - os: windows-2022
+            shell: powershell
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Test launcher
+        run: node --test scripts/launcher.test.js
+
+  docs-lint:
+    name: Docs command lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # People paste these blocks into real shells. The lint catches the
+      # patterns that broke on user machines (unassigned PowerShell
+      # variables, winget on Server, Machine-scope PATH, a foreground or
+      # unready `ollama serve`, npm prefixes that break nvm). Warnings print
+      # but only errors fail the job.
+      - name: Lint README and SECURITY.md command blocks
+        run: node scripts/field/lint-blocks.mjs README.md SECURITY.md
+
+      # The quoted glob is expanded by Node itself: `node --test <dir>` does
+      # not search a directory on Node 22.
+      - name: Test the block lint
+        run: node --test 'scripts/field/*.test.mjs'
 
   audit:
     name: Cargo audit
@@ -177,3 +280,75 @@ jobs:
 
       - name: Run actionlint
         run: ./actionlint -color
+
+  sentinel:
+    name: Field script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # scripts/field/sentinel.sh against a local fake of the GitHub API, npm
+      # and the docs site (bash, curl and jq come with the runner). Nothing
+      # else runs this script before its first scheduled run on main.
+      - name: Test the sentinel
+        run: node --test scripts/field/sentinel.test.js
+
+      # The install matrix's own checks (its row matchers and the glibc-gate
+      # parser) need no containers, so a mistake in the script shows up here
+      # instead of on the next scheduled field run.
+      - name: Test the install matrix script
+        run: bash scripts/field/linux-install.sh --self-test
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # gitleaks (v8.30.1 image, pinned by digest), with every match redacted
+      # in the log. It scans the checked-out tree, plus each commit this PR
+      # or push adds, so a key committed and then deleted in a later commit
+      # is still caught. History already on main is not rescanned. A false
+      # positive in a test fixture takes a trailing `gitleaks:allow` comment.
+      - name: Scan for committed secrets
+        env:
+          IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          run() { docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" "$IMAGE" "$@" --redact --no-banner --exit-code 1; }
+          run dir /repo
+          range=""
+          if [[ "$EVENT" == pull_request ]]; then
+            range="${BASE_SHA}..HEAD"
+          elif [[ "$EVENT" == push && -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]]; then
+            # After a force-push the old head may be gone; the tree scan above
+            # still ran.
+            if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              range="${BEFORE}..HEAD"
+            else
+              echo "::warning::push base ${BEFORE} is not in the clone; scanned the tree only."
+            fi
+          fi
+          if [[ -n "$range" ]]; then
+            run git /repo --log-opts="$range"
+          fi

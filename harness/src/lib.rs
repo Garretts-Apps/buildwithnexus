@@ -216,8 +216,15 @@ pub fn run() {
                 return;
             }
             for s in &all {
-                let title: String = s.title.chars().take(48).collect();
-                println!("  {}  {:<48}  {}", s.id, title, s.cwd);
+                // Titles come from task text and cwd from the checkout's
+                // folder name, so neither reaches the terminal raw.
+                let title: String = tui::sanitize_terminal(&s.title).chars().take(48).collect();
+                println!(
+                    "  {}  {:<48}  {}",
+                    s.id,
+                    title,
+                    tui::sanitize_terminal(&s.cwd)
+                );
             }
             println!();
             println!(
@@ -356,7 +363,8 @@ fn warn_settings_issues(load: &config::SettingsLoad) {
             "{}",
             tui::yellow(&format!(
                 "buildwithnexus: warning: {}: {}",
-                i.source, i.error
+                tui::sanitize_terminal(&i.source),
+                tui::sanitize_terminal(&i.error)
             ))
         );
     }
@@ -577,7 +585,12 @@ fn headless(
                 provider.protocol, provider.model
             ))
         );
-        println!("{}", tui::dim(&format!("  cwd    {}", cwd.display())));
+        // The folder name comes from whoever made the checkout.
+        let shown_cwd = cwd.display().to_string();
+        println!(
+            "{}",
+            tui::dim(&format!("  cwd    {}", tui::sanitize_terminal(&shown_cwd)))
+        );
         // Skill names and paths come from files in the checkout.
         for note in config::startup_context_notices(&cwd) {
             let note = tui::sanitize_terminal(&note);
@@ -589,6 +602,9 @@ fn headless(
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
+    if let Some(n) = agent::ignored_approvals_notice(&cwd) {
+        report::notice(&format!("  {n}"));
+    }
     // MCP tools must be on the surface before the first request; discovery
     // is bounded by each server's timeout, and every outcome is a notice.
     mcp::ensure_ready();
@@ -631,7 +647,7 @@ fn headless(
     }
 
     if let Err(e) = r {
-        eprintln!("{}", tui::red(&e));
+        eprintln!("{}", tui::red(&tui::sanitize_terminal(&e)));
         std::process::exit(if blocked > 0 { 3 } else { 1 });
     }
 }
@@ -721,6 +737,9 @@ fn repl(
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
+    }
+    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+        report::notice(&format!("  {n}"));
     }
     let restored = workflow::restore();
     workflow::set_max_concurrent(settings.max_concurrent_workflows);
@@ -834,7 +853,10 @@ fn repl(
                 if let hooks::PreDecision::Deny(r) =
                     hooks::pre_tool_use("run_command", &tool_input, cwd)
                 {
-                    tui::line(&tui::red(&format!("  blocked by hook: {r}")));
+                    tui::line(&tui::red(&format!(
+                        "  blocked by hook: {}",
+                        tui::sanitize_terminal(&r)
+                    )));
                     tui::bell();
                     continue;
                 }
@@ -938,7 +960,7 @@ fn repl(
         if let Some(perm_arg) = t.strip_prefix("/permissions ") {
             let arg = perm_arg.trim();
             if arg.is_empty() {
-                handle_permissions(&mut perm);
+                handle_permissions(&mut perm, cwd);
             } else {
                 match arg {
                     "ask" | "1" => apply_permission(&mut perm, "ask"),
@@ -1064,7 +1086,7 @@ fn repl(
             let vision = media::model_supports_vision(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             if let Err(e) = agent::run_plan(&provider, perm, &task, cwd, false, images) {
-                tui::line(&tui::red(&format!("  {e}")));
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
             }
             tui::bell();
             continue;
@@ -1083,7 +1105,7 @@ fn repl(
                 &sid,
                 images,
             ) {
-                tui::line(&tui::red(&format!("  {e}")));
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
             }
             tui::bell();
             continue;
@@ -1093,7 +1115,7 @@ fn repl(
             let vision = media::model_supports_vision(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, &task, images).map(|_| ()) {
-                tui::line(&tui::red(&format!("  {e}")));
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
             }
             tui::bell();
             continue;
@@ -1169,7 +1191,7 @@ fn repl(
                     &mut transcript,
                     &sid,
                 ) {
-                    tui::line(&tui::red(&format!("  {e}")));
+                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
                 }
                 tui::bell();
                 continue;
@@ -1186,7 +1208,7 @@ fn repl(
                     &mut transcript,
                     &sid,
                 ) {
-                    tui::line(&tui::red(&format!("  {e}")));
+                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
                 }
                 tui::bell();
                 continue;
@@ -1207,7 +1229,7 @@ fn repl(
                     &mut transcript,
                     &sid,
                 ) {
-                    tui::line(&tui::red(&format!("  {e}")));
+                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
                 }
                 tui::bell();
                 continue;
@@ -1297,7 +1319,7 @@ fn repl(
                 continue;
             }
             "/permissions" => {
-                handle_permissions(&mut perm);
+                handle_permissions(&mut perm, cwd);
                 continue;
             }
             "/sandbox" => {
@@ -1366,10 +1388,12 @@ fn repl(
         if let Some(arg) = t.strip_prefix("/voice") {
             if let Some(voice_text) = handle_voice(arg) {
                 if !voice_text.trim().is_empty() {
+                    // The transcript is read from a `.txt` next to the audio
+                    // file, which a checkout can supply.
                     tui::line(&format!(
                         "  {} {}",
                         tui::green("✓ Voice input transcribed:"),
-                        tui::bold(&voice_text)
+                        tui::bold(&tui::sanitize_terminal(&voice_text))
                     ));
                     task = voice_text;
                     t = task.trim();
@@ -1417,7 +1441,10 @@ fn repl(
                     if let hooks::PreDecision::Deny(r) =
                         hooks::pre_tool_use("run_command", &tool_input, cwd)
                     {
-                        tui::line(&tui::red(&format!("  blocked by hook: {r}")));
+                        tui::line(&tui::red(&format!(
+                            "  blocked by hook: {}",
+                            tui::sanitize_terminal(&r)
+                        )));
                         tui::bell();
                         continue;
                     }
@@ -1449,7 +1476,7 @@ fn repl(
                         &mut transcript,
                         &sid,
                     ) {
-                        tui::line(&tui::red(&format!("  {e}")));
+                        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
                     }
                 }
                 tui::bell();
@@ -1584,7 +1611,7 @@ fn repl(
             }
         };
         if let Err(e) = r {
-            tui::line(&tui::red(&format!("  {e}")));
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
         }
         tui::bell();
     }
@@ -1810,7 +1837,7 @@ fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
 
     tui::line("");
     if let Err(e) = agent::run_build(provider, perm, "engineer", &full_task, cwd, Vec::new()) {
-        tui::line(&tui::red(&format!("  {e}")));
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
     }
 }
 
@@ -1853,7 +1880,7 @@ fn handle_memory(
             if let Err(e) =
                 agent::run_build_session(provider, perm, "engineer", task, cwd, transcript, sid)
             {
-                tui::line(&tui::red(&format!("  {e}")));
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
             }
         }
         _ => {}
@@ -1938,7 +1965,7 @@ fn offer_starter_agents_md(cwd: &std::path::Path) {
     tui::line("");
     tui::line(&tui::dim(&format!(
         "  No AGENTS.md in {} — it tells the agent your build/test commands, conventions, and do-nots.",
-        cwd.display()
+        tui::sanitize_terminal(&cwd.display().to_string())
     )));
     let answer =
         tui::ask("  create a starter AGENTS.md here? [Y/n] ").unwrap_or_else(|| "n".into());
@@ -1946,9 +1973,9 @@ fn offer_starter_agents_md(cwd: &std::path::Path) {
         match config::create_starter_agents_md(cwd) {
             Ok(p) => tui::line(&tui::green(&format!(
                 "  ✓ created {} — fill in the placeholders",
-                p.display()
+                tui::sanitize_terminal(&p.display().to_string())
             ))),
-            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else {
         tui::line(&tui::dim("  skipped"));
@@ -2431,7 +2458,10 @@ fn swap_model(
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        tui::line(&tui::red(&format!("  ✗ validation failed: {e}")));
+                        tui::line(&tui::red(&format!(
+                            "  ✗ validation failed: {}",
+                            tui::sanitize_terminal(&e)
+                        )));
                         let hint = if e.contains("401") || e.contains("403") {
                             format!(
                             "the API key was rejected — re-run /model to enter a new one, or update {}",
@@ -2599,6 +2629,18 @@ fn handle_rules(cwd: &std::path::Path) {
     tui::line(&tui::accent(
         "  /rules — active engineering constraints & business logic rules",
     ));
+    for l in rules_listing(cwd) {
+        tui::line(&l);
+    }
+    tui::line(&tui::dim(
+        "  Tip: Add custom JSON rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt",
+    ));
+}
+
+// Rule ids, descriptions and rules-file names come from the checkout: a
+// description carrying OSC 52 used to write to the user's clipboard.
+fn rules_listing(cwd: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
     let mut engine = crate::rules::RuleEngine::load_defaults();
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
     let (loaded, failures) = load_workspace_rule_files(&rules_dir);
@@ -2606,11 +2648,13 @@ fn handle_rules(cwd: &std::path::Path) {
         engine.add_rule(r);
     }
     for (name, err) in failures {
-        tui::line(&tui::yellow(&format!(
-            "  ⚠ skipped rules file {name}: {err}"
+        out.push(tui::yellow(&format!(
+            "  ⚠ skipped rules file {}: {}",
+            tui::sanitize_terminal(&name),
+            tui::sanitize_terminal(&err)
         )));
     }
-    tui::line(&format!(
+    out.push(format!(
         "  {} active rules loaded for workspace:",
         tui::bold(&engine.rules.len().to_string())
     ));
@@ -2621,15 +2665,13 @@ fn handle_rules(cwd: &std::path::Path) {
             crate::rules::Severity::Medium => tui::yellow("MEDIUM"),
             crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
         };
-        tui::line(&format!(
+        out.push(format!(
             "  [{sev_badge}] {} — {}",
-            tui::bold(&r.id),
-            r.description
+            tui::bold(&tui::sanitize_terminal(&r.id)),
+            tui::sanitize_terminal(&r.description)
         ));
     }
-    tui::line(&tui::dim(
-        "  Tip: Add custom JSON rules to `.buildwithnexus/rules/` or use `@rules:<id>` in prompt",
-    ));
+    out
 }
 
 // Every file in the workspace rules dir, plus one (file name, error) per
@@ -2833,7 +2875,10 @@ fn handle_kb_index(cwd: &std::path::Path) {
     }
     tui::set_agent_running(false);
     if let Err(e) = kb.save() {
-        tui::line(&tui::red(&format!("  Failed to save knowledge base: {e}")));
+        tui::line(&tui::red(&format!(
+            "  Failed to save knowledge base: {}",
+            tui::sanitize_terminal(&e)
+        )));
     } else {
         tui::line(&tui::green(&format!("  ✓ indexed {count} symbols")));
         tui::line(&tui::dim(
@@ -3001,8 +3046,9 @@ fn handle_workflows() {
                 )));
             } else {
                 tui::line(&tui::accent(&format!("  workflow #{id} output:")));
+                // Child stderr is raw tool and model output.
                 for l in lines.iter().take(100) {
-                    tui::line(&format!("    {}", tui::dim(l)));
+                    tui::line(&format!("    {}", tui::dim(&tui::sanitize_terminal(l))));
                 }
                 if lines.len() > 100 {
                     tui::line(&tui::dim(&format!(
@@ -3142,12 +3188,15 @@ fn handle_permissions_reset(cwd: &std::path::Path) {
         tui::line(&tui::green(&format!(
             "  ✓ cleared {n} \"always allow\" entr{} for {}",
             if n == 1 { "y" } else { "ies" },
-            cwd.display()
+            tui::sanitize_terminal(&cwd.display().to_string())
         )));
     }
 }
 
-fn handle_permissions(perm: &mut Permission) {
+fn handle_permissions(perm: &mut Permission, cwd: &std::path::Path) {
+    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+        report::notice(&format!("  {n}"));
+    }
     let current = permission_label(perm);
     let items = vec![
         tui::SelectItem {
@@ -3251,7 +3300,8 @@ fn handle_diff(cwd: &std::path::Path) {
         &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}),
         cwd,
     );
-    for line in out.content.lines() {
+    // File names in the stat come from the checkout.
+    for line in tui::sanitize_terminal(&out.content).lines() {
         tui::line(&tui::dim(&format!("  {line}")));
     }
 }
@@ -3335,12 +3385,13 @@ fn handle_checkpoints(cwd: &std::path::Path) {
         tui::line(&tui::dim("  no checkpoints for this directory"));
         return;
     }
+    // Paths are wherever the model wrote; checkpoint files are on disk.
     for cp in items.iter().take(10) {
         tui::line(&format!(
             "  {}  {}  {}",
-            tui::bold(&cp.id),
-            cp.action,
-            cp.path.display()
+            tui::bold(&tui::sanitize_terminal(&cp.id)),
+            tui::sanitize_terminal(&cp.action),
+            tui::sanitize_terminal(&cp.path.display().to_string())
         ));
     }
 }
@@ -3359,10 +3410,14 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
                     if cps.len() == 1 { "" } else { "s" }
                 )));
                 for c in cps {
-                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                    tui::line(&format!(
+                        "    - {} ({})",
+                        tui::sanitize_terminal(&c.path.display().to_string()),
+                        tui::sanitize_terminal(&c.action)
+                    ));
                 }
             }
-            Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+            Err(e) => tui::line(&tui::yellow(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else if arg == "git" {
         // The one command here that can destroy work bwn didn't do: it
@@ -3380,8 +3435,14 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             return;
         }
         match checkpoint::git_rollback(cwd) {
-            Ok(msg) => tui::line(&tui::green(&format!("  ✓ git reset: {msg}"))),
-            Err(e) => tui::line(&tui::red(&format!("  git reset error: {e}"))),
+            Ok(msg) => tui::line(&tui::green(&format!(
+                "  ✓ git reset: {}",
+                tui::sanitize_terminal(&msg)
+            ))),
+            Err(e) => tui::line(&tui::red(&format!(
+                "  git reset error: {}",
+                tui::sanitize_terminal(&e)
+            ))),
         }
     } else if arg == "all" || arg == "session" {
         let since = checkpoint::now_ms().saturating_sub(24 * 3600 * 1000);
@@ -3402,8 +3463,8 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
         for c in pending.iter().take(8) {
             tui::line(&tui::dim(&format!(
                 "    - {} ({})",
-                c.path.display(),
-                c.action
+                tui::sanitize_terminal(&c.path.display().to_string()),
+                tui::sanitize_terminal(&c.action)
             )));
         }
         if pending.len() > 8 {
@@ -3421,27 +3482,31 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
                     cps.len()
                 )));
                 for c in cps {
-                    tui::line(&format!("    - {} ({})", c.path.display(), c.action));
+                    tui::line(&format!(
+                        "    - {} ({})",
+                        tui::sanitize_terminal(&c.path.display().to_string()),
+                        tui::sanitize_terminal(&c.action)
+                    ));
                 }
             }
-            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else if arg == "latest" {
         match checkpoint::undo_latest(cwd) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored latest {}",
-                cp.path.display()
+                tui::sanitize_terminal(&cp.path.display().to_string())
             ))),
-            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else {
         match checkpoint::undo_by_id(cwd, arg) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored checkpoint {} ({})",
                 cp.id,
-                cp.path.display()
+                tui::sanitize_terminal(&cp.path.display().to_string())
             ))),
-            Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     }
 }
@@ -3504,7 +3569,10 @@ fn handle_align(cwd: &std::path::Path) {
         last_updated: "now".to_string(),
     };
     kb.add_entity(entity);
-    let _ = kb.save();
+    if let Err(e) = kb.save() {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+        return;
+    }
     tui::line(&tui::dim(
         "  Decision recorded into structured knowledge base (.buildwithnexus/knowledge/).",
     ));
@@ -4293,7 +4361,11 @@ fn run_doctor() {
     // Settings
     let load = config::load_settings_diag();
     for i in &load.issues {
-        println!("  ✗ settings       {}: {}", i.source, i.error);
+        println!(
+            "  ✗ settings       {}: {}",
+            tui::sanitize_terminal(&i.source),
+            tui::sanitize_terminal(&i.error)
+        );
     }
     match load.settings.as_ref() {
         None if load.any_present => {
@@ -4338,15 +4410,22 @@ fn run_doctor() {
                                 "  ✓ provider       {} answers as {} (one-token probe)",
                                 s.provider, p.model
                             ),
+                            // The error can carry the server's response body.
                             Err(e) => println!(
                                 "  ✗ provider       {}: {}",
                                 s.provider,
-                                e.chars().take(160).collect::<String>()
+                                tui::sanitize_terminal(&e)
+                                    .chars()
+                                    .take(160)
+                                    .collect::<String>()
                             ),
                         }
                     }
                 }
-                Err(e) => println!("  ✗ provider       {e}"),
+                Err(e) => println!(
+                    "  ✗ provider       {}",
+                    tui::sanitize_terminal(&e.to_string())
+                ),
             }
         }
     }
@@ -4398,11 +4477,7 @@ fn run_doctor() {
         ("rg", "ripgrep (fast search, optional)"),
     ];
     for (bin, label) in &tools_to_check {
-        let found = std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let found = crate::tools::find_on_path(bin).is_some();
         let glyph = if found { "✓" } else { "·" };
         println!("  {glyph} {bin:<12} {label}");
     }
@@ -4474,11 +4549,7 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
 
     let mut missing = Vec::new();
     for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
-        let found = std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let found = crate::tools::find_on_path(bin).is_some();
         if !found {
             missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
         }
@@ -4506,16 +4577,8 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
         return;
     }
 
-    let brew_available = std::process::Command::new("which")
-        .arg("brew")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let apt_available = std::process::Command::new("which")
-        .arg("apt-get")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let brew_available = crate::tools::find_on_path("brew").is_some();
+    let apt_available = crate::tools::find_on_path("apt-get").is_some();
 
     for (bin, brew_pkg, apt_pkg, desc) in missing {
         let ask_msg = format!(
@@ -5138,6 +5201,38 @@ mod tests {
         // No rules dir at all is not an error.
         let (rules, failures) = load_workspace_rule_files(&dir.join("missing"));
         assert!(rules.is_empty() && failures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rules_listing_neutralizes_escapes_from_repo_rules() {
+        let dir = std::env::temp_dir().join(format!("bwn-rules-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = dir.join(".buildwithnexus").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        // OSC 52 sets the clipboard; the payload is base64 for "rm -rf ~".
+        let rule = serde_json::json!({"rules": [{
+            "id": "clip\u{1b}[2J",
+            "description": "harmless\u{1b}]52;c;cm0gLXJmIH4=\u{7}",
+            "severity": "low",
+            "message": "m"
+        }]});
+        std::fs::write(rules.join("evil.json"), rule.to_string()).unwrap();
+        if cfg!(unix) {
+            std::fs::write(rules.join("bad\u{1b}]0;x\u{7}.yaml"), "rules: [").unwrap();
+        }
+
+        let out = rules_listing(&dir).join("\n");
+        assert!(!out.contains("\u{1b}]"), "live OSC in /rules: {out:?}");
+        assert!(
+            !out.contains("\u{1b}[2J") && !out.contains('\u{7}'),
+            "{out:?}"
+        );
+        assert!(out.contains("harmless␛]52;c;cm0gLXJmIH4="), "{out:?}");
+        assert!(out.contains("clip␛[2J"), "{out:?}");
+        if cfg!(unix) {
+            assert!(out.contains("bad␛]0;x.yaml"), "{out:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

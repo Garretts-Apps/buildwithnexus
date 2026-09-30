@@ -72,6 +72,27 @@ function installedBinary() {
   return path.join(ROOT, 'bin', 'buildwithnexus' + ext());
 }
 
+// Written by bootstrap.js after a verified download: { version, sha256 }. If
+// it is here but the binary is not, something removed the binary after it was
+// installed (typically endpoint protection), and downloading it again would
+// only repeat that.
+function installMarker() {
+  return path.join(ROOT, 'bin', '.installed.json');
+}
+
+function readInstallMarker() {
+  try {
+    const m = JSON.parse(fs.readFileSync(installMarker(), 'utf8'));
+    return m && typeof m.version === 'string' ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+// bootstrap.js exits with this after it printed why the binary it installed
+// cannot run, so the launcher does not add a second message.
+const EXIT_EXPLAINED = 3;
+
 // Local development builds in a repo checkout.
 function devBinary() {
   const rootTarget = path.join(ROOT, 'target', 'release', 'buildwithnexus' + ext());
@@ -85,4 +106,7 @@ function existing() {
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
-module.exports = { ROOT, ext, target, platformPackage, packagedBinary, installedBinary, devBinary, existing };
+module.exports = {
+  ROOT, ext, target, platformPackage, packagedBinary, installedBinary, installMarker, readInstallMarker,
+  devBinary, existing, EXIT_EXPLAINED,
+};

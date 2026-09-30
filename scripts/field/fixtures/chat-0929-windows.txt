@@ -1,0 +1,373 @@
+Command blocks from real setup replies on 2026-09-29: Windows 11 and Windows Server 2022 setup, with the follow-up fixes for U25-U28 and U30.
+They are in their original order, with the surrounding prose removed. Each
+block failed or misled on a real machine, and the lint must keep flagging it.
+
+
+#### 2026-09-29T21:48
+```powershell
+winget install --id Microsoft.WindowsTerminal -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
+```
+```powershell
+winget install --id Microsoft.VCRedist.2015+.x64 -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+winget install --id Ollama.Ollama -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+winget install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+winget install --id BurntSushi.ripgrep.MSVC -e --accept-source-agreements --accept-package-agreements
+```
+```powershell
+ollama --version
+```
+```powershell
+node -v
+```
+```powershell
+ffmpeg -version
+```
+```powershell
+rg --version
+```
+```powershell
+Invoke-RestMethod http://localhost:11434/api/version
+```
+```powershell
+Start-Process ollama -ArgumentList serve -WindowStyle Hidden
+```
+```powershell
+ollama pull gemma3:4b
+```
+```powershell
+ollama list
+```
+```powershell
+npm install -g buildwithnexus@latest
+```
+```powershell
+bwn --version
+```
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.buildwithnexus"
+```
+```powershell
+'{ "provider": "ollama", "model": "gemma3:4b", "permission": "ask" }' | Set-Content "$env:USERPROFILE\.buildwithnexus\settings.json"
+```
+```powershell
+New-Item -ItemType Directory -Force C:\dev\vision-test
+```
+```powershell
+Set-Location C:\dev\vision-test
+```
+```powershell
+Add-Type -AssemblyName System.Drawing; $b = New-Object System.Drawing.Bitmap 800,300; $g = [System.Drawing.Graphics]::FromImage($b); $g.Clear([System.Drawing.Color]::White); $g.TextRenderingHint = 'AntiAlias'; $g.DrawString('NEXUS VISION TEST', (New-Object System.Drawing.Font 'Segoe UI',40), [System.Drawing.Brushes]::Black, 30, 70); $g.DrawString('code 4217', (New-Object System.Drawing.Font 'Segoe UI',28), [System.Drawing.Brushes]::Blue, 34, 160); $g.FillEllipse([System.Drawing.Brushes]::Red, 620, 80, 130, 130); $b.Save('C:\dev\vision-test\test.png', [System.Drawing.Imaging.ImageFormat]::Png)
+```
+```powershell
+ollama run gemma3:4b "Read all the text in this image and name the shapes and colours: C:\dev\vision-test\test.png"
+```
+```powershell
+bwn --prompt "what is in @test.png?"
+```
+```
+Read @test.png and write every piece of text you can see in it to image-notes.md
+```
+  ```powershell
+  $env:BWN_IMAGES = "sixel"; bwn --prompt "what is in @test.png?"
+  ```
+
+#### 2026-09-29T21:49
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+```
+```powershell
+New-Item -ItemType Directory -Force C:\dev\installers, C:\tools | Out-Null; Set-Location C:\dev\installers
+```
+```powershell
+Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+```
+```powershell
+Start-Process .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait
+```
+```powershell
+$v = (Invoke-RestMethod https://nodejs.org/dist/index.json | Where-Object { $_.lts } | Select-Object -First 1).version; $v
+```
+```powershell
+Invoke-WebRequest "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile node.msi
+```
+```powershell
+Start-Process msiexec -ArgumentList '/i','node.msi','/qn','/norestart' -Wait
+```
+```powershell
+Invoke-WebRequest https://ollama.com/download/OllamaSetup.exe -OutFile OllamaSetup.exe
+```
+```powershell
+Start-Process .\OllamaSetup.exe -ArgumentList '/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES' -Wait
+```
+```powershell
+Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+```
+```powershell
+Expand-Archive ffmpeg.zip -DestinationPath C:\tools -Force
+```
+```powershell
+$bin = (Get-ChildItem C:\tools -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName; [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','Machine') + ";$bin", 'Machine'); $bin
+```
+```powershell
+$a = (Invoke-RestMethod https://api.github.com/repos/BurntSushi/ripgrep/releases/latest).assets | Where-Object name -like '*x86_64-pc-windows-msvc.zip' | Select-Object -First 1; Invoke-WebRequest $a.browser_download_url -OutFile rg.zip
+```
+```powershell
+Expand-Archive rg.zip -DestinationPath C:\tools -Force; $rg = (Get-ChildItem C:\tools -Recurse -Filter rg.exe | Select-Object -First 1).DirectoryName; [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','Machine') + ";$rg", 'Machine')
+```
+```powershell
+$a = (Invoke-RestMethod https://api.github.com/repos/microsoft/terminal/releases/latest).assets | Where-Object name -like '*_x64.zip' | Select-Object -First 1; $a.name; Invoke-WebRequest $a.browser_download_url -OutFile wt.zip
+```
+```powershell
+Expand-Archive wt.zip -DestinationPath C:\tools\WindowsTerminal -Force
+```
+```powershell
+$wt = (Get-ChildItem C:\tools\WindowsTerminal -Recurse -Filter WindowsTerminal.exe | Select-Object -First 1).FullName; $s = (New-Object -ComObject WScript.Shell).CreateShortcut("$env:PUBLIC\Desktop\Windows Terminal.lnk"); $s.TargetPath = $wt; $s.Save(); $wt
+```
+```powershell
+node -v
+```
+```powershell
+ollama --version
+```
+```powershell
+ffmpeg -version
+```
+```powershell
+Invoke-RestMethod http://localhost:11434/api/version
+```
+```powershell
+Start-Process ollama -ArgumentList serve -WindowStyle Hidden
+```
+```powershell
+ollama pull gemma3:4b
+```
+```powershell
+npm install -g buildwithnexus@latest
+```
+```powershell
+bwn --version
+```
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.buildwithnexus" | Out-Null; '{ "provider": "ollama", "model": "gemma3:4b", "permission": "ask" }' | Set-Content "$env:USERPROFILE\.buildwithnexus\settings.json"
+```
+```powershell
+New-Item -ItemType Directory -Force C:\dev\vision-test | Out-Null; Set-Location C:\dev\vision-test
+```
+```powershell
+Add-Type -AssemblyName System.Drawing; $b = New-Object System.Drawing.Bitmap 800,300; $g = [System.Drawing.Graphics]::FromImage($b); $g.Clear([System.Drawing.Color]::White); $g.TextRenderingHint = 'AntiAlias'; $g.DrawString('NEXUS VISION TEST', (New-Object System.Drawing.Font 'Segoe UI',40), [System.Drawing.Brushes]::Black, 30, 70); $g.DrawString('code 4217', (New-Object System.Drawing.Font 'Segoe UI',28), [System.Drawing.Brushes]::Blue, 34, 160); $g.FillEllipse([System.Drawing.Brushes]::Red, 620, 80, 130, 130); $b.Save('C:\dev\vision-test\test.png', [System.Drawing.Imaging.ImageFormat]::Png)
+```
+```powershell
+ollama run gemma3:4b "Read all the text in this image and name the shapes and colours: C:\dev\vision-test\test.png"
+```
+```powershell
+bwn --prompt "what is in @test.png?"
+```
+  ```powershell
+  $env:BWN_IMAGES = "sixel"; bwn --prompt "what is in @test.png?"
+  ```
+
+#### 2026-09-29T21:51
+```powershell
+$ProgressPreference = 'SilentlyContinue'
+```
+```powershell
+New-Item -ItemType Directory -Force C:\dev\installers, C:\dev\vision-test, C:\tools | Out-Null; Set-Location C:\dev\installers
+```
+```powershell
+Invoke-WebRequest -UseBasicParsing https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+```
+```powershell
+Start-Process .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait
+```
+```powershell
+$v = (Invoke-RestMethod https://nodejs.org/dist/index.json | Where-Object lts | Select-Object -First 1).version; $v
+```
+```powershell
+Invoke-WebRequest -UseBasicParsing "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile node.msi
+```
+```powershell
+Start-Process msiexec.exe -ArgumentList '/i','node.msi','/qn' -Wait
+```
+```powershell
+Invoke-WebRequest -UseBasicParsing https://ollama.com/download/OllamaSetup.exe -OutFile OllamaSetup.exe
+```
+```powershell
+Start-Process .\OllamaSetup.exe -ArgumentList '/VERYSILENT','/NORESTART' -Wait
+```
+```powershell
+Invoke-WebRequest -UseBasicParsing https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+```
+```powershell
+Expand-Archive ffmpeg.zip C:\tools -Force; Get-ChildItem C:\tools -Directory -Filter 'ffmpeg-*' | Rename-Item -NewName ffmpeg
+```
+```powershell
+$rg = (Invoke-RestMethod https://api.github.com/repos/BurntSushi/ripgrep/releases/latest).assets | Where-Object name -like '*x86_64-pc-windows-msvc.zip'; Invoke-WebRequest -UseBasicParsing $rg.browser_download_url -OutFile rg.zip
+```
+```powershell
+Expand-Archive rg.zip C:\tools -Force; Get-ChildItem C:\tools -Directory -Filter 'ripgrep-*' | Rename-Item -NewName ripgrep
+```
+```powershell
+$wt = (Invoke-RestMethod https://api.github.com/repos/microsoft/terminal/releases/latest).assets | Where-Object name -like 'Microsoft.WindowsTerminal_*_x64.zip'; Invoke-WebRequest -UseBasicParsing $wt.browser_download_url -OutFile wt.zip
+```
+```powershell
+Expand-Archive wt.zip C:\tools\wt -Force; Get-ChildItem C:\tools\wt -Recurse -Filter wt.exe | Select-Object -First 1 -ExpandProperty FullName
+```
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','Machine') + ';C:\tools\ffmpeg\bin;C:\tools\ripgrep', 'Machine')
+```
+```powershell
+node -v; ffmpeg -version | Select-Object -First 1; rg --version | Select-Object -First 1; ollama -v
+```
+```powershell
+npm install -g buildwithnexus
+```
+```powershell
+ollama pull gemma3:4b
+```
+```powershell
+Copy-Item "$env:USERPROFILE\Pictures\*.png" C:\dev\vision-test -ErrorAction SilentlyContinue; Set-Location C:\dev\vision-test; Get-ChildItem
+```
+```powershell
+bwn run --provider ollama --model gemma3:4b "describe @test.png"
+```
+```powershell
+bwn
+```
+
+#### 2026-09-29T21:53
+```powershell
+$v = ((Invoke-RestMethod https://nodejs.org/dist/index.json) | Where-Object lts | Select-Object -First 1).version; $v
+```
+```powershell
+Invoke-WebRequest -UseBasicParsing "https://nodejs.org/dist/$v/node-$v-x64.msi" -OutFile node.msi
+```
+```powershell
+Start-Process msiexec.exe -ArgumentList '/i','node.msi','/qn' -Wait
+```
+
+#### 2026-09-29T22:00
+```powershell
+Invoke-WebRequest -UseBasicParsing https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+```
+```powershell
+Expand-Archive ffmpeg.zip C:\tools -Force; Get-ChildItem C:\tools -Directory -Filter 'ffmpeg-*' | Rename-Item -NewName ffmpeg
+```
+```powershell
+C:\tools\ffmpeg\bin\ffmpeg.exe -version | Select-Object -First 1
+```
+
+#### 2026-09-29T22:13
+```powershell
+Set-Location C:\dev\installers
+```
+```powershell
+$rg = (Invoke-RestMethod https://api.github.com/repos/BurntSushi/ripgrep/releases/latest).assets | Where-Object name -like '*x86_64-pc-windows-msvc.zip'; Invoke-WebRequest -UseBasicParsing $rg.browser_download_url -OutFile rg.zip
+```
+```powershell
+Expand-Archive rg.zip C:\tools -Force; Get-ChildItem C:\tools -Directory -Filter 'ripgrep-*' | Rename-Item -NewName ripgrep
+```
+```powershell
+C:\tools\ripgrep\rg.exe --version | Select-Object -First 1
+```
+
+#### 2026-09-29T22:15
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';C:\tools\ffmpeg\bin;C:\tools\ripgrep', 'User')
+```
+```
+C:\tools\wt\terminal-1.24.11911.0\wt.exe
+```
+```powershell
+node -v; ffmpeg -version | Select-Object -First 1; rg --version | Select-Object -First 1; ollama -v
+```
+
+#### 2026-09-29T22:17
+```powershell
+Test-Path "C:\Program Files\nodejs\node.exe"
+```
+```powershell
+Start-Process msiexec.exe -ArgumentList '/i','C:\dev\installers\node.msi','/qn' -Verb RunAs -Wait
+```
+```powershell
+node -v; npm -v
+```
+```powershell
+ollama -v
+```
+
+#### 2026-09-29T22:17
+```powershell
+Test-Path "C:\Program Files\nodejs\node.exe"
+```
+```powershell
+Start-Process msiexec.exe -ArgumentList '/i','C:\dev\installers\node.msi','/qn' -Verb RunAs -Wait
+```
+```powershell
+node -v; npm -v
+```
+```powershell
+npm install -g buildwithnexus
+```
+
+#### 2026-09-29T22:21
+```powershell
+Test-Path "$env:APPDATA\npm\node_modules\buildwithnexus\bin\buildwithnexus.exe"
+```
+```powershell
+Start-Process powershell -Verb RunAs
+```
+```powershell
+Get-MpThreatDetection | Sort-Object InitialDetectionTime | Select-Object -Last 3 InitialDetectionTime, ThreatID, Resources | Format-List
+```
+```powershell
+Add-MpPreference -ExclusionPath "C:\Users\user\AppData\Roaming\npm\node_modules\buildwithnexus\bin"
+```
+```powershell
+Test-Path C:\Windows\System32\vcruntime140.dll
+```
+```powershell
+bwn --version
+```
+
+#### 2026-09-29T22:22
+```powershell
+Start-Process powershell -Verb RunAs
+```
+```powershell
+Get-MpThreatDetection | Sort-Object InitialDetectionTime | Select-Object -Last 3 InitialDetectionTime, ThreatID, Resources | Format-List
+```
+```powershell
+Add-MpPreference -ExclusionPath "C:\Users\user\AppData\Roaming\npm\node_modules\buildwithnexus\bin"
+```
+```powershell
+Test-Path C:\Windows\System32\vcruntime140.dll
+```
+```powershell
+bwn --version
+```
+
+#### 2026-09-29T22:22
+```powershell
+New-Item -ItemType Directory -Force C:\tools\bwn | Out-Null; Invoke-WebRequest -UseBasicParsing https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.14.7/buildwithnexus-x86_64-pc-windows-msvc.exe -OutFile C:\tools\bwn\buildwithnexus.exe
+```
+```powershell
+C:\tools\bwn\buildwithnexus.exe --version
+```
+```powershell
+Test-Path C:\tools\bwn\buildwithnexus.exe
+```
+  ```powershell
+  Get-Service | Where-Object DisplayName -match 'CrowdStrike|Falcon|Sentinel|Sophos|Carbon|Cylance|Symantec|McAfee|Trend|Cortex|Defender' | Select-Object Status, DisplayName
+  ```

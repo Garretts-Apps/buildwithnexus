@@ -72,13 +72,24 @@ jobs:
               exit 1 ;;
           esac
 
+  # The full CI workflow on this exact commit. Nothing is tagged, built or
+  # published unless it passes: 0.14.6 shipped from a commit that never had a
+  # CI run, and #37 merged 3 seconds into a CI run that then failed. (A
+  # workflow_run trigger would not do: crates.io OIDC refuses it.)
+  ci:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   # Creates (or refreshes) the tag + release ONCE, with the CHANGELOG section
   # as the body and GitHub's auto-generated notes appended. The build matrix
   # only uploads assets — when this step ran per matrix job with
   # append_body: true, every job (and every re-dispatch) appended another
   # copy of the notes. body replacement here makes re-dispatches idempotent.
   release:
-    needs: gate
+    needs: [gate, ci]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -155,16 +166,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux builds on 22.04 so the binaries need glibc 2.35 at most and
-        # run on Ubuntu 22.04+ and Debian 12+; a 24.04 build needs 2.39.
+        # Linux builds on 22.04 so the binaries need at most its glibc 2.35
+        # (0.14.9 needs 2.34); a 24.04 build needs 2.39. The floor the docs
+        # promise is checked after the build.
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -279,17 +291,15 @@ jobs:
           else shasum -a 256 "$ASSET" > "$ASSET.sha256"; fi
           cat "$ASSET.sha256"
 
+      # The floor lives in scripts/diagnose.js, which the launcher quotes when
+      # a binary fails on an older glibc, and the docs repeat. A binary that
+      # needs more would make both wrong, so it fails the release instead.
+      # ci.yml runs the same check on every PR, so this should never fire.
       - name: Check the glibc floor
         if: contains(matrix.target, 'linux')
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          need=$(readelf -V "buildwithnexus-$TARGET" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
-          echo "buildwithnexus-$TARGET needs glibc $need"
-          if [ "$(printf '%s\n' "$need" 2.35 | sort -V | tail -1)" != "2.35" ]; then
-            echo "::error::buildwithnexus-$TARGET needs glibc $need; the floor is 2.35 (Ubuntu 22.04)"
-            exit 1
-          fi
+        run: scripts/check-glibc-floor.sh "buildwithnexus-$TARGET"
 
       - name: Hand the asset to the assets job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

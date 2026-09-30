@@ -536,6 +536,84 @@ pub(crate) fn read_project_file(p: &Path, bound: &Path) -> Option<String> {
     fs::read_to_string(&real).ok()
 }
 
+/// Writes a file the harness owns inside the project tree (the knowledge
+/// base, published artifacts). The checkout controls that tree, so a symlink
+/// at `p` or at any directory between `bound` and `p` could aim the write
+/// anywhere (`.buildwithnexus/knowledge -> ~/.ssh`): refuse rather than
+/// follow it. Missing directories are created. The file is replaced through
+/// a fresh temp file and a rename, which never writes through whatever sits
+/// at `p` by the time the write lands.
+pub(crate) fn write_project_file(p: &Path, bound: &Path, contents: &[u8]) -> Result<(), String> {
+    let outside = || {
+        format!(
+            "refusing to write {}: it is outside the project",
+            p.display()
+        )
+    };
+    let linked = |at: &Path| {
+        format!(
+            "refusing to write {}: {} is a symlink, and harness files in the project are never written through one",
+            p.display(),
+            at.display()
+        )
+    };
+    let names = p
+        .strip_prefix(bound)
+        .map_err(|_| outside())?
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(n) => Ok(n),
+            _ => Err(outside()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((file, dirs)) = names.split_last() else {
+        return Err(outside());
+    };
+    let mut dir = bound.to_path_buf();
+    for name in dirs {
+        dir.push(name);
+        match fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => return Err(linked(&dir)),
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "cannot write {}: {} is not a directory",
+                    p.display(),
+                    dir.display()
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?
+            }
+            Err(e) => return Err(format!("cannot write {}: {e}", p.display())),
+        }
+    }
+    let target = dir.join(file);
+    let existing = fs::symlink_metadata(&target).ok();
+    if existing
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_symlink())
+    {
+        return Err(linked(&target));
+    }
+    let mut tmp_name = file.to_os_string();
+    tmp_name.push(format!(".bwn-tmp-{}", std::process::id()));
+    let tmp = dir.join(tmp_name);
+    // A leftover temp, or a link planted at its name, is removed rather than
+    // written through.
+    let _ = fs::remove_file(&tmp);
+    let written = crate::media::write_new(&tmp, contents).and_then(|()| {
+        if let Some(m) = existing {
+            let _ = fs::set_permissions(&tmp, m.permissions());
+        }
+        fs::rename(&tmp, &target)
+    });
+    written.map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", p.display())
+    })
+}
+
 // `Agents.md` (mixed case, harness-specific) defines roles/capabilities the
 // model can adopt. It is distinct from the cross-harness project instruction
 // files `AGENTS.md` / `CLAUDE.md` handled by `load_instructions` below, which
@@ -2386,7 +2464,7 @@ mod tests {
     fn project_files_never_follow_links_out_of_the_tree() {
         let outer = unique_dir("projlink");
         let secret = outer.join("secret.txt");
-        write(&secret, "API_KEY=sk-live");
+        write(&secret, "API_KEY=sk-live"); // gitleaks:allow (fake key for the test)
         let repo = outer.join("repo");
         write(&repo.join("AGENTS.md"), "real rules");
         write(&repo.join(".env"), "TOKEN=x");

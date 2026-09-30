@@ -127,7 +127,7 @@ jobs:
       # binary against its build-provenance attestation (Sigstore, tied to
       # release.yml in this repo), then record the verified hashes in
       # checksums.json inside the immutable npm tarball. The launcher's
-      # first-run download and the platform packages below trust only these.
+      # first-run download trusts only these.
       - name: Verify release binaries and record checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -179,119 +179,6 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Platform binary packages (buildwithnexus-<os>-<cpu>): download each
-      # release asset, verify its SHA-256 against the published checksum, and
-      # publish it as its own package. The main package selects the right one
-      # at install time via optionalDependencies — so the main tarball needs
-      # no install scripts and no network code at all.
-      #
-      # FIRST-TIME SETUP: npm OIDC cannot CREATE a package, so each platform
-      # package's first version has to be published with a token:
-      #   NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh <version>
-      # (or store NPM_TOKEN as a repo secret and re-run this workflow). Then
-      # attach a Trusted Publisher (this repo, publish.yml) to each package at
-      #   https://www.npmjs.com/package/buildwithnexus-<platform>/access
-      # and delete the token; later versions publish via OIDC.
-      #
-      # Until then this step does NOT fail the run: installs work without
-      # the platform packages (the launcher downloads the checksum-verified
-      # release binary on first run). Instead, optionalDependencies in the
-      # published manifest list only the platform packages whose exact version
-      # is on the registry, so npm never resolves a version that doesn't
-      # exist, and the run carries a warning naming the fix.
-      # Runs on every invocation (not gated on the main-package check) and
-      # skips versions that already exist, so re-running fills in the gaps.
-      - name: Publish platform binary packages
-        env:
-          # One-time bootstrap only (see above). Delete the secret once every
-          # platform package has a Trusted Publisher.
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          V=$(node -p "require('./package.json').version")
-          declare -A T=(
-            [linux-x64]=x86_64-unknown-linux-gnu
-            [linux-arm64]=aarch64-unknown-linux-gnu
-            [darwin-x64]=x86_64-apple-darwin
-            [darwin-arm64]=aarch64-apple-darwin
-            [win32-x64]=x86_64-pc-windows-msvc
-          )
-          present=()
-          for p in "${!T[@]}"; do
-            t=${T[$p]}; ext=""; [[ "$t" == *windows* ]] && ext=".exe"
-            if npm view "buildwithnexus-${p}@${V}" version >/dev/null 2>&1; then
-              echo "buildwithnexus-${p}@${V} already published — skipping."
-              present+=("$p")
-              continue
-            fi
-            mkdir -p "npm/${p}/bin"
-            # The attestation-verified copy from the step above.
-            cp "verified/buildwithnexus-${t}${ext}" "npm/${p}/bin/buildwithnexus${ext}"
-            expected=$(A="buildwithnexus-${t}${ext}" node -p "require('./checksums.json')[process.env.A]")
-            got=$(sha256sum "npm/${p}/bin/buildwithnexus${ext}" | cut -d' ' -f1)
-            [[ "$expected" == "$got" ]] || { echo "::error::checksum mismatch for ${p}"; exit 1; }
-            chmod +x "npm/${p}/bin/buildwithnexus${ext}"
-            PKG_FILE="npm/${p}/package.json" V="$V" node -e "const fs=require('fs'),f=process.env.PKG_FILE,j=JSON.parse(fs.readFileSync(f,'utf8'));j.version=process.env.V;fs.writeFileSync(f,JSON.stringify(j,null,2)+'\n')"
-            # OIDC first; bootstrap-token fallback for the first publish of
-            # a brand-new package (see env comment above).
-            # NOTE: --provenance requires an OIDC token. The NPM_TOKEN fallback
-            # uses a classic token, so we intentionally omit --provenance here —
-            # passing it causes npm to return 404 on new packages.
-            if (cd "npm/${p}" && npm publish --access public --provenance); then
-              present+=("$p")
-            elif [ -n "${NPM_TOKEN}" ]; then
-              echo "OIDC publish failed for buildwithnexus-${p} — using the one-time bootstrap token (no provenance)"
-              if (cd "npm/${p}" && npm publish --access public \
-                    --//registry.npmjs.org/:_authToken="${NPM_TOKEN}"); then
-                present+=("$p")
-              else
-                echo "bootstrap-token publish of buildwithnexus-${p} also failed"
-              fi
-            else
-              echo "OIDC publish of buildwithnexus-${p} failed and no NPM_TOKEN bootstrap secret is set."
-            fi
-          done
-          missing=()
-          for p in "${!T[@]}"; do
-            [[ " ${present[*]} " == *" $p "* ]] || missing+=("$p")
-          done
-
-          # Pin optionalDependencies to this exact version, but only for the
-          # platform packages that exist on the registry. Listing a version
-          # that doesn't exist makes npm's resolver hunt for it on every
-          # install; leaving it out sends that platform to the launcher's
-          # first-run download instead.
-          PRESENT="${present[*]}" V="$V" node -e '
-            const fs = require("fs");
-            const j = JSON.parse(fs.readFileSync("package.json", "utf8"));
-            const deps = {};
-            for (const p of (process.env.PRESENT || "").split(" ").filter(Boolean).sort()) {
-              deps["buildwithnexus-" + p] = process.env.V;
-            }
-            if (Object.keys(deps).length) j.optionalDependencies = deps;
-            else delete j.optionalDependencies;
-            fs.writeFileSync("package.json", JSON.stringify(j, null, 2) + "\n");
-            console.log("optionalDependencies:", JSON.stringify(j.optionalDependencies || {}));
-          '
-
-          if [ "${#missing[@]}" -gt 0 ]; then
-            list=""
-            for p in "${missing[@]}"; do list+="buildwithnexus-${p}@${V} "; done
-            echo "::warning title=Platform packages not on npm::${list}are not published, so those platforms install through the first-run download. One-time fix: NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh ${V}, then attach a Trusted Publisher to each package."
-            {
-              echo "### Platform packages missing from npm"
-              echo ""
-              for p in "${missing[@]}"; do echo "- \`buildwithnexus-${p}@${V}\`"; done
-              echo ""
-              echo "These were left out of the published \`optionalDependencies\`; installs on those platforms use the checksum-verified first-run download."
-              echo "One-time fix, from a maintainer machine:"
-              echo ""
-              echo "    NPM_TOKEN=<granular token> scripts/first-publish-platform-packages.sh ${V}"
-              echo ""
-              echo "Then attach a Trusted Publisher (Garretts-Apps/buildwithnexus, publish.yml) to each package so later versions publish via OIDC."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
       #   1. Trusted Publisher configured on npmjs.com for the
@@ -302,13 +189,125 @@ jobs:
       #        - Environment: (blank)
       #   2. id-token: write permission on this job (set above).
       #
-      # No NPM_TOKEN is read. Token-based auth (and its 2FA gate) is bypassed.
+      # This step reads no NPM_TOKEN (only the reserve and deprecate steps
+      # below do, because npm OIDC cannot create packages or deprecate).
       #
       # Configure here:
       #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
       - name: Publish to npm (OIDC Trusted Publisher + provenance)
+        id: npm-publish
         if: steps.published.outputs.already == 'false'
         run: npm publish --access public --provenance
+
+      # 0.12.1-0.14.2 pin buildwithnexus-<os>-<cpu>@<their version> in
+      # optionalDependencies, but those packages were never published, so
+      # anyone could register the names and ship code into those installs.
+      # This reserves each name with an empty placeholder (no code, no bin)
+      # at the current version, which none of those pins match. The launcher
+      # never uses these packages: it downloads the release binary. A name
+      # that exists but is owned by someone else fails the run.
+      # npm OIDC cannot create a package, so creating one uses NPM_TOKEN, and
+      # without provenance (--provenance=false): asking for provenance on the
+      # token path is what made every earlier attempt fail with E404. Once
+      # all five exist this step needs no token and changes nothing.
+      - name: Reserve the platform package names
+        id: reserve
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          owners=$(npm view buildwithnexus maintainers --json | node -e '
+            const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            console.log([].concat(m).map((x) => String(x).split(" ")[0]).join(" "));')
+          npmrc="$RUNNER_TEMP/reserve.npmrc"
+          trap 'rm -f "$npmrc"' EXIT
+          failed=0
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+            name="buildwithnexus-${p}"
+            if got=$(npm view "$name" maintainers --json 2>/dev/null); then
+              mine=$(OWNERS="$owners" node -e '
+                const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                const own = new Set(process.env.OWNERS.split(" "));
+                console.log([].concat(m).some((x) => own.has(String(x).split(" ")[0])));' <<< "$got")
+              if [[ "$mine" == true ]]; then
+                echo "$name is reserved."
+              else
+                echo "::error title=Platform package name taken::$name exists on npm and is not owned by this package's maintainers. Installs of buildwithnexus 0.12.1-0.14.2 may pull it."
+                failed=1
+              fi
+              continue
+            fi
+            if [[ -z "$NPM_TOKEN" ]]; then
+              echo "::error title=Cannot reserve $name::$name is not on npm and the NPM_TOKEN secret is not set."
+              failed=1
+              continue
+            fi
+            printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npmrc"
+            dir="$RUNNER_TEMP/$name"
+            mkdir -p "$dir"
+            NAME="$name" V="$V" DIR="$dir" node -e '
+              const fs = require("fs");
+              const { NAME, V, DIR } = process.env;
+              fs.writeFileSync(DIR + "/package.json", JSON.stringify({
+                name: NAME,
+                version: V,
+                description: "Reserved name with no code. Install the buildwithnexus package instead.",
+                license: "MIT",
+                repository: { type: "git", url: "git+https://github.com/Garretts-Apps/buildwithnexus.git" },
+                homepage: "https://buildwithnexus.dev",
+              }, null, 2) + "\n");
+              fs.writeFileSync(DIR + "/README.md", "# " + NAME + "\n\nThis name is reserved by the buildwithnexus project, and the package contains no code.\nInstall [buildwithnexus](https://www.npmjs.com/package/buildwithnexus) instead.\n");
+            '
+            if (cd "$dir" && npm publish --access public --provenance=false --userconfig "$npmrc"); then
+              echo "Reserved $name@$V."
+            else
+              echo "::error title=Cannot reserve $name::npm publish failed for the placeholder; see the log above."
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+      # Mark versions users should not install. npm OIDC cannot deprecate, so
+      # this uses NPM_TOKEN, and only for a range not yet marked with the
+      # current message (one version per range is checked first).
+      #  - <0.10.0: the earlier VM and Docker products that shared this name.
+      #    Their `destroy` command is the only way to remove what `init` set up.
+      #  - 0.10.0-0.14.8: security fixes landed in 0.14.3 and 0.14.9.
+      - name: Deprecate unsupported versions
+        id: deprecate
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          legacy="Unmaintained: this is the old VM/Docker-based buildwithnexus, a different product from current releases. If you ran 'buildwithnexus init', run 'buildwithnexus destroy' with this version first (it deletes its VM or containers and their data), then install buildwithnexus@latest."
+          security="This version has security issues fixed in 0.14.3 and 0.14.9. Update with: npm install -g buildwithnexus@latest"
+          npmrc="$RUNNER_TEMP/deprecate.npmrc"
+          trap 'rm -f "$npmrc"' EXIT
+          failed=0
+          while IFS='|' read -r range probe msg; do
+            now=$(npm view "buildwithnexus@${probe}" deprecated 2>/dev/null || true)
+            if [[ "$now" == "$msg" ]]; then
+              echo "buildwithnexus@${range} is already deprecated."
+              continue
+            fi
+            if [[ -z "$NPM_TOKEN" ]]; then
+              echo "::error title=Cannot deprecate::buildwithnexus@${range} is not deprecated and the NPM_TOKEN secret is not set."
+              failed=1
+              continue
+            fi
+            printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npmrc"
+            if npm deprecate "buildwithnexus@${range}" "$msg" --userconfig "$npmrc"; then
+              echo "Deprecated buildwithnexus@${range}."
+            else
+              echo "::error title=Cannot deprecate::npm deprecate failed for buildwithnexus@${range}; see the log above."
+              failed=1
+            fi
+          done <<EOF
+          <0.10.0|0.8.11|${legacy}
+          >=0.10.0 <0.14.9|0.14.8|${security}
+          EOF
+          exit "$failed"
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
       # `cargo install bwn` (alias crate). OIDC only — the auth action
@@ -331,6 +330,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       - name: Publish to crates.io
+        id: crates
         if: github.event_name == 'workflow_dispatch'
         env:
           # OIDC token when Trusted Publishing is configured; otherwise the
@@ -375,14 +375,29 @@ jobs:
           done
           echo "::warning::bwn alias crate did not publish — run 'cargo publish -p bwn' manually."
 
+      # Built from what the steps above actually did, not from what they were
+      # meant to do.
       - name: Summary
         if: always()
+        env:
+          ALREADY: ${{ steps.published.outputs.already }}
+          NPM_PUBLISH: ${{ steps.npm-publish.outcome }}
+          RESERVE: ${{ steps.reserve.outcome }}
+          DEPRECATE: ${{ steps.deprecate.outcome }}
+          CRATES: ${{ steps.crates.outcome }}
         run: |
           PKG_VERSION=$(node -e 'console.log(require("./package.json").version)')
+          if [[ "$ALREADY" == true ]]; then
+            npm_line="already on npm, not republished"
+          else
+            npm_line="${NPM_PUBLISH:-not run} (OIDC Trusted Publisher with provenance)"
+          fi
           {
             echo "### Publish"
             echo ""
             echo "- Version: \`$PKG_VERSION\`"
-            echo "- Auth: OIDC Trusted Publisher"
-            echo "- Provenance: signed via OIDC"
+            echo "- npm: ${npm_line}"
+            echo "- Platform package names reserved: ${RESERVE:-not run}"
+            echo "- Deprecations: ${DEPRECATE:-not run}"
+            echo "- crates.io: ${CRATES:-not run}"
           } >> "$GITHUB_STEP_SUMMARY"

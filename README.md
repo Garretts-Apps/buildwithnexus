@@ -28,10 +28,13 @@ A daily background check tells you when a new version is out; set
 - **npm install:** Node.js 18 or later.
 - **cargo install / source build:** Rust 1.94 or later (`rust-version` in
   `harness/Cargo.toml`).
-- **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.35 or later: Ubuntu
-  22.04+, Debian 12+), macOS x64 and arm64,
-  Windows x64. Other platforms (for example musl/Alpine or Windows on Arm)
-  need a source build pointed to by `BWN_BIN`.
+- **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.34 or later: Ubuntu
+  22.04+, Debian 12+, RHEL/Rocky/AlmaLinux 9+, Amazon Linux 2023, Fedora
+  35+), macOS x64 and arm64, Windows x64. Other platforms (for example
+  musl/Alpine or Windows on Arm) need a source build pointed to by
+  `BWN_BIN`. If the prebuilt binary cannot run, the first run says why
+  (glibc too old, musl, or blocked by endpoint protection) instead of
+  reporting it ready.
 - **Optional tools:** `ffmpeg` for video attachments and image previews,
   `bwrap` (bubblewrap) for the Linux [sandbox](#sandbox), `tmux` for
   background dev servers, and `git`, `rg` and `python3` for the tools that
@@ -148,11 +151,14 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600).
 
-**Local models.** No key is needed. Start the server, then pick it in
-`bwn init`, or pass `--provider` on a headless run:
+**Local models.** No key is needed. The Ollama app and its Linux service
+start the server for you; without them (WSL without systemd, for example),
+run `ollama serve` in a second terminal. Check that it answers, then pick it
+in `bwn init`, or pass `--provider` on a headless run. These lines work the
+same in bash, zsh and PowerShell:
 
 ```bash
-ollama serve                 # listens on http://localhost:11434
+ollama list                  # lists your models; "could not connect" means no server
 ollama pull llama3.2         # the default Ollama model
 bwn init                     # choose Ollama
 bwn run --provider ollama --model llama3.2 "summarize this repo"
@@ -265,12 +271,15 @@ sensitive-path or dangerous-command confirmation can't slip one through.
 
 The prompt shows the whole command, with line breaks marked `⏎`, and names
 what `s` / `a` would allow from then on: a binary (`cargo`), a subcommand
-(`git status`), a host, or, for shells and interpreters (`sh`, `python3`,
-`node`, …), only that exact command. Answering `a` (always allow) remembers it
+(`git status`), a host, or, for shells, interpreters and other programs that
+run what they are given (`sh`, `python3`, `python3.12`, `node`, `awk`, `sed`,
+`env`, …), only that exact command. Answering `a` (always allow) remembers it
 **for the current project only** (`project_allowed` in
 `~/.buildwithnexus/settings.json`, keyed by directory). `/permissions reset`
 forgets those answers for the project you're in. The legacy global
-`allowed_commands` list keeps working.
+`allowed_commands` list keeps working, except for a shell or interpreter saved
+by name alone (`python3`, as 0.14.3–0.14.8 stored them): those are ignored,
+and bwn lists them at startup and in `/permissions`.
 
 Network tools (`fetch_url`, `headless_browser`, `wait_for_url`,
 `open_browser`) ask once per host and port under `ask` and `readonly`, since a
@@ -355,9 +364,14 @@ the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`).
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
 `permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
-prompt; otherwise the normal gate applies. Matchers are `*`, an exact tool name,
-or a `|`-separated list; each segment may use `*` and `?` wildcards
-(`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
+prompt; otherwise the normal gate applies. A `PreToolUse` hook that gives no
+answer also blocks the call, with a message naming it: one that times out
+(`"timeout"` in seconds, default 10), cannot start (missing script or
+interpreter, not executable, a `.rs` hook that does not compile) or is killed by
+a signal. Any other non-zero exit is shown and does not block. Other events
+never block on a failed hook, but the failure is shown. Matchers are `*`, an
+exact tool name, or a `|`-separated list; each segment may use `*` and `?`
+wildcards (`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
 [`examples/settings.json`](./examples/settings.json).
 
 ```json
@@ -482,9 +496,9 @@ The npm package is a thin, inert wrapper — **no install scripts, no network
 code, no bundled sources**. The binary is not in the tarball: on first run the
 launcher fetches the release asset for your platform and verifies its SHA-256
 checksum; every asset carries a build-provenance attestation
-(`gh attestation verify`). Per-platform packages (`buildwithnexus-<os>-<cpu>`)
-are declared as `optionalDependencies` and are used automatically once
-published. Non-interactive environments opt in with `bwn --bootstrap` or
+(`gh attestation verify`). The `buildwithnexus-<os>-<cpu>` names on npm are
+empty placeholders, reserved so nobody else can publish under them; nothing is
+installed from them. Non-interactive environments opt in with `bwn --bootstrap` or
 `BWN_ALLOW_BOOTSTRAP=1`; or build from source and point `BWN_BIN` at the result.
 
 ## Platform support
@@ -542,7 +556,9 @@ Endpoint protection such as CrowdStrike Falcon or Microsoft Defender may
 block or quarantine the Windows binary: it is new, has few installs, and the
 npm launcher downloads it on first run and then executes it. The file itself
 matches the release checksum and attestation. On a managed machine, ask IT to
-allowlist it. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
+allowlist it. When a blocked binary cannot start, the launcher prints its path
+and SHA-256 and names the endpoint product it finds, and it does not download
+the binary again on its own. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
 bwn runs, which hosts it connects to and which files it writes, explains how
 to verify a release, and includes a request you can send. Each Windows `.exe`
 carries a version resource and an `asInvoker` manifest, and each release has

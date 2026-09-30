@@ -2726,6 +2726,41 @@ pub fn sanitize_terminal(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+// A prompt mixes harness styling with text a model or server can supply (a
+// question's default answer, a detected model name). Keep the SGR color runs
+// and neutralize everything else as sanitize_terminal does, so no caller can
+// put a live escape on screen through `ask`/`ask_task`.
+fn sanitize_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
+    if !prompt.contains('\x1b') {
+        return sanitize_terminal(prompt);
+    }
+    let mut out = String::with_capacity(prompt.len() + 8);
+    let mut rest = prompt;
+    while let Some(i) = rest.find('\x1b') {
+        out.push_str(&sanitize_terminal(&rest[..i]));
+        let esc = &rest[i..];
+        let sgr = esc.strip_prefix("\x1b[").and_then(|body| {
+            let params = body
+                .bytes()
+                .take_while(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
+                .count();
+            (body.as_bytes().get(params) == Some(&b'm')).then_some(params + 3)
+        });
+        match sgr {
+            Some(n) => {
+                out.push_str(&esc[..n]);
+                rest = &esc[n..];
+            }
+            None => {
+                out.push('␛');
+                rest = &esc[1..];
+            }
+        }
+    }
+    out.push_str(&sanitize_terminal(rest));
+    std::borrow::Cow::Owned(out)
+}
+
 // Clickable file link: resolves to an absolute file:// URL so terminals can
 // open the document/screenshot in the OS default app on click.
 pub fn file_link(path: &str, label: &str) -> String {
@@ -3600,6 +3635,8 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         &format!("  {}  {provider} · {model}", dim("model")),
         w,
     ));
+    // The folder name comes from whoever made the checkout.
+    let cwd = &*sanitize_terminal(cwd);
     let cwd_display: String = cwd
         .chars()
         .rev()
@@ -3897,6 +3934,7 @@ pub fn clear() {
 }
 
 pub fn browse_items(title: &str, items: &[(String, String)]) {
+    let items = &browse_safe(items)[..];
     if !is_raw() || !ALT_SCREEN.load(Ordering::Relaxed) {
         line(&accent(&format!("  {title}")));
         for (name, detail) in items {
@@ -3940,6 +3978,20 @@ pub fn browse_items(title: &str, items: &[(String, String)]) {
     render_output();
     clear_composer();
     render_footer();
+}
+
+// Skill names and descriptions come from files in the checkout, tool names
+// and descriptions from MCP servers: neutralize them once for both views.
+fn browse_safe(items: &[(String, String)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(name, detail)| {
+            (
+                sanitize_terminal(name).into_owned(),
+                sanitize_terminal(detail).into_owned(),
+            )
+        })
+        .collect()
 }
 
 fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail: bool) {
@@ -4515,7 +4567,10 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             }
             let _ = out.flush();
             render_output();
-            line(&green(&format!("  ✓ selected: {}", items[selected].label)));
+            line(&green(&format!(
+                "  ✓ selected: {}",
+                sanitize_terminal(&items[selected].label)
+            )));
             break Some(selected);
         } else if action == "cancel" {
             let mut out = io::stdout();
@@ -4543,6 +4598,7 @@ pub enum InputEvent {
 
 // ── single-line ask ──────────────────────────────────────────────────────────
 pub fn ask(prompt: &str) -> Option<String> {
+    let prompt = &*sanitize_prompt(prompt);
     let _pause_guard = PauseAgentRunningGuard::new();
     if is_raw() {
         match read_line_raw(prompt) {
@@ -4578,6 +4634,7 @@ fn task_draft() -> &'static Mutex<Option<TaskDraft>> {
 }
 
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
+    let prompt = &*sanitize_prompt(prompt);
     // Take the message out inside a tight block: echo_submitted → line →
     // render_output re-locks the queue, and std Mutex is not reentrant.
     let queued = message_queue()
@@ -7121,6 +7178,37 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_prompt_keeps_harness_colors_only() {
+        // `ask`/`ask_task` prompts carry harness SGR plus text a model or
+        // server can supply (the question tool's default, a model name).
+        for (prompt, want) in [
+            (
+                "  Answer \x1b[38;5;103m[a\x1b]52;c;cm0gLXJmIH4=\x07]\x1b[39m: ",
+                "  Answer \x1b[38;5;103m[a␛]52;c;cm0gLXJmIH4=]\x1b[39m: ",
+            ),
+            (
+                "\x1b[38;2;1;2;3m[BUILD]\x1b[0m \x1b[1m›\x1b[22m ",
+                "\x1b[38;2;1;2;3m[BUILD]\x1b[0m \x1b[1m›\x1b[22m ",
+            ),
+            ("  model [x\x1b[2J\x1b[1;1H]: ", "  model [x␛[2J␛[1;1H]: "),
+            (
+                "  model [\x1b]0;pwned\x1b\\x]: ",
+                "  model [␛]0;pwned␛\\x]: ",
+            ),
+            (
+                "  model [x\x1bPtmux;\x1b\x1b\\]: ",
+                "  model [x␛Ptmux;␛␛\\]: ",
+            ),
+            ("  [\u{9b}31mx\u{202E}y\x1b]: ", "  [31mx<U+202E>y␛]: "),
+            ("  [trailing\x1b", "  [trailing␛"),
+            ("  [\x1bé\x1b[]: ", "  [␛é␛[]: "),
+        ] {
+            assert_eq!(sanitize_prompt(prompt), want, "{prompt:?}");
+            assert_eq!(sanitize_prompt(want), want, "idempotent: {want:?}");
+        }
+    }
+
+    #[test]
     fn sanitize_terminal_marks_bidi_and_invisible_format_chars() {
         let evil = "a\u{202E}b\u{2066}c\u{200B}d\u{2028}e\u{FEFF}f\u{061C}g\u{200F}";
         let out = sanitize_terminal(evil);
@@ -7137,6 +7225,19 @@ mod tests {
                 std::borrow::Cow::Borrowed(_)
             ));
         }
+    }
+
+    #[test]
+    fn browse_items_neutralize_skill_and_mcp_text() {
+        // /skills and /tools rows: a skill file's name and description, an
+        // MCP tool's name and description.
+        let items = vec![(
+            "/evil\x1b]52;c;cm0gLXJmIH4=\x07".to_string(),
+            "[project] fine\u{202E}txt\n\nbody \x1b[2J".to_string(),
+        )];
+        let safe = browse_safe(&items);
+        assert_eq!(safe[0].0, "/evil␛]52;c;cm0gLXJmIH4=");
+        assert_eq!(safe[0].1, "[project] fine<U+202E>txt\n\nbody ␛[2J");
     }
 
     #[test]

@@ -1136,7 +1136,7 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 /// Status table lines, one per configured server.
-pub fn status_lines() -> Vec<String> {
+fn status_lines() -> Vec<String> {
     let reports = report();
     if reports.is_empty() {
         let mut lines = vec![
@@ -1182,7 +1182,7 @@ pub fn status_lines() -> Vec<String> {
 }
 
 /// Detail lines for one server: status, then each tool with its description.
-pub fn server_lines(name: &str) -> Result<Vec<String>, String> {
+fn server_lines(name: &str) -> Result<Vec<String>, String> {
     let r = report()
         .into_iter()
         .find(|r| r.name == name)
@@ -1304,6 +1304,16 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
 /// makes `add`/`remove` reload the live session afterwards (the REPL); the
 /// CLI passes false so scripting never spawns servers.
 pub fn manage(args: &[String], connect: bool) -> Result<Vec<String>, String> {
+    // Server names, serverInfo, tool descriptions and error text come from
+    // servers and settings files: neutralize them here, once, for both
+    // `/mcp` and `buildwithnexus mcp`.
+    let safe = |s: String| crate::tui::sanitize_terminal(&s).into_owned();
+    manage_lines(args, connect)
+        .map(|lines| lines.into_iter().map(safe).collect())
+        .map_err(safe)
+}
+
+fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
         "list" | "ls" | "status" => {
