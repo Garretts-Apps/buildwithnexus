@@ -4398,11 +4398,7 @@ fn run_doctor() {
         ("rg", "ripgrep (fast search, optional)"),
     ];
     for (bin, label) in &tools_to_check {
-        let found = std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let found = crate::tools::find_on_path(bin).is_some();
         let glyph = if found { "✓" } else { "·" };
         println!("  {glyph} {bin:<12} {label}");
     }
@@ -4474,11 +4470,7 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
 
     let mut missing = Vec::new();
     for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
-        let found = std::process::Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let found = crate::tools::find_on_path(bin).is_some();
         if !found {
             missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
         }
@@ -4506,16 +4498,8 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
         return;
     }
 
-    let brew_available = std::process::Command::new("which")
-        .arg("brew")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let apt_available = std::process::Command::new("which")
-        .arg("apt-get")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let brew_available = crate::tools::find_on_path("brew").is_some();
+    let apt_available = crate::tools::find_on_path("apt-get").is_some();
 
     for (bin, brew_pkg, apt_pkg, desc) in missing {
         let ask_msg = format!(

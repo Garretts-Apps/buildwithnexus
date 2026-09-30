@@ -6,6 +6,44 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **The first run says "ready" only when the binary runs.** After the
+  checksum check, the npm launcher now runs the new binary with `--version`.
+  On a glibc older than 2.34 (Debian 11, Ubuntu 20.04, RHEL 8), on musl
+  (Alpine), or when the file cannot be executed, it prints what to do and
+  exits 1. It used to print "buildwithnexus is ready" and then a raw
+  `GLIBC_2.34 not found` or `spawnSync ... ENOENT`.
+- **A binary blocked by endpoint protection gets guidance, not a bare
+  `EPERM`.** The launcher names the security products it finds on Windows
+  (CrowdStrike Falcon, Microsoft Defender, SentinelOne, Cylance, Carbon
+  Black) from their install and driver folders, without starting a process,
+  prints the file's path and SHA-256 for IT, and links the IT guide in
+  SECURITY.md.
+- **No re-download loop.** Once a verified binary has been downloaded and then
+  removed, the launcher no longer downloads it again on every run; it
+  explains the removal instead. This includes security software that
+  quarantines the file as soon as it is written, before it is moved into
+  place. `bwn --bootstrap` downloads it again.
+- **A failed first-run download says why.** It used to print "prebuilt
+  unavailable" and then "no terminal here, so the launcher will not download
+  it", even when the download had been allowed. It now prints the error, and
+  on a network or TLS error explains `NODE_USE_ENV_PROXY=1` (Node's `https`
+  ignores `HTTPS_PROXY` without it; Node 22.21+ and 24.5+) and
+  `NODE_EXTRA_CA_CERTS`. A request that gets no data for 30 s fails instead of
+  hanging.
+- **No `--bootstrap` advice where the binary cannot run.** Without a
+  terminal on musl or on a glibc older than 2.34, the launcher explains the
+  platform instead of suggesting a download.
+- **Tool checks work on stock Windows.** `bwn doctor` and the start-up
+  "Missing ... tool(s)" notice searched with `which`, which Windows does not
+  have, so without Git's Unix tools on PATH every tool showed as missing.
+  They now search PATH directly and honour PATHEXT.
+- **The documented glibc floor is the real one: 2.34**, not 2.35, which adds
+  RHEL/Rocky/AlmaLinux 9, Amazon Linux 2023 and Fedora 35+. CI builds the
+  x86_64 release binary on every PR and fails if it needs a newer glibc than
+  the floor the launcher and docs state; the release checks each Linux binary
+  again.
+
 ## [0.14.9] - 2026-09-29
 
 A full security audit of the harness, the npm launcher and the release

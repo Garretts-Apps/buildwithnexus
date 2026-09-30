@@ -2107,6 +2107,70 @@ pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
     None
 }
 
+// ── PATH lookup ──────────────────────────────────────────────────────────────
+
+/// Full path of the executable `bin` would run as, searching PATH. Used
+/// instead of spawning `which`, which stock Windows does not have.
+pub fn find_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let pathext = std::env::var_os("PATHEXT");
+    find_in_path(bin, &path, pathext.as_deref(), cfg!(windows))
+}
+
+/// `find_on_path` with its inputs passed in, so tests can run the Windows
+/// rules anywhere. On Windows a bare name also matches each PATHEXT suffix
+/// (`git` finds `git.exe`), as cmd.exe does.
+fn find_in_path(
+    bin: &str,
+    path: &std::ffi::OsStr,
+    pathext: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<PathBuf> {
+    // Only bare names are looked up; `./x` or `C:\x` is not a PATH search.
+    if bin.is_empty() || bin.contains(['/', '\\']) {
+        return None;
+    }
+    let mut names = Vec::new();
+    if windows {
+        let exts = pathext
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(".COM;.EXE;.BAT;.CMD");
+        let exts: Vec<&str> = exts.split(';').filter(|e| !e.is_empty()).collect();
+        let lower = bin.to_ascii_lowercase();
+        if exts
+            .iter()
+            .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
+        {
+            names.push(bin.to_string());
+        }
+        names.extend(exts.iter().map(|e| format!("{bin}{e}")));
+    } else {
+        names.push(bin.to_string());
+    }
+    std::env::split_paths(path)
+        // A relative entry (including an empty one) would resolve against the
+        // current directory, which may be an untrusted checkout.
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|p| is_executable_file(p))
+}
+
+fn is_executable_file(p: &Path) -> bool {
+    let Ok(meta) = fs::metadata(p) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
 // ── WSL2 filesystem boundary guard ───────────────────────────────────────────
 
 /// True when running inside WSL2 (Windows Subsystem for Linux).
@@ -5771,6 +5835,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn find_in_path_follows_path_order_and_pathext() {
+        let d = tempdir();
+        let (a, b) = (d.join("a"), d.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let make = |p: &Path, exec: bool| {
+            fs::write(p, "x").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if exec { 0o755 } else { 0o644 };
+                fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            #[cfg(not(unix))]
+            let _ = exec;
+        };
+        make(&a.join("tool"), true);
+        make(&b.join("tool"), true);
+        make(&b.join("git.EXE"), true);
+        // Upper case, so the lookups below also pass on a case-sensitive disk.
+        make(&b.join("run.CMD"), true);
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        let find = |bin, ext: Option<&str>, win| {
+            find_in_path(bin, &path, ext.map(std::ffi::OsStr::new), win)
+        };
+
+        // First PATH entry wins; unknown names and path-like names miss.
+        assert_eq!(find("tool", None, false), Some(a.join("tool")));
+        assert_eq!(find("nope", None, false), None);
+        assert_eq!(find("", None, false), None);
+        assert_eq!(find("a/tool", None, false), None);
+        // Windows: a bare name gets each PATHEXT suffix; an explicit one is
+        // used as given; with no PATHEXT the cmd.exe default applies.
+        assert_eq!(
+            find("git", Some(".COM;.EXE"), true),
+            Some(b.join("git.EXE"))
+        );
+        assert_eq!(
+            find("run.CMD", Some(".EXE;.cmd"), true),
+            Some(b.join("run.CMD"))
+        );
+        assert_eq!(find("run", None, true), Some(b.join("run.CMD")));
+        assert_eq!(find("git", Some(".BAT"), true), None);
+        // Without Windows rules, `git` does not match git.EXE.
+        assert_eq!(find("git", Some(".EXE"), false), None);
+        // Relative PATH entries are skipped.
+        let rel = std::env::join_paths([Path::new("a"), b.as_path()]).unwrap();
+        assert_eq!(
+            find_in_path("tool", &rel, None, false),
+            Some(b.join("tool"))
+        );
+
+        #[cfg(unix)]
+        {
+            // A file without an execute bit is not a match, as with `which`.
+            make(&a.join("tool"), false);
+            assert_eq!(find("tool", None, false), Some(b.join("tool")));
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn find_on_path_finds_a_real_tool() {
+        // `cargo` runs this test, so it is on PATH on every CI runner.
+        let found = find_on_path("cargo").expect("cargo on PATH");
+        assert!(found.is_absolute(), "{}", found.display());
     }
 
     #[test]

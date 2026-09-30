@@ -1,0 +1,3 @@
+#!/bin/sh
+# A binary that never gets going and says nothing, whatever it is asked.
+exit 127

@@ -537,16 +537,10 @@ fn ps_clipboard_image_script(dest: Option<&Path>) -> String {
     }
 }
 
-// `which`-style existence check that doesn't run the binary (clipboard tools
-// hang without a display when run with no args).
+// Existence check that doesn't run the binary (clipboard tools hang without a
+// display when run with no args).
 fn have_quick(bin: &str) -> bool {
-    Command::new(if cfg!(windows) { "where" } else { "which" })
-        .arg(bin)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    crate::tools::find_on_path(bin).is_some()
 }
 
 // ── base64 ───────────────────────────────────────────────────────────────────

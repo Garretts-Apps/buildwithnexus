@@ -28,10 +28,13 @@ A daily background check tells you when a new version is out; set
 - **npm install:** Node.js 18 or later.
 - **cargo install / source build:** Rust 1.94 or later (`rust-version` in
   `harness/Cargo.toml`).
-- **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.35 or later: Ubuntu
-  22.04+, Debian 12+), macOS x64 and arm64,
-  Windows x64. Other platforms (for example musl/Alpine or Windows on Arm)
-  need a source build pointed to by `BWN_BIN`.
+- **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.34 or later: Ubuntu
+  22.04+, Debian 12+, RHEL/Rocky/AlmaLinux 9+, Amazon Linux 2023, Fedora
+  35+), macOS x64 and arm64, Windows x64. Other platforms (for example
+  musl/Alpine or Windows on Arm) need a source build pointed to by
+  `BWN_BIN`. If the prebuilt binary cannot run, the first run says why
+  (glibc too old, musl, or blocked by endpoint protection) instead of
+  reporting it ready.
 - **Optional tools:** `ffmpeg` for video attachments and image previews,
   `bwrap` (bubblewrap) for the Linux [sandbox](#sandbox), `tmux` for
   background dev servers, and `git`, `rg` and `python3` for the tools that
@@ -542,7 +545,9 @@ Endpoint protection such as CrowdStrike Falcon or Microsoft Defender may
 block or quarantine the Windows binary: it is new, has few installs, and the
 npm launcher downloads it on first run and then executes it. The file itself
 matches the release checksum and attestation. On a managed machine, ask IT to
-allowlist it. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
+allowlist it. When a blocked binary cannot start, the launcher prints its path
+and SHA-256 and names the endpoint product it finds, and it does not download
+the binary again on its own. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
 bwn runs, which hosts it connects to and which files it writes, explains how
 to verify a release, and includes a request you can send. Each Windows `.exe`
 carries a version resource and an `asInvoker` manifest, and each release has

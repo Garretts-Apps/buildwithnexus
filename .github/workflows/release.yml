@@ -155,8 +155,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux builds on 22.04 so the binaries need glibc 2.35 at most and
-        # run on Ubuntu 22.04+ and Debian 12+; a 24.04 build needs 2.39.
+        # Linux builds on 22.04 so the binaries need at most its glibc 2.35
+        # (0.14.9 needs 2.34); a 24.04 build needs 2.39. The floor the docs
+        # promise is checked after the build.
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -279,17 +280,15 @@ jobs:
           else shasum -a 256 "$ASSET" > "$ASSET.sha256"; fi
           cat "$ASSET.sha256"
 
+      # The floor lives in scripts/diagnose.js, which the launcher quotes when
+      # a binary fails on an older glibc, and the docs repeat. A binary that
+      # needs more would make both wrong, so it fails the release instead.
+      # ci.yml runs the same check on every PR, so this should never fire.
       - name: Check the glibc floor
         if: contains(matrix.target, 'linux')
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          need=$(readelf -V "buildwithnexus-$TARGET" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
-          echo "buildwithnexus-$TARGET needs glibc $need"
-          if [ "$(printf '%s\n' "$need" 2.35 | sort -V | tail -1)" != "2.35" ]; then
-            echo "::error::buildwithnexus-$TARGET needs glibc $need; the floor is 2.35 (Ubuntu 22.04)"
-            exit 1
-          fi
+        run: scripts/check-glibc-floor.sh "buildwithnexus-$TARGET"
 
       - name: Hand the asset to the assets job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
