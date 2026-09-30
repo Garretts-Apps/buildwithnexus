@@ -1,0 +1,21 @@
+# Runner labels GitHub has retired or is retiring on an announced date.
+# scripts/field/sentinel.sh (daily "runner-labels" check) flags every
+# .github/workflows/*.yml that still uses one, outside comments.
+#
+# Add a row only from GitHub's own announcement (a github.blog changelog post
+# or an actions/runner-images issue) that gives the date jobs stop running,
+# and put that link in the note. A label that still works but changed meaning
+# (windows-latest moving to Server 2025, say) does not belong here: it fails
+# nothing, and its issue would never close. Keep a row after the date passes:
+# a retired label fails every job that uses it.
+#
+# Columns, tab-separated: label, date (YYYY-MM-DD: the day it stops working),
+# note. Dates checked against each link on 2026-09-30.
+ubuntu-20.04	2025-04-15	Retired. Use ubuntu-22.04 or ubuntu-24.04. https://github.com/actions/runner-images/issues/11101
+windows-2019	2025-06-30	Retired. Use windows-2022 or windows-2025. https://github.com/actions/runner-images/issues/12045
+macos-13	2025-12-04	Retired. https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+macos-13-large	2025-12-04	Retired. https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+macos-13-xlarge	2025-12-04	Retired. https://github.blog/changelog/2025-09-19-github-actions-macos-13-runner-image-is-closing-down/
+macos-14	2026-11-02	Deprecated since 2026-07-06; jobs fail during brownouts on Oct 5, 12, 16, 19, 23, 26, 29 and 30 2026 (14:00-24:00 UTC) and always from Nov 2. Use macos-15 or macos-26. https://github.com/actions/runner-images/issues/13518
+macos-14-large	2026-11-02	Same schedule as macos-14. https://github.com/actions/runner-images/issues/13518
+macos-14-xlarge	2026-11-02	Same schedule as macos-14. https://github.com/actions/runner-images/issues/13518

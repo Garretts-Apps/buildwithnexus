@@ -1,7 +1,8 @@
 name: labels
 
 # Creates or refreshes the repository labels Dependabot applies
-# (.github/dependabot.yml). Manual: run it once after adding a label here.
+# (.github/dependabot.yml). sentinel.yml dispatches it when a label listed
+# here is missing from the repo, so adding one here is enough.
 on:
   workflow_dispatch:
 

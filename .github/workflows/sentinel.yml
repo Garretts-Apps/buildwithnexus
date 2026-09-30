@@ -1,0 +1,116 @@
+name: sentinel
+
+# Scheduled watchdog for failures that happen outside any PR, so no PR or
+# push workflow can report them. 2bb2a27 (v0.14.6) got neither a release.yml
+# nor a ci.yml push run: a check inside those workflows would never have run.
+# scripts/field/sentinel.sh does the work and keeps one issue per failure
+# signature (label "sentinel"), closed automatically after 3 passing runs.
+#
+# Every 15 minutes: release-gap (main's version not on npm; dispatches
+# release.yml once per commit when it never ran, and publish.yml when the
+# release succeeded but publish.yml did not start, which is always the case
+# after the sentinel's own dispatch: GitHub starts no workflow_run workflows
+# from a run dispatched with GITHUB_TOKEN), main-red (red CI on main; for a
+# main commit with no ci.yml run it dispatches ci.yml once), site-version.
+# Not hourly: U22's merge landed at 18:31Z and the maintainer dispatched by
+# hand at 19:10Z, before an hourly run at :17 could; the 18:49Z run here acts.
+# Daily: audit (cargo audit), labels (dependabot.yml vs repo labels; it
+# dispatches labels.yml once per commit for missing labels labels.yml lists),
+# stale-bot-prs, runner-labels (field/deprecated-labels.tsv).
+#
+# A red run means the sentinel itself is broken, never the repo: failed
+# checks open issues instead, and a network or API hiccup is retried once,
+# then shown as a transient ERROR row in the job summary with the run still
+# green. Only a crash or a request GitHub rejects as malformed or forbidden
+# (a sentinel or permissions bug) fails the run and sends the failure email.
+#
+# Keeping the schedule alive: GitHub runs schedules only from the default
+# branch and disables them in a public repo after 60 days without repository
+# activity. There is deliberately no keepalive commit or self-enable call
+# here. Re-enable with `gh workflow enable sentinel.yml` or from the Actions
+# tab; commits to main reset the 60 days.
+on:
+  schedule:
+    # Off the hour: runs queued at :00 start late when GitHub is busy.
+    - cron: "4-59/15 * * * *"  # frequent checks
+    - cron: "43 13 * * *"      # daily checks (06:43 in Los Angeles during PDT)
+  workflow_dispatch:
+    inputs:
+      checks:
+        description: "Which checks to run"
+        type: choice
+        options: [all, frequent, daily]
+        default: all
+      dry_run:
+        description: "Only print what would change (no issues, no dispatches)"
+        type: boolean
+        default: true
+
+permissions: {}
+
+# Scheduled and manual runs edit the same issues, so they never overlap. A run
+# that is already going is never cancelled half-way through its issue edits.
+concurrency:
+  group: sentinel
+  cancel-in-progress: false
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read        # checkout; main's HEAD and package.json
+      issues: write         # open, update and close sentinel issues; create the label
+      actions: write        # list runs; dispatch release.yml, publish.yml or ci.yml when GitHub dropped an event, labels.yml for missing labels
+      pull-requests: read   # list open Dependabot PRs
+      checks: read          # check runs on those PRs
+      statuses: read        # commit statuses on those PRs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pick checks
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_CHECKS: ${{ inputs.checks }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            checks=$INPUT_CHECKS
+            dry_run=$INPUT_DRY_RUN
+          elif [[ "$SCHEDULE" == "43 13 * * *" ]]; then  # keep in sync with on.schedule
+            checks=daily
+            dry_run=false
+          else
+            checks=frequent
+            dry_run=false
+          fi
+          echo "checks=$checks" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+
+      # Same installer and pin as ci.yml's audit job, so both audits run the
+      # same cargo-audit. A failed download is reported by the script as a
+      # transient ERROR instead of failing the run.
+      - name: Install cargo-audit
+        id: install-audit
+        if: steps.mode.outputs.checks != 'frequent'
+        continue-on-error: true
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-audit
+
+      - name: Run sentinel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKS: ${{ steps.mode.outputs.checks }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          SENTINEL_AUDIT_INSTALL: ${{ steps.install-audit.outcome }}
+        run: |
+          set -euo pipefail
+          args=(--checks "$CHECKS" --repo "$GITHUB_REPOSITORY")
+          if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
+          scripts/field/sentinel.sh "${args[@]}"
