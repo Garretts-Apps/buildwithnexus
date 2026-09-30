@@ -21,7 +21,7 @@ use crate::provider::Provider;
 /// make ffmpeg reach the network.
 // Writes a new temp file, refusing to follow or reuse anything already at
 // `dest` (a symlink planted in a shared /tmp).
-fn write_new(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::OpenOptions::new()
         .write(true)

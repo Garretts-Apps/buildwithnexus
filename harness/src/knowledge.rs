@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
 use std::path::PathBuf;
 
 /// Software engineering primitives represented in the knowledge base.
@@ -233,14 +232,11 @@ impl KnowledgeBase {
             .join("knowledge")
             .join("entities.json");
 
-        let mut kb = if path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|data| serde_json::from_str::<KnowledgeBase>(&data).ok())
-                .unwrap_or_else(KnowledgeBase::default)
-        } else {
-            KnowledgeBase::default()
-        };
+        // The store lives in the checkout: a link out of the project is
+        // never read.
+        let mut kb = crate::config::read_project_file(&path, &root)
+            .and_then(|data| serde_json::from_str::<KnowledgeBase>(&data).ok())
+            .unwrap_or_default();
         kb.workdir = root;
         kb
     }
@@ -298,14 +294,17 @@ impl KnowledgeBase {
     }
 
     /// Persists the knowledge base to `.buildwithnexus/knowledge/entities.json`.
+    /// Refuses a symlink anywhere between the project and the file.
     pub fn save(&self) -> Result<(), String> {
-        let dir = self.workdir.join(".buildwithnexus").join("knowledge");
-        fs::create_dir_all(&dir).map_err(|e| format!("Failed to create knowledge dir: {}", e))?;
-        let path = dir.join("entities.json");
+        let path = self
+            .workdir
+            .join(".buildwithnexus")
+            .join("knowledge")
+            .join("entities.json");
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize knowledge base: {}", e))?;
-        fs::write(&path, json).map_err(|e| format!("Failed to write knowledge base: {}", e))?;
-        Ok(())
+        crate::config::write_project_file(&path, &self.workdir, json.as_bytes())
+            .map_err(|e| format!("Failed to write knowledge base: {}", e))
     }
 
     /// Parses symbol output (e.g. from tree-sitter or ctags formatted as JSON) and populates entities.
@@ -524,6 +523,27 @@ mod tests {
         let alpha = s1.find("**alpha**").expect("alpha listed");
         let beta = s1.find("**beta**").expect("beta listed");
         assert!(alpha < beta, "curated entity should be listed first:\n{s1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_linked_out_of_the_project_is_not_read() {
+        let base = std::env::temp_dir().join(format!("bwn-kb-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ws = base.join("ws");
+        let outside = base.join("outside.json");
+        std::fs::create_dir_all(ws.join(".buildwithnexus/knowledge")).unwrap();
+        std::fs::write(&outside, r#"{"entities":{"x":{"id":"x","entity_type":"function","name":"x","last_updated":"t"}}}"#).unwrap();
+        let store = ws.join(".buildwithnexus/knowledge/entities.json");
+        std::os::unix::fs::symlink(&outside, &store).unwrap();
+        assert!(KnowledgeBase::new(&ws.to_string_lossy())
+            .entities
+            .is_empty());
+        // A regular store file inside the project still loads.
+        std::fs::remove_file(&store).unwrap();
+        std::fs::copy(&outside, &store).unwrap();
+        assert_eq!(KnowledgeBase::new(&ws.to_string_lossy()).entities.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -1220,10 +1220,12 @@ fn text_tool_call(name: &str, input: serde_json::Value) -> provider::ToolCall {
 // The single-line composer prompt for reading a question answer. Kept on one
 // line (no `\n`) so the alt-screen composer positions the cursor correctly and
 // echoes typed input; the question text itself is printed separately above.
+// The default is model-supplied, like the question.
 fn answer_input_prompt(default: &str) -> String {
     if default.is_empty() {
         "  Answer: ".to_string()
     } else {
+        let default = tui::sanitize_terminal(default);
         format!("  Answer {}: ", tui::dim(&format!("[{default}]")))
     }
 }
@@ -1280,11 +1282,12 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
     // Render the question on its own transcript line, then read the answer with
     // a SINGLE-LINE composer prompt. A multi-line prompt string mis-positions
     // the alt-screen composer cursor (prompt_width counts across the newline),
-    // which hides what the user types.
+    // which hides what the user types. The question and options are
+    // model-supplied, so their escapes are neutralized.
     tui::line(&format!(
         "  {} {}",
         tui::yellow("?"),
-        tui::bold(&full_prompt)
+        tui::bold(&tui::sanitize_terminal(&full_prompt))
     ));
     let ans = tui::ask(&answer_input_prompt(default)).unwrap_or_default();
     let out = if ans.trim().is_empty() && !default.is_empty() {
@@ -3743,8 +3746,9 @@ pub fn run_plan(
         loop {
             tui::line("");
             tui::line(&tui::accent("  Plan"));
+            // Steps are the model's plan text.
             for (i, s) in steps.iter().enumerate() {
-                tui::line(&format!("  {}. {}", i + 1, s));
+                tui::line(&format!("  {}. {}", i + 1, tui::sanitize_terminal(s)));
             }
             tui::line("");
             let items = vec![
@@ -4266,6 +4270,23 @@ mod tests {
         let d = answer_input_prompt("yes");
         assert!(!d.contains('\n'));
         assert!(d.contains("yes"));
+    }
+
+    #[test]
+    fn answer_input_prompt_neutralizes_model_default() {
+        // The question tool's `default` is model-supplied and was printed raw
+        // in the Answer prompt; OSC 52 wrote "rm -rf ~" to the clipboard.
+        for (default, shown) in [
+            ("a\x1b]52;c;cm0gLXJmIH4=\x07", "[a␛]52;c;cm0gLXJmIH4=]"),
+            ("b\x1b[2J\x1b[1;1H", "[b␛[2J␛[1;1H]"),
+            ("c\x1b[8m", "[c␛[8m]"),
+            ("d\u{202E}txt", "[d<U+202E>txt]"),
+        ] {
+            let p = answer_input_prompt(default);
+            assert!(p.contains(shown), "{p:?}");
+            assert!(!p.contains("\x1b]") && !p.contains('\x07'), "{p:?}");
+            assert!(!p.contains(&default[1..]), "{p:?}");
+        }
     }
 
     #[test]

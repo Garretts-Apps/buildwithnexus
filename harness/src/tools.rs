@@ -4928,7 +4928,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             };
             let id = entity.id.clone();
             kb.add_entity(entity);
-            let _ = kb.save();
+            if let Err(e) = kb.save() {
+                return err(e);
+            }
             ok(format!("Successfully recorded knowledge entity: {id}"))
         }
         "rule_check" => {
@@ -5286,14 +5288,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 _ => "txt",
             };
             let dir = cwd.join(".buildwithnexus").join("artifacts");
-            let _ = fs::create_dir_all(&dir);
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let filename = format!("{}_{timestamp}.{ext}", safe_title);
             let p = dir.join(&filename);
-            if let Err(e) = write_atomic(&p, contents) {
+            // Both copies land in the checkout: never through a symlink.
+            if let Err(e) = crate::config::write_project_file(&p, cwd, contents.as_bytes()) {
                 return err(format!("cannot write artifact: {e}"));
             }
             let clean_name = if (safe_title.is_empty()
@@ -5313,7 +5315,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if direct_file.exists() {
                 checkpoint::record(cwd, &direct_file, "publish_artifact");
             }
-            if let Err(e) = fs::write(&direct_file, contents) {
+            if let Err(e) =
+                crate::config::write_project_file(&direct_file, cwd, contents.as_bytes())
+            {
                 return err(format!(
                     "artifact archived to {} but the workspace copy {} could not be written: {e}",
                     p.display(),
@@ -7635,6 +7639,88 @@ print("hello " + data.get("name", "world"))
         fs::create_dir_all(&ssh).unwrap();
         std::os::unix::fs::symlink(&ssh, ws.join("keys")).unwrap();
         assert!(is_sensitive(&ws.join("keys/id_rsa")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kb_record_refuses_a_symlinked_store_file() {
+        let d = tempdir();
+        let ws = d.join("ws");
+        let victim = d.join("victim.json");
+        fs::create_dir_all(ws.join(".buildwithnexus/knowledge")).unwrap();
+        fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, ws.join(".buildwithnexus/knowledge/entities.json"))
+            .unwrap();
+        let r = run(
+            "kb_record",
+            &json!({"name": "svc", "description": "d"}),
+            &ws,
+        );
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("symlink"), "{}", r.content);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kb_record_refuses_a_symlinked_store_dir() {
+        let d = tempdir();
+        for link in [".buildwithnexus/knowledge", ".buildwithnexus"] {
+            let ws = d.join("ws");
+            let outside = d.join("outside");
+            let _ = fs::remove_dir_all(&ws);
+            let _ = fs::remove_dir_all(&outside);
+            fs::create_dir_all(ws.join(".buildwithnexus")).unwrap();
+            let _ = fs::remove_dir(ws.join(link));
+            // The link's target already holds the same layout, so a followed
+            // write would overwrite the file below.
+            let victim = if link == ".buildwithnexus" {
+                outside.join("knowledge/entities.json")
+            } else {
+                outside.join("entities.json")
+            };
+            fs::create_dir_all(victim.parent().unwrap()).unwrap();
+            fs::write(&victim, "keep me").unwrap();
+            std::os::unix::fs::symlink(&outside, ws.join(link)).unwrap();
+            let r = run(
+                "kb_record",
+                &json!({"name": "svc", "description": "d"}),
+                &ws,
+            );
+            assert!(r.is_error, "{link}: {}", r.content);
+            assert!(r.content.contains("symlink"), "{link}: {}", r.content);
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me", "{link}");
+            assert_eq!(fs::read_dir(victim.parent().unwrap()).unwrap().count(), 1);
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_copies_are_never_written_through_symlinks() {
+        let d = tempdir();
+        let ws = d.join("ws");
+        let outside = d.join("outside");
+        fs::create_dir_all(ws.join(".buildwithnexus")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let md = json!({"title": "notes", "contents": "# Notes\n\nShipped the fix.", "type": "markdown"});
+        // Archive dir linked out of the project.
+        std::os::unix::fs::symlink(&outside, ws.join(".buildwithnexus/artifacts")).unwrap();
+        let r = run("Artifact", &md, &ws);
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("symlink"), "{}", r.content);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        // Workspace copy linked at a file outside the project.
+        fs::remove_file(ws.join(".buildwithnexus/artifacts")).unwrap();
+        let victim = outside.join("victim.md");
+        fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, ws.join("notes.md")).unwrap();
+        let r = run("Artifact", &md, &ws);
+        assert!(r.is_error, "{}", r.content);
+        assert!(r.content.contains("symlink"), "{}", r.content);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
         let _ = fs::remove_dir_all(&d);
     }
 

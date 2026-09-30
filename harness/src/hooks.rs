@@ -811,7 +811,8 @@ fn run_rust_hook(path: &Path, payload: &Value, cwd: &Path, timeout: Duration) ->
 // Loud, unmissable warning for a hook that failed or exited non-zero — a
 // deny-capable hook that silently never fires would bypass its policy.
 fn hook_warn(msg: &str) {
-    // Commands and stderr come from settings files and hook output.
+    // Program paths, commands and stderr come from settings files, a hooks
+    // folder and hook output.
     let msg = tui::sanitize_terminal(msg);
     if report::is_json() {
         eprintln!("[hook] warning: {msg}");
