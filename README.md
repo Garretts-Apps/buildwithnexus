@@ -360,6 +360,13 @@ Run your own commands at the same lifecycle points as Claude Code, configured in
 (project). User hooks are always active; **project hooks run only after you trust
 that folder** (you're prompted once, and a project hook may *deny* a tool but
 never *grant* one — so cloning a hostile repo can't run or unlock anything).
+The prompt shows each hook's command line and each project MCP server's
+command and arguments. Trusting also pins the project files those commands
+run: scripts they name (`./x.sh`, or a bare `setup` that `sh` or `cmd.exe`
+would find in the folder), and `package.json` or the `Makefile` when they
+call `npm`, `make` and the like, in the project root or in a folder the
+command names (`make -C sub`, `cd web && npm test`). Editing one of those
+asks again.
 Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
 `PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
 `PostToolUse`, `PostResponse`, `OnError`, `Stop` (after every BUILD, PLAN,
@@ -415,6 +422,12 @@ The `instruction_files` settings key changes which names are looked up
 The mixed-case `.buildwithnexus/Agents.md` is different: it defines agent
 roles/capabilities (`/agents` shows it) and is loaded after the instructions.
 
+`~/.buildwithnexus/system.md` adds your own text to every system prompt. A
+project's `.buildwithnexus/system.md` is used only once you trust that folder
+(it is listed in the same prompt as project hooks), and it is added after
+yours, not in place of it. Set `"project_system_prompt": "replace"` in
+`~/.buildwithnexus/settings.json` to let a trusted project's file replace yours.
+
 ## Skills
 
 Skills are markdown instructions loaded on demand: the system prompt carries
@@ -436,9 +449,14 @@ Two layouts are supported, from any of these roots:
   with the file tools.
 - **`<name>.md`** flat files, where the first prose line is the description.
 
-On a name collision the more specific source wins: project beats user beats
-bundled, and a `SKILL.md` folder beats a flat file of the same name. Add more
-roots with the `skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
+On a name collision a `SKILL.md` folder beats a flat file of the same name,
+and your own skills beat bundled ones. A skill from the project (the `./`
+roots above, a relative `skill_dirs` entry, or any `skill_dirs` entry a
+project settings file adds) never replaces a bundled or user skill: it loads
+as `/project:<name>` instead, with a notice at startup.
+Set `"project_skills_override": true` in `~/.buildwithnexus/settings.json` to
+let project skills replace them, as before 0.15. Add more roots with the
+`skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
 `/skills` lists every skill with its source and description.
 
 ## MCP servers
