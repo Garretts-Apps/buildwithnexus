@@ -4,9 +4,12 @@ Short-name alias crate for [buildwithnexus](https://crates.io/crates/buildwithne
 the hilariously fast agentic AI coding CLI.
 
 ```bash
-cargo install bwn            # installs the `bwn` binary
-# or
-cargo install buildwithnexus # installs both `buildwithnexus` and `bwn`
+cargo install bwn --locked
+bwn --version
 ```
+
+Install this crate or `buildwithnexus`, not both: `buildwithnexus` already
+installs `bwn` along with `buildwithnexus`, and cargo refuses to install a
+second crate that provides the same binary name.
 
 Docs: <https://buildwithnexus.dev>
