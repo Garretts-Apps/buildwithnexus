@@ -1,0 +1,6 @@
+# Link the C runtime into the Windows exe instead of importing it from
+# VCRUNTIME140.dll, which only the Visual C++ Redistributable installs; a
+# Windows without it could not start the binary. release.yml checks the
+# release exe with scripts/check-pe-imports.js.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

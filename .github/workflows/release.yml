@@ -245,6 +245,16 @@ jobs:
             exit 1
           }
 
+      # .cargo/config.toml links the C runtime statically, so the exe starts
+      # on a Windows without the Visual C++ Redistributable. 0.14.10 and
+      # earlier imported VCRUNTIME140.dll; fail rather than ship that again.
+      - name: Check the exe needs no Visual C++ runtime
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+        run: node scripts/check-pe-imports.js "$ASSET"
+
       # Authenticode signing through SignPath (free for open source projects
       # via the SignPath Foundation). Off until the repository variable
       # SIGNPATH_ORGANIZATION_ID and the secret SIGNPATH_API_TOKEN exist;

@@ -133,6 +133,12 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --locked --no-run
 
+      # The integration tests build the exe too. It must not need the Visual
+      # C++ Redistributable; release.yml checks the release exe the same way.
+      - name: Check the exe needs no Visual C++ runtime
+        if: runner.os == 'Windows'
+        run: node ../scripts/check-pe-imports.js ../target/debug/buildwithnexus.exe
+
   wrapper:
     name: npm wrapper syntax
     runs-on: ubuntu-latest
@@ -173,7 +179,7 @@ jobs:
       # Arguments, plus what the launcher says when the binary cannot start
       # (old glibc, musl, EACCES, removed after install), against stub binaries.
       - name: Test launcher
-        run: node --test scripts/launcher.test.js
+        run: node --test scripts/launcher.test.js scripts/check-pe-imports.test.js
 
   # The launcher is the first thing to fail on a user's machine, so its tests
   # also run on macOS and on Windows Server 2022 (what managed machines run;

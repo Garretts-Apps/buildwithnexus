@@ -35,9 +35,18 @@ function run(args) {
   });
 }
 
+// A throwaway NEXUS_HOME, where the launcher keeps downloaded binaries.
+function tempHome(t) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-home-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  return home;
+}
+
 // A copy of the published package layout in a temp dir, so a test can put a
 // stub (or nothing) where a downloaded binary goes without touching the repo.
-function tempPackage(t) {
+// `version` stands in for another release; `home` is shared between packages
+// to model npm replacing the package folder on an update.
+function tempPackage(t, { home = tempHome(t), version = VERSION } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-launcher-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const f of ['package.json', 'bin/buildwithnexus.js', 'scripts/resolve-binary.js',
@@ -45,19 +54,30 @@ function tempPackage(t) {
     fs.mkdirSync(path.join(root, path.dirname(f)), { recursive: true });
     fs.copyFileSync(path.join(REPO, f), path.join(root, f));
   }
-  const bin = path.join(root, 'bin', 'buildwithnexus' + (WIN ? '.exe' : ''));
-  return { root, bin, marker: path.join(root, 'bin', '.installed.json') };
+  if (version !== VERSION) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ ...manifest, version }));
+  }
+  const exe = 'buildwithnexus' + (WIN ? '.exe' : '');
+  const dir = path.join(home, 'bin', version);
+  return {
+    root, home, version,
+    bin: path.join(dir, exe),
+    marker: path.join(dir, '.installed.json'),
+    legacyBin: path.join(root, 'bin', exe),
+    legacyMarker: path.join(root, 'bin', '.installed.json'),
+  };
 }
 
 function launch(pkg, args, env = {}, preload = []) {
   const clean = { ...process.env };
-  for (const k of ['BWN_BIN', 'BWN_ALLOW_BOOTSTRAP', 'BWN_SKIP_INSTALL', 'NODE_OPTIONS', 'NODE_USE_ENV_PROXY',
-    'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) delete clean[k];
+  for (const k of ['BWN_BIN', 'BWN_ALLOW_BOOTSTRAP', 'BWN_SKIP_INSTALL', 'BWN_INSTALL_IN_PACKAGE', 'NODE_OPTIONS',
+    'NODE_USE_ENV_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) delete clean[k];
   // stdin is a pipe, not a TTY, so nothing downloads unless a test opts in.
   return spawnSync(process.execPath,
     [...preload.flatMap((p) => ['-r', p]), path.join(pkg.root, 'bin', 'buildwithnexus.js'), ...args], {
       encoding: 'utf8',
-      env: { ...clean, ...env },
+      env: { ...clean, NEXUS_HOME: pkg.home, ...env },
       timeout: 60000,
     });
 }
@@ -85,9 +105,10 @@ function launchFake(pkg, args, { asset, pin, env = {} } = {}) {
   return r;
 }
 
-function installStub(pkg, stub, mode = 0o755) {
-  fs.copyFileSync(path.join(STUBS, stub), pkg.bin);
-  fs.chmodSync(pkg.bin, mode);
+function installStub(pkg, stub, mode = 0o755, dest = pkg.bin) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(path.join(STUBS, stub), dest);
+  fs.chmodSync(dest, mode);
 }
 
 function facts(over) {
@@ -462,6 +483,8 @@ test('launcher: a non-executable binary gets EACCES guidance, not a bare spawnSy
   const r = launch(pkg, ['--version']);
   assert.equal(r.status, 1);
   assert.match(r.stderr, /permission denied starting the binary \(EACCES\)/);
+  // The download is in the user's home now, not the npm prefix.
+  assert.match(r.stderr, /point NEXUS_HOME at a filesystem that allows programs to run/);
   assert.ok(r.stderr.includes(pkg.bin));
   assert.doesNotMatch(r.stderr, /^buildwithnexus: spawnSync/m);
 });
@@ -494,9 +517,14 @@ test('launcher: status 127 with no output is explained', { skip: needsSh }, (t) 
   assert.match(r.stderr, /Docs: /);
 });
 
+function writeMarker(pkg, marker) {
+  fs.mkdirSync(path.dirname(pkg.marker), { recursive: true });
+  fs.writeFileSync(pkg.marker, JSON.stringify(marker));
+}
+
 test('launcher: a verified install that vanished is not downloaded again', (t) => {
   const pkg = tempPackage(t);
-  fs.writeFileSync(pkg.marker, JSON.stringify({ version: VERSION, sha256: '12'.repeat(32) }));
+  writeMarker(pkg, { version: VERSION, sha256: '12'.repeat(32) });
   // BWN_SKIP_INSTALL keeps a regression off the network; the assertions on
   // stdout show whether bootstrap ran at all.
   const r = launch(pkg, ['--version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
@@ -509,7 +537,7 @@ test('launcher: a verified install that vanished is not downloaded again', (t) =
 
 test('launcher: --bootstrap still downloads again after a vanished install', (t) => {
   const pkg = tempPackage(t);
-  fs.writeFileSync(pkg.marker, JSON.stringify({ version: VERSION, sha256: '12'.repeat(32) }));
+  writeMarker(pkg, { version: VERSION, sha256: '12'.repeat(32) });
   const r = launch(pkg, ['--bootstrap', '--version'], { BWN_SKIP_INSTALL: '1' });
   assert.equal(r.status, 1);
   assert.match(r.stdout, /native binary not available yet/);
@@ -520,7 +548,7 @@ test('launcher: --bootstrap still downloads again after a vanished install', (t)
 
 test('launcher: a marker from another version does not block the download', (t) => {
   const pkg = tempPackage(t);
-  fs.writeFileSync(pkg.marker, JSON.stringify({ version: '0.0.1', sha256: '12'.repeat(32) }));
+  writeMarker(pkg, { version: '0.0.1', sha256: '12'.repeat(32) });
   const r = launch(pkg, ['--version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
   assert.match(r.stdout, /native binary not available yet/);
 });
@@ -563,6 +591,72 @@ test('first run: a verified download that runs is "ready" and then runs', { skip
   assert.deepEqual(r.requests.map((u) => u.split('/').pop()), [ASSET]);
   assert.equal(JSON.parse(fs.readFileSync(pkg.marker, 'utf8')).sha256, sha256(asset));
   assert.equal(sha256(pkg.bin), sha256(asset));
+});
+
+// npm deletes and recreates the package folder on every update or reinstall,
+// so a binary kept in it was lost each time (and downloaded again).
+test('upgrade: the binary survives npm replacing the package, and each version keeps its own', {
+  skip: needsSh || noRelease,
+}, (t) => {
+  const home = tempHome(t);
+  const asset = path.join(STUBS, 'prints-version');
+  const first = tempPackage(t, { home });
+  const r1 = launchFake(first, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
+  assert.equal(r1.status, 0, r1.stderr);
+  assert.equal(r1.requests.length, 1);
+  assert.ok(fs.existsSync(first.bin));
+  assert.ok(!fs.existsSync(first.legacyBin));
+
+  // Same version again in a fresh package folder: no download.
+  const again = tempPackage(t, { home });
+  const r2 = launchFake(again, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.deepEqual(r2.requests, []);
+  assert.equal(r2.stdout, `buildwithnexus ${VERSION}\n`);
+
+  // A new version downloads its own binary and leaves the old one alone.
+  const next = tempPackage(t, { home, version: '99.0.0' });
+  const r3 = launchFake(next, ['--version'], { asset, env: { STUB_VERSION: '99.0.0' } });
+  assert.equal(r3.status, 0, r3.stderr);
+  assert.equal(r3.requests.length, 1);
+  assert.match(r3.requests[0], /\/download\/v99\.0\.0\//);
+  assert.ok(r3.stdout.endsWith('buildwithnexus 99.0.0\n'), r3.stdout);
+  assert.notEqual(next.bin, first.bin);
+  assert.ok(fs.existsSync(first.bin));
+  assert.equal(JSON.parse(fs.readFileSync(first.marker, 'utf8')).version, VERSION);
+  assert.equal(JSON.parse(fs.readFileSync(next.marker, 'utf8')).version, '99.0.0');
+});
+
+test('without NEXUS_HOME the binary goes under ~/.buildwithnexus/bin/<version>', {
+  skip: needsSh || noRelease,
+}, (t) => {
+  const pkg = tempPackage(t);
+  const user = tempHome(t);
+  const r = launchFake(pkg, ['--version'], {
+    asset: path.join(STUBS, 'prints-version'),
+    env: { NEXUS_HOME: undefined, HOME: user, USERPROFILE: user, STUB_VERSION: VERSION },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(path.join(user, '.buildwithnexus', 'bin', VERSION, path.basename(pkg.bin))));
+  assert.ok(!fs.existsSync(pkg.bin));
+});
+
+test('a binary downloaded into the package by an earlier release still runs', { skip: needsSh }, (t) => {
+  const pkg = tempPackage(t);
+  installStub(pkg, 'prints-version', 0o755, pkg.legacyBin);
+  const r = launch(pkg, ['--version'], { STUB_VERSION: VERSION });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, `buildwithnexus ${VERSION}\n`);
+});
+
+test('BWN_INSTALL_IN_PACKAGE=1 downloads into the package, as before 0.15', { skip: needsSh || noRelease }, (t) => {
+  const pkg = tempPackage(t);
+  const asset = path.join(STUBS, 'prints-version');
+  const r = launchFake(pkg, ['--version'], { asset, env: { STUB_VERSION: VERSION, BWN_INSTALL_IN_PACKAGE: '1' } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(sha256(pkg.legacyBin), sha256(asset));
+  assert.equal(JSON.parse(fs.readFileSync(pkg.legacyMarker, 'utf8')).version, VERSION);
+  assert.ok(!fs.existsSync(path.dirname(pkg.bin)));
 });
 
 // Endpoint protection that quarantines on write deletes the download as soon
@@ -638,6 +732,7 @@ test('first run: a download that gets no answer times out instead of hanging', {
 
 test('launcher (Windows): an exe denied execute gets security guidance', { skip: !WIN && 'Windows only' }, (t) => {
   const pkg = tempPackage(t);
+  fs.mkdirSync(path.dirname(pkg.bin), { recursive: true });
   fs.copyFileSync(process.execPath, pkg.bin);
   // Deny execute to Everyone (by SID, so it works in any locale); read stays
   // allowed so the hash can still be shown.

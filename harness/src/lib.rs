@@ -1,6 +1,6 @@
-//! A hilariously fast, agentic AI coding CLI — one static binary, written in
-//! Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter, Groq,
-//! Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
+//! A hilariously fast, agentic AI coding CLI — one self-contained binary,
+//! written in Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter,
+//! Groq, Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
 //! OpenAI-compatible `/v1` endpoint.
 //!
 //! This crate is the whole application: the binaries (`buildwithnexus` and

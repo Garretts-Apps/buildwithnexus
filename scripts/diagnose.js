@@ -258,8 +258,9 @@ function describe(kind, f, facts) {
       out.push(`  Check: ls -l '${f.bin}'`);
       if (facts.platform === 'linux') out.push(`         findmnt -T '${dir}'   (look for noexec)`);
       out.push(`  Fix:   chmod +x '${f.bin}'`);
-      out.push('         or install npm packages on a filesystem that allows programs to run,');
-      out.push('         or set BWN_BIN to a copy that can run.');
+      out.push('         or point NEXUS_HOME at a filesystem that allows programs to run (the');
+      out.push('         download goes to $NEXUS_HOME/bin/<version>), or set BWN_BIN to a copy');
+      out.push('         that can run.');
       break;
     }
     case 'dll':

@@ -104,7 +104,11 @@ path, its SHA-256 and a pointer to [For IT and Security
 Teams](#for-it-and-security-teams). A later run that cannot start the binary
 gets the same explanation.
 
-Each verified download is recorded in `bin/.installed.json` (version and
+The binary is downloaded to `~/.buildwithnexus/bin/<version>/` (under
+`NEXUS_HOME` if that is an absolute path), outside the npm package, so an npm
+update or reinstall does not delete it; `BWN_INSTALL_IN_PACKAGE=1` keeps the
+pre-0.15 location, the package's own `bin/`. Each verified download is
+recorded in `.installed.json` next to it (version and
 SHA-256) as soon as its checksum matches, before it is moved into place, so a
 file that security software quarantines on write counts too. If that record
 is there but the binary is not, the launcher does not download it again on its
@@ -180,7 +184,7 @@ shows whether a given file is signed.
   hook scripts, with
   `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File <script>`; and `npm install -g buildwithnexus` only when the user
-  sets `auto_update` to `"install"`.
+  sets `auto_update` to `"install"` or `"install-any"`.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
   `localhost:11434`); `lite.duckduckgo.com`, and the pages the agent fetches
@@ -189,7 +193,8 @@ shows whether a given file is signed.
   daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
   There is no telemetry or analytics.
 - **Files:** its settings, sessions and checkpoints under
-  `~/.buildwithnexus` (or `NEXUS_HOME`); pasted images as `bwn-paste-*.png`
+  `~/.buildwithnexus` (or `NEXUS_HOME`), and there, in `bin/<version>/`, the
+  binary the npm launcher downloaded; pasted images as `bwn-paste-*.png`
   in the temp directory; and the files the user asks it to edit in the
   working directory.
 - **Not done:** no services, scheduled tasks, startup entries, registry
@@ -274,10 +279,11 @@ Update behavior is controlled by the `auto_update` setting in
 |-------------|-----------------------------------------------------------------|
 | `"off"`     | No registry check, no notices.                                  |
 | `"notify"`  | **Default.** Daily check; a one-line notice on the next launch when a newer version exists. Never installs. |
-| `"install"` | Daily check plus silent background `npm install -g`; notice on the next launch. |
+| `"install"` | Daily check plus silent background `npm install -g` of patch releases within the running minor version; notice on the next launch. A new minor or major version is announced with its install command, never installed on its own. |
+| `"install-any"` | As `"install"`, but installs any newer version (what `"install"` did before 0.15). |
 
-`BWN_NO_AUTO_UPDATE=1` is honored for back-compat and caps `"install"` to
-`"notify"`. The check runs inside the CLI (not the npm wrapper), never blocks
+`BWN_NO_AUTO_UPDATE=1` is honored for back-compat and caps `"install"` and
+`"install-any"` to `"notify"`. The check runs inside the CLI (not the npm wrapper), never blocks
 startup, and installs performed by other means (cargo, source builds) are
 never auto-updated.
 

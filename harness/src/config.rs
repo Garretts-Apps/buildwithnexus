@@ -212,9 +212,11 @@ pub struct Settings {
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
     /// npm auto-update policy: "off" (no check, no notices), "notify"
-    /// (daily check, startup notice, never installs — the default), or
-    /// "install" (daily check + silent `npm install -g`, notice on next
-    /// launch). BWN_NO_AUTO_UPDATE=1 caps "install" back to "notify".
+    /// (daily check, startup notice, never installs — the default),
+    /// "install" (daily check + silent `npm install -g` of patch releases
+    /// within the running minor, notice on next launch; newer minors are
+    /// only announced), or "install-any" (installs any newer release).
+    /// BWN_NO_AUTO_UPDATE=1 caps both back to "notify".
     #[serde(default = "default_auto_update")]
     pub auto_update: String,
     /// Shell binaries that auto-approve in Ask mode. Empty = use built-in defaults.

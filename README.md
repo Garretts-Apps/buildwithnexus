@@ -5,7 +5,7 @@
 
 A hilariously fast, **agentic AI CLI** — written in Rust. Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands, asking before each change. One static binary, six direct
+commands, asking before each change. One self-contained binary, six direct
 dependencies, no runtime to babysit — and a terminal UI built to feel
 instant: an incremental wrap cache with atomic frames, live autocomplete,
 GitHub-grade diffs, clickable files and links, and multimodal input straight
@@ -20,8 +20,11 @@ buildwithnexus
 
 The first launch walks you through choosing a model. Then describe a task.
 A daily background check tells you when a new version is out; set
-`auto_update: "install"` in settings to apply updates automatically, or
-`"off"` to silence the check.
+`auto_update: "install"` in settings to apply patch releases automatically
+(a new minor version is announced, not installed; `"install-any"` installs
+those too), or `"off"` to silence the check. The npm launcher keeps the
+downloaded binary in `~/.buildwithnexus/bin/<version>/` (under `NEXUS_HOME`
+if set), outside the npm package, so `npm update` does not delete it.
 
 ## Requirements
 
@@ -30,7 +33,8 @@ A daily background check tells you when a new version is out; set
   `harness/Cargo.toml`).
 - **Prebuilt binaries:** Linux x64 and arm64 (glibc 2.34 or later: Ubuntu
   22.04+, Debian 12+, RHEL/Rocky/AlmaLinux 9+, Amazon Linux 2023, Fedora
-  35+), macOS x64 and arm64, Windows x64. Other platforms (for example
+  35+), macOS x64 and arm64, Windows x64 (the C runtime is linked in, so
+  the Visual C++ Redistributable is not needed). Other platforms (for example
   musl/Alpine or Windows on Arm) need a source build pointed to by
   `BWN_BIN`. If the prebuilt binary cannot run, the first run says why
   (glibc too old, musl, or blocked by endpoint protection) instead of
