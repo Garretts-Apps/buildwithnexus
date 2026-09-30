@@ -1,0 +1,264 @@
+name: Field install
+
+# Installs the PUBLISHED package (npm and the GitHub release asset) on
+# machines like the ones users have, instead of the build machine: old and
+# new glibc, musl, nvm as a non-root user, arm64, Windows Server 2022 with
+# Windows PowerShell 5.1, and macOS. On unsupported platforms (glibc below
+# the floor, musl) the bare asset fails in the loader, which is expected;
+# the npm launcher must explain the failure instead of a raw loader error.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version to test (X.Y.Z), or latest"
+        required: true
+        default: "latest"
+        type: string
+  schedule:
+    # Daily, off the hour: base images and runner images change under us.
+    - cron: "41 7 * * *"
+  workflow_run:
+    workflows: ["Publish to npm"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  version:
+    name: Resolve version
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+
+    steps:
+      # After a publish, test the version that run shipped, read from the
+      # exact commit it published.
+      - name: Checkout the published commit
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve and wait for the registry
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_run) v=$(jq -r .version package.json) ;;
+            workflow_dispatch) v=${INPUT_VERSION:-latest} ;;
+            *) v=latest ;;
+          esac
+          if [ "$v" = latest ]; then v=$(npm view buildwithnexus@latest version); fi
+          if ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::not a version: '$v'"
+            exit 1
+          fi
+          # A publish that just finished can take a few minutes to show up.
+          for i in $(seq 1 20); do
+            npm view "buildwithnexus@$v" version >/dev/null 2>&1 && break
+            [ "$i" = 20 ] && { echo "::error::buildwithnexus@$v is not on npm"; exit 1; }
+            sleep 30
+          done
+          echo "Testing buildwithnexus@$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux install matrix
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the assertions
+        run: bash scripts/field/linux-install.sh --self-test
+
+      # Writes the cell table to the job summary; exits 1 on any FAIL row.
+      - name: Run the matrix
+        env:
+          BWN_VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/field/linux-install.sh --version "$BWN_VERSION" --json field-linux.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: field-linux-${{ needs.version.outputs.version }}
+          path: field-linux.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  linux-arm64:
+    name: Linux arm64 install matrix
+    needs: version
+    # Native arm64, so the aarch64 asset and the arm64 images really run;
+    # nothing has run them before. The script picks the asset by uname -m.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # One cell per case: glibc at and below the floor, the npm launcher
+      # on glibc (with the EACCES check) and on musl.
+      - name: Run the matrix
+        env:
+          BWN_VERSION: ${{ needs.version.outputs.version }}
+        run: >-
+          bash scripts/field/linux-install.sh --version "$BWN_VERSION"
+          --cells ubuntu:22.04,debian:11,node:22-bookworm,node:22-alpine
+          --json field-linux-arm64.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: field-linux-arm64-${{ needs.version.outputs.version }}
+          path: field-linux-arm64.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  windows:
+    name: Windows Server 2022 (Windows PowerShell 5.1)
+    needs: version
+    # Not windows-latest: that is Server 2025. The machine this has to work
+    # on is Server 2022, and powershell (not pwsh) is its 5.1 shell.
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: powershell
+    env:
+      BWN_VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      # Uses the image's own Node (an MSI-style install, like a server's),
+      # not setup-node.
+      - name: Install from npm and run
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $v = $env:BWN_VERSION
+          $script:rows = @()
+          $failed = $false
+          function Row($check, $result, $detail) {
+            $d = ("$detail" -replace '\r?\n', ' / ') -replace '\|', '\|'
+            if ($d.Length -gt 300) { $d = $d.Substring(0, 300) }
+            $script:rows += "| $check | $result | $d |"
+          }
+          # 5.1 wraps native stderr lines in ErrorRecords; flatten to text.
+          function Run([scriptblock]$cmd) {
+            $out = & $cmd 2>&1 | ForEach-Object { "$_" }
+            [pscustomobject]@{ Out = ($out -join "`n"); Code = $LASTEXITCODE }
+          }
+
+          $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          $winget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+          $os = (Get-CimInstance Win32_OperatingSystem).Caption
+          Row 'shell' 'info' ("Windows PowerShell $($PSVersionTable.PSVersion) on $os")
+          Row 'elevated' 'info' $(if ($elevated) { 'yes' } else { 'no' })
+          Row 'winget' 'info' $(if ($winget) { 'present' } else { 'absent' })
+          Row 'execution policy' 'info' (Get-ExecutionPolicy)
+          Row 'node' 'info' ("$(node -v), npm prefix $(npm prefix -g)")
+
+          $r = Run { npm i -g "buildwithnexus@$v" }
+          if ($r.Code -ne 0) {
+            Row 'npm i -g' 'FAIL' ("exit $($r.Code): $($r.Out)")
+            $failed = $true
+          } else {
+            Row 'npm i -g' 'PASS' "buildwithnexus@$v"
+            $shim = (Get-Command bwn -ErrorAction SilentlyContinue).Source
+            $env:BWN_ALLOW_BOOTSTRAP = '1'
+            $r = Run { bwn --version }
+            Write-Output $r.Out
+            if ($r.Code -eq 0 -and $r.Out -match [regex]::Escape("buildwithnexus $v")) {
+              Row 'BWN_ALLOW_BOOTSTRAP=1 bwn --version' 'PASS' "buildwithnexus $v (via $shim)"
+            } else {
+              Row 'BWN_ALLOW_BOOTSTRAP=1 bwn --version' 'FAIL' ("exit $($r.Code): $($r.Out)")
+              $failed = $true
+            }
+            # Each run must reuse the binary, not download it again.
+            $r = Run { bwn --version }
+            if ($r.Out -match 'downloading') {
+              Row 'second bwn --version' 'FAIL' 'downloaded the binary again'
+              $failed = $true
+            } else {
+              Row 'second bwn --version' 'PASS' "exit $($r.Code), no new download"
+            }
+            $r = Run { bwn doctor }
+            Write-Output $r.Out
+            Row 'bwn doctor' 'info' "exit $($r.Code)"
+          }
+
+          $md = "### Windows Server 2022, Windows PowerShell 5.1: buildwithnexus $v`n`n" +
+            "| check | result | detail |`n|---|---|---|`n" + ($script:rows -join "`n") + "`n"
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $md, (New-Object Text.UTF8Encoding $false))
+          Write-Output $md
+          # Explicit, so doctor's exit code does not become the step's.
+          if ($failed) { exit 1 }
+          exit 0
+
+  macos:
+    name: macOS 15
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      BWN_VERSION: ${{ needs.version.outputs.version }}
+
+    steps:
+      - name: Install from npm and run
+        run: |
+          set -u
+          sum=$(mktemp)
+          row() {
+            printf '| %s | %s | %s |\n' "$1" "$2" \
+              "$(printf '%s' "$3" | tr '\n' ' ' | sed 's/|/\\|/g' | cut -c1-300)" >>"$sum"
+          }
+          row node info "$(node -v), npm prefix $(npm prefix -g), macOS $(sw_vers -productVersion) $(uname -m)"
+          failed=0
+          if out=$(npm i -g "buildwithnexus@$BWN_VERSION" 2>&1); then
+            row "npm i -g" PASS "buildwithnexus@$BWN_VERSION"
+            out=$(BWN_ALLOW_BOOTSTRAP=1 bwn --version 2>&1) && rc=0 || rc=$?
+            echo "$out"
+            if [ "$rc" = 0 ] && printf '%s' "$out" | grep -qF "buildwithnexus $BWN_VERSION"; then
+              row "BWN_ALLOW_BOOTSTRAP=1 bwn --version" PASS "buildwithnexus $BWN_VERSION"
+            else
+              row "BWN_ALLOW_BOOTSTRAP=1 bwn --version" FAIL "exit $rc: $out"
+              failed=1
+            fi
+          else
+            row "npm i -g" FAIL "$out"
+            failed=1
+          fi
+          {
+            echo "### macOS 15: buildwithnexus $BWN_VERSION"
+            echo
+            echo "| check | result | detail |"
+            echo "|---|---|---|"
+            cat "$sum"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
