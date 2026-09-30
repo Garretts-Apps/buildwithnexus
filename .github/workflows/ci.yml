@@ -8,12 +8,19 @@ on:
   # sentinel.yml dispatches this on main when GitHub dropped the push event
   # for main's head commit (2bb2a27 got no run at all).
   workflow_dispatch:
+  # release.yml runs this whole workflow on the commit it is about to release
+  # and builds nothing unless it passes (0.14.6 shipped from a commit that
+  # never had a CI run).
+  workflow_call:
 
 permissions: {}
 
+# github.workflow is the caller's name inside a workflow_call, so a release's
+# CI run never shares a group with (or cancels) the push run on main. Only
+# superseded PR runs are cancelled; a run on main always finishes.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -106,7 +113,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -275,7 +282,7 @@ jobs:
         run: ./actionlint -color
 
   sentinel:
-    name: Sentinel script tests
+    name: Field script tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -295,3 +302,53 @@ jobs:
       # else runs this script before its first scheduled run on main.
       - name: Test the sentinel
         run: node --test scripts/field/sentinel.test.js
+
+      # The install matrix's own checks (its row matchers and the glibc-gate
+      # parser) need no containers, so a mistake in the script shows up here
+      # instead of on the next scheduled field run.
+      - name: Test the install matrix script
+        run: bash scripts/field/linux-install.sh --self-test
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # gitleaks (v8.30.1 image, pinned by digest), with every match redacted
+      # in the log. It scans the checked-out tree, plus each commit this PR
+      # or push adds, so a key committed and then deleted in a later commit
+      # is still caught. History already on main is not rescanned. A false
+      # positive in a test fixture takes a trailing `gitleaks:allow` comment.
+      - name: Scan for committed secrets
+        env:
+          IMAGE: zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          run() { docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo:ro" "$IMAGE" "$@" --redact --no-banner --exit-code 1; }
+          run dir /repo
+          range=""
+          if [[ "$EVENT" == pull_request ]]; then
+            range="${BASE_SHA}..HEAD"
+          elif [[ "$EVENT" == push && -n "$BEFORE" && ! "$BEFORE" =~ ^0+$ ]]; then
+            # After a force-push the old head may be gone; the tree scan above
+            # still ran.
+            if git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              range="${BEFORE}..HEAD"
+            else
+              echo "::warning::push base ${BEFORE} is not in the clone; scanned the tree only."
+            fi
+          fi
+          if [[ -n "$range" ]]; then
+            run git /repo --log-opts="$range"
+          fi

@@ -2386,7 +2386,7 @@ mod tests {
     fn project_files_never_follow_links_out_of_the_tree() {
         let outer = unique_dir("projlink");
         let secret = outer.join("secret.txt");
-        write(&secret, "API_KEY=sk-live");
+        write(&secret, "API_KEY=sk-live"); // gitleaks:allow (fake key for the test)
         let repo = outer.join("repo");
         write(&repo.join("AGENTS.md"), "real rules");
         write(&repo.join(".env"), "TOKEN=x");

@@ -72,13 +72,24 @@ jobs:
               exit 1 ;;
           esac
 
+  # The full CI workflow on this exact commit. Nothing is tagged, built or
+  # published unless it passes: 0.14.6 shipped from a commit that never had a
+  # CI run, and #37 merged 3 seconds into a CI run that then failed. (A
+  # workflow_run trigger would not do: crates.io OIDC refuses it.)
+  ci:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   # Creates (or refreshes) the tag + release ONCE, with the CHANGELOG section
   # as the body and GitHub's auto-generated notes appended. The build matrix
   # only uploads assets — when this step ran per matrix job with
   # append_body: true, every job (and every re-dispatch) appended another
   # copy of the notes. body replacement here makes re-dispatches idempotent.
   release:
-    needs: gate
+    needs: [gate, ci]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -163,9 +174,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
