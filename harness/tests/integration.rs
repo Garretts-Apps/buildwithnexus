@@ -157,6 +157,7 @@ fn write_config(home: &Path, provider: &str, permission: &str, port: u16) {
 
 struct Run {
     success: bool,
+    code: Option<i32>,
     events: Vec<Value>,
     stderr: String,
 }
@@ -224,6 +225,7 @@ fn run_env(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Run 
         .collect();
     Run {
         success: out.status.success(),
+        code: out.status.code(),
         events,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
@@ -1102,7 +1104,8 @@ fn finish_without_check_work_runs_it_and_feeds_failures_back_once() {
     write_config(&home, "ollama", "auto", port);
 
     let r = run(&home, &cwd, "add index.js");
-    assert!(r.success, "stderr: {}", r.stderr);
+    // Finishing over failing checks is not a success.
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
     let checks: Vec<&Value> = r
         .events
         .iter()
@@ -1592,5 +1595,242 @@ fn loopback_model_endpoints_never_go_through_the_proxy() {
         seen.lock().unwrap().is_empty(),
         "{:?}",
         seen.lock().unwrap()
+    );
+}
+
+// ── run outcomes ────────────────────────────────────────────────────────────
+
+// An OpenAI reply that also reports `prompt_tokens` of usage, so a priced
+// model runs up a known estimated cost.
+fn with_usage(reply: String, prompt_tokens: u64) -> String {
+    let mut v: Value = serde_json::from_str(&reply).unwrap();
+    v["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": 0});
+    v.to_string()
+}
+
+struct OutcomeCase {
+    name: &'static str,
+    script: Vec<String>,
+    permission: &'static str,
+    // Written to config.json on top of the defaults below.
+    config: Value,
+    // Home hooks, when the case needs one.
+    hooks: Option<Value>,
+    // Files created in the project before the run.
+    files: Vec<(&'static str, &'static str)>,
+    extra_args: Vec<&'static str>,
+    outcome: &'static str,
+    code: i32,
+}
+
+fn run_outcome_case(c: &OutcomeCase, env: &[(&str, &str)]) -> Run {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(c.script.clone());
+    let mut cfg = json!({
+        "provider": "ollama",
+        "model": "test-model",
+        "permission": c.permission,
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+        // Large enough that 60 steps never trigger a compaction request.
+        "context_tokens": 1_000_000,
+    });
+    for (k, v) in c.config.as_object().unwrap() {
+        cfg[k] = v.clone();
+    }
+    let base = cfg["base_url"]
+        .as_str()
+        .unwrap()
+        .replace("{port}", &port.to_string());
+    cfg["base_url"] = json!(base);
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    if let Some(h) = &c.hooks {
+        write_hooks(&home, h.clone());
+    }
+    for (path, content) in &c.files {
+        std::fs::write(cwd.join(path), content).unwrap();
+    }
+    let mut args = vec!["--json"];
+    args.extend(c.extra_args.iter().copied());
+    args.extend(["run", "do the task"]);
+    run_env(&home, &cwd, &args, env)
+}
+
+fn outcome_cases() -> Vec<OutcomeCase> {
+    let mut cases = vec![
+        OutcomeCase {
+            name: "success",
+            script: vec![finish("all done")],
+            permission: "auto",
+            config: json!({}),
+            hooks: None,
+            files: vec![],
+            extra_args: vec![],
+            outcome: "success",
+            code: 0,
+        },
+        OutcomeCase {
+            name: "failed",
+            script: vec![
+                tool_call("c1", "read_file", json!({"path": "missing.txt"})),
+                tool_call("c2", "read_file", json!({"path": "missing.txt"})),
+                tool_call("c3", "read_file", json!({"path": "missing.txt"})),
+                tool_call("c4", "read_file", json!({"path": "missing.txt"})),
+            ],
+            permission: "auto",
+            config: json!({}),
+            hooks: None,
+            files: vec![],
+            extra_args: vec![],
+            outcome: "failed",
+            code: 1,
+        },
+        OutcomeCase {
+            name: "approval_blocked",
+            script: vec![
+                tool_call("c1", "write_file", json!({"path": "a.txt", "content": "x"})),
+                finish("wrote it"),
+            ],
+            permission: "ask",
+            config: json!({}),
+            hooks: None,
+            files: vec![],
+            extra_args: vec![],
+            outcome: "approval_blocked",
+            code: 3,
+        },
+        OutcomeCase {
+            name: "budget_stop",
+            // gpt-4o is priced: 1M prompt tokens is an estimated $2.50. The
+            // "127.1" spelling reaches the loopback mock without matching
+            // the local-URL check, which would book the request at $0.
+            script: vec![with_usage(
+                tool_call("c1", "read_file", json!({"path": "a.txt"})),
+                1_000_000,
+            )],
+            permission: "auto",
+            config: json!({"model": "gpt-4o", "base_url": "http://127.1:{port}/v1"}),
+            hooks: None,
+            files: vec![("a.txt", "hello")],
+            extra_args: vec!["--max-budget-usd", "0.01"],
+            outcome: "budget_stop",
+            code: 5,
+        },
+        OutcomeCase {
+            name: "step_limit",
+            // Identical successful reads are tolerated by the loop guard, so
+            // the run uses up every step; the last POST is the wrap-up reply.
+            script: (0..60)
+                .map(|i| tool_call(&format!("c{i}"), "read_file", json!({"path": "a.txt"})))
+                .chain([text("ran out of steps")])
+                .collect(),
+            permission: "auto",
+            config: json!({}),
+            hooks: None,
+            files: vec![("a.txt", "hello")],
+            extra_args: vec![],
+            outcome: "step_limit",
+            code: 6,
+        },
+        OutcomeCase {
+            name: "check_work_failed",
+            // An unparsable Cargo.toml fails `cargo build` without touching
+            // the network.
+            script: vec![
+                tool_call("c1", "check_work", json!({})),
+                finish("done anyway"),
+            ],
+            permission: "auto",
+            config: json!({}),
+            hooks: None,
+            files: vec![("Cargo.toml", "this is not toml [")],
+            extra_args: vec![],
+            outcome: "check_work_failed",
+            code: 7,
+        },
+        OutcomeCase {
+            name: "verification_failed",
+            // Touching auth code without a security review is a High rule
+            // violation: the verifier blocks, the model gets two fix rounds,
+            // then the turn ends with the violation still standing.
+            script: vec![
+                tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"path": "auth.js", "content": "x"}),
+                ),
+                finish("first"),
+                finish("second"),
+                finish("third"),
+            ],
+            permission: "auto",
+            config: json!({}),
+            hooks: None,
+            files: vec![],
+            extra_args: vec![],
+            outcome: "verification_failed",
+            code: 8,
+        },
+    ];
+    if cfg!(unix) {
+        cases.push(OutcomeCase {
+            name: "hook_blocked",
+            script: vec![finish("never reached")],
+            permission: "auto",
+            config: json!({}),
+            hooks: Some(json!({"UserPromptSubmit": hook("echo no-tasks-today >&2; exit 2")})),
+            files: vec![],
+            extra_args: vec![],
+            outcome: "hook_blocked",
+            code: 4,
+        });
+    }
+    cases
+}
+
+#[test]
+fn headless_outcomes_map_to_distinct_exit_codes() {
+    let cases = outcome_cases();
+    let mut codes: Vec<i32> = cases.iter().map(|c| c.code).collect();
+    codes.sort_unstable();
+    codes.dedup();
+    assert_eq!(
+        codes.len(),
+        cases.len(),
+        "every outcome has its own exit code"
+    );
+    for c in &cases {
+        let r = run_outcome_case(c, &[]);
+        assert_eq!(
+            r.code,
+            Some(c.code),
+            "{}: exit code; stderr: {}\nevents: {:?}",
+            c.name,
+            r.stderr,
+            r.events
+        );
+        let last = r
+            .events
+            .last()
+            .unwrap_or_else(|| panic!("{}: no events", c.name));
+        assert_eq!(last["type"], "result", "{}: final event {last}", c.name);
+        assert_eq!(last["outcome"], c.outcome, "{}: {last}", c.name);
+        assert_eq!(last["exit_code"], c.code, "{}: {last}", c.name);
+    }
+}
+
+#[test]
+fn legacy_exit_codes_restore_zero_for_incomplete_runs() {
+    let cases = outcome_cases();
+    let budget = cases.iter().find(|c| c.name == "budget_stop").unwrap();
+    let r = run_outcome_case(budget, &[("BWN_LEGACY_EXIT_CODES", "1")]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    // The event still names what happened.
+    assert_eq!(r.events.last().unwrap()["outcome"], "budget_stop");
+    // Real failures keep failing.
+    let failed = cases.iter().find(|c| c.name == "failed").unwrap();
+    assert_eq!(
+        run_outcome_case(failed, &[("BWN_LEGACY_EXIT_CODES", "1")]).code,
+        Some(1)
     );
 }

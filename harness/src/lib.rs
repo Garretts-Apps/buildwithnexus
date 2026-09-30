@@ -95,6 +95,9 @@ struct CliOptions {
     args_literal: bool,
     /// `--yes` / `-y`: auto-approve a plan and execute it (headless `plan`).
     yes: bool,
+    /// `--legacy-exit-codes` (or BWN_LEGACY_EXIT_CODES=1): exit 0 when a
+    /// headless run stops short without failing, as before 0.15.
+    legacy_exit_codes: bool,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
@@ -114,6 +117,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--yes" || arg == "-y" {
             opts.yes = true;
+            continue;
+        }
+        if arg == "--legacy-exit-codes" {
+            opts.legacy_exit_codes = true;
             continue;
         }
         let (flag, inline) = arg
@@ -638,18 +645,45 @@ fn headless(
         ));
     }
 
+    let outcome = match &r {
+        Err(_) if blocked > 0 => agent::Outcome::ApprovalBlocked,
+        Err(_) => agent::Outcome::Failed,
+        Ok(()) => agent::stopped_short_outcome().unwrap_or(agent::Outcome::Success),
+    };
+    let legacy = opts.legacy_exit_codes
+        || std::env::var("BWN_LEGACY_EXIT_CODES").is_ok_and(|v| !v.is_empty() && v != "0");
+    let code = headless_exit_code(outcome, r.is_ok(), legacy);
+
     if !report::is_json() {
         println!();
-        if r.is_ok() {
+        if outcome == agent::Outcome::Success {
             println!("{}", tui::green(&format!("✓ done in {elapsed:.2?}")));
+        } else if r.is_ok() {
+            println!(
+                "{}",
+                tui::yellow(&format!("⚠ {} after {elapsed:.2?}", outcome.label()))
+            );
         } else {
             println!("{}", tui::red(&format!("✗ failed after {elapsed:.2?}")));
         }
     }
+    report::result(outcome.as_str(), code);
 
     if let Err(e) = r {
         eprintln!("{}", tui::red(&tui::sanitize_terminal(&e)));
-        std::process::exit(if blocked > 0 { 3 } else { 1 });
+    }
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+// A turn that ended without an error but short of success gets its own exit
+// code, unless legacy exit codes ask for the pre-0.15 zero.
+fn headless_exit_code(outcome: agent::Outcome, turn_ok: bool, legacy: bool) -> i32 {
+    if legacy && turn_ok {
+        0
+    } else {
+        outcome.exit_code()
     }
 }
 
@@ -2029,12 +2063,7 @@ fn handle_model(provider: &mut Provider) {
             p.default_model.to_string(),
             format!("{} ({})", p.label, status),
         ));
-        let extras: &[&str] = match p.id {
-            "anthropic" => &["claude-opus-4-8", "claude-haiku-4-5"],
-            "openai" => &["gpt-4o-mini"],
-            _ => &[],
-        };
-        for m in extras {
+        for m in p.more_models {
             options.push((
                 p.id.to_string(),
                 m.to_string(),
@@ -2174,25 +2203,31 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
 }
 
 fn find_llama_server_binary() -> Option<std::path::PathBuf> {
-    for path in [
-        "/opt/homebrew/bin/llama-server",
-        "/usr/local/bin/llama-server",
-        "/usr/bin/llama-server",
-    ] {
-        let p = std::path::PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("llama-server");
-            if candidate.exists() {
-                return Some(candidate);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let pathext = std::env::var_os("PATHEXT");
+    find_llama_server_in(&path, pathext.as_deref(), cfg!(windows))
+}
+
+/// `find_llama_server_binary` with its inputs passed in, so tests can run
+/// the Windows rules anywhere: there the binary is `llama-server.exe`.
+fn find_llama_server_in(
+    path: &std::ffi::OsStr,
+    pathext: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<std::path::PathBuf> {
+    if !windows {
+        for known in [
+            "/opt/homebrew/bin/llama-server",
+            "/usr/local/bin/llama-server",
+            "/usr/bin/llama-server",
+        ] {
+            let p = std::path::PathBuf::from(known);
+            if p.exists() {
+                return Some(p);
             }
         }
     }
-    None
+    tools::find_in_path("llama-server", path, pathext, windows)
 }
 
 static LLAMA_SERVER_PROCESS: std::sync::Mutex<Option<std::process::Child>> =
@@ -2273,6 +2308,60 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
     None
 }
 
+/// Where a `/model` swap points: the base URL it probes and runs against,
+/// and what it writes to the saved `base_url`.
+#[derive(Debug, PartialEq)]
+struct SwapTarget {
+    base_url: String,
+    /// None leaves the saved value alone; Some(None) clears it.
+    save: Option<Option<String>>,
+}
+
+/// A saved `base_url` belongs to the provider it was set for: a swap within
+/// that provider keeps it (a remote Ollama host, an LM Studio box on the
+/// LAN), a swap to another provider starts from that preset's default and
+/// clears it, and an explicit URL always wins.
+fn plan_swap(
+    current_provider: &str,
+    saved_base_url: Option<&str>,
+    target: &config::Preset,
+    override_url: Option<&str>,
+) -> SwapTarget {
+    if let Some(url) = override_url {
+        return SwapTarget {
+            base_url: url.to_string(),
+            save: Some(Some(url.to_string())),
+        };
+    }
+    match saved_base_url {
+        Some(url) if current_provider == target.id => SwapTarget {
+            base_url: url.to_string(),
+            save: None,
+        },
+        _ if current_provider == target.id => SwapTarget {
+            base_url: target.base_url.to_string(),
+            save: None,
+        },
+        _ => SwapTarget {
+            base_url: target.base_url.to_string(),
+            save: Some(None),
+        },
+    }
+}
+
+/// The swap's success line names the model actually saved, which differs
+/// from the one asked for when a local server only answers as "local-model".
+fn swap_success_line(requested: &str, active: &str, provider_label: &str) -> String {
+    if requested == active || requested.is_empty() {
+        format!("  ✓ active model hot-swapped → {active} on {provider_label} (validated)")
+    } else {
+        format!(
+            "  ✓ active model hot-swapped → {active} on {provider_label} (validated; the server \
+             does not serve '{requested}' by that name, so it runs as '{active}')"
+        )
+    }
+}
+
 /// Applies a model swap only after the target provider is actually usable:
 /// walks the user through a missing API key (or a custom endpoint's URL),
 /// checks that a local server is reachable and has the model, and keeps the
@@ -2292,18 +2381,13 @@ fn swap_model(
         return;
     };
     let mut s = config::load_settings().unwrap_or_default();
-    let switching = s.provider != preset.id;
     let mut model = model.to_string();
     let mut custom_url = base_url_override;
 
     // Custom OpenAI-compatible endpoint: gather URL, optional key, and model.
     if preset.id == "custom" {
         if custom_url.is_none() {
-            let default_url = if !switching {
-                s.base_url.clone().unwrap_or_else(|| preset.base_url.into())
-            } else {
-                preset.base_url.to_string()
-            };
+            let default_url = plan_swap(&s.provider, s.base_url.as_deref(), preset, None).base_url;
             let url = tui::ask(&format!(
                 "  Endpoint base URL (OpenAI-compatible, usually ends in /v1) [{default_url}]: "
             ))
@@ -2361,14 +2445,14 @@ fn swap_model(
 
     // Ollama: confirm the server is up and actually has the model before
     // committing — the alternative is an opaque failure mid-conversation.
+    let mut target = plan_swap(
+        &s.provider,
+        s.base_url.as_deref(),
+        preset,
+        custom_url.as_deref(),
+    );
     if preset.id == "ollama" {
-        let base = if !switching {
-            s.base_url
-                .clone()
-                .unwrap_or_else(|| preset.base_url.to_string())
-        } else {
-            preset.base_url.to_string()
-        };
+        let base = target.base_url.clone();
         let installed = provider::ollama_models(&base);
         if installed.is_empty() {
             tui::line(&tui::yellow(&format!(
@@ -2406,9 +2490,14 @@ fn swap_model(
     }
 
     if preset.id == "llamacpp" || preset.id == "lmstudio" {
-        let preferred = custom_url.as_deref().unwrap_or(preset.base_url);
-        if let Some(active_url) = ensure_local_gguf_server(preferred, &model) {
-            custom_url = Some(active_url);
+        if let Some(active_url) = ensure_local_gguf_server(&target.base_url, &model) {
+            // Another port answered: that server is the one to remember.
+            if active_url != target.base_url {
+                target = SwapTarget {
+                    save: Some(Some(active_url.clone())),
+                    base_url: active_url,
+                };
+            }
         } else {
             tui::line(&tui::yellow(&format!(
                 "  ✗ no local server running on ports 8080/1234/11434/8000 for '{model}'."
@@ -2431,20 +2520,14 @@ fn swap_model(
         }
     }
 
-    // A custom base_url belongs to the provider it was set for. `None`
-    // leaves the saved value alone.
-    let base_url_change = if preset.id != "custom" && custom_url.is_none() {
-        Some(None)
-    } else {
-        custom_url.map(Some)
-    };
+    let base_url_change = target.save;
     if let Some(u) = &base_url_change {
         s.base_url = u.clone();
     }
     s.provider = preset.id.to_string();
     s.model = model.to_string();
     match build_provider(&s) {
-        Ok(p) => {
+        Ok(mut p) => {
             // No success message without proof: a one-token probe through the
             // real request path catches bad keys, unknown model names, and
             // unreachable servers now instead of on the next prompt. Ollama
@@ -2455,10 +2538,12 @@ fn swap_model(
                     "  validating {model} — one-token probe…"
                 )));
                 match provider::validate(&p) {
+                    // The server answered only as its fallback name: run and
+                    // save that, not the name it rejected.
                     Ok(Some(new_model)) => {
                         s.model = new_model.clone();
                         tui::set_model_label(&new_model);
-                        provider.model = new_model;
+                        p.model = new_model;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -2496,7 +2581,6 @@ fn swap_model(
             // The probe's one-token usage mustn't pose as the live prompt
             // size, and a `--effort` given on the command line outlives the swap.
             usage::forget_last();
-            let mut p = p;
             p.effort = provider.effort;
             *provider = p;
             let mut changes = vec![
@@ -2508,9 +2592,10 @@ fn swap_model(
             }
             save_user_settings(&changes);
             provider::prewarm(provider);
-            tui::line(&tui::green(&format!(
-                "  ✓ active model hot-swapped → {} on {} (validated)",
-                model, preset.label
+            tui::line(&tui::green(&swap_success_line(
+                &model,
+                &s.model,
+                preset.label,
             )));
         }
         Err(e) => {
@@ -4322,6 +4407,7 @@ fn usage() {
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
          \x20 --json                        structured headless output\n\
          \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
+         \x20 --legacy-exit-codes           exit 0 when a run stops short without failing\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
@@ -4967,6 +5053,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_exit_codes_flag_zeroes_only_incomplete_runs() {
+        let (opts, rest) = parse_cli_options(
+            ["--legacy-exit-codes", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(opts.legacy_exit_codes);
+        assert_eq!(rest, ["run", "x"]);
+        assert!(!parse_cli_options(vec![]).unwrap().0.legacy_exit_codes);
+        use agent::Outcome;
+        assert_eq!(headless_exit_code(Outcome::StepLimit, true, false), 6);
+        assert_eq!(headless_exit_code(Outcome::StepLimit, true, true), 0);
+        // A turn that errored keeps its code either way.
+        assert_eq!(headless_exit_code(Outcome::ApprovalBlocked, false, true), 3);
+        assert_eq!(headless_exit_code(Outcome::Failed, false, true), 1);
+    }
+
+    #[test]
     fn parse_cli_options_budget_rejects_missing_or_non_positive_values() {
         let err = parse_cli_options(["--max-budget-usd"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("--max-budget-usd requires a value"), "{err}");
@@ -5452,5 +5557,265 @@ mod tests {
     #[test]
     fn test_check_and_offer_install_dependencies() {
         super::check_and_offer_install_dependencies(false);
+    }
+
+    // A loopback HTTP server answering every request with `respond(method,
+    // path, body)` → (status, JSON body). Runs until the test process exits.
+    fn mock_http(respond: fn(&str, &str, &str) -> (u16, String)) -> u16 {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    continue;
+                }
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                let (status, reply) = respond(&method, &path, &String::from_utf8_lossy(&body));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        port
+    }
+
+    // Runs `swap_model` against settings saved under a scratch NEXUS_HOME and
+    // returns the settings it left behind plus the live provider.
+    fn swap_with_saved(
+        saved: config::Settings,
+        target: &str,
+        model: &str,
+    ) -> (config::Settings, Provider) {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "bwn-swap-{}-{}",
+            std::process::id(),
+            saved.provider
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        config::save_settings(&saved);
+        let mut provider = build_provider(&saved).unwrap();
+        swap_model(&mut provider, target, model, None);
+        let after = config::load_settings().unwrap();
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        (after, provider)
+    }
+
+    #[test]
+    fn same_provider_swap_on_a_remote_ollama_keeps_its_base_url() {
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"m1"},{"name":"m2"}]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        let (after, provider) = swap_with_saved(
+            config::Settings {
+                provider: "ollama".into(),
+                model: "m1".into(),
+                base_url: Some(url.clone()),
+                ..Default::default()
+            },
+            "ollama",
+            "m2",
+        );
+        assert_eq!(after.model, "m2");
+        assert_eq!(after.base_url.as_deref(), Some(url.as_str()));
+        assert_eq!(provider.base_url, url);
+    }
+
+    // An OpenAI-compatible local server that only answers as "local-model".
+    fn local_model_only(method: &str, path: &str, body: &str) -> (u16, String) {
+        match (method, path) {
+            ("GET", "/v1/models") => (200, r#"{"data":[{"id":"local-model"}]}"#.into()),
+            ("POST", "/v1/chat/completions") if body.contains(r#""model":"local-model""#) => {
+                (200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())
+            }
+            ("POST", _) => (404, r#"{"error":"model not found"}"#.into()),
+            _ => (200, "{}".into()),
+        }
+    }
+
+    #[test]
+    fn local_server_swaps_use_the_saved_base_url_and_report_the_fallback() {
+        for preset in ["lmstudio", "llamacpp"] {
+            let port = mock_http(local_model_only);
+            let url = format!("http://127.0.0.1:{port}/v1");
+            let (after, provider) = swap_with_saved(
+                config::Settings {
+                    provider: preset.into(),
+                    model: "old".into(),
+                    base_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                preset,
+                "qwen-7b",
+            );
+            assert_eq!(after.base_url.as_deref(), Some(url.as_str()), "{preset}");
+            assert_eq!(after.model, "local-model", "{preset}");
+            assert_eq!(provider.model, "local-model", "{preset}");
+            assert_eq!(provider.base_url, url, "{preset}");
+        }
+    }
+
+    // (from, saved base_url, to, override URL, expected target)
+    type SwapCase = (
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        SwapTarget,
+    );
+
+    #[test]
+    fn plan_swap_over_preset_transitions() {
+        let preset = |id| config::preset(id).unwrap();
+        let keep = |url: &str| SwapTarget {
+            base_url: url.into(),
+            save: None,
+        };
+        let reset = |id| SwapTarget {
+            base_url: preset(id).base_url.into(),
+            save: Some(None),
+        };
+        let remote_ollama = "http://gpu-box:11434";
+        let lan_lmstudio = "http://10.0.0.5:1234/v1";
+        let lan_llama = "http://10.0.0.6:8080/v1";
+        let table: Vec<SwapCase> = vec![
+            (
+                "ollama",
+                Some(remote_ollama),
+                "ollama",
+                None,
+                keep(remote_ollama),
+            ),
+            (
+                "ollama",
+                None,
+                "ollama",
+                None,
+                keep(preset("ollama").base_url),
+            ),
+            (
+                "ollama",
+                Some(remote_ollama),
+                "anthropic",
+                None,
+                reset("anthropic"),
+            ),
+            ("anthropic", None, "ollama", None, reset("ollama")),
+            (
+                "lmstudio",
+                Some(lan_lmstudio),
+                "lmstudio",
+                None,
+                keep(lan_lmstudio),
+            ),
+            (
+                "llamacpp",
+                Some(lan_llama),
+                "llamacpp",
+                None,
+                keep(lan_llama),
+            ),
+            (
+                "llamacpp",
+                Some(lan_llama),
+                "lmstudio",
+                None,
+                reset("lmstudio"),
+            ),
+            (
+                "lmstudio",
+                Some(lan_lmstudio),
+                "ollama",
+                None,
+                reset("ollama"),
+            ),
+            ("openrouter", None, "openai", None, reset("openai")),
+            (
+                "anthropic",
+                None,
+                "custom",
+                Some("http://127.0.0.1:9000/v1"),
+                SwapTarget {
+                    base_url: "http://127.0.0.1:9000/v1".into(),
+                    save: Some(Some("http://127.0.0.1:9000/v1".into())),
+                },
+            ),
+            (
+                "custom",
+                Some("http://127.0.0.1:9000/v1"),
+                "custom",
+                None,
+                keep("http://127.0.0.1:9000/v1"),
+            ),
+        ];
+        for (from, saved, to, url, want) in table {
+            assert_eq!(
+                plan_swap(from, saved, preset(to), url),
+                want,
+                "{from} ({saved:?}) → {to} ({url:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_success_line_names_the_model_actually_saved() {
+        let same = swap_success_line("qwen", "qwen", "LM Studio");
+        assert!(same.contains("→ qwen on LM Studio"), "{same}");
+        let fell_back = swap_success_line("qwen", "local-model", "LM Studio");
+        assert!(
+            fell_back.contains("→ local-model on LM Studio"),
+            "{fell_back}"
+        );
+        assert!(fell_back.contains("'qwen'"), "{fell_back}");
+    }
+
+    #[test]
+    fn llama_server_is_found_as_an_exe_on_windows() {
+        let dir = std::env::temp_dir().join(format!("bwn-llama-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // PATHEXT spells .EXE in upper case; Windows disks ignore case, this
+        // one may not.
+        let exe = dir.join("llama-server.EXE");
+        std::fs::write(&exe, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(find_llama_server_in(&path, None, true), Some(exe.clone()));
+        assert_eq!(
+            find_llama_server_in(&path, Some(std::ffi::OsStr::new(".COM;.EXE")), true),
+            Some(exe)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

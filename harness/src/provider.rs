@@ -641,12 +641,29 @@ fn ollama_exchange(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     let key = format!("{}#{}", req.url(), p.model);
+    let no_think_key = format!("no-think:{key}");
+    if flatten_remembered(&no_think_key) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("think");
+        }
+    }
     if flatten_remembered(&key) {
         flatten_ollama_messages(&mut body);
         return finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking);
     }
     match send_raw(req.clone(), body.clone()) {
         Ok(resp) => finish_ollama(resp, streaming, on_text, on_thinking),
+        // A reasoning effort asked of a model without thinking: drop the
+        // option for this model for the rest of the session and retry, which
+        // still gets the tools fallback below if that is needed too.
+        Err(e) if body.get("think").is_some() && ollama_rejects_thinking(&e) => {
+            remember_flatten(&no_think_key);
+            crate::report::info(&format!(
+                "  ⟳ {} does not support thinking — continuing without it",
+                p.model
+            ));
+            ollama_exchange(p, req, body, streaming, on_text, on_thinking)
+        }
         Err(e) if ollama_rejects_tools(&e) => {
             remember_flatten(&key);
             crate::report::info(&format!(
@@ -658,6 +675,11 @@ fn ollama_exchange(
         }
         Err(e) => Err(e),
     }
+}
+
+// Ollama's 400 for `think` sent to a model without thinking support.
+fn ollama_rejects_thinking(e: &str) -> bool {
+    e.starts_with("HTTP 400") && e.to_lowercase().contains("does not support thinking")
 }
 
 // Ollama's 400 for a model without tool support.
@@ -2787,6 +2809,41 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("- read_file(path?)"));
+        }
+    }
+
+    #[test]
+    fn ollama_retries_without_thinking_when_the_model_has_none_and_remembers() {
+        let ok =
+            r#"{"message":{"role":"assistant","content":"y"},"done":true,"done_reason":"stop"}"#;
+        let reject =
+            r#"{"error":"registry.ollama.ai/library/llama3.2:latest does not support thinking"}"#;
+        let (base, handle, bodies) = mock_server_capture(vec![(400, reject), (200, ok), (200, ok)]);
+        let p = Provider {
+            protocol: Protocol::OllamaNative,
+            base_url: base,
+            api_key: None,
+            model: "llama3.2:latest".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::High,
+            ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        };
+        let msgs = [Msg::User("hi".into())];
+        assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
+        assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
+        handle.join().unwrap();
+        let sent: Vec<Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 3, "400 → retry, then one remembered call");
+        assert_eq!(sent[0]["think"], true);
+        for retry in &sent[1..] {
+            assert!(retry.get("think").is_none(), "{retry}");
         }
     }
 

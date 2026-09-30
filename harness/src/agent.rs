@@ -172,7 +172,19 @@ fn render_msgs(msgs: &[Msg]) -> String {
     s
 }
 
+// Compaction with no size limit on the carried images.
+#[cfg(test)]
 fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec<Msg> {
+    compact_within(msgs, usize::MAX, summarize)
+}
+
+// `compact_with` for a transcript that must come out under `budget`
+// estimated tokens: carried images are dropped, oldest first, until it does.
+fn compact_within(
+    msgs: Vec<Msg>,
+    budget: usize,
+    summarize: impl FnOnce(&[Msg]) -> String,
+) -> Vec<Msg> {
     // The last request's measured prompt size described the transcript
     // being replaced; the meter falls back to the estimate until the next one.
     crate::usage::forget_last();
@@ -192,14 +204,56 @@ fn compact_with(msgs: Vec<Msg>, summarize: impl FnOnce(&[Msg]) -> String) -> Vec
     let mut body =
         format!("[Summary of earlier conversation, compacted to save context]\n{summary}");
     // Pin the original task verbatim so it survives any number of compactions.
-    if let Some(task) = task {
-        body.push_str("\n\n");
-        body.push_str(ORIGINAL_TASK_MARKER);
-        body.push_str(&task);
+    // It goes last: everything after the marker is read back as the task.
+    let pinned = task.map_or(String::new(), |t| format!("\n\n{ORIGINAL_TASK_MARKER}{t}"));
+    let rest = estimate_tokens(&v) + estimate_tokens(&tail) + (body.len() + pinned.len() + 160) / 4;
+    let (images, dropped) = images_to_keep(&middle, budget.saturating_sub(rest));
+    if dropped > 0 {
+        let kept = match images.len() {
+            0 => String::new(),
+            n => format!("; the {n} most recent are attached"),
+        };
+        body.push_str(&format!(
+            "\n\n[{dropped} earlier image(s) were dropped during compaction{kept}]"
+        ));
     }
-    v.push(Msg::User(body));
+    body.push_str(&pinned);
+    v.push(user_msg(body, images));
     v.extend(tail);
     v
+}
+
+// Images attached to the turns being summarized ride along on the summary
+// turn: the model can still see what the user showed it. Each image once,
+// in first-seen order, capped to the most recent few that fit in `room`
+// estimated tokens; the count of any dropped is returned.
+const MAX_KEPT_IMAGES: usize = 4;
+
+fn images_to_keep(middle: &[Msg], room: usize) -> (Vec<(String, String)>, usize) {
+    let mut all: Vec<(String, String)> = Vec::new();
+    for m in middle {
+        if let Msg::UserImages { images, .. } = m {
+            for img in images {
+                if !all.contains(img) {
+                    all.push(img.clone());
+                }
+            }
+        }
+    }
+    let mut used = 0usize;
+    let mut kept = 0usize;
+    for (_, data) in all.iter().rev() {
+        // As estimate_tokens counts an image, rounded up.
+        let cost = data.len() / 3 / 4 + 1;
+        if kept == MAX_KEPT_IMAGES || used + cost > room {
+            break;
+        }
+        used += cost;
+        kept += 1;
+    }
+    let dropped = all.len() - kept;
+    all.drain(..dropped);
+    (all, dropped)
 }
 
 /// Truncate oversized tool result contents to keep context manageable.
@@ -251,8 +305,8 @@ fn model_summary(p: &Provider, middle: &[Msg]) -> String {
 }
 
 fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
-    let budget = p.context_tokens.saturating_mul(8) / 10;
-    if budget == 0 || estimate_tokens(msgs) <= budget {
+    let budget = compaction_budget(p);
+    if estimate_tokens(msgs) <= budget {
         return;
     }
     let (sys_end, tail_start) = compaction_split(msgs);
@@ -261,7 +315,16 @@ fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     }
     report::info("  ⟳ compacting context…");
     let taken = std::mem::take(msgs);
-    *msgs = compact_with(taken, |middle| model_summary(p, middle));
+    *msgs = compact_within(taken, budget, |middle| model_summary(p, middle));
+}
+
+// The estimated size a compacted transcript must fit in: 80% of the model's
+// context, or no limit when that is unknown.
+fn compaction_budget(p: &Provider) -> usize {
+    match p.context_tokens.saturating_mul(8) / 10 {
+        0 => usize::MAX,
+        n => n,
+    }
 }
 
 #[derive(Default)]
@@ -622,6 +685,7 @@ fn budget_exhausted() -> bool {
     match crate::usage::budget_stop() {
         Some(msg) => {
             report::notice(&msg);
+            stopped_short(Outcome::BudgetStop);
             true
         }
         None => false,
@@ -1674,6 +1738,95 @@ fn confirm(label: &str) -> Option<String> {
     confirm_tool(label, "", Path::new("."))
 }
 
+/// How a headless run ended short of success, each with its own exit code.
+/// Exit 0 is kept for real success; 1 (failed) and 2 (usage) predate this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Success,
+    Failed,
+    ApprovalBlocked,
+    HookBlocked,
+    BudgetStop,
+    StepLimit,
+    CheckWorkFailed,
+    VerificationFailed,
+}
+
+impl Outcome {
+    const ALL: [Outcome; 8] = [
+        Outcome::Success,
+        Outcome::Failed,
+        Outcome::ApprovalBlocked,
+        Outcome::HookBlocked,
+        Outcome::BudgetStop,
+        Outcome::StepLimit,
+        Outcome::CheckWorkFailed,
+        Outcome::VerificationFailed,
+    ];
+
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Outcome::Success => 0,
+            Outcome::Failed => 1,
+            Outcome::ApprovalBlocked => 3,
+            Outcome::HookBlocked => 4,
+            Outcome::BudgetStop => 5,
+            Outcome::StepLimit => 6,
+            Outcome::CheckWorkFailed => 7,
+            Outcome::VerificationFailed => 8,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::Failed => "failed",
+            Outcome::ApprovalBlocked => "approval_blocked",
+            Outcome::HookBlocked => "hook_blocked",
+            Outcome::BudgetStop => "budget_stop",
+            Outcome::StepLimit => "step_limit",
+            Outcome::CheckWorkFailed => "check_work_failed",
+            Outcome::VerificationFailed => "verification_failed",
+        }
+    }
+
+    /// Short human wording for the headless summary line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Outcome::Success => "done",
+            Outcome::Failed => "failed",
+            Outcome::ApprovalBlocked => "changes blocked for lack of approval",
+            Outcome::HookBlocked => "blocked by a hook",
+            Outcome::BudgetStop => "stopped at the budget limit",
+            Outcome::StepLimit => "ran out of steps",
+            Outcome::CheckWorkFailed => "finished with failing checks",
+            Outcome::VerificationFailed => "finished with verification failures",
+        }
+    }
+}
+
+// The first reason the top-level turn stopped short of success (0 = none
+// yet). A turn that returns Ok with this set is not a success.
+static STOPPED_SHORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn stopped_short(o: Outcome) {
+    let idx = Outcome::ALL.iter().position(|x| *x == o).unwrap_or(0);
+    let _ = STOPPED_SHORT.compare_exchange(
+        0,
+        idx,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Why the run stopped short of success, if it did.
+pub fn stopped_short_outcome() -> Option<Outcome> {
+    match STOPPED_SHORT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        i => Outcome::ALL.get(i).copied(),
+    }
+}
+
 /// Confirmations refused because nobody was there to answer them. Headless
 /// runs fail instead of reporting "done" when this is non-zero.
 static BLOCKED_WITHOUT_TERMINAL: std::sync::atomic::AtomicUsize =
@@ -1952,7 +2105,9 @@ fn gate_after_hook(
 
 // Public compact helper for the /compact REPL command.
 pub fn compact_msgs(p: &Provider, msgs: Vec<Msg>) -> Vec<Msg> {
-    compact_with(msgs, |middle| model_summary(p, middle))
+    compact_within(msgs, compaction_budget(p), |middle| {
+        model_summary(p, middle)
+    })
 }
 
 // ── BUILD mode ────────────────────────────────────────────────────────────────
@@ -2111,6 +2266,9 @@ fn build_turn(
     let task = match hooks::user_prompt_submit(task, cwd) {
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
+            if depth == 0 {
+                stopped_short(Outcome::HookBlocked);
+            }
             return Ok(String::new());
         }
         Ok(ctx) if !ctx.is_empty() => format!("{task}\n\n[hook context]\n{ctx}"),
@@ -2204,7 +2362,9 @@ fn build_turn(
                     forced_compact_retry = true;
                     report::notice("  ⟳ context overflow — force-compacting and retrying…");
                     let taken = std::mem::take(msgs);
-                    *msgs = compact_with(taken, |middle| model_summary(p, middle));
+                    *msgs = compact_within(taken, compaction_budget(p), |middle| {
+                        model_summary(p, middle)
+                    });
                     continue;
                 }
                 hooks::notify("OnError", cwd);
@@ -2758,6 +2918,10 @@ fn build_turn(
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
                         report::notice(&format!("  ⚠ verification {}", rep.status.label()));
+                        if check_work_passed == Some(false) {
+                            stopped_short(Outcome::CheckWorkFailed);
+                        }
+                        stopped_short(Outcome::VerificationFailed);
                         return Ok(format!(
                             "{s}\n\n[verification note] The verifier still reports `{}` after \
                              {verifier_fix_rounds} fix attempts:\n{violations}",
@@ -2773,6 +2937,11 @@ fn build_turn(
                         }
                     }
                     crate::verifier::VerificationStatus::Passed => {}
+                }
+                // The last check_work verdict stands: finishing over failing
+                // checks is not a success.
+                if check_work_passed == Some(false) {
+                    stopped_short(Outcome::CheckWorkFailed);
                 }
             }
             return Ok(s);
@@ -2801,6 +2970,9 @@ fn build_turn(
     // Ran out of step budget without a finish call. This must never surface as a
     // raw \"hit the limit\" error — land the turn gracefully with an honest
     // summary of where things stand, returned as a normal reply.
+    if depth == 0 {
+        stopped_short(Outcome::StepLimit);
+    }
     msgs.push(Msg::User(
         "That's the end of the step budget for this turn — stop calling tools now. In a few plain \
          sentences (no tool calls), tell me what you got done, what's still left, and the exact next \
@@ -5471,6 +5643,116 @@ mod tests {
         assert!(matches!(&out[0], Msg::System(s) if s == "sys"));
         assert!(matches!(&out[1], Msg::User(s) if s.contains("SUMMARY")));
         assert!(matches!(out.last(), Some(Msg::User(s)) if s == "u9"));
+    }
+
+    #[test]
+    fn compaction_keeps_images_from_the_summarized_turns() {
+        let img = |n: u8| ("image/png".to_string(), format!("BASE64-{n}"));
+        let mut msgs = vec![
+            Msg::System("sys".into()),
+            Msg::UserImages {
+                text: "fix the layout in this screenshot".into(),
+                images: vec![img(1)],
+            },
+            Msg::User("u1".into()),
+            Msg::UserImages {
+                text: "and this one".into(),
+                images: vec![img(2), img(1)],
+            },
+        ];
+        for i in 2..10 {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(msgs, |_| "SUMMARY".into());
+        let Msg::UserImages { text, images } = &out[1] else {
+            panic!("the summary turn dropped the images");
+        };
+        assert!(text.contains("SUMMARY"), "{text}");
+        assert!(text.contains("fix the layout"), "{text}");
+        // Each image once, in the order first seen.
+        assert_eq!(images, &vec![img(1), img(2)]);
+
+        // A second compaction carries them forward again.
+        let mut again = out;
+        for i in 10..20 {
+            again.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(again, |_| "SUMMARY 2".into());
+        assert!(matches!(&out[1], Msg::UserImages { images, .. } if images.len() == 2));
+
+        // Past the cap, the most recent are kept and the drop is noted.
+        let mut many = vec![Msg::System("sys".into())];
+        for n in 0..6 {
+            many.push(Msg::UserImages {
+                text: format!("shot {n}"),
+                images: vec![img(n)],
+            });
+        }
+        for i in 0..KEEP_RECENT {
+            many.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(many, |_| "S".into());
+        let Msg::UserImages { text, images } = &out[1] else {
+            panic!("the summary turn dropped the images");
+        };
+        assert_eq!(images, &(2..6).map(img).collect::<Vec<_>>());
+        assert!(text.contains("2 earlier image(s) were dropped"), "{text}");
+    }
+
+    // Six screenshots, each ~3.3k estimated tokens, then a short recent tail.
+    fn screenshots_then_tail() -> Vec<Msg> {
+        let mut msgs = vec![Msg::System("sys".into())];
+        for n in 0..6 {
+            msgs.push(Msg::UserImages {
+                text: format!("shot {n}"),
+                images: vec![("image/png".into(), format!("{n}").repeat(40_000))],
+            });
+            msgs.push(Msg::Assistant {
+                text: "ok".into(),
+                calls: vec![],
+            });
+        }
+        for i in 0..KEEP_RECENT {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        msgs
+    }
+
+    #[test]
+    fn compaction_carries_only_the_images_that_fit_the_context() {
+        // Nothing listens on port 1, so the summary falls back to the
+        // structural one without a network round trip.
+        let p = Provider {
+            protocol: config::Protocol::OpenAi,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            model: "m".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: config::Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let budget = p.context_tokens * 8 / 10;
+        let mut msgs = screenshots_then_tail();
+        assert!(estimate_tokens(&msgs) > budget);
+        maybe_compact(&p, &mut msgs);
+        assert!(
+            estimate_tokens(&msgs) <= budget,
+            "still over the budget after compacting: {} > {budget}",
+            estimate_tokens(&msgs)
+        );
+        let Msg::UserImages { text, images } = &msgs[1] else {
+            panic!("no image fits? {:?}", estimate_tokens(&msgs));
+        };
+        assert!(!images.is_empty() && images.len() < 4, "{}", images.len());
+        assert!(text.contains("earlier image(s) were dropped"), "{text}");
+    }
+
+    #[test]
+    fn compaction_notes_stay_out_of_the_pinned_task() {
+        let out = compact_with(screenshots_then_tail(), |_| "S".into());
+        assert_eq!(original_task_text(&out).as_deref(), Some("shot 0"));
     }
 
     #[test]

@@ -186,7 +186,8 @@ A configured key is only sent over HTTPS or to a loopback address.
 native control: Claude 4.6+ gets adaptive thinking with `output_config.effort`,
 older Claude models a `budget_tokens` thinking budget (2048 / 8192 / 16384),
 OpenAI reasoning models (`o1`/`o3`/`o4`/`gpt-5`) `reasoning_effort`, and
-Ollama's native API `think: true`. Other models — including anything behind a
+Ollama's native API `think: true` (an Ollama model that does not support
+thinking is retried without it). Other models — including anything behind a
 local OpenAI-compatible server — receive no reasoning parameters at all.
 
 **Cost.** Every request's `usage` block feeds a session ledger: `/cost` shows
@@ -195,7 +196,7 @@ estimated dollar figure from a built-in price table (local providers show
 `$0.00 (local)`; an unlisted model shows tokens only, never a guessed price).
 `--max-budget-usd <n>` (or `max_budget_usd` in settings) stops the agent
 before the next model request once the estimate exceeds `n`, with a `notice`
-event in `--json` mode.
+event in `--json` mode; a headless run then exits 5.
 
 ## Modes
 
@@ -250,14 +251,26 @@ whose API key is in the environment, and writes nothing.
 | `--max-budget-usd <n>` | stop before the next request once the estimated cost exceeds `n` |
 | `--json` | machine-readable events on stdout instead of text |
 | `--yes`, `-y` | `plan` only: approve the plan and execute it |
+| `--legacy-exit-codes` | exit 0 when a run stops short without failing (codes 4 to 8 below) |
 | `--` | everything after it is task text, even if it looks like a flag |
 
-| Exit code | Meaning |
-|---|---|
-| 0 | the task finished |
-| 1 | the run failed, or no provider could be set up |
-| 2 | usage error: unknown option, a flag missing its value, or `plan` with no terminal and no `--yes` |
-| 3 | the run finished but changes were blocked for lack of approval (`ask` with no terminal); nothing was applied |
+| Exit code | `outcome` | Meaning |
+|---|---|---|
+| 0 | `success` | the task finished |
+| 1 | `failed` | the run failed, or no provider could be set up |
+| 2 | | usage error: unknown option, a flag missing its value, or `plan` with no terminal and no `--yes` |
+| 3 | `approval_blocked` | changes were blocked for lack of approval (`ask` with no terminal); nothing was applied |
+| 4 | `hook_blocked` | a `UserPromptSubmit` hook blocked the task |
+| 5 | `budget_stop` | `--max-budget-usd` stopped the run before the next request |
+| 6 | `step_limit` | the turn used every step without finishing |
+| 7 | `check_work_failed` | the model finished, but the project's checks (`check_work`) still fail |
+| 8 | `verification_failed` | the model finished, but the verifier still blocks after its fix rounds |
+
+With `--json`, the last event is `{"type":"result","outcome":…,"exit_code":…}`.
+When more than one applies, the first reason the run stopped short is reported.
+`--legacy-exit-codes` (or `BWN_LEGACY_EXIT_CODES=1`) restores the pre-0.15
+behavior: codes 4 to 8 become 0, while the `result` event still names the
+outcome.
 
 Each `--json` event has a `schema_version` (now `1`). What may change in a
 minor or a patch release (flags, settings keys, events, session files, exit

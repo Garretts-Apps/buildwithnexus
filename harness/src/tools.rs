@@ -2428,7 +2428,7 @@ pub fn find_on_path(bin: &str) -> Option<PathBuf> {
 /// `find_on_path` with its inputs passed in, so tests can run the Windows
 /// rules anywhere. On Windows a bare name also matches each PATHEXT suffix
 /// (`git` finds `git.exe`), as cmd.exe does.
-fn find_in_path(
+pub(crate) fn find_in_path(
     bin: &str,
     path: &std::ffi::OsStr,
     pathext: Option<&std::ffi::OsStr>,

@@ -160,7 +160,11 @@ pub fn run() -> Option<Settings> {
         tui::line("");
         if found.is_empty() {
             tui::line(&tui::yellow("  no local models detected."));
-            tui::line(&tui::dim("    • Ollama: run  ollama pull qwen2.5:3b"));
+            // Pull the model the prompt below defaults to, so Enter works.
+            let starter = config::preset("ollama").map_or("", |p| p.default_model);
+            tui::line(&tui::dim(&format!(
+                "    • Ollama: run  ollama pull {starter}"
+            )));
             tui::line(&tui::dim(&format!(
                 "    • llama.cpp / LM Studio: drop a .gguf into {}",
                 local::models_dir().display()
@@ -170,11 +174,11 @@ pub fn run() -> Option<Settings> {
             ));
             tui::line(&tui::dim("    you can also just type a model name below, then re-run init once it's available"));
             if pick.id == "ollama" {
-                let pull = tui::ask("  pull qwen2.5:3b now? [y/N]: ").unwrap_or_default();
+                let pull = tui::ask(&format!("  pull {starter} now? [y/N]: ")).unwrap_or_default();
                 if matches!(pull.trim(), "y" | "Y" | "yes" | "YES") {
                     let _ = std::process::Command::new("ollama")
                         .arg("pull")
-                        .arg("qwen2.5:3b")
+                        .arg(starter)
                         .stdout(std::process::Stdio::inherit())
                         .stderr(std::process::Stdio::inherit())
                         .status();

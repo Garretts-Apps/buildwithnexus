@@ -626,6 +626,14 @@ pub fn verify(status: &str, report: &Value) {
     }
 }
 
+// The last event of a headless --json run: how it ended and the exit code
+// the process is about to return.
+pub fn result(outcome: &str, exit_code: i32) {
+    if mode() == Mode::Json {
+        emit(json!({"type": "result", "outcome": outcome, "exit_code": exit_code}));
+    }
+}
+
 pub fn error(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::red(&format!("  ✗ {}", tui::sanitize_terminal(msg)))),

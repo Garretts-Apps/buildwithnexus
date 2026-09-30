@@ -35,6 +35,8 @@ pub struct Preset {
     pub base_url: &'static str,
     pub env_key: &'static str,
     pub default_model: &'static str,
+    /// Further models the /model picker offers for this preset.
+    pub more_models: &'static [&'static str],
     pub local: bool,
 }
 
@@ -46,6 +48,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "https://api.anthropic.com",
         env_key: "ANTHROPIC_API_KEY",
         default_model: "claude-sonnet-4-6",
+        more_models: &["claude-opus-4-8", "claude-haiku-4-5"],
         local: false,
     },
     Preset {
@@ -55,6 +58,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "https://api.openai.com/v1",
         env_key: "OPENAI_API_KEY",
         default_model: "gpt-4o",
+        more_models: &["gpt-4o-mini"],
         local: false,
     },
     Preset {
@@ -63,7 +67,8 @@ pub const PRESETS: &[Preset] = &[
         protocol: Protocol::OpenAi,
         base_url: "https://openrouter.ai/api/v1",
         env_key: "OPENROUTER_API_KEY",
-        default_model: "anthropic/claude-3.7-sonnet",
+        default_model: "anthropic/claude-sonnet-4.6",
+        more_models: &[],
         local: false,
     },
     Preset {
@@ -73,6 +78,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "https://api.groq.com/openai/v1",
         env_key: "GROQ_API_KEY",
         default_model: "llama-3.3-70b-versatile",
+        more_models: &[],
         local: false,
     },
     Preset {
@@ -82,6 +88,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "https://router.huggingface.co/v1",
         env_key: "HF_TOKEN",
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
+        more_models: &[],
         local: false,
     },
     Preset {
@@ -93,6 +100,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "http://localhost:11434",
         env_key: "",
         default_model: "llama3.2",
+        more_models: &[],
         local: true,
     },
     Preset {
@@ -102,6 +110,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "http://localhost:8080/v1",
         env_key: "",
         default_model: "local-model",
+        more_models: &[],
         local: true,
     },
     Preset {
@@ -111,6 +120,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "http://localhost:1234/v1",
         env_key: "",
         default_model: "local-model",
+        more_models: &[],
         local: true,
     },
     // Any OpenAI-compatible /v1 server: vLLM, TGI, LiteLLM, a corporate
@@ -124,6 +134,7 @@ pub const PRESETS: &[Preset] = &[
         base_url: "http://localhost:8000/v1",
         env_key: "",
         default_model: "local-model",
+        more_models: &[],
         local: true,
     },
 ];
@@ -2082,6 +2093,89 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
+
+    // A word that names a specific model (as opposed to a family prefix or
+    // a placeholder like "local-model").
+    fn looks_like_model_id(lit: &str) -> bool {
+        const FAMILIES: &[&str] = &[
+            "claude-",
+            "gpt-",
+            "anthropic/",
+            "openai/",
+            "google/",
+            "meta-llama/",
+            "llama3",
+            "llama-3",
+            "qwen",
+            "gemma",
+            "mistral",
+            "deepseek",
+        ];
+        lit.chars().any(|c| c.is_ascii_digit())
+            && FAMILIES
+                .iter()
+                .any(|f| lit.to_ascii_lowercase().starts_with(f))
+    }
+
+    fn string_literals(line: &str) -> Vec<&str> {
+        line.split('"').skip(1).step_by(2).collect()
+    }
+
+    #[test]
+    fn default_model_ids_live_only_in_the_presets_table() {
+        // Files whose model strings are family prefixes for pricing or
+        // capability checks, never a model the harness picks.
+        const PREFIX_TABLES: &[&str] = &["usage.rs", "media.rs", "provider.rs"];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stray = Vec::new();
+        for entry in fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || PREFIX_TABLES.contains(&name.as_str()) {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            // Only shipped code: everything above the first test module.
+            let shipped = text.split("#[cfg(test)]").next().unwrap();
+            let mut in_presets = false;
+            for (n, line) in shipped.lines().enumerate() {
+                if name == "config.rs" && line.starts_with("pub const PRESETS") {
+                    in_presets = true;
+                }
+                if in_presets {
+                    in_presets = line != "];";
+                    continue;
+                }
+                let code = line.split("//").next().unwrap();
+                // Whole literals and words inside messages ("ollama pull …").
+                let words = string_literals(code)
+                    .into_iter()
+                    .flat_map(str::split_whitespace)
+                    .map(|w| w.trim_matches(|c: char| "`'(),.;:".contains(c)));
+                for w in words {
+                    if looks_like_model_id(w) {
+                        stray.push(format!("{name}:{}: {w}", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "model ids outside config::PRESETS: {stray:#?}"
+        );
+        // And the table itself names one of each.
+        for p in PRESETS {
+            assert!(!p.default_model.is_empty(), "{}", p.id);
+        }
+    }
+
+    #[test]
+    fn openrouter_default_is_a_current_model() {
+        let p = preset("openrouter").unwrap();
+        // Retired on OpenRouter in 2026; requests for it fail.
+        assert_ne!(p.default_model, "anthropic/claude-3.7-sonnet");
+        assert!(p.default_model.starts_with("anthropic/"));
+    }
 
     fn unique_home() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
