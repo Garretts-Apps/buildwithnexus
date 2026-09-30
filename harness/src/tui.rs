@@ -4567,7 +4567,10 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
             }
             let _ = out.flush();
             render_output();
-            line(&green(&format!("  ✓ selected: {}", items[selected].label)));
+            line(&green(&format!(
+                "  ✓ selected: {}",
+                sanitize_terminal(&items[selected].label)
+            )));
             break Some(selected);
         } else if action == "cancel" {
             let mut out = io::stdout();

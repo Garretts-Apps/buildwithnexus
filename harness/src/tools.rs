@@ -655,6 +655,7 @@ pub fn has_dangerous_flags(cmd: &str) -> bool {
             .is_some_and(|at| at == 0 || a.text.starts_with('-'));
         if (may_expand_to_flag && !flags.is_empty())
             || flags.iter().any(|f| flag_matches(&a.text, f))
+            || (cfg!(windows) && bin == "sort" && is_windows_sort_output_switch(&a.text))
         {
             return true;
         }
@@ -671,8 +672,26 @@ pub fn has_dangerous_flags(cmd: &str) -> bool {
 pub fn is_plain_command(cmd: &str) -> bool {
     let cmd = cmd.trim();
     !has_shell_metachars(cmd)
+        && !(cfg!(windows) && cmd_exe_rewrites(cmd))
         && program_is_literal(command_program(cmd))
         && !has_dangerous_flags(cmd)
+}
+
+// `run_command` runs through `cmd /C` on Windows, which rewrites the text
+// before the program sees it: `^` escapes a character and `%VAR%` (with
+// `%VAR:~n,m%` substrings) expands, so `rg --pr^e` or `rg --pr%X:~0,1%e`
+// spells a flag that shell_words, which models sh, never sees.
+fn cmd_exe_rewrites(cmd: &str) -> bool {
+    cmd.contains(['^', '%'])
+}
+
+// Windows' sort.exe writes its output to a file with `/O` or `/OUTPUT`, in
+// any case and abbreviation. On Windows, `sort` on PATH is that program.
+fn is_windows_sort_output_switch(tok: &str) -> bool {
+    tok.strip_prefix('/').is_some_and(|rest| {
+        let name = rest.split(':').next().unwrap_or(rest).to_ascii_lowercase();
+        !name.is_empty() && "output".starts_with(&name)
+    })
 }
 
 /// Whether a command that would skip the prompt (read-only or pre-approved)
@@ -7461,6 +7480,39 @@ print("hello " + data.get("name", "world"))
         ] {
             assert!(is_readonly_command(c), "legit command not read-only: {c:?}");
         }
+    }
+
+    #[test]
+    fn windows_cmd_rewrites_and_sort_output_switch_are_recognised() {
+        // cmd.exe `^` escapes and `%VAR%` expansion (Windows-only gate).
+        for cmd in [
+            "rg --pr^e ./x foo",
+            "rg --pr%X:~0,1%e ./x foo",
+            "sort %TEMP%\\x",
+        ] {
+            assert!(cmd_exe_rewrites(cmd), "{cmd}");
+        }
+        assert!(!cmd_exe_rewrites("rg -n foo src"));
+        // sort.exe's output switch, any case or abbreviation.
+        for tok in ["/o", "/O", "/out", "/OUTPUT", "/output:x.txt"] {
+            assert!(is_windows_sort_output_switch(tok), "{tok}");
+        }
+        for tok in ["/r", "/outputs", "/", "-o", "out.txt", "/tmp/o"] {
+            assert!(!is_windows_sort_output_switch(tok), "{tok}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sort_output_and_cmd_rewrites_never_skip_the_prompt() {
+        for cmd in [
+            "sort /o out.txt in.txt",
+            "sort /OUTPUT out.txt in.txt",
+            "rg --pr^e .\\x foo",
+        ] {
+            assert!(!is_readonly_command(cmd), "{cmd}");
+        }
+        assert!(is_readonly_command("sort /r in.txt"));
     }
 
     #[test]

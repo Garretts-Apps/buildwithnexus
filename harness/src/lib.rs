@@ -216,8 +216,15 @@ pub fn run() {
                 return;
             }
             for s in &all {
-                let title: String = s.title.chars().take(48).collect();
-                println!("  {}  {:<48}  {}", s.id, title, s.cwd);
+                // Titles come from task text and cwd from the checkout's
+                // folder name, so neither reaches the terminal raw.
+                let title: String = tui::sanitize_terminal(&s.title).chars().take(48).collect();
+                println!(
+                    "  {}  {:<48}  {}",
+                    s.id,
+                    title,
+                    tui::sanitize_terminal(&s.cwd)
+                );
             }
             println!();
             println!(
@@ -356,7 +363,8 @@ fn warn_settings_issues(load: &config::SettingsLoad) {
             "{}",
             tui::yellow(&format!(
                 "buildwithnexus: warning: {}: {}",
-                i.source, i.error
+                tui::sanitize_terminal(&i.source),
+                tui::sanitize_terminal(&i.error)
             ))
         );
     }
@@ -4353,7 +4361,11 @@ fn run_doctor() {
     // Settings
     let load = config::load_settings_diag();
     for i in &load.issues {
-        println!("  ✗ settings       {}: {}", i.source, i.error);
+        println!(
+            "  ✗ settings       {}: {}",
+            tui::sanitize_terminal(&i.source),
+            tui::sanitize_terminal(&i.error)
+        );
     }
     match load.settings.as_ref() {
         None if load.any_present => {
@@ -4398,15 +4410,22 @@ fn run_doctor() {
                                 "  ✓ provider       {} answers as {} (one-token probe)",
                                 s.provider, p.model
                             ),
+                            // The error can carry the server's response body.
                             Err(e) => println!(
                                 "  ✗ provider       {}: {}",
                                 s.provider,
-                                e.chars().take(160).collect::<String>()
+                                tui::sanitize_terminal(&e)
+                                    .chars()
+                                    .take(160)
+                                    .collect::<String>()
                             ),
                         }
                     }
                 }
-                Err(e) => println!("  ✗ provider       {e}"),
+                Err(e) => println!(
+                    "  ✗ provider       {}",
+                    tui::sanitize_terminal(&e.to_string())
+                ),
             }
         }
     }
