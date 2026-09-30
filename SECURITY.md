@@ -53,14 +53,12 @@ a binary downloaded on an earlier run, then a local `cargo build` in a repo
 checkout. No per-platform package carries a binary, so in practice the
 binary comes from the first-run download below.
 
-**Reserved platform package names.** Versions 0.12.1 to 0.14.2 listed
-`buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies` before any
-such package existed, so anyone could have registered the names and had their
-code installed with those versions. The publish workflow reserves all five
-names as empty placeholders (no code, no `bin`), none at a version those pins
-match, and fails while any name is missing or owned by someone else. Creating
-them needs an npm token allowed to create packages; until one is set the names
-are still unregistered, so avoid installing 0.12.1 to 0.14.2.
+**Unregistered platform package names.** Versions 0.12.1 to 0.14.2 list
+`buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies`, but no such
+package was ever published, so anyone could register those names and have
+their code installed with those versions. Publishing is OIDC-only, and npm's
+OIDC publishing cannot create a new package, so the names stay unregistered.
+Do not install 0.12.1 to 0.14.2; use `buildwithnexus@latest`.
 
 **First-run download.** If no binary is found, the launcher runs
 `scripts/bootstrap.js`, which downloads the release asset for your platform

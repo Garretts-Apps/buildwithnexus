@@ -497,7 +497,7 @@ code, no bundled sources**. The binary is not in the tarball: on first run the
 launcher fetches the release asset for your platform and verifies its SHA-256
 checksum; every asset carries a build-provenance attestation
 (`gh attestation verify`). Nothing is installed from `buildwithnexus-<os>-<cpu>`
-packages; the publish workflow reserves those names as empty placeholders. Non-interactive environments opt in with `bwn --bootstrap` or
+packages, and 0.12.1-0.14.2, which reference them, should not be installed. Non-interactive environments opt in with `bwn --bootstrap` or
 `BWN_ALLOW_BOOTSTRAP=1`; or build from source and point `BWN_BIN` at the result.
 
 ## Platform support
