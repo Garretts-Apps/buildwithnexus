@@ -61,3 +61,4 @@ The event types in schema 1:
 | `finish` | `summary` |
 | `error` | `message` |
 | `notice` | `message` |
+| `result` | `outcome`, `exit_code` (last event of a headless run) |
