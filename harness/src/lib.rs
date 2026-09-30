@@ -52,6 +52,7 @@ pub mod knowledge;
 pub mod local;
 pub mod mcp;
 pub mod media;
+pub mod net;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
@@ -2146,7 +2147,8 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
     for url in candidates {
         let root = url.trim_end_matches('/').trim_end_matches("/v1");
         let probe = format!("{root}/v1/models");
-        if let Ok(res) = ureq::get(&probe)
+        if let Ok(res) = crate::net::shared()
+            .get(&probe)
             .timeout(std::time::Duration::from_millis(400))
             .call()
         {
@@ -2159,7 +2161,8 @@ fn find_active_local_base_url(preferred: &str) -> Option<String> {
             }
         }
         let root_probe = format!("{root}/health");
-        if ureq::get(&root_probe)
+        if crate::net::shared()
+            .get(&root_probe)
             .timeout(std::time::Duration::from_millis(300))
             .call()
             .is_ok()
@@ -2208,7 +2211,7 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
     if let Some(active_url) = find_active_local_base_url(preferred_url) {
         if active_url.contains("8080") {
             let probe = format!("{}/models", active_url.trim_end_matches('/'));
-            if let Ok(res) = ureq::get(&probe).call() {
+            if let Ok(res) = crate::net::shared().get(&probe).call() {
                 if let Ok(json) = res.into_string() {
                     if !json.contains(model_name) {
                         tui::line(&tui::yellow(&format!("  ⚠ local server at {active_url} is loaded with a different model. Switch it manually if needed.")));
@@ -2250,7 +2253,8 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
         std::thread::sleep(std::time::Duration::from_millis(500));
         print!(".");
         let _ = std::io::stdout().flush();
-        if ureq::get("http://localhost:8080/v1/models")
+        if crate::net::shared()
+            .get("http://localhost:8080/v1/models")
             .timeout(std::time::Duration::from_millis(300))
             .call()
             .is_ok()

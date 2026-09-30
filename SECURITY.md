@@ -191,7 +191,16 @@ shows whether a given file is signed.
   when the model uses the web tools (each new host needs the user's approval
   outside `auto` mode); MCP servers the user configures; and a
   daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
-  There is no telemetry or analytics.
+  There is no telemetry or analytics. All of these go through the proxy
+  named by `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` unless `NO_PROXY`
+  matches the host; loopback addresses never do. Certificates are checked
+  against the bundled webpki roots plus the OS certificate store, or plus
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` when set, so a TLS-inspecting proxy with an
+  installed root works. Through a proxy, the proxy resolves host names, so
+  the web tools' check that a name does not resolve to a link-local or
+  metadata address is the proxy's to make; bwn still refuses those
+  addresses and the metadata host names given literally, at every redirect
+  hop.
 - **Files:** its settings, sessions and checkpoints under
   `~/.buildwithnexus` (or `NEXUS_HOME`), and there, in `bin/<version>/`, the
   binary the npm launcher downloaded; pasted images as `bwn-paste-*.png`
@@ -202,7 +211,9 @@ shows whether a given file is signed.
 
 Controls an organization can set: `"auto_update": "off"`,
 `"permission": "ask"` or `"readonly"`, `BWN_SKIP_INSTALL=1` (no first-run
-download), and `BWN_BIN` (run a binary IT placed and verified itself).
+download), `BWN_BIN` (run a binary IT placed and verified itself), and
+`BWN_TLS_ROOTS=bundled` (trust only the roots built into the binary, not the
+OS store or `SSL_CERT_FILE`).
 
 ### Why endpoint protection may block it
 

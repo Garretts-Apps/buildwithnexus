@@ -92,14 +92,14 @@ pub struct Reply {
 // fires on a stalled stream. Probes set their own short per-request timeouts.
 // Redirects are off because ureq forwards custom headers such as x-api-key to
 // whatever host a 3xx names; send_raw turns a 3xx into an error instead.
-fn agent() -> &'static ureq::Agent {
-    static A: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn agent() -> &'static crate::net::Client {
+    static A: std::sync::OnceLock<crate::net::Client> = std::sync::OnceLock::new();
     A.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(read_timeout_secs()))
-            .redirects(0)
-            .build()
+        crate::net::Client::new(|b| {
+            b.timeout_connect(Duration::from_secs(15))
+                .timeout_read(Duration::from_secs(read_timeout_secs()))
+                .redirects(0)
+        })
     })
 }
 
@@ -932,6 +932,12 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
                 ));
             }
             Err(e) => {
+                if let Some(hint) = crate::net::cert_error_hint(&e) {
+                    return Err(format!(
+                        "connection failed: {}\n{hint}",
+                        redact(&e.to_string())
+                    ));
+                }
                 // Nothing is listening on a local port: retrying for two
                 // minutes will not start the server, so say what to do.
                 let refused_locally = is_local_url(req.url())
@@ -3054,7 +3060,7 @@ mod tests {
     // ── transport: timeouts, retries, redirects ────────────────────────────
     #[test]
     fn shared_agent_has_no_overall_deadline_and_follows_no_redirects() {
-        let dbg = format!("{:?}", agent());
+        let dbg = format!("{:?}", agent().agent_for("https://api.example.com"));
         assert!(dbg.contains("timeout: None"), "{dbg}");
         assert!(dbg.contains("timeout_read: Some("), "{dbg}");
         assert!(dbg.contains("timeout_connect: Some(15s)"), "{dbg}");

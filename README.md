@@ -571,6 +571,28 @@ to verify a release, and includes a request you can send. Each Windows `.exe`
 carries a version resource and an `asInvoker` manifest, and each release has
 a CycloneDX SBOM (`buildwithnexus.cdx.json`).
 
+### Behind a proxy
+
+bwn's own connections (model providers, the web tools, MCP servers over
+HTTP, the update check) use the standard proxy variables: `HTTPS_PROXY`,
+`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, in either case. `NO_PROXY` takes
+host names (`corp.example` also covers its subdomains; `.corp.example` and
+`*.corp.example` mean the same), IP addresses, CIDR blocks such as
+`10.0.0.0/8`, and `*`. The proxy URL must be `http://`, optionally with
+`user:password@`. Local model servers on `localhost`, `127.0.0.1`, `::1` or
+`0.0.0.0` are always reached directly.
+
+HTTPS is checked against bwn's bundled roots plus the operating system's
+certificate store, so a TLS-inspecting proxy whose root certificate IT
+installed works without extra steps. If the root is not in the OS store, set
+`SSL_CERT_FILE` to a PEM file holding it (or `SSL_CERT_DIR` to a directory
+of them); these replace the OS store, and the bundled roots still apply. An
+untrusted certificate fails at once with `UnknownIssuer` and names these
+settings.
+
+To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
+`BWN_TLS_ROOTS=bundled` (bundled roots only).
+
 ## Safety
 
 - Default permission is **ask** — every file write, edit, and command is

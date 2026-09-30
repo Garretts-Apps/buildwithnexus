@@ -532,10 +532,9 @@ impl HttpConn {
             url: url.to_string(),
             headers: headers.to_vec(),
             session_id: None,
-            agent: ureq::AgentBuilder::new()
-                .timeout(timeout)
-                .timeout_read(timeout)
-                .build(),
+            agent: crate::net::Client::new(|b| b.timeout(timeout).timeout_read(timeout))
+                .agent_for(url)
+                .clone(),
             next_id: 1,
         }
     }

@@ -6,7 +6,7 @@
 // paths, catastrophic commands, repeated tool loops, the HTTPS guard) get a
 // scenario each.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,7 +87,10 @@ fn serve_recording(script: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
 
 // Read one HTTP request, draining its body, and return the method and body.
 fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    read_request_from(&mut BufReader::new(stream.try_clone().unwrap()))
+}
+
+fn read_request_from(reader: &mut impl BufRead) -> (String, String) {
     let mut first = String::new();
     if reader.read_line(&mut first).is_err() {
         return (String::new(), String::new());
@@ -181,8 +184,33 @@ fn run(home: &Path, cwd: &Path, task: &str) -> Run {
 
 // Same harness, arbitrary argv — for `plan`, `brainstorm`, and flags.
 fn run_args(home: &Path, cwd: &Path, args: &[&str]) -> Run {
-    let out = Command::new(BIN)
+    run_env(home, cwd, args, &[])
+}
+
+// The proxy and CA variables of the machine running the tests never reach
+// the binary; a test that needs them passes its own in `env`.
+const NET_VARS: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "BWN_TLS_ROOTS",
+];
+
+fn run_env(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(cwd)
         .env("NEXUS_HOME", home)
         .env("NO_COLOR", "1")
@@ -1330,5 +1358,239 @@ fn headless_brainstorm_sends_attached_image() {
         r.stderr.contains("attached 1 image"),
         "stderr: {}",
         r.stderr
+    );
+}
+
+// ── corporate networks: a CONNECT proxy and a private CA ────────────────────
+// A throwaway CA, the PEM of its certificate, and a server config for a leaf
+// it signed for model.test and localhost — the shape of a TLS-inspecting
+// proxy whose root IT installed.
+fn private_ca() -> (String, Arc<rustls::ServerConfig>) {
+    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "bwn test inspection CA");
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca, ca_key);
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["model.test".into(), "localhost".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(vec![leaf.der().clone()], key)
+    .unwrap();
+    (ca_cert.pem(), Arc::new(server))
+}
+
+// `serve` over TLS. A client that rejects the certificate ends its
+// connection in the handshake, which consumes nothing from the script.
+fn serve_tls(script: Vec<String>, tls: Arc<rustls::ServerConfig>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(tcp) = stream else { continue };
+            let conn = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+            let mut reader = BufReader::new(rustls::StreamOwned::new(conn, tcp));
+            let (method, _) = read_request_from(&mut reader);
+            let body = match method.as_str() {
+                "" => continue,
+                "POST" => {
+                    served += 1;
+                    script
+                        .get(served - 1)
+                        .cloned()
+                        .unwrap_or_else(|| finish("auto"))
+                }
+                _ => r#"{"object":"list","data":[]}"#.to_string(),
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let tls = reader.get_mut();
+            let _ = tls.write_all(resp.as_bytes());
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        }
+    });
+    port
+}
+
+// An HTTP proxy that answers CONNECT and tunnels every request to 127.0.0.1
+// on `upstream`, whatever host it names, so a name that only the proxy can
+// resolve still reaches the mock. Returns its port and each request line.
+fn connect_proxy(upstream: u16) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(client) = stream else { continue };
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+            }
+            log.lock().unwrap().push(first.trim().to_string());
+            let mut client = client;
+            if !first.starts_with("CONNECT ") {
+                let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+                continue;
+            }
+            let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", upstream)) else {
+                continue;
+            };
+            let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+            let (mut c2, mut s2) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut c2, &mut s2);
+                let _ = s2.shutdown(std::net::Shutdown::Write);
+            });
+            let (mut server, mut client) = (server, client);
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut server, &mut client);
+                let _ = client.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    (port, seen)
+}
+
+fn write_custom_config(home: &Path, base_url: &str) {
+    let cfg = json!({
+        "provider": "custom", "model": "test-model", "permission": "auto",
+        "base_url": base_url,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+}
+
+#[test]
+fn https_proxy_tunnels_provider_traffic_through_connect() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (ca_pem, tls) = private_ca();
+    let ca = home.join("inspection-ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let (proxy, seen) = connect_proxy(serve_tls(vec![finish("via proxy")], tls));
+    // model.test resolves nowhere, so only the proxy can reach it.
+    write_custom_config(&home, "https://model.test/v1");
+
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "hi"],
+        &[
+            ("HTTPS_PROXY", &format!("http://127.0.0.1:{proxy}")),
+            ("SSL_CERT_FILE", ca.to_str().unwrap()),
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.find("finish").unwrap()["summary"], "via proxy");
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("CONNECT model.test:443 ")),
+        "proxy saw: {seen:?}"
+    );
+}
+
+#[test]
+fn private_ca_is_trusted_through_ssl_cert_file_only_unless_roots_are_bundled() {
+    let (ca_pem, tls) = private_ca();
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let ca = home.join("inspection-ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let args = ["--json", "run", "hi"];
+
+    // Without the CA: refused, at once, with the fix named.
+    write_custom_config(
+        &home,
+        &format!(
+            "https://localhost:{}/v1",
+            serve_tls(vec![], Arc::clone(&tls))
+        ),
+    );
+    let started = std::time::Instant::now();
+    let r = run_env(&home, &cwd, &args, &[]);
+    assert!(!r.success);
+    assert!(r.stderr.contains("UnknownIssuer"), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("SSL_CERT_FILE"), "stderr: {}", r.stderr);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a certificate error was retried: {:?}",
+        started.elapsed()
+    );
+
+    // BWN_TLS_ROOTS=bundled trusts only the built-in roots, as 0.14 did.
+    let port = serve_tls(vec![], Arc::clone(&tls));
+    write_custom_config(&home, &format!("https://localhost:{port}/v1"));
+    let r = run_env(
+        &home,
+        &cwd,
+        &args,
+        &[
+            ("SSL_CERT_FILE", ca.to_str().unwrap()),
+            ("BWN_TLS_ROOTS", "bundled"),
+        ],
+    );
+    assert!(!r.success);
+    assert!(r.stderr.contains("UnknownIssuer"), "stderr: {}", r.stderr);
+
+    // With SSL_CERT_FILE naming it: accepted.
+    let port = serve_tls(vec![finish("trusted")], tls);
+    write_custom_config(&home, &format!("https://localhost:{port}/v1"));
+    let r = run_env(
+        &home,
+        &cwd,
+        &args,
+        &[("SSL_CERT_FILE", ca.to_str().unwrap())],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.find("finish").unwrap()["summary"], "trusted");
+}
+
+#[test]
+fn loopback_model_endpoints_never_go_through_the_proxy() {
+    let (proxy, seen) = connect_proxy(9);
+    let proxy_url = format!("http://127.0.0.1:{proxy}");
+    let env = [
+        ("HTTPS_PROXY", proxy_url.as_str()),
+        ("HTTP_PROXY", proxy_url.as_str()),
+        ("ALL_PROXY", proxy_url.as_str()),
+    ];
+    for host in ["127.0.0.1", "localhost"] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![finish("direct")]);
+        let cfg = json!({
+            "provider": "llamacpp", "model": "local-model", "permission": "auto",
+            "base_url": format!("http://{host}:{port}/v1"),
+        });
+        std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+        let r = run_env(&home, &cwd, &["--json", "run", "hi"], &env);
+        assert!(r.success, "{host}: stderr: {}", r.stderr);
+        assert_eq!(r.find("finish").unwrap()["summary"], "direct");
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
     );
 }

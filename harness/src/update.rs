@@ -179,7 +179,8 @@ pub fn spawn_check(policy: &str) {
     }
     std::thread::spawn(move || {
         write_state(&[("lastCheck", serde_json::json!(now_secs()))]);
-        let Ok(resp) = ureq::get(&format!("https://registry.npmjs.org/{PKG}/latest"))
+        let Ok(resp) = crate::net::shared()
+            .get(&format!("https://registry.npmjs.org/{PKG}/latest"))
             .timeout(Duration::from_secs(10))
             .call()
         else {

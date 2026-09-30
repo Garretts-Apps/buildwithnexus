@@ -1768,11 +1768,7 @@ fn wait_for_url(input: &Value) -> Outcome {
     let deadline = started + Duration::from_secs(timeout);
 
     loop {
-        let last_error = match web_agent()
-            .get(url)
-            .set("User-Agent", "buildwithnexus/1.0")
-            .call()
-        {
+        let last_error = match web_get(url, Some("buildwithnexus/1.0")) {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.into_string().unwrap_or_default();
@@ -1800,7 +1796,11 @@ fn wait_for_url(input: &Value) -> Outcome {
                         .unwrap_or_default()
                 )
             }
-            Err(ureq::Error::Status(status, resp)) => {
+            Err(WebError::Blocked(why)) => return err(why),
+            Err(WebError::Http(e)) if matches!(*e, ureq::Error::Status(..)) => {
+                let ureq::Error::Status(status, resp) = *e else {
+                    unreachable!()
+                };
                 let body = resp.into_string().unwrap_or_default();
                 let status_ok = expect_status
                     .map(|expected| status == expected)
@@ -4675,7 +4675,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(why) = blocked_url(url) {
                 return err(why);
             }
-            match http_get_with_retry(web_agent().get(url)) {
+            match http_get_with_retry(url, None) {
                 Ok(resp) => match resp.into_string() {
                     Ok(body) => ok(truncate(body, MAX_OUT)),
                     Err(e) => err(format!("failed to read response body: {e}")),
@@ -4691,9 +4691,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let encoded = url_encode(query);
             let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
             match http_get_with_retry(
-                web_agent()
-                    .get(&search_url)
-                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+                &search_url,
+                Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
@@ -4724,11 +4723,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err(why);
             }
             let extract_links = input["extract_links"].as_bool().unwrap_or(false);
-            match http_get_with_retry(
-                web_agent()
-                    .get(url)
-                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
-            ) {
+            match http_get_with_retry(url, Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)")) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
                         // Extract <title>
@@ -5473,35 +5468,89 @@ impl ureq::Resolver for GuardedResolver {
     }
 }
 
-// The agent every fetch tool uses; redirects re-resolve through the guard.
-fn web_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().resolver(GuardedResolver).build())
+// The client every fetch tool uses. Redirects are followed by web_get, not
+// ureq, so each hop is checked again and takes its own route: through a
+// proxy only the proxy resolves names, and GuardedResolver never sees them.
+fn web_client() -> &'static crate::net::Client {
+    static CLIENT: OnceLock<crate::net::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| crate::net::Client::new(|b| b.resolver(GuardedResolver).redirects(0)))
 }
 
-fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::Error>> {
+enum WebError {
+    Blocked(String),
+    Http(Box<ureq::Error>),
+}
+
+impl std::fmt::Display for WebError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebError::Blocked(why) => f.write_str(why),
+            WebError::Http(e) => e.fmt(f),
+        }
+    }
+}
+
+const MAX_REDIRECTS: usize = 5;
+
+fn web_get(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
+    web_get_with(web_client(), url, user_agent)
+}
+
+fn web_get_with(
+    client: &crate::net::Client,
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<ureq::Response, WebError> {
+    let mut url = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        if let Some(why) = blocked_url(&url) {
+            return Err(WebError::Blocked(why));
+        }
+        let mut req = client.get(&url);
+        if let Some(ua) = user_agent {
+            req = req.set("User-Agent", ua);
+        }
+        let resp = req.call().map_err(|e| WebError::Http(Box::new(e)))?;
+        let next = matches!(resp.status(), 301 | 302 | 303 | 307 | 308)
+            .then(|| resp.header("location"))
+            .flatten()
+            .and_then(|to| url::Url::parse(&url).ok()?.join(to).ok());
+        match next {
+            Some(next) => url = next.to_string(),
+            None => return Ok(resp),
+        }
+    }
+    Err(WebError::Blocked(format!(
+        "stopped after {MAX_REDIRECTS} redirects at {url}"
+    )))
+}
+
+fn http_get_with_retry(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
     let mut attempts = 0;
     let max_attempts = 4;
     let mut delay_ms = 500;
 
     loop {
         attempts += 1;
-        let req_clone = req.clone();
-        match req_clone.call() {
+        match web_get(url, user_agent) {
             Ok(resp) => return Ok(resp),
-            Err(ureq::Error::Status(code, _resp))
-                if (code == 429 || (500..=504).contains(&code)) && attempts < max_attempts =>
+            Err(WebError::Http(e))
+                if matches!(*e, ureq::Error::Status(code, _)
+                    if code == 429 || (500..=504).contains(&code))
+                    && attempts < max_attempts =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;
                 continue;
             }
-            Err(ureq::Error::Transport(_)) if attempts < max_attempts => {
+            Err(WebError::Http(e))
+                if matches!(*e, ureq::Error::Transport(_)) && attempts < max_attempts =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;
                 continue;
             }
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -7603,6 +7652,49 @@ print("hello " + data.get("name", "world"))
         let r = run("find_paths", &json!({"pattern": "id_rsa"}), &d);
         assert!(!r.content.contains(".ssh"), "{}", r.content);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // Through a proxy the resolver guard never sees the target's name, so
+    // each redirect hop is checked before it is requested.
+    #[test]
+    fn a_redirect_through_the_proxy_to_metadata_is_refused() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                log.lock().unwrap().push(first.trim().to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let proxy = format!("http://127.0.0.1:{port}");
+        let client = crate::net::Client::with_lookup(
+            |k| (k == "HTTP_PROXY").then(|| proxy.clone()),
+            |b| b.resolver(GuardedResolver).redirects(0),
+        );
+        let Err(e) = web_get_with(&client, "http://docs.example/", None) else {
+            panic!("the redirect must not be followed");
+        };
+        assert!(e.to_string().contains("refusing"), "{e}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["GET http://docs.example/ HTTP/1.1"],
+            "only the first hop reaches the proxy"
+        );
     }
 
     #[test]
