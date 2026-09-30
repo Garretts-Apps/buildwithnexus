@@ -6,6 +6,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **0.14.10's notes overstated the npm name reservation.** The publish step
+  ran, but the NPM_TOKEN secret cannot create packages (npm answered E404), so
+  the five `buildwithnexus-<os>-<cpu>` names are still unregistered and the
+  deprecations were skipped. Deprecation no longer depends on the reserve
+  step.
+
 ## [0.14.10] - 2026-09-30
 
 Fixes for the security problems reproduced on 0.14.9, a first run that says

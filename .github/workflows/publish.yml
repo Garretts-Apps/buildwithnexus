@@ -206,10 +206,11 @@ jobs:
       # at the current version, which none of those pins match. The launcher
       # never uses these packages: it downloads the release binary. A name
       # that exists but is owned by someone else fails the run.
-      # npm OIDC cannot create a package, so creating one uses NPM_TOKEN, and
-      # without provenance (--provenance=false): asking for provenance on the
-      # token path is what made every earlier attempt fail with E404. Once
-      # all five exist this step needs no token and changes nothing.
+      # npm OIDC cannot create a package, so creating one uses NPM_TOKEN
+      # (without provenance, which needs OIDC). The token must be allowed to
+      # create packages: a PUT answered with E404 means it is not (0.14.10
+      # failed this way with --provenance=false too). Once all five exist
+      # this step needs no token and changes nothing.
       - name: Reserve the platform package names
         id: reserve
         env:
@@ -276,6 +277,9 @@ jobs:
       #  - 0.10.0-0.14.8: security fixes landed in 0.14.3 and 0.14.9.
       - name: Deprecate unsupported versions
         id: deprecate
+        # Independent of the reserve step, so a token that cannot create
+        # packages still deprecates.
+        if: ${{ !cancelled() && steps.npm-publish.outcome != 'failure' }}
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
