@@ -488,9 +488,9 @@ The npm package is a thin, inert wrapper — **no install scripts, no network
 code, no bundled sources**. The binary is not in the tarball: on first run the
 launcher fetches the release asset for your platform and verifies its SHA-256
 checksum; every asset carries a build-provenance attestation
-(`gh attestation verify`). Per-platform packages (`buildwithnexus-<os>-<cpu>`)
-are declared as `optionalDependencies` and are used automatically once
-published. Non-interactive environments opt in with `bwn --bootstrap` or
+(`gh attestation verify`). The `buildwithnexus-<os>-<cpu>` names on npm are
+empty placeholders, reserved so nobody else can publish under them; nothing is
+installed from them. Non-interactive environments opt in with `bwn --bootstrap` or
 `BWN_ALLOW_BOOTSTRAP=1`; or build from source and point `BWN_BIN` at the result.
 
 ## Platform support

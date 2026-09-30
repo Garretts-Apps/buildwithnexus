@@ -50,10 +50,16 @@ The native binary is not in the npm tarball. The launcher
 (`bin/buildwithnexus.js`) looks for it in this order: `BWN_BIN`, then a
 per-platform package (`buildwithnexus-<os>-<cpu>`) if one is installed, then
 a binary downloaded on an earlier run, then a local `cargo build` in a repo
-checkout. The per-platform packages are listed in the published
-`optionalDependencies` only for platforms whose package exists on npm for
-that version. A platform without a published package uses the first-run
-download below.
+checkout. No per-platform package carries a binary, so in practice the
+binary comes from the first-run download below.
+
+**Reserved platform package names.** Versions 0.12.1 to 0.14.2 listed
+`buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies` before any
+such package existed, so anyone could have registered the names and had their
+code installed with those versions. From 0.14.10 the publish workflow owns all
+five names as empty placeholders (no code, no `bin`), none at a version those
+pins match, and fails if any name is owned by someone else. Those versions are
+deprecated on npm.
 
 **First-run download.** If no binary is found, the launcher runs
 `scripts/bootstrap.js`, which downloads the release asset for your platform
