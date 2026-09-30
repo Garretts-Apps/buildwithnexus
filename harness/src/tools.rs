@@ -469,12 +469,15 @@ fn has_shell_metachars(cmd: &str) -> bool {
 }
 
 // Flags that turn a "read-only" binary into a writer or a program launcher.
-// Long flags match exactly or as `--flag=value`; single-letter flags also
+// Long flags match a getopt_long-style prefix (`--compress-prog` of
+// `--compress-program`), with or without `=value`; single-letter flags also
 // match inside a cluster (`sort -uo out`); longer single-dash flags (find's
 // predicates) match exactly.
 fn dangerous_flags_for(bin: &str) -> &'static [&'static str] {
     match bin {
-        "rg" => &["--pre", "--pre-glob"],
+        // `--pre`/`--hostname-bin` run a program; `--pre-glob` selects files
+        // for `--pre`.
+        "rg" => &["--pre", "--pre-glob", "--hostname-bin"],
         "sort" => &["-o", "--output", "--compress-program"],
         "find" => &[
             "-fprint", "-fprint0", "-fls", "-fprintf", "-exec", "-execdir", "-ok", "-okdir",
@@ -506,8 +509,16 @@ fn flag_matches(tok: &str, flag: &str) -> bool {
     if tok == flag {
         return true;
     }
-    if flag.starts_with("--") {
-        return tok.strip_prefix(flag).is_some_and(|r| r.starts_with('='));
+    if let Some(full) = flag.strip_prefix("--") {
+        // getopt_long accepts any unambiguous prefix of a long option, in both
+        // the `--opt=value` and separate-token `--opt value` forms, down to a
+        // single letter (`sort --o=out` is `--output`), so every non-empty
+        // prefix is the flag.
+        let Some(rest) = tok.strip_prefix("--") else {
+            return false;
+        };
+        let name = rest.split('=').next().unwrap_or(rest);
+        return !name.is_empty() && full.starts_with(name);
     }
     let letter = flag.strip_prefix('-').filter(|l| l.len() == 1);
     match letter {
@@ -540,27 +551,128 @@ fn command_words(cmd: &str) -> (String, Vec<&str>) {
     (base, words.collect())
 }
 
+// A program invoked by a path (`./cat`, `/tmp/evil/ls`, `.\cat.exe`,
+// `C:\x\ls.exe`) is not the allowlisted bare binary — a repo can ship its own
+// `./cat`. Such a program is never read-only and never matches a saved
+// approval for the bare name.
+fn is_path_qualified(program: &str) -> bool {
+    program.contains('/') || program.contains('\\')
+}
+
+fn command_program(cmd: &str) -> &str {
+    cmd.split_whitespace().next().unwrap_or("")
+}
+
+// The shell rewrites a program name that has quotes, patterns or (outside
+// Windows, where `\` separates paths) backslashes: `"sh"` and `s\h` run
+// `sh`, which the approval key and the git check would not see.
+fn program_is_literal(program: &str) -> bool {
+    !program.contains(['\'', '"', '*', '?', '[', '{']) && (cfg!(windows) || !program.contains('\\'))
+}
+
+// One word as the shell hands it to the program, quotes removed. `pattern`
+// is the byte offset of its first unquoted glob or brace character, from
+// which the shell may expand it into other words.
+struct ShellWord {
+    text: String,
+    pattern: Option<usize>,
+}
+
+// Split a command into words as `sh` does, removing quotes and backslashes,
+// so `"--pre"`, `'-o'` and `-\o` reach the flag checks as the program sees
+// them. None when the words cannot be known from the text: an unterminated
+// quote, `$'…'`/`$"…"` quoting, or a parameter expansion.
+fn shell_words(cmd: &str) -> Option<Vec<ShellWord>> {
+    // `$` followed by one of these expands (`$x`, `${x}`, `$(…)`, `$1`, `$@`).
+    let expands = |c: Option<&char>| {
+        c.is_some_and(|&c| c.is_ascii_alphanumeric() || "_{([@*#?$!-".contains(c))
+    };
+    let mut words = Vec::new();
+    let mut word: Option<ShellWord> = None;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' ' || c == '\t' {
+            words.extend(word.take());
+            continue;
+        }
+        let w = word.get_or_insert_with(|| ShellWord {
+            text: String::new(),
+            pattern: None,
+        });
+        match c {
+            '\'' => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    q => w.text.push(q),
+                }
+            },
+            '"' => loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' if matches!(chars.peek(), Some('$' | '`' | '"' | '\\')) => {
+                        w.text.push(chars.next()?);
+                    }
+                    '$' if expands(chars.peek()) => return None,
+                    q => w.text.push(q),
+                }
+            },
+            '\\' => w.text.push(chars.next().unwrap_or('\\')),
+            '$' if expands(chars.peek()) || matches!(chars.peek(), Some('\'' | '"')) => {
+                return None;
+            }
+            _ => {
+                if matches!(c, '*' | '?' | '[' | '{') {
+                    w.pattern.get_or_insert(w.text.len());
+                }
+                w.text.push(c);
+            }
+        }
+    }
+    words.extend(word);
+    Some(words)
+}
+
 /// True when a command uses a write/exec flag of its binary (`rg --pre`,
 /// `sort -o`, `find -exec`, `git -c`, `tree -o`, …) or `uniq`'s output
-/// operand.
+/// operand, judged on the words the program receives from the shell.
 pub fn has_dangerous_flags(cmd: &str) -> bool {
-    let (bin, args) = command_words(cmd);
-    let flags = dangerous_flags_for(&bin);
-    if args
-        .iter()
-        .take_while(|a| **a != "--")
-        .any(|a| flags.iter().any(|f| flag_matches(a, f)))
-    {
+    let (bin, _) = command_words(cmd);
+    let Some(words) = shell_words(cmd) else {
         return true;
+    };
+    let args = words.get(1..).unwrap_or_default();
+    let flags = dangerous_flags_for(&bin);
+    for a in args {
+        // `--` ends the options, except that find's expression follows it.
+        if a.text == "--" && bin != "find" {
+            break;
+        }
+        // A glob or brace word can expand into a flag (`sort *` beside a file
+        // named `-o`, `rg {--pre,./x}`) unless it starts with a literal
+        // character other than `-`.
+        let may_expand_to_flag = a
+            .pattern
+            .is_some_and(|at| at == 0 || a.text.starts_with('-'));
+        if (may_expand_to_flag && !flags.is_empty())
+            || flags.iter().any(|f| flag_matches(&a.text, f))
+        {
+            return true;
+        }
     }
-    // `uniq IN OUT` writes OUT.
-    bin == "uniq" && args.iter().filter(|a| !a.starts_with('-')).count() > 1
+    // `uniq IN OUT` writes OUT, and a glob or brace operand can supply both.
+    bin == "uniq"
+        && (args.iter().filter(|a| !a.text.starts_with('-')).count() > 1
+            || args.iter().any(|a| a.pattern.is_some()))
 }
 
 /// A single simple command with no shell metacharacters, control characters
-/// or dangerous flags: the only shape that may skip a permission prompt.
+/// or dangerous flags, running the program it names: the only shape that may
+/// skip a permission prompt.
 pub fn is_plain_command(cmd: &str) -> bool {
-    !has_shell_metachars(cmd.trim()) && !has_dangerous_flags(cmd.trim())
+    let cmd = cmd.trim();
+    !has_shell_metachars(cmd)
+        && program_is_literal(command_program(cmd))
+        && !has_dangerous_flags(cmd)
 }
 
 /// Whether a command that would skip the prompt (read-only or pre-approved)
@@ -738,12 +850,20 @@ pub fn approval_key(cmd: &str) -> String {
     if RUNS_ARBITRARY_CODE.contains(&bin.as_str()) {
         return cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     }
+    // Keep the path in the key for a path-qualified program, so an approval
+    // for `cat` never covers `./cat`.
+    let program = command_program(cmd);
+    let ident = if is_path_qualified(program) {
+        program.to_string()
+    } else {
+        bin.clone()
+    };
     if MULTI_VERB.contains(&bin.as_str()) {
         if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
-            return format!("{bin} {sub}");
+            return format!("{ident} {sub}");
         }
     }
-    bin
+    ident
 }
 
 // Commands that are unambiguously read-only (grep, find, cat, etc.) — allowed
@@ -751,6 +871,11 @@ pub fn approval_key(cmd: &str) -> String {
 pub fn is_readonly_command(cmd: &str) -> bool {
     let trimmed = cmd.trim();
     if !is_plain_command(trimmed) {
+        return false;
+    }
+    // A path-qualified program (`./cat`, `/tmp/evil/ls`) is not the
+    // allowlisted read-only binary, whatever its base name.
+    if is_path_qualified(command_program(trimmed)) {
         return false;
     }
     let lower = trimmed.to_lowercase();
@@ -7026,10 +7151,154 @@ print("hello " + data.get("name", "world"))
     #[test]
     fn approval_key_adds_the_subcommand_for_multi_verb_tools() {
         assert_eq!(approval_key("git status -s"), "git status");
-        assert_eq!(approval_key("/usr/bin/git --no-pager log"), "git log");
+        // A path-qualified program keeps its path so a bare `git` approval
+        // does not cover it.
+        assert_eq!(
+            approval_key("/usr/bin/git --no-pager log"),
+            "/usr/bin/git log"
+        );
         assert_eq!(approval_key("npm test"), "npm test");
         assert_eq!(approval_key("cargo"), "cargo");
         assert_eq!(approval_key("cat README.md"), "cat");
+    }
+
+    // Every read-only-classifier bypass we have ever fixed, in one place.
+    // A command here must never classify as read-only: is_readonly_command is
+    // the gate ReadOnly mode trusts, and each case would otherwise have run a
+    // program, written/deleted a file, or smuggled a mutating tail past the
+    // first token. EVERY FUTURE BYPASS FIX MUST ADD ITS CASE HERE.
+    #[test]
+    fn readonly_classifier_rejects_the_whole_bypass_corpus() {
+        let corpus = [
+            // rg preprocessor / hostname program.
+            "rg --pre ./x foo",
+            "rg --pre-glob '*.pdf' --pre ./x foo",
+            "rg --hostname-bin ./h foo",
+            // sort output operand, attached short-option forms, and the
+            // getopt_long-abbreviated `--compress-program`.
+            "sort -o out f",
+            "sort -oout f",
+            "sort -uoout f",
+            "sort --output=out f",
+            "sort --compress-program=./evil.sh file",
+            "sort --compress-prog=./evil.sh file",
+            "sort --comp=./evil.sh file",
+            // A one-letter getopt_long prefix is still the long option.
+            "sort --o=out f",
+            "sort --o out f",
+            // find actions that run a program or write/delete a file, also
+            // after `--`, which ends find's options but not its expression.
+            "find . -exec rm {} +",
+            "find . -execdir rm {} +",
+            "find . -ok rm {} ;",
+            "find . -delete",
+            "find . -fprint out",
+            "find -- . -delete",
+            // git global options that run programs or retarget the repo, and
+            // code-running config passed via -c.
+            "git -c core.pager=sh log",
+            "git -c core.fsmonitor=touch-pwned status",
+            "git --config-env=GIT_X=Y status",
+            "git --exec-path=/tmp status",
+            // Abbreviated writer flags after a read-only git subcommand.
+            "git log --outp=/tmp/x",
+            "git diff --ext-di",
+            // Case folding and Windows executable extension.
+            "RG --pre ./x foo",
+            "find.exe . -delete",
+            // Newline-separated second command, expansion, substitution.
+            "cat a\nrm -rf ~",
+            "cat $HOME/x",
+            "cat $(mktemp)",
+            "echo `rm x`",
+            // Shell composition, pipes, redirections, process substitution.
+            "cat x; rm -rf ~",
+            "ls && rm -rf /",
+            "grep foo f || rm f",
+            "cat f | sh",
+            "cat f > out",
+            "cat f >> out",
+            "sort <(ls)",
+            // The shell removes quotes and backslashes before the program
+            // sees a flag, and `$'…'` can spell any flag.
+            "rg \"--pre\" ./x foo",
+            "rg '--pre=./x' foo",
+            "rg --p're' ./x foo",
+            "sort '-o' out f",
+            "rg --pr\\e ./x foo",
+            "sort ''-o out f",
+            "find . \"-delete\"",
+            "git log \"--output=/tmp/x\"",
+            "rg $'--pre' ./x foo",
+            "sort $'\\x2do' out f",
+            // Brace and glob expansion into a flag (`*` beside a file named
+            // `-o`), or into uniq's output operand.
+            "rg {--pre,./x} foo",
+            "sort {-o,out} f",
+            "sort *",
+            "sort -? out f",
+            "uniq *.txt",
+            "uniq {a,b}",
+            // Path-qualified programs: a repo can ship its own `./cat`.
+            "./cat x",
+            "/tmp/evil/ls",
+            ".\\cat.exe x",
+            "C:\\evil\\ls.exe",
+        ];
+        for c in corpus {
+            assert!(
+                !is_readonly_command(c),
+                "bypass classified read-only: {c:?}"
+            );
+        }
+        // A bare-name approval must not cover a path-qualified invocation.
+        assert_ne!(approval_key("./cat x"), approval_key("cat x"));
+        assert_ne!(approval_key("/tmp/evil/ls"), approval_key("ls"));
+        // A program name the shell rewrites (`"sh"` runs sh) would dodge the
+        // per-command key for interpreters and the git config check, so such
+        // a command never reaches a saved approval.
+        let mut rewritten = vec![
+            "\"sh\" -c 'rm -rf ~'",
+            "'git' -c core.pager=sh log",
+            "s?rt -o out f",
+        ];
+        if !cfg!(windows) {
+            rewritten.push("s\\h -c 'rm -rf ~'");
+        }
+        for c in rewritten {
+            assert!(
+                !is_plain_command(c),
+                "rewritten program counted plain: {c:?}"
+            );
+        }
+    }
+
+    // Legitimate read-only commands must still skip the prompt, so the bypass
+    // fixes above do not regress normal use.
+    #[test]
+    fn readonly_classifier_still_allows_legitimate_commands() {
+        for c in [
+            "ls -la",
+            "cat README.md",
+            "rg -n foo src",
+            "git status",
+            "git log --oneline -5",
+            "git diff HEAD~1",
+            "find . -name '*.rs'",
+            "sort file",
+            "sort -u file",
+            "head -n 20 f",
+            "wc -l f",
+            "grep -rn x .",
+            // Quoting and globs the shell resolves without producing a flag.
+            "rg 'fn main$' src",
+            "rg -n \"two words\" src",
+            "rg foo src/*.rs",
+            "ls *.rs",
+            "git show HEAD@{1}",
+        ] {
+            assert!(is_readonly_command(c), "legit command not read-only: {c:?}");
+        }
     }
 
     #[test]
