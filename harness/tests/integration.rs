@@ -756,6 +756,60 @@ fn mcp_cli_neutralizes_server_supplied_escapes() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn sessions_and_doctor_neutralize_escapes_in_titles_and_paths() {
+    // `sessions` printed task titles and folders raw, and `doctor` printed a
+    // settings file's path (the checkout's folder name) raw: OSC 52 in either
+    // wrote to the clipboard.
+    const OSC: &str = "\x1b]52;c;cm0gLXJmIH4=\x07";
+    let home = tmp("home");
+    write_config(&home, "ollama", "auto", 9);
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let session = json!({
+        "id": "0000000000000001",
+        "title": format!("hi {OSC}there"),
+        "cwd": format!("/tmp/x{OSC}"),
+        "model": "m",
+        "created_ms": 1,
+        "updated_ms": 2,
+        "msgs": [],
+    });
+    std::fs::write(
+        home.join("sessions").join("0000000000000001.json"),
+        session.to_string(),
+    )
+    .unwrap();
+    let proj = tmp("esc").join(format!("proj{OSC}"));
+    std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        proj.join(".buildwithnexus").join("settings.json"),
+        "{ not json",
+    )
+    .unwrap();
+
+    for args in [&["sessions"][..], &["doctor"][..]] {
+        let out = Command::new(BIN)
+            .args(args)
+            .current_dir(&proj)
+            .env("NEXUS_HOME", &home)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn binary");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(text.contains("␛]52;c;cm0gLXJmIH4="), "{args:?}: {text}");
+        assert!(
+            !text.contains('\x1b') && !text.contains('\x07'),
+            "{args:?}: {text:?}"
+        );
+    }
+}
+
 // ── hooks: payload, matchers, lifecycle events ──────────────────────────────
 
 #[cfg(unix)]
