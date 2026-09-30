@@ -12,12 +12,23 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::provider::Msg;
 
+/// Layout version of a session file, saved as `schema_version` (see
+/// docs/VERSIONING.md). Files written before 0.15 have none and read as 1:
+/// the layout is the same.
+pub const SCHEMA_VERSION: u32 = 1;
+
+fn schema_v1() -> u32 {
+    1
+}
+
 /// Represents a persisted user conversation session.
 ///
 /// Sessions are stored as JSON files in `~/.buildwithnexus/sessions/<id>.json`
 /// and can be resumed across runs via `/resume` or `--continue`.
 #[derive(Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default = "schema_v1")]
+    pub schema_version: u32,
     pub id: String,
     pub title: String, // first user prompt, truncated
     pub cwd: String,
@@ -132,6 +143,7 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
     let _ = std::fs::create_dir_all(dir());
     let created = load(id).map(|s| s.created_ms).unwrap_or_else(now_ms);
     let s = Session {
+        schema_version: SCHEMA_VERSION,
         id: id.to_string(),
         title: title_of(msgs),
         cwd: cwd.to_string_lossy().into_owned(),
@@ -313,6 +325,48 @@ mod tests {
             "set_current owns the id"
         );
         assert!(path("0000000000000077").ends_with("sessions/0000000000000077.json"));
+    }
+
+    #[test]
+    fn saved_sessions_carry_the_schema_version() {
+        with_home(|| {
+            save(
+                "0000000000000005",
+                Path::new("/p"),
+                "m",
+                &[Msg::User("v".into())],
+            );
+            let text = std::fs::read_to_string(file("0000000000000005")).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["schema_version"], SCHEMA_VERSION);
+            assert_eq!(
+                load("0000000000000005").unwrap().schema_version,
+                SCHEMA_VERSION
+            );
+        });
+    }
+
+    #[test]
+    fn a_session_file_from_before_schema_version_still_loads() {
+        // As 0.14.10 wrote it: no schema_version.
+        with_home(|| {
+            let _ = std::fs::create_dir_all(dir());
+            std::fs::write(
+                file("0000000000000006"),
+                r#"{"id":"0000000000000006","title":"old task","cwd":"/p","model":"m","created_ms":1,"updated_ms":2,"msgs":[{"User":"old task"}]}"#,
+            )
+            .unwrap();
+            let s = load("0000000000000006").expect("an old session file loads");
+            assert_eq!(s.title, "old task");
+            assert_eq!(s.msgs.len(), 1);
+            assert_eq!(s.schema_version, 1, "no schema_version reads as version 1");
+            assert_eq!(list().len(), 1);
+            // Resuming and saving it again writes the current version.
+            save("0000000000000006", Path::new("/p"), "m", &s.msgs);
+            let s = load("0000000000000006").unwrap();
+            assert_eq!(s.schema_version, SCHEMA_VERSION);
+            assert_eq!(s.created_ms, 1, "the original creation time is kept");
+        });
     }
 
     #[test]

@@ -104,6 +104,9 @@ function startServer(state) {
         return send(201, {});
       }
       if (req.method === 'POST' && (m = p.match(/\/actions\/workflows\/([\w.-]+)\/dispatches$/))) {
+        // As GitHub answers for a workflow_dispatch that declares no inputs
+        // (publish.yml since 0.15 has none).
+        if (body.inputs) return send(422, { message: `Unexpected inputs provided: ${JSON.stringify(Object.keys(body.inputs))}` });
         state.dispatches.push({ workflow: m[1], ...body });
         return send(204);
       }
@@ -397,7 +400,7 @@ test('main-red dispatches ci.yml once when HEAD has no run, and ignores [skip ci
   assert.equal(state.dispatches.length, 1, 'not dispatched twice for one commit');
   assert.equal(state.issues.length, 1);
 
-  // publish.yml's manual bump commits "chore(release): vX [skip ci]": no run is expected.
+  // publish.yml's old manual bump committed "chore(release): vX [skip ci]": no run is expected.
   const skip = makeState({ ciRunsForHead: 0, head: { sha: SHA, date: iso(NOW - 3600), message: 'chore(release): v0.15.1 [skip ci]' } });
   r = await run(t, skip, ['--checks', 'main-red']);
   assert.match(r.stdout, /PASS\s+main-red\s+ci\.yml run 7 on aaaaaaa: success/);
@@ -434,13 +437,13 @@ test('after the sentinel dispatched release.yml, it dispatches publish.yml itsel
   assert.match(state.issues[0].body, /streak="0"/);
 
   // It succeeded 2 minutes ago. workflow_run never fires for a GITHUB_TOKEN
-  // dispatch, so the sentinel dispatches publish.yml at once, with no bump.
+  // dispatch, so the sentinel dispatches publish.yml at once, with no inputs.
   state.releaseRuns = [releaseOk({ event: 'workflow_dispatch', triggering_actor: BOT, updated_at: iso(NOW - 120) })];
   r = await run(t, state, ['--checks', 'release-gap']);
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /release\.yml succeeded, publish\.yml has not run/);
   assert.deepEqual(state.dispatches.map((d) => d.workflow), ['release.yml', 'publish.yml']);
-  assert.deepEqual(state.dispatches[1], { workflow: 'publish.yml', ref: 'main', inputs: { version_bump: 'none' } });
+  assert.deepEqual(state.dispatches[1], { workflow: 'publish.yml', ref: 'main' });
   assert.equal(state.issues.length, 1, 'the publish dispatch is recorded on the same issue');
   assert.match(state.issues[0].body, new RegExp(`dispatched="release\\.yml:${SHA}@\\S+ publish\\.yml:${SHA}@\\S+"`));
   assert.match(state.comments.at(-1).body, /Dispatched publish\.yml on main/);
@@ -469,7 +472,7 @@ test('a push release whose publish.yml never starts gets publish.yml dispatched 
   state = makeState({ releaseRuns: [releaseOk()] });
   r = await run(t, state, ['--checks', 'release-gap']);
   assert.match(r.stdout, /FAIL\s+release-gap\s+release-gap\/unpublished: v0\.15\.0 was released but publish\.yml never started/);
-  assert.deepEqual(state.dispatches, [{ workflow: 'publish.yml', ref: 'main', inputs: { version_bump: 'none' } }]);
+  assert.deepEqual(state.dispatches, [{ workflow: 'publish.yml', ref: 'main' }]);
 
   // A publish.yml run that chained normally and is running is fine.
   state = makeState({ releaseRuns: [releaseOk()], publishRuns: [{ status: 'in_progress', conclusion: null, event: 'workflow_run', created_at: iso(NOW - 39 * 60) }] });

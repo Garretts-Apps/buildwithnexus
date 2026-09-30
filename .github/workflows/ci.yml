@@ -154,6 +154,22 @@ jobs:
       - name: Check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
+      # package.json, both crates, Cargo.lock and (for a version with no tag
+      # yet, i.e. a release in the making) CHANGELOG.md must agree, or the
+      # binary is not "ready", the bwn crate resolves the wrong buildwithnexus,
+      # or the release ships without notes. Same tag lookup as release.yml's
+      # gate: a failed lookup fails the check instead of guessing.
+      - name: Check versions agree
+        run: |
+          V=$(node -p "require('./package.json').version")
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1 || rc=$?
+          case $rc in
+            0) node scripts/check-versions.js ;;
+            2) node scripts/check-versions.js --require-changelog ;;
+            *) echo "::error::could not list tags on origin (git ls-remote exit $rc)"; exit 1 ;;
+          esac
+
       # Arguments, plus what the launcher says when the binary cannot start
       # (old glibc, musl, EACCES, removed after install), against stub binaries.
       - name: Test launcher

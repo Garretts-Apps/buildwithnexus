@@ -255,6 +255,10 @@ whose API key is in the environment, and writes nothing.
 | 2 | usage error: unknown option, a flag missing its value, or `plan` with no terminal and no `--yes` |
 | 3 | the run finished but changes were blocked for lack of approval (`ask` with no terminal); nothing was applied |
 
+Each `--json` event has a `schema_version` (now `1`). What may change in a
+minor or a patch release (flags, settings keys, events, session files, exit
+codes) is in [docs/VERSIONING.md](./docs/VERSIONING.md).
+
 ```bash
 ANTHROPIC_API_KEY=... bwn run --permission-mode auto --json "fix the failing test"
 ```

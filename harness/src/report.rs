@@ -26,8 +26,20 @@ pub fn is_json() -> bool {
     mode() == Mode::Json
 }
 
+/// Version of the `--json` event schema, sent on every event as
+/// `schema_version`. It changes only for a change that can break a reader
+/// (docs/VERSIONING.md); new event types and new fields keep it.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+fn event_line(mut v: Value) -> String {
+    if let Value::Object(m) = &mut v {
+        m.insert("schema_version".into(), JSON_SCHEMA_VERSION.into());
+    }
+    v.to_string()
+}
+
 fn emit(v: Value) {
-    println!("{v}");
+    println!("{}", event_line(v));
 }
 
 pub fn assistant(text: &str) {
@@ -641,6 +653,19 @@ pub fn info(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_json_event_carries_the_schema_version() {
+        for ev in [
+            json!({"type": "assistant", "text": "hi"}),
+            json!({"type": "finish", "summary": "done"}),
+        ] {
+            let line: Value = serde_json::from_str(&event_line(ev.clone())).unwrap();
+            assert_eq!(line["schema_version"], JSON_SCHEMA_VERSION);
+            assert_eq!(line["type"], ev["type"]);
+        }
+        assert_eq!(JSON_SCHEMA_VERSION, 1);
+    }
 
     #[test]
     fn diff_preview_neutralizes_model_escapes() {

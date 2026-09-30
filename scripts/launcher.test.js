@@ -373,15 +373,59 @@ test('the glibc gate fails a binary that needs more than the floor', {
   assert.match(none.stdout, /::error::the-binary has no GLIBC_ symbol versions/);
 });
 
-test('package.json and both crates carry the same version', () => {
+test('package.json, both crates and Cargo.lock carry the same version', () => {
   // "Ready" needs the binary's --version to equal package.json's version, so
   // a bump that misses a file would fail every first run.
-  for (const toml of ['harness/Cargo.toml', 'bwn/Cargo.toml']) {
-    const text = fs.readFileSync(path.join(REPO, toml), 'utf8');
-    const section = text.split(/^\[/m).find((part) => part.startsWith('package]')) || '';
-    const version = (section.match(/^version\s*=\s*"([^"]+)"/m) || [])[1];
-    assert.equal(version, VERSION, `${toml} [package] version`);
+  const { version, problems } = require('./check-versions.js').check(REPO);
+  assert.equal(version, VERSION);
+  assert.deepEqual(problems, []);
+});
+
+test('docs/VERSIONING.md lists every --json event type and the schema version', () => {
+  const doc = fs.readFileSync(path.join(REPO, 'docs', 'VERSIONING.md'), 'utf8');
+  const report = fs.readFileSync(path.join(REPO, 'harness', 'src', 'report.rs'), 'utf8');
+  const types = [...new Set([...report.matchAll(/emit\(\s*json!\(\{"type": "(\w+)"/g)].map((m) => m[1]))];
+  assert.ok(types.length >= 10, types.join(','));
+  for (const ty of types) assert.match(doc, new RegExp(`^\\| \`${ty}\` \\|`, 'm'), ty);
+  const version = report.match(/pub const JSON_SCHEMA_VERSION: u32 = (\d+);/)[1];
+  assert.match(doc, new RegExp(`\`schema_version\`,\\s+now \`${version}\``));
+});
+
+test('the version gate names each file that disagrees', (t) => {
+  const { check } = require('./check-versions.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-versions-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const f of ['package.json', 'harness/Cargo.toml', 'bwn/Cargo.toml', 'Cargo.lock', 'CHANGELOG.md']) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.copyFileSync(path.join(REPO, f), path.join(dir, f));
   }
+  const edit = (f, from, to) => {
+    const p = path.join(dir, f);
+    const text = fs.readFileSync(p, 'utf8');
+    assert.ok(text.includes(from), `${f} has ${from}`);
+    fs.writeFileSync(p, text.replace(from, to));
+  };
+  assert.deepEqual(check(dir, { requireChangelog: true }).problems, []);
+
+  // A release bump that only touched package.json and harness/Cargo.toml.
+  edit('package.json', `"version": "${VERSION}"`, '"version": "9.8.7"');
+  edit('harness/Cargo.toml', `version = "${VERSION}"`, 'version = "9.8.7"');
+  const { problems } = check(dir, { requireChangelog: true });
+  const files = problems.map((p) => p.split(':')[0]);
+  assert.deepEqual(files, ['bwn/Cargo.toml', 'bwn/Cargo.toml', 'Cargo.lock', 'Cargo.lock', 'CHANGELOG.md'], problems.join('\n'));
+  assert.match(problems[1], /buildwithnexus dependency version is .*, package\.json is 9\.8\.7/);
+  assert.match(problems[4], /no "## \[9\.8\.7\]" section/);
+  // The CHANGELOG section is only required before the version is tagged.
+  assert.equal(check(dir).problems.length, 4);
+
+  // The CLI exits 1 and prints a GitHub annotation per file.
+  const r = spawnSync(process.execPath, [path.join(__dirname, 'check-versions.js'), '--require-changelog', dir], { encoding: 'utf8' });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.equal(r.stdout.match(/^::error::/gm).length, 5);
+  assert.match(r.stdout, /^::error::Cargo\.lock: bwn version is /m);
+
+  const ci = fs.readFileSync(path.join(REPO, '.github', 'workflows', 'ci.yml'), 'utf8');
+  assert.match(ci, /2\) node scripts\/check-versions\.js --require-changelog ;;/);
 });
 
 // ── post-install check (bootstrap.js) against stub binaries ─────────────────

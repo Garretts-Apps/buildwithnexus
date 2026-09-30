@@ -246,6 +246,20 @@ fn executes_tool_then_finishes() {
     assert_eq!(r.find("finish").unwrap()["summary"], "wrote the file");
     assert!(r.has_event("tool_call"));
     assert!(r.has_event("tool_result"));
+    // Every --json event and the saved session file carry the schema version
+    // docs/VERSIONING.md describes.
+    for e in &r.events {
+        assert_eq!(e["schema_version"], 1, "{e}");
+    }
+    let sessions: Vec<_> = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sessions[0]).unwrap()).unwrap();
+    assert_eq!(saved["schema_version"], 1);
 }
 
 #[test]
