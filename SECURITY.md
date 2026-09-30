@@ -20,6 +20,14 @@ We aim to acknowledge new reports within **3 business days** and to ship a fix
 or mitigation within **30 days** of acknowledgement, depending on severity. We
 will credit reporters in the advisory unless they ask to remain anonymous.
 
+## Past Disclosures
+
+- **Anthropic API key in git history.** Commit `4c158d1` (2026-03-16, shipped
+  around 0.6.11) added a `.env.local` holding an Anthropic API key. The key
+  was revoked; revocation confirmed 2026-09-30. The commit remains in the
+  public history, and the key in it no longer works. CI now scans every pull
+  request and push for committed secrets (gitleaks).
+
 ## Scope
 
 In scope:
