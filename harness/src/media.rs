@@ -708,10 +708,33 @@ mod tests {
         let base = format!("http://{}", l.local_addr().unwrap());
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = l.accept() {
-                s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
+                // The whole request, body included: closing with part of it
+                // unread resets the connection, and the probe sees no answer.
+                let mut req = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
                 let body = format!(
                     r#"{{"model_info":{{"llama.context_length":8192}},"capabilities":{capabilities}}}"#
                 );
