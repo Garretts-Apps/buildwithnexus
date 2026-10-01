@@ -265,7 +265,10 @@ jobs:
         id: npm-publish
         if: needs.pack.outputs.already == 'false'
         env:
-          TARBALL: dist/${{ needs.pack.outputs.tarball }}
+          # ./ makes it a file path: npm 12 reads a bare dist/x.tgz as GitHub
+          # shorthand (github:dist/x.tgz) and refuses it with EALLOWGIT,
+          # which failed the 0.15.0 publish.
+          TARBALL: ./dist/${{ needs.pack.outputs.tarball }}
         run: npm publish "$TARBALL" --access public --provenance
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
