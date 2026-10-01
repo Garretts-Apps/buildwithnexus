@@ -439,6 +439,52 @@ fn expand_header_env(value: &str, allowed: &[String]) -> String {
     out
 }
 
+// `$NAME` and `${NAME}` in a header value that `allowed_env_vars` does not
+// list, which are sent as written.
+fn unlisted_header_vars(value: &str, allowed: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        let name = match after.strip_prefix('{') {
+            Some(inner) => inner.find('}').map_or("", |end| &inner[..end]),
+            None => {
+                let n = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                &after[..n]
+            }
+        };
+        if !name.is_empty() && !allowed.iter().any(|a| a == name) && !out.iter().any(|o| o == name)
+        {
+            out.push(name.to_string());
+        }
+        rest = after;
+    }
+    out
+}
+
+// Says once per header and name that a variable goes out as written: a
+// `Bearer $TOKEN` that reaches the service as those characters fails with
+// no other clue.
+fn warn_unlisted_header_vars(header: &str, value: &str, allowed: &[String]) {
+    static WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    for name in unlisted_header_vars(value, allowed) {
+        let key = format!("{header}\0{name}");
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if warned.contains(&key) {
+            continue;
+        }
+        warned.push(key);
+        report::notice(&format!(
+            "  http hook header {}: ${} is not in the hook's allowed_env_vars, so it is sent as written — add \"allowed_env_vars\": [\"{}\"] to fill it in",
+            crate::tui::sanitize_terminal(header),
+            crate::tui::sanitize_terminal(&name),
+            crate::tui::sanitize_terminal(&name)
+        ));
+    }
+}
+
 // An `http` hook: its `url` (http or https) and any string `headers`, whose
 // values may name variables listed in `allowed_env_vars`.
 fn http_hook(h: &Value) -> Option<HookCmd> {
@@ -457,8 +503,10 @@ fn http_hook(h: &Value) -> Option<HookCmd> {
         .into_iter()
         .flatten()
         .filter_map(|(k, v)| {
-            v.as_str()
-                .map(|v| (k.clone(), expand_header_env(v, &allowed)))
+            v.as_str().map(|v| {
+                warn_unlisted_header_vars(k, v, &allowed);
+                (k.clone(), expand_header_env(v, &allowed))
+            })
         })
         .collect();
     Some(HookCmd::Http {
@@ -2976,6 +3024,17 @@ fn fire(event: &str, about: Option<(&str, &str)>, cwd: &Path, extra: Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_header_variable_not_listed_is_named() {
+        let allowed = vec!["LISTED".to_string()];
+        assert_eq!(
+            unlisted_header_vars("Bearer $HOOK_TOKEN ${OTHER} $LISTED $HOOK_TOKEN", &allowed),
+            vec!["HOOK_TOKEN".to_string(), "OTHER".to_string()]
+        );
+        assert!(unlisted_header_vars("Bearer $LISTED", &allowed).is_empty());
+        assert!(unlisted_header_vars("costs $ 5", &allowed).is_empty());
+    }
+
     use super::*;
 
     #[test]

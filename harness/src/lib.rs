@@ -4141,10 +4141,20 @@ fn remember_endpoints(
     endpoints
 }
 
+// The last swap's probe was answered by a server that does not list the
+// model: its success line must not say "validated".
+static SWAP_UNCONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The swap's success line names the model actually saved, which differs
 /// from the one asked for when a local server only answers as "local-model".
 fn swap_success_line(requested: &str, active: &str, provider_label: &str) -> String {
-    if requested == active || requested.is_empty() {
+    if SWAP_UNCONFIRMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // The server answered, but does not list the name: it may be
+        // running another model under it (unlisted_note said so).
+        format!(
+            "  ✓ active model hot-swapped → {active} on {provider_label} (answered; the server does not list it)"
+        )
+    } else if requested == active || requested.is_empty() {
         format!("  ✓ active model hot-swapped → {active} on {provider_label} (validated)")
     } else {
         format!(
@@ -4435,9 +4445,11 @@ fn probe_swap(
                 return Some(p);
             }
             Ok(None) => {
-                if let Some(note) = provider::unlisted_note(&p.model, &provider::served_names(&p)) {
+                let note = provider::unlisted_note(&p.model, &provider::served_names(&p));
+                if let Some(note) = &note {
                     tui::line(&tui::yellow(&format!("  ⚠ {note}")));
                 }
+                SWAP_UNCONFIRMED.store(note.is_some(), std::sync::atomic::Ordering::Relaxed);
                 return Some(p);
             }
             Err(e) => e,
