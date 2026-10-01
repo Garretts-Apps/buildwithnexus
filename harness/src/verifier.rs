@@ -137,10 +137,11 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Creates a new Verifier with default engineering rules.
+    /// Creates a new Verifier with the built-in engineering rules and the
+    /// user's overrides from NEXUS_HOME/rules.
     pub fn new(workdir: &str) -> Self {
         Self {
-            rule_engine: RuleEngine::load_defaults(),
+            rule_engine: RuleEngine::load_with_overrides(&crate::config::home().join("rules")).0,
             workdir: PathBuf::from(workdir),
         }
     }
@@ -158,9 +159,24 @@ impl Verifier {
         // 1. Build EvaluationContext for RuleEngine
         let tools_called: Vec<String> =
             ctx.tool_calls.iter().map(|c| c.tool_name.clone()).collect();
+        // Rules read path names inside the project, never the folders the
+        // project happens to live in.
+        let changed_files: Vec<String> = ctx
+            .changed_files
+            .iter()
+            .map(|f| {
+                std::path::Path::new(f)
+                    .strip_prefix(&self.workdir)
+                    .map(|r| r.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| f.clone())
+            })
+            .collect();
+        let custom_facts = crate::rules::checks_done_facts(
+            std::env::var(crate::rules::CHECKS_DONE_ENV).ok().as_deref(),
+        );
         let eval_ctx = EvaluationContext {
             task_type: ctx.task_type.clone(),
-            changed_files: ctx.changed_files.clone(),
+            changed_files,
             tools_called: tools_called.clone(),
             tests_added: ctx.tests_added.clone(),
             // An explicit check_work verdict counts as tests run; a shell
@@ -187,7 +203,7 @@ impl Verifier {
                 f.to_lowercase().contains("changelog") || f.to_lowercase().contains("release_notes")
             }),
             security_review_done: false,
-            custom_facts: Default::default(),
+            custom_facts,
         };
 
         // 2. Evaluate rules

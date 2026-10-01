@@ -279,23 +279,43 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}) },
     ];
     if include_subagent {
+        // The built-in roles, then every agent file (see config::load_agent_defs).
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let agents = crate::config::load_agent_defs(&cwd);
+        let mut roles: Vec<String> = crate::config::BUILTIN_ROLES
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        roles.extend(agents.iter().map(|a| a.name.clone()));
+        let listed: String = agents
+            .iter()
+            .map(|a| format!(" `{}`: {}.", a.name, a.description.trim_end_matches('.')))
+            .collect();
+        let roles_note = if listed.is_empty() {
+            String::new()
+        } else {
+            format!(" Roles besides engineer and researcher:{listed}")
+        };
         v.push(ToolDef {
             name: "task",
-            description:
-                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.",
+            description: crate::mcp::intern(&format!(
+                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.{roles_note}"
+            )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
                 "description":{"type":"string"},
-                "role":{"type":"string","enum":["engineer","researcher"]},
+                "role":{"type":"string","enum":roles},
                 "isolate":{"type":"boolean"}
             }}),
         });
         v.push(ToolDef {
             name: "spawn_subagent",
-            description: "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.",
+            description: crate::mcp::intern(&format!(
+                "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.{roles_note}"
+            )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
-                "role":{"type":"string","enum":["engineer","researcher"]},
+                "role":{"type":"string","enum":roles},
                 "isolate":{"type":"boolean"}
             },"required":["task"]}),
         });
@@ -4373,7 +4393,8 @@ fn apply_lenient(body: &str, hit: &LenientHit, new: &str) -> String {
     format!("{}{}{}", &body[..hit.start], replacement, &body[hit.end..])
 }
 
-// Small edit distance for "did you mean" suggestions on unknown tool names.
+// Small edit distance for "did you mean" suggestions on unknown tool names
+// (and unknown command-line options).
 pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();

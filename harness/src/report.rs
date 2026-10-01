@@ -42,6 +42,12 @@ fn emit(v: Value) {
     println!("{}", event_line(v));
 }
 
+/// A whole event built by the caller (`--json sessions`), with the schema
+/// version added like every other.
+pub fn event(v: Value) {
+    emit(v);
+}
+
 pub fn assistant(text: &str) {
     if text.trim().is_empty() {
         return;
@@ -598,6 +604,39 @@ pub fn tool_denied(reason: &str) {
     }
 }
 
+// Where an isolated helper's work went: a line on screen, and a
+// `subagent_result` event naming the branch to merge.
+pub fn subagent_result(task: &str, branch: Option<&str>, commits: usize, screen: &str) {
+    match mode() {
+        Mode::Human => tui::line(&tui::yellow(&format!(
+            "  ↳ {}",
+            tui::sanitize_terminal(screen)
+        ))),
+        Mode::Json => emit(json!({
+            "type": "subagent_result",
+            "task": task,
+            "branch": branch,
+            "commits": commits,
+            "merge": branch.map(|b| format!("git merge {b}")),
+            "message": screen,
+        })),
+    }
+}
+
+// One issue a review found (JSON mode; human mode already shows the
+// review's own text).
+pub fn finding(severity: &str, path: Option<&str>, line: Option<u64>, message: &str) {
+    if mode() == Mode::Json {
+        emit(json!({
+            "type": "finding",
+            "severity": severity,
+            "path": path,
+            "line": line,
+            "message": message,
+        }));
+    }
+}
+
 pub fn finish(summary: &str) {
     match mode() {
         Mode::Human => {
@@ -626,12 +665,101 @@ pub fn verify(status: &str, report: &Value) {
     }
 }
 
-// The last event of a headless --json run: how it ended and the exit code
-// the process is about to return.
+/// A tool call the gate or a hook refused during a BUILD turn: the headless
+/// outcome and the result event are built from these.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Denial {
+    pub tool: String,
+    /// The call as the transcript shows it (`write notes.txt`).
+    pub summary: String,
+    pub reason: String,
+    pub mutating: bool,
+}
+
+static DENIALS: Mutex<Vec<Denial>> = Mutex::new(Vec::new());
+// The result event lists at most this many; `denied` still counts all.
+const MAX_LISTED_DENIALS: usize = 20;
+
+/// Records a refusal next to its `tool_denied` trace event.
+pub fn note_denial(tool: &str, summary: &str, reason: &str, mutating: bool) {
+    if let Ok(mut d) = DENIALS.lock() {
+        d.push(Denial {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+            reason: reason.to_string(),
+            mutating,
+        });
+    }
+}
+
+pub fn denials() -> Vec<Denial> {
+    DENIALS.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+/// One line for the end of a headless run: `changes were denied: write
+/// notes.txt (policy: …)`.
+pub fn denials_line(d: &[Denial]) -> Option<String> {
+    let first = d.first()?;
+    let what = if d.iter().any(|x| x.mutating) {
+        "changes were denied"
+    } else {
+        "tool calls were denied"
+    };
+    let more = match d.len() {
+        1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    Some(format!(
+        "{what}: {} ({}){more}",
+        first.summary, first.reason
+    ))
+}
+
+// The last event of a headless --json run: how it ended, the exit code the
+// process is about to return, the session it saved to, what it used and
+// every refused call.
 pub fn result(outcome: &str, exit_code: i32) {
     if mode() == Mode::Json {
-        emit(json!({"type": "result", "outcome": outcome, "exit_code": exit_code}));
+        emit(result_event(
+            outcome,
+            exit_code,
+            crate::session::current(),
+            &crate::usage::snapshot(),
+            &denials(),
+        ));
     }
+}
+
+fn result_event(
+    outcome: &str,
+    exit_code: i32,
+    session_id: Option<String>,
+    usage: &crate::usage::Snapshot,
+    denials: &[Denial],
+) -> Value {
+    let listed: Vec<Value> = denials
+        .iter()
+        .take(MAX_LISTED_DENIALS)
+        .map(|d| json!({"tool": d.tool, "summary": d.summary, "reason": d.reason}))
+        .collect();
+    let mut ev = json!({
+        "type": "result",
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "session_id": session_id,
+        "turns": usage.requests,
+        "tokens_in": usage.totals.prompt_tokens(),
+        "tokens_out": usage.totals.output,
+        // Estimated from the price table; requests to a model with no price
+        // are counted in unpriced_requests, never guessed.
+        "cost_usd": (usage.cost_usd * 1e6).round() / 1e6,
+        "denied": denials.len(),
+        "denials": listed,
+    });
+    if usage.unpriced_requests > 0 {
+        ev["unpriced_requests"] = usage.unpriced_requests.into();
+    }
+    ev
 }
 
 pub fn error(msg: &str) {
@@ -673,6 +801,44 @@ mod tests {
             assert_eq!(line["type"], ev["type"]);
         }
         assert_eq!(JSON_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn result_event_carries_session_usage_and_denials() {
+        let mut usage = crate::usage::Snapshot {
+            requests: 3,
+            cost_usd: 0.012_345_678,
+            ..Default::default()
+        };
+        usage.totals.input = 900;
+        usage.totals.cache_read = 100;
+        usage.totals.output = 42;
+        let d = Denial {
+            tool: "write_file".into(),
+            summary: "write notes.txt".into(),
+            reason: "policy: no writes in CI".into(),
+            mutating: true,
+        };
+        let ev = result_event(
+            "approval_blocked",
+            3,
+            Some("0001".into()),
+            &usage,
+            std::slice::from_ref(&d),
+        );
+        assert_eq!(ev["session_id"], "0001");
+        assert_eq!(ev["turns"], 3);
+        assert_eq!(ev["tokens_in"], 1000);
+        assert_eq!(ev["tokens_out"], 42);
+        assert_eq!(ev["cost_usd"], 0.012346);
+        assert_eq!(ev["denied"], 1);
+        assert_eq!(ev["denials"][0]["summary"], "write notes.txt");
+        assert!(ev.get("unpriced_requests").is_none());
+        assert_eq!(
+            denials_line(&[d.clone(), d]).unwrap(),
+            "changes were denied: write notes.txt (policy: no writes in CI) and 1 more"
+        );
+        assert_eq!(denials_line(&[]), None);
     }
 
     #[test]

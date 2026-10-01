@@ -113,15 +113,22 @@ fn installed_via_npm(exe: &std::path::Path, home: &std::path::Path) -> bool {
 // One-line startup notice when a background update landed (or a newer version
 // was seen that this policy does not install). Consumes the notice so it
 // prints once.
-pub fn startup_notice(policy: &str) -> Option<String> {
-    let policy = effective_policy(policy);
-    let (notice, version) = pending_notice(policy, &read_state(), crate::VERSION)?;
+pub fn startup_notice(setting: &str) -> Option<String> {
+    let policy = effective_policy(setting);
+    let (notice, version) = pending_notice(setting, policy, &read_state(), crate::VERSION)?;
     write_state(&[("noticeShownFor", serde_json::json!(version))]);
     Some(notice)
 }
 
-// The notice for `state`, and the version it is about.
-fn pending_notice(policy: &str, st: &serde_json::Value, current: &str) -> Option<(String, String)> {
+// The notice for `state`, and the version it is about. `setting` is what
+// the user chose, `policy` what applies here; the step is always the one
+// command, and the notice never asks for a setting already chosen.
+fn pending_notice(
+    setting: &str,
+    policy: &str,
+    st: &serde_json::Value,
+    current: &str,
+) -> Option<(String, String)> {
     if policy == "off" {
         return None;
     }
@@ -138,16 +145,149 @@ fn pending_notice(policy: &str, st: &serde_json::Value, current: &str) -> Option
         return None;
     }
     let notice = match policy {
-        "notify" => format!(
-            "  ⬆ v{latest} is available — npm install -g {PKG}@latest (or set auto_update: \"install\")"
+        // Asked to install, but this copy cannot be updated in place.
+        "notify" if setting.starts_with("install") => format!(
+            "  ⬆ v{latest} is available — run buildwithnexus update \
+             (auto_update \"{setting}\" updates only copies installed with npm, and not with BWN_NO_AUTO_UPDATE=1)"
         ),
+        "notify" => format!("  ⬆ v{latest} is available — run buildwithnexus update"),
         // Installed in the background; its own notice follows.
         _ if installs(policy, latest, current) => return None,
         _ => format!(
-            "  ⬆ v{latest} is available — npm install -g {PKG}@{latest} (auto_update: \"install\" only installs patch releases)"
+            "  ⬆ v{latest} is available — {} releases are not installed automatically; \
+             run buildwithnexus update",
+            if major(latest) == major(current) {
+                "minor"
+            } else {
+                "major"
+            }
         ),
     };
     Some((notice, latest.to_string()))
+}
+
+fn major(v: &str) -> u64 {
+    v.split('.')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Where the latest version is looked up: BWN_UPDATE_REGISTRY, else npm's
+/// own `npm_config_registry` (a company mirror), else the public registry.
+fn registry() -> String {
+    ["BWN_UPDATE_REGISTRY", "npm_config_registry"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .find(|u| !u.is_empty())
+        .unwrap_or_else(|| "https://registry.npmjs.org".into())
+}
+
+fn fetch_latest() -> Result<String, String> {
+    let url = format!("{}/{PKG}/latest", registry());
+    let resp = crate::net::shared()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .call()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let body: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("{url}: not JSON ({e})"))?;
+    body["version"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{url}: no version in the reply"))
+}
+
+/// Exit code of `update --check` (and of `update` that could not install)
+/// when a newer release exists.
+pub const EXIT_BEHIND: i32 = 10;
+
+/// `buildwithnexus update [--check]`: look up the latest release; with
+/// --check only report (exit 0 when current, 10 when behind). Otherwise an
+/// npm install updates itself with `npm install -g`, and any other install
+/// gets the command that updates it (exit 10: still behind).
+pub fn cli(args: &[String]) -> i32 {
+    let check_only = match args {
+        [] => false,
+        [a] if a == "--check" => true,
+        _ => {
+            eprintln!("usage: buildwithnexus update [--check]");
+            return 2;
+        }
+    };
+    let current = crate::VERSION;
+    let latest = match fetch_latest() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("buildwithnexus update: could not look up the latest version — {e}");
+            return 1;
+        }
+    };
+    write_state(&[
+        ("latestSeen", serde_json::json!(latest)),
+        ("lastCheck", serde_json::json!(now_secs())),
+    ]);
+    let behind = newer(&latest, current);
+    if crate::report::is_json() {
+        crate::report::event(serde_json::json!({
+            "type": "update",
+            "current": current,
+            "latest": latest,
+            "behind": behind,
+        }));
+    } else {
+        println!("current  {current}");
+        println!("latest   {latest}");
+    }
+    if !behind {
+        if !crate::report::is_json() {
+            println!("up to date");
+        }
+        return 0;
+    }
+    if check_only {
+        if !crate::report::is_json() {
+            println!("run `buildwithnexus update` to install v{latest}");
+        }
+        return EXIT_BEHIND;
+    }
+    let npm_install = std::env::current_exe()
+        .map(|p| installed_via_npm(&p, &crate::config::home()))
+        .unwrap_or(false);
+    if !npm_install {
+        println!("this copy was not installed with npm; update it with:");
+        println!("  cargo install {PKG} --locked");
+        return EXIT_BEHIND;
+    }
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let target = format!("{PKG}@{latest}");
+    println!("running: {npm} install -g {target}");
+    match Command::new(npm)
+        .args(["install", "-g", &target, "--no-fund", "--no-audit"])
+        .stdin(Stdio::null())
+        .status()
+    {
+        Ok(s) if s.success() => {
+            write_state(&[("updatedTo", serde_json::json!(latest))]);
+            println!("updated to v{latest} — restart buildwithnexus to use it");
+            0
+        }
+        Ok(s) => {
+            eprintln!(
+                "buildwithnexus update: npm exited with {} — run it yourself: npm install -g {target}",
+                s.code().map_or("a signal".into(), |c| c.to_string())
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!(
+                "buildwithnexus update: could not start {npm} ({e}) — install Node.js, or run: npm install -g {target}"
+            );
+            1
+        }
+    }
 }
 
 // Whether `policy` installs `latest` over `current`: "install" only within
@@ -179,19 +319,10 @@ pub fn spawn_check(policy: &str) {
     }
     std::thread::spawn(move || {
         write_state(&[("lastCheck", serde_json::json!(now_secs()))]);
-        let Ok(resp) = crate::net::shared()
-            .get(&format!("https://registry.npmjs.org/{PKG}/latest"))
-            .timeout(Duration::from_secs(10))
-            .call()
-        else {
+        let Ok(latest) = fetch_latest() else {
             return;
         };
-        let Ok(body) = resp.into_json::<serde_json::Value>() else {
-            return;
-        };
-        let Some(latest) = body["version"].as_str() else {
-            return;
-        };
+        let latest = latest.as_str();
         write_state(&[("latestSeen", serde_json::json!(latest))]);
         if !installs(policy, latest, crate::VERSION) {
             return;
@@ -312,29 +443,55 @@ mod tests {
     #[test]
     fn a_new_minor_is_announced_with_its_command_under_install() {
         let seen = json!({"latestSeen": "0.16.0"});
-        let (text, v) = pending_notice("install", &seen, "0.15.1").unwrap();
+        let (text, v) = pending_notice("install", "install", &seen, "0.15.1").unwrap();
         assert_eq!(v, "0.16.0");
-        assert!(
-            text.contains("npm install -g buildwithnexus@0.16.0"),
-            "{text}"
+        assert_eq!(
+            text,
+            "  ⬆ v0.16.0 is available — minor releases are not installed automatically; run buildwithnexus update"
         );
+        let major = json!({"latestSeen": "1.0.0"});
+        assert!(pending_notice("install", "install", &major, "0.15.1")
+            .unwrap()
+            .0
+            .contains("major releases are not installed automatically"));
         // Shown once.
         let shown = json!({"latestSeen": "0.16.0", "noticeShownFor": "0.16.0"});
-        assert_eq!(pending_notice("install", &shown, "0.15.1"), None);
+        assert_eq!(pending_notice("install", "install", &shown, "0.15.1"), None);
         // A patch is installed in the background, so nothing to announce yet.
         let patch = json!({"latestSeen": "0.15.2"});
-        assert_eq!(pending_notice("install", &patch, "0.15.1"), None);
-        assert_eq!(pending_notice("install-any", &seen, "0.15.1"), None);
+        assert_eq!(pending_notice("install", "install", &patch, "0.15.1"), None);
+        assert_eq!(
+            pending_notice("install-any", "install-any", &seen, "0.15.1"),
+            None
+        );
         let done = json!({"latestSeen": "0.15.2", "updatedTo": "0.15.2"});
-        assert!(pending_notice("install", &done, "0.15.1")
+        assert!(pending_notice("install", "install", &done, "0.15.1")
             .unwrap()
             .0
             .contains("updated to v0.15.2"));
-        assert!(pending_notice("notify", &seen, "0.15.1")
+        assert_eq!(pending_notice("off", "off", &seen, "0.15.1"), None);
+    }
+
+    #[test]
+    fn the_notice_never_asks_for_the_setting_already_chosen() {
+        let seen = json!({"latestSeen": "0.16.0"});
+        let notify = pending_notice("notify", "notify", &seen, "0.15.1")
             .unwrap()
-            .0
-            .contains("@latest"));
-        assert_eq!(pending_notice("off", &seen, "0.15.1"), None);
+            .0;
+        assert_eq!(
+            notify,
+            "  ⬆ v0.16.0 is available — run buildwithnexus update"
+        );
+        // "install" capped to notify (a cargo install, or BWN_NO_AUTO_UPDATE):
+        // the step, and why nothing was installed — not "set install".
+        let capped = pending_notice("install", "notify", &seen, "0.15.1")
+            .unwrap()
+            .0;
+        assert!(capped.contains("run buildwithnexus update"), "{capped}");
+        assert!(!capped.contains("set auto_update"), "{capped}");
+        for text in [notify, capped] {
+            assert!(!text.contains("npm install"), "{text}");
+        }
     }
 
     #[test]

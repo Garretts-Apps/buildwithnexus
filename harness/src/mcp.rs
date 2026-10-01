@@ -55,6 +55,9 @@ pub struct ServerConfig {
     /// Off by default: the hint is the server's own claim, and a malicious
     /// or compromised server can mark a destructive tool read-only.
     pub trust_read_only_hints: bool,
+    /// `timeout_secs` was set for this server: a headless run waits for it
+    /// that long instead of HEADLESS_WAIT.
+    pub timeout_set: bool,
 }
 
 impl ServerConfig {
@@ -174,6 +177,7 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         timeout: Duration::from_secs(timeout),
         enabled,
         trust_read_only_hints,
+        timeout_set: !matches!(obj.get("timeout_secs"), None | Some(Value::Null)),
     })
 }
 
@@ -969,6 +973,63 @@ pub fn ensure_ready() -> bool {
     wait_ready(budget)
 }
 
+/// How long a headless run waits for a server that sets no `timeout_secs`
+/// before it starts without that server's tools.
+pub const HEADLESS_WAIT: Duration = Duration::from_secs(5);
+
+/// Discovery for a headless run: waits HEADLESS_WAIT (or the longest
+/// `timeout_secs` a server sets) and returns one notice per server still
+/// connecting, which the run goes on without.
+pub fn ensure_ready_headless() -> Vec<String> {
+    start_background();
+    let wait = server_states()
+        .into_iter()
+        .filter_map(|(_, s)| {
+            lock_state(&s).config.as_ref().map(|c| {
+                if c.timeout_set {
+                    c.timeout
+                } else {
+                    HEADLESS_WAIT
+                }
+            })
+        })
+        .max()
+        .unwrap_or(HEADLESS_WAIT);
+    if wait_ready(wait) {
+        return Vec::new();
+    }
+    server_states()
+        .into_iter()
+        .filter(|(_, s)| lock_state(s).status == Status::Connecting)
+        .map(|(name, _)| {
+            format!(
+                "mcp: {name} not ready after {}s — skipped (timeout_secs in settings)",
+                wait.as_secs()
+            )
+        })
+        .collect()
+}
+
+/// For a gate refusal of `mangled`: the tool says it is read-only, but its
+/// server's hints are not trusted, so here is the setting that would let it
+/// run without asking.
+pub fn untrusted_read_only_hint(mangled: &str) -> Option<String> {
+    for (server, state) in server_states() {
+        let st = lock_state(&state);
+        if let Some(t) = st.tools.iter().find(|t| t.mangled == mangled) {
+            let trusted = st.config.as_ref().is_some_and(|c| c.trust_read_only_hints);
+            return (t.read_only && !trusted).then(|| {
+                format!(
+                    "{server}/{} says it is read-only; set \"trust_read_only_hints\": true on \
+                     mcp_servers.{server} to let its read-only tools run without asking",
+                    t.name
+                )
+            });
+        }
+    }
+    None
+}
+
 /// Startup/disconnect messages queued by background threads, oldest first,
 /// as `(message, ok)`.
 pub fn drain_notices() -> Vec<(String, bool)> {
@@ -1299,6 +1360,38 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
     Ok((name.to_string(), Value::Object(entry)))
 }
 
+/// The end of the error `mcp add` gives for a name already configured.
+pub const EXISTS: &str = "already exists — use --force to replace it";
+
+// `--force` anywhere before the server's own command line, removed.
+fn take_force(args: &[String]) -> (bool, Vec<String>) {
+    let mut force = false;
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    let mut named = false;
+    while let Some(a) = it.next() {
+        if a == "--force" {
+            force = true;
+            continue;
+        }
+        out.push(a.clone());
+        if !named {
+            named = true;
+            continue;
+        }
+        match a.as_str() {
+            "--url" | "--header" | "-H" | "--env" | "-e" | "--timeout" => {
+                out.extend(it.next().cloned());
+            }
+            _ => {
+                out.extend(it.cloned());
+                break;
+            }
+        }
+    }
+    (force, out)
+}
+
 /// Runs one management command and returns the lines to print. `connect`
 /// makes `add`/`remove` reload the live session afterwards (the REPL); the
 /// CLI passes false so scripting never spawns servers.
@@ -1327,7 +1420,15 @@ fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
             Ok(lines)
         }
         "add" => {
-            let (name, entry) = parse_add(&args[1..])?;
+            let (force, add_args) = take_force(&args[1..]);
+            let (name, entry) = parse_add(&add_args)?;
+            let exists = std::fs::read_to_string(config::settings_path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|v| v["mcp_servers"].get(&name).is_some());
+            if exists && !force {
+                return Err(format!("{name} {EXISTS}"));
+            }
             config::update_settings_json(|obj| {
                 let servers = obj.entry("mcp_servers").or_insert_with(|| json!({}));
                 if !servers.is_object() {
@@ -1336,7 +1437,9 @@ fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
                 servers[&name] = entry.clone();
             })?;
             let mut lines = vec![format!(
-                "added MCP server '{name}' to {}",
+                "{} MCP server '{name}' {} {}",
+                if exists { "replaced" } else { "added" },
+                if exists { "in" } else { "to" },
                 config::settings_path().display()
             )];
             if connect {
@@ -1374,7 +1477,7 @@ fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
         "help" | "-h" | "--help" => Ok(vec![
             "mcp                       list servers (transport, status, tool count)".into(),
             "mcp <name>                list a server's tools".into(),
-            "mcp add <name> <command> [args...]".into(),
+            "mcp add [--force] <name> <command> [args...]".into(),
             "mcp add <name> --url <url> [--header K=V]... [--timeout <secs>]".into(),
             "mcp remove <name>".into(),
             "mcp reload                reconnect every server".into(),
@@ -2043,6 +2146,33 @@ mod tests {
     // ── management parsing ──────────────────────────────────────────────
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn force_is_taken_only_before_the_server_command() {
+        assert_eq!(
+            take_force(&s(&["--force", "fs", "npx", "x"])),
+            (true, s(&["fs", "npx", "x"]))
+        );
+        assert_eq!(
+            take_force(&s(&[
+                "h",
+                "--timeout",
+                "7",
+                "--force",
+                "--url",
+                "https://h"
+            ])),
+            (true, s(&["h", "--timeout", "7", "--url", "https://h"]))
+        );
+        // After the command it is the server's own argument.
+        assert_eq!(
+            take_force(&s(&["fs", "srv", "--force"])),
+            (false, s(&["fs", "srv", "--force"]))
+        );
+        let set = parse_server("x", &json!({"command": "c", "timeout_secs": 9})).unwrap();
+        let unset = parse_server("x", &json!({"command": "c"})).unwrap();
+        assert!(set.timeout_set && !unset.timeout_set);
     }
 
     #[test]

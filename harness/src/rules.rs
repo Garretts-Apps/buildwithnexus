@@ -317,15 +317,11 @@ impl RuleEngine {
                     }
                 }
                 Condition::ChangeTouches(keyword) => {
-                    let kw = keyword.to_lowercase();
                     if ctx
                         .changed_files
                         .iter()
-                        .any(|f| f.to_lowercase().contains(&kw))
-                        || ctx
-                            .tools_called
-                            .iter()
-                            .any(|t| t.to_lowercase().contains(&kw))
+                        .chain(&ctx.tools_called)
+                        .any(|f| name_touches(f, keyword))
                     {
                         applies = true;
                     }
@@ -381,7 +377,9 @@ impl RuleEngine {
                         })
                 }
                 "rollback_plan" | "backup_plan" => ctx.has_rollback_plan,
-                "security_review" | "secret_scan" => ctx.security_review_done,
+                "security_review" | "secret_scan" => {
+                    ctx.security_review_done || fact_true(&ctx.custom_facts, req)
+                }
                 "license_check"
                 | "vulnerability_check"
                 | "maintenance_check"
@@ -417,14 +415,65 @@ impl RuleEngine {
                     "Changed files: {:?}, Tools called: {:?}",
                     ctx.changed_files, ctx.tools_called
                 )),
-                suggested_action: Some(format!(
-                    "Satisfy requirements: {}",
-                    missing_reqs.join(", ")
-                )),
+                suggested_action: Some(how_to_clear(&rule.id, &missing_reqs)),
             })
         } else {
             None
         }
+    }
+
+    /// The built-in rules with the user's overrides from `dir` (normally
+    /// NEXUS_HOME/rules) applied, plus one (file name, error) per file that
+    /// could not be used. The checkout cannot turn a rule off: the agent may
+    /// write there, so a rule it fails could not be trusted to stay on.
+    pub fn load_with_overrides(dir: &std::path::Path) -> (Self, Vec<(String, String)>) {
+        let mut engine = Self::load_defaults();
+        let mut failures = Vec::new();
+        let Ok(rd) = fs::read_dir(dir) else {
+            return (engine, failures);
+        };
+        let mut paths: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Err(e) = engine.apply_overrides_file(&path) {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                failures.push((name, e));
+            }
+        }
+        (engine, failures)
+    }
+
+    /// Applies `{"rules": [...]}` from `path`: an entry whose id names a
+    /// loaded rule changes only the fields it gives (`{"id": …, "enabled":
+    /// false}` turns it off); any other entry must be a whole rule and is
+    /// added.
+    pub fn apply_overrides_file(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let entries = v["rules"].as_array().ok_or("expected {\"rules\": [...]}")?;
+        for entry in entries {
+            let id = entry["id"].as_str().ok_or("a rule without an id")?;
+            match self.rules.iter_mut().find(|r| r.id == id) {
+                Some(rule) => {
+                    let mut merged = serde_json::to_value(&*rule).map_err(|e| e.to_string())?;
+                    for (k, val) in entry.as_object().into_iter().flatten() {
+                        merged[k] = val.clone();
+                    }
+                    *rule = serde_json::from_value(merged).map_err(|e| format!("{id}: {e}"))?;
+                }
+                None => self.add_rule(
+                    serde_json::from_value(entry.clone()).map_err(|e| format!("{id}: {e}"))?,
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Returns true if any High or Critical violations exist in the context.
@@ -460,6 +509,101 @@ impl RuleEngine {
     }
 }
 
+/// Environment variable naming required checks that were done outside the
+/// run (`BWN_CHECKS_DONE=security_review`), for a pipeline whose own review
+/// step covers them.
+pub const CHECKS_DONE_ENV: &str = "BWN_CHECKS_DONE";
+
+/// The checks `BWN_CHECKS_DONE` names, as facts for `EvaluationContext`.
+pub fn checks_done_facts(raw: Option<&str>) -> HashMap<String, Value> {
+    raw.unwrap_or("")
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| (c.to_string(), Value::Bool(true)))
+        .collect()
+}
+
+fn fact_true(facts: &HashMap<String, Value>, key: &str) -> bool {
+    facts.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+// How a person clears a violation: record the checks as done for the run,
+// or turn the rule off in their own rules folder.
+fn how_to_clear(rule_id: &str, missing: &[String]) -> String {
+    let dir = crate::config::home().join("rules");
+    format!(
+        "If {} {} done, set {CHECKS_DONE_ENV}={} for the run; to turn this rule off, \
+         put {{\"rules\": [{{\"id\": \"{rule_id}\", \"enabled\": false}}]}} in a .json file in {}",
+        missing.join(", "),
+        if missing.len() == 1 { "was" } else { "were" },
+        missing.join(","),
+        dir.display()
+    )
+}
+
+// Words of a path or tool name: split at separators, dots, dashes,
+// underscores and camelCase humps, lower-cased (`src/OAuthClient.ts` →
+// src, o, auth, client, ts).
+fn name_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        let hump = c.is_uppercase()
+            && !cur.is_empty()
+            && (chars[i - 1].is_lowercase() || chars.get(i + 1).is_some_and(|n| n.is_lowercase()));
+        if hump {
+            words.push(std::mem::take(&mut cur));
+        }
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+// Endings that keep a word about the same thing (`authn`, `loggers`);
+// `author` and `authors` are not among them.
+const SAME_THING_ENDINGS: &[&str] = &["", "s", "n", "z", "ed", "er", "ers", "ing"];
+
+// Starts of endings whose every form is the same thing: authenticate,
+// authorize and authorise, however conjugated (`authorising`,
+// `authenticates`, `authorizations`).
+const SAME_THING_STEMS: &[&str] = &["entic", "oriz", "oris"];
+
+fn word_is(word: &str, kw: &str) -> bool {
+    let word = word.trim_end_matches(|c: char| c.is_ascii_digit());
+    word.strip_prefix(kw)
+        .is_some_and(|rest| {
+            SAME_THING_ENDINGS.contains(&rest) || SAME_THING_STEMS.iter().any(|s| rest.starts_with(s))
+        })
+        // A compound ending in the keyword: `oauth`, `basicauth`.
+        || (word.len() > kw.len() && word.ends_with(kw))
+}
+
+/// Does a changed path (or tool name) name `keyword`? Matched by whole words
+/// of the name, so `AUTHORS.md` is not auth code and `logging/` is not a
+/// login; a keyword of several words (`public_api`) needs them in order.
+pub fn name_touches(name: &str, keyword: &str) -> bool {
+    let kw = name_words(keyword);
+    let words = name_words(name);
+    if kw.is_empty() || words.len() < kw.len() {
+        return false;
+    }
+    if let [k] = kw.as_slice() {
+        return words.iter().any(|w| word_is(w, k));
+    }
+    words.windows(kw.len()).any(|w| w == kw.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +623,102 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.rule_id == "bug_fix_requires_regression_test"));
+    }
+
+    #[test]
+    fn change_touches_matches_path_names_not_substrings() {
+        for p in [
+            "AUTHORS.md",
+            "docs/author.py",
+            "src/logging/setup.py",
+            "authority.txt",
+        ] {
+            assert!(!name_touches(p, "auth"), "{p}");
+        }
+        for p in [
+            "src/auth/login.py",
+            "auth.py",
+            "lib/oauth_client.py",
+            "src/OAuthClient.ts",
+            "middleware/authn.go",
+            "app/authorization.rb",
+            "oauth2/provider.py",
+        ] {
+            assert!(name_touches(p, "auth"), "{p}");
+        }
+        // Every spelling and form of authenticate and authorize still counts,
+        // as it did when any substring did.
+        for p in [
+            "src/authorisation.py",
+            "lib/authorise.rb",
+            "auth/authenticating.go",
+            "src/authorizing_middleware.ts",
+            "policies/Authorizes.java",
+            "app/authentications.py",
+            "app/authorisers.py",
+        ] {
+            assert!(name_touches(p, "auth"), "{p}");
+        }
+        assert!(!name_touches("docs/authorship.md", "auth"));
+        assert!(!name_touches("src/authoritative_dns.rs", "auth"));
+        assert!(name_touches("src/logging/setup.py", "logging"));
+        assert!(name_touches("api/public_api.rs", "public_api"));
+        assert!(!name_touches("api/public.rs", "public_api"));
+        assert!(!name_touches("republic/api.rs", "public_api"));
+    }
+
+    #[test]
+    fn an_authors_edit_does_not_trip_the_auth_rule_and_auth_code_does() {
+        let engine = RuleEngine::load_defaults();
+        let ctx = |f: &str| EvaluationContext {
+            changed_files: vec![f.to_string()],
+            ..Default::default()
+        };
+        let fired = |f: &str| {
+            engine
+                .evaluate(&ctx(f))
+                .into_iter()
+                .find(|v| v.rule_id == "auth_change_requires_security_review")
+        };
+        assert!(fired("AUTHORS.md").is_none());
+        let v = fired("src/auth/login.py").expect("auth rule");
+        let act = v.suggested_action.unwrap();
+        assert!(act.contains("BWN_CHECKS_DONE=security_review"), "{act}");
+        assert!(act.contains("\"enabled\": false"), "{act}");
+        // Recorded as done for the run: the rule is satisfied.
+        let done = EvaluationContext {
+            changed_files: vec!["src/auth/login.py".into()],
+            custom_facts: checks_done_facts(Some("security_review, changelog_entry")),
+            ..Default::default()
+        };
+        assert!(!engine
+            .evaluate(&done)
+            .iter()
+            .any(|v| v.rule_id == "auth_change_requires_security_review"));
+    }
+
+    #[test]
+    fn user_overrides_turn_a_rule_off() {
+        let dir = std::env::temp_dir().join(format!("bwn-rules-ovr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("off.json"),
+            r#"{"rules": [{"id": "auth_change_requires_security_review", "enabled": false}]}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("broken.json"), "{").unwrap();
+        let (engine, failures) = RuleEngine::load_with_overrides(&dir);
+        let auth = engine
+            .rules
+            .iter()
+            .find(|r| r.id == "auth_change_requires_security_review")
+            .unwrap();
+        assert!(!auth.enabled);
+        assert_eq!(auth.severity, Severity::High, "untouched fields stay");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "broken.json");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

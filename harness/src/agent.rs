@@ -2753,17 +2753,25 @@ fn build_turn(
         Ok(_) => task.to_string(),
     };
     let task_for_recovery = recovery_task_text(&task);
+    let custom = active_agent(depth);
     let defs = if matches!(perm, Permission::ReadOnly) {
         tools::defs_readonly()
     } else {
         tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
+    };
+    let defs = match &custom {
+        Some(a) => agent_defs_only(defs, a),
+        None => defs,
     };
     open_turn(
         msgs,
         || {
             // Role identity and the current-mode contract come FIRST; the
             // environment/tool-manifest/skills/memory sections follow.
-            let mut sys = String::from(role(role_id).system);
+            let mut sys = match &custom {
+                Some(a) => agent_system(a),
+                None => String::from(role(role_id).system),
+            };
             if let Some(guidance) = artifact_guidance(&task_for_recovery) {
                 sys.push_str("\n\n");
                 sys.push_str(&guidance);
@@ -2775,6 +2783,11 @@ fn build_turn(
         &task,
         images,
     );
+    // Saved before the first request too, so a run killed mid-request
+    // still leaves its task on disk to resume.
+    if let Some(sid) = sid {
+        crate::session::save(sid, cwd, &p.model, msgs);
+    }
 
     // Track which files have been read this session so we can enforce read-before-write.
     let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
@@ -2799,6 +2812,9 @@ fn build_turn(
     let mut check_work_called = false;
     let mut check_work_passed: Option<bool> = None;
     let mut auto_check_rounds = 0usize;
+    // The first call in the last tool round that never ran (unknown tool,
+    // invalid or missing arguments): ending on text after one is not success.
+    let mut last_unrun: Option<String> = None;
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -2922,6 +2938,9 @@ fn build_turn(
                     continue;
                 }
                 report::notice("  ⚠ model returned no output");
+                if depth == 0 && (!any_tool_ran || last_unrun.is_some()) {
+                    stopped_short(Outcome::Failed);
+                }
                 return Ok(reply.text);
             }
             // Imperative task answered with how-to prose instead of tool
@@ -3046,6 +3065,12 @@ fn build_turn(
                 text: reply.text.clone(),
                 calls: vec![],
             });
+            if depth == 0 {
+                if let Some(note) = unrun_call_note(last_unrun.as_deref(), &reply.text) {
+                    report::notice(&note);
+                    stopped_short(Outcome::Failed);
+                }
+            }
             return Ok(reply.text);
         }
 
@@ -3054,9 +3079,11 @@ fn build_turn(
         let mut loop_nudge: Option<String> = None;
         let mut loop_stop: Option<String> = None;
         let mut artifact_recovery: Option<String> = None;
+        let mut round_unrun: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
                 let msg = invalid_args_feedback(&call.name, raw, &defs);
+                round_unrun.get_or_insert_with(|| format!("{} (invalid arguments)", call.name));
                 report::tool_denied(&msg);
                 note_loop_result(
                     &mut loop_guard,
@@ -3111,7 +3138,23 @@ fn build_turn(
                 continue;
             }
 
-            let reason = hook_gate(perm, &call.name, &call_input, cwd);
+            let reviewing = REVIEWING.load(Ordering::Relaxed);
+            // Outside an agent file's tools is a slip of the helper's, like
+            // an edit during a review: refused, but not a blocked change.
+            let off_surface = agent_tool_refusal(custom.as_ref(), &call.name);
+            let counted = off_surface.is_none() && !reviewing;
+            let reason = off_surface.or_else(|| hook_gate(perm, &call.name, &call_input, cwd));
+            let reason = reason.map(|r| {
+                let r = if reviewing {
+                    phase_readonly_reason(r, REVIEW_READONLY)
+                } else {
+                    r
+                };
+                match crate::mcp::untrusted_read_only_hint(&call.name) {
+                    Some(hint) => format!("{r} — {hint}"),
+                    None => r,
+                }
+            });
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
@@ -3119,6 +3162,16 @@ fn build_turn(
                     format!("{} denied", call.name),
                     serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "build", "depth": depth}),
                 );
+                // A review asked for findings, not changes: a refused edit
+                // there is the model's slip, not a failed run.
+                if counted {
+                    report::note_denial(
+                        &call.name,
+                        &tools::preview(&call.name, &call_input),
+                        &reason,
+                        tools::is_mutating_call(&call.name, &call_input),
+                    );
+                }
                 note_loop_result(
                     &mut loop_guard,
                     &call.name,
@@ -3203,6 +3256,12 @@ fn build_turn(
             hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
             if out.is_error {
                 hooks::notify("OnError", cwd);
+                if call_could_not_run(&call.name, &call_input, &defs) {
+                    round_unrun.get_or_insert_with(|| {
+                        let why = out.content.lines().next().unwrap_or("").trim();
+                        format!("{} ({})", call.name, trace::preview(why, 100))
+                    });
+                }
             }
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
@@ -3278,6 +3337,7 @@ fn build_turn(
             calls: reply.calls,
         });
         msgs.push(Msg::Tool(results));
+        last_unrun = round_unrun;
         // Persist the transcript after every tool round so a crash or kill
         // doesn't lose the session (save is cheap and swallows I/O errors).
         if let Some(sid) = sid {
@@ -3312,10 +3372,21 @@ fn build_turn(
                 report::tool_call("check_work", &tools::preview("check_work", &input), &input);
                 trace_tool_call("check_work", &input, "build", depth);
                 // The project's scripts run like any model call: hook, then gate.
-                // A denial skips the round and is noted in the tool record.
+                // A denial skips the round and is noted in the tool record. The
+                // round is the harness's own step, so a refusal for want of a
+                // terminal is not one of the run's blocked changes.
+                let blocked_before = BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed);
                 let out = match hook_gate(perm, "check_work", &input, cwd) {
                     Some(reason) => {
+                        let no_terminal =
+                            BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed) > blocked_before;
+                        BLOCKED_WITHOUT_TERMINAL.store(blocked_before, Ordering::Relaxed);
                         report::tool_denied(&reason);
+                        report::notice(&if no_terminal {
+                            "  checks were not run (no terminal to approve them)".to_string()
+                        } else {
+                            format!("  checks were not run ({reason})")
+                        });
                         trace_tool_result("check_work", &reason, true, "build", depth);
                         None
                     }
@@ -3526,6 +3597,206 @@ fn invalid_args_feedback(name: &str, raw: &str, defs: &[tools::ToolDef]) -> Stri
     )
 }
 
+// A call that never ran: a tool this turn does not offer, or one missing an
+// argument its schema requires.
+fn call_could_not_run(name: &str, input: &serde_json::Value, defs: &[tools::ToolDef]) -> bool {
+    let Some(def) = defs.iter().find(|d| d.name == name) else {
+        return true;
+    };
+    def.schema["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|k| k.as_str())
+        .any(|k| {
+            input
+                .get(k)
+                .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()))
+        })
+}
+
+// A reply that opens with a tool call in JSON (`{"name": …, "arguments": …}`)
+// that was not recognised, so nothing ran.
+fn unparsed_tool_call(text: &str) -> Option<String> {
+    let t = text.trim_start();
+    if !t.starts_with('{') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::Deserializer::from_str(t)
+        .into_iter()
+        .next()?
+        .ok()?;
+    let call = v.get("function").unwrap_or(&v);
+    let name = call.get("name")?.as_str()?;
+    (call.get("arguments").is_some() || call.get("parameters").is_some()).then(|| name.to_string())
+}
+
+// Why a turn that ends on text is not a success: the last tool round held a
+// call that never ran, or the text itself is a call nothing ran.
+fn unrun_call_note(last_unrun: Option<&str>, text: &str) -> Option<String> {
+    if let Some(call) = last_unrun {
+        return Some(format!(
+            "  ⚠ the model stopped after a call that could not run: {call}"
+        ));
+    }
+    unparsed_tool_call(text)
+        .map(|name| format!("  ⚠ the model answered with a {name} call that bwn could not run"))
+}
+
+#[cfg(test)]
+mod unrun_call_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn calls_that_never_ran_are_told_apart_from_failing_ones() {
+        let defs = tools::defs_for_context(true, 128_000);
+        assert!(call_could_not_run("open_document", &json!({}), &defs));
+        assert!(call_could_not_run(
+            "read_file",
+            &json!({"path": " "}),
+            &defs
+        ));
+        assert!(call_could_not_run(
+            "read_file",
+            &json!({"parameters": {}}),
+            &defs
+        ));
+        // Ran and failed (a missing file) is the model's to handle.
+        assert!(!call_could_not_run(
+            "read_file",
+            &json!({"path": "nope.txt"}),
+            &defs
+        ));
+    }
+
+    #[test]
+    fn a_text_reply_that_is_a_call_is_recognised() {
+        let call = r#"{"name": "open_document", "arguments": {"name": "a.txt"}}"#;
+        assert_eq!(unparsed_tool_call(call).as_deref(), Some("open_document"));
+        let wrapped = r#"{"type":"function","function":{"name":"x","parameters":{}}} then prose"#;
+        assert_eq!(unparsed_tool_call(wrapped).as_deref(), Some("x"));
+        assert_eq!(unparsed_tool_call(r#"{"name": "Ada"} is the author"#), None);
+        assert_eq!(unparsed_tool_call("The file says hello."), None);
+        assert!(
+            unrun_call_note(Some("read_file (path argument is required)"), "ok")
+                .unwrap()
+                .contains("read_file")
+        );
+    }
+}
+
+// ── review ───────────────────────────────────────────────────────────────────
+
+// Set while `run_review` runs, so every refusal says why edits are off.
+static REVIEWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const REVIEW_READONLY: &str =
+    "review is read-only: it reports findings and changes nothing (use BUILD to apply a fix)";
+
+/// A code review turn: read-only whatever the session permission is (in
+/// auto too), with the researcher role. Returns the model's final answer,
+/// which holds the findings.
+pub fn run_review(
+    p: &Provider,
+    task: &str,
+    cwd: &Path,
+    transcript: &mut Vec<Msg>,
+    sid: &str,
+) -> Result<String, String> {
+    crate::session::set_current(sid);
+    REVIEWING.store(true, Ordering::Relaxed);
+    let r = build_turn(
+        p,
+        Permission::ReadOnly,
+        "researcher",
+        task,
+        cwd,
+        0,
+        transcript,
+        Some(sid),
+        Vec::new(),
+    );
+    REVIEWING.store(false, Ordering::Relaxed);
+    hooks::notify("Stop", cwd);
+    crate::session::save(sid, cwd, &p.model, transcript);
+    r
+}
+
+// The agent file each running subagent depth was started from. Subagents
+// run one at a time, so a depth names exactly one.
+static ACTIVE_AGENTS: Mutex<Vec<Option<config::AgentDef>>> = Mutex::new(Vec::new());
+
+fn set_active_agent(depth: usize, def: Option<config::AgentDef>) {
+    let mut a = ACTIVE_AGENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if a.len() <= depth {
+        a.resize(depth + 1, None);
+    }
+    a[depth] = def;
+}
+
+fn active_agent(depth: usize) -> Option<config::AgentDef> {
+    if depth == 0 {
+        return None;
+    }
+    ACTIVE_AGENTS
+        .lock()
+        .ok()
+        .and_then(|a| a.get(depth).cloned().flatten())
+}
+
+// Handing work to another helper. Never on a `tools` list's surface: that
+// helper (an engineer, say) would have every tool, so the list would hold
+// nothing back.
+const DELEGATION_TOOLS: &[&str] = &["task", "spawn_subagent"];
+
+// Whether a helper with the `tools` list `allowed` may call `name`.
+fn agent_may_call(allowed: &[String], name: &str) -> bool {
+    name == "finish" || (allowed.iter().any(|t| t == name) && !DELEGATION_TOOLS.contains(&name))
+}
+
+// The tool surface of an agent file with a `tools` list: those tools and
+// finish, nothing else.
+fn agent_defs_only(defs: Vec<tools::ToolDef>, agent: &config::AgentDef) -> Vec<tools::ToolDef> {
+    match &agent.tools {
+        Some(allowed) => defs
+            .into_iter()
+            .filter(|d| agent_may_call(allowed, d.name))
+            .collect(),
+        None => defs,
+    }
+}
+
+// Refusal for a call outside an agent file's `tools` list.
+fn agent_tool_refusal(agent: Option<&config::AgentDef>, name: &str) -> Option<String> {
+    let agent = agent?;
+    let allowed = agent.tools.as_ref()?;
+    if agent_may_call(allowed, name) {
+        return None;
+    }
+    Some(if DELEGATION_TOOLS.contains(&name) {
+        format!(
+            "the {} helper has a tools list, so it cannot hand work on to another helper — finish and say what is left",
+            agent.name
+        )
+    } else {
+        format!(
+            "{name} is not one of the {} helper's tools ({}) — use those, or finish and say what is missing",
+            agent.name,
+            allowed.join(", ")
+        )
+    })
+}
+
+// An agent file's system prompt: who it is, its own instructions, and how
+// to end.
+fn agent_system(agent: &config::AgentDef) -> String {
+    format!(
+        "You are the `{}` helper: {}\n\n{}\n\nWork only on the task you are given. \
+         When it is complete, call the finish tool with a one-paragraph summary.",
+        agent.name, agent.description, agent.prompt
+    )
+}
+
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 // Returns the subagent's result and whether it failed — failures must reach
@@ -3550,18 +3821,43 @@ fn spawn_subagent(
     }
     let role = input["role"].as_str().unwrap_or("engineer");
     let isolate = input["isolate"].as_bool().unwrap_or(false);
+    // A role names a built-in prompt or an agent file (resolved from the
+    // session's folder, before any worktree).
+    let custom = if config::BUILTIN_ROLES.contains(&role) {
+        None
+    } else {
+        let agents = config::load_agent_defs(cwd);
+        match agents.iter().find(|a| a.name == role) {
+            Some(a) => Some(a.clone()),
+            None => {
+                let mut known: Vec<String> = config::BUILTIN_ROLES
+                    .iter()
+                    .map(|r| r.to_string())
+                    .collect();
+                known.extend(agents.into_iter().map(|a| a.name));
+                return (
+                    format!("unknown role '{role}' — use one of: {}", known.join(", ")),
+                    true,
+                );
+            }
+        }
+    };
 
     let (run_cwd, note, worktree) = if isolate {
         match make_worktree(cwd) {
-            Some(wt) => {
+            Ok(wt) => {
                 let n = format!("[isolated worktree: {}]\n", wt.path.display());
                 (wt.path.clone(), n, Some(wt))
             }
-            None => (
-                cwd.to_path_buf(),
-                "[worktree unavailable — ran in place]\n".into(),
-                None,
-            ),
+            Err(why) => {
+                // Said before the helper writes anything into the folder.
+                report::notice(&format!("  {why} — the helper will write in your folder"));
+                (
+                    cwd.to_path_buf(),
+                    format!("[worktree unavailable ({why}) — ran in place]\n"),
+                    None,
+                )
+            }
         }
     } else {
         (cwd.to_path_buf(), String::new(), None)
@@ -3580,13 +3876,19 @@ fn spawn_subagent(
         }),
     );
     let mut child: Vec<Msg> = Vec::new();
-    let (result, is_error) =
-        match build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child, None) {
-            Ok(r) => (r, false),
-            Err(e) => (format!("subagent error: {e}"), true),
-        };
+    set_active_agent(depth + 1, custom);
+    let outcome = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child, None);
+    set_active_agent(depth + 1, None);
+    let (result, is_error) = match outcome {
+        Ok(r) => (r, false),
+        Err(e) => (format!("subagent error: {e}"), true),
+    };
     let result = match &worktree {
-        Some(wt) => format!("{result}\n{}", finish_worktree(cwd, wt)),
+        Some(wt) => {
+            let done = finish_worktree(cwd, wt);
+            report::subagent_result(task, done.branch.as_deref(), done.commits, &done.screen);
+            format!("{result}\n{}", done.note)
+        }
         None => result,
     };
     hooks::notify_with(
@@ -3620,21 +3922,46 @@ struct Worktree {
     base: String,
 }
 
-fn make_worktree(cwd: &Path) -> Option<Worktree> {
+// A worktree on a new branch from HEAD, or why there cannot be one.
+fn make_worktree(cwd: &Path) -> Result<Worktree, String> {
     let id = SUB_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = cwd.join(format!(".bwn/worktrees/sub-{}-{id}", std::process::id()));
     let branch = format!("bwn-sub-{}-{id}", std::process::id());
-    let base = git_out(cwd, &["rev-parse", "HEAD"])?;
+    let base = git_out(cwd, &["rev-parse", "HEAD"])
+        .ok_or("not a git repository with commits, so the helper cannot be isolated")?;
     let out = Command::new("git")
         .current_dir(cwd)
         .args(["worktree", "add", "-b", &branch])
         .arg(&path)
         .arg(&base)
+        .stdin(std::process::Stdio::null())
         .output()
-        .ok()?;
-    out.status
-        .success()
-        .then_some(Worktree { path, branch, base })
+        .map_err(|e| format!("git could not start ({e})"))?;
+    if out.status.success() {
+        Ok(Worktree { path, branch, base })
+    } else {
+        let why = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "git could not make a worktree ({})",
+            why.lines().last().unwrap_or("").trim()
+        ))
+    }
+}
+
+/// Does git know who the user is (config, GIT_AUTHOR_*/GIT_COMMITTER_*,
+/// EMAIL)? Commits made for the user carry that identity when it does.
+pub(crate) fn git_identity_known(dir: &Path) -> bool {
+    git_out(dir, &["var", "GIT_AUTHOR_IDENT"]).is_some()
+        && git_out(dir, &["var", "GIT_COMMITTER_IDENT"]).is_some()
+}
+
+// What became of an isolated helper's worktree: the note the model gets,
+// the line the person sees, and the branch holding the work, if any.
+struct WorktreeDone {
+    note: String,
+    screen: String,
+    branch: Option<String>,
+    commits: usize,
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
@@ -3651,18 +3978,26 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
 
 // Close an isolated subagent's worktree without losing its work, and say
 // what became of it. Uncommitted edits are committed to the worktree's
-// branch first; if that fails the worktree stays where it is. A branch with
-// no new commits is deleted, one with commits is kept and named.
-fn finish_worktree(cwd: &Path, wt: &Worktree) -> String {
+// branch first, as the user when git knows them; if that fails the worktree
+// stays where it is. A branch with no new commits is deleted, one with
+// commits is kept and named.
+fn finish_worktree(cwd: &Path, wt: &Worktree) -> WorktreeDone {
+    let kept = |note: String, screen: String| WorktreeDone {
+        note,
+        screen,
+        branch: Some(wt.branch.clone()),
+        commits: 0,
+    };
     let dirty = git_out(&wt.path, &["status", "--porcelain"]).map(|s| !s.is_empty());
     let mut saved = false;
+    let mut as_bwn = false;
     if dirty != Some(false) {
         let add = git_out(&wt.path, &["add", "-A"]);
-        // The user's identity when git has one, a local one otherwise; no
-        // hooks or signing, which could fail or prompt with no one to answer.
-        let named = git_out(&wt.path, &["config", "user.email"]).is_some();
+        // No hooks or signing, which could fail or prompt with no one to
+        // answer; a local identity only when git has none for the user.
         let mut args = vec!["-c", "commit.gpgsign=false"];
-        if !named {
+        if !git_identity_known(&wt.path) {
+            as_bwn = true;
             args.extend(["-c", "user.name=bwn", "-c", "user.email=bwn@localhost"]);
         }
         args.extend([
@@ -3673,11 +4008,18 @@ fn finish_worktree(cwd: &Path, wt: &Worktree) -> String {
             "bwn: uncommitted work from an isolated subagent",
         ]);
         if add.is_none() || git_out(&wt.path, &args).is_none() {
-            return format!(
-                "[isolated worktree kept: the subagent left uncommitted changes that could \
-                 not be committed; they are in {} (branch {})]",
-                wt.path.display(),
-                wt.branch
+            return kept(
+                format!(
+                    "[isolated worktree kept: the subagent left uncommitted changes that could \
+                     not be committed; they are in {} (branch {})]",
+                    wt.path.display(),
+                    wt.branch
+                ),
+                format!(
+                    "the helper's uncommitted work is in {} (branch {})",
+                    wt.path.display(),
+                    wt.branch
+                ),
             );
         }
         saved = true;
@@ -3688,27 +4030,56 @@ fn finish_worktree(cwd: &Path, wt: &Worktree) -> String {
         .unwrap_or(0);
     let removed = git_out(cwd, &["worktree", "remove", &wt.path.to_string_lossy()]).is_some();
     if !removed {
-        return format!(
-            "[isolated worktree kept: {} could not be removed; its work is on branch {}]",
-            wt.path.display(),
-            wt.branch
-        );
+        return WorktreeDone {
+            commits,
+            ..kept(
+                format!(
+                    "[isolated worktree kept: {} could not be removed; its work is on branch {}]",
+                    wt.path.display(),
+                    wt.branch
+                ),
+                format!(
+                    "the helper's work is on branch {} in {} — git merge {}",
+                    wt.branch,
+                    wt.path.display(),
+                    wt.branch
+                ),
+            )
+        };
     }
     if commits == 0 {
         let _ = git_out(cwd, &["branch", "-D", &wt.branch]);
-        return "[isolated worktree removed: the subagent changed no files]".into();
+        return WorktreeDone {
+            note: "[isolated worktree removed: the subagent changed no files]".into(),
+            screen: "the helper changed no files".into(),
+            branch: None,
+            commits: 0,
+        };
     }
     let how = if saved {
         "including its uncommitted changes, committed for it"
     } else {
         "as the subagent committed it"
     };
-    format!(
-        "[isolated worktree removed; its work is NOT in this checkout. {commits} commit(s) \
-         on branch {} ({how}). Review with `git log -p {range}`, bring in with \
-         `git merge {}`]",
-        wt.branch, wt.branch
-    )
+    let author = if as_bwn {
+        " (committed as bwn <bwn@localhost>: git has no identity for you)"
+    } else {
+        ""
+    };
+    WorktreeDone {
+        note: format!(
+            "[isolated worktree removed; its work is NOT in this checkout. {commits} commit(s) \
+             on branch {} ({how}). Review with `git log -p {range}`, bring in with \
+             `git merge {}`]",
+            wt.branch, wt.branch
+        ),
+        screen: format!(
+            "the helper's work is on branch {} — git merge {}{author}",
+            wt.branch, wt.branch
+        ),
+        branch: Some(wt.branch.clone()),
+        commits,
+    }
 }
 
 fn parse_plan_steps(plan_text: &str) -> Vec<String> {
@@ -7352,7 +7723,7 @@ mod tests {
         // The subagent edits a tracked file and adds one, committing neither.
         std::fs::write(wt.path.join("a.txt"), "subagent edit").unwrap();
         std::fs::write(wt.path.join("new.txt"), "added").unwrap();
-        let report = finish_worktree(&repo, &wt);
+        let report = finish_worktree(&repo, &wt).note;
         let a = git(&["show", &format!("{}:a.txt", wt.branch)]);
         let new = git(&["show", &format!("{}:new.txt", wt.branch)]);
         let head = git(&["show", "HEAD:a.txt"]);
@@ -7381,13 +7752,13 @@ mod tests {
                 .unwrap()
         };
         wgit(&["commit", "-qam", "sub"]);
-        let report = finish_worktree(&repo, &wt);
+        let report = finish_worktree(&repo, &wt).note;
         assert!(report.contains("1 commit(s)"), "{report}");
         assert!(report.contains("as the subagent committed it"), "{report}");
         assert!(!wt.path.exists());
 
         let idle = make_worktree(&repo).unwrap();
-        let report = finish_worktree(&repo, &idle);
+        let report = finish_worktree(&repo, &idle).note;
         let branches = git(&["branch", "--list", &idle.branch]);
         let _ = std::fs::remove_dir_all(&repo);
         assert!(report.contains("changed no files"), "{report}");
@@ -7410,7 +7781,7 @@ mod tests {
         let wt_index = String::from_utf8_lossy(&wt_index.stdout).trim().to_string();
         assert_ne!(index, wt_index);
         std::fs::write(format!("{wt_index}.lock"), "").unwrap();
-        let report = finish_worktree(&repo, &wt);
+        let report = finish_worktree(&repo, &wt).note;
         let kept = std::fs::read_to_string(wt.path.join("a.txt")).ok();
         let _ = std::fs::remove_dir_all(&repo);
         assert_eq!(kept.as_deref(), Some("unsaved"));

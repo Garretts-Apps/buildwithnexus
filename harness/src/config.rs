@@ -1566,63 +1566,363 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
 // ── custom slash commands ─────────────────────────────────────────────────────
 pub struct CustomCommand {
     pub name: String,            // without leading /
-    pub content: String,         // markdown instructions injected as context
+    pub content: String,         // markdown body (frontmatter stripped)
     pub script: Option<PathBuf>, // optional shell/py script to run
+    /// `description:` frontmatter, else the body's first prose line.
+    pub description: String,
+    /// A skill reached as a command (`[Skill: name]` context) rather than a
+    /// commands/ file whose body is the prompt.
+    pub skill: bool,
 }
 
-pub fn load_custom_commands() -> Vec<CustomCommand> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    if let Ok(rd) = fs::read_dir(commands_dir()) {
-        for e in rd.flatten() {
-            let path = e.path();
-            let ext = path
-                .extension()
-                .map(|x| x.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let stem = path
-                .file_stem()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if stem.is_empty() || stem.starts_with('.') {
-                continue;
-            }
-            match ext.as_str() {
-                "md" => {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        seen.insert(stem.clone());
-                        out.push(CustomCommand {
-                            name: stem,
-                            content: content.trim().to_string(),
-                            script: None,
-                        });
-                    }
-                }
-                "sh" | "py" | "bash" => {
+/// Has the user trusted anything in this folder (`trusted.json` holds an
+/// entry for it)? Commands from the checkout load only then: a script runs
+/// code, and a prompt file speaks with the user's voice.
+pub fn project_folder_trusted(cwd: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(home().join("trusted.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    match &v[project_key(cwd)] {
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::String(s) => !s.is_empty(),
+        _ => false,
+    }
+}
+
+// Command folders in precedence order: the user's own first, then the
+// checkout's once the folder is trusted. A name already taken is skipped.
+fn command_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![commands_dir()];
+    if let Some(u) = user_home() {
+        dirs.push(u.join(".claude").join("commands"));
+    }
+    if project_folder_trusted(cwd) {
+        dirs.push(cwd.join(".buildwithnexus").join("commands"));
+        dirs.push(cwd.join(".claude").join("commands"));
+    }
+    dirs
+}
+
+fn scan_commands(dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<CustomCommand>) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let ext = path
+            .extension()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem.is_empty() || stem.starts_with('.') || seen.contains(&stem) {
+            continue;
+        }
+        match ext.as_str() {
+            "md" => {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    let (fm, body) = parse_frontmatter(&text);
+                    let body = body.trim().to_string();
                     seen.insert(stem.clone());
                     out.push(CustomCommand {
                         name: stem,
-                        content: String::new(),
-                        script: Some(path),
+                        description: fm
+                            .get("description")
+                            .map(|d| d.trim().to_string())
+                            .filter(|d| !d.is_empty())
+                            .unwrap_or_else(|| skill_description(&body)),
+                        content: body,
+                        script: None,
+                        skill: false,
                     });
                 }
-                _ => {}
             }
+            "sh" | "py" | "bash" => {
+                seen.insert(stem.clone());
+                out.push(CustomCommand {
+                    name: stem,
+                    content: String::new(),
+                    script: Some(path),
+                    description: "custom command".into(),
+                    skill: false,
+                });
+            }
+            _ => {}
         }
+    }
+}
+
+pub fn load_custom_commands() -> Vec<CustomCommand> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in command_dirs(&cwd) {
+        scan_commands(&dir, &mut seen, &mut out);
     }
     // Every discovered skill (bundled, user, project, .claude, .agents) is a
     // slash command too; an explicit commands/ entry of the same name wins.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     for skill in discover_skills(&cwd) {
         if !seen.contains(&skill.name) {
             out.push(CustomCommand {
                 content: skill.loaded_text(),
+                description: skill.description_or_default().to_string(),
                 name: skill.name,
                 script: None,
+                skill: true,
             });
         }
     }
     out
+}
+
+/// `$ARGUMENTS` (all of them) and `$1`…`$9` (one word each) in `text`, or
+/// None when it has no placeholder.
+pub fn expand_command_args(text: &str, args: &str) -> Option<String> {
+    let has_positional = (1..=9).any(|i| text.contains(&format!("${i}")));
+    if !text.contains("$ARGUMENTS") && !has_positional {
+        return None;
+    }
+    let words =
+        shlex::split(args).unwrap_or_else(|| args.split_whitespace().map(str::to_string).collect());
+    // One pass, so an argument that itself holds `$1` stays as typed.
+    let mut out = String::with_capacity(text.len() + args.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some(tail) = after.strip_prefix("ARGUMENTS") {
+            out.push_str(args.trim());
+            rest = tail;
+        } else if let Some(d) = after
+            .chars()
+            .next()
+            .and_then(|c| c.to_digit(10))
+            .filter(|d| *d > 0)
+        {
+            out.push_str(words.get(d as usize - 1).map(String::as_str).unwrap_or(""));
+            rest = &after[1..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The prompt for `/name args`: a commands/ file's body with its arguments
+/// filled in (or listed after it), or a skill's text after the typed line,
+/// the arguments sent once either way.
+pub fn command_prompt(cmd: &CustomCommand, args: &str) -> String {
+    let args = args.trim();
+    if cmd.skill {
+        return match expand_command_args(&cmd.content, args) {
+            Some(text) => format!("/{}\n\n[Skill: {}]\n{text}", cmd.name, cmd.name),
+            None if args.is_empty() => {
+                format!("/{}\n\n[Skill: {}]\n{}", cmd.name, cmd.name, cmd.content)
+            }
+            None => format!(
+                "/{} {args}\n\n[Skill: {}]\n{}",
+                cmd.name, cmd.name, cmd.content
+            ),
+        };
+    }
+    match expand_command_args(&cmd.content, args) {
+        Some(text) => text,
+        None if args.is_empty() => cmd.content.clone(),
+        None => format!("{}\n\nArguments: {args}", cmd.content),
+    }
+}
+
+// ── custom subagents ─────────────────────────────────────────────────────────
+
+/// A helper the model can delegate to by name (`task` / `spawn_subagent`
+/// with `role: <name>`), from `<name>.md` with `name`, `description` and
+/// `tools` frontmatter and the helper's instructions as the body.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentDef {
+    pub name: String,
+    pub description: String,
+    /// The tools it may use (bwn names); None means the usual set.
+    pub tools: Option<Vec<String>>,
+    pub prompt: String,
+    pub path: PathBuf,
+}
+
+/// The built-in roles; an agent file cannot take these names.
+pub const BUILTIN_ROLES: &[&str] = &["engineer", "researcher"];
+
+/// A tool name as written in an agent file, in bwn's terms: Claude Code's
+/// names (Read, Write, Bash, …) map to the bwn tool that does the same.
+pub fn agent_tool_name(name: &str) -> String {
+    match name.trim() {
+        "Read" => "read_file",
+        "Write" => "write_file",
+        "Edit" => "edit_file",
+        "MultiEdit" => "multi_edit",
+        "Bash" => "run_command",
+        "Grep" => "grep_files",
+        "Glob" => "find_files",
+        "LS" => "list_dir",
+        "WebFetch" => "fetch_url",
+        "WebSearch" => "web_search",
+        "TodoWrite" => "todo_write",
+        other => other,
+    }
+    .to_string()
+}
+
+fn parse_agent_file(path: &Path, text: &str) -> Option<AgentDef> {
+    let (fm, body) = parse_frontmatter(text);
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let name = fm
+        .get("name")
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(stem);
+    let tools = fm.get("tools").map(|t| {
+        t.trim_matches(|c| c == '[' || c == ']')
+            .split([',', ' '])
+            .map(|w| w.trim().trim_matches(|c| c == '"' || c == '\''))
+            .filter(|w| !w.is_empty())
+            .map(agent_tool_name)
+            .collect::<Vec<_>>()
+    });
+    Some(AgentDef {
+        description: fm
+            .get("description")
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| skill_description(body)),
+        name,
+        tools,
+        prompt: body.trim().to_string(),
+        path: path.to_path_buf(),
+    })
+}
+
+/// Agent files the model may delegate to: NEXUS_HOME/agents and
+/// ~/.claude/agents, then the checkout's .buildwithnexus/agents and
+/// .claude/agents once the folder is trusted. A name already taken (or a
+/// built-in role) is skipped.
+pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDef> {
+    let mut dirs = vec![home().join("agents")];
+    if let Some(u) = user_home() {
+        dirs.push(u.join(".claude").join("agents"));
+    }
+    if project_folder_trusted(cwd) {
+        dirs.push(cwd.join(".buildwithnexus").join("agents"));
+        dirs.push(cwd.join(".claude").join("agents"));
+    }
+    let mut out: Vec<AgentDef> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "md"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(def) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| parse_agent_file(&path, &t))
+            else {
+                continue;
+            };
+            let usable = def
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if usable
+                && !BUILTIN_ROLES.contains(&def.name.as_str())
+                && !out.iter().any(|a| a.name == def.name)
+            {
+                out.push(def);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod agent_file_tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_file_gives_name_description_tools_and_prompt() {
+        let text = "---\nname: test-writer\ndescription: Writes unit tests\ntools: Read, write_file\n---\nWrite focused tests.\n";
+        let a = parse_agent_file(Path::new("/x/tw.md"), text).unwrap();
+        assert_eq!(a.name, "test-writer");
+        assert_eq!(a.description, "Writes unit tests");
+        assert_eq!(
+            a.tools,
+            Some(vec!["read_file".to_string(), "write_file".to_string()])
+        );
+        assert_eq!(a.prompt, "Write focused tests.");
+        let bare = parse_agent_file(Path::new("/x/helper.md"), "Help out.\n").unwrap();
+        assert_eq!((bare.name.as_str(), bare.tools), ("helper", None));
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    fn cmd(content: &str, skill: bool) -> CustomCommand {
+        CustomCommand {
+            name: "fix-issue".into(),
+            content: content.into(),
+            script: None,
+            description: String::new(),
+            skill,
+        }
+    }
+
+    #[test]
+    fn arguments_fill_placeholders_once() {
+        assert_eq!(
+            expand_command_args("Fix issue $1 ($ARGUMENTS) $2.", "42 'needs triage'").as_deref(),
+            Some("Fix issue 42 (42 'needs triage') needs triage.")
+        );
+        assert_eq!(
+            expand_command_args("cost: $5 flat", "a").as_deref(),
+            Some("cost:  flat")
+        );
+        assert_eq!(expand_command_args("no placeholders, $ alone", "x"), None);
+        assert_eq!(
+            expand_command_args("echo $1", "'$ARGUMENTS'").as_deref(),
+            Some("echo $ARGUMENTS")
+        );
+    }
+
+    #[test]
+    fn a_command_is_its_body_and_a_skill_follows_the_typed_line() {
+        assert_eq!(
+            command_prompt(&cmd("Fix issue $1", false), "42"),
+            "Fix issue 42"
+        );
+        assert_eq!(
+            command_prompt(&cmd("Fix the issue.", false), "42"),
+            "Fix the issue.\n\nArguments: 42"
+        );
+        let skill = command_prompt(&cmd("Deploy carefully.", true), "staging");
+        assert_eq!(
+            skill,
+            "/fix-issue staging\n\n[Skill: fix-issue]\nDeploy carefully."
+        );
+        assert_eq!(skill.matches("staging").count(), 1);
+        let filled = command_prompt(&cmd("Deploy to $ARGUMENTS.", true), "staging");
+        assert_eq!(filled.matches("staging").count(), 1, "{filled}");
+    }
 }
 
 // ── hooks directory ───────────────────────────────────────────────────────────

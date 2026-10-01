@@ -562,7 +562,8 @@ fn mcp_read_only_hint_is_ignored_unless_trusted() {
     write_config(&home, "ollama", "readonly", port);
 
     let r = run(&home, &cwd, "try add");
-    assert!(r.success, "stderr: {}", r.stderr);
+    // A refused call means the run did not do what it was asked.
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
     assert!(r.text_of("tool_denied").contains("read-only"));
     assert!(!r
         .events
@@ -585,7 +586,7 @@ fn mcp_read_only_hint_gates_under_readonly() {
     write_config(&home, "ollama", "readonly", port);
 
     let r = run(&home, &cwd, "try both");
-    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
     assert!(r.text_of("tool_denied").contains("read-only"));
     let add = r
         .events
@@ -720,8 +721,10 @@ fn mcp_cli_add_list_remove_round_trip() {
     assert!(out.contains("mcp__fake__add [read-only]"));
     assert!(out.contains("Add two integers"));
 
+    // Nothing serves the provider on port 9, so doctor fails; the MCP
+    // server is still checked.
     let (ok, out, _) = cli(&["doctor"]);
-    assert!(ok);
+    assert!(!ok);
     assert!(out.contains("mcp:fake"), "{out}");
     assert!(out.contains("2 tools"), "{out}");
 }
@@ -2307,7 +2310,10 @@ fn a_server_started_in_a_running_tmux_keeps_no_provider_key() {
 
 // ── setup, keys and settings (credentials-setup) ────────────────────────────
 
-// `buildwithnexus <args>` with `input` on stdin (a pipe, not a terminal).
+// `buildwithnexus <args>` with `input` on stdin (a pipe, not a terminal),
+// written from a thread so a large input cannot deadlock against the output
+// pipes. `stderr` also holds stdout, so a check that a key is never echoed
+// covers both streams.
 fn run_stdin(home: &Path, cwd: &Path, args: &[&str], input: &str) -> Run {
     let mut cmd = Command::new(BIN);
     for var in NET_VARS {
@@ -2323,13 +2329,14 @@ fn run_stdin(home: &Path, cwd: &Path, args: &[&str], input: &str) -> Run {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn binary");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_string();
+    let writer = thread::spawn(move || {
+        // The binary may stop reading at its cap; a broken pipe is expected then.
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output().expect("wait for binary");
+    let _ = writer.join();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     Run {
         success: out.status.success(),
@@ -3262,4 +3269,1325 @@ fn sessions_export_writes_markdown_and_prints_the_path() {
         .unwrap();
     assert_eq!(missing.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no session '123'"));
+}
+
+// ── headless input on stdin ─────────────────────────────────────────────────
+
+// The text of the last user message in a recorded chat request.
+fn last_user_text(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    v["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .map(|m| match &m["content"] {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn stdin_is_the_task_when_no_task_is_given() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("fixed it")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_stdin(&home, &cwd, &["--json", "run"], "fix the typo in README\n");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(last_user_text(&posts[0]).trim(), "fix the typo in README");
+}
+
+#[test]
+fn stdin_is_context_after_a_task_argument() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("the linker failed")]);
+    write_config(&home, "ollama", "auto", port);
+    let log = "ERROR: linker failed: undefined symbol foo\n";
+    let r = run_stdin(&home, &cwd, &["--json", "run", "why did this fail?"], log);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = last_user_text(&posts.lock().unwrap()[0]);
+    assert!(sent.starts_with("why did this fail?"), "{sent}");
+    assert!(
+        sent.contains("[stdin]\nERROR: linker failed: undefined symbol foo"),
+        "{sent}"
+    );
+    // The question is sent once, not repeated inside the block.
+    assert_eq!(sent.matches("why did this fail?").count(), 1, "{sent}");
+}
+
+#[test]
+fn stdin_over_the_cap_is_cut_with_a_notice() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("summarized")]);
+    write_config(&home, "ollama", "auto", port);
+    let big = "x".repeat(1024 * 1024 + 4096);
+    let r = run_stdin(&home, &cwd, &["--json", "run", "summarize"], &big);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let notices = r.text_of("notice");
+    assert!(notices.contains("1 MiB"), "{notices}");
+    let sent = last_user_text(&posts.lock().unwrap()[0]);
+    let xs = sent.matches('x').count();
+    assert!(xs <= 1024 * 1024 && xs > 1000 * 1000, "{xs}");
+}
+
+#[test]
+fn a_large_task_arrives_through_stdin() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("read it")]);
+    write_config(&home, "ollama", "auto", port);
+    let line = "2026-10-01T00:00:00Z INFO worker heartbeat ok id=0000\n";
+    let task = format!("summarize this log:\n{}", line.repeat(6000));
+    assert!(task.len() > 300 * 1024);
+    let r = run_stdin(&home, &cwd, &["--json", "run"], &task);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = last_user_text(&posts.lock().unwrap()[0]);
+    assert_eq!(sent.matches("heartbeat").count(), 6000);
+}
+
+#[test]
+fn no_task_and_nothing_on_stdin_is_a_usage_error_without_a_request() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("should not run")]);
+    write_config(&home, "ollama", "auto", port);
+    for r in [
+        run_args(&home, &cwd, &["--json", "run"]),
+        run_stdin(&home, &cwd, &["run"], "  \n"),
+    ] {
+        assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+        assert!(r.stderr.contains("no task given"), "{}", r.stderr);
+    }
+    assert!(posts.lock().unwrap().is_empty());
+}
+
+// ── what the exit code and the result event say ─────────────────────────────
+
+// A hook that answers PreToolUse for `matcher` with `decision`.
+fn pre_tool_hook(matcher: &str, command: &str) -> Value {
+    json!({"PreToolUse": [{ "matcher": matcher, "hooks": [{ "type": "command", "command": command }] }]})
+}
+
+#[test]
+fn a_write_denied_by_a_hook_ends_approval_blocked_with_the_denial() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        pre_tool_hook(
+            "write_file",
+            "cat >/dev/null; echo 'policy: no writes in CI' >&2; exit 2",
+        ),
+    );
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("wrote notes.txt"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "write notes");
+    assert!(!cwd.join("notes.txt").exists());
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    let last = r.events.last().unwrap();
+    assert_eq!(last["outcome"], "approval_blocked", "{last}");
+    assert_eq!(last["denied"], 1, "{last}");
+    assert_eq!(last["denials"][0]["tool"], "write_file", "{last}");
+    assert!(
+        last["denials"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("policy: no writes in CI"),
+        "{last}"
+    );
+    assert!(r.stderr.contains("changes were denied"), "{}", r.stderr);
+    // --legacy-exit-codes keeps the old zero for a run that only stopped short.
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("wrote notes.txt"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let legacy = run_args(
+        &home,
+        &cwd,
+        &["--json", "--legacy-exit-codes", "run", "write notes"],
+    );
+    assert_eq!(legacy.code, Some(0), "stderr: {}", legacy.stderr);
+    assert_eq!(legacy.events.last().unwrap()["outcome"], "approval_blocked");
+}
+
+#[test]
+fn a_readonly_refused_write_is_not_a_success() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "readonly", port);
+    let r = run(&home, &cwd, "write notes");
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    let last = r.events.last().unwrap();
+    assert_eq!(last["outcome"], "approval_blocked");
+    assert!(
+        last["denials"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "{last}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_allowed_write_with_unapproved_checks_is_a_success_that_says_so() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        pre_tool_hook(
+            "write_file",
+            r#"cat >/dev/null; echo '{"permissionDecision":"allow"}'"#,
+        ),
+    );
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("wrote notes.txt"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "write notes");
+    assert!(cwd.join("notes.txt").exists());
+    assert_eq!(r.code, Some(0), "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(r.events.last().unwrap()["outcome"], "success");
+    assert!(
+        r.text_of("notice")
+            .contains("checks were not run (no terminal to approve them)"),
+        "{:?}",
+        r.events
+    );
+}
+
+#[test]
+fn the_result_event_names_the_session_turns_tokens_and_cost() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("a.txt"), "hello").unwrap();
+    let port = serve(vec![
+        with_usage(tool_call("c1", "read_file", json!({"path": "a.txt"})), 1000),
+        with_usage(finish("read it"), 1200),
+    ]);
+    // gpt-4o is priced; "127.1" reaches the loopback mock without being
+    // booked as a free local request.
+    let cfg = json!({
+        "provider": "ollama", "model": "gpt-4o", "permission": "auto",
+        "base_url": format!("http://127.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "read a.txt");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let last = r.events.last().unwrap();
+    assert_eq!(last["type"], "result");
+    assert_eq!(last["turns"], 2, "{last}");
+    assert_eq!(last["tokens_in"], 2200, "{last}");
+    assert!(last["cost_usd"].as_f64().unwrap() > 0.0, "{last}");
+    assert_eq!(last["denied"], 0);
+    let sid = last["session_id"].as_str().unwrap();
+    assert!(home.join("sessions").join(format!("{sid}.json")).exists());
+
+    let out = Command::new(BIN)
+        .args(["--json", "sessions"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let lines: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every line is JSON"))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["type"], "session");
+    assert_eq!(lines[0]["id"], sid);
+}
+
+#[test]
+fn a_turn_that_ends_after_a_call_that_could_not_run_is_not_a_success() {
+    for script in [
+        // read_file without its path, then a confident answer.
+        vec![
+            tool_call("c1", "read_file", json!({"parameters": {"path": "a.txt"}})),
+            text("The file says hello."),
+        ],
+        // A tool this run does not have.
+        vec![
+            tool_call("c1", "open_document", json!({"name": "a.txt"})),
+            text("The file says hello."),
+        ],
+        // A call written as text that nothing parsed.
+        vec![text(
+            r#"{"name": "open_document", "arguments": {"name": "a.txt"}}"#,
+        )],
+    ] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "read a.txt and tell me what it says");
+        assert_eq!(r.code, Some(1), "stderr: {}\n{:?}", r.stderr, r.events);
+        assert_eq!(r.events.last().unwrap()["outcome"], "failed");
+        assert!(
+            r.text_of("notice").contains("could not run"),
+            "{:?}",
+            r.events
+        );
+    }
+}
+
+// Accepts one chat request and never answers it.
+fn serve_silent() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = read_request(&mut stream);
+            held.push(stream);
+        }
+    });
+    port
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_and_sigint_end_with_an_interrupted_result_and_a_saved_session() {
+    for (sig, code) in [("-TERM", 143), ("-INT", 130)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        write_config(&home, "ollama", "auto", serve_silent());
+        let child = Command::new(BIN)
+            .args(["--json", "run", "wait for the slow model"])
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The request is in flight once the session file exists.
+        let sessions = home.join("sessions");
+        for _ in 0..100 {
+            if std::fs::read_dir(&sessions).is_ok_and(|mut d| d.next().is_some()) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        thread::sleep(std::time::Duration::from_millis(300));
+        let killed = Command::new("kill")
+            .args([sig, &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{sig}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let last: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(last["type"], "result");
+        assert_eq!(last["outcome"], "interrupted");
+        assert_eq!(last["exit_code"], code);
+        let sid = last["session_id"].as_str().unwrap();
+        let saved = std::fs::read_to_string(sessions.join(format!("{sid}.json"))).unwrap();
+        assert!(saved.contains("wait for the slow model"));
+    }
+}
+
+// ── built-in rules read path names ──────────────────────────────────────────
+
+// Read `path`, rewrite it, then finish (three times, for the verifier's
+// fix rounds).
+fn edit_script(path: &str) -> Vec<String> {
+    vec![
+        tool_call("c0", "read_file", json!({"path": path})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": path, "content": "- Ada\n- Grace\n"}),
+        ),
+        finish("first"),
+        finish("second"),
+        finish("third"),
+    ]
+}
+
+#[test]
+fn an_authors_edit_passes_verification_and_auth_code_says_how_to_clear_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("AUTHORS.md"), "- Ada\n").unwrap();
+    let port = serve(edit_script("AUTHORS.md"));
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "run", "add Grace to AUTHORS.md"]);
+    assert!(std::fs::read_to_string(cwd.join("AUTHORS.md"))
+        .unwrap()
+        .contains("Grace"));
+    let verify = r.find("verify").expect("verify event");
+    assert_eq!(verify["report"]["rule_violations"], json!([]), "{verify}");
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+
+    let auth = |env: &[(&str, &str)], home: &Path| {
+        let cwd = tmp("proj");
+        std::fs::create_dir_all(cwd.join("src/auth")).unwrap();
+        std::fs::write(cwd.join("src/auth/login.py"), "- Ada\n").unwrap();
+        let port = serve(edit_script("src/auth/login.py"));
+        write_config(home, "ollama", "auto", port);
+        run_env(home, &cwd, &["--json", "run", "edit login"], env)
+    };
+    let r = auth(&[], &home);
+    assert_eq!(r.code, Some(8), "stderr: {}", r.stderr);
+    let notices = r.text_of("verify");
+    assert!(
+        notices.contains("BWN_CHECKS_DONE=security_review"),
+        "{notices}"
+    );
+    assert!(notices.contains("enabled"), "{notices}");
+    // Recorded as done for this run.
+    let r = auth(&[("BWN_CHECKS_DONE", "security_review")], &home);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    // Turned off in the user's rules folder.
+    std::fs::create_dir_all(home.join("rules")).unwrap();
+    std::fs::write(
+        home.join("rules/off.json"),
+        r#"{"rules": [{"id": "auth_change_requires_security_review", "enabled": false}]}"#,
+    )
+    .unwrap();
+    let r = auth(&[], &home);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+}
+
+// ── command-line mistakes are usage errors ──────────────────────────────────
+
+#[test]
+fn command_line_mistakes_exit_2_and_send_nothing() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("should not run")]);
+    write_config(&home, "ollama", "auto", port);
+    for (args, says) in [
+        (
+            vec!["run", "--modle", "big", "say hi"],
+            "unknown option --modle (did you mean --model?)",
+        ),
+        (
+            vec!["--effort", "hihg", "run", "say hi"],
+            "--effort must be one of",
+        ),
+        (
+            vec!["--frobnicate", "say hi"],
+            "unknown option --frobnicate",
+        ),
+        (
+            vec!["plan", "--yes", "--dry-run", "x"],
+            "unknown option --dry-run",
+        ),
+    ] {
+        let r = run_args(&home, &cwd, &args);
+        assert_eq!(r.code, Some(2), "{args:?}: {}", r.stderr);
+        assert!(r.stderr.contains(says), "{args:?}: {}", r.stderr);
+    }
+    assert!(posts.lock().unwrap().is_empty());
+    // After `--` a task may start with dashes.
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "run", "--", "--explain the --verbose flag"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = last_user_text(&posts.lock().unwrap()[0]);
+    assert!(sent.contains("--explain the --verbose flag"), "{sent}");
+}
+
+#[test]
+fn base_url_points_a_settings_free_run_at_a_gateway() {
+    // No settings at all, as in a fresh CI container.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("hello from the gateway")]);
+    let url = format!("http://127.0.0.1:{port}/v1");
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "run",
+            "--provider",
+            "custom",
+            "--base-url",
+            &url,
+            "--model",
+            "gw-model",
+            "say hi",
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 1);
+    let body: Value = serde_json::from_str(&posts[0]).unwrap();
+    assert_eq!(body["model"], "gw-model");
+    // Nothing was written to settings by an unattended run.
+    assert!(!home.join("settings.json").exists());
+}
+
+// ── doctor checks what you use ──────────────────────────────────────────────
+
+// An Ollama that knows `models` and answers every request with them.
+fn serve_ollama_tags(models: &[&str]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = json!({"models": models.iter().map(|m| json!({"name": m})).collect::<Vec<_>>()})
+        .to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = read_request(&mut stream);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+fn doctor(home: &Path, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, String) {
+    let cwd = tmp("proj");
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    for (k, _) in [
+        ("ANTHROPIC_API_KEY", ""),
+        ("OPENAI_API_KEY", ""),
+        ("OPENROUTER_API_KEY", ""),
+        ("GROQ_API_KEY", ""),
+        ("HF_TOKEN", ""),
+        ("CUSTOM_API_KEY", ""),
+    ] {
+        cmd.env_remove(k);
+    }
+    let out = cmd
+        .args(args)
+        .envs(env.iter().copied())
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+#[test]
+fn doctor_on_a_healthy_ollama_lists_no_hosted_keys_and_flags_a_missing_model() {
+    let home = tmp("home");
+    let port = serve_ollama_tags(&["tinycoder:3b", "qwen3:latest"]);
+    let cfg = |model: &str| {
+        json!({"provider": "ollama", "model": model, "permission": "ask",
+               "base_url": format!("http://127.0.0.1:{port}")})
+        .to_string()
+    };
+    for model in ["tinycoder:3b", "qwen3"] {
+        std::fs::write(home.join("config.json"), cfg(model)).unwrap();
+        let (code, out) = doctor(&home, &["doctor"], &[]);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains(&format!("has {model}")), "{out}");
+        assert!(
+            !out.contains("API_KEY") && !out.contains("HF_TOKEN"),
+            "{out}"
+        );
+        assert!(!out.contains("anthropic.com"), "{out}");
+        assert!(!out.contains('✗'), "{out}");
+    }
+    std::fs::write(home.join("config.json"), cfg("tinycoder:7b")).unwrap();
+    let (code, out) = doctor(&home, &["doctor"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("ollama pull tinycoder:7b"), "{out}");
+}
+
+#[test]
+fn doctor_fails_on_a_dead_gateway_and_speaks_json() {
+    let home = tmp("home");
+    // Nothing listens on port 9 here.
+    write_custom_config(&home, "http://127.0.0.1:9/v1");
+    let (code, out) = doctor(&home, &["doctor"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("1 check failed: provider"), "{out}");
+
+    let (code, out) = doctor(&home, &["--json", "doctor"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    // Every line is JSON: a check each, and the provider layer's notices.
+    let checks: Vec<Value> = out
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).expect("every line is JSON"))
+        .filter(|e| e["type"] == "check")
+        .collect();
+    let provider = checks.iter().find(|c| c["name"] == "provider").unwrap();
+    assert_eq!(provider["status"], "fail");
+    assert!(checks
+        .iter()
+        .any(|c| c["name"] == "settings" && c["status"] == "ok"));
+}
+
+#[test]
+fn doctor_for_a_hosted_provider_without_its_key_names_only_that_key() {
+    let home = tmp("home");
+    std::fs::write(
+        home.join("config.json"),
+        json!({"provider": "openai", "model": "gpt-4o", "permission": "ask"}).to_string(),
+    )
+    .unwrap();
+    let (code, out) = doctor(&home, &["doctor"], &[]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("✗ OPENAI_API_KEY"), "{out}");
+    for other in [
+        "ANTHROPIC_API_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "HF_TOKEN",
+    ] {
+        assert!(!out.contains(other), "{other}: {out}");
+    }
+}
+
+// ── delegated work says where it went ───────────────────────────────────────
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("git");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+// A repository with one commit and no identity of its own.
+fn git_repo() -> PathBuf {
+    let cwd = tmp("repo");
+    git(&cwd, &["init", "-q", "-b", "main"]);
+    git(&cwd, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(cwd.join("README.md"), "# demo\n").unwrap();
+    git(&cwd, &["add", "-A"]);
+    git(
+        &cwd,
+        &[
+            "-c",
+            "user.name=dev",
+            "-c",
+            "user.email=dev@example.test",
+            "commit",
+            "-qm",
+            "init",
+        ],
+    );
+    cwd
+}
+
+// The user's identity as CI often gives it: environment only, no config.
+fn git_identity_env(home: &Path) -> Vec<(&'static str, String)> {
+    vec![
+        ("HOME", home.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM", "1".into()),
+        ("GIT_AUTHOR_NAME", "Tess Ter".into()),
+        ("GIT_AUTHOR_EMAIL", "tess@example.test".into()),
+        ("GIT_COMMITTER_NAME", "Tess Ter".into()),
+        ("GIT_COMMITTER_EMAIL", "tess@example.test".into()),
+    ]
+}
+
+fn isolated_helper_script() -> Vec<String> {
+    vec![
+        tool_call(
+            "c1",
+            "spawn_subagent",
+            json!({"task": "write sub.txt", "isolate": true}),
+        ),
+        tool_call(
+            "s1",
+            "write_file",
+            json!({"path": "sub.txt", "content": "from the helper\n"}),
+        ),
+        finish("sub: wrote sub.txt"),
+        finish("parent done"),
+    ]
+}
+
+#[test]
+fn an_isolated_helper_names_the_branch_and_commits_as_the_user() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let port = serve(isolated_helper_script());
+    write_config(&home, "ollama", "auto", port);
+    let env = git_identity_env(&home);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "delegate writing sub.txt"],
+        &env,
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(!cwd.join("sub.txt").exists(), "the checkout is untouched");
+    let done = r.find("subagent_result").expect("subagent_result event");
+    let branch = done["branch"].as_str().unwrap();
+    assert!(branch.starts_with("bwn-sub-"), "{done}");
+    assert_eq!(done["merge"], format!("git merge {branch}"));
+    assert_eq!(done["commits"], 1);
+    assert_eq!(
+        git(&cwd, &["log", "-1", "--format=%an <%ae>", branch]),
+        "Tess Ter <tess@example.test>"
+    );
+
+    // The line on screen is the event's message (walk_deleg checks it).
+    assert!(done["message"].as_str().unwrap().contains(&format!(
+        "the helper's work is on branch {branch} — git merge {branch}"
+    )));
+}
+
+#[test]
+fn a_helper_that_cannot_be_isolated_says_so_before_it_writes() {
+    let home = tmp("home");
+    let cwd = tmp("proj"); // not a git repository
+    let port = serve(isolated_helper_script());
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "delegate writing sub.txt");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(cwd.join("sub.txt").exists());
+    let said = r
+        .events
+        .iter()
+        .position(|e| {
+            e["type"] == "notice"
+                && e["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("the helper will write in your folder"))
+        })
+        .expect("in-place notice");
+    let wrote = r
+        .events
+        .iter()
+        .position(|e| e["type"] == "tool_call" && e["name"] == "write_file")
+        .unwrap();
+    assert!(said < wrote, "{:?}", r.events);
+    assert!(r
+        .text_of("notice")
+        .contains("not a git repository with commits"));
+}
+
+#[test]
+fn worktree_flag_runs_the_session_on_its_own_branch() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "feature.txt", "content": "x\n"}),
+        ),
+        finish("wrote feature.txt"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--worktree",
+            "feature-x",
+            "run",
+            "add feature.txt",
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let wt = cwd.join(".bwn/worktrees/feature-x");
+    assert!(wt.join("feature.txt").exists());
+    assert!(!cwd.join("feature.txt").exists());
+    assert_eq!(git(&wt, &["branch", "--show-current"]), "bwn/feature-x");
+    assert!(r.stderr.contains("git merge bwn/feature-x"), "{}", r.stderr);
+    // The main checkout does not list the worktree folder.
+    assert_eq!(git(&cwd, &["status", "--porcelain"]), "");
+    // A name git cannot take is a usage error.
+    let r = run_args(&home, &cwd, &["--worktree", "../up", "run", "x"]);
+    assert_eq!(r.code, Some(2), "{}", r.stderr);
+}
+
+// ── skills and custom commands, headless and with arguments ─────────────────
+
+// Mark `cwd` trusted the way a yes at the trust prompt does.
+fn trust_folder(home: &Path, cwd: &Path) {
+    let key = cwd.canonicalize().unwrap().to_string_lossy().into_owned();
+    std::fs::write(
+        home.join("trusted.json"),
+        json!({ key: {"settings.json": "sha256:0"} }).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_skill_runs_headless_with_its_argument_once() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("skills")).unwrap();
+    std::fs::write(
+        home.join("skills/deploy.md"),
+        "---\ndescription: Deploy the app\n---\nRun the release checklist, then deploy.\n",
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![finish("deployed")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "/deploy staging");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = last_user_text(&posts.lock().unwrap()[0]);
+    assert!(sent.contains("[Skill: deploy]"), "{sent}");
+    assert!(sent.contains("Run the release checklist"), "{sent}");
+    assert_eq!(sent.matches("staging").count(), 1, "{sent}");
+}
+
+#[test]
+fn project_commands_take_arguments_and_load_only_when_trusted() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus/commands")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/commands/fix-issue.md"),
+        "Fix issue $1\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(cwd.join(".claude/commands")).unwrap();
+    std::fs::write(
+        cwd.join(".claude/commands/review-pr.md"),
+        "Review pull request #$ARGUMENTS\n",
+    )
+    .unwrap();
+
+    // Not trusted: the text goes to the model as typed.
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+    run(&home, &cwd, "/fix-issue 42");
+    assert_eq!(last_user_text(&posts.lock().unwrap()[0]), "/fix-issue 42");
+
+    trust_folder(&home, &cwd);
+    for (typed, expected) in [
+        ("/fix-issue 42", "Fix issue 42"),
+        ("/review-pr 7", "Review pull request #7"),
+    ] {
+        let (port, posts) = serve_recording(vec![finish("ok")]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, typed);
+        assert!(r.success, "stderr: {}", r.stderr);
+        assert_eq!(last_user_text(&posts.lock().unwrap()[0]), expected);
+    }
+}
+
+// ── MCP: a stuck server, adding twice, read-only hints ──────────────────────
+
+#[test]
+fn a_stuck_mcp_server_is_skipped_after_a_few_seconds() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // Reads stdin until bwn goes away and never answers initialize.
+    let hang = home.join("hang.py");
+    std::fs::write(&hang, "import sys\nsys.stdin.read()\n").unwrap();
+    let settings = json!({"mcp_servers": {
+        "fake": {"command": "python3", "args": [FAKE_MCP]},
+        "hang": {"command": "python3", "args": [hang.to_string_lossy()]},
+    }});
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    let port = serve(vec![
+        tool_call("c1", "mcp__fake__echo", json!({"text": "still here"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let started = std::time::Instant::now();
+    let r = run(&home, &cwd, "use the tools");
+    let took = started.elapsed();
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(took < std::time::Duration::from_secs(6), "{took:?}");
+    let notices = r.text_of("notice");
+    assert!(
+        notices.contains("mcp: hang not ready after 5s — skipped (timeout_secs in settings)"),
+        "{notices}"
+    );
+    let echo = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "mcp__fake__echo")
+        .expect("the ready server's tool ran");
+    assert_eq!(echo["content"], "echo: still here");
+}
+
+#[test]
+fn mcp_add_refuses_to_replace_without_force() {
+    let home = tmp("home");
+    write_config(&home, "ollama", "auto", 9);
+    let cli = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("NEXUS_HOME", &home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    assert_eq!(cli(&["mcp", "add", "fake", "python3", "one.py"]).0, Some(0));
+    let (code, _, err) = cli(&["mcp", "add", "fake", "python3", "other.py"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(
+        err.contains("fake already exists — use --force to replace it"),
+        "{err}"
+    );
+    let saved = || -> Value {
+        serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap()).unwrap()
+    };
+    assert_eq!(saved()["mcp_servers"]["fake"]["args"][0], "one.py");
+    let (code, out, err) = cli(&["mcp", "add", "--force", "fake", "python3", "other.py"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("replaced MCP server 'fake'"), "{out}");
+    assert_eq!(saved()["mcp_servers"]["fake"]["args"][0], "other.py");
+}
+
+#[test]
+fn a_blocked_read_only_mcp_tool_names_the_setting_that_trusts_its_hint() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_mcp_settings(&home);
+    let port = serve(vec![
+        tool_call("c1", "mcp__fake__add", json!({"a": 2, "b": 3})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "add numbers");
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    let denied = r.text_of("tool_denied");
+    assert!(denied.contains("trust_read_only_hints"), "{denied}");
+    assert!(denied.contains("fake/add says it is read-only"), "{denied}");
+}
+
+// ── update ──────────────────────────────────────────────────────────────────
+
+// A registry that says `version` is the latest buildwithnexus.
+fn serve_registry(version: &str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = json!({"name": "buildwithnexus", "version": version}).to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = read_request(&mut stream);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+fn update_cmd(
+    bin: &Path,
+    home: &Path,
+    port: u16,
+    args: &[&str],
+    path: Option<&Path>,
+) -> (Option<i32>, String) {
+    let mut cmd = Command::new(bin);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    if let Some(dir) = path {
+        let old = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{old}", dir.display()));
+    }
+    let out = cmd
+        .args(args)
+        .env("NEXUS_HOME", home)
+        .env("BWN_UPDATE_REGISTRY", format!("http://127.0.0.1:{port}"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[test]
+fn update_check_reports_current_and_latest_with_its_exit_code() {
+    let home = tmp("home");
+    let current = env!("CARGO_PKG_VERSION");
+    let bin = Path::new(BIN);
+    let (code, out) = update_cmd(
+        bin,
+        &home,
+        serve_registry(current),
+        &["update", "--check"],
+        None,
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains(&format!("latest   {current}")) && out.contains("up to date"),
+        "{out}"
+    );
+    let (code, out) = update_cmd(
+        bin,
+        &home,
+        serve_registry("99.0.0"),
+        &["update", "--check"],
+        None,
+    );
+    assert_eq!(code, Some(10), "{out}");
+    assert!(out.contains("latest   99.0.0"), "{out}");
+    let (code, out) = update_cmd(
+        bin,
+        &home,
+        serve_registry("99.0.0"),
+        &["--json", "update", "--check"],
+        None,
+    );
+    assert_eq!(code, Some(10), "{out}");
+    let ev: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(ev["behind"], true);
+    // A copy built from source is told the cargo command.
+    let (code, out) = update_cmd(bin, &home, serve_registry("99.0.0"), &["update"], None);
+    assert_eq!(code, Some(10), "{out}");
+    assert!(
+        out.contains("cargo install buildwithnexus --locked"),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_runs_npm_for_an_npm_install() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp("home");
+    // Where the npm launcher keeps the binary it downloaded.
+    let dir = home.join("bin").join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("buildwithnexus");
+    std::fs::copy(BIN, &bin).unwrap();
+    // A stand-in npm that records how it was called.
+    let fake = tmp("fakenpm");
+    let log = fake.join("npm-args.txt");
+    std::fs::write(
+        fake.join("npm"),
+        format!("#!/bin/sh\necho \"$@\" > '{}'\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(fake.join("npm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, out) = update_cmd(
+        &bin,
+        &home,
+        serve_registry("99.0.0"),
+        &["update"],
+        Some(&fake),
+    );
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("updated to v99.0.0"), "{out}");
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        args.starts_with("install -g buildwithnexus@99.0.0"),
+        "{args}"
+    );
+}
+
+// ── review ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn review_is_read_only_even_in_auto_and_reports_findings() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    std::fs::write(cwd.join("README.md"), "# demo, now edited\n").unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "README.md", "content": "rewritten by the reviewer\n"}),
+        ),
+        finish(
+            "Reviewed.\n- [blocking] README.md:1 — the title lost the project name\n- [nit] README.md — trailing comma",
+        ),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "review"]);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("README.md")).unwrap(),
+        "# demo, now edited\n"
+    );
+    assert!(
+        r.text_of("tool_denied").contains("review is read-only"),
+        "{:?}",
+        r.events
+    );
+    let findings: Vec<&Value> = r.events.iter().filter(|e| e["type"] == "finding").collect();
+    assert_eq!(findings.len(), 2, "{:?}", r.events);
+    assert_eq!(findings[0]["severity"], "blocking");
+    assert_eq!(findings[0]["path"], "README.md");
+    assert_eq!(findings[0]["line"], 1);
+    assert_eq!(r.code, Some(9), "stderr: {}", r.stderr);
+    assert_eq!(r.events.last().unwrap()["outcome"], "review_blocking");
+    // The diff went with the request.
+    assert!(last_user_text(&posts.lock().unwrap()[0]).contains("now edited"));
+}
+
+#[test]
+fn review_without_blocking_findings_or_without_changes_succeeds() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let (port, posts) = serve_recording(vec![finish("No findings.")]);
+    write_config(&home, "ollama", "auto", port);
+    // Nothing changed: no request at all.
+    let r = run_args(&home, &cwd, &["--json", "review"]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert!(r.text_of("notice").contains("nothing to review"));
+    assert!(posts.lock().unwrap().is_empty());
+    // A branch reviewed against its base.
+    git(&cwd, &["checkout", "-qb", "feature"]);
+    std::fs::write(cwd.join("NEW.md"), "new\n").unwrap();
+    git(&cwd, &["add", "-A"]);
+    git(
+        &cwd,
+        &[
+            "-c",
+            "user.name=dev",
+            "-c",
+            "user.email=d@e",
+            "commit",
+            "-qm",
+            "new",
+        ],
+    );
+    let r = run_args(&home, &cwd, &["--json", "review", "--base", "main"]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert!(!r.has_event("finding"));
+    assert!(last_user_text(&posts.lock().unwrap()[0]).contains("NEW.md"));
+}
+
+#[test]
+fn review_covers_new_files_and_leaves_out_secrets() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    // What an agent turn usually leaves: a file git does not track yet.
+    std::fs::write(
+        cwd.join("login.py"),
+        "def login(pw):\n    return pw == 'admin'\n",
+    )
+    .unwrap();
+    std::fs::write(cwd.join(".env"), "API_TOKEN=sk-live-123\n").unwrap();
+    let answer = || finish("- [blocking] login.py:2 — the password is hardcoded");
+    let (port, posts) = serve_recording(vec![answer(), answer()]);
+    write_config(&home, "ollama", "auto", port);
+    for args in [
+        &["--json", "review"][..],
+        &["--json", "review", "--base", "main"],
+    ] {
+        let r = run_args(&home, &cwd, args);
+        assert_eq!(r.code, Some(9), "{args:?} stderr: {}", r.stderr);
+    }
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    for body in posts.iter() {
+        let sent = last_user_text(body);
+        assert!(sent.contains("+++ b/login.py"), "{sent}");
+        assert!(sent.contains("+    return pw == 'admin'"), "{sent}");
+        assert!(!sent.contains("sk-live-123"), "{sent}");
+    }
+    // Staged changes only: an untracked file is not part of them.
+    let r = run_args(&home, &cwd, &["--json", "review", "--staged"]);
+    assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
+    assert!(r.text_of("notice").contains("nothing to review"));
+}
+
+// ── custom subagents ────────────────────────────────────────────────────────
+
+fn tools_offered(body: &str) -> Vec<String> {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    v["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+// A model with room for the whole tool surface (small local windows get a
+// compact one without the task tool).
+fn write_big_context_config(home: &Path, port: u16) {
+    let cfg = json!({
+        "provider": "ollama", "model": "test-model", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+        "context_tokens": 1_000_000,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+}
+
+#[test]
+fn an_agent_file_is_a_role_with_only_its_tools() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus/agents")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/agents/test-writer.md"),
+        "---\nname: test-writer\ndescription: Writes focused unit tests\ntools: read_file, write_file\n---\nWrite one test per behaviour.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(cwd.join(".claude/agents")).unwrap();
+    std::fs::write(
+        cwd.join(".claude/agents/doc-writer.md"),
+        "---\ndescription: Writes docs\ntools: Read, Write\n---\nDocument it.\n",
+    )
+    .unwrap();
+    let script = || {
+        vec![
+            tool_call(
+                "c1",
+                "task",
+                json!({"task": "add a test", "role": "test-writer"}),
+            ),
+            tool_call("s1", "run_command", json!({"command": "echo hi > ran.txt"})),
+            tool_call(
+                "s2",
+                "write_file",
+                json!({"path": "test_x.py", "content": "def test_x(): pass\n"}),
+            ),
+            finish("sub: wrote test_x.py"),
+            finish("parent done"),
+        ]
+    };
+
+    // Untrusted folder: the project's agent is not a role.
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "task",
+            json!({"task": "add a test", "role": "test-writer"}),
+        ),
+        finish("parent done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "get tests written");
+    let first = posts.lock().unwrap()[0].clone();
+    assert!(!first.contains("test-writer"), "offered before trust");
+    assert!(
+        r.text_of("tool_result")
+            .contains("unknown role 'test-writer'"),
+        "{:?}",
+        r.events
+    );
+
+    trust_folder(&home, &cwd);
+    let (port, posts) = serve_recording(script());
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "get tests written");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    // The parent is offered the role, with its description.
+    assert!(posts[0].contains("test-writer") && posts[0].contains("Writes focused unit tests"));
+    assert!(
+        posts[0].contains("`doc-writer`: Writes docs"),
+        ".claude/agents is read too"
+    );
+    // The helper's own request lists only its tools.
+    let mut helper_tools = tools_offered(&posts[1]);
+    helper_tools.sort();
+    assert_eq!(helper_tools, ["finish", "read_file", "write_file"]);
+    assert!(posts[1].contains("Write one test per behaviour."));
+    // Its run_command attempt is refused; its write lands.
+    assert!(!cwd.join("ran.txt").exists());
+    assert!(r
+        .text_of("tool_denied")
+        .contains("run_command is not one of the test-writer helper's tools"));
+    assert!(cwd.join("test_x.py").exists());
+}
+
+#[test]
+fn a_helper_with_a_tools_list_cannot_delegate_past_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    // `task` on the list: a built-in engineer helper of its own would have
+    // every tool, so the list would hold nothing back.
+    std::fs::write(
+        home.join("agents/reader.md"),
+        "---\nname: reader\ndescription: Reads code\ntools: read_file, task\n---\nRead only.\n",
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "task",
+            json!({"task": "look around", "role": "reader"}),
+        ),
+        tool_call(
+            "s1",
+            "task",
+            json!({"task": "write notes.txt", "role": "engineer"}),
+        ),
+        finish("reader: could not hand it on"),
+        finish("parent done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "look around");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    let mut helper_tools = tools_offered(&posts[1]);
+    helper_tools.sort();
+    assert_eq!(helper_tools, ["finish", "read_file"]);
+    assert!(
+        r.text_of("tool_denied").contains("cannot hand work on"),
+        "{:?}",
+        r.events
+    );
+    // No third agent: the reader's next request is its own, then the parent's
+    // with the reader's summary as the task result.
+    assert_eq!(posts.len(), 4);
+    assert!(posts[3].contains("reader: could not hand it on"));
 }

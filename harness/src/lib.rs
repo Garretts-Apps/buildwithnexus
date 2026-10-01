@@ -101,16 +101,70 @@ struct CliOptions {
     /// `--trust-project <digest>` (or BWN_TRUST_PROJECT): trust exactly this
     /// project settings content for this run (`buildwithnexus trust --print`).
     trust_project: Option<String>,
+    /// `--base-url <url>`: the model endpoint, over the settings value.
+    base_url: Option<String>,
+    /// Words before `--` that look like options but are none of ours, in
+    /// order. Commands with options of their own (`mcp add --url`) read
+    /// them; every other command refuses them as a usage error.
+    unknown_flags: Vec<String>,
+    /// `--worktree <name>`: run the session in .bwn/worktrees/<name> on
+    /// branch bwn/<name>.
+    worktree: Option<String>,
+}
+
+/// Every option `parse_cli_options` knows, for "did you mean" hints.
+const CLI_OPTIONS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--base-url",
+    "--permission-mode",
+    "--permission",
+    "--sandbox",
+    "--prompt",
+    "--effort",
+    "--max-budget-usd",
+    "--json",
+    "--yes",
+    "--legacy-exit-codes",
+    "--trust-project",
+    "--worktree",
+    "--help",
+    "--version",
+];
+
+// `-x` or `--word`; a lone `-` and negative numbers (`-1`) are plain words.
+fn looks_like_option(arg: &str) -> bool {
+    arg.len() > 1 && arg.starts_with('-') && !arg[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// `unknown option --modle (did you mean --model?)`.
+fn unknown_option_msg(flag: &str) -> String {
+    unknown_option_among(flag, CLI_OPTIONS)
+}
+
+fn unknown_option_among(flag: &str, known: &[&str]) -> String {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let near = known
+        .iter()
+        .map(|o| (tools::levenshtein(name, o), *o))
+        .filter(|(d, _)| *d <= 2)
+        .min();
+    match near {
+        Some((_, o)) => format!("unknown option {name} (did you mean {o}?); see --help"),
+        None => format!("unknown option {name}; see --help"),
+    }
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
     let mut opts = CliOptions::default();
     let mut rest = Vec::new();
     let mut budget_raw: Option<String> = None;
+    let mut literal_from: Option<usize> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "--" {
             opts.args_literal = true;
+            literal_from = Some(rest.len());
             rest.extend(it);
             break;
         }
@@ -138,6 +192,8 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--effort" => &mut opts.effort,
             "--max-budget-usd" => &mut budget_raw,
             "--trust-project" => &mut opts.trust_project,
+            "--base-url" => &mut opts.base_url,
+            "--worktree" => &mut opts.worktree,
             _ => {
                 rest.push(arg);
                 continue;
@@ -152,6 +208,19 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
                 .ok_or_else(|| format!("{flag} requires a value; see `buildwithnexus --help`"))?,
         );
     }
+    // The first word may be a flag-spelled command (`-p`, `--version`).
+    let options_end = literal_from.unwrap_or(rest.len());
+    opts.unknown_flags = rest[..options_end]
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| looks_like_option(a) && !(*i == 0 && !is_unknown_option(a)))
+        .map(|(_, a)| a.clone())
+        .collect();
+    if let Some(level) = &opts.effort {
+        config::Effort::parse(level).ok_or_else(|| {
+            format!("--effort must be one of off, low, medium, high (got '{level}')")
+        })?;
+    }
     if let Some(raw) = budget_raw {
         let usd = raw
             .trim()
@@ -165,6 +234,54 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         opts.max_budget_usd = Some(usd);
     }
     Ok((opts, rest))
+}
+
+#[cfg(test)]
+mod cli_option_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<(CliOptions, Vec<String>), String> {
+        parse_cli_options(args.iter().map(|a| a.to_string()).collect())
+    }
+
+    #[test]
+    fn options_nobody_knows_are_collected_before_the_separator_only() {
+        let (opts, rest) = parse(&["run", "--modle", "big", "fix it"]).unwrap();
+        assert_eq!(opts.unknown_flags, ["--modle"]);
+        assert_eq!(rest, ["run", "--modle", "big", "fix it"]);
+        let (opts, _) = parse(&["run", "--", "--modle", "big"]).unwrap();
+        assert!(opts.unknown_flags.is_empty());
+        // Flag-spelled commands first, negative numbers and a lone dash pass.
+        let (opts, _) = parse(&["-p", "subtract", "-1", "-", "x"]).unwrap();
+        assert!(opts.unknown_flags.is_empty());
+        let (opts, _) = parse(&["run", "-p", "x"]).unwrap();
+        assert_eq!(opts.unknown_flags, ["-p"]);
+    }
+
+    #[test]
+    fn unknown_options_suggest_the_nearest_real_one() {
+        assert_eq!(
+            unknown_option_msg("--modle"),
+            "unknown option --modle (did you mean --model?); see --help"
+        );
+        assert_eq!(
+            unknown_option_msg("--base_url=http://x"),
+            "unknown option --base_url (did you mean --base-url?); see --help"
+        );
+        assert_eq!(
+            unknown_option_msg("--frobnicate"),
+            "unknown option --frobnicate; see --help"
+        );
+    }
+
+    #[test]
+    fn base_url_is_an_option_and_effort_is_checked_while_parsing() {
+        let (opts, rest) = parse(&["--base-url", "https://gw.example/v1", "run", "x"]).unwrap();
+        assert_eq!(opts.base_url.as_deref(), Some("https://gw.example/v1"));
+        assert_eq!(rest, ["run", "x"]);
+        let err = parse(&["--effort", "hihg", "run", "x"]).unwrap_err();
+        assert!(err.contains("off, low, medium, high"), "{err}");
+    }
 }
 
 pub fn run() {
@@ -190,6 +307,24 @@ pub fn run() {
     }
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
+    // A mistyped option must not become part of a task (or an interactive
+    // prompt): `run --modle big '<task>'` sends nothing and says so.
+    // Commands with options of their own check them themselves.
+    let own_options = matches!(cmd, "mcp" | "trust" | "update" | "review");
+    if let (false, Some(flag)) = (own_options, opts.unknown_flags.first()) {
+        if matches!(flag.as_str(), "-h" | "--help") {
+            usage();
+            return;
+        }
+        eprintln!("buildwithnexus: {}", unknown_option_msg(flag));
+        std::process::exit(2);
+    }
+    if let Some(name) = &opts.worktree {
+        if let Err((code, e)) = enter_session_worktree(name) {
+            eprintln!("buildwithnexus: --worktree: {e}");
+            std::process::exit(code);
+        }
+    }
 
     match cmd {
         "" => interactive(opts.prompt.clone(), opts),
@@ -202,8 +337,17 @@ pub fn run() {
             }
         }
         "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
+            let input = HeadlessInput::require(&rest());
             headless(&opts, |p, perm, cwd| {
-                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                if let Some((cmd, args)) = find_slash_command(&input.argv) {
+                    if let Some(script) = &cmd.script {
+                        let out = run_script_command(script, &args, perm, &cwd);
+                        let text = out.as_ref().unwrap_or_else(|e| e);
+                        report::tool_result("run_command", text, out.is_err());
+                        return out.map(|_| ());
+                    }
+                }
+                let (task, images) = input.task(p, &cwd);
                 agent::run_build(p, perm, "engineer", &task, &cwd, images)
             })
         }
@@ -217,22 +361,37 @@ pub fn run() {
                 );
                 std::process::exit(2);
             }
+            let input = HeadlessInput::require(&rest());
             headless(&opts, |p, perm, cwd| {
-                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                let (task, images) = input.task(p, &cwd);
                 agent::run_plan(p, perm, &task, &cwd, opts.yes, images)
             })
         }
-        "brainstorm" => headless(&opts, |p, perm, cwd| {
-            let (task, images) = headless_attachments(p, &rest(), &cwd);
-            agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
-        }),
+        "brainstorm" => {
+            let input = HeadlessInput::require(&rest());
+            headless(&opts, |p, perm, cwd| {
+                let (task, images) = input.task(p, &cwd);
+                agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
+            })
+        }
         "sessions" => sessions_command(&args[1..]),
         "continue" | "-c" | "--continue" => continue_command(opts.clone(), rest()),
         "resume" | "-r" | "--resume" => resume_command(opts.clone(), &args[1..]),
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
-        "doctor" => run_doctor(),
+        "doctor" => run_doctor(&opts),
         "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
+        "review" => {
+            let req = match ReviewRequest::parse(&args[1..]) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("buildwithnexus review: {e}");
+                    std::process::exit(2);
+                }
+            };
+            headless(&opts, |p, _perm, cwd| headless_review(p, &req, &cwd))
+        }
+        "update" => std::process::exit(update::cli(&args[1..])),
         "mcp" => match mcp::manage(&args[1..], false) {
             Ok(lines) => {
                 for l in lines {
@@ -241,7 +400,8 @@ pub fn run() {
             }
             Err(e) => {
                 eprintln!("buildwithnexus mcp: {e}");
-                std::process::exit(2);
+                // A refusal to overwrite is not a usage mistake.
+                std::process::exit(if e.ends_with(mcp::EXISTS) { 1 } else { 2 });
             }
         },
         // A stray flag must not become an interactive prompt: `bwn --modle x`
@@ -259,6 +419,144 @@ pub fn run() {
             std::process::exit(2);
         }
     }
+    print_session_worktree_hint();
+}
+
+// `--json sessions`: one `session` event per saved session, newest first,
+// and nothing else on stdout (an empty list prints nothing).
+fn print_sessions_json(all: &[session::Session]) {
+    for s in all {
+        report::event(serde_json::json!({
+            "type": "session",
+            "id": s.id,
+            "title": s.title,
+            "cwd": s.cwd,
+            "model": s.model,
+            "created_ms": s.created_ms as u64,
+            "updated_ms": s.updated_ms as u64,
+            "messages": s.msgs.len(),
+        }));
+    }
+}
+
+// The worktree a `--worktree` session runs in: (path, branch, repo root).
+static SESSION_WORKTREE: std::sync::OnceLock<(PathBuf, String, PathBuf)> =
+    std::sync::OnceLock::new();
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git could not start ({e})"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .last()
+            .unwrap_or("git failed")
+            .trim()
+            .to_string())
+    }
+}
+
+// A name git accepts in a branch and a folder: letters, digits, `.`, `_`, `-`.
+fn worktree_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `--worktree <name>`: create (or reuse) <repo>/.bwn/worktrees/<name> on
+/// branch bwn/<name> from HEAD and move the session into it. `.bwn/` goes
+/// into the repository's info/exclude so the main checkout never shows it.
+fn enter_session_worktree(name: &str) -> Result<(), (i32, String)> {
+    if !worktree_name_ok(name) {
+        return Err((
+            2,
+            format!("'{name}' is not a usable name — use letters, digits, '.', '_' or '-'"),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|e| (1, e.to_string()))?;
+    let root = git_in(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .map_err(|_| (1, "not inside a git repository".to_string()))?;
+    git_in(&root, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|_| (1, "the repository has no commits yet".to_string()))?;
+    let path = root.join(".bwn").join("worktrees").join(name);
+    let branch = format!("bwn/{name}");
+    if !path.join(".git").exists() {
+        let has_branch = git_in(
+            &root,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok();
+        let path_s = path.to_string_lossy().into_owned();
+        let args: Vec<&str> = if has_branch {
+            vec!["worktree", "add", &path_s, &branch]
+        } else {
+            vec!["worktree", "add", "-b", &branch, &path_s, "HEAD"]
+        };
+        git_in(&root, &args).map_err(|e| (1, format!("git worktree add failed: {e}")))?;
+    }
+    if let Ok(common) = git_in(&root, &["rev-parse", "--git-common-dir"]) {
+        let exclude = root.join(common).join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !text.lines().any(|l| l.trim() == "/.bwn/") {
+            let _ = std::fs::create_dir_all(exclude.parent().unwrap_or(&root));
+            let sep = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let _ = std::fs::write(&exclude, format!("{text}{sep}/.bwn/\n"));
+        }
+    }
+    std::env::set_current_dir(&path).map_err(|e| (1, e.to_string()))?;
+    eprintln!(
+        "{}",
+        tui::dim(&format!(
+            "buildwithnexus: working in .bwn/worktrees/{name} on branch {branch}"
+        ))
+    );
+    let _ = SESSION_WORKTREE.set((path, branch, root));
+    Ok(())
+}
+
+/// On the way out of a `--worktree` session: where the work is and how to
+/// bring it in.
+fn print_session_worktree_hint() {
+    let Some((path, branch, root)) = SESSION_WORKTREE.get() else {
+        return;
+    };
+    let shown = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let dirty = git_in(path, &["status", "--porcelain"])
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let pending = if dirty > 0 {
+        format!(
+            " ({dirty} uncommitted change{} there — commit them first)",
+            if dirty == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "{}",
+        tui::yellow(&tui::sanitize_terminal(&format!(
+            "buildwithnexus: this session's work is on branch {branch} in {shown}{pending} — git merge {branch}"
+        )))
+    );
 }
 
 // Options and flag-spelled subcommands the top-level match accepts. Anything
@@ -311,6 +609,9 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         // at the address last used with it, or at its preset default.
         settings.base_url = remembered_endpoint(p);
         settings.provider = p.clone();
+    }
+    if let Some(u) = &opts.base_url {
+        settings.base_url = Some(u.clone());
     }
     set_active_preset(&settings.provider);
     let mut provider = build_provider(&settings)?;
@@ -612,6 +913,248 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
     Ok(provider)
 }
 
+/// Most piped input a headless run sends, as the task or as a `[stdin]`
+/// block after it; the rest is read and dropped so the writer never sees a
+/// broken pipe.
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
+/// With a task on the command line, stdin is read only if something arrives
+/// this soon: a pipe a parent process leaves open must not hang the run.
+const STDIN_FIRST_BYTE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a headless run was asked to do: the task from argv, and what was
+/// piped on stdin.
+struct HeadlessInput {
+    argv: String,
+    stdin: Option<String>,
+    // Said once the run has started (truncation, an ignored silent pipe).
+    notice: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Piped {
+    Text { text: String, cut: bool },
+    // A task was given and nothing arrived in time; the pipe was not read.
+    Silent,
+    Nothing,
+}
+
+impl HeadlessInput {
+    /// Reads stdin when it is not a terminal, and exits 2 when neither argv
+    /// nor stdin holds a task, before any setup or request.
+    fn require(argv: &str) -> Self {
+        let have_task = !argv.trim().is_empty();
+        let piped = if std::io::stdin().is_terminal() {
+            Piped::Nothing
+        } else {
+            let wait = have_task.then_some(STDIN_FIRST_BYTE_WAIT);
+            collect_piped(&spawn_stdin_reader(), wait, MAX_STDIN_BYTES)
+        };
+        let input = Self::from_parts(argv, piped);
+        if !have_task && input.stdin.is_none() {
+            eprintln!(
+                "buildwithnexus: no task given — pass it as an argument \
+                 (buildwithnexus run 'fix the typo') or on stdin (echo 'fix the typo' | buildwithnexus run)"
+            );
+            std::process::exit(2);
+        }
+        input
+    }
+
+    fn from_parts(argv: &str, piped: Piped) -> Self {
+        let mib = MAX_STDIN_BYTES / (1024 * 1024);
+        let (stdin, notice) = match piped {
+            Piped::Text { text, .. } if text.trim().is_empty() => (None, None),
+            Piped::Text { text, cut } => (
+                Some(if cut {
+                    format!("{text}\n[stdin cut at {mib} MiB]")
+                } else {
+                    text
+                }),
+                cut.then(|| {
+                    format!("  stdin was longer than {mib} MiB — only the first {mib} MiB was sent")
+                }),
+            ),
+            Piped::Silent => (
+                None,
+                Some(format!(
+                    "  nothing arrived on stdin within {}s, so it was not read — \
+                     for slow input, write it to a file and redirect it (< file)",
+                    STDIN_FIRST_BYTE_WAIT.as_secs()
+                )),
+            ),
+            Piped::Nothing => (None, None),
+        };
+        Self {
+            argv: argv.to_string(),
+            stdin,
+            notice,
+        }
+    }
+
+    /// The task for the model. Argv words go through @path attachments as
+    /// typed tasks do; piped text is data (logs, diffs) and is sent as is.
+    fn task(&self, p: &Provider, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
+        if let Some(n) = &self.notice {
+            report::notice(n);
+        }
+        let stdin = self.stdin.as_deref();
+        if self.argv.trim().is_empty() {
+            return (stdin.unwrap_or_default().to_string(), Vec::new());
+        }
+        // `/deploy staging` runs the deploy command or skill, as in a session.
+        if let Some((cmd, args)) = find_slash_command(&self.argv) {
+            let prompt = config::command_prompt(&cmd, &args);
+            return match stdin {
+                Some(s) => (format!("{prompt}\n\n[stdin]\n{s}"), Vec::new()),
+                None => (prompt, Vec::new()),
+            };
+        }
+        let (task, images) = headless_attachments(p, &self.argv, cwd);
+        match stdin {
+            Some(s) => (format!("{task}\n\n[stdin]\n{s}"), images),
+            None => (task, images),
+        }
+    }
+}
+
+// Reads stdin on its own thread, a chunk per message; the channel closes at
+// end of input. Once the receiver is gone the rest is read and dropped.
+fn spawn_stdin_reader() -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = tx.send(buf[..n].to_vec());
+                }
+            }
+        }
+    });
+    rx
+}
+
+// Up to `cap` bytes from the reader. `first_wait` bounds the wait for the
+// first chunk; without it the wait is unbounded, with a hint on stderr.
+fn collect_piped(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    first_wait: Option<std::time::Duration>,
+    cap: usize,
+) -> Piped {
+    use std::sync::mpsc::RecvTimeoutError;
+    let first = match first_wait {
+        Some(wait) => match rx.recv_timeout(wait) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Timeout) => return Piped::Silent,
+            Err(RecvTimeoutError::Disconnected) => return Piped::Nothing,
+        },
+        None => match rx.recv_timeout(STDIN_FIRST_BYTE_WAIT) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Disconnected) => return Piped::Nothing,
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("buildwithnexus: no task argument — waiting for the task on stdin…");
+                match rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return Piped::Nothing,
+                }
+            }
+        },
+    };
+    let mut buf = first;
+    let mut cut = false;
+    while buf.len() <= cap {
+        match rx.recv() {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    if buf.len() > cap {
+        buf.truncate(cap);
+        cut = true;
+        // Drop a character split by the cut rather than send U+FFFD.
+        while std::str::from_utf8(&buf).is_err_and(|e| e.error_len().is_none()) {
+            buf.pop();
+        }
+    }
+    Piped::Text {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        cut,
+    }
+}
+
+#[cfg(test)]
+mod headless_input_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    #[test]
+    fn piped_input_is_read_to_the_end_and_cut_at_the_cap() {
+        let (tx, rx) = channel();
+        tx.send(b"abc".to_vec()).unwrap();
+        tx.send(b"def".to_vec()).unwrap();
+        drop(tx);
+        let got = collect_piped(&rx, Some(Duration::from_secs(1)), 100);
+        assert_eq!(
+            got,
+            Piped::Text {
+                text: "abcdef".into(),
+                cut: false
+            }
+        );
+
+        let (tx, rx) = channel();
+        tx.send("é".repeat(10).into_bytes()).unwrap();
+        // 7 bytes would split the fourth two-byte character: it is dropped.
+        let Piped::Text { text, cut } = collect_piped(&rx, None, 7) else {
+            panic!("no text");
+        };
+        assert!(cut);
+        assert_eq!(text, "ééé");
+    }
+
+    #[test]
+    fn a_silent_pipe_is_skipped_only_when_a_task_was_given() {
+        let (tx, rx) = channel::<Vec<u8>>();
+        assert_eq!(
+            collect_piped(&rx, Some(Duration::from_millis(20)), 100),
+            Piped::Silent
+        );
+        drop(tx);
+        assert_eq!(collect_piped(&rx, None, 100), Piped::Nothing);
+    }
+
+    #[test]
+    fn piped_text_follows_the_task_as_a_block_or_is_the_task() {
+        let input = HeadlessInput::from_parts(
+            "why?",
+            Piped::Text {
+                text: "log line".into(),
+                cut: true,
+            },
+        );
+        assert_eq!(
+            input.stdin.as_deref(),
+            Some("log line\n[stdin cut at 1 MiB]")
+        );
+        assert!(input.notice.unwrap().contains("1 MiB"));
+        let blank = HeadlessInput::from_parts(
+            "",
+            Piped::Text {
+                text: " \n".into(),
+                cut: false,
+            },
+        );
+        assert!(blank.stdin.is_none() && blank.notice.is_none());
+        let silent = HeadlessInput::from_parts("why?", Piped::Silent);
+        assert!(silent.stdin.is_none());
+        assert!(silent.notice.unwrap().contains("not read"));
+    }
+}
+
 fn headless(
     opts: &CliOptions,
     f: impl FnOnce(&Provider, Permission, PathBuf) -> Result<(), String>,
@@ -625,6 +1168,7 @@ fn headless(
             std::process::exit(1);
         }
     };
+    exit_on_interrupt();
     provider::prewarm(&provider);
     hooks::init(&cwd, false);
     hooks::set_permission_mode(agent::permission_name(perm));
@@ -669,10 +1213,14 @@ fn headless(
     if let Some(n) = agent::ignored_approvals_notice_once(&cwd) {
         report::notice(&format!("  {n}"));
     }
-    // MCP tools must be on the surface before the first request; discovery
-    // is bounded by each server's timeout, and every outcome is a notice.
-    mcp::ensure_ready();
+    // MCP tools must be on the surface before the first request. A server
+    // that is not ready within a few seconds (or its own timeout_secs) is
+    // skipped for this run, with a notice, rather than stalling it.
+    let skipped = mcp::ensure_ready_headless();
     report_mcp_notices();
+    for n in skipped {
+        report::notice(&format!("  {n}"));
+    }
 
     // Nobody can answer an approval prompt here, so `ask` blocks every edit
     // and command. Say so before the run, not after it looks successful.
@@ -707,20 +1255,48 @@ fn headless(
             if blocked == 1 { "it" } else { "them" }
         ));
     }
+    // Refusals by a hook, a rule or read-only mode: the run did not do what
+    // it was asked, though nothing failed.
+    let denied = (blocked == 0)
+        .then(|| report::denials_line(&report::denials()))
+        .flatten();
 
     let outcome = match &r {
         Err(_) if blocked > 0 => agent::Outcome::ApprovalBlocked,
         Err(_) => agent::Outcome::Failed,
+        Ok(()) if denied.is_some() => agent::Outcome::ApprovalBlocked,
         Ok(()) => agent::stopped_short_outcome().unwrap_or(agent::Outcome::Success),
     };
     let legacy = opts.legacy_exit_codes
         || std::env::var("BWN_LEGACY_EXIT_CODES").is_ok_and(|v| !v.is_empty() && v != "0");
-    let code = headless_exit_code(outcome, r.is_ok(), legacy);
+    let mut code = headless_exit_code(outcome, r.is_ok(), legacy);
+    let mut outcome_name = outcome.as_str();
+    let blocking = REVIEW_BLOCKING.load(std::sync::atomic::Ordering::Relaxed);
+    if outcome == agent::Outcome::Success && blocking > 0 {
+        code = EXIT_REVIEW_BLOCKING;
+        outcome_name = "review_blocking";
+    }
 
     if !report::is_json() {
         println!();
-        if outcome == agent::Outcome::Success {
+        if code == EXIT_REVIEW_BLOCKING {
+            println!(
+                "{}",
+                tui::yellow(&format!(
+                    "⚠ review found {blocking} blocking issue{} after {elapsed:.2?}",
+                    if blocking == 1 { "" } else { "s" }
+                ))
+            );
+        } else if outcome == agent::Outcome::Success {
             println!("{}", tui::green(&format!("✓ done in {elapsed:.2?}")));
+        } else if let (Ok(()), Some(line)) = (&r, &denied) {
+            println!(
+                "{}",
+                tui::yellow(&format!(
+                    "⚠ {} after {elapsed:.2?}",
+                    tui::sanitize_terminal(line)
+                ))
+            );
         } else if r.is_ok() {
             println!(
                 "{}",
@@ -730,12 +1306,15 @@ fn headless(
             println!("{}", tui::red(&format!("✗ failed after {elapsed:.2?}")));
         }
     }
-    report::result(outcome.as_str(), code);
+    report::result(outcome_name, code);
 
     if let Err(e) = r {
         eprintln!("{}", tui::red(&tui::sanitize_terminal(&e)));
+    } else if let (true, Some(line)) = (report::is_json(), &denied) {
+        eprintln!("{}", tui::yellow(&tui::sanitize_terminal(line)));
     }
     if code != 0 {
+        print_session_worktree_hint();
         std::process::exit(code);
     }
 }
@@ -748,6 +1327,80 @@ fn headless_exit_code(outcome: agent::Outcome, turn_ok: bool, legacy: bool) -> i
     } else {
         outcome.exit_code()
     }
+}
+
+// SIGINT or SIGTERM during a headless run: end with 128 + the signal, a
+// final result event (outcome "interrupted") and a line naming the saved
+// session. The handler only records the signal; a watcher thread does the
+// rest outside signal context.
+static INTERRUPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn exit_on_interrupt() {
+    if !install_interrupt_handlers() {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        let sig = INTERRUPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+        if sig != 0 {
+            let code = 128 + sig;
+            report::result("interrupted", code);
+            let resume = crate::session::current()
+                .map(|id| {
+                    format!(
+                        " — session {id} saved; resume with `buildwithnexus resume {id} <task>`"
+                    )
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "{}",
+                tui::yellow(&format!("buildwithnexus: interrupted{resume}"))
+            );
+            print_session_worktree_hint();
+            std::process::exit(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+}
+
+#[cfg(unix)]
+fn install_interrupt_handlers() -> bool {
+    extern "C" fn on_signal(sig: libc::c_int) {
+        INTERRUPT_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+    }
+    let h: extern "C" fn(libc::c_int) = on_signal;
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, h as usize);
+        libc::signal(libc::SIGTERM, h as usize);
+    }
+    true
+}
+
+// Ctrl+C and Ctrl+Break in a console: handled (TRUE), so the watcher thread
+// can report and exit with 130. Closing the window keeps the default.
+#[cfg(windows)]
+fn install_interrupt_handlers() -> bool {
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn on_ctrl(kind: u32) -> i32 {
+        // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1.
+        if kind <= 1 {
+            INTERRUPT_SIGNAL.store(2, std::sync::atomic::Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+    // SAFETY: registers a handler that only stores to an atomic.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) != 0 }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_interrupt_handlers() -> bool {
+    false
 }
 
 // Connected / failed / disconnected lines from background discovery.
@@ -1366,28 +2019,14 @@ fn repl(
                 handle_compact(&provider, &mut transcript);
                 continue;
             }
-            "/review" => {
-                tui::line(&tui::accent("  /review — AI code review"));
-                tui::line(&tui::dim("  Reviews staged changes (or the last diff). Press Enter to review, or type a focus area."));
-                let focus = tui::ask("  focus (optional): ").unwrap_or_default();
-                let task = if focus.trim().is_empty() {
-                    "Review the current git diff (git diff HEAD and git diff --staged). Summarize what changed, identify bugs, style issues, and potential improvements. Be concise.".to_string()
-                } else {
-                    format!("Review the current git diff focusing on: {}. Run `git diff HEAD` and `git diff --staged` to see the changes.", focus.trim())
-                };
-                tui::line("");
-                if let Err(e) = agent::run_build_session(
+            _ if t == "/review" || t.starts_with("/review ") => {
+                handle_review(
                     &provider,
-                    perm,
-                    "researcher",
-                    &task,
+                    t["/review".len()..].trim(),
                     cwd,
                     &mut transcript,
                     &sid,
-                ) {
-                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-                }
-                tui::bell();
+                );
                 continue;
             }
             "/commit" => {
@@ -1420,7 +2059,7 @@ fn repl(
                 continue;
             }
             "/doctor" | "/debug" => {
-                handle_doctor_tui();
+                handle_doctor_tui(&provider);
                 continue;
             }
             "/diff" => {
@@ -1647,45 +2286,21 @@ fn repl(
             let cmd_name = words.next().unwrap_or("");
             let cmd_args = words.next().unwrap_or("").trim();
             if let Some(custom) = find_custom_command(cmd_name) {
-                if let Some(script) = custom.script {
-                    // Shell-quote the script path to guard against spaces (UX-007).
-                    let escaped = script.to_string_lossy().replace('\'', "'\"'\"'");
-                    let shell_cmd = if cmd_args.is_empty() {
-                        format!("'{escaped}'")
-                    } else {
-                        format!("'{escaped}' {cmd_args}")
-                    };
-                    let tool_input = serde_json::json!({"command": shell_cmd});
-                    // UX-002: script-based custom commands must pass through the
-                    // permission gate and PreToolUse hooks just like any run_command.
-                    if let hooks::PreDecision::Deny(r) =
-                        hooks::pre_tool_use("run_command", &tool_input, cwd)
-                    {
-                        tui::line(&tui::red(&format!(
-                            "  blocked by hook: {}",
-                            tui::sanitize_terminal(&r)
-                        )));
-                        tui::bell();
-                        continue;
-                    }
-                    if let Some(reason) = agent::gate(perm, "run_command", &tool_input, cwd) {
-                        tui::line(&tui::red(&format!("  {reason}")));
-                        tui::bell();
-                        continue;
-                    }
-                    let out = tools::run("run_command", &tool_input, cwd);
-                    for l in tui::sanitize_terminal(&out.content).lines() {
-                        tui::line(&format!("  {l}"));
+                if let Some(script) = &custom.script {
+                    match run_script_command(script, cmd_args, perm, cwd) {
+                        Ok(out) => {
+                            for l in tui::sanitize_terminal(&out).lines() {
+                                tui::line(&format!("  {l}"));
+                            }
+                        }
+                        Err(e) => {
+                            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))))
+                        }
                     }
                 } else {
-                    // Inject the skill content as context and run in BUILD mode.
-                    let user_input = if cmd_args.is_empty() {
-                        t.to_string()
-                    } else {
-                        format!("{t} {cmd_args}")
-                    };
-                    let task_with_context =
-                        format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
+                    // A command's body (or a skill as context) with the
+                    // arguments filled in once, run in BUILD mode.
+                    let task_with_context = config::command_prompt(&custom, cmd_args);
                     tui::line("");
                     if let Err(e) = agent::run_build_session(
                         &provider,
@@ -2262,6 +2877,9 @@ fn sessions_command(args: &[String]) {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let all = session::list_here_first(&cwd);
+    if report::is_json() {
+        return print_sessions_json(&all);
+    }
     if all.is_empty() {
         // Empty output reads as "broken"; say why the list is empty.
         println!("no saved sessions yet — every conversation is saved as it runs.");
@@ -2678,6 +3296,43 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
     config::load_custom_commands()
         .into_iter()
         .find(|c| c.name == name)
+}
+
+/// `/name args` naming a command or skill: that command and its arguments.
+/// A task that merely starts with a path (`/usr/bin/foo fails`) is not one.
+fn find_slash_command(text: &str) -> Option<(config::CustomCommand, String)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let mut words = rest.splitn(2, char::is_whitespace);
+    let name = words.next().filter(|n| !n.is_empty() && !n.contains('/'))?;
+    let args = words.next().unwrap_or("").trim().to_string();
+    find_custom_command(name).map(|c| (c, args))
+}
+
+// A script command runs like any run_command: PreToolUse hooks, then the
+// permission gate. Its output on success, the refusal or output otherwise.
+fn run_script_command(
+    script: &std::path::Path,
+    args: &str,
+    perm: Permission,
+    cwd: &std::path::Path,
+) -> Result<String, String> {
+    // Shell-quote the script path to guard against spaces (UX-007).
+    let escaped = script.to_string_lossy().replace('\'', "'\"'\"'");
+    let shell_cmd = if args.is_empty() {
+        format!("'{escaped}'")
+    } else {
+        format!("'{escaped}' {args}")
+    };
+    let tool_input = serde_json::json!({"command": shell_cmd});
+    if let Some(reason) = agent::hook_gate(perm, "run_command", &tool_input, cwd) {
+        return Err(reason);
+    }
+    let out = tools::run("run_command", &tool_input, cwd);
+    if out.is_error {
+        Err(out.content)
+    } else {
+        Ok(out.content)
+    }
 }
 
 fn handle_model(provider: &mut Provider) {
@@ -3693,9 +4348,11 @@ fn handle_rules(cwd: &std::path::Path) {
 // description carrying OSC 52 used to write to the user's clipboard.
 fn rules_listing(cwd: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut engine = crate::rules::RuleEngine::load_defaults();
+    let user_dir = config::home().join("rules");
+    let (mut engine, user_failures) = crate::rules::RuleEngine::load_with_overrides(&user_dir);
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
-    let (loaded, failures) = load_workspace_rule_files(&rules_dir);
+    let (loaded, mut failures) = load_workspace_rule_files(&rules_dir);
+    failures.extend(user_failures);
     for r in loaded {
         engine.add_rule(r);
     }
@@ -3718,9 +4375,14 @@ fn rules_listing(cwd: &std::path::Path) -> Vec<String> {
             crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
         };
         out.push(format!(
-            "  [{sev_badge}] {} — {}",
+            "  [{sev_badge}] {} — {}{}",
             tui::bold(&tui::sanitize_terminal(&r.id)),
-            tui::sanitize_terminal(&r.description)
+            tui::sanitize_terminal(&r.description),
+            if r.enabled {
+                String::new()
+            } else {
+                tui::dim(" (off)")
+            }
         ));
     }
     out
@@ -3936,6 +4598,316 @@ fn handle_kb_index(cwd: &std::path::Path) {
         tui::line(&tui::dim(
             "  tip: @kb:<name> or @symbol:<name> injects symbol definitions into prompts",
         ));
+    }
+}
+
+// ── review ───────────────────────────────────────────────────────────────────
+
+/// `bwn review` exits with this when a finding is blocking.
+const EXIT_REVIEW_BLOCKING: i32 = 9;
+// Blocking findings of the headless review in this process.
+static REVIEW_BLOCKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// The diff a review sends is cut here; the model can read files for more.
+const MAX_REVIEW_DIFF_BYTES: usize = 200 * 1024;
+
+/// What to review: `--base <ref>` (the branch since it forked, plus
+/// uncommitted changes), `--staged`, or by default everything not yet
+/// committed; any other words are the focus.
+#[derive(Debug, Default, PartialEq)]
+struct ReviewRequest {
+    base: Option<String>,
+    staged: bool,
+    focus: String,
+}
+
+impl ReviewRequest {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut req = ReviewRequest::default();
+        let mut focus = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let (flag, inline) = a
+                .split_once('=')
+                .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
+            match flag {
+                "--base" => {
+                    let v = inline
+                        .map(str::to_string)
+                        .or_else(|| it.next().cloned())
+                        .filter(|v| !v.trim().is_empty() && !v.starts_with('-'))
+                        .ok_or("--base needs a git ref (e.g. --base origin/main)")?;
+                    req.base = Some(v);
+                }
+                "--staged" => req.staged = true,
+                f if looks_like_option(f) => {
+                    return Err(unknown_option_among(f, &["--base", "--staged"]))
+                }
+                _ => focus.push(a.clone()),
+            }
+        }
+        if req.staged && req.base.is_some() {
+            return Err("give --base or --staged, not both".into());
+        }
+        req.focus = focus.join(" ");
+        Ok(req)
+    }
+
+    // What the review covers, in words and as git diff arguments.
+    fn diffs(&self) -> Vec<(String, Vec<String>)> {
+        match (&self.base, self.staged) {
+            (Some(b), _) => vec![
+                (format!("changes since {b}"), vec![format!("{b}...HEAD")]),
+                ("uncommitted changes".into(), vec!["HEAD".into()]),
+            ],
+            (None, true) => vec![("staged changes".into(), vec!["--staged".into()])],
+            (None, false) => vec![("uncommitted changes".into(), vec!["HEAD".into()])],
+        }
+    }
+}
+
+// The diff text for `req`, each part headed; empty when nothing changed.
+fn review_diff(req: &ReviewRequest, cwd: &std::path::Path) -> Result<String, String> {
+    let mut out = String::new();
+    for (what, args) in req.diffs() {
+        let mut cmd = vec!["--no-pager", "diff", "--no-color", "--no-ext-diff"];
+        cmd.extend(args.iter().map(String::as_str));
+        let text = git_in(cwd, &cmd).map_err(|e| format!("git diff failed: {e}"))?;
+        if !text.trim().is_empty() {
+            out.push_str(&format!("### {what}\n```diff\n{text}\n```\n"));
+        }
+    }
+    // A file git does not track yet is not yet committed either.
+    if !req.staged {
+        out.push_str(&untracked_diff(cwd));
+    }
+    if out.len() > MAX_REVIEW_DIFF_BYTES {
+        let mut cut = MAX_REVIEW_DIFF_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n…(diff cut at 200 KiB — read the files for the rest)\n");
+    }
+    Ok(out)
+}
+
+// Files git neither tracks nor ignores, each as a new-file diff. Key and
+// credential files are named but not sent, as the file tools hide them;
+// links and binary files are named only.
+fn untracked_diff(cwd: &std::path::Path) -> String {
+    use std::io::Read;
+    let Ok(list) = git_in(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]) else {
+        return String::new();
+    };
+    let mut body = String::new();
+    let mut left_out = Vec::new();
+    for rel in list.split('\0').filter(|p| !p.is_empty()) {
+        if body.len() > MAX_REVIEW_DIFF_BYTES {
+            break;
+        }
+        let path = cwd.join(rel);
+        if tools::is_sensitive(&path) {
+            left_out.push(rel);
+            continue;
+        }
+        let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+        let mut bytes = Vec::new();
+        let read = regular
+            && std::fs::File::open(&path)
+                .and_then(|f| f.take(MAX_REVIEW_DIFF_BYTES as u64).read_to_end(&mut bytes))
+                .is_ok();
+        body.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
+        match std::str::from_utf8(&bytes) {
+            Ok(text) if read && !bytes.contains(&0) => {
+                for l in text.lines() {
+                    body.push('+');
+                    body.push_str(l);
+                    body.push('\n');
+                }
+            }
+            _ => body.push_str("(not text: a link, a folder or a binary file)\n"),
+        }
+    }
+    let mut out = String::new();
+    if !body.is_empty() {
+        out.push_str(&format!(
+            "### new files, not yet tracked\n```diff\n{body}```\n"
+        ));
+    }
+    if !left_out.is_empty() {
+        out.push_str(&format!(
+            "(new files left out because they may hold keys or credentials: {})\n",
+            left_out.join(", ")
+        ));
+    }
+    out
+}
+
+fn review_task(req: &ReviewRequest, diff: &str) -> String {
+    let focus = if req.focus.is_empty() {
+        String::new()
+    } else {
+        format!("Focus on: {}.\n", req.focus)
+    };
+    format!(
+        "Review this change as a careful senior reviewer. Read the files around it when \
+         the diff alone is not enough. You cannot edit anything.\n{focus}\n\
+         End with the findings, one per line, exactly in this form:\n\
+         - [blocking] path/to/file.rs:42 — what is wrong and why it matters\n\
+         Severities: blocking (a bug, security hole or data loss that must be fixed \
+         before merging), major, minor, nit. Leave out the location when there is none. \
+         If there is nothing to report, say: No findings.\n\n{diff}"
+    )
+}
+
+#[derive(Debug, PartialEq)]
+struct Finding {
+    severity: String,
+    path: Option<String>,
+    line: Option<u64>,
+    message: String,
+}
+
+// `- [blocking] src/a.rs:42 — message` lines of a review answer.
+fn parse_findings(text: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let l = raw.trim().trim_start_matches(['-', '*', '•']).trim_start();
+        let Some(rest) = l.strip_prefix('[') else {
+            continue;
+        };
+        let Some((sev, body)) = rest.split_once(']') else {
+            continue;
+        };
+        let severity = sev.trim().to_ascii_lowercase();
+        if !matches!(severity.as_str(), "blocking" | "major" | "minor" | "nit") {
+            continue;
+        }
+        let body = body.trim();
+        let (loc, message) = match body.split_once(" — ").or_else(|| body.split_once(" - ")) {
+            Some((loc, msg)) if !loc.contains(' ') => (Some(loc.trim_matches('`')), msg.trim()),
+            _ => (None, body),
+        };
+        let (path, line) = match loc.and_then(|l| l.rsplit_once(':')) {
+            Some((p, n)) if n.parse::<u64>().is_ok() => (Some(p.to_string()), n.parse().ok()),
+            _ => (loc.map(str::to_string), None),
+        };
+        out.push(Finding {
+            severity,
+            path,
+            line,
+            message: message.to_string(),
+        });
+    }
+    out
+}
+
+// `bwn review`: one read-only review turn over the diff; a `finding`
+// event per issue, and exit 9 when one is blocking.
+fn headless_review(p: &Provider, req: &ReviewRequest, cwd: &std::path::Path) -> Result<(), String> {
+    let diff = review_diff(req, cwd)?;
+    if diff.trim().is_empty() {
+        report::notice("  nothing to review: no changes");
+        return Ok(());
+    }
+    let mut transcript = Vec::new();
+    let sid = session::claim_or_new();
+    let text = agent::run_review(p, &review_task(req, &diff), cwd, &mut transcript, &sid)?;
+    let findings = parse_findings(&text);
+    for f in &findings {
+        report::finding(&f.severity, f.path.as_deref(), f.line, &f.message);
+    }
+    let blocking = findings.iter().filter(|f| f.severity == "blocking").count();
+    REVIEW_BLOCKING.store(blocking, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+// `/review [--base <ref>|--staged] [focus]`: the same read-only review in
+// the session's conversation.
+fn handle_review(
+    provider: &Provider,
+    args: &str,
+    cwd: &std::path::Path,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    let words = shlex::split(args).unwrap_or_default();
+    let req = match ReviewRequest::parse(&words) {
+        Ok(r) => r,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            tui::line(&tui::dim(
+                "  usage: /review [--base <ref> | --staged] [focus]",
+            ));
+            return;
+        }
+    };
+    let diff = match review_diff(&req, cwd) {
+        Ok(d) if d.trim().is_empty() => {
+            tui::line(&tui::dim("  nothing to review: no changes"));
+            return;
+        }
+        Ok(d) => d,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            return;
+        }
+    };
+    let what: Vec<String> = req.diffs().into_iter().map(|(w, _)| w).collect();
+    tui::line(&tui::accent(&format!(
+        "  /review — {} (read-only)",
+        what.join(" and ")
+    )));
+    tui::line("");
+    if let Err(e) = agent::run_review(provider, &review_task(&req, &diff), cwd, transcript, sid) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::bell();
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn review_targets_parse() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ReviewRequest::parse(&a(&["--base", "origin/main", "auth", "paths"])).unwrap(),
+            ReviewRequest {
+                base: Some("origin/main".into()),
+                staged: false,
+                focus: "auth paths".into()
+            }
+        );
+        assert!(ReviewRequest::parse(&a(&["--base=main"]))
+            .unwrap()
+            .base
+            .is_some());
+        assert!(ReviewRequest::parse(&a(&["--base"])).is_err());
+        assert!(ReviewRequest::parse(&a(&["--staged", "--base", "x"])).is_err());
+        assert!(ReviewRequest::parse(&a(&["--bsae", "x"]))
+            .unwrap_err()
+            .contains("did you mean --base"));
+    }
+
+    #[test]
+    fn findings_are_read_from_the_answer() {
+        let text = "Looks fine overall.\n\
+                    - [blocking] src/auth.rs:42 — token compared with ==, timing leak\n\
+                    * [nit] README.md — typo in the title\n\
+                    - [minor] no tests for the new flag\n\
+                    - [later] not a severity\n";
+        let f = parse_findings(text);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0].severity, "blocking");
+        assert_eq!(f[0].path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(f[0].line, Some(42));
+        assert_eq!(f[1].path.as_deref(), Some("README.md"));
+        assert_eq!(f[1].line, None);
+        assert_eq!(f[2].path, None);
+        assert_eq!(f[2].message, "no tests for the new flag");
+        assert!(parse_findings("No findings.").is_empty());
     }
 }
 
@@ -5551,31 +6523,65 @@ fn handle_align(cwd: &std::path::Path) {
     ));
 }
 
+// What delegation really is: the model hands a subtask to a helper with the
+// task tool; helpers are the two built-in roles and any agent files.
 fn handle_teamwork() {
-    tui::line(&tui::accent("  teamwork — multi-agent swarm preview"));
+    tui::line(&tui::accent(
+        "  teamwork — helpers the model can delegate to",
+    ));
     tui::line(&tui::dim(
-        "  for complex projects, buildwithnexus orchestrates specialized subagent teams:",
+        "  In BUILD the model can hand a self-contained subtask to a helper with the task tool \
+         (spawn_subagent). The helper gets a fresh context, works, and reports back.",
     ));
     tui::line(&format!(
-        "    • {} — Explores documentation, code graphs, and symbol trees",
-        tui::bold("Researcher Subagent")
+        "    • {} — the default: edits files and runs commands under your permission",
+        tui::bold("engineer")
     ));
     tui::line(&format!(
-        "    • {} — Analyzes logs, stack traces, and test regressions",
-        tui::bold("Debugger Subagent")
+        "    • {} — reads and investigates, cites paths",
+        tui::bold("researcher")
     ));
     tui::line(&format!(
-        "    • {} — Edits code files, runs migrations, and applies patches",
-        tui::bold("Code Writer Subagent")
+        "    • {} — `isolate: true` runs the helper in a git worktree on its own branch",
+        tui::bold("isolation")
     ));
-    tui::line(&format!(
-        "    • {} — Checks engineering rules, static analysis, and confidence",
-        tui::bold("Verifier Subagent")
-    ));
-    tui::line(&tui::dim("  Tip: Use `invoke_subagent` in your custom rules/workflows to dispatch tasks to this team."));
+    tui::line(&tui::dim(&format!(
+        "  Your own helpers: <name>.md files (name, description, tools in frontmatter; instructions \
+         as the body) in {}/agents or ~/.claude/agents, and in a trusted project's \
+         .buildwithnexus/agents or .claude/agents. /agents lists them.",
+        config::home().display()
+    )));
 }
 
+// `/agents`: the helpers the model can delegate to, then Agents.md.
 fn handle_agents() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let defs = config::load_agent_defs(&cwd);
+    if defs.is_empty() {
+        tui::line(&tui::dim(&format!(
+            "  no helper agents yet — add <name>.md to {}/agents or .buildwithnexus/agents (see /teamwork)",
+            config::home().display()
+        )));
+    } else {
+        tui::line(&tui::accent("  helper agents (task tool roles)"));
+        for a in &defs {
+            let tools = a
+                .tools
+                .as_ref()
+                .map_or("all tools".to_string(), |t| t.join(", "));
+            // Names, descriptions and paths come from files on disk.
+            tui::line(&format!(
+                "    • {} — {}",
+                tui::bold(&tui::sanitize_terminal(&a.name)),
+                tui::sanitize_terminal(&a.description)
+            ));
+            tui::line(&tui::dim(&format!(
+                "      tools: {} · {}",
+                tui::sanitize_terminal(&tools),
+                tui::sanitize_terminal(&a.path.display().to_string())
+            )));
+        }
+    }
     match config::load_agents() {
         Some(agents) => {
             // Agents.md is Markdown — render it instead of dumping #/**/- raw.
@@ -5591,62 +6597,51 @@ fn handle_agents() {
 }
 
 // One line per configured MCP server, after a bounded connection attempt.
-fn doctor_mcp_lines() -> Vec<String> {
+// One MCP check per configured server: a real connect and handshake each,
+// bounded by their timeouts.
+fn mcp_checks() -> Vec<DoctorCheck> {
     mcp::ensure_ready();
     let reports = mcp::report();
     if reports.is_empty() {
-        return vec!["  ·  mcp          no servers configured".into()];
+        return vec![DoctorCheck::note("mcp", "no servers configured")];
     }
     reports
         .into_iter()
         .map(|r| {
             let name = format!("mcp:{}", r.name);
             match r.status {
-                mcp::Status::Connected => format!(
-                    "  ✓ {name:<14} {} · {} tool{}",
-                    r.transport,
-                    r.tools.len(),
-                    if r.tools.len() == 1 { "" } else { "s" }
+                mcp::Status::Connected => DoctorCheck::pass(
+                    name,
+                    format!(
+                        "{} · {} tool{}",
+                        r.transport,
+                        r.tools.len(),
+                        if r.tools.len() == 1 { "" } else { "s" }
+                    ),
                 ),
-                mcp::Status::Disabled => format!("  ·  {name:<13} disabled"),
+                mcp::Status::Disabled => DoctorCheck::note(name, "disabled"),
                 mcp::Status::Connecting => {
-                    format!("  ✗ {name:<14} still connecting after the timeout")
+                    DoctorCheck::fail(name, "still connecting after the timeout")
                 }
                 mcp::Status::Failed(e) | mcp::Status::Invalid(e) => {
-                    format!("  ✗ {name:<14} {}", e.chars().take(160).collect::<String>())
+                    DoctorCheck::fail(name, e.chars().take(160).collect::<String>())
                 }
             }
         })
-        .map(|l| tui::sanitize_terminal(&l).into_owned())
         .collect()
 }
 
-fn handle_doctor_tui() {
+// `/doctor` (and `/debug`): the same checks as `buildwithnexus doctor`,
+// probing the model this session is using.
+fn handle_doctor_tui(live: &Provider) {
     tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));
-    match config::load_settings() {
-        Some(s) => {
-            tui::line(&format!("  provider: {}", s.provider));
-            tui::line(&format!("  model: {}", s.model));
-            tui::line(&format!("  permission: {}", s.permission));
-        }
-        None => tui::line(&tui::yellow("  settings: not configured")),
+    let checks = doctor_checks(&CliOptions::default(), Some(live));
+    for c in &checks {
+        tui::line(&c.line());
     }
-    let (glyph, text) = sandbox::doctor_summary();
-    tui::line(&format!("  {glyph} sandbox: {text}"));
-    tui::line(&format!("  home: {}", config::home().display()));
-    for line in doctor_mcp_lines() {
-        tui::line(&line);
+    if let Some(summary) = doctor_summary_line(&checks) {
+        tui::line(&tui::yellow(&summary));
     }
-    tui::line(&format!(
-        "  rust: {}",
-        std::process::Command::new("rustc")
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "not found".to_string())
-    ));
 }
 
 fn print_help() {
@@ -6347,6 +7342,7 @@ fn usage() {
          USAGE:\n\
          \x20 buildwithnexus                 interactive session (all modes, full TUI)\n\
          \x20 buildwithnexus run <task>      execute a task (agentic BUILD loop)\n\
+         \x20 ... | buildwithnexus run [task] piped text is the task, or context after it (1 MiB)\n\
          \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
          \x20 buildwithnexus brainstorm <q>  chat with tools (grep, fetch, read, etc.)\n\
          \x20 buildwithnexus continue <task> continue the most recent session\n\
@@ -6357,13 +7353,18 @@ fn usage() {
          \x20 buildwithnexus login           replace the provider's API key (checked first)\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus update [--check] install the latest release (--check: exit 10 if behind)\n\
+         \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
          \x20 buildwithnexus version | help\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
          \x20 --model <name>                override the configured model\n\
+         \x20 --base-url <url>              model endpoint, e.g. a gateway (--provider custom\n\
+         \x20                               reads CUSTOM_API_KEY from the environment)\n\
          \x20 --permission-mode <mode>      ask, auto, or readonly\n\
          \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
+         \x20 --worktree <name>             work in .bwn/worktrees/<name> on branch bwn/<name>\n\
          \x20 --prompt <text>               initial interactive prompt\n\
          \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
@@ -6371,6 +7372,11 @@ fn usage() {
          \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
          \x20 --legacy-exit-codes           exit 0 when a run stops short without failing\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
+         EXIT CODES (headless; --json ends with a result event naming the outcome):\n\
+         \x20 0 success   1 failed   2 usage error   3 changes blocked or denied\n\
+         \x20 4 hook blocked the task   5 budget limit   6 step limit\n\
+         \x20 7 checks fail   8 verification failed   9 review found blocking issues\n\
+         \x20 130/143 interrupted (SIGINT/SIGTERM)\n\n\
          INTERACTIVE:\n\
          \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
          \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
@@ -6385,7 +7391,7 @@ fn usage() {
          \x20 /context               show current context usage\n\
          \x20 /cost                  session tokens and estimated cost\n\
          \x20 /diff                  show current git diff summary\n\
-         \x20 /review                AI code review of staged git diff\n\
+         \x20 /review [--base <ref>|--staged] [focus]  read-only review of your changes\n\
          \x20 /commit                AI-drafted conventional commit message\n\
          \x20 /pr                    AI-drafted pull request title + description\n\
          \x20 /schedule <delay> <t>  one-shot workflow  (e.g. /schedule 5m cargo test)\n\
@@ -6406,119 +7412,273 @@ fn usage() {
     );
 }
 
-fn run_doctor() {
-    println!("buildwithnexus {VERSION} — doctor");
-    println!();
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CheckState {
+    Pass,
+    Warn,
+    Fail,
+    Note,
+}
 
-    // Settings
+/// One line of `doctor`: what was checked, how it went, and the detail
+/// (with the fix when it failed).
+#[derive(Debug)]
+struct DoctorCheck {
+    name: String,
+    state: CheckState,
+    detail: String,
+}
+
+impl DoctorCheck {
+    fn new(name: impl Into<String>, state: CheckState, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            state,
+            detail: detail.into(),
+        }
+    }
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Pass, detail)
+    }
+    fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Fail, detail)
+    }
+    fn note(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Note, detail)
+    }
+    // sandbox::doctor_summary and hook lines speak in glyphs.
+    fn from_glyph(name: impl Into<String>, glyph: &str, detail: impl Into<String>) -> Self {
+        let state = match glyph {
+            "✓" => CheckState::Pass,
+            "✗" => CheckState::Fail,
+            "⚠" => CheckState::Warn,
+            _ => CheckState::Note,
+        };
+        Self::new(name, state, detail)
+    }
+
+    fn status(&self) -> &'static str {
+        match self.state {
+            CheckState::Pass => "ok",
+            CheckState::Warn => "warn",
+            CheckState::Fail => "fail",
+            CheckState::Note => "info",
+        }
+    }
+
+    // Names and details carry paths, server names and server errors.
+    fn line(&self) -> String {
+        let glyph = match self.state {
+            CheckState::Pass => "✓",
+            CheckState::Warn => "⚠",
+            CheckState::Fail => "✗",
+            CheckState::Note => "·",
+        };
+        format!(
+            "  {glyph} {:<14} {}",
+            tui::sanitize_terminal(&self.name),
+            tui::sanitize_terminal(&self.detail)
+        )
+    }
+}
+
+// Seam with trust-approvals (hooks::doctor_lines): each configured hook, and
+// a line starting with ⚠ for every problem (unknown events and types,
+// untrusted files). Returns nothing until that lands.
+fn hook_doctor_lines() -> Vec<String> {
+    Vec::new()
+}
+
+// `ollama list` names carry a tag; a configured name without one means
+// `:latest`.
+fn ollama_has_model(installed: &[String], model: &str) -> bool {
+    installed
+        .iter()
+        .any(|m| m == model || (!model.contains(':') && *m == format!("{model}:latest")))
+}
+
+// The live check of the model endpoint. Ollama answers for free on
+// /api/tags, which also says whether the configured model is there; every
+// other server pays one output token. A local setup never reaches a hosted
+// address.
+fn provider_check(p: &Provider, id: &str) -> DoctorCheck {
+    let url = tui::sanitize_terminal(&p.base_url).into_owned();
+    if id == "ollama" && p.protocol == config::Protocol::OllamaNative {
+        let models = provider::ollama_models(&p.base_url);
+        return if models.is_empty() {
+            DoctorCheck::fail(
+                "provider",
+                format!(
+                    "no answer or no models at Ollama {url} — is it running (ollama serve) \
+                     and is the model pulled (ollama pull {})?",
+                    p.model
+                ),
+            )
+        } else if !ollama_has_model(&models, &p.model) {
+            DoctorCheck::fail(
+                "provider",
+                format!(
+                    "{} is not installed at Ollama {url} — ollama pull {}",
+                    p.model, p.model
+                ),
+            )
+        } else {
+            DoctorCheck::pass("provider", format!("Ollama at {url} has {}", p.model))
+        };
+    }
+    match provider::validate(p) {
+        Ok(Some(served)) => DoctorCheck::pass(
+            "provider",
+            format!("{id} at {url} answers as {served} (one-token probe)"),
+        ),
+        Ok(None) => DoctorCheck::pass(
+            "provider",
+            format!("{id} at {url} answers as {} (one-token probe)", p.model),
+        ),
+        // The error can carry the server's response body.
+        Err(e) => DoctorCheck::fail(
+            "provider",
+            format!("{id} at {url}: {}", e.chars().take(200).collect::<String>()),
+        ),
+    }
+}
+
+/// Every doctor check, in order. `live` is the session's provider (/doctor);
+/// otherwise the provider is built as a headless run would build it.
+fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck> {
+    let mut out = Vec::new();
+
     let load = config::load_settings_diag();
     for i in &load.issues {
-        println!(
-            "  ✗ settings       {}: {}",
-            tui::sanitize_terminal(&i.source),
-            tui::sanitize_terminal(&i.error)
-        );
+        out.push(DoctorCheck::fail(
+            "settings",
+            format!("{}: {}", i.source, i.error),
+        ));
     }
-    match load.settings.as_ref() {
-        None if load.any_present => {
-            println!("  ✗ settings       present but unusable — fix the file(s) above");
-        }
-        None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
+    let mut settings = match load.settings.clone() {
         Some(s) => {
-            println!(
-                "  ✓ settings       provider={} model={} permission={}",
-                s.provider,
-                if s.model.is_empty() {
-                    "(default)"
-                } else {
-                    &s.model
-                },
-                s.permission
-            );
-            // Live connectivity through the exact path real requests take —
-            // key presence says nothing about whether the provider answers.
-            // Ollama is probed via its free /api/tags; everything else pays
-            // one output token, which is what a diagnostic command is for.
-            match build_provider(s) {
-                Ok(p) => {
-                    if config::preset(&s.provider).is_some_and(|pr| pr.id == "ollama") {
-                        let models = provider::ollama_models(&p.base_url);
-                        if models.is_empty() {
-                            println!(
-                                "  ✗ provider       can't reach Ollama at {} — is it running? (ollama serve)",
-                                p.base_url
-                            );
-                        } else {
-                            println!(
-                                "  ✓ provider       Ollama at {} — {} model{} installed",
-                                p.base_url,
-                                models.len(),
-                                if models.len() == 1 { "" } else { "s" }
-                            );
-                        }
+            out.push(DoctorCheck::pass(
+                "settings",
+                format!(
+                    "provider={} model={} permission={}",
+                    s.provider,
+                    if s.model.is_empty() {
+                        "(default)"
                     } else {
-                        match provider::validate(&p) {
-                            Ok(_) => println!(
-                                "  ✓ provider       {} answers as {} (one-token probe)",
-                                s.provider, p.model
-                            ),
-                            // The error can carry the server's response body.
-                            Err(e) => println!(
-                                "  ✗ provider       {}: {}",
-                                s.provider,
-                                tui::sanitize_terminal(&e)
-                                    .chars()
-                                    .take(160)
-                                    .collect::<String>()
-                            ),
-                        }
-                    }
-                }
-                Err(e) => println!(
-                    "  ✗ provider       {}",
-                    tui::sanitize_terminal(&e.to_string())
+                        &s.model
+                    },
+                    s.permission
                 ),
+            ));
+            Some(s)
+        }
+        None if load.any_present => {
+            out.push(DoctorCheck::fail(
+                "settings",
+                "present but unusable — fix the file(s) above",
+            ));
+            None
+        }
+        // As a headless run would: --provider, or the first key set.
+        None => {
+            match unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some()) {
+                Some(s) => {
+                    out.push(DoctorCheck::note(
+                        "settings",
+                        format!(
+                            "none — runs use {} from flags or the environment",
+                            s.provider
+                        ),
+                    ));
+                    Some(s)
+                }
+                None => {
+                    out.push(DoctorCheck::fail(
+                        "settings",
+                        "not found — run `buildwithnexus init`, or pass --provider",
+                    ));
+                    None
+                }
             }
+        }
+    };
+    if let Some(s) = settings.as_mut() {
+        if let Some(p) = &opts.provider {
+            s.provider = p.clone();
+        }
+        if let Some(u) = &opts.base_url {
+            s.base_url = Some(u.clone());
+        }
+        if let Some(m) = &opts.model {
+            s.model = m.clone();
         }
     }
 
-    // Sandbox: the probe runs the real backend once, so this reports whether
-    // shell commands would actually be confined on this machine.
-    if let Some(s) = &load.settings {
+    // The key of the provider in use, and no other.
+    if let Some(preset) = settings.as_ref().and_then(|s| config::preset(&s.provider)) {
+        if preset.id == "custom" {
+            let set = config::load_key(config::CUSTOM_KEY).is_some();
+            out.push(DoctorCheck::note(
+                config::CUSTOM_KEY,
+                if set {
+                    "set"
+                } else {
+                    "not set (optional for most servers)"
+                },
+            ));
+        } else if !preset.env_key.is_empty() {
+            out.push(match config::load_key(preset.env_key) {
+                Some(_) => DoctorCheck::pass(preset.env_key, "set"),
+                None => DoctorCheck::fail(
+                    preset.env_key,
+                    format!(
+                        "not set (needed for {}) — export it or run `buildwithnexus init`",
+                        preset.label
+                    ),
+                ),
+            });
+        }
+    }
+
+    if let Some(s) = &settings {
+        match live {
+            Some(p) => out.push(provider_check(p, &s.provider)),
+            None => match build_provider(s) {
+                Ok(p) => out.push(provider_check(&p, &s.provider)),
+                Err(e) => out.push(DoctorCheck::fail("provider", e)),
+            },
+        }
+    }
+
+    // The probe runs the real backend once, so this reports whether shell
+    // commands would actually be confined on this machine.
+    if let Some(s) = &settings {
         if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
-            println!("  ✗ sandbox        {e}");
+            out.push(DoctorCheck::fail("sandbox", e));
         }
     }
     let (glyph, text) = sandbox::doctor_summary();
-    println!("  {glyph} sandbox        {text}");
+    out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
 
-    // API key
-    for preset in config::PRESETS
-        .iter()
-        .filter(|p| !p.env_key.is_empty() && !p.local)
-    {
-        match config::load_key(preset.env_key) {
-            Some(_) => println!("  ✓ {}  set", preset.env_key),
-            None => println!(
-                "  ✗ {}  not set (needed for {})",
-                preset.env_key, preset.label
-            ),
-        }
+    out.push(match config::load_memory() {
+        None => DoctorCheck::note("memory.md", "(empty)"),
+        Some(m) => DoctorCheck::pass("memory.md", format!("{} chars", m.len())),
+    });
+    out.push(DoctorCheck::note(
+        "home",
+        config::home().display().to_string(),
+    ));
+
+    for line in hook_doctor_lines() {
+        out.push(match line.strip_prefix('⚠') {
+            Some(problem) => DoctorCheck::new("hooks", CheckState::Warn, problem.trim()),
+            None => DoctorCheck::pass("hooks", line),
+        });
     }
 
-    // Memory
-    match config::load_memory() {
-        None => println!("  ·  memory.md     (empty)"),
-        Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
-    }
+    out.extend(mcp_checks());
 
-    // MCP servers: a real connect + handshake each, bounded by their timeouts.
-    for line in doctor_mcp_lines() {
-        println!("{line}");
-    }
-
-    // External tools
-    let tools_to_check = [
+    for (bin, label) in [
         ("git", "version control"),
         ("cargo", "Rust build tool"),
         ("node", "Node.js runtime"),
@@ -6527,57 +7687,83 @@ fn run_doctor() {
         ("gh", "GitHub CLI (optional)"),
         ("docker", "Docker (optional)"),
         ("rg", "ripgrep (fast search, optional)"),
-    ];
-    for (bin, label) in &tools_to_check {
-        let found = crate::tools::find_on_path(bin).is_some();
-        let glyph = if found { "✓" } else { "·" };
-        println!("  {glyph} {bin:<12} {label}");
+    ] {
+        out.push(if crate::tools::find_on_path(bin).is_some() {
+            DoctorCheck::pass(bin, label)
+        } else {
+            DoctorCheck::note(bin, format!("{label} — not found"))
+        });
     }
 
     if crate::tools::is_wsl() {
-        println!();
-        println!("  ✓ WSL2 runtime     detected");
         let home = config::home();
-        if crate::tools::is_wsl_windows_mount(&home) {
-            println!(
-                "  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).",
-                home.display()
-            );
-            println!("                     Set NEXUS_HOME to a Linux path (~/.buildwithnexus) for 10x faster I/O.");
+        out.push(if crate::tools::is_wsl_windows_mount(&home) {
+            DoctorCheck::new(
+                "wsl2",
+                CheckState::Warn,
+                format!(
+                    "NEXUS_HOME is on a Windows mount ({}) — set it to a Linux path for faster I/O",
+                    home.display()
+                ),
+            )
         } else {
-            println!("  ✓ WSL2 filesystem  native Linux filesystem detected (optimal I/O speed)");
+            DoctorCheck::pass("wsl2", "native Linux filesystem")
+        });
+    }
+    out
+}
+
+// "2 checks failed: provider, OPENAI_API_KEY" when anything failed.
+fn doctor_summary_line(checks: &[DoctorCheck]) -> Option<String> {
+    let failed: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.state == CheckState::Fail)
+        .map(|c| c.name.as_str())
+        .collect();
+    (!failed.is_empty()).then(|| {
+        format!(
+            "  {} check{} failed: {}",
+            failed.len(),
+            if failed.len() == 1 { "" } else { "s" },
+            tui::sanitize_terminal(&failed.join(", "))
+        )
+    })
+}
+
+// `buildwithnexus doctor`: exits 1 when a check fails, so it can gate a
+// pipeline; `--json doctor` prints one `check` event per line.
+fn run_doctor(opts: &CliOptions) {
+    if !report::is_json() {
+        println!("buildwithnexus {VERSION} — doctor");
+        println!();
+    }
+    let checks = doctor_checks(opts, None);
+    let failed = checks.iter().any(|c| c.state == CheckState::Fail);
+    if report::is_json() {
+        for c in &checks {
+            report::event(serde_json::json!({
+                "type": "check",
+                "name": c.name,
+                "status": c.status(),
+                "detail": c.detail,
+            }));
+        }
+    } else {
+        for c in &checks {
+            println!("{}", c.line());
+        }
+        println!();
+        if let Some(summary) = doctor_summary_line(&checks) {
+            println!("{summary}");
+        }
+        // Offering installs needs someone to answer.
+        if std::io::stdin().is_terminal() {
+            check_and_offer_install_dependencies(true);
         }
     }
-
-    // Connectivity (quick HEAD to detect outbound network)
-    println!();
-    println!("  checking connectivity...");
-    let reachable = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "5",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "https://api.anthropic.com",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|code| code.trim() != "000")
-        .unwrap_or(false);
-    if reachable {
-        println!("  ✓ api.anthropic.com reachable");
-    } else {
-        println!("  ✗ api.anthropic.com unreachable — check firewall / proxy");
+    if failed {
+        std::process::exit(1);
     }
-
-    println!();
-    check_and_offer_install_dependencies(true);
-    println!();
-    println!("  Run `buildwithnexus init` to fix any missing configuration.");
 }
 
 /// Tools bwn can use from PATH: (binary, Homebrew package, apt package,
@@ -7288,8 +8474,7 @@ mod tests {
         let err =
             parse_cli_options(["--max-budget-usd", "0"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("positive dollar amount"), "{err}");
-        // Effort values are validated when the provider is built, but the
-        // missing-value rule applies here like every other option.
+        // The missing-value rule applies to --effort like every other option.
         let err =
             parse_cli_options(["--effort", "--json"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("--effort requires a value"), "{err}");
