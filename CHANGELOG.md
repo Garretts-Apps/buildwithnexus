@@ -131,11 +131,12 @@ the setting that restores the old behavior is listed in
 - **Trust is checked each time a project hook runs.** A hook script that
   changed since you trusted the folder is asked about again (`scripts/fmt.sh
   changed since you trusted it — run it?`), or skipped with a warning in a
-  headless run. The trust prompt asks separately about a repository's
-  `base_url` and `permission`, and a "no" is remembered for that file version.
-  A repository's own AGENTS.md/CLAUDE.md is asked about once per folder and
-  content (`press r to review or Enter to use them`); after that a dim line
-  names it. Headless runs, and sessions with prompts piped in, print one
+  headless run. The trust prompt is one screen and one answer: `y`
+  everything, `e` all except a repository's `base_url` and `permission`, `n`
+  nothing (the default). A repository's own AGENTS.md/CLAUDE.md is on that
+  screen (`r` reads it) and covered by the same answer; a folder with no
+  settings to trust asks about it alone (`use them? y yes · n no · r review
+  [N]`), once per folder and content. After that a dim line names it. Headless runs, and sessions with prompts piped in, print one
   line until it is acknowledged.
 - **Web search asks first.** `web_search` counts as network access to
   `lite.duckduckgo.com` and asks outside `auto`, read-only mode included.
@@ -564,7 +565,9 @@ the setting that restores the old behavior is listed in
 - **Read-only helpers are reads for the gate.** A helper started with
   `read_only: true` is a read; a call a helper is refused counts toward exit 3
   and is reported to the parent.
-- **Local models.** One helper at a time unless `max_parallel_helpers` is set;
+- **Local models.** A 32,768-token window (what bwn asks Ollama for) gets the
+  full tool set; only smaller windows get the compact one. One helper at a
+  time unless `max_parallel_helpers` is set;
   `/context` and `/teamwork` say when the window was not reported;
   `screenshot_url` is refused up front for a text-only model; a picture over
   5 MB in the prompt is not sent.

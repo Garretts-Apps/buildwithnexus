@@ -350,16 +350,16 @@ fn mcp_defs() -> Vec<ToolDef> {
         .collect()
 }
 
-// Models reporting at most this many context tokens get the compact tool set.
-// Small open-weight models degrade sharply with large tool catalogs, so
-// everything in local-model range (≤32k) gets the trimmed surface; remote
-// frontier providers report much larger contexts and keep the full set.
-const COMPACT_TOOLS_MAX_CONTEXT: usize = 32_768;
+// Models reporting fewer context tokens than this get the compact tool set.
+// Small open-weight models degrade sharply with large tool catalogs, so 8k
+// and 16k windows get the trimmed surface; a 32k window (what bwn asks
+// Ollama for) and the larger windows of remote providers keep the full set.
+const FULL_TOOLS_MIN_CONTEXT: usize = 32_768;
 
 /// Whether a model with this window gets the compact tool set: no helpers,
 /// todo list or screenshots.
 pub fn compact_surface(context_tokens: usize) -> bool {
-    context_tokens <= COMPACT_TOOLS_MAX_CONTEXT
+    context_tokens < FULL_TOOLS_MIN_CONTEXT
 }
 
 pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<ToolDef> {
@@ -7997,9 +7997,10 @@ pub(crate) mod tests {
 
     #[test]
     fn defs_for_small_context_keeps_core_tools_and_drops_bulk() {
-        // 32k is the top of the compact range: all realistic local models get
-        // the trimmed surface; larger remote contexts keep the full set.
-        let compact = defs_for_context(false, 32_768)
+        // Just under 32k is the top of the compact range; a 32k window keeps
+        // the full set.
+        assert!(!compact_surface(32_768));
+        let compact = defs_for_context(false, 32_767)
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();

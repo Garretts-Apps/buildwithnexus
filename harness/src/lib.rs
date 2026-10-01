@@ -6485,7 +6485,7 @@ fn window_notes(p: &Provider) -> Vec<String> {
     if !out.is_empty() {
         out.push(
             "set \"context_tokens\" in settings.json to the model's real window \
-             (a window over 32,768 tokens offers every tool)"
+             (a window of 32,768 tokens or more offers every tool)"
                 .into(),
         );
     }
@@ -6641,6 +6641,13 @@ fn review_repo_instructions(cwd: &std::path::Path) {
         tui::line(&tui::dim(&format!("  {notice}")));
         return;
     }
+    // Answered no on the trust screen this launch.
+    if config::repo_instructions_declined() {
+        tui::line(&tui::dim(&format!(
+            "  ✗ not using {notice} this session — asked again next time"
+        )));
+        return;
+    }
     // Prompts piped in: the first one is not an answer to this.
     if !std::io::stdin().is_terminal() {
         tui::line(&tui::dim(&format!("  {notice} (not reviewed)")));
@@ -6682,7 +6689,7 @@ fn review_repo_instructions(cwd: &std::path::Path) {
     }
 }
 
-fn show_instruction_files(files: &[config::InstructionFile]) {
+pub(crate) fn show_instruction_files(files: &[config::InstructionFile]) {
     for f in files {
         tui::line(&tui::bold(&format!(
             "  ── {} ──",

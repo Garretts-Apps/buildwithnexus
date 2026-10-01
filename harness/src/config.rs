@@ -1575,6 +1575,11 @@ pub fn decline_repo_instructions() {
     REPO_INSTRUCTIONS_DECLINED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the repository's instruction files were declined this session.
+pub fn repo_instructions_declined() -> bool {
+    REPO_INSTRUCTIONS_DECLINED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The instruction files the model is sent: `load_instructions`, without
 /// the repository's own files once they were declined.
 pub fn prompt_instructions(cwd: &Path) -> Vec<InstructionFile> {

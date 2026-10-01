@@ -839,6 +839,43 @@ class TrustScreenTests(TerminalHarness):
         self.assertNotIn(b"settings for this folder changed", self.output)
 
 
+class TrustScreenInstructionsTests(TerminalHarness):
+    """A repository with settings and an AGENTS.md is one screen and one
+    answer: the instructions are on it, and no question follows."""
+
+    def files(self):
+        return {
+            ".buildwithnexus/settings.json": json.dumps({
+                "hooks": {"SessionStart": [{"hooks": [
+                    {"type": "command", "command": "touch started.txt"}]}]},
+            }),
+            "AGENTS.md": "Always answer in French.\n",
+        }
+
+    def wait_for_startup(self):
+        self.wait_for(lambda: b"[N]: " in self.output, "the trust question")
+
+    def test_one_answer_covers_the_instructions(self):
+        screen = bytes(self.output)
+        self.assertIn(b"instructions the model follows", screen)
+        self.assertIn(b"r read the instructions", screen)
+        self.send("r\r")
+        self.wait_for(lambda: b"Always answer in French." in self.output, "the file shown")
+        self.send("y\r")
+        self.wait_for(lambda: b"describe a task" in self.output, "the session")
+        self.pump(0.5)
+        self.assertNotIn(b"use them?", self.output)
+
+    def test_no_keeps_them_out_and_keeps_typed_text(self):
+        self.send("fix the failing test\r")
+        self.wait_for(lambda: b"your text is kept" in self.output, "held")
+        self.send("n\r")
+        self.wait_for(lambda: b"not using" in self.output, "declined")
+        self.assertNotIn(b"use them?", self.output)
+        self.wait_for(lambda: b"fix the failing test" in self.output.rsplit(b"describe a task", 1)[-1],
+                      "the text back in the input box")
+
+
 class InlineImageTests(TerminalHarness):
     """The kitty graphics path, forced on: the PNG is uploaded once as a
     virtual placement and the transcript row carries Unicode placeholders."""

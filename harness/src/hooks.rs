@@ -1854,6 +1854,15 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     for l in changes_since_trust(cwd, &pending) {
         tui::line(&tui::dim(&format!("    ({l})")));
     }
+    // The repository's AGENTS.md and the like steer the model too: they are
+    // on this screen and in this answer, not a second question after it.
+    let instructions = config::repo_instructions(cwd).filter(|r| !r.acknowledged(cwd));
+    if let Some(r) = &instructions {
+        tui::line(&format!(
+            "    instructions the model follows: {}",
+            tui::sanitize_terminal(&r.notice())
+        ));
+    }
     let separate = separate_keys(&pending);
     let general = pending.iter().any(|f| {
         f.keys
@@ -1863,31 +1872,62 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     // One question; the keys that send requests elsewhere or loosen
     // approvals can be left out of a yes.
     let except = (general && !separate.is_empty()).then(|| separate.join(" and "));
-    let question = match &except {
-        Some(keys) => format!("Trust? y everything above · e all except {keys} · n nothing [N]:"),
-        None => "Trust everything above? y yes · n no [N]:".to_string(),
+    let read = if instructions.is_some() {
+        " · r read the instructions"
+    } else {
+        ""
     };
-    let declined: Vec<&str> = loop {
+    let question = match &except {
+        Some(keys) => {
+            format!("Trust? y everything above · e all except {keys} · n nothing{read} [N]:")
+        }
+        None => format!("Trust everything above? y yes · n no{read} [N]:"),
+    };
+    // A task typed while this was on screen is no answer: it is kept for
+    // the input box.
+    let mut held: Vec<String> = Vec::new();
+    let declined: Option<Vec<&str>> = loop {
         // Esc answers like n.
         let a = tui::ask(&format!("  {question} ")).unwrap_or_default();
         match a.trim().to_lowercase().as_str() {
-            "y" | "yes" => break Vec::new(),
-            "e" if except.is_some() => break separate.clone(),
-            "" | "n" | "no" => {
-                tui::line(&tui::dim(if only_extensions {
-                    "  (not trusted: the repo's commands, skills and agents stay off; you'll be asked again next time)"
-                } else {
-                    "  (untrusted project settings ignored; harmless ones like model still apply)"
-                }));
-                return;
+            "y" | "yes" => break Some(Vec::new()),
+            "e" if except.is_some() => break Some(separate.clone()),
+            "" | "n" | "no" => break None,
+            "r" if instructions.is_some() => {
+                if let Some(r) = &instructions {
+                    crate::show_instruction_files(&r.files);
+                }
             }
-            _ => tui::line(&tui::yellow(if except.is_some() {
+            short if short.chars().count() <= 1 => tui::line(&tui::yellow(if except.is_some() {
                 "  answer y, e or n"
             } else {
                 "  answer y or n"
             })),
+            _ => {
+                held.push(a);
+                tui::line(&tui::dim(
+                    "  (answer this first — your text is kept for the input box)",
+                ));
+            }
         }
     };
+    if !held.is_empty() {
+        tui::prefill_composer(&held.join("\n"));
+    }
+    let Some(declined) = declined else {
+        if instructions.is_some() {
+            config::decline_repo_instructions();
+        }
+        tui::line(&tui::dim(if only_extensions {
+            "  (not trusted: the repo's commands, skills and agents stay off; you'll be asked again next time)"
+        } else {
+            "  (untrusted project settings ignored; harmless ones like model still apply)"
+        }));
+        return;
+    };
+    if let Some(r) = &instructions {
+        r.acknowledge(cwd);
+    }
     store_trust_declining(cwd, &pending, &declined);
     if !declined.is_empty() {
         tui::line(&tui::dim(&format!(

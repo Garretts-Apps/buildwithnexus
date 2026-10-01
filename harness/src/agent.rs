@@ -4249,7 +4249,7 @@ fn unoffered_call(name: &str, defs: &[tools::ToolDef], strict: bool) -> Option<(
             .map(|d| d.name)
             .collect();
         let why = if !compact.contains(&name) && defs.iter().all(|d| compact.contains(&d.name)) {
-            " (the compact tool set for a window of 32,768 tokens or less leaves it out; \
+            " (the compact tool set for a window under 32,768 tokens leaves it out; \
              set \"context_tokens\" in settings.json to the model's real window to offer it)"
         } else {
             ""
