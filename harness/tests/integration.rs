@@ -3712,6 +3712,11 @@ fn command_line_mistakes_exit_2_and_send_nothing() {
             vec!["plan", "--yes", "--dry-run", "x"],
             "unknown option --dry-run",
         ),
+        // init takes --agents-md, and nothing else.
+        (
+            vec!["init", "--agents-md", "--dry-run"],
+            "unknown option --dry-run",
+        ),
     ] {
         let r = run_args(&home, &cwd, &args);
         assert_eq!(r.code, Some(2), "{args:?}: {}", r.stderr);

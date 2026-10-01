@@ -311,7 +311,16 @@ pub fn run() {
     // prompt): `run --modle big '<task>'` sends nothing and says so.
     // Commands with options of their own check them themselves.
     let own_options = matches!(cmd, "mcp" | "trust" | "update" | "review");
-    if let (false, Some(flag)) = (own_options, opts.unknown_flags.first()) {
+    // `init --agents-md` is init's one option; any other is still a mistake.
+    let command_flags: &[&str] = match cmd {
+        "init" | "da-init" | "setup" => &["--agents-md"],
+        _ => &[],
+    };
+    let unknown = opts
+        .unknown_flags
+        .iter()
+        .find(|f| !command_flags.contains(&f.as_str()));
+    if let (false, Some(flag)) = (own_options, unknown) {
         if matches!(flag.as_str(), "-h" | "--help") {
             usage();
             return;
