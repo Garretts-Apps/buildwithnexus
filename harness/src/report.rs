@@ -38,11 +38,40 @@ fn event_line(mut v: Value) -> String {
     v.to_string()
 }
 
+/// Where JSON events go in place of stdout: `bwn acp` turns them into
+/// protocol messages. Set once, before the first event.
+pub type Sink = Box<dyn Fn(Value) + Send + Sync>;
+
+static SINK: OnceLock<Sink> = OnceLock::new();
+
+pub fn set_sink(sink: Sink) {
+    let _ = SINK.set(sink);
+}
+
+/// Whether events go to a sink (`bwn acp`) rather than stdout. The sink also
+/// gets what `--json` leaves out: streamed text, reasoning, diff bodies and
+/// the todo list.
+pub fn has_sink() -> bool {
+    SINK.get().is_some()
+}
+
 fn emit(v: Value) {
-    let line = event_line(v);
-    // A helper running beside others keeps its events for its block.
-    if !tui::capture_event(&line) {
-        println!("{line}");
+    match SINK.get() {
+        Some(sink) => sink(v),
+        None => {
+            let line = event_line(v);
+            // A helper running beside others keeps its events for its block.
+            if !tui::capture_event(&line) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+// Events only a sink gets (`bwn acp`): never part of the --json output.
+fn to_sink(v: Value) {
+    if let Some(sink) = SINK.get() {
+        sink(v);
     }
 }
 
@@ -72,12 +101,31 @@ fn stream_renderer() -> &'static Mutex<tui::StreamRenderer> {
 }
 
 pub fn assistant_delta(chunk: &str) {
-    if mode() == Mode::Human && !chunk.is_empty() {
+    if chunk.is_empty() {
+        return;
+    }
+    if has_sink() {
+        to_sink(json!({"type": "assistant_delta", "text": chunk}));
+    } else if mode() == Mode::Human {
         if let Ok(mut r) = stream_renderer().lock() {
             r.push(chunk);
         }
     }
 }
+
+/// Streamed reasoning, for a sink only (the TUI draws its own).
+pub fn thinking_delta(chunk: &str) {
+    if !chunk.is_empty() {
+        to_sink(json!({"type": "thinking_delta", "text": chunk}));
+    }
+}
+
+/// The todo list after a todo_write, for a sink only (the TUI draws a
+/// checklist).
+pub fn todos(items: &Value) {
+    to_sink(json!({"type": "todos", "items": items}));
+}
+
 pub fn assistant_end() {
     if mode() == Mode::Human {
         if let Ok(mut r) = stream_renderer().lock() {
@@ -88,6 +136,10 @@ pub fn assistant_end() {
 }
 
 pub fn tool_call(name: &str, preview: &str, input: &Value) {
+    if has_sink() {
+        to_sink(json!({"type": "tool_call", "name": name, "input": input, "title": preview}));
+        return;
+    }
     if mode() == Mode::Json {
         emit(json!({"type": "tool_call", "name": name, "input": input}));
         return;
@@ -258,6 +310,10 @@ const LCS_MAX_CELLS: usize = 250_000;
 /// In JSON mode emits `{"type":"diff","path":…,"added":N,"removed":M}`
 /// instead. Call from the edit/write tool paths right after the change lands.
 pub fn diff(path: &str, old: &str, new: &str) {
+    if has_sink() {
+        to_sink(json!({"type": "diff", "path": path, "old_text": old, "new_text": new}));
+        return;
+    }
     if mode() == Mode::Json {
         let (_, added, removed) = diff_rows(old, new);
         emit(json!({"type": "diff", "path": path, "added": added, "removed": removed}));
@@ -712,6 +768,13 @@ pub fn denials() -> Vec<Denial> {
     DENIALS.lock().map(|d| d.clone()).unwrap_or_default()
 }
 
+/// Forgets the refusals so far: `bwn acp` runs many turns in one process.
+pub fn clear_denials() {
+    if let Ok(mut d) = DENIALS.lock() {
+        d.clear();
+    }
+}
+
 /// One line for the end of a headless run: `changes were denied: write
 /// notes.txt (policy: …)`.
 pub fn denials_line(d: &[Denial]) -> Option<String> {
@@ -798,6 +861,8 @@ pub fn notice(msg: &str) {
 pub fn info(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::dim(&tui::sanitize_terminal(msg))),
+        // A sink can tell chrome from warnings; --json keeps one type.
+        Mode::Json if has_sink() => to_sink(json!({"type": "info", "message": msg})),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }

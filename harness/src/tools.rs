@@ -1814,6 +1814,39 @@ fn task_arg(input: &Value) -> Option<&str> {
         .or_else(|| input["description"].as_str())
 }
 
+/// Text files read and written through an editor (`bwn acp` with a client
+/// that offers fs/read_text_file and fs/write_text_file): reads see unsaved
+/// buffers and the editor records each write. `None` means the editor does
+/// not handle that direction, so the disk is used.
+pub trait EditorFiles: Send + Sync {
+    fn read(&self, path: &Path) -> Option<Result<String, String>>;
+    fn write(&self, path: &Path, contents: &str) -> Option<Result<(), String>>;
+}
+
+static EDITOR_FILES: OnceLock<Box<dyn EditorFiles>> = OnceLock::new();
+
+pub fn set_editor_files(files: Box<dyn EditorFiles>) {
+    let _ = EDITOR_FILES.set(files);
+}
+
+// A text file as the editor has it, else from disk. An editor that cannot
+// read it (outside its project, say) leaves the disk to answer: the gate has
+// already allowed the read.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    match EDITOR_FILES.get().and_then(|e| e.read(path)) {
+        Some(Ok(text)) => Ok(text),
+        _ => fs::read_to_string(path),
+    }
+}
+
+// Writes through the editor when it takes writes; its refusal stands.
+fn write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    match EDITOR_FILES.get().and_then(|e| e.write(path, contents)) {
+        Some(r) => r.map_err(std::io::Error::other),
+        None => write_atomic(path, contents),
+    }
+}
+
 // Write file contents atomically: same-directory temp + rename, so a crash
 // or power loss mid-write can never leave a truncated file (std's rename
 // replaces existing destinations on both POSIX and Windows). The
@@ -5855,7 +5888,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(out) = read_media(&p, input, cwd) {
                 return out;
             }
-            match fs::read_to_string(&p) {
+            match read_text(&p) {
                 Ok(c) => ok(truncate_read(
                     apply_line_range(&c, line_range(input)),
                     MAX_READ,
@@ -6141,8 +6174,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 let _ = fs::create_dir_all(dir);
             }
             checkpoint::record(cwd, &p, "write_file");
-            let prior = fs::read_to_string(&p).unwrap_or_default();
-            match write_atomic(&p, content) {
+            let prior = read_text(&p).unwrap_or_default();
+            match write_text(&p, content) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, content);
                     ok(format!("wrote {} ({} bytes)", p.display(), content.len()))
@@ -6164,7 +6197,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .as_str()
                 .or_else(|| input["newString"].as_str())
                 .unwrap_or("");
-            let body = match fs::read_to_string(&p) {
+            let body = match read_text(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
@@ -6179,7 +6212,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
                     checkpoint::record(cwd, &p, "edit_file");
                     let updated = apply_lenient(&body, &hit, new);
-                    return match write_atomic(&p, &updated) {
+                    return match write_text(&p, &updated) {
                         Ok(_) => {
                             crate::report::diff(&p.display().to_string(), &body, &updated);
                             ok(format!("edited {} ({LENIENT_MATCH_NOTE})", p.display()))
@@ -6203,7 +6236,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             checkpoint::record(cwd, &p, "edit_file");
             let updated = body.replacen(old, new, 1);
-            match write_atomic(&p, &updated) {
+            match write_text(&p, &updated) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &body, &updated);
                     ok(format!("edited {}", p.display()))
@@ -6223,7 +6256,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if edits.is_empty() {
                 return err("edits array cannot be empty");
             }
-            let mut body = match fs::read_to_string(&p) {
+            let mut body = match read_text(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
@@ -6267,7 +6300,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             } else {
                 String::new()
             };
-            match write_atomic(&p, &body) {
+            match write_text(&p, &body) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, &body);
                     ok(format!(
@@ -6395,6 +6428,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     if !crate::report::is_json() {
                         crate::tui::line(&crate::tui::todo_checklist(&todos));
                     }
+                    crate::report::todos(&json!(todos
+                        .iter()
+                        .map(|(task, status)| json!({"task": task, "status": status}))
+                        .collect::<Vec<_>>()));
                     ok(format!("stored {} todo item(s)", todos.len()))
                 }
                 Err(_) => err("todo store unavailable"),

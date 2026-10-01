@@ -43,6 +43,7 @@
 //! <https://buildwithnexus.dev>; source at
 //! <https://github.com/Garretts-Apps/buildwithnexus>.
 
+mod acp;
 pub mod agent;
 pub mod checkpoint;
 pub mod config;
@@ -491,6 +492,13 @@ pub fn run() {
             headless(&opts, |p, _perm, cwd| headless_review(p, &req, &cwd))
         }
         "update" => std::process::exit(update::cli(&args[1..])),
+        "acp" => {
+            if let Some(extra) = args.get(1) {
+                eprintln!("buildwithnexus acp: unexpected argument '{extra}'; the editor talks to it on stdin");
+                std::process::exit(2);
+            }
+            std::process::exit(acp::serve(&opts))
+        }
         "mcp" => match mcp::manage(&args[1..], false, &mut |l| println!("  {l}")) {
             Ok(lines) => {
                 for l in lines {
@@ -7410,6 +7418,7 @@ mod terminal_ui_tests {
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
 pub enum Mode {
     Plan,
     Build,
@@ -7980,6 +7989,7 @@ fn usage() {
          \x20 buildwithnexus update [--check] install the latest release (--check: exit 10 if behind)\n\
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers\n\
+         \x20 buildwithnexus acp            Agent Client Protocol server on stdio (Zed, JetBrains, Neovim)\n\
          \x20 buildwithnexus version | help\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\

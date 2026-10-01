@@ -469,6 +469,37 @@ ANTHROPIC_API_KEY=... bwn run --permission-mode auto --json "fix the failing tes
 On npm installs in CI, add `--bootstrap` or set `BWN_ALLOW_BOOTSTRAP=1` so the
 launcher can fetch the binary on first run.
 
+**GitHub Actions.** The repository is also an action: it installs bwn from
+npm, runs `run` or `review` with `--json`, turns the outcome into the step's
+result with annotations (review findings land on their lines), uploads the
+event log as an artifact and, with `comment: true`, posts the summary on the
+pull request, updating the same comment on later pushes.
+[examples/github/bwn-review.yml](./examples/github/bwn-review.yml) reviews
+every pull request:
+
+```yaml
+- uses: Garretts-Apps/buildwithnexus@v0.15.0
+  with:
+    command: review              # or run, with prompt: <task>
+    review-base: origin/${{ github.base_ref }}
+    provider: anthropic
+    max-budget-usd: "1"
+    comment: "true"              # needs pull-requests: write
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+`permission-mode` defaults to `readonly`. Exit 0 passes the step; every other
+exit code fails it with an error annotation naming the outcome, unless the
+outcome is listed in `allow-outcomes` (for example `budget_stop,step_limit`),
+which makes it a warning. The outputs are `outcome`, `exit-code`, `passed`,
+`session-id`, `cost-usd`, `findings`, `summary` and `events` (the log's path).
+`install` takes a version, an npm package spec or a tarball from `npm pack`
+(empty: the action's own version), and `BWN_BIN` in the step's environment
+runs a binary you built instead. Inputs reach the scripts as environment
+variables, never as script text, and the token is passed only to the comment
+step. All inputs are in [action.yml](./action.yml).
+
 ## Permissions
 
 Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
@@ -970,6 +1001,65 @@ place of it before the model, the transcript or the terminal sees it.
 `bwn mcp logout <name>` asks the authorization server to revoke the token
 and deletes the file. A server with an `Authorization` header in `headers`
 is left as configured.
+
+## Editors (Agent Client Protocol)
+
+`buildwithnexus acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com)
+(version 1) on stdin and stdout, so Zed, JetBrains IDEs and Neovim plugins
+that run ACP agents can drive bwn: the editor shows the streamed reply, each
+tool call with its diff, the plan, and the approval questions. In Zed, add it
+to `settings.json`, then pick it from the Agent Panel's new-thread menu:
+
+```json
+{
+  "agent_servers": {
+    "buildwithnexus": {
+      "type": "custom",
+      "command": "bwn",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Other ACP clients take the same command and arguments. bwn uses the provider,
+model and key you set up in the terminal (`~/.buildwithnexus`); put an API key
+or `NEXUS_HOME` in `env` to use others, and the options of
+[Headless and CI](#headless-and-ci) in `args` (for example
+`["acp", "--permission-mode", "accept-edits"]`). If the editor cannot find
+`bwn`, give the full path that `command -v bwn` prints.
+
+What carries over from the terminal:
+
+- **Approvals.** Every approval the terminal would ask for is asked in the
+  editor with *Allow once*, *Always allow* (the terminal's `a`: remembered for
+  this project in your settings) and *Reject* (told to the model as a
+  denial). Permission modes, allow/ask/deny rules, hooks and the sandbox apply
+  as in the terminal. The model's `question` tool gets no answer.
+- **Folder trust.** A project's `.buildwithnexus` settings are asked about
+  in the editor at the first prompt, with the same questions; a yes is
+  remembered as in the terminal, and `--trust-project` works too. A project
+  hook whose script changed since you trusted it is skipped with a warning,
+  as in headless runs.
+- **Modes.** Build, Plan and Brainstorm are the session's modes. In Plan the
+  plan arrives as the editor's plan, and building it is a question of its own;
+  approving it switches the session to Build.
+- **Files.** When the editor offers it, `read_file`, `write_file`,
+  `edit_file` and `multi_edit` read and write through the editor, so they see
+  unsaved changes and the editor tracks each edit. Commands run in bwn's own
+  shell.
+- **Sessions.** Each editor thread is a bwn session saved like any other;
+  the editor can reopen one (`session/load` replays it), and `bwn resume`
+  continues it in the terminal.
+- **Cancel** stops the turn at once, including an open question.
+- **MCP servers** the editor passes (stdio or HTTP) join the ones in your
+  settings; SSE servers are skipped.
+
+One `bwn acp` process serves one folder, and runs one prompt at a time.
+Everything bwn prints besides the protocol goes to stderr, which the editor
+keeps as the agent's log. Images and embedded files in a prompt are sent to
+the model (images only when it takes them); audio is not.
 
 ## Build from source
 

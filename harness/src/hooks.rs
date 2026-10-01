@@ -1526,10 +1526,61 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             "    (settings for this folder changed since you last trusted them)"
         }));
     }
-    let yes = |q: &str| {
+    let mut yes = |q: &str| {
         tui::ask(&format!("  {q} {} ", tui::dim("[y/N]")))
             .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"))
     };
+    if decide_trust(cwd, &pending, &mut yes, &mut |l| tui::line(&tui::dim(l))) {
+        trust_project(cwd, interactive);
+    }
+}
+
+/// `bwn acp`: the trust questions the terminal asks, asked through the
+/// editor. `ask` gets each question and the lines that explain it, and
+/// says whether it was accepted.
+pub fn trust_project_remote(cwd: &Path, ask: &mut dyn FnMut(&str, &[String]) -> bool) {
+    apply_run_trust(cwd);
+    let pending = config::untrusted_project_files(cwd);
+    if pending.is_empty() {
+        return;
+    }
+    let only_extensions = pending.iter().all(|f| f.name == config::PROJECT_EXTENSIONS);
+    let mut details = vec![if only_extensions {
+        format!(
+            "{} has commands, skills or agents that speak to the model for you or run code:",
+            cwd.display()
+        )
+    } else {
+        format!(
+            "{} has project settings that can run commands, send your API key elsewhere, loosen approvals, or add to the system prompt:",
+            cwd.display()
+        )
+    }];
+    details.extend(trust_prompt_lines(cwd, &pending));
+    if read_trust_store().get(config::project_key(cwd)).is_some() {
+        details.push(if only_extensions {
+            "(new or changed since you last trusted this folder)".into()
+        } else {
+            "(settings for this folder changed since you last trusted them)".into()
+        });
+    }
+    let more = decide_trust(cwd, &pending, &mut |q| ask(q, &details), &mut |l| {
+        eprintln!("buildwithnexus: {}", l.trim())
+    });
+    if more {
+        trust_project_remote(cwd, ask);
+    }
+}
+
+// The questions themselves, shared by the terminal and the editor; a yes is
+// stored in trusted.json either way. True when the settings just trusted
+// add skill folders whose files must be asked about next.
+fn decide_trust(
+    cwd: &Path,
+    pending: &[config::UntrustedProjectFile],
+    yes: &mut dyn FnMut(&str) -> bool,
+    say: &mut dyn FnMut(&str),
+) -> bool {
     // Sending requests (and the key) elsewhere and loosening approvals each
     // get their own question; everything else is one decision.
     let has = |k: &str| pending.iter().any(|f| f.keys.iter().any(|fk| fk == k));
@@ -1538,22 +1589,25 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             .iter()
             .any(|k| !SEPARATE_TRUST_KEYS.contains(&k.as_str()))
     });
+    // Only the repo's commands, skills and agents wait for a yes.
+    let only_extensions = pending.iter().all(|f| f.name == config::PROJECT_EXTENSIONS);
     let question = if only_extensions {
         "Trust this repo's commands, skills and agents (above)?"
     } else {
         "Trust these project settings (hooks, MCP servers and the rest above)?"
     };
     if general && !yes(question) {
-        tui::line(&tui::dim(if only_extensions {
+        say(if only_extensions {
             "  (not trusted: the repo's commands, skills and agents stay off; you'll be asked again next time)"
         } else {
             "  (untrusted project settings ignored; harmless ones like model still apply)"
-        }));
+        });
+        return false;
         return;
     }
     let mut declined: Vec<&str> = Vec::new();
     if has("base_url") {
-        let url = project_value(&pending, "base_url");
+        let url = project_value(pending, "base_url");
         if !yes(&format!(
             "this repo wants your requests (and API key) sent to {url} — allow?"
         )) {
@@ -1561,28 +1615,28 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
         }
     }
     if has("permission") {
-        let perm = project_value(&pending, "permission");
+        let perm = project_value(pending, "permission");
         if !yes(&format!("this repo sets permission: {perm} — allow?")) {
             declined.push("permission");
         }
     }
     if !general && declined.len() == SEPARATE_TRUST_KEYS.iter().filter(|k| has(k)).count() {
         // Nothing was accepted: ask again next time, as for a plain "no".
-        return;
+        return false;
     }
-    store_trust_declining(cwd, &pending, &declined);
+    store_trust_declining(cwd, pending, &declined);
     if !declined.is_empty() {
-        tui::line(&tui::dim(&format!(
+        say(&format!(
             "  (trusted, except {} — your own settings apply there)",
             declined.join(" and ")
-        )));
+        ));
     }
     // A trusted settings file can add skill folders (`skill_dirs`): their
     // skills are asked about now, not at the next start.
-    let more = config::untrusted_project_files(cwd);
-    if !only_extensions && more.iter().any(|f| f.name == config::PROJECT_EXTENSIONS) {
-        trust_project(cwd, interactive);
-    }
+    !only_extensions
+        && config::untrusted_project_files(cwd)
+            .iter()
+            .any(|f| f.name == config::PROJECT_EXTENSIONS)
 }
 
 // Project keys asked about on their own in the trust prompt.

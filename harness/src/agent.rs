@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::checkpoint;
 use crate::config;
@@ -710,6 +710,16 @@ fn request_reply(
     defs: &[tools::ToolDef],
     label: &str,
 ) -> Result<Reply, String> {
+    if report::has_sink() {
+        // `bwn acp`: the reply streams to the editor as it arrives.
+        return provider::stream(
+            p,
+            msgs,
+            defs,
+            &mut |c| report::assistant_delta(c),
+            &mut |t| report::thinking_delta(t),
+        );
+    }
     if report::is_json() {
         let r = complete(p, msgs, defs)?;
         report::assistant(&r.text);
@@ -2070,7 +2080,67 @@ fn confirm_call(
     }
 }
 
+/// A question for the person at the other end of `bwn acp`, asked in their
+/// editor instead of the terminal.
+pub enum RemoteAsk<'a> {
+    /// The approval prompt: what the call does, and the key an "always"
+    /// answer remembers (empty when there is nothing to remember).
+    Tool { label: &'a str, key: &'a str },
+    /// Whether to build an approved plan.
+    Plan { steps: &'a [String] },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteAnswer {
+    Once,
+    /// The terminal's `a`: allowed from now on in this project.
+    Always,
+    Reject,
+    /// The turn was cancelled while the question was open.
+    Cancelled,
+}
+
+pub type RemoteApprover = Box<dyn Fn(RemoteAsk) -> RemoteAnswer + Send + Sync>;
+
+static REMOTE_APPROVER: OnceLock<RemoteApprover> = OnceLock::new();
+
+/// Sends every approval prompt to `ask` (an editor over ACP). Set once.
+pub fn set_remote_approver(ask: RemoteApprover) {
+    let _ = REMOTE_APPROVER.set(ask);
+}
+
+// A remote answer at the gate means what the terminal's y, a, n and Esc do.
+fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<String> {
+    match answer {
+        RemoteAnswer::Once => None,
+        RemoteAnswer::Always => {
+            add_session_allowed_tool(cwd, tool_key);
+            crate::config::add_project_allowed(cwd, tool_key);
+            None
+        }
+        RemoteAnswer::Reject => Some("denied by user".into()),
+        RemoteAnswer::Cancelled => {
+            stop_turn();
+            Some(STOPPED_BY_USER.into())
+        }
+    }
+}
+
+/// Forgets how the last turn ended, before the next one in the same process
+/// (`bwn acp` serves many turns).
+pub fn reset_turn_outcome() {
+    STOPPED_SHORT.store(0, Ordering::Relaxed);
+    BLOCKED_WITHOUT_TERMINAL.store(0, Ordering::Relaxed);
+}
+
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
+    if let Some(ask) = REMOTE_APPROVER.get() {
+        let answer = ask(RemoteAsk::Tool {
+            label,
+            key: tool_key,
+        });
+        return remote_decision(answer, tool_key, cwd);
+    }
     if report::is_json() || !std::io::stdin().is_terminal() {
         let checks = GATING_CHECKS.with(|g| g.get().is_some());
         if checks {
@@ -3249,14 +3319,18 @@ fn build_turn(
             }
             // Imperative task answered with how-to prose instead of tool
             // calls: tell the model to act, bounded per task. Never fires
-            // once a mutating tool has run (that prose is a real summary).
-            if should_nudge_to_act(
-                &task_for_recovery,
-                &reply.text,
-                any_tool_ran,
-                mutating_tool_ran,
-                act_nudges,
-            ) {
+            // once a mutating tool has run (that prose is a real summary),
+            // nor in a review, whose answer is prose by design (the diff in
+            // its task reads as an order to change things).
+            if !REVIEWING.load(Ordering::Relaxed)
+                && should_nudge_to_act(
+                    &task_for_recovery,
+                    &reply.text,
+                    any_tool_ran,
+                    mutating_tool_ran,
+                    act_nudges,
+                )
+            {
                 act_nudges += 1;
                 report::notice("  ⟳ model explained instead of acting — nudging it to use tools");
                 msgs.push(Msg::Assistant {
@@ -5546,6 +5620,11 @@ pub fn plan_turn(
 
     if auto_approve {
         report::info("  ✓ plan auto-approved (--yes) — executing");
+    } else if let Some(ask) = REMOTE_APPROVER.get() {
+        match ask(RemoteAsk::Plan { steps: &steps }) {
+            RemoteAnswer::Once | RemoteAnswer::Always => {}
+            RemoteAnswer::Reject | RemoteAnswer::Cancelled => return Ok(PlanEnd::Cancelled),
+        }
     } else {
         let items = vec![
             tui::SelectItem {
@@ -8970,6 +9049,25 @@ mod tests {
         assert!(turn_stopped(true));
         assert!(!turn_stopped(false));
         assert!(hook_gate(Permission::Auto, "read_file", &json!({"path": "a"}), cwd).is_none());
+    }
+
+    #[test]
+    fn an_editor_answer_means_what_the_terminal_key_does() {
+        let cwd = Path::new("/proj-remote");
+        set_turn_stopped(false);
+        assert_eq!(remote_decision(RemoteAnswer::Once, "edit_file", cwd), None);
+        // Once is not remembered.
+        assert!(!is_pre_approved(None, "edit_file", cwd));
+        assert_eq!(
+            remote_decision(RemoteAnswer::Reject, "edit_file", cwd).as_deref(),
+            Some("denied by user")
+        );
+        assert!(!turn_stopped(false));
+        // A cancelled question stops the turn, like Esc at the prompt.
+        let r = remote_decision(RemoteAnswer::Cancelled, "edit_file", cwd).unwrap();
+        assert!(r.contains("stopped by the user"), "{r}");
+        assert!(turn_stopped(true));
+        tui::consume_interrupt();
     }
 
     #[test]

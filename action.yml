@@ -1,0 +1,225 @@
+name: buildwithnexus
+description: Run a buildwithnexus (bwn) task or a read-only review in a workflow, with the event log, annotations and an optional pull request comment.
+author: Garrett Eaglin
+branding:
+  icon: terminal
+  color: purple
+
+# Inputs reach the scripts as environment variables only, never as text in
+# a script, so a pull request title or branch name cannot become a command.
+# The token goes to the comment step alone; bwn never sees it.
+inputs:
+  command:
+    description: "`run` does the task in `prompt`; `review` reviews the changes (read-only, `prompt` is the focus)."
+    default: run
+  prompt:
+    description: The task for `run` (required there), or what `review` should focus on.
+    default: ""
+  permission-mode:
+    description: "`readonly`, `accept-edits`, `auto` or `ask` (with no terminal, `ask` blocks every change)."
+    default: readonly
+  max-budget-usd:
+    description: Stop before the next model request once the estimated cost exceeds this many dollars.
+    default: ""
+  provider:
+    description: Provider id (`bwn providers` lists them). Its API key comes from the step's environment, for example `ANTHROPIC_API_KEY` from a secret.
+    default: ""
+  model:
+    description: Model name for this run.
+    default: ""
+  base-url:
+    description: Model endpoint, such as a gateway (`--base-url`).
+    default: ""
+  review-base:
+    description: For `review`, also review the branch since this git ref (for example `origin/main`).
+    default: ""
+  args:
+    description: More bwn options, separated by spaces (for example `--sandbox auto --effort low`).
+    default: ""
+  working-directory:
+    description: Folder to run in.
+    default: "."
+  install:
+    description: What to install from npm. Empty installs this action's own version; also takes a version (`0.15.0`), a package spec, or the path of a tarball from `npm pack`.
+    default: ""
+  allow-outcomes:
+    description: Outcomes that warn instead of failing the step, separated by commas (for example `budget_stop,step_limit`).
+    default: ""
+  upload-events:
+    description: Upload the `--json` event log as an artifact.
+    default: "true"
+  artifact-name:
+    description: Name of that artifact. Empty picks a unique one.
+    default: ""
+  events-file:
+    description: Where to write the event log. Empty uses a new folder under the runner's temp folder.
+    default: ""
+  comment:
+    description: "Post the result on the pull request (the job needs `pull-requests: write`). Later runs update the same comment."
+    default: "false"
+  comment-tag:
+    description: Tells this action's comments apart when one pull request gets several (for example `review` and `run`).
+    default: bwn
+  pr-number:
+    description: Pull request to comment on.
+    default: ${{ github.event.pull_request.number }}
+  github-token:
+    description: Token for the comment.
+    default: ${{ github.token }}
+  github-api-url:
+    description: GitHub API address for the comment.
+    default: ${{ github.api_url }}
+
+outputs:
+  outcome:
+    description: How the run ended (`success`, `approval_blocked`, `budget_stop`, `review_blocking`, ...).
+    value: ${{ steps.run.outputs.outcome }}
+  exit-code:
+    description: bwn's exit code.
+    value: ${{ steps.run.outputs.exit-code }}
+  passed:
+    description: "`true` when the step passes: success, or an outcome in `allow-outcomes`."
+    value: ${{ steps.run.outputs.passed }}
+  session-id:
+    description: The saved session, for `bwn resume`.
+    value: ${{ steps.run.outputs.session-id }}
+  cost-usd:
+    description: Estimated cost in dollars (empty when the model has no known price).
+    value: ${{ steps.run.outputs.cost-usd }}
+  findings:
+    description: Number of review findings.
+    value: ${{ steps.run.outputs.findings }}
+  summary:
+    description: The final summary or reply.
+    value: ${{ steps.run.outputs.summary }}
+  events:
+    description: Path of the `--json` event log.
+    value: ${{ steps.run.outputs.events }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install buildwithnexus
+      id: install
+      shell: bash
+      env:
+        INPUT_INSTALL: ${{ inputs.install }}
+        ACTION_PATH: ${{ github.action_path }}
+        BWN_ALLOW_BOOTSTRAP: "1"
+      run: |
+        set -eo pipefail
+        command -v npm >/dev/null || { echo "::error title=bwn::npm is not on PATH; add actions/setup-node before this action"; exit 1; }
+        spec="$INPUT_INSTALL"
+        if [ -z "$spec" ]; then
+          spec="buildwithnexus@$(node -p "require(process.env.ACTION_PATH + '/package.json').version")"
+        elif [[ "$spec" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([-+.].*)?$ ]]; then
+          spec="buildwithnexus@${spec#v}"
+        elif [ -f "$spec" ]; then
+          spec="$(cd "$(dirname "$spec")" && pwd)/$(basename "$spec")"
+        fi
+        prefix="${RUNNER_TEMP:-/tmp}/bwn-action"
+        echo "installing $spec"
+        npm install --prefix "$prefix" --no-audit --no-fund --loglevel=error "$spec"
+        bin="$prefix/node_modules/.bin/bwn"
+        "$bin" --version
+        echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+    - name: Run buildwithnexus
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BWN: ${{ steps.install.outputs.bin }}
+        BWN_ALLOW_BOOTSTRAP: "1"
+        ACTION_PATH: ${{ github.action_path }}
+        INPUT_COMMAND: ${{ inputs.command }}
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_PERMISSION_MODE: ${{ inputs.permission-mode }}
+        INPUT_MAX_BUDGET_USD: ${{ inputs.max-budget-usd }}
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_BASE_URL: ${{ inputs.base-url }}
+        INPUT_REVIEW_BASE: ${{ inputs.review-base }}
+        INPUT_ARGS: ${{ inputs.args }}
+        INPUT_EVENTS_FILE: ${{ inputs.events-file }}
+        INPUT_ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        BWN_ALLOW_OUTCOMES: ${{ inputs.allow-outcomes }}
+        BWN_COMMENT_TAG: ${{ inputs.comment-tag }}
+      run: |
+        dir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/bwn-XXXXXX")"
+        events="${INPUT_EVENTS_FILE:-$dir/events.jsonl}"
+        mkdir -p "$(dirname "$events")"
+        artifact="${INPUT_ARTIFACT_NAME:-bwn-events-${GITHUB_JOB}-${dir##*-}}"
+        args=(--json --permission-mode "$INPUT_PERMISSION_MODE")
+        if [ -n "$INPUT_MAX_BUDGET_USD" ]; then args+=(--max-budget-usd "$INPUT_MAX_BUDGET_USD"); fi
+        if [ -n "$INPUT_PROVIDER" ]; then args+=(--provider "$INPUT_PROVIDER"); fi
+        if [ -n "$INPUT_MODEL" ]; then args+=(--model "$INPUT_MODEL"); fi
+        if [ -n "$INPUT_BASE_URL" ]; then args+=(--base-url "$INPUT_BASE_URL"); fi
+        read -r -a extra <<< "$INPUT_ARGS" || true
+        args+=(${extra[@]+"${extra[@]}"})
+        case "$INPUT_COMMAND" in
+          run)
+            if [ -z "$INPUT_PROMPT" ]; then
+              echo "::error title=bwn::the run command needs a prompt"
+              exit 1
+            fi
+            args+=(run -- "$INPUT_PROMPT")
+            ;;
+          review)
+            args+=(review)
+            if [ -n "$INPUT_REVIEW_BASE" ]; then args+=(--base "$INPUT_REVIEW_BASE"); fi
+            if [ -n "$INPUT_PROMPT" ]; then args+=("$INPUT_PROMPT"); fi
+            ;;
+          *)
+            echo "::error title=bwn::command must be run or review (got $INPUT_COMMAND)"
+            exit 1
+            ;;
+        esac
+        # Nothing is piped in: stdin would otherwise be read as more task.
+        # The step itself does not fail here, so the log is uploaded and the
+        # comment posted; the last step passes or fails on the outcome.
+        code=0
+        "$BWN" "${args[@]}" < /dev/null > "$events" || code=$?
+        {
+          echo "events=$events"
+          echo "artifact=$artifact"
+        } >> "$GITHUB_OUTPUT"
+        BWN_EVENTS="$events" BWN_EXIT_CODE="$code" BWN_COMMAND="$INPUT_COMMAND" \
+          BWN_ARTIFACT="$artifact" BWN_COMMENT_FILE="$dir/comment.md" \
+          node "$ACTION_PATH/scripts/action/report.js" summarize
+        echo "comment-file=$dir/comment.md" >> "$GITHUB_OUTPUT"
+
+    - name: Upload the event log
+      if: always() && inputs.upload-events == 'true' && steps.run.outputs.events != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ steps.run.outputs.artifact }}
+        path: ${{ steps.run.outputs.events }}
+        if-no-files-found: warn
+
+    - name: Comment on the pull request
+      if: always() && inputs.comment == 'true' && steps.run.outputs.comment-file != ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BWN_TOKEN: ${{ inputs.github-token }}
+        BWN_API_URL: ${{ inputs.github-api-url }}
+        BWN_REPOSITORY: ${{ github.repository }}
+        BWN_PR_NUMBER: ${{ inputs.pr-number }}
+        BWN_COMMENT_TAG: ${{ inputs.comment-tag }}
+        BWN_COMMENT_FILE: ${{ steps.run.outputs.comment-file }}
+      run: node "$ACTION_PATH/scripts/action/report.js" comment
+
+    - name: Pass or fail on the outcome
+      if: always() && steps.run.outputs.passed != ''
+      shell: bash
+      env:
+        PASSED: ${{ steps.run.outputs.passed }}
+        OUTCOME: ${{ steps.run.outputs.outcome }}
+        CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        if [ "$PASSED" != true ]; then
+          echo "bwn ended with $OUTCOME (exit $CODE)"
+          exit 1
+        fi

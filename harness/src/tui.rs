@@ -34,6 +34,9 @@ pub enum InterruptKind {
 }
 
 static INTERRUPT_KIND_VAL: AtomicU8 = AtomicU8::new(0);
+// `bwn acp`: stdin carries the protocol, so nothing may read a prompt from
+// it, and a cancel from the editor raises the interrupt without raw mode.
+static PROTOCOL_STDIN: AtomicBool = AtomicBool::new(false);
 static AGENT_RUNNING: AtomicBool = AtomicBool::new(false);
 // Live "working" readout: when the current turn started, how many streamed
 // characters have landed since (→ tokens/s), and when the footer last
@@ -5014,6 +5017,9 @@ pub fn trigger_interrupt(kind: InterruptKind) {
 }
 
 pub fn get_interrupt_kind() -> InterruptKind {
+    if PROTOCOL_STDIN.load(Ordering::Relaxed) {
+        return interrupt_kind();
+    }
     if !is_raw() {
         return InterruptKind::None;
     }
@@ -5037,6 +5043,13 @@ fn interrupt_kind() -> InterruptKind {
 
 pub fn interrupted() -> bool {
     get_interrupt_kind() != InterruptKind::None
+}
+
+/// For `bwn acp`: stdin is the protocol channel, so prompts answer "no
+/// answer" without reading it, and `trigger_interrupt` (a cancel from the
+/// editor) stops the turn without a raw terminal.
+pub fn set_protocol_stdin() {
+    PROTOCOL_STDIN.store(true, Ordering::Relaxed);
 }
 
 pub fn consume_interrupt() -> InterruptKind {
@@ -5731,6 +5744,9 @@ pub enum InputEvent {
 /// line return None: callers treat None as cancel, never as an empty answer.
 /// Without a terminal it reads one line from stdin (None at end of input).
 pub fn ask(prompt: &str) -> Option<String> {
+    if PROTOCOL_STDIN.load(Ordering::Relaxed) {
+        return None;
+    }
     let prompt = &*sanitize_prompt(prompt);
     let _pause_guard = PauseAgentRunningGuard::new();
     if is_raw() {
@@ -5763,6 +5779,9 @@ pub fn ask(prompt: &str) -> Option<String> {
 /// never reaches the screen or the scrollback. Esc, Ctrl+C, and Ctrl+D on an
 /// empty line return None (cancel). Without a terminal it reads one line.
 pub fn ask_secret(prompt: &str) -> Option<String> {
+    if PROTOCOL_STDIN.load(Ordering::Relaxed) {
+        return None;
+    }
     let prompt = &*sanitize_prompt(prompt);
     let _pause_guard = PauseAgentRunningGuard::new();
     if !io::stdin().is_terminal() {

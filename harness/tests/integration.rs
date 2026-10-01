@@ -5491,6 +5491,26 @@ fn review_is_read_only_even_in_auto_and_reports_findings() {
     assert!(last_user_text(&posts.lock().unwrap()[0]).contains("now edited"));
 }
 
+// The review prompt asks for findings at the end of the reply. A model that
+// answers from the diff alone, without a tool call, gave them in plain text,
+// and the act-don't-explain nudge used to replace that reply with another.
+#[test]
+fn review_findings_in_a_plain_reply_are_kept() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    std::fs::write(cwd.join("README.md"), "# demo, now edited\n").unwrap();
+    let (port, posts) = serve_recording(vec![text(
+        "The change edits the title.\n- [blocking] README.md:1 — the title lost the project name",
+    )]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "review"]);
+    assert_eq!(r.code, Some(9), "{:?}\nstderr: {}", r.events, r.stderr);
+    let finding = r.find("finding").expect("a finding event");
+    assert_eq!(finding["path"], "README.md");
+    assert!(!r.text_of("notice").contains("nudging"), "{:?}", r.events);
+    assert_eq!(posts.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn review_without_blocking_findings_or_without_changes_succeeds() {
     let home = tmp("home");
@@ -7678,4 +7698,1055 @@ fn a_helper_works_in_the_added_folders_too() {
     let r = run_with_dir(&home, &cwd, &other, "delegate a write");
     assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi\n");
+}
+
+// ── bwn acp: Agent Client Protocol over stdio ───────────────────────────────
+
+// The mock model for ACP sessions, which stream: each scripted reply (as
+// built by tool_call and text) goes out as OpenAI server-sent events, text
+// split into word chunks. Every POST body is kept.
+fn serve_sse(script: Vec<String>) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&posts);
+    thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (method, request) = read_request(&mut stream);
+            if method != "POST" {
+                let body = r#"{"object":"list","data":[]}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
+            seen.lock().unwrap().push(request);
+            let reply: Value = serde_json::from_str(
+                &script
+                    .get(served)
+                    .cloned()
+                    .unwrap_or_else(|| text("(script ended)")),
+            )
+            .unwrap();
+            served += 1;
+            let msg = &reply["choices"][0]["message"];
+            let mut chunks = Vec::new();
+            if let Some(calls) = msg["tool_calls"].as_array() {
+                let calls: Vec<Value> = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let mut c = c.clone();
+                        c["index"] = json!(i);
+                        c
+                    })
+                    .collect();
+                chunks.push(json!({"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": calls}}]}));
+            } else {
+                let content = msg["content"].as_str().unwrap_or("");
+                for word in content.split_inclusive(' ') {
+                    chunks.push(json!({"choices": [{"index": 0, "delta": {"content": word}}]}));
+                }
+            }
+            chunks.push(json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+            let mut body = String::new();
+            for c in chunks {
+                body.push_str(&format!("data: {c}\n\n"));
+            }
+            body.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        }
+    });
+    (port, posts)
+}
+
+// A scripted ACP client: it starts `buildwithnexus acp`, writes JSON-RPC
+// lines to its stdin and reads its stdout, where every line must be one
+// JSON-RPC 2.0 message.
+struct Acp {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    stderr: Arc<Mutex<String>>,
+    next_id: u64,
+    // Every notification and request the agent sent, in order.
+    seen: Vec<Value>,
+}
+
+impl Acp {
+    fn start(home: &Path, cwd: &Path, args: &[&str]) -> Acp {
+        let mut cmd = Command::new(BIN);
+        for var in NET_VARS {
+            cmd.env_remove(var);
+        }
+        let mut child = cmd
+            .args(args)
+            .arg("acp")
+            .current_dir(cwd)
+            .env("NEXUS_HOME", home)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn binary");
+        let (tx, lines) = std::sync::mpsc::channel();
+        let out = child.stdout.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&stderr);
+        let err = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines() {
+                let Ok(line) = line else { break };
+                let mut s = sink.lock().unwrap();
+                s.push_str(&line);
+                s.push('\n');
+            }
+        });
+        Acp {
+            stdin: child.stdin.take(),
+            child,
+            lines,
+            stderr,
+            next_id: 1,
+            seen: Vec::new(),
+        }
+    }
+
+    fn stderr(&self) -> String {
+        self.stderr.lock().unwrap().clone()
+    }
+
+    fn send_line(&mut self, line: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn send(&mut self, msg: Value) {
+        self.send_line(&msg.to_string());
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
+        id
+    }
+
+    fn notify(&mut self, method: &str, params: Value) {
+        self.send(json!({"jsonrpc": "2.0", "method": method, "params": params}));
+    }
+
+    // The next message from the agent; every stdout line must be JSON-RPC.
+    fn recv(&mut self) -> Value {
+        let line = match self.lines.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = self.child.kill();
+                panic!("no message from bwn acp ({e}); stderr:\n{}", self.stderr());
+            }
+        };
+        let msg: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("stdout line is not JSON ({e}): {line}"));
+        assert_eq!(msg["jsonrpc"], "2.0", "not JSON-RPC 2.0: {line}");
+        msg
+    }
+
+    // Sends a request and returns its response. Requests the agent makes
+    // meanwhile are answered with `answer`'s result; they and every
+    // notification are kept in `seen`.
+    fn call(
+        &mut self,
+        method: &str,
+        params: Value,
+        answer: &mut dyn FnMut(&Value) -> Value,
+    ) -> Value {
+        let id = self.request(method, params);
+        self.until_response(id, answer)
+    }
+
+    fn until_response(&mut self, id: u64, answer: &mut dyn FnMut(&Value) -> Value) -> Value {
+        loop {
+            let msg = self.recv();
+            if msg.get("method").is_none() {
+                if msg["id"] == json!(id) {
+                    return msg;
+                }
+                panic!("response to an unknown request: {msg}");
+            }
+            self.seen.push(msg.clone());
+            if let Some(req_id) = msg.get("id") {
+                let result = answer(&msg);
+                self.send(json!({"jsonrpc": "2.0", "id": req_id, "result": result}));
+            }
+        }
+    }
+
+    // The `update` of every session/update seen so far.
+    fn updates(&self) -> Vec<Value> {
+        self.seen
+            .iter()
+            .filter(|m| m["method"] == "session/update")
+            .map(|m| m["params"]["update"].clone())
+            .collect()
+    }
+
+    fn agent_requests(&self, method: &str) -> Vec<Value> {
+        self.seen
+            .iter()
+            .filter(|m| m["method"] == method && m.get("id").is_some())
+            .cloned()
+            .collect()
+    }
+
+    // Closes stdin and waits for the agent to exit.
+    fn close(mut self) -> (Option<i32>, String) {
+        self.stdin.take();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                thread::sleep(std::time::Duration::from_millis(100));
+                return (status.code(), self.stderr());
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = self.child.kill();
+                panic!(
+                    "bwn acp did not exit at end of input; stderr:\n{}",
+                    self.stderr()
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn no_requests(req: &Value) -> Value {
+    panic!("unexpected request from the agent: {req}");
+}
+
+// Answers a permission request with the first option of `kind`.
+fn choose(kind: &str) -> impl FnMut(&Value) -> Value + '_ {
+    move |req: &Value| {
+        assert_eq!(req["method"], "session/request_permission", "{req}");
+        let option = req["params"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} option in {req}"));
+        json!({"outcome": {"outcome": "selected", "optionId": option["optionId"]}})
+    }
+}
+
+fn acp_init(acp: &mut Acp, client_caps: Value) -> Value {
+    let r = acp.call(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": client_caps,
+               "clientInfo": {"name": "scripted-client", "version": "1.0"}}),
+        &mut no_requests,
+    );
+    assert!(r.get("error").is_none(), "{r}");
+    r["result"].clone()
+}
+
+fn acp_new_session(acp: &mut Acp, cwd: &Path) -> String {
+    let r = acp.call(
+        "session/new",
+        json!({"cwd": cwd, "mcpServers": []}),
+        &mut no_requests,
+    );
+    r["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no sessionId: {r}; stderr:\n{}", acp.stderr()))
+        .to_string()
+}
+
+fn prompt(sid: &str, text: &str) -> Value {
+    json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]})
+}
+
+// The agent's streamed reply text, joined.
+fn agent_text(updates: &[Value]) -> String {
+    updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect()
+}
+
+#[test]
+fn acp_prompt_asks_permission_streams_updates_and_applies_the_edit() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let notes = cwd.join("notes.txt");
+    std::fs::write(&notes, "hello\n").unwrap();
+    let (port, posts) = serve_sse(vec![
+        tool_call("c1", "read_file", json!({"path": "notes.txt"})),
+        tool_call(
+            "c2",
+            "edit_file",
+            json!({"path": "notes.txt", "old": "hello", "new": "goodbye"}),
+        ),
+        text("Changed notes.txt to say goodbye."),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    let init = acp_init(&mut acp, json!({}));
+    assert_eq!(init["protocolVersion"], 1);
+    assert_eq!(init["agentCapabilities"]["loadSession"], true);
+    assert_eq!(
+        init["agentCapabilities"]["promptCapabilities"]["image"],
+        true
+    );
+    assert_eq!(init["agentInfo"]["name"], "buildwithnexus");
+
+    let new = acp.call(
+        "session/new",
+        json!({"cwd": cwd, "mcpServers": []}),
+        &mut no_requests,
+    );
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
+    let modes = &new["result"]["modes"];
+    assert_eq!(modes["currentModeId"], "build", "{new}");
+    let ids: Vec<&str> = modes["availableModes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["build", "plan", "brainstorm"]);
+
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "change hello to goodbye in notes.txt"),
+        &mut choose("allow_once"),
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "goodbye\n");
+
+    // One question, for the edit (the read needs none), with the three
+    // answers the terminal prompt offers.
+    let asked = acp.agent_requests("session/request_permission");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let params = &asked[0]["params"];
+    assert_eq!(params["sessionId"], sid.as_str());
+    let kinds: Vec<&str> = params["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["allow_once", "allow_always", "reject_once"]);
+    let call_id = params["toolCall"]["toolCallId"].as_str().unwrap();
+
+    let updates = acp.updates();
+    let announced = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call" && u["toolCallId"] == call_id)
+        .expect("the edit was announced before the question");
+    assert_eq!(announced["kind"], "edit", "{announced}");
+    assert_eq!(announced["status"], "pending");
+    assert_eq!(
+        announced["locations"][0]["path"],
+        notes.display().to_string(),
+        "{announced}"
+    );
+    let completed = updates
+        .iter()
+        .find(|u| {
+            u["sessionUpdate"] == "tool_call_update"
+                && u["toolCallId"] == call_id
+                && u["status"] == "completed"
+        })
+        .expect("the edit completed");
+    let diff = completed["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "diff")
+        .unwrap_or_else(|| panic!("no diff in {completed}"));
+    assert_eq!(diff["path"], notes.display().to_string());
+    assert_eq!(diff["oldText"], "hello\n");
+    assert_eq!(diff["newText"], "goodbye\n");
+    // The read ran without asking and completed too.
+    let read = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "tool_call" && u["kind"] == "read")
+        .expect("the read was announced");
+    assert!(updates
+        .iter()
+        .any(|u| u["sessionUpdate"] == "tool_call_update"
+            && u["toolCallId"] == read["toolCallId"]
+            && u["status"] == "completed"));
+    // The reply streamed in chunks, in order.
+    let chunks = updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+        .count();
+    assert!(chunks >= 2, "{updates:?}");
+    assert_eq!(agent_text(&updates), "Changed notes.txt to say goodbye.");
+    let body: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
+    assert_eq!(body["stream"], true);
+
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn acp_cancel_answers_the_open_question_and_the_session_goes_on() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let marker = cwd.join("ran");
+    let (port, posts) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": format!("touch '{}'", marker.display())}),
+        ),
+        text("Still here."),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let id = acp.request(
+        "session/prompt",
+        prompt(&sid, "run touch on the marker file"),
+    );
+    // The editor cancels while the question is open, then answers it
+    // `cancelled`, as the protocol requires.
+    let session = sid.clone();
+    let mut cancelled_once = false;
+    let resp = loop {
+        let msg = acp.recv();
+        if msg.get("method").is_none() {
+            assert_eq!(msg["id"], json!(id));
+            break msg;
+        }
+        acp.seen.push(msg.clone());
+        if msg["method"] == "session/request_permission" {
+            assert!(!cancelled_once, "asked again after the cancel: {msg}");
+            cancelled_once = true;
+            acp.notify("session/cancel", json!({"sessionId": session}));
+            acp.send(json!({"jsonrpc": "2.0", "id": msg["id"],
+                            "result": {"outcome": {"outcome": "cancelled"}}}));
+        }
+    };
+    assert!(cancelled_once, "no question was asked: {:?}", acp.seen);
+    assert_eq!(resp["result"]["stopReason"], "cancelled", "{resp}");
+    assert!(!marker.exists(), "the cancelled command ran");
+    assert_eq!(posts.lock().unwrap().len(), 1, "a request after the cancel");
+
+    // The next prompt in the same session runs normally.
+    let next = acp.call(
+        "session/prompt",
+        prompt(&sid, "are you there?"),
+        &mut no_requests,
+    );
+    assert_eq!(next["result"]["stopReason"], "end_turn", "{next}");
+    assert!(agent_text(&acp.updates()).ends_with("Still here."));
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn acp_cancel_stops_the_turn_even_when_the_editor_leaves_the_question_open() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let marker = cwd.join("ran");
+    let (port, _posts) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": format!("touch '{}'", marker.display())}),
+        ),
+        text("Still here."),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let id = acp.request(
+        "session/prompt",
+        prompt(&sid, "run touch on the marker file"),
+    );
+    // The editor cancels and never answers the open question: the turn
+    // must not wait for an answer that is not coming.
+    let mut question = Value::Null;
+    let resp = loop {
+        let line = match acp.lines.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(l) => l,
+            Err(_) => {
+                let _ = acp.child.kill();
+                panic!(
+                    "the cancelled prompt never answered; stderr:\n{}",
+                    acp.stderr()
+                );
+            }
+        };
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        if msg.get("method").is_none() {
+            assert_eq!(msg["id"], json!(id), "{msg}");
+            break msg;
+        }
+        if msg["method"] == "session/request_permission" {
+            assert!(question.is_null(), "asked again after the cancel: {msg}");
+            question = msg.clone();
+            acp.notify("session/cancel", json!({"sessionId": sid}));
+        }
+    };
+    assert!(!question.is_null(), "no question was asked");
+    assert_eq!(resp["result"]["stopReason"], "cancelled", "{resp}");
+    assert!(!marker.exists(), "the cancelled command ran");
+    // A late answer to the closed question changes nothing, and the session
+    // goes on.
+    acp.send(json!({"jsonrpc": "2.0", "id": question["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}}));
+    let next = acp.call(
+        "session/prompt",
+        prompt(&sid, "are you there?"),
+        &mut no_requests,
+    );
+    assert_eq!(next["result"]["stopReason"], "end_turn", "{next}");
+    assert!(!marker.exists(), "the late answer ran the command");
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn acp_invalid_requests_get_json_rpc_errors_and_the_server_keeps_serving() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let mut acp = Acp::start(&home, &cwd, &[]);
+
+    acp.send_line("this is not json");
+    let r = acp.recv();
+    assert_eq!(r["error"]["code"], -32700, "{r}");
+    assert!(r["id"].is_null(), "{r}");
+
+    acp.send(json!({"jsonrpc": "2.0", "id": 41, "params": {}}));
+    let r = acp.recv();
+    assert_eq!(r["error"]["code"], -32600, "{r}");
+    assert_eq!(r["id"], 41);
+
+    acp.send(json!({"jsonrpc": "2.0", "id": 42, "method": "no/such_method", "params": {}}));
+    let r = acp.recv();
+    assert_eq!(r["error"]["code"], -32601, "{r}");
+    assert_eq!(r["id"], 42);
+
+    let r = acp.call(
+        "session/prompt",
+        prompt("sess-that-does-not-exist", "hi"),
+        &mut no_requests,
+    );
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let r = acp.call(
+        "session/new",
+        json!({"cwd": "relative/dir", "mcpServers": []}),
+        &mut no_requests,
+    );
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("absolute"),
+        "{r}"
+    );
+    // An unknown notification gets no reply, and the server still answers.
+    acp.notify("no/such_notification", json!({}));
+    let init = acp_init(&mut acp, json!({}));
+    assert_eq!(init["protocolVersion"], 1);
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn acp_file_tools_read_and_write_through_the_editor_when_it_offers_fs() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let notes = cwd.join("notes.txt");
+    std::fs::write(&notes, "on disk\n").unwrap();
+    let (port, posts) = serve_sse(vec![
+        tool_call("c1", "read_file", json!({"path": "notes.txt"})),
+        tool_call(
+            "c2",
+            "edit_file",
+            json!({"path": "notes.txt", "old": "unsaved buffer", "new": "edited buffer"}),
+        ),
+        text("Edited the open buffer."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(
+        &mut acp,
+        json!({"fs": {"readTextFile": true, "writeTextFile": true}}),
+    );
+    let sid = acp_new_session(&mut acp, &cwd);
+    let mut writes = Vec::new();
+    let mut reads = 0;
+    let shown = notes.display().to_string();
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "edit the unsaved buffer in notes.txt"),
+        &mut |req| {
+            assert_eq!(req["params"]["sessionId"], sid.as_str(), "{req}");
+            assert_eq!(req["params"]["path"], shown.as_str(), "{req}");
+            match req["method"].as_str().unwrap() {
+                "fs/read_text_file" => {
+                    reads += 1;
+                    json!({"content": "unsaved buffer\n"})
+                }
+                "fs/write_text_file" => {
+                    writes.push(req["params"]["content"].as_str().unwrap().to_string());
+                    json!({})
+                }
+                other => panic!("unexpected request {other}: {req}"),
+            }
+        },
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    assert!(reads >= 2, "read_file and edit_file both read the buffer");
+    assert_eq!(writes, ["edited buffer\n"]);
+    // The editor owns the write: the file on disk is untouched.
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "on disk\n");
+    // The model saw the buffer, not the disk.
+    assert!(posts.lock().unwrap()[1].contains("unsaved buffer"));
+    acp.close();
+}
+
+#[test]
+fn acp_session_load_replays_the_conversation_and_continues_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_sse(vec![text("It greets people."), text("Add a --name flag.")]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut first = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut first, json!({}));
+    let sid = acp_new_session(&mut first, &cwd);
+    let r = first.call(
+        "session/prompt",
+        prompt(&sid, "what does this project do?"),
+        &mut no_requests,
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    first.close();
+
+    let mut second = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut second, json!({}));
+    let elsewhere = tmp("elsewhere");
+    let wrong = second.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": elsewhere, "mcpServers": []}),
+        &mut no_requests,
+    );
+    assert_eq!(wrong["error"]["code"], -32602, "{wrong}");
+    let loaded = second.call(
+        "session/load",
+        json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+        &mut no_requests,
+    );
+    assert!(loaded["result"].is_object(), "{loaded}");
+    // The whole conversation came back before the response.
+    let replay = second.updates();
+    let user: String = replay
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "user_message_chunk")
+        .filter_map(|u| u["content"]["text"].as_str())
+        .collect();
+    assert!(user.contains("what does this project do?"), "{replay:?}");
+    assert_eq!(agent_text(&replay), "It greets people.");
+
+    let r = second.call(
+        "session/prompt",
+        prompt(&sid, "how would I add a flag?"),
+        &mut no_requests,
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    // The model got the earlier exchange with the new question.
+    let posts = posts.lock().unwrap();
+    assert!(posts[1].contains("It greets people."), "{}", posts[1]);
+    assert!(posts[1].contains("how would I add a flag?"));
+    second.close();
+}
+
+#[test]
+fn acp_plan_mode_shows_the_plan_and_builds_only_after_approval() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, _) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "exit_plan",
+            json!({"steps": ["Create out.txt with hello.", "Verify the file exists."]}),
+        ),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "out.txt", "content": "hello"}),
+        ),
+        text("Built it."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let r = acp.call(
+        "session/set_mode",
+        json!({"sessionId": sid, "modeId": "plan"}),
+        &mut no_requests,
+    );
+    assert!(r["result"].is_object(), "{r}");
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "create out.txt containing hello"),
+        &mut choose("allow_once"),
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    let updates = acp.updates();
+    let plan = updates
+        .iter()
+        .find(|u| u["sessionUpdate"] == "plan")
+        .expect("a plan update");
+    assert_eq!(plan["entries"][0]["content"], "Create out.txt with hello.");
+    assert_eq!(plan["entries"].as_array().unwrap().len(), 2);
+    let asked = acp.agent_requests("session/request_permission");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0]["params"]["toolCall"]["kind"], "switch_mode");
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["sessionUpdate"] == "current_mode_update" && u["currentModeId"] == "build"),
+        "{updates:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("out.txt")).unwrap(),
+        "hello"
+    );
+    acp.close();
+}
+
+#[test]
+fn acp_untrusted_project_hooks_ask_through_the_editor() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let marker = cwd.join("hook-ran");
+    let (port, _) = serve_sse(vec![text("Hi."), text("Hi again.")]);
+    write_config(&home, "llamacpp", "auto", port);
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"hooks": {"SessionStart": hook(&format!("touch '{}'", marker.display()))}})
+            .to_string(),
+    )
+    .unwrap();
+
+    // Refused: the project's hook stays off.
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "hello"),
+        &mut choose("reject_once"),
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    let asked = acp.agent_requests("session/request_permission");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let question = asked[0]["params"]["toolCall"].to_string();
+    assert!(question.contains("settings.json"), "{question}");
+    assert!(!marker.exists(), "an untrusted hook ran");
+    acp.close();
+
+    // Trusted: it runs, and the answer is remembered like the terminal's.
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "hello"),
+        &mut choose("allow_always"),
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    assert!(marker.exists(), "the trusted hook did not run");
+    acp.close();
+}
+
+#[test]
+fn acp_always_allow_is_remembered_for_the_project_and_reject_is_told_to_the_model() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "one"}),
+        ),
+        text("Wrote a.txt."),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "b.txt", "content": "two"}),
+        ),
+        text("Wrote b.txt."),
+        tool_call("c3", "run_command", json!({"command": "echo hi > c.txt"})),
+        text("Could not run it."),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "create a.txt"),
+        &mut choose("allow_always"),
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    // The same kind of change is not asked about again in this project.
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "create b.txt"),
+        &mut no_requests,
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "two");
+    // A command is asked about; refusing it reaches the model as a denial.
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "write c.txt with a shell command"),
+        &mut choose("reject_once"),
+    );
+    assert_eq!(r["result"]["stopReason"], "end_turn", "{r}");
+    assert!(!cwd.join("c.txt").exists());
+    assert!(posts.lock().unwrap()[5].contains("denied by user"));
+    assert_eq!(acp.agent_requests("session/request_permission").len(), 2);
+    acp.close();
+
+    // Remembered on disk, as the terminal's `a` is.
+    let settings = std::fs::read_to_string(home.join("settings.json")).unwrap_or_default()
+        + &std::fs::read_to_string(home.join("config.json")).unwrap_or_default();
+    assert!(settings.contains("project_allowed"), "{settings}");
+}
+
+#[test]
+fn acp_stray_output_goes_to_stderr_and_never_into_the_protocol() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    // A corrupt session file makes the loader print a warning.
+    std::fs::write(
+        home.join("sessions/0000000000000001-deadbeef.json"),
+        "{ not json",
+    )
+    .unwrap();
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let r = acp.call(
+        "session/load",
+        json!({"sessionId": "0000000000000001-deadbeef", "cwd": cwd, "mcpServers": []}),
+        &mut no_requests,
+    );
+    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let empty = acp.call(
+        "session/prompt",
+        json!({"sessionId": "x", "prompt": []}),
+        &mut no_requests,
+    );
+    assert_eq!(empty["error"]["code"], -32602, "{empty}");
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0));
+    assert!(
+        stderr.contains("skipping corrupt session file"),
+        "stderr:\n{stderr}"
+    );
+}
+
+// The protocol's stdout is bwn's alone: a command (or hook, or MCP server)
+// that inherited it could send the editor requests of its own, such as
+// fs/write_text_file for a path its sandbox keeps it from.
+#[cfg(unix)]
+#[test]
+fn acp_commands_cannot_write_into_the_protocol() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let forged = json!({"jsonrpc": "2.0", "id": 9999, "method": "fs/write_text_file",
+                        "params": {"sessionId": "x", "path": "/tmp/forged", "content": "x"}});
+    let script = cwd.join("forge.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "for fd in /proc/self/fd/* /dev/fd/*; do n=${{fd##*/}}; \
+             [ \"$n\" -gt 2 ] 2>/dev/null && printf '%s\\n' '{forged}' > \"$fd\"; done 2>/dev/null; echo tried\n"
+        ),
+    )
+    .unwrap();
+    let (port, _) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": format!("sh '{}'", script.display())}),
+        ),
+        text("Done."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({"fs": {"writeTextFile": true}}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "run the forge script"),
+        &mut no_requests,
+    );
+    assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+    assert!(
+        acp.updates()
+            .iter()
+            .any(|u| u.to_string().contains("tried")),
+        "the script did not run: {:?}",
+        acp.updates()
+    );
+    let (code, stderr) = acp.close();
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn acp_mcp_servers_from_the_editor_are_connected_and_called() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_sse(vec![
+        tool_call(
+            "c1",
+            "mcp__editor_fake__echo",
+            json!({"text": "from the editor"}),
+        ),
+        text("Echoed."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let new = acp.call(
+        "session/new",
+        json!({"cwd": cwd, "mcpServers": [{
+            "name": "editor_fake", "command": "python3", "args": [FAKE_MCP],
+            "env": [{"name": "FAKE_MCP_UNUSED", "value": "1"}],
+        }]}),
+        &mut no_requests,
+    );
+    let sid = new["result"]["sessionId"].as_str().unwrap().to_string();
+    let r = acp.call(
+        "session/prompt",
+        prompt(&sid, "echo through mcp"),
+        &mut no_requests,
+    );
+    assert_eq!(
+        r["result"]["stopReason"],
+        "end_turn",
+        "{r}; stderr:\n{}",
+        acp.stderr()
+    );
+    // The editor's server was offered to the model and answered the call.
+    let posts = posts.lock().unwrap();
+    assert!(posts[0].contains("mcp__editor_fake__echo"), "{}", posts[0]);
+    let done = acp
+        .updates()
+        .into_iter()
+        .find(|u| u["sessionUpdate"] == "tool_call_update" && u["status"] == "completed")
+        .expect("the mcp call completed");
+    assert_eq!(
+        done["content"][0]["content"]["text"],
+        "echo: from the editor"
+    );
+    let (_, stderr) = acp.close();
+    assert!(
+        stderr.contains("mcp: editor_fake connected"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn acp_cancel_stops_a_model_request_that_is_still_running() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // A model that takes 20 s to say anything.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (method, _) = read_request(&mut stream);
+            if method == "POST" {
+                thread::sleep(std::time::Duration::from_secs(20));
+            }
+            let body = r#"{"object":"list","data":[]}"#;
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    write_config(&home, "llamacpp", "auto", port);
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let started = std::time::Instant::now();
+    let id = acp.request(
+        "session/prompt",
+        prompt(&sid, "write a long essay into essay.md"),
+    );
+    thread::sleep(std::time::Duration::from_millis(500));
+    acp.notify("session/cancel", json!({"sessionId": sid}));
+    let r = acp.until_response(id, &mut no_requests);
+    assert_eq!(r["result"]["stopReason"], "cancelled", "{r}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the cancel waited for the model: {:?}",
+        started.elapsed()
+    );
+    acp.close();
 }

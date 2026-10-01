@@ -25,6 +25,8 @@ no tag yet until CHANGELOG.md has its `## [x.y.z]` section.
 | `--json` events on stdout | removing or renaming an event type or field; changing a field's type or meaning | a new event type; a new field |
 | Session files in `~/.buildwithnexus/sessions/` | a file an earlier version wrote no longer loads | new fields |
 | Exit codes (see README, Headless and CI) | a code changing meaning | a new code for a case that had none |
+| `buildwithnexus acp` | dropping the protocol version it speaks (ACP 1) or a mode id (`build`, `plan`, `brainstorm`) | a new capability, mode or kind of update |
+| The GitHub Action (`action.yml`) | removing or renaming an input or output; changing what a value does | a new input or output |
 
 Human-readable output, TUI layout, log wording, and files under
 `~/.buildwithnexus/` other than sessions and settings are not covered.
