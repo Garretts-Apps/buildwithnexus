@@ -7013,6 +7013,7 @@ mod terminal_ui_tests {
             iteration: 0,
             elapsed_secs: None,
             output_lines: 0,
+            reason: None,
         };
         assert!(waiting_workflows(&[]).is_empty());
         assert_eq!(
