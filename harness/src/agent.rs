@@ -6806,7 +6806,13 @@ mod tests {
         let _g = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let home = std::env::temp_dir().join(format!("bwn-agent-chat-{}", std::process::id()));
+        // Unique per run: test checkpoints live under the temp folder by
+        // project path, and a reused process id would find an earlier run's.
+        let home = std::env::temp_dir().join(format!(
+            "bwn-agent-chat-{}-{}",
+            std::process::id(),
+            checkpoint::now_ms()
+        ));
         let _ = std::fs::remove_dir_all(&home);
         let proj = home.join("proj");
         std::fs::create_dir_all(&proj).unwrap();
