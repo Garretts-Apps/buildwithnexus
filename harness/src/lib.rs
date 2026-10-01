@@ -1955,7 +1955,7 @@ fn repl(
         // conversation, like `/build <task>`: kept, saved and counted.
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             match agent::plan_turn(
                 &provider,
@@ -1981,7 +1981,7 @@ fn repl(
         }
         if let Some(task) = t.strip_prefix("/build ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             if let Err(e) = agent::run_build_session_with_images(
                 &provider,
@@ -2000,7 +2000,7 @@ fn repl(
         }
         if let Some(task) = t.strip_prefix("/brainstorm ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             match agent::brainstorm_turn(&provider, cwd, &task, images, &mut transcript, &sid) {
                 // The person answered y to the model's suggestion to switch.
@@ -2414,7 +2414,7 @@ fn repl(
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
-        let vision = media::model_supports_vision(&provider);
+        let vision = Vision::of(&provider);
         let (clean_task, mut image_data) = extract_attachments(t, cwd, vision);
 
         // Merge any /btw context queued since the last turn.
@@ -7146,8 +7146,7 @@ fn headless_attachments(
     task: &str,
     cwd: &std::path::Path,
 ) -> (String, Vec<(String, String)>) {
-    let vision = media::model_supports_vision(p);
-    let (task, images) = extract_attachments(task, cwd, vision);
+    let (task, images) = extract_attachments(task, cwd, Vision::of(p));
     if !images.is_empty() {
         let n = images.len();
         eprintln!("⎘ attached {n} image{}", if n == 1 { "" } else { "s" });
@@ -7155,11 +7154,39 @@ fn headless_attachments(
     (task, images)
 }
 
+/// Whether an image or a video may be attached, and if not, the notice that
+/// says who decided (the `vision` setting, the server, or the model name).
+enum Vision {
+    Yes,
+    No(String),
+}
+
+impl Vision {
+    fn of(p: &Provider) -> Self {
+        if media::model_supports_vision(p) {
+            Vision::Yes
+        } else {
+            Vision::No(media::vision_refusal(p))
+        }
+    }
+}
+
+impl From<bool> for Vision {
+    fn from(yes: bool) -> Self {
+        if yes {
+            Vision::Yes
+        } else {
+            Vision::No("this model does not accept images — image not attached".into())
+        }
+    }
+}
+
 fn extract_attachments(
     task: &str,
     cwd: &std::path::Path,
-    vision: bool,
+    vision: impl Into<Vision>,
 ) -> (String, Vec<(String, String)>) {
+    let vision = vision.into();
     let mut images: Vec<(String, String)> = Vec::new();
     let mut text_attachments = Vec::new();
     // Attachment words are replaced where they stand; every other byte of
@@ -7172,7 +7199,7 @@ fn extract_attachments(
         // part of the file name; it stays in the prompt after the marker.
         let word = w.value.trim_end_matches(['?', '!', '.', ',', ';', ':']);
         let after = &w.value[word.len()..];
-        let Some(marker) = attach_word(word, cwd, vision, &mut images, &mut text_attachments)
+        let Some(marker) = attach_word(word, cwd, &vision, &mut images, &mut text_attachments)
         else {
             continue;
         };
@@ -7290,7 +7317,7 @@ fn quoted(text: &str, j: usize) -> Option<(usize, String)> {
 fn attach_word(
     word: &str,
     cwd: &std::path::Path,
-    vision: bool,
+    vision: &Vision,
     images: &mut Vec<(String, String)>,
     text_attachments: &mut Vec<String>,
 ) -> Option<String> {
@@ -7424,10 +7451,8 @@ fn attach_word(
             tui::sanitize_terminal(&p.display().to_string())
         )));
     } else if image_exts.contains(&ext.as_str()) && p.exists() {
-        if !vision {
-            tui::line(&tui::yellow(
-                "  ⚠ current model is not multimodal — image not attached",
-            ));
+        if let Vision::No(why) = vision {
+            tui::line(&tui::yellow(&format!("  ⚠ {why}")));
         } else if let Ok(mut f) = std::fs::File::open(&p) {
             let mut buf = Vec::new();
             if f.read_to_end(&mut buf).is_ok() {
@@ -7450,10 +7475,9 @@ fn attach_word(
             }
         }
     } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
-        if !vision {
-            tui::line(&tui::yellow(
-                "  ⚠ current model is not multimodal — video not attached",
-            ));
+        if let Vision::No(why) = vision {
+            let why = why.replace("image not attached", "video not attached");
+            tui::line(&tui::yellow(&format!("  ⚠ {why}")));
         } else if !media::ffmpeg_available() {
             tui::line(&tui::yellow(
                 "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",

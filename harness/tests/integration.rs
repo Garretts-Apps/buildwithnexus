@@ -3015,6 +3015,45 @@ fn a_message_bigger_than_the_window_is_not_saved_in_any_mode() {
     }
 }
 
+// An image the model cannot take is refused with the reason: here the
+// `vision` setting, which wins over a model name that suggests vision.
+#[test]
+fn an_image_refusal_names_who_said_the_model_takes_no_images() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("described")]);
+    let cfg = json!({
+        "provider": "custom", "model": "gpt-4o", "permission": "auto", "vision": false,
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("settings.json"), cfg.to_string()).unwrap();
+    std::fs::write(cwd.join("shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(["run", "what is in shot.png"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let all =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        all.contains(
+            "this model does not accept images (\"vision\": false in settings.json) — image not attached"
+        ),
+        "{all}"
+    );
+    assert!(!all.contains("not multimodal"), "{all}");
+    let posts = posts.lock().unwrap();
+    assert!(!posts.is_empty());
+    assert!(!posts[0].contains("image_url"), "the image was sent");
+}
+
 // ── conversation-sessions ───────────────────────────────────────────────────
 
 // Four headless runs started together share one home; each keeps its own
