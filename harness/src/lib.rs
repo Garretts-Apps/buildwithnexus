@@ -58,6 +58,7 @@ pub mod provider;
 pub mod report;
 pub mod rules;
 pub mod sandbox;
+pub mod screenshot;
 pub mod session;
 pub mod sixel;
 pub mod tools;
@@ -1311,14 +1312,10 @@ fn headless(
     let mut r = f(&provider, perm, cwd.clone());
     let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
-    let blocked = agent::blocked_without_terminal();
+    let blocked_calls = agent::blocked_without_terminal();
+    let blocked = blocked_calls.len();
     if r.is_ok() && blocked > 0 {
-        r = Err(format!(
-            "{blocked} change{} blocked for lack of approval; nothing was applied for {}. \
-             Re-run with --permission-mode auto to allow changes.",
-            if blocked == 1 { " was" } else { "s were" },
-            if blocked == 1 { "it" } else { "them" }
-        ));
+        r = Err(blocked_line(&blocked_calls));
     }
     // Refusals by a hook, a rule or read-only mode: the run did not do what
     // it was asked, though nothing failed.
@@ -1382,6 +1379,24 @@ fn headless(
         print_session_worktree_hint();
         std::process::exit(code);
     }
+}
+
+// The closing line of a run whose changes nobody could approve: what was
+// blocked, by its approval label, and nothing about the rest of the run.
+fn blocked_line(calls: &[String]) -> String {
+    let n = calls.len();
+    let shown: Vec<&str> = calls.iter().take(3).map(String::as_str).collect();
+    let more = match n.saturating_sub(shown.len()) {
+        0 => String::new(),
+        k => format!(" and {k} more"),
+    };
+    format!(
+        "{n} change{} blocked for lack of approval and not made: {}{more}. \
+         Re-run with --permission-mode auto to allow {}.",
+        if n == 1 { " was" } else { "s were" },
+        shown.join("; "),
+        if n == 1 { "it" } else { "them" }
+    )
 }
 
 // A turn that ended without an error but short of success gets its own exit
@@ -6133,6 +6148,12 @@ fn context_breakdown(msgs: &[provider::Msg], tools: &[tools::ToolDef]) -> Contex
             }
             provider::Msg::Tool(results) => {
                 b.conversation += results.iter().map(|r| r.content.len()).sum::<usize>() / 4;
+                b.images += results
+                    .iter()
+                    .flat_map(|r| &r.images)
+                    .map(|(_, d)| d.len() / 3)
+                    .sum::<usize>()
+                    / 4;
             }
         }
     }
@@ -8947,6 +8968,23 @@ mod tests {
     }
 
     #[test]
+    fn the_blocked_line_names_what_was_blocked() {
+        let calls: Vec<String> = ["write a.txt", "run: npm test", "remove b", "run: ls", "x"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(
+            blocked_line(&calls[..1]),
+            "1 change was blocked for lack of approval and not made: write a.txt. \
+             Re-run with --permission-mode auto to allow it."
+        );
+        assert_eq!(
+            blocked_line(&calls),
+            "5 changes were blocked for lack of approval and not made: write a.txt; \
+             run: npm test; remove b and 2 more. Re-run with --permission-mode auto to allow them."
+        );
+    }
+
+    #[test]
     fn parse_cli_options_budget_rejects_missing_or_non_positive_values() {
         let err = parse_cli_options(["--max-budget-usd"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("--max-budget-usd requires a value"), "{err}");
@@ -10096,6 +10134,7 @@ mod tests {
                 id: "1".into(),
                 content: "r".repeat(40),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let tools = vec![tools::ToolDef {

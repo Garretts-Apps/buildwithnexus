@@ -8,6 +8,7 @@
 // `complete()` and the streaming `stream()` so there's exactly one place that
 // knows each vendor's JSON shape.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +51,12 @@ pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
+    /// Images the tool returned (a file read, a screenshot), as
+    /// `(media_type, base64_data)` pairs like `Msg::UserImages`. Anthropic
+    /// takes them inside the tool_result; the other protocols get them in a
+    /// user turn right after the round's tool messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<(String, String)>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Msg {
@@ -1757,7 +1764,7 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Opti
                     .map(|r| {
                         json!({
                             "type": "tool_result", "tool_use_id": r.id,
-                            "content": r.content, "is_error": r.is_error
+                            "content": anthropic_tool_content(r), "is_error": r.is_error
                         })
                     })
                     .collect();
@@ -1790,6 +1797,50 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Opti
             .collect::<Vec<_>>());
     }
     body
+}
+
+// A tool_result's content: the text alone, or text and image blocks when
+// the tool returned images (an empty text block is refused by the API).
+fn anthropic_tool_content(r: &ToolResult) -> Value {
+    if r.images.is_empty() {
+        return json!(r.content);
+    }
+    let mut parts = Vec::new();
+    if !r.content.is_empty() {
+        parts.push(json!({"type": "text", "text": r.content}));
+    }
+    parts.extend(r.images.iter().map(|(mt, data)| {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mt, "data": data}
+        })
+    }));
+    json!(parts)
+}
+
+// Tool messages on the OpenAI and Ollama protocols carry text only, so the
+// images a round of tools returned follow it in one user turn. Each set is
+// named by the call it came from; `None` when no result had an image.
+fn tool_images_intro(results: &[ToolResult], names: &HashMap<&str, &str>) -> Option<String> {
+    let lines: Vec<String> = results
+        .iter()
+        .filter(|r| !r.images.is_empty())
+        .map(|r| tool_images_label(r, names))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn tool_images_label(r: &ToolResult, names: &HashMap<&str, &str>) -> String {
+    let n = r.images.len();
+    let what = if n == 1 {
+        "1 image".to_string()
+    } else {
+        format!("{n} images")
+    };
+    match names.get(r.id.as_str()) {
+        Some(name) => format!("[{what} returned by the {name} call {}]", r.id),
+        None => format!("[{what} returned by tool call {}]", r.id),
+    }
 }
 
 fn anthropic_request(
@@ -2138,20 +2189,13 @@ fn openai_body(
     if !system.is_empty() {
         messages.push(json!({"role": "system", "content": system}));
     }
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images
-                    .iter()
-                    .map(|(mt, data)| {
-                        json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:{mt};base64,{data}")}
-                        })
-                    })
-                    .collect();
+                let mut parts: Vec<Value> = images.iter().map(openai_image_part).collect();
                 parts.push(json!({"type": "text", "text": text}));
                 messages.push(json!({"role": "user", "content": parts}));
             }
@@ -2165,6 +2209,9 @@ fn openai_body(
                             "function": {"name": c.name, "arguments": c.input.to_string()}
                         }))
                         .collect::<Vec<_>>());
+                    for c in calls {
+                        call_names.insert(&c.id, &c.name);
+                    }
                 }
                 messages.push(msg);
             }
@@ -2172,6 +2219,18 @@ fn openai_body(
                 for r in results {
                     messages
                         .push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
+                }
+                // After every tool message of the round: a user turn between
+                // them would orphan the calls that follow it.
+                if tool_images_intro(results, &call_names).is_some() {
+                    let mut parts: Vec<Value> = Vec::new();
+                    for r in results.iter().filter(|r| !r.images.is_empty()) {
+                        parts.push(
+                            json!({"type": "text", "text": tool_images_label(r, &call_names)}),
+                        );
+                        parts.extend(r.images.iter().map(openai_image_part));
+                    }
+                    messages.push(json!({"role": "user", "content": parts}));
                 }
             }
         }
@@ -2191,6 +2250,13 @@ fn openai_body(
         })).collect::<Vec<_>>());
     }
     body
+}
+
+fn openai_image_part((mt, data): &(String, String)) -> Value {
+    json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{mt};base64,{data}")}
+    })
 }
 
 fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
@@ -2726,7 +2792,7 @@ fn ollama_body(
     // Ollama tool-call messages carry no ids on the wire, so tool results are
     // threaded by name instead: map call ids to names while walking the
     // transcript, then stamp tool_name on each result.
-    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
@@ -2759,6 +2825,15 @@ fn ollama_body(
                         msg["tool_name"] = json!(name);
                     }
                     messages.push(msg);
+                }
+                // Images go on a user turn, the role every vision template
+                // renders them for.
+                if let Some(intro) = tool_images_intro(results, &call_names) {
+                    let imgs: Vec<&str> = results
+                        .iter()
+                        .flat_map(|r| r.images.iter().map(|(_, data)| data.as_str()))
+                        .collect();
+                    messages.push(json!({"role": "user", "content": intro, "images": imgs}));
                 }
             }
         }
@@ -3515,12 +3590,136 @@ mod tests {
             id: "t1".into(),
             content: "ok".into(),
             is_error: false,
+            images: Vec::new(),
         }])];
         let b = anthropic_body("m", &msgs, &[], None);
         let block = &b["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "t1");
         assert_eq!(block["is_error"], false);
+        // Text only: the content stays a plain string.
+        assert_eq!(block["content"], "ok");
+    }
+
+    // A round where one tool returned an image and one did not, after the
+    // assistant turn that made both calls.
+    fn image_round() -> Vec<Msg> {
+        vec![
+            Msg::Assistant {
+                text: String::new(),
+                calls: vec![
+                    tc("c1", "read_file", json!({"path": "a.png"})),
+                    tc("c2", "read_file", json!({"path": "b.txt"})),
+                ],
+            },
+            Msg::Tool(vec![
+                ToolResult {
+                    id: "c1".into(),
+                    content: "image a.png".into(),
+                    is_error: false,
+                    images: vec![("image/png".into(), "QUJD".into())],
+                },
+                ToolResult {
+                    id: "c2".into(),
+                    content: "hello".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+            ]),
+        ]
+    }
+
+    #[test]
+    fn anthropic_body_puts_tool_images_inside_the_tool_result() {
+        let b = anthropic_body("m", &image_round(), &[], None);
+        let results = &b["messages"][1]["content"];
+        assert_eq!(
+            results[0]["content"],
+            json!([
+                {"type": "text", "text": "image a.png"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+            ])
+        );
+        assert_eq!(results[1]["content"], "hello");
+        // No empty text block when the tool said nothing.
+        let mut bare = image_round();
+        if let Msg::Tool(rs) = &mut bare[1] {
+            rs[0].content.clear();
+        }
+        let b = anthropic_body("m", &bare, &[], None);
+        assert_eq!(
+            b["messages"][1]["content"][0]["content"][0]["type"],
+            "image"
+        );
+    }
+
+    #[test]
+    fn openai_body_follows_the_tool_messages_with_their_images() {
+        let b = openai_body("m", &image_round(), &[], None, None);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(m[1]["role"], "tool");
+        assert_eq!(m[1]["content"], "image a.png");
+        assert_eq!(m[2]["role"], "tool");
+        assert_eq!(m[3]["role"], "user");
+        assert_eq!(
+            m[3]["content"],
+            json!([
+                {"type": "text", "text": "[1 image returned by the read_file call c1]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+            ])
+        );
+        // A round without images adds nothing.
+        let b = openai_body("m", &image_round()[..1], &[], None, None);
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ollama_body_follows_the_tool_messages_with_their_images() {
+        let b = ollama_body("m", &image_round(), &[], None, None, 8_192);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(m[1]["role"], "tool");
+        assert!(m[1].get("images").is_none());
+        assert_eq!(m[3]["role"], "user");
+        assert_eq!(
+            m[3]["content"],
+            "[1 image returned by the read_file call c1]"
+        );
+        assert_eq!(m[3]["images"], json!(["QUJD"]));
+    }
+
+    #[test]
+    fn flattened_requests_keep_tool_images_on_the_user_turn() {
+        let mut msgs = vec![Msg::User("look at a.png".into())];
+        msgs.extend(image_round());
+        let mut b = openai_body("m", &msgs, &[], None, None);
+        flatten_openai_messages(&mut b, true);
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["image_url"]["url"], "data:image/png;base64,QUJD",
+            "{last}"
+        );
+        let mut b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        flatten_ollama_messages(&mut b);
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["images"], json!(["QUJD"]), "{last}");
+    }
+
+    #[test]
+    fn tool_images_survive_a_session_round_trip_and_old_files_still_load() {
+        let r: ToolResult =
+            serde_json::from_str(r#"{"id":"a","content":"x","is_error":false}"#).unwrap();
+        assert!(r.images.is_empty());
+        let Msg::Tool(rs) = &image_round()[1] else {
+            unreachable!()
+        };
+        let text = serde_json::to_string(&rs[..]).unwrap();
+        assert_eq!(text.matches("images").count(), 1, "{text}");
+        let back: Vec<ToolResult> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back[0].images, rs[0].images);
     }
 
     #[test]
@@ -3797,11 +3996,13 @@ mod tests {
                 id: "a".into(),
                 content: "1".into(),
                 is_error: false,
+                images: Vec::new(),
             },
             ToolResult {
                 id: "b".into(),
                 content: "2".into(),
                 is_error: true,
+                images: Vec::new(),
             },
         ])];
         let b = openai_body("m", &msgs, &[], None, None);
@@ -4489,11 +4690,13 @@ mod tests {
                     id: "c1".into(),
                     content: "ok".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
                 ToolResult {
                     id: "unknown".into(),
                     content: "?".into(),
                     is_error: true,
+                    images: Vec::new(),
                 },
             ]),
         ];
@@ -5113,6 +5316,7 @@ mod tests {
                 id: call_id.clone(),
                 content: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);

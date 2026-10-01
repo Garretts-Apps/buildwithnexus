@@ -212,6 +212,18 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
                 tui::line(&rows.join("\n"));
             }
         }
+        // A picture read or a screenshot: what the model was shown, and
+        // whether it could see it.
+        "read" | "read_file" | "screenshot_url"
+            if name == "screenshot_url"
+                || (content.starts_with("image ") && content.lines().count() <= 2) =>
+        {
+            let rows: Vec<String> = clip_head(content, 3)
+                .into_iter()
+                .map(|l| tui::dim(&format!("    ↳ {l}")))
+                .collect();
+            tui::line(&rows.join("\n"));
+        }
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "list_python_tools" => {
             let n = content.lines().count();

@@ -23,6 +23,9 @@ pub struct Outcome {
     pub content: String,
     pub is_error: bool,
     pub finished: bool, // the `finish` tool ends the loop
+    /// Images for the model, `(media_type, base64)`. The agent drops them,
+    /// and says why, for a model that does not take images.
+    pub images: Vec<(String, String)>,
 }
 
 fn ok(s: impl Into<String>) -> Outcome {
@@ -30,6 +33,7 @@ fn ok(s: impl Into<String>) -> Outcome {
         content: s.into(),
         is_error: false,
         finished: false,
+        images: Vec::new(),
     }
 }
 fn err(s: impl Into<String>) -> Outcome {
@@ -37,6 +41,7 @@ fn err(s: impl Into<String>) -> Outcome {
         content: s.into(),
         is_error: true,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -201,7 +206,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "python_tool", description: "Run a Python tool script with JSON input on stdin. Use for specialized local tools that are easier to maintain outside Rust.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"input":{"type":"object"}},"required":["path"]}) },
-        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. Works anywhere on the filesystem and expands `~`.",
+        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. A PNG, JPEG, GIF or WebP picture comes back as an image you can look at; a PDF as its text. Works anywhere on the filesystem and expands `~`.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}) },
         ToolDef { name: "read_many_files", description: "Read several UTF-8 text files at once. Use for comparing related files without repeated round trips.",
             schema: json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},"max_bytes_per_file":{"type":"integer","minimum":1000,"maximum":100000}},"required":["paths"]}) },
@@ -261,6 +266,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"expect_status":{"type":"integer","minimum":100,"maximum":599},"expect_text":{"type":"string"}},"required":["url"]}) },
         ToolDef { name: "open_browser", description: "Open a URL or local file in the user's default browser. Use after publishing an HTML artifact or starting a web server.",
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string"}}}) },
+        ToolDef { name: "screenshot_url", description: "Take a screenshot of a web page served on this machine (http://localhost:3000, a dev server you started) with a local headless Chrome, Chromium or Edge, and look at it. Use it to check how a page you built renders. Loopback addresses only, unless settings allow the host; requests the page makes to other hosts are blocked.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string","description":"http:// or https:// URL on localhost / 127.0.0.1"},"width":{"type":"integer","minimum":320,"maximum":2560,"description":"viewport width in pixels (default 1280)"},"height":{"type":"integer","minimum":240,"maximum":2560,"description":"viewport height in pixels (default 800)"}},"required":["url"]}) },
         ToolDef { name: "list_skills", description: "List available skills with their source and short description. Use before load_skill when choosing task-specific instructions.",
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task. Folder skills report their directory so referenced scripts/references can be read with read_file.",
@@ -415,6 +422,7 @@ pub fn defs_readonly() -> Vec<ToolDef> {
                         | "list_servers"
                         | "read_server_log"
                         | "wait_for_url"
+                        | "screenshot_url"
                         | "list_skills"
                         | "load_skill"
                         | "kb_query"
@@ -1639,7 +1647,8 @@ pub fn is_file_edit(name: &str, input: &Value) -> bool {
 const WEB_SEARCH_HOST: &str = "lite.duckduckgo.com";
 
 /// The host a network tool will contact (`fetch_url`, `web_search`,
-/// `headless_browser`, `wait_for_url`, and `open_browser` with a URL).
+/// `headless_browser`, `wait_for_url`, `screenshot_url`, and `open_browser`
+/// with a URL).
 /// Fetches and search queries can carry data out (`https://evil/?k=<secret>`,
 /// "my api key is …") and fetches reach local services, so outside `auto`
 /// they are approved per host. `?` when the URL has no parsable host.
@@ -1649,7 +1658,12 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
     }
     if !matches!(
         name,
-        "webfetch" | "fetch_url" | "headless_browser" | "wait_for_url" | "open_browser"
+        "webfetch"
+            | "fetch_url"
+            | "headless_browser"
+            | "wait_for_url"
+            | "screenshot_url"
+            | "open_browser"
     ) {
         return None;
     }
@@ -1714,6 +1728,7 @@ fn raw_preview(name: &str, input: &Value) -> String {
         "stop_server" => format!("stop server: {}", input["name"].as_str().unwrap_or("?")),
         "read_server_log" => format!("server log: {}", input["name"].as_str().unwrap_or("?")),
         "wait_for_url" => format!("wait for URL: {}", input["url"].as_str().unwrap_or("?")),
+        "screenshot_url" => format!("screenshot {}", input["url"].as_str().unwrap_or("?")),
         "open_browser" => format!(
             "open browser: {}",
             input["url"]
@@ -5036,6 +5051,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
             content: truncate_head_tail(s, MAX_OUT),
             is_error: true,
             finished: false,
+            images: Vec::new(),
         };
     }
     let code = cap.code.unwrap_or(-1);
@@ -5044,6 +5060,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         content: truncate_head_tail(s, MAX_OUT),
         is_error: code != 0,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -5295,6 +5312,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
         content: truncate_head_tail(format!("{header}\n\n{}", sections.join("\n\n")), MAX_OUT),
         is_error: any_fail,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -5542,6 +5560,244 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 // `isError: true` from the server is a tool error, like any local failure.
+// ── pictures and PDFs ────────────────────────────────────────────────────────
+
+// The picture formats every vision API takes, by extension.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+// The largest picture sent to a model: the Anthropic API's per-image limit.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+const PDF_TIMEOUT: Duration = Duration::from_secs(60);
+
+// read_file on a picture or a PDF. None for anything else, a file that is
+// not there (the usual error follows), and a file whose bytes are not what
+// its extension says (it is read as text).
+fn read_media(p: &Path, input: &Value, cwd: &Path) -> Option<Outcome> {
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    if ext == "pdf" {
+        return read_pdf(p, input);
+    }
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let meta = fs::metadata(p).ok().filter(|m| m.is_file())?;
+    let shown = display_path(p, cwd);
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Some(err(format!(
+            "{shown} is {}; pictures over 5 MB are not sent to the model. Make a smaller copy \
+             (for example `ffmpeg -i {shown} -vf scale=1280:-1 small.png`) and read that.",
+            human_bytes(meta.len())
+        )));
+    }
+    let bytes = fs::read(p).ok()?;
+    // The bytes decide the media type: APIs refuse one that does not match.
+    let mime = crate::media::image_media_type(&bytes)?;
+    let dims = crate::media::image_dimensions(&bytes)
+        .map(|(w, h)| format!(", {w}x{h}"))
+        .unwrap_or_default();
+    let mut out = ok(format!(
+        "image {shown} ({mime}{dims}, {})",
+        human_bytes(meta.len())
+    ));
+    out.images
+        .push((mime.to_string(), crate::media::b64_encode(&bytes)));
+    Some(out)
+}
+
+// A PDF's text, through pdftotext (poppler) when it is installed.
+fn read_pdf(p: &Path, input: &Value) -> Option<Outcome> {
+    let mut head = [0u8; 5];
+    let mut f = fs::File::open(p).ok()?;
+    if std::io::Read::read_exact(&mut f, &mut head).is_err() || &head != b"%PDF-" {
+        return None;
+    }
+    let Some(bin) = find_on_path("pdftotext") else {
+        return Some(err(format!(
+            "cannot read {} as text: it is a PDF, and pdftotext is not installed. Install poppler \
+             (`apt install poppler-utils`, `brew install poppler`, or `choco install poppler` on \
+             Windows), or ask the user for the text. Do not retry read_file on it.",
+            p.display()
+        )));
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(["-layout", "-enc", "UTF-8", "-q"]).arg(p).arg("-");
+    crate::sandbox::scrub_credentials(&mut cmd);
+    Some(match run_with_timeout(cmd, None, PDF_TIMEOUT) {
+        Ok(cap) if cap.timed_out => err(format!(
+            "pdftotext did not finish reading {} within {}s",
+            p.display(),
+            PDF_TIMEOUT.as_secs()
+        )),
+        Ok(cap) if cap.code == Some(0) && cap.stdout.trim().is_empty() => ok(format!(
+            "{} has no text layer (a scanned PDF?): pdftotext found nothing to read",
+            p.display()
+        )),
+        Ok(cap) if cap.code == Some(0) => ok(truncate_read(
+            apply_line_range(&cap.stdout, line_range(input)),
+            MAX_READ,
+        )),
+        Ok(cap) => err(format!(
+            "pdftotext could not read {}: {}",
+            p.display(),
+            cap.stderr.trim()
+        )),
+        Err(e) => err(format!("pdftotext could not start: {e}")),
+    })
+}
+
+// ── screenshots ──────────────────────────────────────────────────────────────
+// See screenshot.rs for how the browser is found and kept off the network.
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
+    use crate::screenshot;
+    let url = input["url"].as_str().unwrap_or("").trim();
+    let parsed =
+        match url::Url::parse(url) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => u,
+            _ => return err(
+                "screenshot_url takes an http:// or https:// URL, such as http://localhost:3000",
+            ),
+        };
+    let url = parsed.as_str();
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(['[', ']'])
+        .to_string();
+    // The gate refuses these too; the tool never relies on it alone.
+    let direct = if screenshot::is_loopback_host(&host) {
+        None
+    } else if crate::agent::network_allows(&host, cwd) {
+        Some(host.as_str())
+    } else {
+        return err(screenshot::off_loopback_refusal(&host));
+    };
+    if let Some(why) = blocked_url(url) {
+        return err(why);
+    }
+    let Some(browser) = screenshot::find_chrome() else {
+        return err(
+            "no Chrome, Chromium or Edge found for screenshot_url: install one, or set BWN_CHROME \
+             to the browser's path (a Playwright Chromium is found on its own). Do not retry \
+             until one is installed.",
+        );
+    };
+    // Nothing listening is a server to start, not a picture of Chrome's
+    // error page. One request, no redirects followed.
+    let status = match web_client().get(url).call() {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => {
+            return err(format!(
+                "nothing answered at {url} ({e}). Start the server first (start_server), wait for \
+                 it (wait_for_url), then take the screenshot."
+            ))
+        }
+    };
+    let size = |k: &str, default: u32, min: u64| {
+        input[k]
+            .as_u64()
+            .map_or(default, |v| v.clamp(min, 2560) as u32)
+    };
+    let (w, h) = (
+        size("width", screenshot::DEFAULT_SIZE.0, 320),
+        size("height", screenshot::DEFAULT_SIZE.1, 240),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "bwn-screenshot-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    if let Err(e) = fs::create_dir(&dir) {
+        return err(format!("cannot make a folder for the screenshot: {e}"));
+    }
+    let png_path = dir.join("shot.png");
+    let hole = match screenshot::Blackhole::start() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return err(format!("cannot start the screenshot's network guard: {e}"));
+        }
+    };
+    let mut cmd = Command::new(&browser);
+    cmd.args(screenshot::chrome_args(
+        url,
+        (w, h),
+        &dir.join("profile"),
+        &png_path,
+        hole.port,
+        direct,
+        running_as_root(),
+    ));
+    crate::sandbox::scrub_credentials(&mut cmd);
+    let ran = run_with_timeout(cmd, None, SCREENSHOT_TIMEOUT);
+    let png = fs::read(&png_path).ok();
+    let blocked = hole.hosts();
+    drop(hole);
+    let _ = fs::remove_dir_all(&dir);
+    let png = match (png, ran) {
+        (Some(png), _) if crate::media::image_media_type(&png) == Some("image/png") => png,
+        (_, Ok(cap)) if cap.timed_out => {
+            return err(format!(
+                "{} did not finish the screenshot within {}s",
+                browser.display(),
+                SCREENSHOT_TIMEOUT.as_secs()
+            ))
+        }
+        (_, Ok(cap)) => {
+            let tail: Vec<&str> = cap.stderr.lines().rev().take(5).collect();
+            return err(format!(
+                "{} wrote no screenshot (exit {}): {}",
+                browser.display(),
+                cap.code.unwrap_or(-1),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            ));
+        }
+        (_, Err(e)) => return err(format!("cannot start {}: {e}", browser.display())),
+    };
+    if png.len() as u64 > MAX_IMAGE_BYTES {
+        return err(format!(
+            "the screenshot is {}, over the 5 MB a model takes: try a smaller width and height",
+            human_bytes(png.len() as u64)
+        ));
+    }
+    let mut text = format!(
+        "screenshot of {url} ({w}x{h}, HTTP {status}) taken with {}",
+        screenshot::browser_name(&browser)
+    );
+    if !blocked.is_empty() {
+        text.push_str(&format!(
+            "\nrequests to other hosts were blocked, so what they serve is missing: {}",
+            blocked.join(", ")
+        ));
+    }
+    let mut out = ok(text);
+    out.images
+        .push(("image/png".into(), crate::media::b64_encode(&png)));
+    out
+}
+
+// Chrome will not start its sandbox as root (containers, CI).
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} bytes"),
+        1024..1_048_576 => format!("{} KB", n / 1024),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
+}
+
 fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
     match r {
         Ok((text, false)) => ok(truncate(text, MAX_OUT)),
@@ -5568,6 +5824,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err("path argument is required and cannot be empty");
             }
             let p = resolve(cwd, p_str);
+            if let Some(out) = read_media(&p, input, cwd) {
+                return out;
+            }
             match fs::read_to_string(&p) {
                 Ok(c) => ok(truncate_read(
                     apply_line_range(&c, line_range(input)),
@@ -6307,6 +6566,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         "stop_server" => stop_server(input),
         "read_server_log" => read_server_log(input),
         "wait_for_url" => wait_for_url(input),
+        "screenshot_url" => screenshot_url(input, cwd),
         "open_browser" => open_browser(input, cwd),
         "list_python_tools" => {
             let rows = list_python_tools(cwd);
@@ -6836,6 +7096,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
             is_error: false,
             finished: true,
+            images: Vec::new(),
         },
         "exit_plan" | "ExitPlanMode" => {
             if let Some(steps) = input["steps"].as_array() {
@@ -8511,6 +8772,55 @@ print("hello " + data.get("name", "world"))
         assert!(o.is_error);
         assert!(o.content.ends_with("[exit 3]"));
         assert!(o.content.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn read_file_returns_pictures_as_images_by_their_bytes() {
+        let dir = std::env::temp_dir().join(format!("bwn-read-media-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let gif = b"GIF89a\x02\x00\x03\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        fs::write(dir.join("a.gif"), gif).unwrap();
+        // A JPEG saved as .png goes out as the JPEG it is.
+        fs::write(dir.join("photo.png"), [0xff, 0xd8, 0xff, 0xe0, 0, 0x10]).unwrap();
+        // Text that only has a picture's name is read as text.
+        fs::write(dir.join("notes.png"), "not a picture").unwrap();
+
+        let out = run("read_file", &json!({"path": "a.gif"}), &dir);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "image a.gif (image/gif, 2x3, 43 bytes)");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].0, "image/gif");
+        assert_eq!(
+            crate::media::b64_decode(&out.images[0].1).unwrap(),
+            gif.to_vec()
+        );
+        let out = run("read_file", &json!({"path": "photo.png"}), &dir);
+        assert_eq!(out.images[0].0, "image/jpeg");
+        let out = run("read_file", &json!({"path": "notes.png"}), &dir);
+        assert!(out.images.is_empty());
+        assert_eq!(out.content, "not a picture");
+        // A missing picture gets the usual not-found recovery.
+        let out = run("read_file", &json!({"path": "gone.png"}), &dir);
+        assert!(
+            out.is_error && out.content.contains("recovery:"),
+            "{}",
+            out.content
+        );
+        // Over the limit: refused with a way to make it fit.
+        let big = dir.join("big.png");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        let out = run("read_file", &json!({"path": "big.png"}), &dir);
+        assert!(out.is_error && out.images.is_empty());
+        assert!(out.content.contains("over 5 MB"), "{}", out.content);
+        // A .pdf that is not a PDF is read as text.
+        fs::write(dir.join("fake.pdf"), "plain").unwrap();
+        assert_eq!(
+            run("read_file", &json!({"path": "fake.pdf"}), &dir).content,
+            "plain"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

@@ -372,6 +372,34 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     (w > 0 && h > 0).then_some((w, h))
 }
 
+/// The media type of a picture every vision API takes (PNG, JPEG, GIF,
+/// WebP), from its leading bytes; None for anything else.
+pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Pixel size of a PNG or GIF from its header; None for other formats.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if let Some(d) = png_dimensions(bytes) {
+        return Some(d);
+    }
+    if image_media_type(bytes) == Some("image/gif") && bytes.len() >= 10 {
+        let le = |i: usize| u32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+        return Some((le(6), le(8))).filter(|&(w, h)| w > 0 && h > 0);
+    }
+    None
+}
+
 /// PNG bytes and pixel size for `path`, no wider than `max_w` pixels. A PNG
 /// that already fits is returned as-is; larger or non-PNG inputs go through
 /// ffmpeg (`-frames:v 1`, so a video yields its first frame). None when the

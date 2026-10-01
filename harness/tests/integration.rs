@@ -91,11 +91,19 @@ fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
 }
 
 fn read_request_from(reader: &mut impl BufRead) -> (String, String) {
+    let (method, _, body) = read_request_with_path(reader);
+    (method, body)
+}
+
+// The method, the path and the body of one request.
+fn read_request_with_path(reader: &mut impl BufRead) -> (String, String, String) {
     let mut first = String::new();
     if reader.read_line(&mut first).is_err() {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), String::new());
     }
-    let method = first.split_whitespace().next().unwrap_or("").to_string();
+    let mut words = first.split_whitespace();
+    let method = words.next().unwrap_or("").to_string();
+    let path = words.next().unwrap_or("").to_string();
     let mut len = 0usize;
     loop {
         let mut line = String::new();
@@ -113,7 +121,7 @@ fn read_request_from(reader: &mut impl BufRead) -> (String, String) {
     if len > 0 {
         let _ = reader.read_exact(&mut body);
     }
-    (method, String::from_utf8_lossy(&body).into_owned())
+    (method, path, String::from_utf8_lossy(&body).into_owned())
 }
 
 // ── OpenAI chat-completion response builders ────────────────────────────────
@@ -1394,17 +1402,18 @@ fn untrusted_project_settings_may_tighten_the_gate() {
     );
 }
 
+// 1x1 transparent PNG.
+const PNG: [u8; 67] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
 // An @image in a headless BRAINSTORM (or any mode) reaches a vision model.
 #[test]
 fn headless_brainstorm_sends_attached_image() {
-    // 1x1 transparent PNG.
-    const PNG: [u8; 67] = [
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
-        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
-        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
-        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
     let home = tmp("home");
     let cwd = tmp("proj");
     std::fs::write(cwd.join("pic.png"), PNG).unwrap();
@@ -1957,6 +1966,78 @@ fn accept_edits_applies_edits_and_blocks_commands() {
     assert!(!cwd.join("ran.txt").exists(), "the command was not run");
     assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
     assert_eq!(r.find("result").unwrap()["outcome"], "approval_blocked");
+    // The closing line names what was blocked, not "nothing was applied".
+    assert!(
+        r.stderr
+            .contains("1 change was blocked for lack of approval and not made: run: touch ran.txt"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+// accept-edits with no terminal, and the model runs check_work itself, as
+// bwn's system prompt tells it to: the edit is made, the checks cannot be
+// approved. Checks are verification, not a change, so the run is a success
+// that says they were not run, and the automatic round does not ask again.
+#[test]
+fn accept_edits_without_a_terminal_says_checks_were_not_run_and_succeeds() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"p","version":"1.0.0","scripts":{"test":"touch tested.txt"}}"#,
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "edited"}),
+        ),
+        tool_call("c2", "check_work", json!({})),
+        finish("wrote notes.txt"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "run",
+            "--permission-mode",
+            "accept-edits",
+            "add notes",
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("notes.txt")).unwrap(),
+        "edited"
+    );
+    assert!(!cwd.join("tested.txt").exists(), "the checks did not run");
+    assert_eq!(r.code, Some(0), "stderr: {}\n{:?}", r.stderr, r.events);
+    assert!(
+        !r.stderr.contains("blocked for lack of approval"),
+        "{}",
+        r.stderr
+    );
+    let last = r.events.last().unwrap();
+    assert_eq!(last["outcome"], "success", "{last}");
+    assert_eq!(last["denied"], 0, "{last}");
+    assert!(
+        r.text_of("notice")
+            .contains("checks were not run (no terminal to approve them)"),
+        "{:?}",
+        r.events
+    );
+    let checks = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_call" && e["name"] == "check_work")
+        .count();
+    assert_eq!(checks, 1, "asked once: {:?}", r.events);
+    // The model is told why, in the request after the refused call.
+    let sent = posts.lock().unwrap();
+    assert!(sent[2].contains("checks were not run"), "{}", sent[2]);
 }
 
 #[cfg(unix)]
@@ -4014,6 +4095,34 @@ fn a_turn_that_ends_after_a_call_that_could_not_run_is_not_a_success() {
     }
 }
 
+// Asked for an example function call, the model answers with one and then
+// explains it. Nothing in the run offers that function, so the answer is the
+// result: one request, no call, a success.
+#[test]
+fn an_answer_that_opens_with_an_example_call_is_a_success() {
+    for reply in [
+        "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\n\
+         That is the shape of a function call: the name and its arguments.",
+        "{\"name\": \"getWeather\", \"arguments\": {\"city\": \"Paris\"}}\n\n\
+         The model fills in the arguments and your code runs it.",
+    ] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let (port, posts) = serve_recording(vec![text(reply)]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(
+            &home,
+            &cwd,
+            "what does a function call for a weather tool look like?",
+        );
+        assert_eq!(r.code, Some(0), "stderr: {}\n{:?}", r.stderr, r.events);
+        assert_eq!(r.events.last().unwrap()["outcome"], "success");
+        assert_eq!(posts.lock().unwrap().len(), 1, "{:?}", r.events);
+        assert!(!r.has_event("tool_call"), "{:?}", r.events);
+        assert!(!r.text_of("notice").contains("could not run"));
+    }
+}
+
 // Accepts one chat request and never answers it.
 fn serve_silent() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5841,4 +5950,498 @@ fn repo_skills_and_agents_wait_for_trust_and_trust_print_lists_them() {
         first.contains("Reviews diffs strictly"),
         "agent offered once trusted"
     );
+}
+
+// ── tools that return images ────────────────────────────────────────────────
+// A model server for each wire protocol bwn speaks. A chat request (Anthropic
+// /v1/messages, OpenAI …/chat/completions, Ollama /api/chat) takes the next
+// reply in `script` and its body is kept; Ollama's /api/show describes a
+// vision model; anything else gets an empty model list. With `tls` it speaks
+// HTTPS, since a keyed provider never sends its key over plain http.
+fn serve_protocols(
+    script: Vec<String>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> (u16, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&posts);
+    thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut tcp) = stream else { continue };
+            match &tls {
+                None => answer_protocol(&mut tcp, &script, &mut served, &seen),
+                Some(cfg) => {
+                    let conn = rustls::ServerConnection::new(Arc::clone(cfg)).unwrap();
+                    let mut s = rustls::StreamOwned::new(conn, tcp);
+                    answer_protocol(&mut s, &script, &mut served, &seen);
+                    s.conn.send_close_notify();
+                    let _ = s.flush();
+                }
+            }
+        }
+    });
+    (port, posts)
+}
+
+fn answer_protocol(
+    stream: &mut (impl std::io::Read + Write),
+    script: &[String],
+    served: &mut usize,
+    seen: &Mutex<Vec<Value>>,
+) {
+    let mut reader = BufReader::new(stream);
+    let (method, path, body) = read_request_with_path(&mut reader);
+    let reply = match method.as_str() {
+        "" => return,
+        "POST" if path.ends_with("/api/show") => json!({
+            "capabilities": ["completion", "tools", "vision"],
+            "model_info": {"general.architecture": "llama", "llama.context_length": 131_072}
+        })
+        .to_string(),
+        "POST" => {
+            seen.lock()
+                .unwrap()
+                .push(serde_json::from_str(&body).unwrap_or(Value::Null));
+            *served += 1;
+            script
+                .get(*served - 1)
+                .cloned()
+                .unwrap_or_else(|| finish("auto"))
+        }
+        _ => r#"{"object":"list","data":[]}"#.to_string(),
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        reply.len(),
+        reply
+    );
+    let w = reader.get_mut();
+    let _ = w.write_all(resp.as_bytes());
+    let _ = w.flush();
+}
+
+// The same tool call in the Anthropic and Ollama reply shapes.
+fn anthropic_tool_use(id: &str, name: &str, input: Value) -> String {
+    json!({
+        "id": "msg", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "tool_use", "id": id, "name": name, "input": input}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    })
+    .to_string()
+}
+
+fn ollama_tool_call(name: &str, args: Value) -> String {
+    json!({
+        "model": "m", "done": true, "done_reason": "stop",
+        "message": {"role": "assistant", "content": "",
+                    "tool_calls": [{"function": {"name": name, "arguments": args}}]}
+    })
+    .to_string()
+}
+
+// Base64 of the PNG fixture, as it must appear on the wire.
+fn png_b64() -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in PNG.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+// read_file on a picture, then finish: the request after the read carries
+// the picture where each protocol takes it.
+#[test]
+fn read_file_sends_an_image_in_each_protocols_shape() {
+    let b64 = png_b64();
+
+    // OpenAI-compatible: the tool message, then a user turn with the image.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let (port, posts) = serve_protocols(
+        vec![
+            tool_call("c1", "read_file", json!({"path": "pic.png"})),
+            finish("a transparent pixel"),
+        ],
+        None,
+    );
+    let cfg = json!({
+        "provider": "llamacpp", "model": "gemma3:4b", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "what is in pic.png?");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    let posts = posts.lock().unwrap();
+    let msgs = posts[1]["messages"].as_array().unwrap();
+    let tool = msgs.iter().position(|m| m["role"] == "tool").unwrap();
+    assert!(
+        msgs[tool]["content"].as_str().unwrap().contains("pic.png"),
+        "{}",
+        msgs[tool]
+    );
+    let next = &msgs[tool + 1];
+    assert_eq!(next["role"], "user", "{next}");
+    assert_eq!(
+        next["content"][0]["text"],
+        "[1 image returned by the read_file call c1]"
+    );
+    assert_eq!(
+        next["content"][1]["image_url"]["url"],
+        format!("data:image/png;base64,{b64}")
+    );
+
+    // Ollama native: the tool message, then a user turn with bare base64.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let (port, posts) = serve_protocols(
+        vec![
+            ollama_tool_call("read_file", json!({"path": "pic.png"})),
+            ollama_tool_call("finish", json!({"summary": "a transparent pixel"})),
+        ],
+        None,
+    );
+    let cfg = json!({
+        "provider": "ollama", "model": "some-model", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "what is in pic.png?");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    let posts = posts.lock().unwrap();
+    let msgs = posts[1]["messages"].as_array().unwrap();
+    let tool = msgs.iter().position(|m| m["role"] == "tool").unwrap();
+    assert_eq!(msgs[tool]["tool_name"], "read_file");
+    assert!(msgs[tool].get("images").is_none());
+    let next = &msgs[tool + 1];
+    assert_eq!(next["role"], "user", "{next}");
+    assert_eq!(next["images"], json!([b64]));
+
+    // Anthropic: image blocks inside the tool_result, over TLS with a key.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let (ca_pem, tls) = private_ca();
+    let ca = home.join("ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let (port, posts) = serve_protocols(
+        vec![
+            anthropic_tool_use("t1", "read_file", json!({"path": "pic.png"})),
+            anthropic_tool_use("t2", "finish", json!({"summary": "a transparent pixel"})),
+        ],
+        Some(tls),
+    );
+    let cfg = json!({
+        "provider": "anthropic", "model": "claude-test", "permission": "auto",
+        "base_url": format!("https://localhost:{port}"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "what is in pic.png?"],
+        &[
+            ("SSL_CERT_FILE", ca.to_str().unwrap()),
+            ("ANTHROPIC_API_KEY", "sk-test"),
+        ],
+    );
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    let posts = posts.lock().unwrap();
+    let last = posts[1]["messages"].as_array().unwrap().last().unwrap();
+    let result = &last["content"][0];
+    assert_eq!(result["type"], "tool_result", "{last}");
+    assert_eq!(result["tool_use_id"], "t1");
+    let parts = result["content"].as_array().unwrap();
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(
+        parts[1],
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+    );
+}
+
+// A model that does not take images gets the reason in text, and no image.
+#[test]
+fn read_file_on_an_image_tells_a_text_only_model_why_it_sees_none() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let (port, posts) = serve_protocols(
+        vec![
+            tool_call("c1", "read_file", json!({"path": "pic.png"})),
+            finish("cannot see it"),
+        ],
+        None,
+    );
+    let cfg = json!({
+        "provider": "llamacpp", "model": "text-coder", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"), "context_tokens": 131_072,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "what is in pic.png?");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    let posts = posts.lock().unwrap();
+    let sent = posts[1].to_string();
+    assert!(!sent.contains(&png_b64()), "{sent}");
+    let msgs = posts[1]["messages"].as_array().unwrap();
+    let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+    let content = tool["content"].as_str().unwrap();
+    assert!(
+        content.contains("does not accept images") && content.contains("\"vision\": true"),
+        "{content}"
+    );
+    // The screenshot tool is not offered to it either.
+    assert!(!posts[0].to_string().contains("screenshot_url"));
+}
+
+// A PDF is read as text through pdftotext; without it, the model is told
+// what to install.
+#[cfg(unix)]
+#[test]
+fn read_file_reads_a_pdf_through_pdftotext_or_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tmp("bin");
+    let fake = bin.join("pdftotext");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho \"args: $*\" >&2\nprintf 'Quarterly report\\nRevenue is up.\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (path, expect) in [
+        (bin.to_str().unwrap().to_string(), "Quarterly report"),
+        (tmp("empty").to_str().unwrap().to_string(), "pdftotext"),
+    ] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(cwd.join("report.pdf"), b"%PDF-1.4\n%binary\x00\xff\n").unwrap();
+        let (port, posts) = serve_protocols(
+            vec![
+                tool_call("c1", "read_file", json!({"path": "report.pdf"})),
+                finish("read it"),
+            ],
+            None,
+        );
+        write_config(&home, "llamacpp", "auto", port);
+        let r = run_env(
+            &home,
+            &cwd,
+            &["--json", "run", "summarise report.pdf"],
+            &[("PATH", path.as_str())],
+        );
+        assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+        let result = r
+            .events
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["name"] == "read_file")
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains(expect), "{content}");
+        let sent = posts.lock().unwrap()[1].to_string();
+        assert!(sent.contains(expect), "{sent}");
+    }
+}
+
+// Serves one HTML page on loopback until the test ends, counting requests.
+fn serve_page(html: &'static str) -> (u16, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&hits);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = read_request(&mut stream);
+            count.fetch_add(1, Ordering::Relaxed);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (port, hits)
+}
+
+// The leading bytes of standard base64.
+fn b64_head(s: &str, n: usize) -> Vec<u8> {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let vals: Vec<u32> = s
+        .bytes()
+        .take(n.div_ceil(3) * 4)
+        .map(|c| A.iter().position(|&a| a == c).unwrap() as u32)
+        .collect();
+    let mut out = Vec::new();
+    for q in vals.chunks(4) {
+        let v = q.iter().fold(0u32, |acc, x| (acc << 6) | x) << (6 * (4 - q.len()));
+        out.extend([(v >> 16) as u8, (v >> 8) as u8, v as u8]);
+    }
+    out.truncate(n);
+    out
+}
+
+// A vision model asks for a screenshot of a page a local server is serving:
+// the request after it carries a PNG of the requested size, and what the
+// page asked of other hosts was blocked and named.
+#[test]
+fn screenshot_url_shows_a_local_page_to_the_model() {
+    let (page, hits) = serve_page(
+        "<html><body style=\"background:#c00\"><h1>hello</h1>\
+         <img src=\"http://example.test/logo.png\">\
+         <img src=\"http://169.254.169.254/latest/meta-data/x.png\"></body></html>",
+    );
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let url = format!("http://127.0.0.1:{page}/");
+    let (port, posts) = serve_protocols(
+        vec![
+            tool_call(
+                "c1",
+                "screenshot_url",
+                json!({"url": url, "width": 400, "height": 300}),
+            ),
+            finish("it is red"),
+        ],
+        None,
+    );
+    let cfg = json!({
+        "provider": "llamacpp", "model": "gemma3:4b", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"), "context_tokens": 131_072,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "how does the page look?");
+    let result = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "screenshot_url")
+        .unwrap_or_else(|| panic!("stderr: {}\n{:?}", r.stderr, r.events));
+    let content = result["content"].as_str().unwrap();
+    if content.contains("no Chrome, Chromium or Edge found") {
+        eprintln!("skipping: no browser installed ({content})");
+        return;
+    }
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(result["is_error"], false, "{content}");
+    assert!(
+        content.starts_with(&format!("screenshot of {url} (400x300, HTTP 200)")),
+        "{content}"
+    );
+    assert!(
+        content.contains("blocked") && content.contains("example.test"),
+        "{content}"
+    );
+    // Chrome sends link-local addresses (cloud metadata) around a proxy
+    // unless told not to; they are blocked like any other host.
+    assert!(content.contains("169.254.169.254"), "{content}");
+    assert!(hits.load(Ordering::Relaxed) >= 2, "checked, then loaded");
+    let posts = posts.lock().unwrap();
+    // Offered to a model that takes images.
+    assert!(posts[0].to_string().contains("\"screenshot_url\""));
+    let msgs = posts[1]["messages"].as_array().unwrap();
+    let shot = msgs.last().unwrap();
+    assert_eq!(shot["role"], "user", "{shot}");
+    let data = shot["content"][1]["image_url"]["url"].as_str().unwrap();
+    let b64 = data.strip_prefix("data:image/png;base64,").unwrap();
+    let head = b64_head(b64, 24);
+    assert_eq!(&head[..8], &PNG[..8], "a PNG");
+    let be = |i: usize| u32::from_be_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+    assert_eq!((be(16), be(20)), (400, 300));
+}
+
+// Other hosts are refused before any browser starts unless settings allow
+// them; loopback is gated like a fetch (asks outside auto) and network.deny
+// refuses it in every mode.
+#[test]
+fn screenshot_url_stays_on_this_machine_unless_settings_allow_a_host() {
+    let shot = |url: &str| tool_call("c1", "screenshot_url", json!({"url": url}));
+    let run_case = |url: &str, permission: &str, settings: Value| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![shot(url), finish("done")]);
+        write_config(&home, "llamacpp", permission, port);
+        std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+        run(&home, &cwd, "screenshot it")
+    };
+    let denied = |r: &Run| r.text_of("tool_denied");
+
+    let r = run_case("http://example.com/", "auto", json!({}));
+    assert!(
+        denied(&r).contains("pages on this machine only"),
+        "{:?}",
+        r.events
+    );
+    assert!(!r.has_event("tool_result") || !r.text_of("tool_result").contains("screenshot of"));
+
+    // An allowed host passes the gate: here nothing answers for it.
+    let r = run_case(
+        "http://screens.invalid/",
+        "auto",
+        json!({"network": {"allow": ["screens.invalid"]}}),
+    );
+    assert_eq!(denied(&r), "", "{:?}", r.events);
+    let result = r.find("tool_result").unwrap();
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("nothing answered at http://screens.invalid/"),
+        "{result}"
+    );
+
+    // Loopback in ask mode with no terminal: the host needs an approval.
+    let r = run_case("http://127.0.0.1:9/", "ask", json!({}));
+    assert!(
+        denied(&r).contains("network access to 127.0.0.1:9"),
+        "{:?}",
+        r.events
+    );
+    // network.deny refuses loopback too, even in auto.
+    let r = run_case(
+        "http://localhost:9/",
+        "auto",
+        json!({"network": {"deny": ["localhost"]}}),
+    );
+    assert!(denied(&r).contains("network.deny"), "{:?}", r.events);
+    assert!(!r.text_of("tool_result").contains("nothing answered"));
+}
+
+// In the transcript, a picture read says what was read, not "1 line".
+#[test]
+fn an_image_read_shows_what_was_read_in_the_transcript() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("pic.png"), PNG).unwrap();
+    let port = serve_streaming(vec![
+        tool_call("c1", "read_file", json!({"path": "pic.png"})),
+        finish("a pixel"),
+    ]);
+    let cfg = json!({
+        "provider": "llamacpp", "model": "gemma3:4b", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let (code, out) = run_human(&home, &cwd, "what does the picture show");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(
+        out.contains("↳ image pic.png (image/png, 1x1, 67 bytes)"),
+        "{out}"
+    );
+    assert!(!out.contains("↳ 1 line"), "{out}");
 }

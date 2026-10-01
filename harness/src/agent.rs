@@ -66,7 +66,10 @@ fn estimate_tokens(msgs: &[Msg]) -> usize {
                         .map(|c| c.name.len() + c.input.to_string().len())
                         .sum::<usize>()
             }
-            Msg::Tool(rs) => rs.iter().map(|r| r.content.len()).sum(),
+            Msg::Tool(rs) => rs
+                .iter()
+                .map(|r| r.content.len() + r.images.iter().map(|(_, d)| d.len() / 3).sum::<usize>())
+                .sum(),
         };
     }
     chars / 4
@@ -163,6 +166,9 @@ fn render_msgs(msgs: &[Msg]) -> String {
             Msg::Tool(rs) => {
                 for r in rs {
                     s.push_str("result: ");
+                    if !r.images.is_empty() {
+                        s.push_str(&format!("[+{} image(s)] ", r.images.len()));
+                    }
                     s.push_str(&r.content.chars().take(800).collect::<String>());
                 }
             }
@@ -224,19 +230,23 @@ fn compact_within(
 }
 
 // Images attached to the turns being summarized ride along on the summary
-// turn: the model can still see what the user showed it. Each image once,
-// in first-seen order, capped to the most recent few that fit in `room`
-// estimated tokens; the count of any dropped is returned.
+// turn: the model can still see what the user showed it and what its tools
+// returned. Each image once, in first-seen order, capped to the most recent
+// few that fit in `room` estimated tokens; the count of any dropped is
+// returned.
 const MAX_KEPT_IMAGES: usize = 4;
 
 fn images_to_keep(middle: &[Msg], room: usize) -> (Vec<(String, String)>, usize) {
     let mut all: Vec<(String, String)> = Vec::new();
     for m in middle {
-        if let Msg::UserImages { images, .. } = m {
-            for img in images {
-                if !all.contains(img) {
-                    all.push(img.clone());
-                }
+        let images: Vec<&(String, String)> = match m {
+            Msg::UserImages { images, .. } => images.iter().collect(),
+            Msg::Tool(rs) => rs.iter().flat_map(|r| &r.images).collect(),
+            _ => Vec::new(),
+        };
+        for img in images {
+            if !all.contains(img) {
+                all.push(img.clone());
             }
         }
     }
@@ -1158,8 +1168,12 @@ fn tool_code_args_to_input(
 // call markup) rather than JSON embedded in prose.
 fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
     let trimmed = text.trim();
-    // Whole-text JSON (the strict, original case).
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+    // Whole-text JSON (the strict, original case). JSON followed by prose is
+    // an answer that opens with an example; its leading object is looked at
+    // below, like JSON anywhere else in an answer.
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
+    {
         return Some((trimmed, true));
     }
     // A fenced ```json block that is the entire message.
@@ -1949,14 +1963,35 @@ pub fn stopped_short_outcome() -> Option<Outcome> {
     }
 }
 
-/// Confirmations refused because nobody was there to answer them. Headless
-/// runs fail instead of reporting "done" when this is non-zero.
-static BLOCKED_WITHOUT_TERMINAL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// Confirmations refused because nobody was there to answer them, by what
+/// each would have done. Headless runs fail instead of reporting "done"
+/// when there are any.
+static BLOCKED_WITHOUT_TERMINAL: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-pub fn blocked_without_terminal() -> usize {
-    BLOCKED_WITHOUT_TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
+pub fn blocked_without_terminal() -> Vec<String> {
+    BLOCKED_WITHOUT_TERMINAL
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default()
 }
+
+thread_local! {
+    // Set while the project's checks are gated: Some(true) once a refusal
+    // for want of a terminal happened. Checks verify the work; they change
+    // nothing, so that refusal is not one of the run's blocked changes.
+    static GATING_CHECKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+// The gate for check_work. Returns the refusal, if any, and whether it was
+// only that nobody could approve the checks.
+fn gate_checks(perm: Permission, input: &serde_json::Value, cwd: &Path) -> Option<(String, bool)> {
+    GATING_CHECKS.with(|g| g.set(Some(false)));
+    let reason = hook_gate(perm, "check_work", input, cwd);
+    let no_terminal = GATING_CHECKS.with(|g| g.replace(None)) == Some(true);
+    reason.map(|r| (r, no_terminal))
+}
+
+const CHECKS_NOT_RUN: &str = "checks were not run (no terminal to approve them)";
 
 thread_local! {
     // Set when the user cancels an approval prompt (Esc, Ctrl+C, end of
@@ -2026,7 +2061,12 @@ fn confirm_call(
 
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
-        BLOCKED_WITHOUT_TERMINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let checks = GATING_CHECKS.with(|g| g.get().is_some());
+        if checks {
+            GATING_CHECKS.with(|g| g.set(Some(true)));
+        } else if let Ok(mut b) = BLOCKED_WITHOUT_TERMINAL.lock() {
+            b.push(label.to_string());
+        }
         return Some(format!(
             "blocked (no interactive terminal to confirm: {label})"
         ));
@@ -2152,6 +2192,24 @@ pub(crate) fn gate(
     let host_ref = host.as_deref();
     if let Some(reason) = denied_by_rule(&rules, name, input, cwd, host_ref) {
         return Some(reason);
+    }
+    // screenshot_url runs the page in a real browser: this machine only,
+    // unless an allow rule names the host. No prompt can widen that.
+    if name == "screenshot_url" {
+        if let Some(h) = host_ref.filter(|h| !crate::screenshot::is_loopback_host(h)) {
+            if rule_for(
+                &rules,
+                config::RuleEffect::Allow,
+                name,
+                input,
+                cwd,
+                host_ref,
+            )
+            .is_none()
+            {
+                return Some(crate::screenshot::off_loopback_refusal(h));
+            }
+        }
     }
 
     // Read-only: refuse every mutation outright, before the sensitive-path and
@@ -2491,6 +2549,21 @@ fn rule_for<'a>(
         .iter()
         .filter(|r| r.effect == effect)
         .find(|r| rule_covers(r, name, input, cwd, host))
+}
+
+/// Whether settings allow screenshot_url to open `host`: a `network.allow`
+/// entry or an allow rule for the tool that covers it.
+pub(crate) fn network_allows(host: &str, cwd: &Path) -> bool {
+    let input = serde_json::json!({"url": format!("http://{host}/")});
+    rule_for(
+        &config::policy_rules(cwd),
+        config::RuleEffect::Allow,
+        "screenshot_url",
+        &input,
+        cwd,
+        Some(host),
+    )
+    .is_some()
 }
 
 // The refusal for a call a deny rule or network.deny covers. A refusal by
@@ -2958,11 +3031,14 @@ fn build_turn(
     };
     let task_for_recovery = recovery_task_text(&task);
     let custom = active_agent(depth);
-    let defs = if matches!(perm, Permission::ReadOnly) {
-        tools::defs_readonly()
-    } else {
-        tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
-    };
+    let defs = offered(
+        p,
+        if matches!(perm, Permission::ReadOnly) {
+            tools::defs_readonly()
+        } else {
+            tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
+        },
+    );
     let defs = match &custom {
         Some(a) => agent_defs_only(defs, a),
         None => defs,
@@ -3262,7 +3338,7 @@ fn build_turn(
                 calls: vec![],
             });
             if depth == 0 {
-                if let Some(note) = unrun_call_note(last_unrun.as_deref(), &reply.text) {
+                if let Some(note) = unrun_call_note(last_unrun.as_deref(), &reply.text, &defs) {
                     report::notice(&note);
                     stopped_short(Outcome::Failed);
                 }
@@ -3294,6 +3370,7 @@ fn build_turn(
                     id: call.id.clone(),
                     content: msg,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -3330,6 +3407,7 @@ fn build_turn(
                     id: call.id.clone(),
                     content: answer,
                     is_error,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -3339,7 +3417,15 @@ fn build_turn(
             // an edit during a review: refused, but not a blocked change.
             let off_surface = agent_tool_refusal(custom.as_ref(), &call.name);
             let counted = off_surface.is_none() && !reviewing;
-            let reason = off_surface.or_else(|| hook_gate(perm, &call.name, &call_input, cwd));
+            let mut checks_unapproved = false;
+            let reason = off_surface.or_else(|| {
+                if call.name != "check_work" {
+                    return hook_gate(perm, &call.name, &call_input, cwd);
+                }
+                let (r, no_terminal) = gate_checks(perm, &call_input, cwd)?;
+                checks_unapproved = no_terminal;
+                Some(r)
+            });
             let reason = reason.map(|r| {
                 let r = if reviewing {
                     phase_readonly_reason(r, REVIEW_READONLY)
@@ -3359,15 +3445,27 @@ fn build_turn(
                     serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "build", "depth": depth}),
                 );
                 // A review asked for findings, not changes: a refused edit
-                // there is the model's slip, not a failed run.
-                if counted {
-                    report::note_denial(
-                        &call.name,
-                        &tools::preview(&call.name, &call_input),
-                        &reason,
-                        tools::is_mutating_call(&call.name, &call_input),
-                    );
-                }
+                // there is the model's slip, not a failed run. Checks nobody
+                // could approve leave the work as it is, unverified, and the
+                // automatic round would only be refused again.
+                let reason = if checks_unapproved {
+                    check_work_called = true;
+                    report::notice(&format!("  {CHECKS_NOT_RUN}"));
+                    format!(
+                        "{reason} — the project's {CHECKS_NOT_RUN}. Do not retry them; \
+                         finish, and say in your summary that they were not run."
+                    )
+                } else {
+                    if counted {
+                        report::note_denial(
+                            &call.name,
+                            &tools::preview(&call.name, &call_input),
+                            &reason,
+                            tools::is_mutating_call(&call.name, &call_input),
+                        );
+                    }
+                    reason
+                };
                 note_loop_result(
                     &mut loop_guard,
                     &call.name,
@@ -3381,6 +3479,7 @@ fn build_turn(
                     id: call.id.clone(),
                     content: reason,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -3411,6 +3510,7 @@ fn build_turn(
                         id: call.id.clone(),
                         content: msg,
                         is_error: true,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -3426,6 +3526,7 @@ fn build_turn(
                     id: call.id.clone(),
                     content: out,
                     is_error,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -3440,6 +3541,7 @@ fn build_turn(
                         id: call.id.clone(),
                         content: msg,
                         is_error: false,
+                        images: Vec::new(),
                     });
                     continue;
                 }
@@ -3448,7 +3550,7 @@ fn build_turn(
             if tools::is_mutating_call(&call.name, &call_input) {
                 mutating_tool_ran = true;
             }
-            let mut out = tools::run(&call.name, &call_input, cwd);
+            let mut out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             if out.is_error {
                 hooks::notify("OnError", cwd);
@@ -3525,6 +3627,7 @@ fn build_turn(
                 id: call.id.clone(),
                 content: out.content,
                 is_error: out.is_error,
+                images: out.images,
             });
         }
 
@@ -3568,18 +3671,13 @@ fn build_turn(
                 report::tool_call("check_work", &tools::preview("check_work", &input), &input);
                 trace_tool_call("check_work", &input, "build", depth);
                 // The project's scripts run like any model call: hook, then gate.
-                // A denial skips the round and is noted in the tool record. The
-                // round is the harness's own step, so a refusal for want of a
-                // terminal is not one of the run's blocked changes.
-                let blocked_before = BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed);
-                let mut out = match hook_gate(perm, "check_work", &input, cwd) {
-                    Some(reason) => {
-                        let no_terminal =
-                            BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed) > blocked_before;
-                        BLOCKED_WITHOUT_TERMINAL.store(blocked_before, Ordering::Relaxed);
+                // A denial skips the round and is noted in the tool record. A
+                // refusal for want of a terminal is not a blocked change.
+                let mut out = match gate_checks(perm, &input, cwd) {
+                    Some((reason, no_terminal)) => {
                         report::tool_denied(&reason);
                         report::notice(&if no_terminal {
-                            "  checks were not run (no terminal to approve them)".to_string()
+                            format!("  {CHECKS_NOT_RUN}")
                         } else {
                             format!("  checks were not run ({reason})")
                         });
@@ -3793,6 +3891,28 @@ fn invalid_args_feedback(name: &str, raw: &str, defs: &[tools::ToolDef]) -> Stri
     )
 }
 
+// The tools a turn offers this model: a screenshot is no use to one that
+// does not take images.
+fn offered(p: &Provider, defs: Vec<tools::ToolDef>) -> Vec<tools::ToolDef> {
+    if crate::media::model_supports_vision(p) {
+        return defs;
+    }
+    defs.into_iter()
+        .filter(|d| d.name != "screenshot_url")
+        .collect()
+}
+
+// Images a tool returned reach the model only when it takes them; for one
+// that does not, the result says why there are none.
+fn vision_checked(p: &Provider, mut out: tools::Outcome) -> tools::Outcome {
+    if !out.images.is_empty() && !crate::media::model_supports_vision(p) {
+        out.images.clear();
+        out.content
+            .push_str(&format!("\n[{}]", crate::media::vision_refusal(p)));
+    }
+    out
+}
+
 // A call that never ran: a tool this turn does not offer, or one missing an
 // argument its schema requires.
 fn call_could_not_run(name: &str, input: &serde_json::Value, defs: &[tools::ToolDef]) -> bool {
@@ -3811,31 +3931,44 @@ fn call_could_not_run(name: &str, input: &serde_json::Value, defs: &[tools::Tool
         })
 }
 
-// A reply that opens with a tool call in JSON (`{"name": …, "arguments": …}`)
-// that was not recognised, so nothing ran.
-fn unparsed_tool_call(text: &str) -> Option<String> {
-    let t = text.trim_start();
-    if !t.starts_with('{') {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::Deserializer::from_str(t)
-        .into_iter()
-        .next()?
-        .ok()?;
+// A reply that is nothing but a tool call in JSON (`{"name": …, "arguments":
+// …}`, bare or alone in a ```json fence) to a tool this turn offers, which
+// was not recognised, so nothing ran. JSON that opens an explanation, or
+// names a function the run does not offer, is an answer showing a call.
+fn unparsed_tool_call(text: &str, defs: &[tools::ToolDef]) -> Option<String> {
+    let t = text.trim();
+    let t = match t.strip_prefix("```") {
+        Some(rest) => {
+            let (lang, body) = rest.split_once('\n')?;
+            let lang = lang.trim();
+            if !(lang.is_empty() || lang.eq_ignore_ascii_case("json")) {
+                return None;
+            }
+            body.trim_end().strip_suffix("```")?.trim()
+        }
+        None => t,
+    };
+    let v: serde_json::Value = serde_json::from_str(t).ok()?;
     let call = v.get("function").unwrap_or(&v);
     let name = call.get("name")?.as_str()?;
-    (call.get("arguments").is_some() || call.get("parameters").is_some()).then(|| name.to_string())
+    (defs.iter().any(|d| d.name == name)
+        && (call.get("arguments").is_some() || call.get("parameters").is_some()))
+    .then(|| name.to_string())
 }
 
 // Why a turn that ends on text is not a success: the last tool round held a
 // call that never ran, or the text itself is a call nothing ran.
-fn unrun_call_note(last_unrun: Option<&str>, text: &str) -> Option<String> {
+fn unrun_call_note(
+    last_unrun: Option<&str>,
+    text: &str,
+    defs: &[tools::ToolDef],
+) -> Option<String> {
     if let Some(call) = last_unrun {
         return Some(format!(
             "  ⚠ the model stopped after a call that could not run: {call}"
         ));
     }
-    unparsed_tool_call(text)
+    unparsed_tool_call(text, defs)
         .map(|name| format!("  ⚠ the model answered with a {name} call that bwn could not run"))
 }
 
@@ -3868,17 +4001,45 @@ mod unrun_call_tests {
 
     #[test]
     fn a_text_reply_that_is_a_call_is_recognised() {
-        let call = r#"{"name": "open_document", "arguments": {"name": "a.txt"}}"#;
-        assert_eq!(unparsed_tool_call(call).as_deref(), Some("open_document"));
-        let wrapped = r#"{"type":"function","function":{"name":"x","parameters":{}}} then prose"#;
-        assert_eq!(unparsed_tool_call(wrapped).as_deref(), Some("x"));
-        assert_eq!(unparsed_tool_call(r#"{"name": "Ada"} is the author"#), None);
-        assert_eq!(unparsed_tool_call("The file says hello."), None);
+        let defs = tools::defs_for_context(true, 128_000);
+        let call = r#"{"name": "read_file", "arguments": {"path": "a.txt"}}"#;
+        assert_eq!(
+            unparsed_tool_call(call, &defs).as_deref(),
+            Some("read_file")
+        );
+        let fenced = format!("```json\n{call}\n```");
+        assert_eq!(
+            unparsed_tool_call(&fenced, &defs).as_deref(),
+            Some("read_file")
+        );
+        let wrapped = r#"{"type":"function","function":{"name":"grep_files","parameters":{}}}"#;
+        assert_eq!(
+            unparsed_tool_call(wrapped, &defs).as_deref(),
+            Some("grep_files")
+        );
+        assert_eq!(unparsed_tool_call("The file says hello.", &defs), None);
         assert!(
-            unrun_call_note(Some("read_file (path argument is required)"), "ok")
+            unrun_call_note(Some("read_file (path argument is required)"), "ok", &defs)
                 .unwrap()
                 .contains("read_file")
         );
+    }
+
+    #[test]
+    fn an_answer_that_shows_a_call_is_not_an_unparsed_call() {
+        let defs = tools::defs_for_context(true, 128_000);
+        for text in [
+            // A name this run does not offer: an example, however bare.
+            r#"{"name": "get_weather", "arguments": {"city": "Paris"}}"#,
+            r#"{"name": "getWeather", "arguments": {"city": "Paris"}}"#,
+            // An offered name with an explanation after it is an answer too.
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}\n\nThat is a call.",
+            r#"{"type":"function","function":{"name":"grep_files","parameters":{}}} then prose"#,
+            r#"{"name": "Ada"} is the author"#,
+        ] {
+            assert_eq!(unparsed_tool_call(text, &defs), None, "{text}");
+            assert_eq!(unrun_call_note(None, text, &defs), None, "{text}");
+        }
     }
 }
 
@@ -5066,7 +5227,7 @@ fn record_plan_exchange(
 // The planning loop: read-only tool rounds until the model produces a plan
 // (or a plain answer).
 fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Result<Draft, String> {
-    let defs = tools::defs_readonly(); // planning inspects context but never writes
+    let defs = offered(p, tools::defs_readonly()); // planning inspects context but never writes
     let mut loop_guard = ToolLoopGuard::default();
     let mut tool_rounds = 0usize;
     let mut plan_format_recovery_count = 0usize;
@@ -5151,6 +5312,7 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                     id: call.id.clone(),
                     content: msg,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5180,6 +5342,7 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                         id: call.id.clone(),
                         content,
                         is_error: true,
+                        images: Vec::new(),
                     });
                     let fallback = fallback_exit_plan_input(task);
                     report::tool_call(
@@ -5223,6 +5386,7 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                     id: call.id.clone(),
                     content: answer,
                     is_error,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5251,6 +5415,7 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                     id: call.id.clone(),
                     content: reason,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5264,11 +5429,12 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                         id: call.id.clone(),
                         content: msg,
                         is_error: false,
+                        images: Vec::new(),
                     });
                     continue;
                 }
             }
-            let out = tools::run(&call.name, &call_input, cwd);
+            let out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "plan", 0);
             note_loop_result(
@@ -5284,6 +5450,7 @@ fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Resu
                 id: call.id.clone(),
                 content: out.content,
                 is_error: out.is_error,
+                images: out.images,
             });
         }
         msgs.push(Msg::Assistant {
@@ -5482,7 +5649,7 @@ fn brainstorm_reply(
     question: &str,
     msgs: &mut Vec<Msg>,
 ) -> Result<String, String> {
-    let defs = tools::defs_readonly(); // brainstorm inspects but never writes
+    let defs = offered(p, tools::defs_readonly()); // brainstorm inspects but never writes
     let mut loop_guard = ToolLoopGuard::default();
     maybe_compact(p, msgs);
     let mut tool_rounds = 0usize;
@@ -5538,6 +5705,7 @@ fn brainstorm_reply(
                     id: call.id.clone(),
                     content: msg,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5566,6 +5734,7 @@ fn brainstorm_reply(
                     id: call.id.clone(),
                     content: answer,
                     is_error,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5592,6 +5761,7 @@ fn brainstorm_reply(
                     id: call.id.clone(),
                     content: reason,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5605,11 +5775,12 @@ fn brainstorm_reply(
                         id: call.id.clone(),
                         content: msg,
                         is_error: false,
+                        images: Vec::new(),
                     });
                     continue;
                 }
             }
-            let mut out = tools::run(&call.name, &call_input, cwd);
+            let mut out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
@@ -5626,6 +5797,7 @@ fn brainstorm_reply(
                 id: call.id.clone(),
                 content: out.content,
                 is_error: out.is_error,
+                images: out.images,
             });
         }
         msgs.push(Msg::Assistant {
@@ -5780,11 +5952,14 @@ fn chat_rounds(
     question: &str,
     msgs: &mut Vec<Msg>,
 ) -> Result<(), String> {
-    let defs = if matches!(perm, Permission::ReadOnly) {
-        tools::defs_readonly()
-    } else {
-        tools::defs_for_context(false, p.context_tokens)
-    };
+    let defs = offered(
+        p,
+        if matches!(perm, Permission::ReadOnly) {
+            tools::defs_readonly()
+        } else {
+            tools::defs_for_context(false, p.context_tokens)
+        },
+    );
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
@@ -5826,6 +6001,7 @@ fn chat_rounds(
                     id: call.id.clone(),
                     content: msg,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
@@ -5869,11 +6045,12 @@ fn chat_rounds(
                     id: call.id.clone(),
                     content: reason,
                     is_error: true,
+                    images: Vec::new(),
                 });
                 continue;
             }
 
-            let mut out = tools::run(&call.name, &call_input, cwd);
+            let mut out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "chat", tool_round);
@@ -5890,6 +6067,7 @@ fn chat_rounds(
                 id: call.id.clone(),
                 content: out.content,
                 is_error: out.is_error,
+                images: out.images,
             });
         }
 
@@ -6470,6 +6648,8 @@ mod tests {
             // An example call explained in prose.
             r#"A call comes back as {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}} and your code runs it."#.to_string(),
             "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n```\nThat is what the model sends back.".to_string(),
+            // The example first, then the explanation.
+            "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\nThat is what the model sends back.".to_string(),
         ] {
             let r = normalize_text_tool_calls(
                 Reply {
@@ -7541,6 +7721,44 @@ mod tests {
         assert!(text.contains("2 earlier image(s) were dropped"), "{text}");
     }
 
+    #[test]
+    fn compaction_keeps_the_images_tools_returned_and_counts_them() {
+        let img = ("image/png".to_string(), "S".repeat(12_000));
+        let mut msgs = vec![
+            Msg::System("sys".into()),
+            Msg::User("look at the page".into()),
+            Msg::Assistant {
+                text: String::new(),
+                calls: vec![provider::ToolCall {
+                    id: "c1".into(),
+                    name: "screenshot_url".into(),
+                    input: serde_json::json!({"url": "http://localhost:3000"}),
+                }],
+            },
+            Msg::Tool(vec![ToolResult {
+                id: "c1".into(),
+                content: "screenshot".into(),
+                is_error: false,
+                images: vec![img.clone()],
+            }]),
+        ];
+        // An image counts as its encoded size, as a user's image does.
+        assert!(
+            estimate_tokens(&msgs[3..]) >= 1_000,
+            "{}",
+            estimate_tokens(&msgs[3..])
+        );
+        assert!(render_msgs(&msgs[3..]).contains("[+1 image(s)]"));
+        for i in 0..KEEP_RECENT + 2 {
+            msgs.push(Msg::User(format!("u{i}")));
+        }
+        let out = compact_with(msgs, |_| "SUMMARY".into());
+        let Msg::UserImages { images, .. } = &out[1] else {
+            panic!("the summary turn dropped the screenshot");
+        };
+        assert_eq!(images, &vec![img]);
+    }
+
     // Six screenshots, each ~3.3k estimated tokens, then a short recent tail.
     fn screenshots_then_tail() -> Vec<Msg> {
         let mut msgs = vec![Msg::System("sys".into())];
@@ -7687,6 +7905,7 @@ mod tests {
                 id: format!("{i}"),
                 content: "r".into(),
                 is_error: false,
+                images: Vec::new(),
             }]));
         }
         msgs.push(Msg::User("follow-up".into()));
@@ -7737,6 +7956,7 @@ mod tests {
             id: "1".into(),
             content: long.clone(),
             is_error: false,
+            images: Vec::new(),
         }]));
         let out = compact_with(msgs, |_| "S".into());
         let Some(Msg::Tool(results)) = out.last() else {

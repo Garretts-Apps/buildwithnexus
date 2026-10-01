@@ -643,6 +643,7 @@ mod tests {
                     id: "c1".into(),
                     content: "TOOL OUTPUT BODY".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }]),
                 Msg::User("[harness] You called finish without running check_work".into()),
                 Msg::Assistant {
