@@ -5713,7 +5713,7 @@ pub fn run_chat_turn(
         r.map(|()| String::new()),
         |reason| {
             msgs.push(Msg::User(reason.to_string()));
-            let r = chat_reply(p, perm, cwd, reason, msgs);
+            let r = chat_reply(p, perm, readonly, cwd, reason, msgs);
             if r.is_err() {
                 drop_refused_message(p, msgs);
             }
