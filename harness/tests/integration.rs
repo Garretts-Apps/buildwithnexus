@@ -8300,6 +8300,25 @@ impl Acp {
         for var in NET_VARS {
             cmd.env_remove(var);
         }
+        // bwn starts with only its standard descriptors, as an editor starts
+        // it. A descriptor the test runner inherited (GitHub's runner passes
+        // its own control pipe down) would otherwise reach the commands bwn
+        // runs, and the test that writes to every descriptor a command has
+        // would write into it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: only close(2), which is async-signal-safe, between
+            // fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    for fd in 3..1024 {
+                        libc::close(fd);
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = cmd
             .args(args)
             .arg("acp")
