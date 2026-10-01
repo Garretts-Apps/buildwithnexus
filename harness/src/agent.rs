@@ -2711,6 +2711,19 @@ fn build_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A message `provider::request` refused before sending (bigger than the
+/// server's window) stays out of the conversation, or every later message
+/// would carry it to the server. A conversation left with only its system
+/// prompt is emptied, so nothing is saved for it.
+fn drop_refused_message(p: &Provider, msgs: &mut Vec<Msg>) {
+    if provider::oversized_message(p, msgs).is_some() {
+        msgs.pop();
+        if msgs.iter().all(|m| matches!(m, Msg::System(_))) {
+            msgs.clear();
+        }
+    }
+}
+
 fn build_turn(
     p: &Provider,
     perm: Permission,
@@ -2832,14 +2845,7 @@ fn build_turn(
                     });
                     continue;
                 }
-                // Refused before sending: it stays out of the conversation,
-                // or every later message would carry it to the server.
-                if provider::oversized_message(p, msgs).is_some() {
-                    msgs.pop();
-                    if msgs.iter().all(|m| matches!(m, Msg::System(_))) {
-                        msgs.clear();
-                    }
-                }
+                drop_refused_message(p, msgs);
                 hooks::notify("OnError", cwd);
                 return Err(e);
             }
@@ -4802,6 +4808,9 @@ pub fn brainstorm_turn(
     });
     msgs.push(user_msg(question.to_string(), images));
     let r = brainstorm_reply(p, cwd, question, msgs);
+    if r.is_err() {
+        drop_refused_message(p, msgs);
+    }
     // The reply is complete — the agent stopped responding for this turn.
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, msgs);
@@ -5047,6 +5056,9 @@ pub fn run_chat_turn(
     }
     msgs.push(user_msg(question.to_string(), images));
     let r = chat_reply(p, perm, cwd, question, msgs);
+    if r.is_err() {
+        drop_refused_message(p, msgs);
+    }
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, msgs);
     match r {

@@ -2947,6 +2947,41 @@ fn a_file_bigger_than_the_loaded_window_is_refused_before_sending() {
     );
 }
 
+// The same holds for a BRAINSTORM turn, which writes to the session's
+// conversation directly: the refused message is not saved, and `continue`
+// carries the conversation without it.
+#[test]
+fn a_brainstorm_message_bigger_than_the_window_leaves_the_conversation() {
+    let (port, posts) = serve_lmstudio("tinycoder-7b-instruct", 4096);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let cfg = json!({
+        "provider": "lmstudio", "model": "tinycoder-7b-instruct", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run_env(&home, &cwd, &["--json", "run", "say hi"], &[]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(posts.lock().unwrap().len(), 1);
+    let pasted = "the quick brown fox. ".repeat(1_000);
+    let r = run_env(&home, &cwd, &["brainstorm", &pasted], &[]);
+    assert!(
+        r.stderr.contains("and the server holds 4.1k"),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(posts.lock().unwrap().len(), 1);
+    let r = run_env(&home, &cwd, &["--json", "continue", "say bye"], &[]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert!(posts[1].contains("say hi") && posts[1].contains("say bye"));
+    assert!(
+        !posts[1].contains("quick brown fox"),
+        "the refused message was sent"
+    );
+}
+
 // ── conversation-sessions ───────────────────────────────────────────────────
 
 // Four headless runs started together share one home; each keeps its own
