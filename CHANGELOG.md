@@ -6,7 +6,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.15.0] - Unreleased
+## [0.15.0] - 2026-10-01
 
 An install IT can approve, and trust you grant explicitly: approvals, rules
 and keys that mean what they say, setup that finishes only with a model that
@@ -1118,7 +1118,9 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.14.9...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.15.0
+[0.14.10]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.10
 [0.14.9]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.9
 [0.14.8]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.8
 [0.14.7]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.7
