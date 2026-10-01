@@ -5228,30 +5228,7 @@ fn serve_streaming(script: Vec<String>) -> u16 {
                 )
                 .unwrap();
                 served += 1;
-                let msg = &reply["choices"][0]["message"];
-                let mut delta = json!({"role": "assistant"});
-                if let Some(calls) = msg["tool_calls"].as_array() {
-                    let calls: Vec<Value> = calls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            let mut c = c.clone();
-                            c["index"] = json!(i);
-                            c
-                        })
-                        .collect();
-                    delta["tool_calls"] = json!(calls);
-                } else {
-                    delta["content"] = msg["content"].clone();
-                }
-                let mut body = String::new();
-                for chunk in [
-                    json!({"choices": [{"index": 0, "delta": delta}]}),
-                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
-                ] {
-                    body.push_str(&format!("data: {chunk}\n\n"));
-                }
-                body.push_str("data: [DONE]\n\n");
+                let body = sse_body(&reply);
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -5271,6 +5248,35 @@ fn serve_streaming(script: Vec<String>) -> u16 {
         }
     });
     port
+}
+
+// A scripted OpenAI reply as the server-sent events of a streamed one.
+fn sse_body(reply: &Value) -> String {
+    let msg = &reply["choices"][0]["message"];
+    let mut delta = json!({"role": "assistant"});
+    if let Some(calls) = msg["tool_calls"].as_array() {
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut c = c.clone();
+                c["index"] = json!(i);
+                c
+            })
+            .collect();
+        delta["tool_calls"] = json!(calls);
+    } else {
+        delta["content"] = msg["content"].clone();
+    }
+    let mut body = String::new();
+    for chunk in [
+        json!({"choices": [{"index": 0, "delta": delta}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+    ] {
+        body.push_str(&format!("data: {chunk}\n\n"));
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
 }
 
 // Human (not --json) output of a headless run: stdout, then stderr.
@@ -6444,4 +6450,724 @@ fn an_image_read_shows_what_was_read_in_the_transcript() {
         "{out}"
     );
     assert!(!out.contains("↳ 1 line"), "{out}");
+}
+
+// ── parallel helpers ────────────────────────────────────────────────────────
+
+// Several tool calls in one reply.
+fn tool_calls(calls: &[(&str, &str, Value)]) -> String {
+    let calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, args)| {
+            json!({"id": id, "type": "function",
+                   "function": {"name": name, "arguments": args.to_string()}})
+        })
+        .collect();
+    json!({"choices": [{"message": {"content": "", "tool_calls": calls}}]}).to_string()
+}
+
+// A model server that answers requests at the same time, one thread each.
+// `route` gives each POST body its reply and whether to hold it: held
+// requests wait until `together` requests are in flight at once (or `hold`
+// passes), so helpers that really run side by side meet there, and helpers
+// run one after another each wait it out. Keeps the most requests ever in
+// flight at once, and every body.
+struct ConcurrentModel {
+    port: u16,
+    peak: Arc<Mutex<usize>>,
+    posts: Arc<Mutex<Vec<String>>>,
+}
+
+type Route = dyn Fn(&str) -> (String, bool) + Send + Sync;
+
+fn serve_concurrent(
+    route: impl Fn(&str) -> (String, bool) + Send + Sync + 'static,
+    together: usize,
+    hold: std::time::Duration,
+) -> ConcurrentModel {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peak = Arc::new(Mutex::new(0usize));
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    // Requests in flight, and whether `together` of them have ever met.
+    let state = Arc::new((Mutex::new((0usize, false)), std::sync::Condvar::new()));
+    let route: Arc<Route> = Arc::new(route);
+    let (peak_w, posts_w) = (Arc::clone(&peak), Arc::clone(&posts));
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let route = Arc::clone(&route);
+            let state = Arc::clone(&state);
+            let (peak, posts) = (Arc::clone(&peak_w), Arc::clone(&posts_w));
+            thread::spawn(move || {
+                let (method, body) = read_request(&mut stream);
+                if method != "POST" {
+                    let list = r#"{"object":"list","data":[]}"#;
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{list}",
+                            list.len()
+                        )
+                        .as_bytes(),
+                    );
+                    return;
+                }
+                posts.lock().unwrap().push(body.clone());
+                let (reply, held) = route(&body);
+                let (lock, cv) = &*state;
+                {
+                    let mut st = lock.lock().unwrap();
+                    st.0 += 1;
+                    if st.0 >= together {
+                        st.1 = true;
+                    }
+                    let mut p = peak.lock().unwrap();
+                    *p = (*p).max(st.0);
+                    drop(p);
+                    cv.notify_all();
+                    let deadline = std::time::Instant::now() + hold;
+                    while held && !st.1 {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        st = cv.wait_timeout(st, left).unwrap().0;
+                    }
+                }
+                let (ctype, out) = if body.contains("\"stream\":true") {
+                    (
+                        "text/event-stream",
+                        sse_body(&serde_json::from_str(&reply).unwrap()),
+                    )
+                } else {
+                    ("application/json", reply)
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                        out.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = stream.flush();
+                lock.lock().unwrap().0 -= 1;
+            });
+        }
+    });
+    ConcurrentModel { port, peak, posts }
+}
+
+impl ConcurrentModel {
+    fn peak(&self) -> usize {
+        *self.peak.lock().unwrap()
+    }
+    fn posts(&self) -> Vec<String> {
+        self.posts.lock().unwrap().clone()
+    }
+}
+
+// The parent asks three helpers (`args` each, plus a task naming A, B or
+// C); each helper answers at once, held so the server sees whether they
+// overlap; the parent finishes once it has their summaries. Every reply
+// reports usage: 11 prompt tokens for the parent's first request, 5 for
+// each helper, 7 for the parent's last.
+fn three_helpers(args: Value) -> impl Fn(&str) -> (String, bool) + Send + Sync + 'static {
+    move |body: &str| {
+        if body.contains("SUMMARY-") {
+            return (with_usage(finish("parent done"), 7), false);
+        }
+        for x in ["A", "B", "C"] {
+            if body.contains(&format!("child task {x}")) {
+                return (with_usage(finish(&format!("SUMMARY-{x}")), 5), true);
+            }
+        }
+        let call = |x: &str| {
+            let mut a = args.clone();
+            a["task"] = json!(format!("child task {x}"));
+            a
+        };
+        let reply = tool_calls(&[
+            ("t1", "task", call("A")),
+            ("t2", "task", call("B")),
+            ("t3", "task", call("C")),
+        ]);
+        (with_usage(reply, 11), false)
+    }
+}
+
+fn hold(ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(ms)
+}
+
+#[test]
+fn read_only_helpers_from_one_reply_run_at_the_same_time() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(
+        three_helpers(json!({"role": "researcher", "read_only": true})),
+        3,
+        hold(5_000),
+    );
+    write_big_context_config(&home, m.port);
+    let r = run(&home, &cwd, "look at three things");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    // All three helpers' requests were in flight together.
+    assert_eq!(m.peak(), 3, "helpers did not overlap");
+    let posts = m.posts();
+    assert_eq!(posts.len(), 5, "parent, three helpers, parent");
+    // The parent gets every result, in call order.
+    let last = &posts[4];
+    let at = |x: &str| last.find(&format!("SUMMARY-{x}")).expect(x);
+    assert!(at("A") < at("B") && at("B") < at("C"), "{last}");
+    // Each helper's events say which one it was.
+    for (n, x) in [(1, "A"), (2, "B"), (3, "C")] {
+        let done = r
+            .events
+            .iter()
+            .find(|e| e["type"] == "finish" && e["summary"] == format!("SUMMARY-{x}"))
+            .unwrap_or_else(|| panic!("helper {x} finish: {:?}", r.events));
+        assert_eq!(done["helper"], n, "{done}");
+    }
+    // Tokens and requests add up across the helpers.
+    let result = r.find("result").expect("result event");
+    assert_eq!(result["turns"], 5, "{result}");
+    assert_eq!(result["tokens_in"], 11 + 3 * 5 + 7, "{result}");
+    // The saved session records each result.
+    let saved = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .find(|t| t.contains("look at three things"))
+        .expect("session file");
+    for x in ["A", "B", "C"] {
+        assert!(saved.contains(&format!("SUMMARY-{x}")), "{saved}");
+    }
+}
+
+#[test]
+fn helpers_that_write_in_place_run_one_after_another() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(three_helpers(json!({"role": "engineer"})), 2, hold(400));
+    write_big_context_config(&home, m.port);
+    let r = run(&home, &cwd, "change three things");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(m.peak(), 1, "two writers ran at the same time");
+    assert_eq!(m.posts().len(), 5);
+    assert!(m.posts()[4].contains("SUMMARY-C"));
+    // Nothing ran side by side, so no event is marked as a helper's.
+    assert!(r.events.iter().all(|e| e.get("helper").is_none()));
+}
+
+#[test]
+fn max_parallel_helpers_of_one_runs_read_only_helpers_one_at_a_time() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(
+        three_helpers(json!({"role": "researcher", "read_only": true})),
+        2,
+        hold(400),
+    );
+    write_big_context_config(&home, m.port);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"max_parallel_helpers": 1}).to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "look at three things");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(m.peak(), 1);
+    assert!(m.posts()[4].contains("SUMMARY-C"));
+}
+
+#[test]
+fn two_at_a_time_when_max_parallel_helpers_is_two() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(
+        three_helpers(json!({"role": "researcher", "read_only": true})),
+        3,
+        hold(600),
+    );
+    write_big_context_config(&home, m.port);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"max_parallel_helpers": 2}).to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "look at three things");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(m.peak(), 2);
+    assert!(m.posts()[4].contains("SUMMARY-C"));
+}
+
+#[test]
+fn agent_file_helpers_that_only_read_run_side_by_side_and_cannot_write() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    // Only tools that change nothing: read-only without saying so.
+    std::fs::write(
+        home.join("agents/scout.md"),
+        "---\nname: scout\ndescription: Looks around\ntools: Read, Grep, Glob\n---\nLook.\n",
+    )
+    .unwrap();
+    // Every tool, but read-only.
+    std::fs::write(
+        home.join("agents/auditor.md"),
+        "---\nname: auditor\ndescription: Audits\nread_only: true\n---\nAudit.\n",
+    )
+    .unwrap();
+    let m = serve_concurrent(
+        |body: &str| {
+            if body.contains("SUMMARY-") {
+                return (finish("parent done"), false);
+            }
+            if body.contains("child task C") {
+                // The auditor tries a write first, then reports.
+                return if body.contains("is read-only") {
+                    (finish("SUMMARY-C"), false)
+                } else {
+                    let w = json!({"path": "audit.txt", "content": "x"});
+                    (tool_call("w1", "write_file", w), true)
+                };
+            }
+            for x in ["A", "B"] {
+                if body.contains(&format!("child task {x}")) {
+                    return (finish(&format!("SUMMARY-{x}")), true);
+                }
+            }
+            let reply = tool_calls(&[
+                (
+                    "t1",
+                    "task",
+                    json!({"task": "child task A", "role": "scout"}),
+                ),
+                (
+                    "t2",
+                    "task",
+                    json!({"task": "child task B", "role": "scout"}),
+                ),
+                (
+                    "t3",
+                    "task",
+                    json!({"task": "child task C", "role": "auditor"}),
+                ),
+            ]);
+            (reply, false)
+        },
+        3,
+        hold(5_000),
+    );
+    write_big_context_config(&home, m.port);
+    let r = run(&home, &cwd, "survey the code");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(m.peak(), 3, "agent-file helpers did not overlap");
+    assert!(!cwd.join("audit.txt").exists(), "a read-only helper wrote");
+    let denied = r.find("tool_denied").expect("refusal");
+    assert!(
+        denied["reason"]
+            .as_str()
+            .unwrap()
+            .contains("this helper is read-only"),
+        "{denied}"
+    );
+    assert_eq!(denied["helper"], 3);
+    // Its write tools were never offered.
+    let auditor = m
+        .posts()
+        .into_iter()
+        .find(|b| b.contains("child task C"))
+        .unwrap();
+    assert!(!tools_offered(&auditor).contains(&"write_file".to_string()));
+}
+
+#[test]
+fn isolated_helpers_run_side_by_side_each_on_its_own_branch() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let m = serve_concurrent(
+        |body: &str| {
+            if body.contains("SUMMARY-") {
+                return (finish("parent done"), false);
+            }
+            for x in ["A", "B", "C"] {
+                if body.contains(&format!("child task {x}")) {
+                    return if body.contains("wrote ") {
+                        (finish(&format!("SUMMARY-{x}")), false)
+                    } else {
+                        let w = json!({"path": format!("{x}.txt"), "content": x});
+                        (tool_call("w1", "write_file", w), true)
+                    };
+                }
+            }
+            let call = |x: &str| json!({"task": format!("child task {x}"), "isolate": true});
+            let reply = tool_calls(&[
+                ("t1", "task", call("A")),
+                ("t2", "task", call("B")),
+                ("t3", "task", call("C")),
+            ]);
+            (reply, false)
+        },
+        3,
+        hold(5_000),
+    );
+    write_big_context_config(&home, m.port);
+    let env = git_identity_env(&home);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let r = run_env(&home, &cwd, &["--json", "run", "write three files"], &env);
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(m.peak(), 3, "isolated helpers did not overlap");
+    let done: Vec<&Value> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "subagent_result")
+        .collect();
+    assert_eq!(done.len(), 3, "{:?}", r.events);
+    let mut branches: Vec<String> = done
+        .iter()
+        .map(|d| d["branch"].as_str().unwrap().to_string())
+        .collect();
+    branches.sort();
+    branches.dedup();
+    assert_eq!(branches.len(), 3, "{branches:?}");
+    for d in &done {
+        assert_eq!(d["commits"], 1, "{d}");
+    }
+    for x in ["A", "B", "C"] {
+        assert!(
+            !cwd.join(format!("{x}.txt")).exists(),
+            "the checkout is untouched"
+        );
+    }
+    // No worktree is left behind.
+    assert_eq!(git(&cwd, &["worktree", "list"]).lines().count(), 1);
+}
+
+// A worktree keeps a helper out of the checkout, not out of a folder added
+// with --add-dir: helpers that may write there run one after another.
+#[test]
+fn isolated_helpers_take_turns_when_they_can_write_in_an_added_folder() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let shared = tmp("shared");
+    let target = shared.join("log.txt");
+    let path = target.display().to_string();
+    let m = serve_concurrent(
+        move |body: &str| {
+            if body.contains("SUMMARY-") {
+                return (finish("parent done"), false);
+            }
+            for x in ["A", "B"] {
+                if body.contains(&format!("child task {x}")) {
+                    return if body.contains("wrote ") {
+                        (finish(&format!("SUMMARY-{x}")), false)
+                    } else {
+                        let w = json!({"path": format!("{path}.{x}"), "content": x});
+                        (tool_call("w1", "write_file", w), true)
+                    };
+                }
+            }
+            let call = |x: &str| json!({"task": format!("child task {x}"), "isolate": true});
+            (
+                tool_calls(&[("t1", "task", call("A")), ("t2", "task", call("B"))]),
+                false,
+            )
+        },
+        2,
+        hold(3_000),
+    );
+    write_big_context_config(&home, m.port);
+    let env = git_identity_env(&home);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let dir = shared.display().to_string();
+    let r = run_env(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--add-dir",
+            &dir,
+            "run",
+            "write in the shared folder",
+        ],
+        &env,
+    );
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(
+        m.peak(),
+        1,
+        "helpers that can write in the added folder overlapped"
+    );
+    for x in ["A", "B"] {
+        let f = shared.join(format!("log.txt.{x}"));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), x);
+    }
+    assert_eq!(git(&cwd, &["worktree", "list"]).lines().count(), 1);
+}
+
+#[test]
+fn each_helper_shows_its_work_in_one_labelled_block() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(
+        three_helpers(json!({"role": "researcher", "read_only": true})),
+        3,
+        hold(5_000),
+    );
+    write_big_context_config(&home, m.port);
+    let (code, out) = run_human(&home, &cwd, "look at three things");
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("❖ 3 helpers at once"), "{out}");
+    for (n, x) in [(1, "A"), (2, "B"), (3, "C")] {
+        let head = format!("❖ helper {n} of 3 done · researcher · child task {x}");
+        let start = out.find(&head).unwrap_or_else(|| panic!("{head}:\n{out}"));
+        let rest = &out[start + head.len()..];
+        let block = &rest[..rest.find("❖ helper ").unwrap_or(rest.len())];
+        // Its own summary, inside its gutter, and nobody else's.
+        assert!(block.contains(&format!("│ SUMMARY-{x}")), "{block}");
+        for other in ["A", "B", "C"].iter().filter(|o| **o != x) {
+            assert!(!block.contains(&format!("SUMMARY-{other}")), "{block}");
+        }
+    }
+}
+
+// ── added working folders ───────────────────────────────────────────────────
+
+// `run --add-dir <dir>` with `--json`, against `script`.
+fn run_with_dir(home: &Path, cwd: &Path, dir: &Path, task: &str) -> Run {
+    let dir = dir.display().to_string();
+    run_args(home, cwd, &["--json", "--add-dir", &dir, "run", task])
+}
+
+#[test]
+fn an_added_folder_is_searched_written_and_named_to_the_model() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    std::fs::write(other.join("lib.rs"), "fn needle() {}\n").unwrap();
+    std::fs::write(other.join("AGENTS.md"), "ADDED-FOLDER-RULE: tabs only\n").unwrap();
+    let new_file = other.join("new.txt");
+    let (port, posts) = serve_recording(vec![
+        tool_call("c1", "find_files", json!({"pattern": "*.rs"})),
+        tool_call("c2", "grep_files", json!({"pattern": "needle"})),
+        tool_call(
+            "c3",
+            "write_file",
+            json!({"path": new_file.display().to_string(), "content": "hello\n"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_with_dir(&home, &cwd, &other, "work across both");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(std::fs::read_to_string(&new_file).unwrap(), "hello\n");
+    let results: Vec<&Value> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result")
+        .collect();
+    let lib = other.join("lib.rs").display().to_string();
+    assert!(
+        results[0]["content"].as_str().unwrap().contains(&lib),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1]["content"].as_str().unwrap().contains(&lib),
+        "{}",
+        results[1]
+    );
+    // The folder's AGENTS.md is named in a notice before it reaches the model.
+    let notice = r
+        .events
+        .iter()
+        .position(|e| {
+            e["type"] == "notice"
+                && e["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("AGENTS.md") && m.contains("added folder"))
+        })
+        .unwrap_or_else(|| panic!("no notice: {:?}", r.events));
+    let first_call = r
+        .events
+        .iter()
+        .position(|e| e["type"] == "tool_call")
+        .unwrap();
+    assert!(notice < first_call);
+    let first = &posts.lock().unwrap()[0];
+    assert!(first.contains("ADDED-FOLDER-RULE"), "instructions not sent");
+    assert!(
+        first.contains(&other.display().to_string()),
+        "folder not named"
+    );
+}
+
+#[test]
+fn without_add_dir_a_write_there_is_refused() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    let target = other.join("new.txt");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": target.display().to_string(), "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "write there");
+    assert!(!target.exists());
+    assert!(r
+        .text_of("tool_result")
+        .contains("outside the working directory"));
+    assert!(
+        r.text_of("tool_result").contains("--add-dir"),
+        "{:?}",
+        r.events
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_inside_an_added_folder_that_points_outside_is_still_refused() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    let outside = tmp("outside");
+    std::fs::write(outside.join("target.txt"), "original\n").unwrap();
+    std::os::unix::fs::symlink(&outside, other.join("escape")).unwrap();
+    std::os::unix::fs::symlink(outside.join("target.txt"), other.join("link.txt")).unwrap();
+    let in_other = |rel: &str| other.join(rel).display().to_string();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": in_other("escape/pwn.txt"), "content": "x"}),
+        ),
+        // Read first: an existing file must be read before it is written.
+        tool_call("c2", "read_file", json!({"path": in_other("link.txt")})),
+        tool_call(
+            "c3",
+            "write_file",
+            json!({"path": in_other("link.txt"), "content": "overwritten\n"}),
+        ),
+        tool_call("c4", "create_dir", json!({"path": in_other("escape/made")})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_with_dir(&home, &cwd, &other, "try to escape");
+    let refusals = r.text_of("tool_result");
+    assert_eq!(
+        refusals.matches("outside the working directory").count(),
+        3,
+        "{refusals}"
+    );
+    assert!(!outside.join("pwn.txt").exists());
+    assert!(!outside.join("made").exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("target.txt")).unwrap(),
+        "original\n"
+    );
+}
+
+#[test]
+fn sensitive_paths_in_an_added_folder_still_need_a_yes() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    let key = other.join(".ssh").join("id_rsa");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": key.display().to_string(), "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_with_dir(&home, &cwd, &other, "write a key");
+    assert!(!key.exists());
+    assert!(
+        r.text_of("tool_denied").contains("sensitive path"),
+        "{:?}",
+        r.events
+    );
+}
+
+#[test]
+fn an_added_folder_brings_no_settings_hooks_or_agents_even_from_a_trusted_session() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    let marker = other.join("hook-ran");
+    std::fs::create_dir_all(other.join(".buildwithnexus/agents")).unwrap();
+    std::fs::write(
+        other.join(".buildwithnexus/settings.json"),
+        json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": format!("touch {}", marker.display())}
+        ]}]}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        other.join(".buildwithnexus/agents/planted.md"),
+        "---\nname: planted\ndescription: from the added folder\n---\nx\n",
+    )
+    .unwrap();
+    trust_folder(&home, &cwd);
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "list_dir",
+            json!({"path": other.display().to_string()}),
+        ),
+        finish("done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run_with_dir(&home, &cwd, &other, "look");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(!marker.exists(), "the added folder's hook ran");
+    assert!(!posts.lock().unwrap()[0].contains("planted"));
+}
+
+#[test]
+fn add_dir_refuses_what_is_not_a_folder_or_is_too_wide() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let file = cwd.join("f.txt");
+    std::fs::write(&file, "x").unwrap();
+    for (dir, why) in [
+        (cwd.join("missing").display().to_string(), "missing"),
+        (file.display().to_string(), "not a folder"),
+        ("/".to_string(), "too wide"),
+    ] {
+        let r = run_args(&home, &cwd, &["--json", "--add-dir", &dir, "run", "x"]);
+        assert_eq!(r.code, Some(2), "{dir}: {}", r.stderr);
+        assert!(r.stderr.contains("--add-dir"), "{dir}: {}", r.stderr);
+        assert!(r.stderr.contains(why), "{dir}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn a_helper_works_in_the_added_folders_too() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let other = tmp("other");
+    let target = other.join("from-helper.txt");
+    let port = serve(vec![
+        tool_call("c1", "task", json!({"task": "write the file over there"})),
+        tool_call(
+            "s1",
+            "write_file",
+            json!({"path": target.display().to_string(), "content": "hi\n"}),
+        ),
+        finish("helper wrote it"),
+        finish("parent done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run_with_dir(&home, &cwd, &other, "delegate a write");
+    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi\n");
 }

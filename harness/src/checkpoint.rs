@@ -47,6 +47,10 @@ pub struct Checkpoint {
     /// The task of the turn that made the change, shown by /checkpoints.
     #[serde(default)]
     pub task: Option<String>,
+    /// The folder added with --add-dir that the file lies in, when it is
+    /// outside `cwd`: restore may write there too, later sessions included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
 }
 
 fn default_snapshotted() -> bool {
@@ -607,6 +611,7 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         mode,
         after: None,
         task: CURRENT_TASK.lock().ok().and_then(|t| t.clone()),
+        root: crate::workdirs::containing(path).filter(|_| !inside_tree(path, cwd)),
     };
     let checkpoint_dir = dir(cwd);
     let _ = fs::create_dir_all(&checkpoint_dir);
@@ -722,7 +727,9 @@ fn restore_one(cp: &Checkpoint) -> Result<(), String> {
     check_restorable(cp)?;
     if cp.existed {
         let target = write_target(&cp.path);
-        if target.parent().is_some_and(Path::exists) && !inside_tree(&target, &cp.cwd) {
+        let in_a_root = inside_tree(&target, &cp.cwd)
+            || cp.root.as_deref().is_some_and(|r| inside_tree(&target, r));
+        if target.parent().is_some_and(Path::exists) && !in_a_root {
             return Err(format!(
                 "cannot restore {}: it now resolves outside the working tree ({})",
                 cp.path.display(),
@@ -1332,6 +1339,24 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_change_in_an_added_folder_is_undone_even_after_the_session() {
+        let d = scratch("addroot-cwd");
+        let other = scratch("addroot-other");
+        let file = other.join("lib.rs");
+        fs::write(&file, "original").unwrap();
+        crate::workdirs::clear();
+        crate::workdirs::add(&other.display().to_string(), &d).unwrap();
+        record(&d, &file, "edit_file");
+        fs::write(&file, "edited").unwrap();
+        // A later session that did not add the folder still restores it.
+        crate::workdirs::clear();
+        undo_latest(&d, &mut |_| true).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&other);
     }
 
     fn git(d: &Path, args: &[&str]) {

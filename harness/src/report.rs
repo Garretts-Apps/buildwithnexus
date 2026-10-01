@@ -39,7 +39,11 @@ fn event_line(mut v: Value) -> String {
 }
 
 fn emit(v: Value) {
-    println!("{}", event_line(v));
+    let line = event_line(v);
+    // A helper running beside others keeps its events for its block.
+    if !tui::capture_event(&line) {
+        println!("{line}");
+    }
 }
 
 /// A whole event built by the caller (`--json sessions`), with the schema

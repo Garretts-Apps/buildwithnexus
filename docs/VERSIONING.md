@@ -68,6 +68,12 @@ The event types in schema 1:
 | `check` | `name`, `status` (`ok`, `warn`, `fail` or `info`), `detail` (`--json doctor`) |
 | `update` | `current`, `latest`, `behind` (`--json update`) |
 
+Events from helpers that ran at the same time (read-only or isolated
+`task` calls from one reply) are written together when each helper
+finishes, and each carries `helper`: its place among the helpers started
+together, from 1. The `tool_result` of each `task` call follows, in call
+order.
+
 `turns` counts model requests, `tokens_in` includes cached input, and
 `cost_usd` is estimated from the price table; requests to a model with no
 price are counted in `unpriced_requests`, never guessed. `denied` counts every

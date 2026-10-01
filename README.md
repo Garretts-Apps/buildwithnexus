@@ -320,6 +320,7 @@ Inside the interactive session:
 /ask <question>           a side question that is not added to the conversation
 /init                     run setup, then offer to write AGENTS.md from this repository
 /agents                   helper agents from agent files, then Agents.md
+/add-dir [path]           also work in another folder for this session (no path: list them)
 /schedule <delay> <task>  run a task once in the background (5s, 2m, 1h)
 /loop <interval> <task>   run a task repeatedly in the background (up to max_concurrent_workflows at once, default 2)
 /workflows                list and manage background workflows (i<id> shows a run's log, kept in ~/.buildwithnexus/workflows/)
@@ -395,6 +396,7 @@ whose API key is in the environment, and writes nothing.
 | `--legacy-exit-codes` | exit 0 when a run stops short without failing (codes 4 to 8, and 3 or 1 for refused or unrun calls, below) |
 | `--trust-project <digest>` | trust exactly this content of the folder's project settings for this run (also `BWN_TRUST_PROJECT`; `buildwithnexus trust --print` prints the digest) |
 | `--worktree <name>` | work in `.bwn/worktrees/<name>` on branch `bwn/<name>` (created from HEAD, or reused); on exit bwn prints the branch and `git merge bwn/<name>` |
+| `--add-dir <path>` | also read and change files in `<path>`; repeatable (see [More folders](#more-folders)). A missing folder, a file, `/` or a folder holding your home exits 2. |
 | `--plain` | line mode for the terminal UI: no alternate screen or cursor addressing (as with `TERM=dumb`) |
 | `--` | everything after it is task text, even if it looks like a flag |
 
@@ -518,6 +520,26 @@ or not) do not inherit provider keys: variables ending in `_API_KEY` or
 from their environment. List any your build needs in
 `"shell_env_passthrough": ["MAPS_API_KEY"]`. Hooks are your own and keep
 their environment.
+
+### More folders
+
+`--add-dir <path>` (repeatable) or `/add-dir <path>` adds a folder to work
+in besides the one you started in, for the rest of the session. The file
+tools may change files there under the same permission mode (`accept-edits`
+included), searches without a folder of their own (`find_files`,
+`grep_files`, `find_paths`) and `@` completion cover it, the sandbox binds
+it writable, and helpers and background workflows get it too. The footer
+shows `+N dirs`, and `/add-dir` alone lists them.
+
+What stays the same: sensitive paths there still ask in every mode, a link
+inside the folder that leads out of it is outside, and its `.git` stays
+read-only to sandboxed commands and asks in `accept-edits`. Folder trust
+does not extend to it: its settings, hooks, commands, skills and agent
+files never load. Its `AGENTS.md` (or the first `instruction_files` name at
+its top) is sent to the model, after a notice names it, as instructions
+for that folder. The filesystem root, a folder that holds your home folder,
+bwn's own folder and credential stores cannot be added. A resumed session
+starts without the folders; add them again.
 
 ### Allow, ask and deny rules
 
@@ -835,6 +857,18 @@ tools: Read, Grep, Glob, Write
 ---
 Write tests for the module you are given. Do not change the module itself.
 ```
+
+A helper started with `read_only: true`, or from an agent file with
+`read_only: true` or a `tools` list that only reads (`Read, Grep, Glob`),
+can read and search but never change anything. Read-only helpers and
+isolated ones (`isolate: true`) that the model starts in the same reply run
+at the same time, up to `max_parallel_helpers` at once (default 3; `1`
+runs them one after another). Isolated helpers take turns while folders
+added with `--add-dir` are in use: a worktree does not cover those, and each
+helper may write there. Each shows its work in one labelled block
+when it finishes, a helper that needs an approval says which one it is,
+and Esc or Ctrl+C stops them all. Helpers that write in your folder always
+run one after another. Their tokens and cost count toward the session.
 
 Agent files load from `~/.buildwithnexus/agents/` and `~/.claude/agents/`,
 and, once you trust them, from the project's `.buildwithnexus/agents/`

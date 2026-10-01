@@ -1421,7 +1421,10 @@ impl StreamRenderer {
     // still classify as fence openers or protocol JSON are held back — they
     // may never be shown at all.
     fn echo_partial(&mut self) {
-        if !ALT_SCREEN.load(Ordering::Relaxed) || !matches!(self.state, StreamState::Normal) {
+        if !ALT_SCREEN.load(Ordering::Relaxed)
+            || capturing()
+            || !matches!(self.state, StreamState::Normal)
+        {
             return;
         }
         let head = self.pending.trim_start();
@@ -3386,6 +3389,9 @@ fn queue_footer(out: &mut impl Write) {
         String::new()
     };
 
+    // Folders added with /add-dir: the agent may write there too.
+    let base_text = format!("{base_text}{}", dirs_badge(crate::workdirs::count()));
+
     // The context gauge is the least urgent part of the footer: on a narrow
     // terminal drop it whole rather than cut it off mid-number.
     let fits = |s: &str| strip_ansi(s).chars().count() <= width as usize;
@@ -3411,6 +3417,15 @@ fn queue_footer(out: &mut impl Write) {
         text = format!("{text}  {}", accent(&fl));
     }
     let _ = write!(out, "{}", ellipsize_ansi_line(&text, width as usize));
+}
+
+// ` · +2 dirs` with folders added to the session, else nothing.
+fn dirs_badge(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => format!(" {}", accent("· +1 dir")),
+        n => format!(" {}", accent(&format!("· +{n} dirs"))),
+    }
 }
 
 fn render_footer() {
@@ -4648,6 +4663,119 @@ fn ellipsize_ansi_line(s: &str, max_cols: usize) -> String {
     format!("{cut}{}…", reset_all())
 }
 
+// ── helper output capture ────────────────────────────────────────────────────
+// A helper running beside others (agent.rs) writes its transcript lines and
+// --json events here instead of the screen, so several helpers never
+// interleave mid-line; its block is shown, labelled, when it finishes. Per
+// thread: each helper runs on its own.
+#[derive(Default)]
+struct Captured {
+    lines: Vec<String>,
+    // A streamed line still waiting for its newline.
+    partial: String,
+}
+
+impl Captured {
+    fn end_partial(&mut self) {
+        if !self.partial.is_empty() {
+            self.lines.push(std::mem::take(&mut self.partial));
+        }
+    }
+}
+
+thread_local! {
+    static CAPTURE: std::cell::RefCell<Option<Captured>> = const { std::cell::RefCell::new(None) };
+}
+
+/// From now on this thread's transcript output is kept for `capture_take`.
+pub fn capture_start() {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Captured::default()));
+}
+
+/// Ends this thread's capture and returns what it held, one entry per line.
+pub fn capture_take() -> Vec<String> {
+    CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .map(|mut c| {
+            c.end_partial();
+            c.lines
+        })
+        .unwrap_or_default()
+}
+
+pub fn capturing() -> bool {
+    CAPTURE.with(|c| c.borrow().is_some())
+}
+
+/// Runs `f` with this thread's capture set aside, so what it shows (a
+/// helper's approval prompt) reaches the screen at once.
+pub fn uncaptured<T>(f: impl FnOnce() -> T) -> T {
+    let saved = CAPTURE.with(|c| c.borrow_mut().take());
+    let out = f();
+    CAPTURE.with(|c| *c.borrow_mut() = saved);
+    out
+}
+
+// Keeps `s` (one or more lines) when this thread is capturing.
+fn capture_lines(s: &str) -> bool {
+    CAPTURE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(c) = c.as_mut() else {
+            return false;
+        };
+        c.end_partial();
+        c.lines
+            .extend(s.replace('\r', "").split('\n').map(str::to_string));
+        true
+    })
+}
+
+// Keeps a streamed chunk when this thread is capturing: whole lines as they
+// complete, the rest until its newline.
+fn capture_stream(chunk: &str) -> bool {
+    CAPTURE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(c) = c.as_mut() else {
+            return false;
+        };
+        for ch in chunk.chars() {
+            match ch {
+                '\r' => {}
+                '\n' => c.lines.push(std::mem::take(&mut c.partial)),
+                _ => c.partial.push(ch),
+            }
+        }
+        true
+    })
+}
+
+// Drops the captured partial line, or replaces it with `with` (the streamed
+// line's rendered form).
+fn capture_settle_partial(with: Option<&str>) -> bool {
+    CAPTURE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(c) = c.as_mut() else {
+            return false;
+        };
+        c.partial.clear();
+        if let Some(l) = with {
+            c.lines.push(l.to_string());
+        }
+        true
+    })
+}
+
+/// Keeps one --json event line when this thread is capturing.
+pub(crate) fn capture_event(line: &str) -> bool {
+    CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(c) => {
+            c.lines.push(line.to_string());
+            true
+        }
+        None => false,
+    })
+}
+
 // Transcript index of the line currently receiving streamed text, or
 // usize::MAX when no stream line is open. line() (and transcript clears)
 // invalidate it so interleaved notices (trace records, hook lines) never get
@@ -4662,6 +4790,9 @@ fn invalidate_stream_line() {
 // back to appending a fresh line when no stream line is open (start of turn,
 // or a notice landed mid-stream and invalidated the index).
 fn commit_stream_line(rendered: &str) {
+    if capture_settle_partial(Some(rendered)) {
+        return;
+    }
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         line(rendered);
         return;
@@ -4687,6 +4818,9 @@ fn commit_stream_line(rendered: &str) {
 // Remove the open streamed line entirely (an echoed raw partial that turned
 // out to be chrome — a code fence or protocol JSON — and must not be shown).
 fn retract_stream_line() {
+    if capture_settle_partial(None) {
+        return;
+    }
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
@@ -4713,6 +4847,9 @@ fn pin_scroll(before_rows: usize, t: &Transcript) {
 }
 
 pub fn line(s: &str) {
+    if capture_lines(s) {
+        return;
+    }
     if ALT_SCREEN.load(Ordering::Relaxed) {
         invalidate_stream_line();
         if let Ok(mut t) = transcript().lock() {
@@ -4743,6 +4880,9 @@ pub fn line(s: &str) {
 
 pub fn write_stream(chunk: &str) {
     STREAM_CHARS.fetch_add(chunk.chars().count(), Ordering::Relaxed);
+    if capture_stream(chunk) {
+        return;
+    }
     if ALT_SCREEN.load(Ordering::Relaxed) {
         if let Ok(mut t) = transcript().lock() {
             let before = if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
@@ -5952,6 +6092,7 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/model",
     "/permissions",
     "/sandbox",
+    "/add-dir",
     "/mcp",
     "/scroll",
     "/mouse",
@@ -6100,6 +6241,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/model" => "hot-swap the AI model",
         "/permissions" => "tool permission level (ask/auto/readonly)",
         "/sandbox" => "OS sandbox for shell commands (off/auto/require)",
+        "/add-dir" => "also read and change files in another folder",
         "/mcp" => "MCP servers: list, <name>, add, remove, reload",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
@@ -6385,6 +6527,15 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
                 out.push(full);
             }
         }
+        // Folders added with /add-dir, offered by their full path.
+        for root in crate::workdirs::list() {
+            for deep in crate::tools::rank_by_name(&project_files_cached(&root), prefix, 20) {
+                let full = format!("{}{range_suffix}", root.join(deep).display());
+                if !out.contains(&full) {
+                    out.push(full);
+                }
+            }
+        }
     }
     out
 }
@@ -6392,20 +6543,23 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
 // The project's file list for `@` completion, walked at most every five
 // seconds: the popup asks on every keystroke.
 fn project_files_cached(cwd: &std::path::Path) -> Vec<String> {
+    // One entry per folder: the working folder and each added one.
     #[allow(clippy::type_complexity)]
-    static CACHE: OnceLock<Mutex<Option<(u64, std::path::PathBuf, Vec<String>)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    static CACHE: OnceLock<Mutex<Vec<(u64, std::path::PathBuf, Vec<String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
     let now = monotonic_ms();
     if let Ok(c) = cache.lock() {
-        if let Some((ts, dir, files)) = &*c {
-            if dir == cwd && now.saturating_sub(*ts) < 5_000 {
-                return files.clone();
-            }
+        if let Some((_, _, files)) = c
+            .iter()
+            .find(|(ts, dir, _)| dir == cwd && now.saturating_sub(*ts) < 5_000)
+        {
+            return files.clone();
         }
     }
     let files = crate::tools::project_files(cwd);
     if let Ok(mut c) = cache.lock() {
-        *c = Some((now, cwd.to_path_buf(), files.clone()));
+        c.retain(|(_, dir, _)| dir != cwd);
+        c.push((now, cwd.to_path_buf(), files.clone()));
     }
     files
 }
@@ -7609,6 +7763,63 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_completion_offers_files_from_added_folders_by_full_path() {
+        let base = std::env::temp_dir().join(format!("bwn-at-added-{}", std::process::id()));
+        let (cwd, other) = (base.join("cwd"), base.join("other"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(other.join("src")).unwrap();
+        std::fs::write(other.join("src/zebra_widget.rs"), "").unwrap();
+        crate::workdirs::clear();
+        assert!(path_candidates("zebra_w", &cwd).is_empty());
+        crate::workdirs::add(&other.display().to_string(), &cwd).unwrap();
+        let want = other
+            .canonicalize()
+            .unwrap()
+            .join("src/zebra_widget.rs")
+            .display()
+            .to_string();
+        assert!(path_candidates("zebra_w", &cwd).contains(&want));
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_footer_counts_added_folders() {
+        assert_eq!(dirs_badge(0), "");
+        assert_eq!(plain(&dirs_badge(1)), " · +1 dir");
+        assert_eq!(plain(&dirs_badge(3)), " · +3 dirs");
+    }
+
+    #[test]
+    fn a_capturing_thread_keeps_its_lines_and_others_are_untouched() {
+        capture_start();
+        line("one\ntwo");
+        write_stream("thinking ›");
+        write_stream(" a\npart");
+        commit_stream_line("rendered part");
+        write_stream("chrome");
+        retract_stream_line();
+        assert!(capture_event("{\"type\":\"notice\"}"));
+        // A prompt from the helper goes to the screen, not into the block.
+        assert!(uncaptured(|| !capturing()));
+        assert!(capturing());
+        // Another thread is never captured.
+        assert!(!std::thread::spawn(capturing).join().unwrap());
+        assert_eq!(
+            capture_take(),
+            [
+                "one",
+                "two",
+                "thinking › a",
+                "rendered part",
+                "{\"type\":\"notice\"}"
+            ]
+        );
+        assert!(!capturing());
+        assert!(capture_take().is_empty());
+    }
 
     fn plain(s: &str) -> String {
         let mut out = String::new();

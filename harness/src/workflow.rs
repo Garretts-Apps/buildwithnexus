@@ -133,9 +133,10 @@ fn context() -> Option<SessionContext> {
 }
 
 /// The child's command line: the session's permission, provider and model,
-/// then the task after `--` so a task like "--permission auto …" stays text.
-/// The child runs in the session's folder and reads the same settings files,
-/// where /model saves the endpoint it switches to.
+/// the folders added with --add-dir, then the task after `--` so a task
+/// like "--permission auto …" stays text. The child runs in the session's
+/// folder and reads the same settings files, where /model saves the
+/// endpoint it switches to.
 pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String> {
     let mut args = vec!["run".to_string(), "--json".to_string()];
     if let Some(c) = ctx {
@@ -150,6 +151,7 @@ pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String
             }
         }
     }
+    args.extend(crate::workdirs::child_args());
     args.push("--".to_string());
     args.push(task.to_string());
     args
@@ -1090,6 +1092,29 @@ mod tests {
         );
         // Before a session exists (tests, headless) nothing is added.
         assert_eq!(child_args(None, "t"), ["run", "--json", "--", "t"]);
+    }
+
+    #[test]
+    fn background_runs_work_in_the_added_folders_too() {
+        let base = std::env::temp_dir().join(format!("bwn-wf-dirs-{}", std::process::id()));
+        let (cwd, other) = (base.join("cwd"), base.join("other"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        crate::workdirs::clear();
+        crate::workdirs::add(&other.display().to_string(), &cwd).unwrap();
+        let other = other.canonicalize().unwrap();
+        assert_eq!(
+            child_args(None, "t"),
+            [
+                "run".to_string(),
+                "--json".into(),
+                format!("--add-dir={}", other.display()),
+                "--".into(),
+                "t".into()
+            ]
+        );
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

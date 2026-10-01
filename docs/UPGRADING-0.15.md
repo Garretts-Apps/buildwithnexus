@@ -8,8 +8,8 @@ the entry says why.
 Nothing changes without opting in for these new features: `accept-edits`,
 `permissions` and `network` rules, `on_error`, `shell_env_passthrough`,
 `prices`, `vision`, `buildwithnexus trust --print`, `--trust-project` /
-`BWN_TRUST_PROJECT`, `--base-url`, `--worktree`, agent files and
-`buildwithnexus update`.
+`BWN_TRUST_PROJECT`, `--base-url`, `--worktree`, `--add-dir` and
+`/add-dir`, agent files and `buildwithnexus update`.
 
 ## Install and update
 
@@ -118,6 +118,9 @@ Nothing changes without opting in for these new features: `accept-edits`,
 | An agent file's `tools` list never grants `task` or `spawn_subagent`. | Leave out the `tools` list for a helper that may delegate. |
 | An isolated helper's leftover edits are committed with the identity git resolves (config, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, `EMAIL`), and as `bwn <bwn@localhost>` only when git has none. | None (defect). |
 | `/agents` lists helper agents before Agents.md, and the `/teamwork` text describes delegation as it works. | None: the old text was wrong. |
+| Helpers from one reply that only read (`read_only: true` on the call or in the agent file, an agent file whose `tools` all only read, or a read-only session) or that have a worktree of their own (`isolate: true`) run at the same time, up to 3 at once. Each shows its work in one labelled block when it finishes. Helpers that write in your folder still run one after another, and so do isolated helpers while folders added with `--add-dir` are in use. | `"max_parallel_helpers": 1` in settings.json runs every helper one after another. |
+| A helper started with `read_only: true`, or from an agent file with `read_only: true`, is offered only read tools and refused anything that changes files or runs a writing command. | Leave out `read_only` for a helper that should write. |
+| Esc or Ctrl+C while a helper runs ends the whole turn. Before, it ended only the helper and the model carried on without it. | None (defect): the stop key must stop the turn. |
 
 ## Conversations, sessions and undo
 
@@ -169,6 +172,7 @@ Nothing changes without opting in for these new features: `accept-edits`,
 | Session files are saved with `"schema_version": 1`. | None needed: 0.14 ignores the field, and 0.15 reads older files as version 1. |
 | `run`, `plan` and `brainstorm` read stdin when it is not a terminal. With a task argument, a pipe that stays silent for 3 s is ignored. `bwn run` with no task and empty stdin exits 2 instead of sending an empty request. | Pass `</dev/null` so stdin is never read. |
 | `--json sessions` prints JSON lines instead of the human table. | Drop `--json` for the table. |
+| `--json`: the events of helpers that ran at the same time arrive together when each finishes, each with a `helper` field (its place among the helpers started together, from 1). | `"max_parallel_helpers": 1` keeps every helper's events in order, without the field. |
 | Unknown options anywhere before `--` exit 2 instead of becoming task words or an interactive prompt. A bad `--effort` exits 2 instead of 1. | Put text that starts with dashes after `--`. |
 | Built-in rule conditions match whole words of project-relative paths instead of substrings of absolute paths. | None (defect). To turn a rule off, put `{"rules":[{"id":"<id>","enabled":false}]}` in a `.json` file in `NEXUS_HOME/rules/`; `BWN_CHECKS_DONE=<check>` marks a required check done for one run. |
 | `buildwithnexus doctor` exits 1 when a check fails, lists only the configured provider's key, no longer contacts `api.anthropic.com` for a local setup, and prints install commands instead of offering to run them. `/doctor` runs the full check list, including the one-token provider probe. | `buildwithnexus doctor || true` where only the report is wanted. |

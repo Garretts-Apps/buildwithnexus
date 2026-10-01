@@ -67,6 +67,7 @@ pub mod tui;
 pub mod update;
 pub mod usage;
 pub mod verifier;
+pub mod workdirs;
 pub mod workflow;
 
 use std::io::IsTerminal;
@@ -111,6 +112,8 @@ struct CliOptions {
     /// `--worktree <name>`: run the session in .bwn/worktrees/<name> on
     /// branch bwn/<name>.
     worktree: Option<String>,
+    /// `--add-dir <path>`, repeatable: more folders to work in.
+    add_dirs: Vec<String>,
 }
 
 /// Every option `parse_cli_options` knows, for "did you mean" hints.
@@ -130,6 +133,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--plain",
     "--trust-project",
     "--worktree",
+    "--add-dir",
     "--help",
     "--version",
 ];
@@ -191,6 +195,15 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if flag == "--add-dir" {
+            let dir = inline
+                .map(str::to_string)
+                .or_else(|| it.next().filter(|v| !v.starts_with('-')))
+                .filter(|v| !v.trim().is_empty())
+                .ok_or("--add-dir requires a folder; see `buildwithnexus --help`")?;
+            opts.add_dirs.push(dir);
+            continue;
+        }
         let slot = match flag {
             "--provider" => &mut opts.provider,
             "--model" => &mut opts.model,
@@ -314,6 +327,16 @@ mod cli_option_tests {
     }
 
     #[test]
+    fn add_dir_repeats_in_either_spelling_and_needs_a_folder() {
+        let (opts, rest) = parse(&["--add-dir", "../a", "run", "--add-dir=/b", "x"]).unwrap();
+        assert_eq!(opts.add_dirs, ["../a", "/b"]);
+        assert_eq!(rest, ["run", "x"]);
+        assert!(opts.unknown_flags.is_empty());
+        let err = parse(&["--add-dir", "--json", "run", "x"]).unwrap_err();
+        assert!(err.contains("--add-dir requires a folder"), "{err}");
+    }
+
+    #[test]
     fn base_url_is_an_option_and_effort_is_checked_while_parsing() {
         let (opts, rest) = parse(&["--base-url", "https://gw.example/v1", "run", "x"]).unwrap();
         assert_eq!(opts.base_url.as_deref(), Some("https://gw.example/v1"));
@@ -367,10 +390,29 @@ pub fn run() {
         eprintln!("buildwithnexus: {}", unknown_option_msg(flag));
         std::process::exit(2);
     }
+    // A relative --add-dir names a folder from where bwn was started, even
+    // when --worktree moves the session.
+    let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let add_dirs: Vec<PathBuf> = opts
+        .add_dirs
+        .iter()
+        .map(|d| tools::resolve(&launch_dir, d.trim()))
+        .collect();
     if let Some(name) = &opts.worktree {
         if let Err((code, e)) = enter_session_worktree(name) {
             eprintln!("buildwithnexus: --worktree: {e}");
             std::process::exit(code);
+        }
+    }
+    // Checked here, before any request; their notices come with the
+    // session's other startup lines.
+    if !add_dirs.is_empty() {
+        let cwd = std::env::current_dir().unwrap_or(launch_dir);
+        for dir in &add_dirs {
+            if let Err(e) = workdirs::add(&dir.to_string_lossy(), &cwd) {
+                eprintln!("buildwithnexus: --add-dir: {e}");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -695,6 +737,7 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
     }
+    agent::set_max_parallel_helpers(settings.max_parallel_helpers);
     workflow::set_launch(
         &settings.provider,
         &provider.model,
@@ -1275,6 +1318,11 @@ fn headless(
         // and with interactive=false this only prints when something is missing.
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
+    // Added folders, and the instruction files they bring, are named
+    // before the model reads them (a `notice` event in --json mode).
+    for n in workdirs::notices(&cwd) {
+        report::notice(&format!("  {n}"));
+    }
 
     if let Some(n) = agent::ignored_approvals_notice_once(&cwd) {
         report::notice(&format!("  {n}"));
@@ -1654,6 +1702,9 @@ fn repl(
     if let Some(n) = config::untrusted_extensions_notice(cwd) {
         report::notice(&format!("  {}", tui::sanitize_terminal(&n)));
     }
+    for n in workdirs::notices(cwd) {
+        report::notice(&format!("  {n}"));
+    }
     if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
         report::notice(&format!("  {n}"));
     }
@@ -1907,6 +1958,12 @@ fn repl(
             } else {
                 handle_permissions_arg(&mut perm, cwd, arg);
             }
+            continue;
+        }
+
+        // /add-dir <path>: another folder to work in for this session.
+        if let Some(arg) = t.strip_prefix("/add-dir ") {
+            handle_add_dir(arg, cwd);
             continue;
         }
 
@@ -2286,6 +2343,10 @@ fn repl(
             }
             "/sandbox" => {
                 handle_sandbox("status");
+                continue;
+            }
+            "/add-dir" => {
+                handle_add_dir("", cwd);
                 continue;
             }
             "/mouse" => {
@@ -6762,12 +6823,63 @@ fn handle_teamwork() {
         "    • {} — `isolate: true` runs the helper in a git worktree on its own branch",
         tui::bold("isolation")
     ));
+    tui::line(&format!(
+        "    • {} — `read_only: true` (or an agent file's) lets it read and search, never change",
+        tui::bold("read-only")
+    ));
+    tui::line(&tui::dim(
+        "  Read-only and isolated helpers from one reply run at the same time (max_parallel_helpers, \
+         default 3) and each shows its work when it finishes; Esc stops them all. Helpers that \
+         write in your folder run one after another.",
+    ));
     tui::line(&tui::dim(&format!(
-        "  Your own helpers: <name>.md files (name, description, tools in frontmatter; instructions \
-         as the body) in {}/agents or ~/.claude/agents, and in a trusted project's \
+        "  Your own helpers: <name>.md files (name, description, tools, read_only in frontmatter; \
+         instructions as the body) in {}/agents or ~/.claude/agents, and in a trusted project's \
          .buildwithnexus/agents or .claude/agents. /agents lists them.",
         config::home().display()
     )));
+}
+
+// `/add-dir <path>` adds a folder to work in; bare `/add-dir` lists them.
+fn handle_add_dir(arg: &str, cwd: &std::path::Path) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        let dirs = workdirs::list();
+        if dirs.is_empty() {
+            tui::line(&tui::dim(
+                "  no added folders — /add-dir <path> lets the agent read and change files in another folder",
+            ));
+        }
+        for d in dirs {
+            let shown = d.display().to_string();
+            tui::line(&format!("  + {}", tui::sanitize_terminal(&shown)));
+        }
+        return;
+    }
+    match workdirs::add(arg, cwd) {
+        Ok(workdirs::Added::New(dir)) => {
+            let shown = dir.display().to_string();
+            tui::line(&tui::green(&format!(
+                "  ✓ added {} — the agent may read and change files there; sandboxed commands may write there",
+                tui::sanitize_terminal(&shown)
+            )));
+            // The instruction files it brings, named before the next
+            // message carries them to the model.
+            for n in workdirs::notices(cwd)
+                .into_iter()
+                .filter(|n| n.starts_with("instructions") && n.contains(&shown))
+            {
+                report::notice(&format!("  {n}"));
+            }
+        }
+        Ok(workdirs::Added::Covered(why)) => {
+            tui::line(&tui::dim(&format!("  {}", tui::sanitize_terminal(&why))))
+        }
+        Err(e) => tui::line(&tui::red(&format!(
+            "  /add-dir: {}",
+            tui::sanitize_terminal(&e)
+        ))),
+    }
 }
 
 // `/agents`: the helpers the model can delegate to, then Agents.md.
@@ -6782,10 +6894,13 @@ fn handle_agents() {
     } else {
         tui::line(&tui::accent("  helper agents (task tool roles)"));
         for a in &defs {
-            let tools = a
+            let mut tools = a
                 .tools
                 .as_ref()
                 .map_or("all tools".to_string(), |t| t.join(", "));
+            if a.read_only {
+                tools.push_str(", read-only");
+            }
             // Names, descriptions and paths come from files on disk.
             tui::line(&format!(
                 "    • {} — {}",
@@ -7014,6 +7129,11 @@ fn print_help() {
                     "/sandbox",
                     "[off|auto|require|status]",
                     "OS sandbox for shell commands",
+                ),
+                (
+                    "/add-dir",
+                    "[path]",
+                    "also work in another folder (list with no path)",
                 ),
                 (
                     "/model",
@@ -7853,6 +7973,7 @@ fn usage() {
          \x20 --permission-mode <mode>      ask, auto, or readonly\n\
          \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
          \x20 --worktree <name>             work in .bwn/worktrees/<name> on branch bwn/<name>\n\
+         \x20 --add-dir <path>              also read and change files in <path> (repeatable)\n\
          \x20 --prompt <text>               initial interactive prompt\n\
          \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\

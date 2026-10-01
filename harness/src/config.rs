@@ -248,6 +248,11 @@ pub struct Settings {
     /// How many background workflows may run at once (default 2).
     #[serde(default = "default_max_concurrent_workflows")]
     pub max_concurrent_workflows: usize,
+    /// How many helpers (`task` calls from one reply that only read, or
+    /// that work in their own git worktree) run at once (default 3; 1 runs
+    /// every helper one after another).
+    #[serde(default = "default_max_parallel_helpers")]
+    pub max_parallel_helpers: usize,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -405,6 +410,7 @@ impl Default for Settings {
             allowed_commands: Vec::new(),
             project_allowed: BTreeMap::new(),
             max_concurrent_workflows: default_max_concurrent_workflows(),
+            max_parallel_helpers: default_max_parallel_helpers(),
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             instruction_files: default_instruction_files(),
@@ -452,6 +458,10 @@ fn wrong_typed_key(files: impl Iterator<Item = PathBuf>) -> Option<(PathBuf, Str
 
 fn default_max_concurrent_workflows() -> usize {
     2
+}
+
+fn default_max_parallel_helpers() -> usize {
+    3
 }
 
 // Only unambiguously read-only binaries auto-approve in Ask mode by default.
@@ -998,6 +1008,53 @@ pub fn load_instructions_with(cwd: &Path, names: &[String]) -> Vec<InstructionFi
         out.push(InstructionFile {
             path,
             label,
+            content,
+            truncated,
+        });
+    }
+    out
+}
+
+/// Instruction files at the top of each of `roots` (folders added with
+/// --add-dir): the first `instruction_files` name present in each, read
+/// only within that folder, with the usual per-file and total caps.
+pub fn load_root_instructions(cwd: &Path, roots: &[PathBuf]) -> Vec<InstructionFile> {
+    let names = load_settings_from_dir(cwd)
+        .map(|s| s.instruction_files)
+        .unwrap_or_else(default_instruction_files);
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for root in roots {
+        let listing = dir_names(root);
+        let Some(name) = names.iter().find(|n| listing.contains(n.as_str())) else {
+            continue;
+        };
+        let path = root.join(name);
+        let Some(raw) = read_project_file(&path, root)
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        let cap = INSTRUCTION_FILE_CAP.min(INSTRUCTION_TOTAL_CAP.saturating_sub(total));
+        if cap == 0 {
+            break;
+        }
+        let truncated = raw.len() > cap;
+        let content = if truncated {
+            format!(
+                "{}\n\n[… truncated at {} KiB — read {} for the rest]",
+                cut_at_char_boundary(&raw, cap),
+                cap / 1024,
+                path.display()
+            )
+        } else {
+            raw
+        };
+        total += content.len();
+        out.push(InstructionFile {
+            label: name.clone(),
+            path,
             content,
             truncated,
         });
@@ -1793,6 +1850,9 @@ pub struct AgentDef {
     pub description: String,
     /// The tools it may use (bwn names); None means the usual set.
     pub tools: Option<Vec<String>>,
+    /// `read_only: true`: it may read and search but never change anything.
+    /// Read-only helpers started from the same reply run side by side.
+    pub read_only: bool,
     pub prompt: String,
     pub path: PathBuf,
 }
@@ -1836,6 +1896,10 @@ fn parse_agent_file(path: &Path, text: &str) -> Option<AgentDef> {
             .map(agent_tool_name)
             .collect::<Vec<_>>()
     });
+    let read_only = ["read_only", "read-only", "readonly"]
+        .iter()
+        .filter_map(|k| fm.get(*k))
+        .any(|v| v.trim().eq_ignore_ascii_case("true"));
     Some(AgentDef {
         description: fm
             .get("description")
@@ -1844,6 +1908,7 @@ fn parse_agent_file(path: &Path, text: &str) -> Option<AgentDef> {
             .unwrap_or_else(|| skill_description(body)),
         name,
         tools,
+        read_only,
         prompt: body.trim().to_string(),
         path: path.to_path_buf(),
     })
@@ -2078,8 +2143,15 @@ mod agent_file_tests {
             Some(vec!["read_file".to_string(), "write_file".to_string()])
         );
         assert_eq!(a.prompt, "Write focused tests.");
+        assert!(!a.read_only);
         let bare = parse_agent_file(Path::new("/x/helper.md"), "Help out.\n").unwrap();
         assert_eq!((bare.name.as_str(), bare.tools), ("helper", None));
+        let ro = "---\nname: scout\nread_only: true\n---\nLook only.\n";
+        assert!(
+            parse_agent_file(Path::new("/x/scout.md"), ro)
+                .unwrap()
+                .read_only
+        );
     }
 }
 

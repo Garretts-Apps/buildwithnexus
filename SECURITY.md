@@ -217,7 +217,8 @@ shows whether a given file is signed.
   (`key-checks.json`, a hash, never the key) under `~/.buildwithnexus` (or
   `NEXUS_HOME`), and there, in `bin/<version>/`, the binary the npm launcher
   downloaded; pasted images as `bwn-paste-*.png` in the temp directory; the
-  files the user asks it to edit in the working directory; and, with
+  files the user asks it to edit in the working directory and in folders
+  added with `--add-dir` or `/add-dir`; and, with
   `--worktree <name>`, a git worktree in `.bwn/worktrees/<name>` (listed in
   the repository's `.git/info/exclude`).
 - **Not done:** no services, scheduled tasks, startup entries, registry
@@ -365,10 +366,11 @@ Backends: `bwrap` (bubblewrap) on Linux and `sandbox-exec` (Seatbelt) on
 macOS. Windows and WSL have no backend, so `auto` runs unconfined there and
 `require` refuses to run commands.
 
-Inside the sandbox, the command can write only to the working directory and
-the temp directories; the rest of the filesystem, including
-`~/.buildwithnexus`, is read-only, and so are the workspace's `.git` and
-`.buildwithnexus` (on Linux an empty read-only placeholder stands in when
+Inside the sandbox, the command can write only to the working directory,
+the folders added with `--add-dir` and the temp directories; the rest of the
+filesystem, including `~/.buildwithnexus`, is read-only, and so are the
+`.git` and `.buildwithnexus` of the workspace and of each added folder (on
+Linux an empty read-only placeholder stands in when
 they don't exist yet, so a command cannot create a `.git/config` that runs
 later outside the sandbox). On Linux, `/tmp` is a fresh private
 directory that is discarded when the command exits. On macOS, `/tmp` and
@@ -378,7 +380,8 @@ you set `"sandbox_network": false`.
 The sandbox does not confine: reads (the whole filesystem stays readable,
 including files such as `~/.ssh` and `.env` unless their permissions stop
 your user), network access by default, the agent's own file tools (which are
-fenced to the working directory by the permission gate instead), hooks, MCP
+fenced to the working directory and the added folders by the permission gate
+instead), hooks, MCP
 servers, and `start_server`. It never approves anything; it only limits what
 an already-approved command can touch. For untrusted work, use a container
 or VM.

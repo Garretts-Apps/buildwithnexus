@@ -306,30 +306,35 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
         v.push(ToolDef {
             name: "task",
             description: crate::mcp::intern(&format!(
-                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.{roles_note}"
+                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.{PARALLEL_NOTE}{roles_note}"
             )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
                 "description":{"type":"string"},
                 "role":{"type":"string","enum":roles},
-                "isolate":{"type":"boolean"}
+                "isolate":{"type":"boolean"},
+                "read_only":{"type":"boolean"}
             }}),
         });
         v.push(ToolDef {
             name: "spawn_subagent",
             description: crate::mcp::intern(&format!(
-                "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.{roles_note}"
+                "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.{PARALLEL_NOTE}{roles_note}"
             )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
                 "role":{"type":"string","enum":roles},
-                "isolate":{"type":"boolean"}
+                "isolate":{"type":"boolean"},
+                "read_only":{"type":"boolean"}
             },"required":["task"]}),
         });
     }
     v.extend(mcp_defs());
     v
 }
+
+// How delegation calls in one reply run, for the task tools' descriptions.
+const PARALLEL_NOTE: &str = " Set read_only=true for a helper that only reads and reports (it cannot change anything). Read-only and isolate=true helpers called in the same reply run at the same time; other helpers run one after another.";
 
 // Tools discovered on connected MCP servers, advertised as
 // `mcp__<server>__<tool>` with the server's own description and input
@@ -1835,7 +1840,7 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> 
     }
 }
 
-fn resolve(cwd: &Path, p: &str) -> PathBuf {
+pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     // `~` expansion: $HOME, or %USERPROFILE% on Windows (where `~\x` is
     // also accepted).
     let user_home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
@@ -2121,6 +2126,17 @@ pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathB
             path_arg(input).map(|p| resolve(cwd, p))
         }
         _ => None,
+    }
+}
+
+// Where a search without a folder of its own looks: the working folder and
+// every added one. A named folder is searched alone.
+fn search_roots(input: &Value, cwd: &Path) -> Vec<PathBuf> {
+    match root_arg(input) {
+        "." => std::iter::once(cwd.to_path_buf())
+            .chain(crate::workdirs::list())
+            .collect(),
+        r => vec![resolve(cwd, r)],
     }
 }
 
@@ -2960,6 +2976,13 @@ pub fn escapes_cwd(p: &Path, cwd: &Path) -> bool {
     !canonicalize_lenient(p).starts_with(&base)
 }
 
+/// True if the path resolves outside the working directory and every folder
+/// added with --add-dir. Links are followed, so one inside an added folder
+/// that leads elsewhere is outside.
+pub fn escapes_roots(p: &Path, cwd: &Path) -> bool {
+    escapes_cwd(p, cwd) && crate::workdirs::list().iter().all(|r| escapes_cwd(p, r))
+}
+
 // The resolved out-of-cwd path for a mutating file-tool call, if any. The
 // permission gate can route this through the same confirmation flow used for
 // sensitive paths; `run` also refuses such writes outright so a target outside
@@ -2983,14 +3006,14 @@ pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<Path
         // Trimmed, as move_path trims them before it moves anything.
         "move_path" => {
             let from = resolve(cwd, input["from"].as_str().unwrap_or("").trim());
-            if escapes_cwd(&from, cwd) {
+            if escapes_roots(&from, cwd) {
                 return Some(from);
             }
             resolve(cwd, input["to"].as_str().unwrap_or("").trim())
         }
         _ => return None,
     };
-    if escapes_cwd(&candidate, cwd) {
+    if escapes_roots(&candidate, cwd) {
         Some(candidate)
     } else {
         None
@@ -5812,7 +5835,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     // refuses regardless so an unwired gate cannot leak a stray write.
     if let Some(p) = out_of_cwd_mutation(name, input, cwd) {
         return err(format!(
-            "refusing to write outside the working directory: {} resolves beyond {}. Out-of-cwd writes require explicit user approval — ask the user first (question tool), and once approved perform the change with run_command, or have the user restart the session in the target directory.",
+            "refusing to write outside the working directory: {} resolves beyond {}. Out-of-cwd writes require explicit user approval — ask the user first (question tool), and once approved perform the change with run_command, or have the user add the folder with /add-dir (--add-dir at launch) or restart the session in the target directory.",
             p.display(),
             cwd.display()
         ));
@@ -5949,7 +5972,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "glob" | "find_paths" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -5960,7 +5982,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut paths = Vec::new();
             let mut seen = 0;
-            collect_paths(&root, &mut paths, &mut seen, include_dirs, include_files);
+            for root in search_roots(input, cwd) {
+                collect_paths(&root, &mut paths, &mut seen, include_dirs, include_files);
+            }
             paths.sort();
             let matches: Vec<String> = paths
                 .into_iter()
@@ -5985,7 +6009,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "find_files" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -5993,7 +6016,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut files = Vec::new();
             let mut seen = 0;
-            collect_files(&root, &mut files, &mut seen);
+            for root in search_roots(input, cwd) {
+                collect_files(&root, &mut files, &mut seen);
+            }
             files.sort();
             let matches: Vec<String> = files
                 .into_iter()
@@ -6018,7 +6043,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "grep" | "grep_files" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("");
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -6036,7 +6060,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut files = Vec::new();
             let mut seen = 0;
-            collect_files(&root, &mut files, &mut seen);
+            for root in search_roots(input, cwd) {
+                collect_files(&root, &mut files, &mut seen);
+            }
             files.sort();
             let mut matches = Vec::new();
             let mut total = 0usize;

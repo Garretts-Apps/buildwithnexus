@@ -1413,7 +1413,13 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
         );
     }
     let default = input["default"].as_str().unwrap_or("").trim();
-    answer_with(question, &full_prompt, default, tui::ask)
+    helper_prompt(
+        || answer_with(question, &full_prompt, default, tui::ask),
+        || {
+            stop_turn();
+            (STOPPED_BY_USER.into(), true)
+        },
+    )
 }
 
 // Shows the question and reads the answer with `ask` (None: cancelled).
@@ -1611,6 +1617,11 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
                 "[Environment — tools already installed]\n{env_snap}"
             ));
         }
+    }
+
+    // Folders added with --add-dir, and what their instruction files say.
+    if let Some(section) = crate::workdirs::prompt_section(cwd, compact) {
+        parts.push(section);
     }
 
     // Project instructions (AGENTS.md / CLAUDE.md) come before memory and the
@@ -2071,7 +2082,13 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
             "blocked (no interactive terminal to confirm: {label})"
         ));
     }
-    confirm_with(label, tool_key, cwd, tui::ask)
+    helper_prompt(
+        || confirm_with(label, tool_key, cwd, tui::ask),
+        || {
+            stop_turn();
+            Some(STOPPED_BY_USER.into())
+        },
+    )
 }
 
 // The approval prompt itself; `ask` reads the answer (None: cancelled).
@@ -2350,7 +2367,7 @@ pub(crate) fn gate(
                 && tools::is_file_edit(name, input)
                 && paths
                     .iter()
-                    .all(|p| !tools::escapes_cwd(p, cwd) && !inside_git_dir(p, cwd))
+                    .all(|p| !tools::escapes_roots(p, cwd) && !inside_git_dir(p, cwd))
             {
                 return None;
             }
@@ -2379,10 +2396,15 @@ fn command_of<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
     })
 }
 
-// Whether `p` lies inside a `.git` directory of the project (its own or a
-// nested checkout's).
+// Whether `p` lies inside a `.git` directory of the project or of a folder
+// added with --add-dir (its own or a nested checkout's).
 fn inside_git_dir(p: &Path, cwd: &Path) -> bool {
-    tools::project_relative(p, cwd)
+    let root = if tools::escapes_cwd(p, cwd) {
+        crate::workdirs::containing(p)
+    } else {
+        None
+    };
+    tools::project_relative(p, root.as_deref().unwrap_or(cwd))
         .is_some_and(|rel| rel.split('/').any(|c| c.eq_ignore_ascii_case(".git")))
 }
 
@@ -2966,6 +2988,7 @@ fn user_msg(text: String, images: Vec<(String, String)>) -> Msg {
     }
 }
 
+
 // `sid` is Some for the top-level session (per-round transcript saves) and
 // None for subagents, whose transcripts live inside the parent's results.
 #[allow(clippy::too_many_arguments)]
@@ -3030,10 +3053,11 @@ fn build_turn(
         Ok(_) => task.to_string(),
     };
     let task_for_recovery = recovery_task_text(&task);
-    let custom = active_agent(depth);
+    let helper = helper_ctx(depth);
+    let custom = helper.agent.clone();
     let defs = offered(
         p,
-        if matches!(perm, Permission::ReadOnly) {
+        if matches!(perm, Permission::ReadOnly) || helper.read_only {
             tools::defs_readonly()
         } else {
             tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
@@ -3043,26 +3067,34 @@ fn build_turn(
         Some(a) => agent_defs_only(defs, a),
         None => defs,
     };
-    open_turn(
-        msgs,
-        || {
-            // Role identity and the current-mode contract come FIRST; the
-            // environment/tool-manifest/skills/memory sections follow.
-            let mut sys = match &custom {
-                Some(a) => agent_system(a),
-                None => String::from(role(role_id).system),
-            };
-            if let Some(guidance) = artifact_guidance(&task_for_recovery) {
-                sys.push_str("\n\n");
-                sys.push_str(&guidance);
-            }
+    let system = || {
+        // Role identity and the current-mode contract come FIRST; the
+        // environment/tool-manifest/skills/memory sections follow.
+        let mut sys = match &custom {
+            Some(a) => agent_system(a),
+            None => String::from(role(role_id).system),
+        };
+        if let Some(guidance) = artifact_guidance(&task_for_recovery) {
             sys.push_str("\n\n");
-            sys.push_str(&context_prefix(cwd, p.context_tokens));
-            sys
-        },
-        &task,
-        images,
-    );
+            sys.push_str(&guidance);
+        }
+        sys.push_str("\n\n");
+        sys.push_str(&context_prefix(cwd, p.context_tokens));
+        sys
+    };
+    open_turn(msgs, system, &task, images);
+    // A folder added (/add-dir) since the system prompt was written, or a
+    // resumed conversation that names folders this session lacks: write it
+    // again so the model knows where it may work.
+    if let Some(Msg::System(s)) = msgs.first() {
+        let stale = match crate::workdirs::prompt_marker() {
+            Some(marker) => !s.contains(&marker),
+            None => s.contains(crate::workdirs::PROMPT_HEAD),
+        };
+        if stale {
+            msgs[0] = Msg::System(system());
+        }
+    }
     // Saved before the first request too, so a run killed mid-request
     // still leaves its task on disk to resume; not a message the request
     // will refuse as bigger than the window, which never joins it.
@@ -3099,7 +3131,7 @@ fn build_turn(
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
-            report::notice(take_interrupt());
+            report::notice(take_interrupt(depth));
             return Ok(String::new());
         }
         if budget_exhausted() {
@@ -3116,7 +3148,7 @@ fn build_turn(
             Err(e) => {
                 let lower = e.to_ascii_lowercase();
                 if lower.contains("interrupted") {
-                    report::notice(take_interrupt());
+                    report::notice(take_interrupt(depth));
                     return Ok(String::new());
                 }
                 // A context-overflow rejection is recoverable: force-compact the
@@ -3352,7 +3384,23 @@ fn build_turn(
         let mut loop_stop: Option<String> = None;
         let mut artifact_recovery: Option<String> = None;
         let mut round_unrun: Option<String> = None;
+        // Helpers from this reply that may run side by side (they only read,
+        // or work in a worktree of their own), held until the next call that
+        // is not one of them or the end of the reply, so every other call
+        // still runs in the order the model gave. Only the top-level turn
+        // starts helpers side by side.
+        let side_by_side_ok = depth == 0 && MAX_PARALLEL_HELPERS.load(Ordering::Relaxed) > 1;
+        let mut waiting: Vec<WaitingHelper> = Vec::new();
         for call in &reply.calls {
+            let side_by_side = (side_by_side_ok
+                && matches!(call.name.as_str(), "task" | "spawn_subagent")
+                && call.input.get(tools::INVALID_ARGS).is_none())
+            .then(|| resolve_helper(perm, &call.input, cwd, depth).ok())
+            .flatten()
+            .filter(|s| s.read_only || s.isolate);
+            if side_by_side.is_none() && !waiting.is_empty() {
+                start_waiting_helpers(p, perm, &mut waiting, &mut results, cwd, depth);
+            }
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
                 let msg = invalid_args_feedback(&call.name, raw, &defs);
                 round_unrun.get_or_insert_with(|| format!("{} (invalid arguments)", call.name));
@@ -3415,7 +3463,12 @@ fn build_turn(
             let reviewing = REVIEWING.load(Ordering::Relaxed);
             // Outside an agent file's tools is a slip of the helper's, like
             // an edit during a review: refused, but not a blocked change.
-            let off_surface = agent_tool_refusal(custom.as_ref(), &call.name);
+            let off_surface = agent_tool_refusal(custom.as_ref(), &call.name).or_else(|| {
+                helper
+                    .read_only
+                    .then(|| read_only_helper_refusal(&call.name, &call_input, cwd))
+                    .flatten()
+            });
             let counted = off_surface.is_none() && !reviewing;
             let mut checks_unapproved = false;
             let reason = off_surface.or_else(|| {
@@ -3519,6 +3572,19 @@ fn build_turn(
             if matches!(call.name.as_str(), "task" | "spawn_subagent") {
                 // A subagent can mutate the workspace — count it as action.
                 mutating_tool_ran = true;
+                if let Some(spec) = side_by_side {
+                    waiting.push(WaitingHelper {
+                        slot: results.len(),
+                        name: call.name.clone(),
+                        spec,
+                    });
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: String::new(),
+                        is_error: false,
+                    });
+                    continue;
+                }
                 let (out, is_error) = spawn_subagent(p, perm, &call_input, cwd, depth);
                 report::tool_result(&call.name, &out, is_error);
                 trace_tool_result(&call.name, &out, is_error, "build", depth);
@@ -3630,6 +3696,9 @@ fn build_turn(
                 images: out.images,
             });
         }
+        if !waiting.is_empty() {
+            start_waiting_helpers(p, perm, &mut waiting, &mut results, cwd, depth);
+        }
 
         msgs.push(Msg::Assistant {
             text: assistant_tool_turn_text(reply.text, &reply.calls),
@@ -3649,7 +3718,11 @@ fn build_turn(
             return Ok(String::new());
         }
         if !report::is_json() {
-            tui::context_meter(context_used(msgs), p.context_tokens);
+            // The footer shows the conversation's context, not that of one
+            // of several helpers running at once.
+            if !tui::capturing() {
+                tui::context_meter(context_used(msgs), p.context_tokens);
+            }
             tui::poll_typeahead();
         }
         if let Some(s) = summary {
@@ -4099,26 +4172,40 @@ pub fn run_review(
     r
 }
 
-// The agent file each running subagent depth was started from. Subagents
-// run one at a time, so a depth names exactly one.
-static ACTIVE_AGENTS: Mutex<Vec<Option<config::AgentDef>>> = Mutex::new(Vec::new());
-
-fn set_active_agent(depth: usize, def: Option<config::AgentDef>) {
-    let mut a = ACTIVE_AGENTS.lock().unwrap_or_else(|e| e.into_inner());
-    if a.len() <= depth {
-        a.resize(depth + 1, None);
-    }
-    a[depth] = def;
+// What each running helper depth on this thread was started as: its agent
+// file, if any, and whether it may only read. Per thread: helpers that run
+// side by side each have a thread of their own, and a nested helper runs on
+// its parent's.
+#[derive(Clone, Default)]
+struct HelperCtx {
+    agent: Option<config::AgentDef>,
+    read_only: bool,
+    // How a prompt from it names it: role and task.
+    label: String,
 }
 
-fn active_agent(depth: usize) -> Option<config::AgentDef> {
+thread_local! {
+    static HELPER_CTX: std::cell::RefCell<Vec<Option<HelperCtx>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn set_helper_ctx(depth: usize, ctx: Option<HelperCtx>) {
+    HELPER_CTX.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.len() <= depth {
+            a.resize(depth + 1, None);
+        }
+        a[depth] = ctx;
+    });
+}
+
+fn helper_ctx(depth: usize) -> HelperCtx {
     if depth == 0 {
-        return None;
+        return HelperCtx::default();
     }
-    ACTIVE_AGENTS
-        .lock()
-        .ok()
-        .and_then(|a| a.get(depth).cloned().flatten())
+    HELPER_CTX
+        .with(|a| a.borrow().get(depth).cloned().flatten())
+        .unwrap_or_default()
 }
 
 // Handing work to another helper. Never on a `tools` list's surface: that
@@ -4164,6 +4251,22 @@ fn agent_tool_refusal(agent: Option<&config::AgentDef>, name: &str) -> Option<St
     })
 }
 
+// A read-only helper's refusal of a call that would change something:
+// whatever the session's permission, like read-only mode's own check.
+// Clearly read-only shell commands (grep, git status…) still run.
+fn read_only_helper_refusal(name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+    if !tools::is_mutating_call(name, input) {
+        return None;
+    }
+    let readonly_shell = tools::command_arg_for(name, input)
+        .is_some_and(|c| tools::is_readonly_command(c) && tools::skips_prompt_safely(c, cwd));
+    (!readonly_shell).then(|| {
+        format!(
+            "this helper is read-only, so {name} was not run — finish and say what should change"
+        )
+    })
+}
+
 // An agent file's system prompt: who it is, its own instructions, and how
 // to end.
 fn agent_system(agent: &config::AgentDef) -> String {
@@ -4176,17 +4279,57 @@ fn agent_system(agent: &config::AgentDef) -> String {
 
 static SUB_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-// Returns the subagent's result and whether it failed — failures must reach
-// the parent model as is_error so it can react instead of trusting bad output.
-fn spawn_subagent(
-    p: &Provider,
+/// How many helpers from one reply run at once when not set (`max_parallel_helpers`).
+pub const DEFAULT_MAX_PARALLEL_HELPERS: usize = 3;
+static MAX_PARALLEL_HELPERS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_PARALLEL_HELPERS);
+
+/// Sets `max_parallel_helpers`; zero counts as one (one at a time).
+pub fn set_max_parallel_helpers(n: usize) {
+    MAX_PARALLEL_HELPERS.store(n.max(1), Ordering::Relaxed);
+}
+
+// A `task` / `spawn_subagent` call, checked and resolved: what the helper is
+// asked, as which role or agent file, and whether it only reads or works in
+// a worktree of its own (the two kinds that may run beside others).
+struct HelperSpec {
+    input: serde_json::Value,
+    task: String,
+    role: String,
+    agent: Option<config::AgentDef>,
+    read_only: bool,
+    isolate: bool,
+}
+
+// A helper ready to start: where it runs, and the worktree it got.
+struct Helper {
+    spec: HelperSpec,
+    run_cwd: PathBuf,
+    note: String,
+    worktree: Option<Worktree>,
+}
+
+impl Helper {
+    // Read-only helpers and those in a worktree of their own touch nothing
+    // another helper works on. A worktree does not cover folders added with
+    // --add-dir, which every helper may write in.
+    fn runs_beside_others(&self) -> bool {
+        self.spec.read_only || (self.worktree.is_some() && crate::workdirs::count() == 0)
+    }
+}
+
+// Checks a delegation call and resolves its role, without side effects. A
+// role names a built-in prompt or an agent file (resolved from the
+// session's folder, before any worktree). A helper is read-only when the
+// call or its agent file says so, when its agent file lists only tools that
+// change nothing, or when the session itself is read-only.
+fn resolve_helper(
     perm: Permission,
     input: &serde_json::Value,
     cwd: &Path,
     depth: usize,
-) -> (String, bool) {
+) -> Result<HelperSpec, String> {
     if depth + 1 >= MAX_DEPTH {
-        return ("subagent depth limit reached".into(), true);
+        return Err("subagent depth limit reached".into());
     }
     let task = input["task"]
         .as_str()
@@ -4194,13 +4337,10 @@ fn spawn_subagent(
         .unwrap_or("")
         .trim();
     if task.is_empty() {
-        return ("spawn_subagent requires a task".into(), true);
+        return Err("spawn_subagent requires a task".into());
     }
     let role = input["role"].as_str().unwrap_or("engineer");
-    let isolate = input["isolate"].as_bool().unwrap_or(false);
-    // A role names a built-in prompt or an agent file (resolved from the
-    // session's folder, before any worktree).
-    let custom = if config::BUILTIN_ROLES.contains(&role) {
+    let agent = if config::BUILTIN_ROLES.contains(&role) {
         None
     } else {
         let agents = config::load_agent_defs(cwd);
@@ -4212,22 +4352,60 @@ fn spawn_subagent(
                     .map(|r| r.to_string())
                     .collect();
                 known.extend(agents.into_iter().map(|a| a.name));
-                return (
-                    format!("unknown role '{role}' — use one of: {}", known.join(", ")),
-                    true,
-                );
+                return Err(format!(
+                    "unknown role '{role}' — use one of: {}",
+                    known.join(", ")
+                ));
             }
         }
     };
+    Ok(HelperSpec {
+        input: input.clone(),
+        task: task.to_string(),
+        role: role.to_string(),
+        read_only: helper_reads_only(perm, input, agent.as_ref()),
+        agent,
+        isolate: input["isolate"].as_bool().unwrap_or(false),
+    })
+}
 
-    let (run_cwd, note, worktree) = if isolate {
+// Whether a helper may only read: the session is read-only, the call says
+// `read_only: true`, or its agent file says so or lists only tools that
+// change nothing.
+fn helper_reads_only(
+    perm: Permission,
+    input: &serde_json::Value,
+    agent: Option<&config::AgentDef>,
+) -> bool {
+    // The editor tools write or only view by their `command`.
+    let only_reads = |n: &String| {
+        !tools::is_mutating(n)
+            && !matches!(
+                n.as_str(),
+                "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
+            )
+    };
+    let lists_only_reads = agent.is_some_and(|a| {
+        a.tools
+            .as_ref()
+            .is_some_and(|t| !t.is_empty() && t.iter().all(only_reads))
+    });
+    matches!(perm, Permission::ReadOnly)
+        || input["read_only"].as_bool() == Some(true)
+        || agent.is_some_and(|a| a.read_only)
+        || lists_only_reads
+}
+
+// Gives a helper that asked for isolation its worktree; one that cannot have
+// one runs in place, said before it writes anything.
+fn place_helper(spec: HelperSpec, cwd: &Path) -> Helper {
+    let (run_cwd, note, worktree) = if spec.isolate {
         match make_worktree(cwd) {
             Ok(wt) => {
                 let n = format!("[isolated worktree: {}]\n", wt.path.display());
                 (wt.path.clone(), n, Some(wt))
             }
             Err(why) => {
-                // Said before the helper writes anything into the folder.
                 report::notice(&format!("  {why} — the helper will write in your folder"));
                 (
                     cwd.to_path_buf(),
@@ -4239,7 +4417,32 @@ fn spawn_subagent(
     } else {
         (cwd.to_path_buf(), String::new(), None)
     };
+    Helper {
+        spec,
+        run_cwd,
+        note,
+        worktree,
+    }
+}
 
+// Runs one helper on this thread. Returns its result and whether it failed
+// — failures must reach the parent model as is_error so it can react
+// instead of trusting bad output.
+fn run_helper(
+    p: &Provider,
+    perm: Permission,
+    h: &Helper,
+    cwd: &Path,
+    depth: usize,
+) -> (String, bool) {
+    let HelperSpec {
+        input,
+        task,
+        role,
+        agent,
+        read_only,
+        isolate,
+    } = &h.spec;
     report::info(&format!("  ↳ subagent: {}", trace::preview(task, 80)));
     trace::record_visible(
         "subagent_spawn",
@@ -4248,13 +4451,21 @@ fn spawn_subagent(
             "task": task,
             "role": role,
             "isolate": isolate,
-            "cwd": run_cwd.to_string_lossy(),
+            "read_only": read_only,
+            "cwd": h.run_cwd.to_string_lossy(),
             "parent_depth": depth,
         }),
     );
     let mut child: Vec<Msg> = Vec::new();
-    set_active_agent(depth + 1, custom);
-    let outcome = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child, None);
+    set_helper_ctx(
+        depth + 1,
+        Some(HelperCtx {
+            agent: agent.clone(),
+            read_only: *read_only,
+            label: format!("{role} · {}", trace::preview(task, 60)),
+        }),
+    );
+    let outcome = build_inner(p, perm, role, task, &h.run_cwd, depth + 1, &mut child, None);
     // SubagentStop carries the call and what the helper answered; a hook
     // may send the helper on, as Stop does for the turn.
     let outcome = after_stop_hooks(
@@ -4274,15 +4485,17 @@ fn spawn_subagent(
         outcome,
         |reason| {
             CONTINUING.with(|c| c.set(true));
-            build_inner(p, perm, role, reason, &run_cwd, depth + 1, &mut child, None)
+            build_inner(p, perm, role, reason, &h.run_cwd, depth + 1, &mut child, None)
         },
     );
-    set_active_agent(depth + 1, None);
+    set_helper_ctx(depth + 1, None);
     let (result, is_error) = match outcome {
+        // Esc or Ctrl+C ended it: say so, rather than an empty success.
+        Ok(r) if r.is_empty() && tui::interrupted() => (HELPER_STOPPED.to_string(), true),
         Ok(r) => (r, false),
         Err(e) => (format!("subagent error: {e}"), true),
     };
-    let result = match &worktree {
+    let result = match &h.worktree {
         Some(wt) => {
             let done = finish_worktree(cwd, wt);
             report::subagent_result(task, done.branch.as_deref(), done.commits, &done.screen);
@@ -4297,13 +4510,277 @@ fn spawn_subagent(
             "task": task,
             "role": role,
             "isolate": isolate,
-            "cwd": run_cwd.to_string_lossy(),
+            "read_only": read_only,
+            "cwd": h.run_cwd.to_string_lossy(),
             "result": result,
             "is_error": is_error,
             "depth": depth + 1,
         }),
     );
-    (format!("{note}{result}"), is_error)
+    (format!("{}{result}", h.note), is_error)
+}
+
+fn spawn_subagent(
+    p: &Provider,
+    perm: Permission,
+    input: &serde_json::Value,
+    cwd: &Path,
+    depth: usize,
+) -> (String, bool) {
+    match resolve_helper(perm, input, cwd, depth) {
+        Ok(spec) => run_helper(p, perm, &place_helper(spec, cwd), cwd, depth),
+        Err(e) => (e, true),
+    }
+}
+
+// Helpers started from one reply. Those that only read or have a worktree
+// of their own run side by side, up to `max_parallel_helpers` at a time;
+// one whose worktree could not be made writes in place, so it runs after
+// them, on its own. Results come back in call order.
+fn run_helpers(
+    p: &Provider,
+    perm: Permission,
+    specs: Vec<HelperSpec>,
+    cwd: &Path,
+    depth: usize,
+) -> Vec<(String, bool)> {
+    let total = specs.len();
+    // Worktrees are made here, one after another: git takes its own locks.
+    let placed: Vec<Helper> = specs.into_iter().map(|s| place_helper(s, cwd)).collect();
+    let beside: Vec<usize> = (0..total)
+        .filter(|&i| placed[i].runs_beside_others())
+        .collect();
+    let mut results: Vec<Option<(String, bool)>> = vec![None; total];
+    if beside.len() > 1 {
+        let group: Vec<&Helper> = beside.iter().map(|&i| &placed[i]).collect();
+        for (k, r) in run_side_by_side(p, perm, &group, cwd, depth)
+            .into_iter()
+            .enumerate()
+        {
+            results[beside[k]] = Some(r);
+        }
+    }
+    for i in 0..total {
+        if results[i].is_some() {
+            continue;
+        }
+        results[i] = Some(if turn_stopped(false) || tui::interrupted() {
+            (HELPER_NOT_STARTED.into(), true)
+        } else {
+            run_helper(p, perm, &placed[i], cwd, depth)
+        });
+    }
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| (HELPER_NOT_STARTED.into(), true)))
+        .collect()
+}
+
+const HELPER_NOT_STARTED: &str = "not started: the user stopped the turn";
+const HELPER_STOPPED: &str = "stopped by the user before it finished";
+
+// A helper call held back to start with the others from its reply: the
+// results slot it fills and the tool name it was called by.
+struct WaitingHelper {
+    slot: usize,
+    name: String,
+    spec: HelperSpec,
+}
+
+// Starts the held helpers and puts each one's result in its slot, in call
+// order. None start once the user has stopped the turn.
+fn start_waiting_helpers(
+    p: &Provider,
+    perm: Permission,
+    waiting: &mut Vec<WaitingHelper>,
+    results: &mut [ToolResult],
+    cwd: &Path,
+    depth: usize,
+) {
+    let (calls, specs): (Vec<(usize, String)>, Vec<HelperSpec>) = std::mem::take(waiting)
+        .into_iter()
+        .map(|w| ((w.slot, w.name), w.spec))
+        .unzip();
+    let outs: Vec<(String, bool)> = if turn_stopped(false) || tui::interrupted() {
+        specs
+            .iter()
+            .map(|_| (HELPER_NOT_STARTED.to_string(), true))
+            .collect()
+    } else {
+        run_helpers(p, perm, specs, cwd, depth)
+    };
+    for ((slot, name), (out, is_error)) in calls.into_iter().zip(outs) {
+        report::tool_result(&name, &out, is_error);
+        trace_tool_result(&name, &out, is_error, "build", depth);
+        if let Some(r) = results.get_mut(slot) {
+            r.content = out;
+            r.is_error = is_error;
+        }
+    }
+}
+
+// What a helper that ran beside others left: its result and its captured
+// screen lines (or --json events), shown as one block when it finishes.
+struct HelperDone {
+    index: usize,
+    result: (String, bool),
+    lines: Vec<String>,
+    secs: f64,
+    // Esc or Ctrl+C reached it.
+    interrupted: bool,
+    // The person cancelled a prompt it asked.
+    stopped: bool,
+}
+
+// What helpers running side by side show outside their own block: an
+// approval or a question one of them asks, and each finished block. Taken
+// for each, so neither lands in the middle of the other.
+static HELPER_SCREEN: Mutex<()> = Mutex::new(());
+
+fn helper_screen() -> std::sync::MutexGuard<'static, ()> {
+    HELPER_SCREEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// Runs `group` on worker threads, at most `max_parallel_helpers` at once.
+// Each helper's output is held back and shown, labelled, when it finishes;
+// Esc or Ctrl+C reaches every running helper (none of them clears it) and
+// the queued ones never start. Tokens and cost add up in the session's
+// usage ledger like any other request.
+fn run_side_by_side(
+    p: &Provider,
+    perm: Permission,
+    group: &[&Helper],
+    cwd: &Path,
+    depth: usize,
+) -> Vec<(String, bool)> {
+    let n = group.len();
+    let width = MAX_PARALLEL_HELPERS.load(Ordering::Relaxed).clamp(1, n);
+    if !report::is_json() {
+        let at_once = if width < n {
+            format!("{n} helpers, {width} at a time")
+        } else {
+            format!("{n} helpers at once")
+        };
+        tui::line(&tui::accent(&format!(
+            "  ❖ {at_once} — each shows its work when it finishes · Esc stops them all"
+        )));
+    }
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<Option<(String, bool)>> = vec![None; n];
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<HelperDone>();
+        for _ in 0..width {
+            let tx = tx.clone();
+            let next = &next;
+            s.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(h) = group.get(index) else {
+                    break;
+                };
+                let started = std::time::Instant::now();
+                let (result, lines) = if tui::interrupted() {
+                    ((HELPER_NOT_STARTED.to_string(), true), Vec::new())
+                } else {
+                    tui::capture_start();
+                    let r = run_helper(p, perm, h, cwd, depth);
+                    (r, tui::capture_take())
+                };
+                let done = HelperDone {
+                    index,
+                    result,
+                    lines,
+                    secs: started.elapsed().as_secs_f64(),
+                    interrupted: tui::interrupted(),
+                    // Taken: this thread may start another helper next.
+                    stopped: turn_stopped(true),
+                };
+                if tx.send(done).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        for done in rx {
+            show_helper_block(group[done.index], done.index, n, &done);
+            // A helper's cancelled prompt stops the whole turn.
+            if done.stopped {
+                set_turn_stopped(true);
+            }
+            results[done.index] = Some(done.result);
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| (HELPER_NOT_STARTED.into(), true)))
+        .collect()
+}
+
+// One finished helper's block: a header naming it, then what it showed
+// while it ran. In --json mode its events, each with `helper` (its place
+// among the helpers started together, from 1).
+fn show_helper_block(h: &Helper, index: usize, of: usize, done: &HelperDone) {
+    let _screen = helper_screen();
+    if report::is_json() {
+        for l in &done.lines {
+            match serde_json::from_str::<serde_json::Value>(l) {
+                Ok(mut v) if v.is_object() => {
+                    v["helper"] = (index + 1).into();
+                    println!("{v}");
+                }
+                _ => println!("{l}"),
+            }
+        }
+        return;
+    }
+    let (result, is_error) = &done.result;
+    let how = if result == HELPER_NOT_STARTED {
+        "not started"
+    } else if done.interrupted {
+        "stopped"
+    } else if *is_error {
+        "failed"
+    } else {
+        "done"
+    };
+    let head = format!(
+        "  ❖ helper {} of {of} {how} · {} · {} · {:.1}s",
+        index + 1,
+        h.spec.role,
+        trace::preview(&h.spec.task, 60),
+        done.secs
+    );
+    let mut block = vec![if *is_error {
+        tui::yellow(&tui::sanitize_terminal(&head))
+    } else {
+        tui::accent(&tui::sanitize_terminal(&head))
+    }];
+    let gutter = tui::dim("  │ ");
+    block.extend(done.lines.iter().map(|l| format!("{gutter}{l}")));
+    tui::line(&block.join("\n"));
+}
+
+// A helper asking the person something while others run: its block is not
+// shown yet, so the prompt says which helper asks, and goes straight to the
+// screen, one at a time. One that waited while the person stopped the turn
+// at another helper's prompt asks nothing (`stopped`).
+fn helper_prompt<T>(ask: impl FnOnce() -> T, stopped: impl FnOnce() -> T) -> T {
+    if !tui::capturing() {
+        return ask();
+    }
+    let _screen = helper_screen();
+    if tui::interrupted() {
+        return stopped();
+    }
+    let who = HELPER_CTX
+        .with(|a| a.borrow().iter().flatten().last().map(|h| h.label.clone()))
+        .unwrap_or_default();
+    tui::uncaptured(|| {
+        tui::line(&tui::accent(&format!(
+            "  ❖ helper ({}) asks:",
+            tui::sanitize_terminal(&who)
+        )));
+        ask()
+    })
 }
 
 struct Worktree {
@@ -4312,8 +4789,14 @@ struct Worktree {
     base: String,
 }
 
+// Making and closing helpers' worktrees, one at a time: they share the
+// repository's refs and worktree list, and helpers in worktrees of their own
+// run at the same time.
+static WORKTREE_GIT: Mutex<()> = Mutex::new(());
+
 // A worktree on a new branch from HEAD, or why there cannot be one.
 fn make_worktree(cwd: &Path) -> Result<Worktree, String> {
+    let _git = WORKTREE_GIT.lock().unwrap_or_else(|e| e.into_inner());
     let id = SUB_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = cwd.join(format!(".bwn/worktrees/sub-{}-{id}", std::process::id()));
     let branch = format!("bwn-sub-{}-{id}", std::process::id());
@@ -4372,6 +4855,7 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
 // stays where it is. A branch with no new commits is deleted, one with
 // commits is kept and named.
 fn finish_worktree(cwd: &Path, wt: &Worktree) -> WorktreeDone {
+    let _git = WORKTREE_GIT.lock().unwrap_or_else(|e| e.into_inner());
     let kept = |note: String, screen: String| WorktreeDone {
         note,
         screen,
@@ -5516,15 +6000,22 @@ fn interrupted_turn(e: &str) -> bool {
     if !e.contains("interrupted") {
         return false;
     }
-    report::notice(take_interrupt());
+    report::notice(take_interrupt(0));
     true
 }
 
 // Takes the user's interrupt (Esc, Ctrl+C) and says so; a Stop hook will
-// not send this turn on.
-fn take_interrupt() -> &'static str {
+// not send this turn on. The top-level turn clears it; a helper only looks,
+// so the stop also reaches the helpers running beside it and the turn that
+// started them.
+fn take_interrupt(depth: usize) -> &'static str {
     STOPPED_EARLY.with(|u| u.set(true));
-    match tui::consume_interrupt() {
+    let kind = if depth == 0 {
+        tui::consume_interrupt()
+    } else {
+        tui::get_interrupt_kind()
+    };
+    match kind {
         tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
         _ => "  ⚠ interrupted",
     }
@@ -6436,6 +6927,60 @@ mod tests {
         ] {
             assert_eq!(parse_permission(permission_name(p)), Ok(p));
         }
+    }
+
+    #[test]
+    fn a_helper_reads_only_when_the_call_its_agent_file_or_the_session_says_so() {
+        let agent = |tools: Option<&[&str]>, read_only: bool| config::AgentDef {
+            name: "a".into(),
+            description: String::new(),
+            tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            read_only,
+            prompt: String::new(),
+            path: PathBuf::new(),
+        };
+        let plain = json!({"task": "t"});
+        let ro = |perm, input: &serde_json::Value, a: Option<&config::AgentDef>| {
+            helper_reads_only(perm, input, a)
+        };
+        assert!(!ro(Permission::Auto, &plain, None));
+        assert!(ro(Permission::ReadOnly, &plain, None));
+        assert!(ro(
+            Permission::Auto,
+            &json!({"task": "t", "read_only": true}),
+            None
+        ));
+        assert!(!ro(
+            Permission::Auto,
+            &json!({"task": "t", "read_only": false}),
+            None
+        ));
+        assert!(ro(Permission::Ask, &plain, Some(&agent(None, true))));
+        let reads = ["read_file", "grep_files", "find_files"];
+        assert!(ro(
+            Permission::Ask,
+            &plain,
+            Some(&agent(Some(&reads), false))
+        ));
+        // A command runner or an editor may write.
+        for writer in ["run_command", "write_file", "str_replace_editor"] {
+            let t = ["read_file", writer];
+            assert!(!ro(Permission::Ask, &plain, Some(&agent(Some(&t), false))));
+        }
+        assert!(!ro(Permission::Ask, &plain, Some(&agent(Some(&[]), false))));
+        assert!(!ro(Permission::Ask, &plain, Some(&agent(None, false))));
+    }
+
+    #[test]
+    fn a_read_only_helper_is_refused_changes_but_not_reads() {
+        let cwd = Path::new("/proj");
+        let refused = |name, input: serde_json::Value| read_only_helper_refusal(name, &input, cwd);
+        assert!(refused("read_file", json!({"path": "a"})).is_none());
+        assert!(refused("run_command", json!({"command": "git status"})).is_none());
+        let r = refused("write_file", json!({"path": "a", "content": "x"})).unwrap();
+        assert!(r.contains("this helper is read-only"), "{r}");
+        assert!(refused("run_command", json!({"command": "rm -rf build"})).is_some());
+        assert!(refused("task", json!({"task": "t"})).is_some());
     }
 
     #[test]
@@ -8494,6 +9039,49 @@ mod tests {
                 "{name} {input}: {r:?}"
             );
         }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn accept_edits_covers_added_folders_but_not_their_git_or_links_out() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-accept-added-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (proj, other, outside) = (home.join("proj"), home.join("other"), home.join("outside"));
+        for d in [&proj, &other, &outside, &other.join(".git")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("NEXUS_HOME", home.join("nexus"));
+        let in_other = |rel: &str| other.join(rel).display().to_string();
+        let write = |path: String| json!({"path": path, "content": "x"});
+        let perm = Permission::AcceptEdits;
+        // Before the folder is added, an edit there asks.
+        crate::workdirs::clear();
+        let before = gate(perm, "write_file", &write(in_other("lib.rs")), &proj);
+        assert!(before.is_some_and(|r| r.contains("blocked")));
+        crate::workdirs::add(&other.display().to_string(), &proj).unwrap();
+        assert_eq!(
+            gate(perm, "write_file", &write(in_other("lib.rs")), &proj),
+            None
+        );
+        // Its .git, and a link out of it, still ask.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, other.join("out")).unwrap();
+        let mut asks = vec![in_other(".git/config")];
+        if cfg!(unix) {
+            asks.push(in_other("out/x.txt"));
+        }
+        for path in asks {
+            let r = gate(perm, "write_file", &write(path.clone()), &proj);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("blocked")),
+                "{path}: {r:?}"
+            );
+        }
+        crate::workdirs::clear();
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

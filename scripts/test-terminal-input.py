@@ -151,6 +151,10 @@ class TerminalHarness(unittest.TestCase):
     def prepare(self):
         """Runs before the binary starts: settings, fixtures, servers."""
 
+    def args(self):
+        """Command-line arguments after the binary."""
+        return []
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="bwn-terminal-test-")
         self.root = Path(self.temp.name)
@@ -182,7 +186,7 @@ class TerminalHarness(unittest.TestCase):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         self.proc = subprocess.Popen(
-            [BINARY], stdin=slave, stdout=slave, stderr=slave,
+            [BINARY, *self.args()], stdin=slave, stdout=slave, stderr=slave,
             cwd=self.root, start_new_session=True, env=self.env,
         )
         os.close(slave)
@@ -750,6 +754,284 @@ class RepoCommandTrustTests(TerminalHarness):
         self.send("/hello\r")
         self.wait_for(lambda: b"/hello comes from this repo and is off" in self.output,
                       "the command is off")
+
+
+class HelperModel:
+    """An OpenAI-compatible model that answers requests at the same time.
+    The first request gets three `task` calls (read-only helpers named A, B
+    and C); `helper(name, messages)` answers each helper's requests with
+    ("finish", summary), ("tool", name, args), ("after", event, summary) to
+    finish half a second after `event` is set, or ("hang",) to keep the
+    request open until the test ends; the parent then finishes."""
+
+    def __init__(self, helper, calls=None):
+        self.calls = calls or [{"task": f"helper task {n}", "role": "researcher",
+                                "read_only": True} for n in "ABC"]
+        self.requests = []
+        self.open = 0
+        self.lock = threading.Lock()
+        self.release = threading.Event()
+        model = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def send_body(self, kind, body):
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", kind)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # the client gave up on this request
+
+            def do_GET(self):
+                self.send_body("application/json", b'{"object":"list","data":[]}')
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                messages = json.loads(self.rfile.read(length) or b"{}").get("messages", [])
+                with model.lock:
+                    model.requests.append(messages)
+                    model.open += 1
+                try:
+                    self.answer(model.reply(messages))
+                finally:
+                    with model.lock:
+                        model.open -= 1
+
+            def answer(self, reply):
+                if reply[0] == "after":
+                    reply[1].wait(10)
+                    time.sleep(0.5)
+                    reply = ("finish", reply[2])
+                if reply[0] == "hang":
+                    model.release.wait(30)
+                    reply = ("finish", "released")
+                if reply[0] == "finish":
+                    reply = ("tool", "finish", {"summary": reply[1]})
+                calls = reply[1] if reply[0] == "calls" else [(reply[1], reply[2])]
+                delta = {"role": "assistant", "tool_calls": [{
+                    "index": i, "id": f"call_{len(model.requests)}_{i}", "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)}}
+                    for i, (name, args) in enumerate(calls)]}
+                chunks = [{"choices": [{"index": 0, "delta": delta}]},
+                          {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}]
+                sse = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+                self.send_body("text/event-stream", sse.encode())
+
+        self.helper = helper
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def reply(self, messages):
+        text = json.dumps(messages)
+        if "SUMMARY-" in text:
+            return ("finish", "parent done")
+        for name in "ABC":
+            if f"helper task {name}" in text:
+                return self.helper(name, messages)
+        return ("calls", [("task", args) for args in self.calls])
+
+    def close(self):
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class ParallelHelperHarness(TerminalHarness):
+    """A --plain session (every printed row appears once) whose model starts
+    three read-only helpers from one reply."""
+
+    def helper(self, name, messages):
+        return ("finish", f"SUMMARY-{name}")
+
+    def args(self):
+        return ["--plain"]
+
+    def settings(self):
+        return {**self.config(),
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "context_tokens": 1000000}
+
+    def calls(self):
+        return None
+
+    def setUp(self):
+        self.model = HelperModel(self.helper, self.calls())
+        self.addCleanup(self.model.close)
+        super().setUp()
+
+    def wait_open(self, n):
+        self.wait_for(lambda: self.model.open >= n, f"{n} requests in flight")
+
+
+class HelperStopTests(ParallelHelperHarness):
+    def helper(self, name, messages):
+        return ("hang",)
+
+    def stop_with(self, key):
+        self.send("/build look at three things\r")
+        self.wait_open(3)
+        asked = len(self.model.requests)
+        self.assertEqual(asked, 4, "the parent's request, then one per helper")
+        started = time.monotonic()
+        self.send(key)
+        self.wait_for(lambda: self.output.count(b"stopped") >= 3, "every helper stops")
+        self.wait_for(lambda: b"interrupted" in self.output, "the turn ends")
+        self.assertLess(time.monotonic() - started, 4)
+        self.pump(1.0)
+        # Nothing was asked after the stop: not the helpers, not the parent.
+        self.assertEqual(len(self.model.requests), asked)
+        for n in (1, 2, 3):
+            self.assertIn(f"helper {n} of 3 stopped".encode(), self.output)
+
+    def test_esc_stops_every_helper_and_the_turn(self):
+        self.stop_with("\x1b")
+
+    def test_ctrl_c_stops_every_helper_and_the_turn(self):
+        self.stop_with("\x03")
+
+
+class HelperInPlaceStopTests(ParallelHelperHarness):
+    """Esc in a helper that runs on its own (it may write) ends the turn
+    too, instead of the model carrying on without it."""
+
+    def calls(self):
+        return [{"task": "helper task A"}]
+
+    def helper(self, name, messages):
+        return ("hang",)
+
+    def test_esc_in_a_helper_ends_the_turn(self):
+        self.send("/build change one thing\r")
+        self.wait_for(lambda: len(self.model.requests) == 2 and self.model.open == 1,
+                      "the helper's request")
+        self.send("\x1b")
+        self.wait_for(lambda: self.output.count(b"interrupted") >= 2, "the helper and the turn stop")
+        self.pump(1.0)
+        self.assertEqual(len(self.model.requests), 2, "the parent asked the model again")
+
+
+class HelperPromptTests(ParallelHelperHarness):
+    """Helper A asks to read a sensitive file; B and C finish while it
+    waits for the answer, and their blocks wait with it."""
+
+    def helper(self, name, messages):
+        if name != "A":
+            return ("after", self.a_asked, f"SUMMARY-{name}")
+        if messages and messages[-1].get("role") == "tool":
+            return ("finish", "SUMMARY-A")
+        self.a_asked.set()
+        return ("tool", "read_file", {"path": ".ssh/key"})
+
+    def setUp(self):
+        self.a_asked = threading.Event()
+        super().setUp()
+
+    def test_a_helper_names_itself_when_it_asks(self):
+        (self.root / ".ssh").mkdir()
+        (self.root / ".ssh" / "key").write_text("not a real key\n")
+        self.send("/build look at three things\r")
+        self.wait_for(lambda: b"allow?" in self.output, "the helper's approval prompt")
+        out = bytes(self.output)
+        asks = out.find(b"helper (researcher \xc2\xb7 helper task A) asks:")
+        self.assertGreater(asks, 0, out[-1500:])
+        self.assertIn(b"access sensitive path", out[asks:])
+        # B and C finish now, but their blocks wait for the answer.
+        self.pump(1.5)
+        self.assertEqual(self.model.open, 0, "B and C have their replies")
+        self.assertNotIn(b"helper 2 of 3", self.output)
+        self.send("y\r")
+        self.wait_for(lambda: b"parent done" in self.output, "the turn ends")
+        out = bytes(self.output)
+        prompt = out.find(b"allow?")
+        for n in (1, 2, 3):
+            self.assertGreater(out.find(f"helper {n} of 3 done".encode()), prompt)
+
+
+class AddDirModel(HelperModel):
+    """Answers the first message with `finish`; after that, writes made.txt
+    in the folder named by `target` and finishes."""
+
+    def __init__(self, target):
+        super().__init__(None)
+        self.target = target
+
+    def reply(self, messages):
+        if messages and messages[-1].get("role") == "tool":
+            return ("finish", "wrote it")
+        if len([m for m in messages if m.get("role") == "user"]) < 2:
+            return ("finish", "hello")
+        return ("tool", "write_file", {"path": str(self.target / "made.txt"),
+                                       "content": "from the agent\n"})
+
+
+class AddDirTests(TerminalHarness):
+    """/add-dir mid-session: the footer counts the folder, the next message
+    tells the model about it, and the agent may write there."""
+
+    def settings(self):
+        return {**self.config(),
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "context_tokens": 1000000}
+
+    def setUp(self):
+        self.other = Path(tempfile.mkdtemp(prefix="bwn-added-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.other, ignore_errors=True))
+        (self.other / "AGENTS.md").write_text("ADDED-FOLDER-RULE\n")
+        self.model = AddDirModel(self.other.resolve())
+        self.addCleanup(self.model.close)
+        super().setUp()
+
+    def test_add_dir_widens_the_session(self):
+        self.send("/build say hello\r")
+        self.wait_for(lambda: b"hello" in self.output and len(self.model.requests) == 1,
+                      "the first turn")
+        self.pump(0.5)
+        first_system = json.dumps(self.model.requests[0][0])
+        self.assertNotIn("ADDED-FOLDER-RULE", first_system)
+        self.send(f"/add-dir {self.other}\r")
+        self.wait_for(lambda: "✓ added".encode() in self.output, "the folder is added")
+        self.wait_for(lambda: b"AGENTS.md (not reviewed)" in self.output, "its instructions are named")
+        self.wait_for(lambda: b"+1 dir" in self.output, "the footer counts it")
+        self.send("/build write a file there\r")
+        self.wait_for(lambda: b"wrote it" in self.output, "the second turn")
+        self.assertEqual((self.other / "made.txt").read_text(), "from the agent\n")
+        # The conversation's system prompt was rewritten with the folder.
+        system = json.dumps(self.model.requests[1][0])
+        self.assertIn(str(self.other.resolve()), system)
+        self.assertIn("ADDED-FOLDER-RULE", system)
+
+
+class HelperPromptStopTests(ParallelHelperHarness):
+    """Helpers A and B both ask; Esc at the first question stops the turn,
+    so the other never asks."""
+
+    def helper(self, name, messages):
+        if name == "C":
+            return ("finish", "SUMMARY-C")
+        if messages and messages[-1].get("role") == "tool":
+            return ("finish", f"SUMMARY-{name}")
+        return ("tool", "read_file", {"path": ".ssh/key"})
+
+    def test_esc_at_one_helpers_question_stops_the_others_asking(self):
+        (self.root / ".ssh").mkdir()
+        (self.root / ".ssh" / "key").write_text("not a real key\n")
+        self.send("/build look at three things\r")
+        self.wait_for(lambda: b"allow?" in self.output, "the first approval prompt")
+        self.wait_for(lambda: len(self.model.requests) >= 4, "every helper started")
+        self.pump(0.5)
+        self.send("\x1b")
+        self.wait_for(lambda: self.output.count(b"interrupted") >= 1
+                      or b"stopped" in self.output, "the turn stops")
+        self.pump(1.5)
+        self.assertEqual(self.output.count(b"allow?"), 1, bytes(self.output[-1500:]))
 
 
 class CliArgumentTests(unittest.TestCase):

@@ -11,7 +11,7 @@
 //! the network when `sandbox_network` is false. Not confined: reads, the
 //! agent's own file tools (already fenced to cwd), hooks, MCP servers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
@@ -203,20 +203,32 @@ fn detect() -> Result<Backend, String> {
 /// empty directory behind as the mount point. It is not removed afterwards:
 /// a background server may still be using it, and git ignores an empty
 /// `.git` directory.
+///
+/// Folders added with --add-dir are bound read-write the same way, each with
+/// its own `.git` and `.buildwithnexus` kept read-only.
 pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
-    bwrap_argv(cmd, cwd, network, true)
+    bwrap_argv(cmd, cwd, &crate::workdirs::list(), network, true)
 }
 
 // The availability probe runs at `/` and must not mount anything there.
 fn bwrap_probe_args() -> Vec<String> {
-    bwrap_argv("true", Path::new("/"), true, false)
+    bwrap_argv("true", Path::new("/"), &[], true, false)
 }
 
-fn bwrap_argv(cmd: &str, cwd: &Path, network: bool, protect: bool) -> Vec<String> {
-    let protected: Vec<(String, bool)> = PROTECTED_IN_WORKSPACE
+fn bwrap_argv(
+    cmd: &str,
+    cwd: &Path,
+    extra: &[PathBuf],
+    network: bool,
+    protect: bool,
+) -> Vec<String> {
+    let roots: Vec<&Path> = std::iter::once(cwd)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    let protected: Vec<(String, bool)> = roots
         .iter()
+        .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
         .filter(|_| protect)
-        .map(|d| cwd.join(d))
         .map(|p| {
             let exists = p.symlink_metadata().is_ok();
             (p.to_string_lossy().into_owned(), exists)
@@ -251,6 +263,10 @@ fn bwrap_argv(cmd: &str, cwd: &Path, network: bool, protect: bool) -> Vec<String
         ]
         .map(str::to_string),
     );
+    for dir in extra {
+        let dir = dir.to_string_lossy().into_owned();
+        a.extend(["--bind".to_string(), dir.clone(), dir]);
+    }
     for (p, exists) in &protected {
         if *exists {
             a.extend(["--ro-bind".to_string(), p.clone(), p.clone()]);
@@ -365,24 +381,32 @@ fn sbpl_quote(p: &Path) -> String {
 /// Seatbelt profile: allow everything, deny writes, re-allow them under the
 /// workspace and the temp dirs. Callers pass realpath'd paths so `/var/…`
 /// and `/private/var/…` agree.
-pub fn seatbelt_profile(cwd: &Path, tmpdir: Option<&Path>, network: bool) -> String {
+/// Folders added with --add-dir (`extra`) are writable like the workspace.
+pub fn seatbelt_profile(
+    cwd: &Path,
+    extra: &[PathBuf],
+    tmpdir: Option<&Path>,
+    network: bool,
+) -> String {
     let mut p =
         String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
-    for dir in [
-        Some(cwd),
-        Some(Path::new("/private/tmp")),
-        Some(Path::new("/tmp")),
-        tmpdir,
-    ]
-    .into_iter()
-    .flatten()
+    let roots: Vec<&Path> = std::iter::once(cwd)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    for dir in roots
+        .iter()
+        .copied()
+        .chain([Path::new("/private/tmp"), Path::new("/tmp")])
+        .chain(tmpdir)
     {
         p.push_str(&format!("\n  (subpath {})", sbpl_quote(dir)));
     }
     p.push_str(")\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (regex #\"^/dev/tty\"))\n");
     p.push_str("(deny file-write*");
-    for d in PROTECTED_IN_WORKSPACE {
-        p.push_str(&format!("\n  (subpath {})", sbpl_quote(&cwd.join(d))));
+    for root in &roots {
+        for d in PROTECTED_IN_WORKSPACE {
+            p.push_str(&format!("\n  (subpath {})", sbpl_quote(&root.join(d))));
+        }
     }
     p.push_str(")\n(deny appleevent-send)\n");
     if !network {
@@ -404,7 +428,11 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
                 .map(std::path::PathBuf::from)
                 .and_then(|t| t.canonicalize().ok());
             let mut c = Command::new("sandbox-exec");
-            c.args(["-p", &seatbelt_profile(&cwd, tmp.as_deref(), network())]);
+            let extra = crate::workdirs::list();
+            c.args([
+                "-p",
+                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), network()),
+            ]);
             c.args(["sh", "-c", cmd]);
             c
         }
@@ -573,6 +601,35 @@ mod tests {
     }
 
     #[test]
+    fn added_folders_are_bound_writable_with_their_git_read_only() {
+        let extra = [PathBuf::from("/work/lib"), PathBuf::from("/srv/data")];
+        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, false, true);
+        let s = a.join(" ");
+        assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 3, "{s}");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {s}"))
+        };
+        for d in ["/work/lib", "/srv/data"] {
+            let bind = at(&format!("--bind {d} {d}"));
+            // Their own .git and .buildwithnexus stay read-only, after the bind.
+            assert!(bind < at(&format!("--tmpfs {d}/.git --remount-ro {d}/.git")));
+            assert!(bind < at(&format!("--remount-ro {d}/.buildwithnexus")));
+        }
+        assert!(at("--chdir /work/proj") > at("/srv/data/.buildwithnexus"));
+        let p = seatbelt_profile(Path::new("/w"), &extra, None, false);
+        let (allow, deny) = p.split_once("(deny file-write*\n").unwrap();
+        assert!(
+            allow.contains("(subpath \"/work/lib\")") && allow.contains("(subpath \"/srv/data\")")
+        );
+        assert!(deny.contains("(subpath \"/work/lib/.git\")"), "{p}");
+        assert!(
+            deny.contains("(subpath \"/srv/data/.buildwithnexus\")"),
+            "{p}"
+        );
+    }
+
+    #[test]
     fn bwrap_argv_keeps_git_and_settings_read_only() {
         let ws = std::env::temp_dir().join(format!("bwn-sandbox-ro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
@@ -671,6 +728,7 @@ mod tests {
     fn seatbelt_profile_denies_writes_except_workspace_and_tmp() {
         let p = seatbelt_profile(
             Path::new("/private/var/w/my \"proj\""),
+            &[],
             Some(Path::new("/private/var/folders/xy/T")),
             true,
         );
@@ -686,7 +744,7 @@ mod tests {
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
         assert!(!p.contains("network"));
-        let no_net = seatbelt_profile(Path::new("/w"), None, false);
+        let no_net = seatbelt_profile(Path::new("/w"), &[], None, false);
         assert!(no_net.ends_with("(deny network*)\n"));
         assert!(!no_net.contains("folders"));
     }
@@ -758,6 +816,28 @@ mod tests {
             "{} leaked out of the sandbox",
             outside.display()
         );
+
+        // A folder added with --add-dir is writable; its .git is not.
+        let added = std::env::temp_dir().join(format!("bwn-sandbox-added-{id}"));
+        let _ = std::fs::remove_dir_all(&added);
+        std::fs::create_dir_all(added.join(".git")).unwrap();
+        let added = added.canonicalize().unwrap();
+        crate::workdirs::clear();
+        assert!(matches!(
+            crate::workdirs::add(&added.display().to_string(), &ws),
+            Ok(crate::workdirs::Added::New(_))
+        ));
+        let wrote = run(&format!("echo ok > '{}/a.txt'", added.display()));
+        assert!(wrote.status.success(), "{wrote:?}");
+        assert_eq!(
+            std::fs::read_to_string(added.join("a.txt")).unwrap(),
+            "ok\n"
+        );
+        let hook = run(&format!("echo x > '{}/.git/config'", added.display()));
+        assert!(!hook.status.success(), "{hook:?}");
+        assert!(!added.join(".git/config").exists());
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(&added);
         let _ = std::fs::remove_dir_all(&ws);
     }
 }
