@@ -4387,9 +4387,12 @@ struct Helper {
 impl Helper {
     // Read-only helpers and those in a worktree of their own touch nothing
     // another helper works on. A worktree does not cover folders added with
-    // --add-dir, which every helper may write in.
+    // --add-dir, which every helper may write in. Under an editor (`bwn acp`)
+    // helpers take turns: the editor nests each call inside the open one, so
+    // two helpers' calls must not interleave.
     fn runs_beside_others(&self) -> bool {
-        self.spec.read_only || (self.worktree.is_some() && crate::workdirs::count() == 0)
+        !report::has_sink()
+            && (self.spec.read_only || (self.worktree.is_some() && crate::workdirs::count() == 0))
     }
 }
 

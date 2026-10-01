@@ -1056,7 +1056,9 @@ What carries over from the terminal:
 - **MCP servers** the editor passes (stdio or HTTP) join the ones in your
   settings; SSE servers are skipped.
 
-One `bwn acp` process serves one folder, and runs one prompt at a time.
+One `bwn acp` process serves one folder, and runs one prompt at a time;
+helpers a reply starts run one after another, so the editor can show each
+one's calls under it.
 Everything bwn prints besides the protocol goes to stderr, which the editor
 keeps as the agent's log. Images and embedded files in a prompt are sent to
 the model (images only when it takes them); audio is not.

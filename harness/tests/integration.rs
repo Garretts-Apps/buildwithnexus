@@ -8750,3 +8750,87 @@ fn acp_cancel_stops_a_model_request_that_is_still_running() {
     );
     acp.close();
 }
+
+// In an editor the helpers from one reply take turns: the editor shows each
+// tool call inside the one that started it, which only holds when one
+// helper's calls end before the next one's begin.
+#[test]
+fn acp_helpers_from_one_reply_take_turns_and_every_call_ends() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    for x in ["A", "B", "C"] {
+        std::fs::write(cwd.join(format!("{x}.txt")), format!("CONTENT-{x}\n")).unwrap();
+    }
+    let parent = three_helpers(json!({"role": "researcher", "read_only": true}));
+    // Each helper reads its own file, then answers with what it read.
+    let route = move |body: &str| {
+        if body.contains("SUMMARY-") {
+            return parent(body);
+        }
+        for x in ["A", "B", "C"] {
+            if body.contains(&format!("child task {x}")) {
+                if body.contains(&format!("CONTENT-{x}")) {
+                    return (with_usage(finish(&format!("SUMMARY-{x}")), 5), false);
+                }
+                let read = tool_calls(&[(
+                    &format!("r{x}"),
+                    "read_file",
+                    json!({"path": format!("{x}.txt")}),
+                )]);
+                return (with_usage(read, 5), true);
+            }
+        }
+        parent(body)
+    };
+    let m = serve_concurrent(route, 2, hold(400));
+    write_big_context_config(&home, m.port);
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "fix the three modules"),
+        &mut no_requests,
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    assert_eq!(m.posts().len(), 8, "parent, three helpers twice, parent");
+    assert_eq!(m.peak(), 1, "helpers ran side by side under an editor");
+    let updates = acp.updates();
+    let opened: Vec<&Value> = updates
+        .iter()
+        .filter(|u| u["sessionUpdate"] == "tool_call")
+        .collect();
+    assert_eq!(opened.len(), 6, "{updates:?}");
+    for call in opened {
+        let id = &call["toolCallId"];
+        let ended: Vec<&Value> = updates
+            .iter()
+            .filter(|u| {
+                u["sessionUpdate"] == "tool_call_update"
+                    && &u["toolCallId"] == id
+                    && matches!(u["status"].as_str(), Some("completed" | "failed"))
+            })
+            .collect();
+        assert_eq!(
+            ended.len(),
+            1,
+            "call {id} ended {} times: {updates:?}",
+            ended.len()
+        );
+        // A helper's read ends with that helper's file.
+        if let Some(path) = call["rawInput"]["path"].as_str() {
+            let x = &path[..1];
+            assert!(
+                ended[0].to_string().contains(&format!("CONTENT-{x}")),
+                "{path} ended with another helper's result: {}",
+                ended[0]
+            );
+        }
+    }
+    acp.close();
+}
