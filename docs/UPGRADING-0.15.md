@@ -5,6 +5,12 @@ behavior. Every change is listed here with the setting that restores the old
 behavior. Where there is none, the old behavior was a defect or lost data, and
 the entry says why.
 
+Nothing changes without opting in for these new features: `accept-edits`,
+`permissions` and `network` rules, `on_error`, `shell_env_passthrough`,
+`prices`, `vision`, `buildwithnexus trust --print`, `--trust-project` /
+`BWN_TRUST_PROJECT`, `--base-url`, `--worktree`, agent files and
+`buildwithnexus update`.
+
 ## Install and update
 
 | Change | To restore the old behavior |
@@ -12,15 +18,20 @@ the entry says why.
 | The npm launcher downloads the binary to `~/.buildwithnexus/bin/<version>/` (or `$NEXUS_HOME/bin/<version>/` when `NEXUS_HOME` is absolute) instead of the package's `bin/`. | `BWN_INSTALL_IN_PACKAGE=1`. For a noexec home, set `NEXUS_HOME` to an absolute path elsewhere or point `BWN_BIN` at a binary. |
 | `"auto_update": "install"` installs patch releases only; a new minor or major is announced with its install command. | `"auto_update": "install-any"` in `~/.buildwithnexus/settings.json`. |
 | The Windows exe links the C runtime statically. | Nothing to restore: it also runs where the Visual C++ Redistributable is installed. |
+| Update notices say `run buildwithnexus update` instead of an npm command. `buildwithnexus update [--check]` is new and exits 10 when a newer release exists. | None needed. `BWN_UPDATE_REGISTRY` or `npm_config_registry` points the check at a mirror. |
+| First launch no longer asks to install git, rg, node, npm or python3 and never runs `brew` or `sudo apt-get`. `buildwithnexus doctor` prints the install command for each missing tool and runs none. Session start mentions only a missing git. | None (security). Install the tools with your package manager. |
+| A new file, `NEXUS_HOME/notices.json`, records which upgrade notices were shown, so each is shown once. | Delete the file to see them again. |
 
 ## Network
 
 | Change | To restore the old behavior |
 |---|---|
 | `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are honored (0.14 always connected directly). | `NO_PROXY='*'`, or list the hosts to reach directly in `NO_PROXY`. Loopback model servers are always direct. |
-| A proxy variable that is not an `http://` URL (for example `socks5://`) makes the requests that would use it fail with an explanation. | `NO_PROXY='*'`, or point `HTTPS_PROXY`/`HTTP_PROXY` at an `http://` proxy. |
+| Model servers on private, link-local, CGNAT (100.64/10) or IPv6 unique-local addresses, and host names that resolve only to them, connect directly even when a proxy variable is set, as with 0.14.10, which never used a proxy. Host names are resolved locally, with a 1 s cap, only when a proxy variable is set. | `BWN_PROXY_PRIVATE=1` sends them through the proxy. |
+| A proxy variable that is not an `http://` URL (for example `socks5://`) makes the requests that would use it fail with an explanation. An `https://` proxy URL fails at once instead of after retries. | `NO_PROXY='*'`, or point `HTTPS_PROXY`/`HTTP_PROXY` at an `http://` proxy. |
 | Certificates are checked against the OS store (or `SSL_CERT_FILE`/`SSL_CERT_DIR`) as well as the bundled roots. | `BWN_TLS_ROOTS=bundled`. |
 | The web tools follow at most 5 redirects themselves and check each hop. | None needed: every redirect not aimed at a blocked address still succeeds. |
+| `web_search` counts as network access to `lite.duckduckgo.com` and asks before sending a query outside `auto`, read-only mode included. | `"network": {"allow": ["lite.duckduckgo.com"]}` in `~/.buildwithnexus/settings.json`, or answer `a` once in a project. |
 
 ## Folder trust
 
@@ -29,6 +40,9 @@ the entry says why.
 | A project's `.buildwithnexus/system.md` applies only after you trust the folder, and is appended to your own `system.md`. | `"project_system_prompt": "replace"` in `~/.buildwithnexus/settings.json` lets a trusted project's file replace yours. The trust requirement has no opt-out. |
 | A project skill with the same name as a bundled or user skill loads as `/project:<name>`. A project `skill_dirs` entry counts as the project's own, even as an absolute path. | `"project_skills_override": true` in your own settings (ignored in project settings), or add the directory to `~/.buildwithnexus/settings.json`. |
 | Folders trusted before 0.15 are asked about again once if their hooks or MCP servers run repo files, call npm/make/just (in any subfolder), name a file by a bare word, or if the folder has a `.buildwithnexus/system.md`. | None: the trust record now covers those files. Answering the prompt once re-trusts the folder. |
+| The trust prompt asks separately about a repository's `base_url` and `permission`, and a "no" is remembered for that file version. Existing `trusted.json` entries (plain digests) keep full trust. Older bwn versions read the new `{"digest","declined"}` entries as untrusted and ask again. | None needed. Answer yes to each question to trust the whole file as before. |
+| A trusted project hook whose script changes mid-session is asked about in the terminal UI, or skipped with a warning in a headless run. | Trust the folder again. In CI, `--trust-project <digest>` (from `buildwithnexus trust --print`) trusts exactly the current content. |
+| Project command folders (`.buildwithnexus/commands`, `.claude/commands`) and agent folders (`.buildwithnexus/agents`, `.claude/agents`) load only in a trusted folder, and a project's `prices` apply only once it is trusted. | New in 0.15; nothing to restore. |
 
 ## Permission gate
 
@@ -36,14 +50,44 @@ the entry says why.
 |---|---|
 | Windows-form sensitive paths (backslashes, drive letters, UNC, 8.3 names, wildcards, `-Path:value`) prompt. | None: skipping the prompt was a defect. Answer `s` or `a` for a specific command. |
 | Windows destructive commands (see the CHANGELOG) and `rm -rf` on a drive path prompt even in auto mode. Some ordinary uses such as `rd /s /q build` or `bcdedit /enum` prompt too. | None: they are gated like `rm -rf /`. Answer `y` to let one through. |
+| A permission switch typed in the conversation ("use auto") and `/permissions <mode>` last for the session and no longer write settings.json. | `/permissions default <mode>`, or "save as default" in the `/permissions` picker. |
+| `s` and `a` answers for `rm`, `mv`, `cp`, `ln`, `chmod`, `chown`, `chgrp`, `dd`, `truncate`, `kill`, `pkill`, `killall` (and their Windows forms) cover that exact command. Approvals saved before still work. | To allow every call of such a program, add it to `allowed_commands`, or add a rule such as `"permissions": {"allow": ["run_command(rm *)"]}`. |
+| Esc or Ctrl+C at an approval prompt ends the turn instead of returning the refusal to the model. | Answer `d <reason>` to refuse and let the model carry on. |
+| Esc or Ctrl+C at a question the model asks stops the turn; the question's default is no longer sent as your answer. | Answer with text to let the model continue; Enter on an empty line still takes the default. |
+| `"permission": "acceptEdits"` (or `accept-edits`) means the new accept-edits mode, which applies file edits only; it used to mean auto. | `"permission": "auto"`. |
+| An unknown `--permission-mode` exits 2. An unknown `permission` value in settings warns and uses ask (it was silently ask before). | None: use ask, accept-edits, auto or readonly (`plan` reads as readonly). |
+| The command given to `check_work` or `start_server` goes through the sensitive-path and dangerous-command checks even in auto, so `check_work` with `cat ~/.ssh/id_rsa` asks first. | None (security fix). |
+| A `permissions` rule naming `run_command`, `bash` or `Bash` also covers the commands of `check_work` and `start_server`. | None (security fix). A rule that names `check_work` or `start_server` applies to that tool only. |
+| Provider keys (`*_API_KEY`, `*_API_TOKEN`, `HF_TOKEN` and the other preset key variables) are removed from the environment of commands the agent runs, even without the sandbox. In a tmux server that was already running, `start_server` starts its command as `env -u <key names> sh -c '…'` (sh, not tmux's default shell). Hooks keep their environment. | List the variables a build or server needs in `"shell_env_passthrough"`. |
+| A deny rule or a `network.deny` entry ends a headless run with exit 3 (`approval_blocked`). | No change unless you add these settings. |
 
-## Headless runs and output
+## Hooks
 
 | Change | To restore the old behavior |
 |---|---|
-| Runs that stop short exit 4 (hook blocked), 5 (budget), 6 (step limit), 7 (`check_work` failed) or 8 (verifier blocked) instead of 0. | `--legacy-exit-codes` or `BWN_LEGACY_EXIT_CODES=1`. Only the exit code changes back; the summary line still names the outcome. |
-| `--json` output ends with a `{"type":"result",…}` event, and every event carries `"schema_version": 1`. | None needed (additive). A reader that rejects unknown keys or expects a specific last event type should skip `result` and ignore `schema_version`. |
-| Session files are saved with `"schema_version": 1`. | None needed: 0.14 ignores the field, and 0.15 reads older files as version 1. |
+| Matchers that use Claude Code tool names (`Bash`, `Edit`, `Write`, `Read`, `Grep`, `Glob`, `WebFetch`, `WebSearch`, `mcp__.*`) match the bwn tools they stand for; `Write` also matches `write` and `write_file`. | None: in 0.14 such a matcher matched no bwn tool, so the hook never ran. |
+| A `*` or empty matcher no longer runs `PreToolUse` on `finish` and `exit_plan`. | Name them in the matcher, for example `"finish|exit_plan"`. |
+| Hooks under an unknown event, of an unknown type or without their command are reported at startup and by `doctor` instead of being ignored silently. | None (warnings only). |
+
+## Keys, setup and /model
+
+| Change | To restore the old behavior |
+|---|---|
+| Keys typed at setup, `/model` and `/login` show as dots, and only the masked key stays on screen. | None (security). |
+| `/model` saves a key typed during a swap only after the one-token probe accepts it (`rejected (HTTP 401) — not saved` otherwise). Esc or Ctrl+C at any `/model` question cancels. | None (defect and security fix): a non-empty answer was saved before the check, so a later chat line could become `CUSTOM_API_KEY`. |
+| Setup saves nothing (settings or key) until the chosen model answers, and refuses an empty key. Leaving setup, or `buildwithnexus init` without a terminal, prints `setup not finished` and exits 1 (it used to exit 0 with a half-written setup). | None (defect fix). To configure without a terminal, write settings.json and export the key variable, or pass `--provider`. |
+| Setup lists Ollama once, marked "found, recommended" when it runs. Typing 0 still picks it. | Nothing needed. |
+| An OpenAI-compatible endpoint is asked for a key only when it answers 401 or 403. `/model <name>` on the configured custom endpoint no longer asks for the URL or key; `/model <new-url> <model>` still asks. | Nothing needed. |
+| An unknown `--provider` exits 2 (usage error) with a "did you mean" suggestion; it used to exit 1. `BWN_LEGACY_EXIT_CODES` does not cover it. | None. Scripts that matched exit 1 for this should match 2. |
+| `provider`, `model` and `permission` may be left out of settings: an empty model means the preset default, a missing permission means ask, and a file with no provider means setup has not run. | Nothing needed (the old rule only rejected these files). |
+| A settings value with the wrong type is reported as `<file>: "<key>": …` instead of `merged settings: …`. | None. Anything that matched the old warning text should match the file path. |
+| Human banners say `model  <preset> (<host:port>) · <model>`, such as `LM Studio (localhost:1234)`, instead of the wire protocol. `--json` output is unchanged. | None. |
+| `--provider X`, when X differs from the saved provider, runs at X's last-used address or its preset default instead of the saved provider's `base_url`. | Pass `--base-url`, or run `/model <url>` once to set X's address. |
+| `/model` and setup write an `endpoints` map (provider to last address, from your own settings only) to `~/.buildwithnexus/settings.json`, and swapping back to a provider returns to that address. | Delete the key, or one entry, to forget an address. |
+| `/model http://host:11434 <model>` (an Ollama host root) selects the Ollama preset and its native API instead of the custom preset. URLs ending in `/v1` stay on the custom preset. | Add `/v1` to the URL. |
+| `/init` switches the running session to the provider, model and address it saved and prints `now using …`. | None (defect fix): the old provider kept answering until restart. |
+| `/init` no longer writes the fixed AGENTS.md template. It offers to generate AGENTS.md from the repository, or improve the existing one, through the approval gate. `buildwithnexus init` prints a hint instead; `buildwithnexus init --agents-md` generates it headless. | Answer `n` to skip. |
+| A new file, `~/.buildwithnexus/key-checks.json` (0600), records whether each saved key passed its last check, as a hash, never the key. | Delete it to clear `key rejected` labels. |
 
 ## Models and agents
 
@@ -54,6 +98,74 @@ the entry says why.
 | When onboarding finds no local models it suggests pulling the Ollama preset's default model. | Type another model name at the prompt. |
 | Compaction keeps earlier images while they fit the context window (at most 4). | None: the old behavior silently lost them. `/clear` still drops everything. |
 | An isolated subagent that changed files leaves a `bwn-sub-<pid>-<n>` branch, named in its result. | Delete the branch with `git branch -D <branch>`. Branches with no new commits are still removed. |
+| A 429 or 5xx answer is retried 3 times (0.14: 4 times for hosted providers, 14 for local URLs). Out-of-memory 500s are not retried; a 503 "Loading model" still waits about two minutes. A refused connection gets one retry on every host. | `BWN_MAX_RETRIES=N` (0 to 20); `BWN_MAX_RETRIES=14` restores the old local patience. Nothing changes the refused-connection retry, because retrying a closed port cannot start the server. |
+| Provider errors: the first line is a sentence with the fix, the second is `HTTP <code>: <server message>`, replacing `HTTP <code>: <raw JSON body>`. The `--json` events and exit codes are unchanged. | None (usability defect). Scripts that parsed the raw body from stderr should match the `HTTP <code>:` line. |
+| With `--max-budget-usd` or `max_budget_usd` set, a remote model with no known price stops before the first request with exit 2 (its requests counted as $0 and the cap never fired). A model server on another machine counts as remote even when it runs LM Studio or llama.cpp. | None (defect). Add the model under `prices` in settings.json (`"prices": {"<model>": {"input": 0, "output": 0}}` marks it free), or remove the cap. |
+| Text tool calls from local models: JSON shaped like a tool call runs when the reply is that JSON, even when the name was not offered, and is answered with the tool list when no such tool exists. JSON quoted inside an answer, or a tool definition, stays text. | None needed: such calls were dropped silently. |
+| Ollama: when `/api/show` fails because the server is down or busy, bwn asks again on the next request instead of using `/v1` for the rest of the session. A missing model is an error that names `ollama pull`. | None (defects). `context_tokens` in settings still skips the probe. |
+| llama.cpp, LM Studio and vLLM (local presets or a loopback custom endpoint) use the window the server reports instead of 8,192. That moves compaction thresholds, and above 32k it gives the model the full tool surface. A message bigger than a known window is refused before sending, removed from the conversation and not saved in the session. | `context_tokens` in settings restores a fixed window. Send a smaller part of a large message. |
+| Whether a local model takes images follows the server's report (Ollama capabilities, LM Studio model type, llama.cpp modalities) before the model-name guess. | `"vision": true` or `"vision": false` decides outright. |
+| `/local` prints one line per server with its address and models, then GGUF files and suggestions, and no longer runs curl. A `/model` swap to llama.cpp or LM Studio no longer lands on Ollama's `/v1` port. | None (defects). |
+| A `task` or `spawn_subagent` call with an unknown role fails with the list of roles instead of running as engineer. | None: a mistyped helper name must not get every tool. Use engineer or researcher, or define an agent file. |
+| An agent file's `tools` list never grants `task` or `spawn_subagent`. | Leave out the `tools` list for a helper that may delegate. |
+| An isolated helper's leftover edits are committed with the identity git resolves (config, `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, `EMAIL`), and as `bwn <bwn@localhost>` only when git has none. | None (defect). |
+| `/agents` lists helper agents before Agents.md, and the `/teamwork` text describes delegation as it works. | None: the old text was wrong. |
+
+## Conversations, sessions and undo
+
+| Change | To restore the old behavior |
+|---|---|
+| `/undo`, `/undo latest`, `/undo <id>`, `/undo all` and `/rewind` ask `<file> changed after the agent edited it — overwrite your changes? [y/N]` when a file differs from what the agent left, including hand edits between two agent turns. Checkpoints written by 0.14 restore without asking. | Answer `y`. No setting turns the question off: it prevents data loss. |
+| BRAINSTORM no longer switches to PLAN on its own for task-like input or long pastes. Cancel or Esc at the plan selector stays in PLAN instead of switching to BUILD. | Shift+Tab or `/mode plan`. No setting: the switch changed the mode without your choice. |
+| BRAINSTORM no longer opens its own `you ›` prompt; the main composer continues the conversation, and every mode carries the earlier messages. Brainstorm and conversational turns are saved as sessions, and `bwn brainstorm` saves a session and never prompts. | `/new` for a fresh conversation. No setting restores separate per-mode histories (defect). |
+| The plan selector has a fourth item, Revise Plan; Execute, Edit Step and Cancel keep their positions. Planning sees the conversation. | `/new` gives planning a fresh start. |
+| `/commit` shows the drafted message and asks `[c]ommit · [e]dit · [n]o`; nothing staged is reported before any model request. | Press `c`. No setting restores the unattended commit (risk fix). |
+| In a repository whose git config can name programs for git to run, `/commit` and `/diff` ask before running git. | Answer `y`. |
+| Session ids are `<16-digit milliseconds>-<8 hex digits>` in session files, `bwn sessions`, `bwn resume <id>`, and hooks' `session_id` and `transcript_path`. | None: the old ids let parallel runs overwrite each other. 16-digit ids from 0.14 still load and resume. |
+| Prompts are sent byte for byte: quotes, line breaks, tabs and repeated spaces are kept. | None (defect). |
+| `bwn continue` continues the latest session started in this folder; with none there it continues the latest anywhere and says so on stderr. `bwn continue`, `bwn -c` and `bwn resume <id>` with no task open the terminal UI; without a terminal they exit 2 (0.14 ran an empty headless turn), as does `bwn resume` with no id. `bwn resume <unknown id>` prints one line and exits 1. | `bwn resume <id>` for a specific session; add a task to run headless. |
+| `bwn sessions` adds age and message-count columns and lists this folder first. | Scripts should read `bwn --json sessions`, not the human listing. |
+| Bare `/undo` after a relaunch asks before undoing the last task in this folder. Each folder keeps its newest 500 checkpoints: when the store passes 600 files, older ones are deleted with a notice. | None. 500 per folder is far beyond `/undo all`'s 24-hour window. |
+| `/diff` prints a file list, one summary line and a picker instead of git's `--stat` output twice, and includes untracked files. | None (defect). |
+| `/rewind` opens the prompt picker (code, conversation or both) instead of being an alias of `/undo`. | Bare `/undo` is unchanged, and `/rewind <id>` still works like `/undo <id>`. |
+| BUILD turns in a git repository whose config is inert run `git status` at the start and end of each turn to report files changed by shell commands. In very large repositories this adds that time to each turn. | No setting yet. |
+| `/btw` adds a note to the next message as before; only its wording changed. | None needed. |
+
+## Terminal UI
+
+| Change | To restore the old behavior |
+|---|---|
+| In pickers, `j`, `k` and `q` are letters that filter the list; typed text that matches no row no longer confirms the highlighted default. | Use ↑↓ to move and Esc to close. No setting: typed text confirming the default was the risk this fixes. |
+| Esc cancels a question instead of clearing its line, and Ctrl+C cancels a question instead of quitting, setup and `/init` questions included. | None: a key that ended the process at a question was a defect. |
+| Ctrl+C on an empty prompt needs a second press within 2 s to quit. Quitting with workflows waiting asks `quit anyway? [y/N]`. | Ctrl+D still quits in one press. |
+| The `theme` setting defaults to `auto`, so a light terminal (detected through OSC 11 or `COLORFGBG`) gets the light palette. With dark, the background is painted on every transcript row. | `"theme": "dark"` in settings.json or `/theme dark`; `"theme": "ansi"` keeps the terminal's own background. |
+| `TERM=dumb` runs in line mode, with no alternate screen and no colours. | Run with a real `TERM` such as `xterm-256color` for the full-screen UI. |
+| Human (non `--json`) output no longer prints `• tool_call`, `• tool_result`, `• hook`, `• hook_result`, `• tool_input_repaired`, `• tool_denied`, `• subagent_spawn` or `• subagent_done` lines, nor the `recovery: parsed` notice. | They are in `/trace` and the trace file under `NEXUS_HOME/traces`. Scripts should use `--json`. |
+| A paste over 1,000 characters or 10 lines keeps its line breaks when sent (it was flattened to spaces) and shows as one token in the box. | None: the model now gets what you pasted. |
+| `grep_files`, `find_files`, `find_paths` and `list_tree` no longer list gitignored files or virtualenv folders. | Read such a file by path with `read_file`, or search with a command such as `rg -uu`. |
+| A message that starts with an absolute path is sent to the model instead of being refused as an unknown command. | None (defect). |
+
+## Headless runs and output
+
+| Change | To restore the old behavior |
+|---|---|
+| Runs that stop short exit 4 (hook blocked), 5 (budget), 6 (step limit), 7 (`check_work` failed) or 8 (verifier blocked) instead of 0. | `--legacy-exit-codes` or `BWN_LEGACY_EXIT_CODES=1`. Only the exit code changes back; the summary line still names the outcome. |
+| A run whose calls a hook, a rule or read-only mode refused exits 3 (`approval_blocked`) instead of 0, with `changes were denied: …`. A run whose turn ends right after a call that could not run exits 1 (`failed`). | `--legacy-exit-codes` or `BWN_LEGACY_EXIT_CODES=1` restores 0 for both. |
+| The automatic `check_work` round that could not be approved for want of a terminal no longer makes the run exit 3; the run says the checks were not run. | None (defect). |
+| SIGINT and SIGTERM end a headless run with exit 130 and 143 and a final `result` event, instead of the process being killed by the signal. The session file is written before the first request. | None (defect). |
+| `--json` output ends with a `{"type":"result",…}` event, and every event carries `"schema_version": 1`. | None needed (additive). A reader that rejects unknown keys or expects a specific last event type should skip `result` and ignore `schema_version`. |
+| The `result` event has new fields (`session_id`, `turns`, `tokens_in`, `tokens_out`, `cost_usd`, `denied`, `denials`, `unpriced_requests`) and outcomes (`interrupted`, `review_blocking`), and there are new event types (`finding`, `subagent_result`, `session`, `check`, `update`). `schema_version` stays 1. | None needed (additive); see [VERSIONING.md](VERSIONING.md). |
+| Session files are saved with `"schema_version": 1`. | None needed: 0.14 ignores the field, and 0.15 reads older files as version 1. |
+| `run`, `plan` and `brainstorm` read stdin when it is not a terminal. With a task argument, a pipe that stays silent for 3 s is ignored. `bwn run` with no task and empty stdin exits 2 instead of sending an empty request. | Pass `</dev/null` so stdin is never read. |
+| `--json sessions` prints JSON lines instead of the human table. | Drop `--json` for the table. |
+| Unknown options anywhere before `--` exit 2 instead of becoming task words or an interactive prompt. A bad `--effort` exits 2 instead of 1. | Put text that starts with dashes after `--`. |
+| Built-in rule conditions match whole words of project-relative paths instead of substrings of absolute paths. | None (defect). To turn a rule off, put `{"rules":[{"id":"<id>","enabled":false}]}` in a `.json` file in `NEXUS_HOME/rules/`; `BWN_CHECKS_DONE=<check>` marks a required check done for one run. |
+| `buildwithnexus doctor` exits 1 when a check fails, lists only the configured provider's key, no longer contacts `api.anthropic.com` for a local setup, and prints install commands instead of offering to run them. `/doctor` runs the full check list, including the one-token provider probe. | `buildwithnexus doctor || true` where only the report is wanted. |
+| A `commands/*.md` file's body, with frontmatter stripped and arguments filled in, is the prompt; it used to be wrapped as `/name args [Skill: name]`, and arguments are no longer sent twice. | Make the file a skill to keep the wrapping. |
+| A headless run waits 5 s for MCP servers (it was up to the 30 s default per server). | Set `timeout_secs` on a server to wait longer for it. |
+| `mcp add <existing-name>` exits 1 instead of overwriting. | Add `--force`. |
+| `/review` no longer prompts for a focus, and is read-only even in auto. `/review` and `buildwithnexus review` (default and `--base`) also send untracked, non-ignored files as new-file diffs, so a review that said "nothing to review" may now run and exit 9. | Put the focus after the command. `--staged` reviews only staged changes. Apply fixes from BUILD. |
+| Background workflows (`/schedule`, `/loop`) run under the session's permission, provider and model, not the ones in settings.json. A `/loop` run that has a change refused stops the loop with `✗ workflow #N blocked: …`. | A workflow that should edit unattended needs `/permissions auto` in the session that schedules it, or remove the rule that refused it. |
 
 ## Release process (maintainers)
 

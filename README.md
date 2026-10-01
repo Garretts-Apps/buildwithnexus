@@ -18,11 +18,18 @@ cargo install buildwithnexus --locked   # installs `buildwithnexus` + the `bwn` 
 buildwithnexus
 ```
 
-The first launch walks you through choosing a model. Then describe a task.
-A daily background check tells you when a new version is out; set
-`auto_update: "install"` in settings to apply patch releases automatically
-(a new minor version is announced, not installed; `"install-any"` installs
-those too), or `"off"` to silence the check. The npm launcher keeps the
+The first launch walks you through choosing a model, and setup finishes only
+once that model has answered. Then describe a task. What is sent to a hosted
+provider, and what stays on your machine, is on the
+[data and privacy page](https://buildwithnexus.dev/docs/data).
+
+A daily background check tells you when a new version is out;
+`buildwithnexus update` installs it (`buildwithnexus update --check` exits 10
+when one is available). Set `auto_update: "install"` in settings to apply
+patch releases automatically (a new minor version is announced, not
+installed; `"install-any"` installs those too), or `"off"` to silence the
+check. The check reads `BWN_UPDATE_REGISTRY`, else npm's
+`npm_config_registry`, else the public registry. The npm launcher keeps the
 downloaded binary in `~/.buildwithnexus/bin/<version>/` (under `NEXUS_HOME`
 if set), outside the npm package, so `npm update` does not delete it.
 
@@ -42,7 +49,8 @@ if set), outside the npm package, so `npm update` does not delete it.
 - **Optional tools:** `ffmpeg` for video attachments and image previews,
   `bwrap` (bubblewrap) for the Linux [sandbox](#sandbox), `tmux` for
   background dev servers, and `git`, `rg` and `python3` for the tools that
-  use them. `buildwithnexus doctor` reports what is missing.
+  use them. `buildwithnexus doctor` reports what is missing and prints the
+  command that installs it; bwn never installs them itself.
 
 ## Try it in a sandbox
 
@@ -92,15 +100,35 @@ once you're ready to let it loose on a real project.
   languages by a zero-dependency lexer; markdown tables are drawn aligned,
   with header rules and column alignment; `---`, task lists and
   `~~strikethrough~~` render too.
-- **Know what it's doing** — the footer shows the model, a spinner, elapsed
-  time and streamed tokens/s while the agent works; when a long turn ends
-  while you're in another window you get a desktop notification (OSC 99/777/9)
-  and a taskbar progress state on terminals that have one.
+- **Know what it's doing** — the banner names the model and the server
+  answering it (`LM Studio (localhost:1234)`); the footer shows the model, a
+  spinner, elapsed time and streamed tokens/s while the agent works. Each
+  tool call is one plain line, and the agent's todo list is a checklist that
+  ticks off items. When a long turn ends, or an approval or a question is
+  waiting, while you're in another window you get a desktop notification
+  (OSC 99/777/9) and a taskbar progress state on terminals that have one.
 - **Claude-Code-grade ergonomics** — `Esc` interrupts the agent; messages
   typed while it works queue and auto-send; ↑ history is prefix-filtered and
   never destroys your draft; double-click selects a word, triple-click a
   line, and every copy confirms itself in the footer via OSC 52 (terminals
   known to ignore OSC 52 get a one-time notice instead).
+- **Prompts own the keyboard** — while an approval, a question or a picker is
+  open, the input box shows it and keys go only to it. `Esc`, `Ctrl+C`, or
+  `Ctrl+D` on an empty line cancels a question. Pickers filter as you type, a
+  digit picks a numbered row, and Enter picks only a row that is shown.
+  `Ctrl+C` on an empty prompt quits only on a second press within 2 s
+  (`Ctrl+D` quits at once; with workflows waiting it asks first).
+- **What you type is what is sent** — quotes, tabs and line breaks are kept. A
+  paste over 1,000 characters or 10 lines shows as `[pasted 20,024 chars]`
+  and is sent in full. `@` completes files by name anywhere in the project. A
+  message that starts with an absolute path (a dropped screenshot) is sent
+  with the image attached.
+- **Themes and line mode** — `dark`, `light` (at least 4.5:1 contrast) and
+  `ansi` (the terminal's own 16 colours); the `theme` setting defaults to
+  `auto`, which follows the terminal's background, and `/theme` switches and
+  saves it. `--plain` (or `TERM=dumb`) is line mode: no alternate screen, no
+  cursor addressing, no spinner frames, for screen readers and plain
+  consoles. Narrow terminals wrap between words.
 
 ## Why
 
@@ -153,7 +181,12 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 | LM Studio | local | — |
 
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
-`~/.buildwithnexus/.env.keys` (0600).
+`~/.buildwithnexus/.env.keys` (0600). A key is typed hidden (dots, then only
+the masked key) and saved only after the provider accepts it. If a key is
+rejected later, `/login` in a session (or `buildwithnexus login`) replaces it
+in place, checked first; the `/model` picker marks a key whose last check
+failed `key rejected` (recorded as a hash in
+`~/.buildwithnexus/key-checks.json`, never the key).
 
 **Local models.** No key is needed. The Ollama app and its Linux service
 start the server for you; without them (WSL without systemd, for example),
@@ -179,7 +212,30 @@ set `base_url` in `~/.buildwithnexus/settings.json`:
 { "provider": "ollama", "model": "qwen2.5-coder", "base_url": "http://gpu-box:11434" }
 ```
 
+`--base-url <url>` does the same for one run (with `--provider custom` it
+reads `CUSTOM_API_KEY` from the environment). `/model` and setup remember the
+address last used with each provider (`endpoints` in your own
+`~/.buildwithnexus/settings.json`, never a project's), so switching back to a
+provider, or `--provider` on a headless run, returns to that server.
+`/model http://host:11434 <model>` picks Ollama's native API; a URL ending in
+`/v1` is a custom OpenAI-compatible endpoint. `provider`, `model` and
+`permission` may be left out of a settings file: an empty model means the
+preset's default.
+
 A configured key is only sent over HTTPS or to a loopback address.
+
+**Local servers.** llama.cpp, LM Studio and vLLM report their context window,
+and bwn uses it (`context_tokens` in settings fixes a value); `/context` shows
+the total and what fills it (system prompt, tools, MCP tools, conversation,
+images). A message bigger than a known window is refused before it is sent.
+Whether a model takes images follows what the server reports (Ollama
+capabilities, LM Studio model type, llama.cpp modalities); `"vision": true` or
+`false` decides outright. `/local` lists the configured server and every local
+preset with its models, then the GGUF files on disk. A busy server (429 or
+5xx) is retried 3 times (`BWN_MAX_RETRIES=0`…`20`), a model that is still
+loading for about two minutes. Errors say what happened and what to do, with
+the server's own message underneath (`nothing is answering at <host>`, a
+missing Ollama model with its `ollama pull` command).
 
 **Reasoning.** `reasoning_effort` in settings (`off` by default, or `low` / `medium` /
 `high`; `--effort <level>` per run, `/effort` in-session) maps to each API's
@@ -196,44 +252,122 @@ estimated dollar figure from a built-in price table (local providers show
 `$0.00 (local)`; an unlisted model shows tokens only, never a guessed price).
 `--max-budget-usd <n>` (or `max_budget_usd` in settings) stops the agent
 before the next model request once the estimate exceeds `n`, with a `notice`
-event in `--json` mode; a headless run then exits 5.
+event in `--json` mode; a headless run then exits 5. With a cap set, a remote
+model that has no known price stops before the first request (exit 2): give
+it a price in USD per million tokens under `prices`, which wins over the
+built-in table (`cache_read` and `cache_write` default to `input`):
+
+```json
+{ "prices": { "my-gateway-model": { "input": 3.0, "output": 15.0 },
+              "llama3.1:70b": { "input": 0, "output": 0 } } }
+```
 
 ## Modes
 
-- **PLAN** — decompose the task into steps you approve or edit, then execute.
+- **PLAN** — decompose the task into steps you approve, edit (Edit Step) or
+  push back on (Revise Plan: say what to change and get a revised plan), then
+  execute.
 - **BUILD** — the agentic ReAct loop: read/edit files, run commands, iterate.
-- **BRAINSTORM** — free-form chat with read-only tools (read, grep, fetch, read-only commands); never writes. Action-like prompts auto-escalate to BUILD.
+- **BRAINSTORM** — free-form chat with read-only tools (read, grep, fetch, read-only commands); never writes. A task typed here gets a hint to switch; the mode changes only when you change it (Shift+Tab, `/mode`, or bare `/plan`, `/build`, `/brainstorm`).
+
+All three modes are one conversation: each turn sees the earlier ones, the
+whole conversation is saved as the session, and `/context` counts it. `/new`
+starts a fresh one.
 
 ```bash
 buildwithnexus                 # full-screen interactive session
 buildwithnexus run <task>      # execute a task (agentic, headless)
 buildwithnexus plan <task>     # decompose, approve, then execute
 buildwithnexus brainstorm <q>  # free-form chat (read-only tools)
+buildwithnexus continue        # reopen this folder's latest session
+buildwithnexus resume <id>     # reopen a session (bwn sessions lists them)
 buildwithnexus init            # (re)configure provider / model / key
+buildwithnexus login           # replace the provider's API key, checked first
 buildwithnexus providers       # list built-in providers
 buildwithnexus doctor          # diagnose setup (keys, tools, connectivity)
+buildwithnexus review          # read-only review of your changes (exit 9: blocking)
 ```
 
 Inside the interactive session:
 
 ```
 /model [name]             hot-swap the AI model mid-session
+/login                    replace the API key (checked before it is saved)
 /effort [off|low|medium|high]  show or set reasoning depth (persisted to settings)
+/permissions [mode|default <mode>|list|remove <entry>|reset]  see Permissions
+/theme [dark|light|ansi|auto]  colour theme (saved)
+/local                    local servers, their models, and GGUF files on disk
 /compact                  compress context (free up token budget)
-/context                  context window usage (measured from the last request when known)
+/context                  context window usage and what fills it
 /cost                     session tokens by category, request count, estimated cost
-/review                   AI code review of current git diff
-/commit                   AI-drafted conventional commit message
+/diff [turn]              changed and new files, one summary, a file's diff; turn: the last turn's changes
+/review [--base <ref>|--staged] [focus]  read-only review of uncommitted, staged or branch changes
+/commit                   AI-drafted commit message; commits only after [c]ommit
 /pr                       AI-drafted pull request title + description
+/undo [latest|git|all|<id>]  revert the last agent turn's edits (asks before overwriting yours)
+/rewind                   go back to an earlier prompt: code, conversation, or both
+/checkpoints              tasks and files /undo can restore
+/resume                   pick a saved session (this folder first; type to filter)
+/rename <name>            name this session
+/export [file]            this conversation as Markdown (default ~/.buildwithnexus/exports/<id>.md)
+/copy                     the last answer to the clipboard (OSC 52)
+/ask <question>           a side question that is not added to the conversation
+/init                     run setup, then offer to write AGENTS.md from this repository
+/agents                   helper agents from agent files, then Agents.md
 /schedule <delay> <task>  run a task once in the background (5s, 2m, 1h)
 /loop <interval> <task>   run a task repeatedly in the background (up to max_concurrent_workflows at once, default 2)
 /workflows                list and manage background workflows (i<id> shows a run's log, kept in ~/.buildwithnexus/workflows/)
-/btw <context>            inject context into the next agent turn
+/btw <context>            add a note to your next message
 /config                   configure hooks, memory, and commands via AI
 /memory                   view and edit session memory
 /skills                   list skills and custom commands
 /trace                    inspect hooks, tools, skills, and subagents
 ```
+
+Background workflows (`/schedule`, `/loop`) run under the session's
+permission, provider and model. Nobody can answer an approval for them, so
+outside `auto` a change they try is refused: a refused `/loop` run stops the
+loop with `✗ workflow #N blocked: …`. Use `/permissions auto` in the session
+that schedules a workflow that should edit unattended. Bare `/loop`,
+`/schedule` or `/btw` print their usage; `/help` lists the commands, the
+keys, and the answers to an approval prompt.
+
+## Sessions and undo
+
+Every conversation is saved as it runs (`~/.buildwithnexus/sessions/`) and
+belongs to the folder it started in.
+
+```bash
+bwn continue                   # reopen this folder's latest session in the UI
+bwn continue "now add tests"   # or run one more task on it, headless
+bwn resume <id>                # reopen a session; bwn resume alone opens the picker
+bwn sessions                   # this folder first, with age and message count
+bwn sessions export <id>       # the conversation as Markdown
+bwn sessions rm <id>           # delete a saved session
+```
+
+`bwn -c` is `bwn continue`. With no session in this folder, `continue` takes
+the latest one anywhere and says so. In a session, `/resume` picks a saved
+session (this folder first; type words to filter), `/rename <name>` names the
+current one, and `/new` starts a fresh one. `/export [file]` writes the
+conversation as Markdown, `/copy` puts the last answer on the clipboard
+(OSC 52, so it works over SSH), and `/ask <question>` answers a side question
+from the conversation without adding it. `/btw <note>` adds a note to your
+next message.
+
+Every file write is checkpointed first. Bare `/undo` reverts the last agent
+turn's edits, `/undo all` everything from the last 24 hours, and
+`/undo <id>` one checkpoint from `/checkpoints`. When a file has changed since
+the agent edited it, `/undo` asks `<file> changed after the agent edited it —
+overwrite your changes? [y/N]`, and `n` keeps your version while the rest is
+restored. `/undo` also says what it cannot undo: changes made by shell
+commands, commits, and files too large to snapshot (the approval prompt warns
+about those too). `/rewind` goes back to an earlier prompt and restores the
+code, the conversation, or both. `/diff` lists every changed and new file
+with one summary line and shows a chosen file's diff; `/diff turn` shows what
+the last turn changed. `/commit` drafts a message and commits only when you
+answer `c` (`[c]ommit · [e]dit · [n]o`). Each folder keeps its newest 500
+checkpoints. [RECOVERY.md](RECOVERY.md) has the details.
 
 ## Headless and CI
 
@@ -245,32 +379,74 @@ whose API key is in the environment, and writes nothing.
 |---|---|
 | `--provider <id>` | provider for this run (`buildwithnexus providers` lists ids) |
 | `--model <name>` | model for this run |
-| `--permission-mode <ask\|auto\|readonly>` | permission gate; with no terminal, `ask` blocks every change, so CI usually wants `auto` or `readonly` |
+| `--base-url <url>` | model endpoint for this run, such as a gateway (`--provider custom` reads `CUSTOM_API_KEY`) |
+| `--permission-mode <mode>` | `ask`, `accept-edits`, `auto` or `readonly` (see [Permissions](#permissions)); with no terminal, `ask` blocks every change, so CI usually wants `auto` or `readonly`. An unknown name exits 2. |
 | `--sandbox <off\|auto\|require>` | OS sandbox for shell commands (see [Sandbox](#sandbox)) |
 | `--effort <off\|low\|medium\|high>` | reasoning depth |
 | `--max-budget-usd <n>` | stop before the next request once the estimated cost exceeds `n` |
 | `--json` | machine-readable events on stdout instead of text |
 | `--yes`, `-y` | `plan` only: approve the plan and execute it |
-| `--legacy-exit-codes` | exit 0 when a run stops short without failing (codes 4 to 8 below) |
+| `--legacy-exit-codes` | exit 0 when a run stops short without failing (codes 4 to 8, and 3 or 1 for refused or unrun calls, below) |
+| `--trust-project <digest>` | trust exactly this content of the folder's project settings for this run (also `BWN_TRUST_PROJECT`; `buildwithnexus trust --print` prints the digest) |
+| `--worktree <name>` | work in `.bwn/worktrees/<name>` on branch `bwn/<name>` (created from HEAD, or reused); on exit bwn prints the branch and `git merge bwn/<name>` |
+| `--plain` | line mode for the terminal UI: no alternate screen or cursor addressing (as with `TERM=dumb`) |
 | `--` | everything after it is task text, even if it looks like a flag |
+
+An unknown option anywhere before `--` is a usage error (exit 2) with a
+"did you mean" hint, and nothing is sent.
+
+**Piped input.** When stdin is not a terminal, `run`, `plan` and
+`brainstorm` read it: with no task argument it is the task, and with one it
+is added after the task as a `[stdin]` block (up to 1 MiB; the rest is cut
+with a notice). With a task argument, a pipe that sends nothing for 3 s is
+ignored. No task at all exits 2 before any request; pass `</dev/null` to keep
+stdin out.
+
+```bash
+git diff | bwn run --permission-mode readonly "review this diff for bugs"
+```
 
 | Exit code | `outcome` | Meaning |
 |---|---|---|
 | 0 | `success` | the task finished |
-| 1 | `failed` | the run failed, or no provider could be set up |
-| 2 | | usage error: unknown option, a flag missing its value, or `plan` with no terminal and no `--yes` |
-| 3 | `approval_blocked` | changes were blocked for lack of approval (`ask` with no terminal); nothing was applied |
+| 1 | `failed` | the run failed, no provider could be set up, or the turn ended right after a call that could not run |
+| 2 | | usage error: unknown option or `--provider`, a bad `--permission-mode` or `--effort`, a flag missing its value, no task, `plan` with no terminal and no `--yes`, or a spend cap on a model with no known price |
+| 3 | `approval_blocked` | changes were blocked for lack of approval (`ask` with no terminal), or a hook, a deny rule or read-only mode refused a call (`changes were denied: …`) |
 | 4 | `hook_blocked` | a `UserPromptSubmit` hook blocked the task |
 | 5 | `budget_stop` | `--max-budget-usd` stopped the run before the next request |
 | 6 | `step_limit` | the turn used every step without finishing |
 | 7 | `check_work_failed` | the model finished, but the project's checks (`check_work`) still fail |
 | 8 | `verification_failed` | the model finished, but the verifier still blocks after its fix rounds |
+| 9 | `review_blocking` | `buildwithnexus review` found a blocking issue |
+| 130, 143 | `interrupted` | SIGINT or SIGTERM; the session is saved and the line names it |
 
-With `--json`, the last event is `{"type":"result","outcome":…,"exit_code":…}`.
-When more than one applies, the first reason the run stopped short is reported.
+With `--json`, the last event is the `result` event: `outcome`, `exit_code`,
+`session_id`, `turns`, `tokens_in`, `tokens_out`, `cost_usd`, `denied` and
+`denials` (the refused calls, each with its reason). When more than one
+applies, the first reason the run stopped short is reported.
 `--legacy-exit-codes` (or `BWN_LEGACY_EXIT_CODES=1`) restores the pre-0.15
-behavior: codes 4 to 8 become 0, while the `result` event still names the
-outcome.
+behavior: codes 4 to 8, and 3 or 1 for refused or unrun calls, become 0,
+while the `result` event still names the outcome. `buildwithnexus update
+--check` exits 10 when a newer release exists, and `buildwithnexus doctor`
+exits 1 when a check fails (`--json doctor` prints one `check` event per
+check; `--json sessions` one `session` event per saved session).
+
+**Reviews in CI.** `buildwithnexus review [--base <ref> | --staged] [focus]`
+reviews uncommitted changes (plus the branch since `<ref>` with `--base`, or
+only staged changes with `--staged`), including new files git does not track
+yet; key and credential files are named but never sent. It is read-only in
+every permission mode, prints a `finding` event per issue with `--json`, and
+exits 9 when one is blocking. `/review` takes the same arguments in a session.
+
+**Trusting a repository in CI.** Project hooks, MCP servers and allow rules
+need folder trust, and CI has nobody to answer the prompt. Run
+`buildwithnexus trust --print` in the checkout to see what the project
+settings run and their digest, then pass `--trust-project <digest>` (or set
+`BWN_TRUST_PROJECT`): if the files change, the run stops with exit 2 and
+names them.
+
+**Custom commands headless.** `bwn run '/deploy staging'` runs a custom command
+or skill with its arguments, as in a session.
 
 Each `--json` event has a `schema_version` (now `1`). What may change in a
 minor or a patch release (flags, settings keys, events, session files, exit
@@ -286,15 +462,31 @@ launcher can fetch the binary on first run.
 ## Permissions
 
 Every mutating tool (`write_file`, `edit_file`, `run_command`) passes a gate:
-`ask` (default), `auto` (yolo), or `readonly`. Set it during setup. In
-`readonly`, mutations are refused outright — never prompted — so an approved
+`ask` (default), `accept-edits`, `auto` (yolo), or `readonly`. Set it during
+setup, with `--permission-mode`, or with `/permissions`. In `readonly`,
+mutations are refused outright — never prompted — so an approved
 sensitive-path or dangerous-command confirmation can't slip one through.
+`accept-edits` applies file edits inside the project without asking, while
+commands, deletions, network access and anything inside `.git` still ask.
+Claude Code's names are accepted too (`acceptEdits`, `default` for ask,
+`plan` and `dontAsk` for readonly, `bypassPermissions` for auto); an unknown
+name is an error, and a misspelt `permission` setting warns and uses `ask`.
+
+A switch made in a session (`/permissions auto`, or typing "use auto") lasts
+for that session. `/permissions default <mode>`, or "save as default" in the
+`/permissions` picker, saves it for every new session. `/permissions list`
+(and the bare picker) shows the saved approvals and the rules in force;
+`/permissions remove <entry>` forgets one approval.
 
 The prompt shows the whole command, with line breaks marked `⏎`, and names
 what `s` / `a` would allow from then on: a binary (`cargo`), a subcommand
 (`git status`), a host, or, for shells, interpreters and other programs that
 run what they are given (`sh`, `python3`, `python3.12`, `node`, `awk`, `sed`,
-`env`, …), only that exact command. Answering `a` (always allow) remembers it
+`env`, …), and for programs whose arguments decide what they destroy or stop
+(`rm`, `mv`, `cp`, `ln`, `chmod`, `chown`, `dd`, `truncate`, `kill`, `pkill`,
+`killall`, `del`, `robocopy`, …), only that exact command. Answering `y`
+allows the call once; `d <reason>` refuses it and tells the model why; `Esc`
+or `Ctrl+C` refuses it and stops the turn. Answering `a` (always allow) remembers it
 **for the current project only** (`project_allowed` in
 `~/.buildwithnexus/settings.json`, keyed by directory). `/permissions reset`
 forgets those answers for the project you're in. The legacy global
@@ -302,11 +494,56 @@ forgets those answers for the project you're in. The legacy global
 by name alone (`python3`, as 0.14.3–0.14.8 stored them): those are ignored,
 and bwn lists them at startup and in `/permissions`.
 
-Network tools (`fetch_url`, `headless_browser`, `wait_for_url`,
-`open_browser`) ask once per host and port under `ask` and `readonly`, since a
-fetch can carry data out or reach services on your network. `s` / `a` allow
-that host; an `allowed_commands` entry `"fetch *"` allows every host. Web
-search does not ask.
+Network tools (`fetch_url`, `web_search`, `headless_browser`,
+`wait_for_url`, `open_browser`) ask once per host and port in every mode but
+`auto`, `readonly` included, since a fetch or a search query can carry data
+out or reach services on your network. `web_search` sends its query to
+`lite.duckduckgo.com`. `s` / `a` allow that host; an `allowed_commands` entry
+`"fetch *"` allows every host.
+
+Commands the agent runs (including `check_work` and `start_server`, sandboxed
+or not) do not inherit provider keys: variables ending in `_API_KEY` or
+`_API_TOKEN`, and the presets' key variables such as `HF_TOKEN`, are removed
+from their environment. List any your build needs in
+`"shell_env_passthrough": ["MAPS_API_KEY"]`. Hooks are your own and keep
+their environment.
+
+### Allow, ask and deny rules
+
+`permissions` and `network` in `settings.json` set rules that apply before
+the mode: a deny rule refuses in every mode, an ask rule always prompts (even
+in `auto` or after an `a` answer), and an allow rule skips the prompt. Deny
+beats ask, ask beats allow, and all three beat the mode.
+
+```json
+{
+  "permissions": {
+    "allow": ["run_command(cargo test*)", "write_file(src/**)"],
+    "ask":   ["write_file(migrations/**)"],
+    "deny":  ["run_command(git push*)", "WebFetch(domain:pastebin.com)"]
+  },
+  "network": { "allow": ["docs.rs", "*.github.com"], "deny": ["*.internal.example"] }
+}
+```
+
+A rule is `Tool` or `Tool(pattern)`. The tool part is matched like a hook
+matcher, so Claude Code names work (`Bash`, `Edit`, `Write`, `WebFetch`), and
+a rule for `run_command`, `bash` or `Bash` also covers the commands of
+`check_work` and `start_server`. The pattern is a `*`/`?` wildcard matched
+against the command for shell tools (Claude Code's `git push:*` means
+`git push*`), the host for network tools (`domain:` is optional), the query
+for `web_search`, and the touched paths for file tools: project-relative
+(`migrations/**`), or absolute or `~/` for any path. An allow rule must cover
+a whole plain command (no chaining or redirection) and every path; ask and
+deny rules match any part of a compound command and any path. `network`
+entries are host patterns (`example.com`, `*.example.com`) for the network
+tools. A refusal names the rule and whether it came from user or project
+settings, and a headless run refused by one exits 3.
+
+Rules add up across `~/.buildwithnexus/settings.json`, `settings.local.json`
+and the project's `.buildwithnexus/settings.json`, so a project cannot drop
+your deny rules. A project file adds ask and deny rules on its own, and allow
+rules only once you trust the folder.
 
 Headless `plan` needs a terminal to approve the plan; pass `--yes` / `-y` to
 auto-approve and execute (in `--json` mode the plan is emitted as a `plan` event
@@ -363,8 +600,9 @@ the `images` settings key (`"auto"` default, `"kitty"`, `"sixel"`, `"blocks"`,
 half the window's width and a third of its height, and re-fit when the
 window is resized. Uploads are freed when you `/clear` or exit.
 
-Two related settings: `notify` (`"auto"` — desktop notification when a turn
-of 8 s or longer ends while the window is unfocused; `"always"`; `"off"`).
+A related setting: `notify` (`"auto"` — desktop notification when a turn of
+8 s or longer ends, or an approval or a question is waiting, while the window
+is unfocused; `"always"`; `"off"`).
 
 ## Hooks
 
@@ -379,7 +617,12 @@ run: scripts they name (`./x.sh`, or a bare `setup` that `sh` or `cmd.exe`
 would find in the folder), and `package.json` or the `Makefile` when they
 call `npm`, `make` and the like, in the project root or in a folder the
 command names (`make -C sub`, `cd web && npm test`). Editing one of those
-asks again.
+asks again, and the check is repeated before every run of a project hook: a
+script that changed since you trusted it is asked about
+(`scripts/fmt.sh changed since you trusted it — run it?`), or skipped with a
+warning in a headless run. The prompt asks separately before a project's
+`base_url` (where your requests and key go) or `permission` takes effect.
+For CI, see *Trusting a repository in CI* under [Headless and CI](#headless-and-ci).
 Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
 `PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
 `PostToolUse`, `PostResponse`, `OnError`, `Stop` (after every BUILD, PLAN,
@@ -387,7 +630,7 @@ BRAINSTORM, or chat response), and `SubagentStop` (when a `spawn_subagent` call
 returns; its payload carries the subagent's `tool_input`). Each hook command
 receives the event as JSON on stdin with Claude Code's field names:
 `hook_event_name`, `session_id` (the id the transcript is saved under),
-`transcript_path`, `permission_mode` (`ask` | `auto` | `readonly`), `cwd`, plus
+`transcript_path`, `permission_mode` (`ask` | `accept-edits` | `auto` | `readonly`), `cwd`, plus
 the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`).
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
@@ -396,10 +639,19 @@ prompt; otherwise the normal gate applies. A `PreToolUse` hook that gives no
 answer also blocks the call, with a message naming it: one that times out
 (`"timeout"` in seconds, default 10), cannot start (missing script or
 interpreter, not executable, a `.rs` hook that does not compile) or is killed by
-a signal. Any other non-zero exit is shown and does not block. Other events
-never block on a failed hook, but the failure is shown. Matchers are `*`, an
-exact tool name, or a `|`-separated list; each segment may use `*` and `?`
-wildcards (`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
+a signal. Any other non-zero exit is shown with the end of its stderr and
+does not block, unless the hook sets `"on_error": "deny"`, which makes a
+crashing guard block the call. Other events never block on a failed hook, but
+the failure is shown. Matchers are `*`, an exact tool name, or a
+`|`-separated list; each segment may use `*` and `?` wildcards (`"*_file"`,
+`"mcp__*"`, or Claude Code's `"mcp__.*"`). Claude Code tool names stand for
+the bwn tools that do the same thing: `Bash` (`run_command`, `bash`,
+`start_server`), `Edit`, `MultiEdit`, `Write`, `Read`, `Grep`, `Glob`, `LS`,
+`WebFetch`, `WebSearch`, `Task` and `TodoWrite`, so a matcher copied from a
+Claude Code settings file guards the same calls. A `*` or empty matcher does
+not run on `finish` and `exit_plan`; name them to guard them. A hook under an
+event bwn does not fire, of an unknown `type`, or without its command is
+reported at startup and by `doctor` instead of being ignored. See
 [`examples/settings.json`](./examples/settings.json).
 
 ```json
@@ -407,7 +659,9 @@ wildcards (`"*_file"`, `"mcp__*"`, `"Edit|Write"`). See
   "hooks": {
     "PreToolUse": [
       { "matcher": "run_command",
-        "hooks": [{ "type": "command", "command": "echo 'no shell on main' >&2; exit 2" }] }
+        "hooks": [{ "type": "command", "command": "echo 'no shell on main' >&2; exit 2" }] },
+      { "matcher": "Edit|Write",
+        "hooks": [{ "type": "command", "command": "./scripts/guard.sh", "on_error": "deny" }] }
     ]
   }
 }
@@ -426,9 +680,12 @@ precedence):
    then `.buildwithnexus/AGENTS.md`
 
 Each file is capped at 32 KiB (cut with a visible marker) and 96 KiB in
-total. A dim line at startup lists what was found:
-`instructions: AGENTS.md, src/AGENTS.md`. `/init` offers to create a starter
-`AGENTS.md` (build/test commands, conventions, do-nots) when the cwd has none.
+total. A dim line at startup lists what was found, and says which files came
+from the repository and that nobody reviewed them unless you trusted the
+folder: `instructions from this repo: AGENTS.md, src/AGENTS.md (not reviewed)`.
+`/init` offers to write `AGENTS.md` from the repository's own build and test
+files (or to improve the one there), shown as a diff you approve;
+`buildwithnexus init --agents-md` does the same headless.
 The `instruction_files` settings key changes which names are looked up
 (default `["AGENTS.md", "CLAUDE.md"]`; add `"GEMINI.md"`, or `[]` to disable).
 
@@ -472,6 +729,56 @@ let project skills replace them, as before 0.15. Add more roots with the
 `skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
 `/skills` lists every skill with its source and description.
 
+### Custom commands
+
+A Markdown file in a commands folder is a slash command named after the file:
+`deploy.md` is `/deploy`. Its body, with the YAML frontmatter stripped, is the
+prompt; `description` in the frontmatter is what the command popup shows.
+`$ARGUMENTS` in the body is replaced by everything typed after the command,
+and `$1`…`$9` by single words (quotes group words), so `/deploy staging` fills
+in `staging`. A body with no placeholder gets the arguments added after it.
+A `.sh`, `.bash` or `.py` file runs as a command instead, through the same
+hooks and permission gate as `run_command`.
+
+Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
+and, once you trust the folder, from the project's `.buildwithnexus/commands/`
+and `.claude/commands/`. Skills and commands work headless too:
+`bwn run '/deploy staging'`.
+
+```markdown
+---
+description: Deploy to an environment
+---
+Run the deploy for $ARGUMENTS, then check the health endpoint.
+```
+
+### Helper agents
+
+The model can hand a subtask to a helper with the `task` (or
+`spawn_subagent`) tool, as the built-in `engineer` or `researcher` role or as
+a helper you define. An agent file is `<name>.md` with `name`, `description`
+and `tools` frontmatter and the helper's instructions as the body; `tools`
+limits what it may use, and Claude Code's tool names work (`Read`, `Grep`,
+`Bash`, …). A helper with a `tools` list can never delegate further (`task`
+and `spawn_subagent` are left out), and a call naming an unknown role fails
+with the list of roles. `/agents` lists the helpers.
+
+```markdown
+---
+name: test-writer
+description: Writes focused unit tests for one module
+tools: Read, Grep, Glob, Write
+---
+Write tests for the module you are given. Do not change the module itself.
+```
+
+Agent files load from `~/.buildwithnexus/agents/` and `~/.claude/agents/`,
+and, once you trust the folder, from the project's `.buildwithnexus/agents/`
+and `.claude/agents/`. A helper that runs isolated in a git worktree shows
+its branch and the merge command when it finishes (a `subagent_result` event
+in `--json` mode), and commits with your git identity. To run a whole session
+on its own branch, start it with `--worktree <name>`.
+
 ## MCP servers
 
 buildwithnexus is a full [Model Context Protocol](https://modelcontextprotocol.io)
@@ -498,8 +805,9 @@ client. Configure servers under `mcp_servers` in `~/.buildwithnexus/settings.jso
 | `timeout_secs` | Per-request deadline (default `30`). A server that hangs or exits is reported once and its tools drop out for the session. |
 | `enabled` | `false` keeps the entry but never connects. |
 
-Servers connect lazily in the background on the first prompt (`--json`
-headless runs connect before the first request); each one logs
+Servers connect lazily in the background on the first prompt (headless runs
+connect before the first request, waiting at most 5 s, or a server's own
+`timeout_secs`, and skip a server that is not ready with a notice); each one logs
 `mcp: <name> connected, N tools` or its error. Discovered tools are advertised
 to the model as **`mcp__<server>__<tool>`** with the server's own description
 and input schema, and answer over the persistent connection. They count as
@@ -513,14 +821,16 @@ connection.
 ```
 /mcp                                   servers: transport, status, tool count
 /mcp <name>                            a server's tools with descriptions
-/mcp add <name> <command> [args...]    stdio server → settings.json, then reconnect
-/mcp add <name> --url <url> [--header K=V]... [--timeout <secs>]
+/mcp add [--force] <name> <command> [args...]   stdio server → settings.json, then reconnect
+/mcp add [--force] <name> --url <url> [--header K=V]... [--timeout <secs>]
 /mcp remove <name>
 /mcp reload                            reconnect every server
 ```
 
 `buildwithnexus mcp list|<name>|add|remove|reload` mirrors this for scripts
-(`add`/`remove` only edit the settings file; `list` connects). `/doctor` and
+(`add`/`remove` only edit the settings file; `list` connects). `add` refuses
+to replace a server that already has that name (exit 1) unless you pass
+`--force`. `/doctor` and
 `buildwithnexus doctor` connect to every configured server and report the
 outcome. Legacy SSE-only (`type: "sse"`) servers are not supported.
 
@@ -610,8 +920,13 @@ HTTP, the update check) use the standard proxy variables: `HTTPS_PROXY`,
 host names (`corp.example` also covers its subdomains; `.corp.example` and
 `*.corp.example` mean the same), IP addresses, CIDR blocks such as
 `10.0.0.0/8`, and `*`. The proxy URL must be `http://`, optionally with
-`user:password@`. Local model servers on `localhost`, `127.0.0.1`, `::1` or
-`0.0.0.0` are always reached directly.
+`user:password@`; an `https://` proxy URL fails at once. Local model servers
+on `localhost`, `127.0.0.1`, `::1` or `0.0.0.0` are always reached directly,
+and so are model servers on private, link-local, CGNAT (100.64/10) or IPv6
+unique-local addresses, or host names that resolve only to them, as they were
+before 0.15 (`BWN_PROXY_PRIVATE=1` sends those through the proxy). A proxy
+failure names the proxy and its variable: not answering, 407, rejected
+credentials, or a refused tunnel.
 
 HTTPS is checked against bwn's bundled roots plus the operating system's
 certificate store, so a TLS-inspecting proxy whose root certificate IT
@@ -627,7 +942,8 @@ To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
 ## Safety
 
 - Default permission is **ask** — every file write, edit, and command is
-  confirmed. `auto` ("yolo") and `readonly` are opt-in.
+  confirmed. `accept-edits`, `auto` ("yolo") and `readonly` are opt-in, and
+  deny rules hold in every mode.
 - Mutating file tools (write/edit/patch) are confined to the working directory —
   writes outside it require explicit confirmation. Reads are unconfined, but
   sensitive paths (the key store, `~/.ssh`, `.env`, `*.pem`) require
@@ -635,10 +951,17 @@ To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
 - API keys are never sent to a non-HTTPS endpoint, and key-like tokens are
   redacted from surfaced errors.
 - In non-interactive / `--json` runs, anything that would prompt is denied
-  rather than blocking.
+  rather than blocking, and the run exits 3.
+- Commands the agent runs never inherit provider keys (`*_API_KEY`,
+  `*_API_TOKEN`, `HF_TOKEN`); see [Permissions](#permissions).
+- The file tools (`grep_files`, `find_files`, `find_paths`, `list_tree`) and
+  `@` completion skip what `.gitignore` ignores and Python virtualenvs, and
+  never list `.env` and other sensitive files, even when a `.gitignore` line
+  un-ignores them. `read_file` still reads an ignored file by path.
 - Every write is checkpointed before it happens; bare `/undo` reverts the
-  whole last agent turn. Failure modes, checkpoint mechanics, and what is
-  deliberately **not** protected: [RECOVERY.md](RECOVERY.md).
+  whole last agent turn and asks before overwriting your own later edits.
+  Failure modes, checkpoint mechanics, and what is deliberately **not**
+  protected: [RECOVERY.md](RECOVERY.md).
 
 ## License
 

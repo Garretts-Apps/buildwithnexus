@@ -184,16 +184,24 @@ shows whether a given file is signed.
   hook scripts, with
   `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File <script>`; and `npm install -g buildwithnexus` only when the user
-  sets `auto_update` to `"install"` or `"install-any"`.
+  runs `buildwithnexus update` or sets `auto_update` to `"install"` or
+  `"install-any"`. It never installs other software: `buildwithnexus doctor`
+  prints the install command for a missing tool and runs none. Commands the
+  agent runs do not inherit provider keys (variables ending in `_API_KEY` or
+  `_API_TOKEN`, and `HF_TOKEN`) unless the user lists them in
+  `shell_env_passthrough`.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
-  `localhost:11434`); `lite.duckduckgo.com`, and the pages the agent fetches
-  when the model uses the web tools (each new host needs the user's approval
-  outside `auto` mode); MCP servers the user configures; and a
-  daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
-  There is no telemetry or analytics. All of these go through the proxy
-  named by `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` unless `NO_PROXY`
-  matches the host; loopback addresses never do. Certificates are checked
+  `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
+  the agent fetches when the model uses the web tools (each new host,
+  including the search host, needs the user's approval outside `auto` mode);
+  MCP servers the user configures; and a daily `registry.npmjs.org` version
+  check unless `auto_update` is `"off"` (`BWN_UPDATE_REGISTRY` or
+  `npm_config_registry` points it at a mirror). There is no telemetry or
+  analytics. All of these go through the proxy named by `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` unless `NO_PROXY` matches the host; loopback
+  addresses never do, and neither do model servers on private, link-local,
+  CGNAT or IPv6 unique-local addresses unless `BWN_PROXY_PRIVATE=1`. Certificates are checked
   against the bundled webpki roots plus the OS certificate store, or plus
   `SSL_CERT_FILE`/`SSL_CERT_DIR` when set, so a TLS-inspecting proxy with an
   installed root works. Through a proxy, the proxy resolves host names, so
@@ -201,19 +209,25 @@ shows whether a given file is signed.
   metadata address is the proxy's to make; bwn still refuses those
   addresses and the metadata host names given literally, at every redirect
   hop.
-- **Files:** its settings, sessions and checkpoints under
-  `~/.buildwithnexus` (or `NEXUS_HOME`), and there, in `bin/<version>/`, the
-  binary the npm launcher downloaded; pasted images as `bwn-paste-*.png`
-  in the temp directory; and the files the user asks it to edit in the
-  working directory.
+- **Files:** its settings, keys (`.env.keys`), sessions, checkpoints,
+  traces, conversation exports (`exports/`), which upgrade notices were shown
+  (`notices.json`) and whether each saved key passed its last check
+  (`key-checks.json`, a hash, never the key) under `~/.buildwithnexus` (or
+  `NEXUS_HOME`), and there, in `bin/<version>/`, the binary the npm launcher
+  downloaded; pasted images as `bwn-paste-*.png` in the temp directory; the
+  files the user asks it to edit in the working directory; and, with
+  `--worktree <name>`, a git worktree in `.bwn/worktrees/<name>` (listed in
+  the repository's `.git/info/exclude`).
 - **Not done:** no services, scheduled tasks, startup entries, registry
   writes, drivers, or elevation.
 
 Controls an organization can set: `"auto_update": "off"`,
-`"permission": "ask"` or `"readonly"`, `BWN_SKIP_INSTALL=1` (no first-run
-download), `BWN_BIN` (run a binary IT placed and verified itself), and
-`BWN_TLS_ROOTS=bundled` (trust only the roots built into the binary, not the
-OS store or `SSL_CERT_FILE`).
+`"permission": "ask"`, `"accept-edits"` or `"readonly"`, `permissions.deny`
+rules (for example `run_command(git push*)`) and `network.deny` hosts, which
+refuse in every mode and which a project's settings cannot remove,
+`BWN_SKIP_INSTALL=1` (no first-run download), `BWN_BIN` (run a binary IT
+placed and verified itself), and `BWN_TLS_ROOTS=bundled` (trust only the
+roots built into the binary, not the OS store or `SSL_CERT_FILE`).
 
 ### Why endpoint protection may block it
 
@@ -323,13 +337,16 @@ never auto-updated.
   `main`, and a newly created tag points at the commit the workflow built.
 - Inside the harness itself: mutating file tools are gated by the permission
   model, sensitive paths and catastrophic commands require confirmation even in
-  `auto`, API keys are refused over non-HTTPS endpoints, and key-like tokens are
-  redacted from surfaced errors.
+  `auto` (also when they are the command of `check_work` or `start_server`),
+  API keys are refused over non-HTTPS endpoints, typed hidden and saved only
+  after the provider accepts them, key-like tokens are redacted from surfaced
+  errors, and provider keys are removed from the environment of the commands
+  the agent runs.
 
 ## Permission Gates and the Optional Sandbox
 
-`ask` / `auto` / `readonly` modes, protected paths, and checkpoints are
-guardrails against mistakes. They are **not OS-level isolation**. An approved
+`ask` / `accept-edits` / `auto` / `readonly` modes, allow, ask and deny
+rules, protected paths, and checkpoints are guardrails against mistakes. They are **not OS-level isolation**. An approved
 command runs with your user's permissions, and checkpoints can rewind file
 edits in the working tree but not network calls, pushed commits, published
 packages, or other external effects.
