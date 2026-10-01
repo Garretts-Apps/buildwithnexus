@@ -3582,6 +3582,7 @@ fn build_turn(
                         id: call.id.clone(),
                         content: String::new(),
                         is_error: false,
+                        images: Vec::new(),
                     });
                     continue;
                 }
