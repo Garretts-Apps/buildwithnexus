@@ -2250,7 +2250,11 @@ pub(crate) fn gate(
                 return None;
             }
             if tools::is_mutating_call(name, input) {
-                return confirm_tool(&tools::approval_label(name, input), &tool_key, cwd);
+                let mut label = tools::approval_label(name, input);
+                if let Some(note) = checkpoint::undo_note(&paths) {
+                    label = format!("{label} · {note}");
+                }
+                return confirm_tool(&label, &tool_key, cwd);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.
@@ -2610,6 +2614,13 @@ pub fn run_build_session_with_images(
     // only records which session and gate it runs under, then fires Stop.
     crate::session::set_current(sid);
     hooks::set_permission_mode(permission_name(perm));
+    let pruned = checkpoint::begin_turn(cwd, task);
+    if pruned > 0 {
+        report::info(&format!(
+            "  pruned {pruned} old checkpoints — this folder keeps the newest {}",
+            checkpoint::KEEP_CHECKPOINTS
+        ));
+    }
     let r = build_turn(
         p,
         perm,
@@ -2622,6 +2633,9 @@ pub fn run_build_session_with_images(
         images,
     )
     .map(|_| ());
+    // What the turn left each file as, so /undo can tell a later hand edit,
+    // and which changes no checkpoint covers.
+    checkpoint::end_turn(cwd);
     hooks::notify("Stop", cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
@@ -2644,7 +2658,8 @@ impl Drop for AgentRunningGuard {
     }
 }
 
-// A fresh transcript gets the system prompt first; then the turn's user
+// A fresh transcript gets the system prompt first, and one carried in from
+// another mode gets the build prompt in its place; then the turn's user
 // message, multimodal when images are attached, so a first-prompt image never
 // displaces the system prompt.
 fn open_turn(
@@ -2653,8 +2668,19 @@ fn open_turn(
     task: &str,
     images: Vec<(String, String)>,
 ) {
-    if msgs.is_empty() {
-        msgs.push(Msg::System(system()));
+    match msgs.first() {
+        None => msgs.push(Msg::System(system())),
+        // A conversation carried in from BRAINSTORM, PLAN or a chat turn
+        // gets the build prompt in place of theirs.
+        Some(Msg::System(s))
+            if [BRAINSTORM_HEAD, PLAN_HEAD, CHAT_HEAD]
+                .iter()
+                .any(|h| s.starts_with(h)) =>
+        {
+            msgs[0] = Msg::System(system());
+        }
+        Some(Msg::System(_)) => {}
+        Some(_) => msgs.insert(0, Msg::System(system())),
     }
     msgs.push(user_msg(task.to_string(), images));
 }
@@ -4178,12 +4204,52 @@ pub fn run_plan(
     auto_approve: bool,
     images: Vec<(String, String)>,
 ) -> Result<(), String> {
-    let _running_guard = AgentRunningGuard::new();
+    let mut transcript = Vec::new();
+    plan_turn(
+        p,
+        perm,
+        task,
+        cwd,
+        auto_approve,
+        images,
+        &mut transcript,
+        &crate::session::claim_or_new(),
+    )
+    .map(|_| ())
+}
+
+/// How a PLAN turn ended. The REPL leaves PLAN only when the person chose to
+/// execute the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanEnd {
+    /// The approved plan ran in BUILD.
+    Executed,
+    /// Cancel or Esc at the plan selector.
+    Cancelled,
+    /// No plan was made: a plain answer, or the budget stopped the turn.
+    Answered,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_turn(
+    p: &Provider,
+    perm: Permission,
+    task: &str,
+    cwd: &Path,
+    auto_approve: bool,
+    images: Vec<(String, String)>,
+    transcript: &mut Vec<Msg>,
+    sid: &str,
+) -> Result<PlanEnd, String> {
+    crate::session::set_current(sid);
+    let running = AgentRunningGuard::new();
     // Hooks see the phase's real gate, not the session permission.
     hooks::set_permission_mode("plan");
-    // Role identity + mode contract come first; environment sections follow.
-    let prefix = context_prefix(cwd, p.context_tokens);
-    let sys = format!(
+    // Planning reads the whole conversation under the PLAN prompt.
+    let mut msgs = transcript.clone();
+    use_system(&mut msgs, PLAN_HEAD, || {
+        let prefix = context_prefix(cwd, p.context_tokens);
+        let sys = format!(
         "You are bwn in PLAN mode: an expert software architect and technical lead working out an implementation plan with the user. \
         You have full read access to inspect the codebase as needed. Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
         When the user gives you a high-level or underspecified task (or when key choices like tech stack, exit conditions, or edge case handling are ambiguous): \
@@ -4192,11 +4258,205 @@ pub fn run_plan(
         Do not list raw tool names (like read_file or write_file) as plan steps. \
         If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
     );
+        sys
+    });
+    msgs.push(user_msg(task.into(), images.clone()));
+    let drafted = draft_plan(p, cwd, task, &mut msgs)?;
 
+    // The planning response is complete (a plan, or a natural reply).
+    hooks::notify("Stop", cwd);
+    let plan_text = match drafted {
+        Draft::Plan(text) => text,
+        Draft::Answer(text) => {
+            record_plan_exchange(transcript, &msgs, task, images, &text);
+            crate::session::save(sid, cwd, &p.model, transcript);
+            return Ok(PlanEnd::Answered);
+        }
+        Draft::Stopped => return Ok(PlanEnd::Answered),
+    };
+    let mut plan_text = plan_text;
+    let mut steps = parse_plan_steps(&plan_text);
+    if !plan_steps_are_actionable(&steps) {
+        return Err(
+            "planning did not produce an actionable numbered or bulleted plan after recovery attempts"
+                .into(),
+        );
+    }
+    report::plan(&steps);
+    // The conversation keeps the question and the plan; the planning tool
+    // rounds stay out of it.
+    record_plan_exchange(transcript, &msgs, task, images, &plan_text);
+    crate::session::save(sid, cwd, &p.model, transcript);
+
+    if auto_approve {
+        report::info("  ✓ plan auto-approved (--yes) — executing");
+    } else {
+        let items = vec![
+            tui::SelectItem {
+                label: "Execute Plan".into(),
+                detail: "Switch to BUILD mode and start implementing".into(),
+            },
+            tui::SelectItem {
+                label: "Edit Step".into(),
+                detail: "Modify one of the plan steps".into(),
+            },
+            tui::SelectItem {
+                label: "Cancel".into(),
+                detail: "Keep the plan in the conversation without executing".into(),
+            },
+            // Last, so the 0.14 positions (and ↓↓ Enter to cancel) still hold.
+            tui::SelectItem {
+                label: "Revise Plan".into(),
+                detail: "Say what to change and get a revised plan".into(),
+            },
+        ];
+        loop {
+            show_plan(&steps, items.len());
+            match tui::select_item("Approve Plan", &items) {
+                Some(0) => break, // Execute Plan: explicitly selected
+                Some(3) => {
+                    let Some(feedback) = tui::ask("  what should change? ")
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                    else {
+                        continue;
+                    };
+                    let current = numbered_plan(&steps);
+                    push_revision(&mut msgs, &current, &feedback);
+                    match draft_plan(p, cwd, task, &mut msgs)? {
+                        Draft::Plan(text)
+                            if plan_steps_are_actionable(&parse_plan_steps(&text)) =>
+                        {
+                            plan_text = text;
+                            steps = parse_plan_steps(&plan_text);
+                            report::plan(&steps);
+                        }
+                        Draft::Stopped => return Ok(PlanEnd::Answered),
+                        Draft::Plan(text) | Draft::Answer(text) => plan_text = text,
+                    }
+                    transcript.push(Msg::User(revision_request(&feedback)));
+                    transcript.push(Msg::Assistant {
+                        text: plan_text.clone(),
+                        calls: vec![],
+                    });
+                    crate::session::save(sid, cwd, &p.model, transcript);
+                }
+                Some(1) => {
+                    let step_items: Vec<tui::SelectItem> = steps
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| tui::SelectItem {
+                            label: format!("{}. {}", i + 1, s),
+                            detail: "Select step to edit".into(),
+                        })
+                        .collect();
+                    if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
+                        tui::line(&tui::dim(&format!(
+                            "  step {} now: {}",
+                            idx + 1,
+                            tui::sanitize_terminal(&steps[idx])
+                        )));
+                        let prompt = format!("  edit step {} (Enter keeps it): ", idx + 1);
+                        if let Some(new_text) = tui::ask(&prompt) {
+                            if !new_text.trim().is_empty() {
+                                steps[idx] = new_text.trim().to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    tui::line(&tui::yellow(
+                        "  cancelled — still in PLAN; say what to change for a revised plan",
+                    ));
+                    return Ok(PlanEnd::Cancelled);
+                }
+            }
+        }
+    }
+
+    let full = approved_plan_build_task(task, &numbered_plan(&steps));
+    drop(running);
+    run_build_session_with_images(p, perm, "engineer", &full, cwd, transcript, sid, Vec::new())
+        .map(|_| PlanEnd::Executed)
+}
+
+fn numbered_plan(steps: &[String]) -> String {
+    steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {}", i + 1, s))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// The plan above the approval selector. The selector draws over the rows
+// just above the composer, so blank rows keep the plan in view under it.
+fn show_plan(steps: &[String], selector_items: usize) {
+    tui::line("");
+    tui::line(&tui::accent("  Plan"));
+    // Steps are the model's plan text.
+    for (i, s) in steps.iter().enumerate() {
+        tui::line(&format!("  {}. {}", i + 1, tui::sanitize_terminal(s)));
+    }
+    tui::line("");
+    if tui::is_raw() {
+        for _ in 0..selector_items + 2 {
+            tui::line("");
+        }
+    }
+}
+
+fn revision_request(feedback: &str) -> String {
+    format!(
+        "Revise the plan: {feedback}\n\
+         Keep the steps that still apply and give the complete revised plan."
+    )
+}
+
+// Continues the planning conversation with the plan as it stands (including
+// any step edits) and the person's feedback, so the next draft builds on it.
+fn push_revision(msgs: &mut Vec<Msg>, current_plan: &str, feedback: &str) {
+    msgs.push(Msg::Assistant {
+        text: current_plan.to_string(),
+        calls: vec![],
+    });
+    msgs.push(Msg::User(revision_request(feedback)));
+}
+
+// What a planning loop produced.
+enum Draft {
+    Plan(String),
+    /// A plain reply to a question or small talk, already shown.
+    Answer(String),
+    /// The budget stopped the turn.
+    Stopped,
+}
+
+// Appends the PLAN question and its answer (the plan text) to the shared
+// conversation, starting it with the PLAN prompt when it was empty.
+fn record_plan_exchange(
+    transcript: &mut Vec<Msg>,
+    planning: &[Msg],
+    task: &str,
+    images: Vec<(String, String)>,
+    answer: &str,
+) {
+    if transcript.is_empty() {
+        if let Some(sys @ Msg::System(_)) = planning.first() {
+            transcript.push(sys.clone());
+        }
+    }
+    transcript.push(user_msg(task.to_string(), images));
+    transcript.push(Msg::Assistant {
+        text: answer.to_string(),
+        calls: vec![],
+    });
+}
+
+// The planning loop: read-only tool rounds until the model produces a plan
+// (or a plain answer).
+fn draft_plan(p: &Provider, cwd: &Path, task: &str, msgs: &mut Vec<Msg>) -> Result<Draft, String> {
     let defs = tools::defs_readonly(); // planning inspects context but never writes
-                                       // The approved plan executes with the same images the plan was made from.
-    let exec_images = images.clone();
-    let mut msgs = vec![Msg::System(sys), user_msg(task.into(), images)];
     let mut loop_guard = ToolLoopGuard::default();
     let mut tool_rounds = 0usize;
     let mut plan_format_recovery_count = 0usize;
@@ -4211,10 +4471,10 @@ pub fn run_plan(
             ));
         }
         if budget_exhausted() {
-            return Ok(());
+            return Ok(Draft::Stopped);
         }
-        maybe_compact(p, &mut msgs);
-        let reply = request_reply(p, &msgs, &defs, "planning")?;
+        maybe_compact(p, msgs);
+        let reply = request_reply(p, msgs, &defs, "planning")?;
         let reply = normalize_text_tool_calls(reply, &defs, task);
 
         if reply.calls.is_empty() {
@@ -4226,7 +4486,7 @@ pub fn run_plan(
             // want gone. (A real task with junk output still falls through to the
             // recovery path below, because task_is_plannable stays true for it.)
             if !plan_steps_are_actionable(&candidate_steps) && !task_is_plannable(task) {
-                return Ok(());
+                return Ok(Draft::Answer(reply.text));
             }
             if !plan_steps_are_actionable(&candidate_steps) && plan_format_recovery_count < 2 {
                 plan_format_recovery_count += 1;
@@ -4437,82 +4697,7 @@ pub fn run_plan(
             msgs.push(Msg::User(nudge));
         }
     };
-
-    let mut steps = parse_plan_steps(&plan_text);
-    // The planning response is complete (a plan, or a natural reply above).
-    hooks::notify("Stop", cwd);
-    if !plan_steps_are_actionable(&steps) {
-        return Err(
-            "planning did not produce an actionable numbered or bulleted plan after recovery attempts"
-                .into(),
-        );
-    }
-    report::plan(&steps);
-
-    if auto_approve {
-        report::info("  ✓ plan auto-approved (--yes) — executing");
-    } else {
-        loop {
-            tui::line("");
-            tui::line(&tui::accent("  Plan"));
-            // Steps are the model's plan text.
-            for (i, s) in steps.iter().enumerate() {
-                tui::line(&format!("  {}. {}", i + 1, tui::sanitize_terminal(s)));
-            }
-            tui::line("");
-            let items = vec![
-                tui::SelectItem {
-                    label: "Execute Plan".into(),
-                    detail: "Switch to BUILD mode and start implementing".into(),
-                },
-                tui::SelectItem {
-                    label: "Edit Step".into(),
-                    detail: "Modify one of the plan steps".into(),
-                },
-                tui::SelectItem {
-                    label: "Cancel".into(),
-                    detail: "Cancel planning without executing".into(),
-                },
-            ];
-            match tui::select_item("Approve Plan", &items) {
-                Some(0) => break, // Execute Plan: explicitly selected
-                Some(1) => {
-                    let step_items: Vec<tui::SelectItem> = steps
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| tui::SelectItem {
-                            label: format!("{}. {}", i + 1, s),
-                            detail: "Select step to edit".into(),
-                        })
-                        .collect();
-                    if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
-                        if let Some(new_text) = tui::ask(&format!("  edit step {}: ", idx + 1)) {
-                            if !new_text.trim().is_empty() {
-                                steps[idx] = new_text.trim().to_string();
-                            }
-                        }
-                    }
-                }
-                Some(2) | None => {
-                    tui::line(&tui::yellow("  cancelled"));
-                    return Ok(());
-                }
-                _ => {
-                    tui::line(&tui::yellow("  cancelled"));
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    let plan = steps
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{}. {}", i + 1, s))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let full = approved_plan_build_task(task, &plan);
-    run_build(p, perm, "engineer", &full, cwd, exec_images)
+    Ok(Draft::Plan(plan_text))
 }
 
 fn approved_plan_build_task(task: &str, plan: &str) -> String {
@@ -4528,13 +4713,48 @@ fn approved_plan_build_task(task: &str, plan: &str) -> String {
     )
 }
 
+// ── One conversation in every mode ─────────────────────────────────────────────
+// BRAINSTORM, PLAN, BUILD and conversational turns all read and extend the
+// same transcript, and every turn is saved to the session. Each mode keeps
+// its own system prompt: a turn puts its mode's prompt at the head of the
+// conversation (see open_turn and use_system) and leaves the messages after
+// it as they are.
+const BRAINSTORM_HEAD: &str = "You are a sharp, concise thought partner";
+const PLAN_HEAD: &str = "You are bwn in PLAN mode";
+const CHAT_HEAD: &str = "You are buildwithnexus in a coding terminal";
+
+// This mode's system prompt at the head of a shared conversation; a prompt
+// from another mode is replaced, the messages after it are kept.
+fn use_system(msgs: &mut Vec<Msg>, head: &str, system: impl FnOnce() -> String) {
+    match msgs.first() {
+        Some(Msg::System(s)) if s.starts_with(head) => {}
+        Some(Msg::System(_)) => msgs[0] = Msg::System(system()),
+        _ => msgs.insert(0, Msg::System(system())),
+    }
+}
+
+// An interrupted reply ends the turn quietly, like an interrupted build
+// turn; the question stays in the conversation.
+fn interrupted_turn(e: &str) -> bool {
+    if !e.contains("interrupted") {
+        return false;
+    }
+    let msg = match tui::consume_interrupt() {
+        tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
+        _ => "  ⚠ interrupted",
+    };
+    report::notice(msg);
+    true
+}
+
 // ── BRAINSTORM mode ───────────────────────────────────────────────────────────
 // Brainstorm is conversational with read-only tool access: the model can grep,
 // read files, fetch URLs, and run read-only commands when the conversation
-// calls for it, but never writes — exactly like PLAN. (Action-like prompts are
-// auto-escalated to BUILD by the REPL before they get here.) It also has a
+// calls for it, but never writes — exactly like PLAN. It also has a
 // mode-transition sensor: if it detects the user wants to build or plan, it
-// suggests switching.
+// suggests switching, and the person decides.
+
+/// One headless BRAINSTORM turn, saved as its own session.
 pub fn run_brainstorm(
     p: &Provider,
     // Unused: BRAINSTORM gates as read-only whatever the session permission.
@@ -4543,289 +4763,364 @@ pub fn run_brainstorm(
     first: &str,
     images: Vec<(String, String)>,
 ) -> Result<Option<ModeHint>, String> {
-    // Held only while the model works: the footer's "working · Esc to
-    // interrupt" must not stay up while the follow-up prompt waits on you.
-    let mut running = Some(AgentRunningGuard::new());
+    let mut transcript = Vec::new();
+    brainstorm_turn(
+        p,
+        cwd,
+        first,
+        images,
+        &mut transcript,
+        &crate::session::claim_or_new(),
+    )
+}
+
+/// One BRAINSTORM turn on the session's conversation. The REPL's composer is
+/// the follow-up prompt; this returns after the reply, saved, with the mode
+/// the person chose when the model suggested switching.
+pub fn brainstorm_turn(
+    p: &Provider,
+    cwd: &Path,
+    question: &str,
+    images: Vec<(String, String)>,
+    msgs: &mut Vec<Msg>,
+    sid: &str,
+) -> Result<Option<ModeHint>, String> {
+    crate::session::set_current(sid);
+    let running = AgentRunningGuard::new();
     hooks::set_permission_mode("readonly");
     // Role identity + mode contract come first; environment sections follow.
-    let prefix = context_prefix(cwd, p.context_tokens);
-    let sys = format!("You are a sharp, concise thought partner with read access to the codebase and the internet. \
+    use_system(msgs, BRAINSTORM_HEAD, || {
+        let prefix = context_prefix(cwd, p.context_tokens);
+        format!("You are a sharp, concise thought partner with read access to the codebase and the internet. \
         Use tools freely to look things up, read files, grep for patterns, or run read-only commands — \
         whatever helps the conversation. \
         This mode is read-only: do not write or edit files, apply patches, spawn subagents, or run mutating shell commands. \
         If the user wants changes made, say so and suggest switching modes. \
         When you think the user is ready to stop discussing and start building or planning, \
         end your response with the exact token [SUGGEST:BUILD] or [SUGGEST:PLAN] on its own line. \
-        Otherwise just respond naturally. No fluff.\n\n{prefix}");
+        Otherwise just respond naturally. No fluff.\n\n{prefix}")
+    });
+    msgs.push(user_msg(question.to_string(), images));
+    let r = brainstorm_reply(p, cwd, question, msgs);
+    // The reply is complete — the agent stopped responding for this turn.
+    hooks::notify("Stop", cwd);
+    crate::session::save(sid, cwd, &p.model, msgs);
+    drop(running);
+    let reply_text = match r {
+        Ok(t) => t,
+        Err(e) if interrupted_turn(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
 
+    // A suggestion to switch modes needs someone to answer it: never in
+    // --json output or without a terminal.
+    let hint = if reply_text.contains("[SUGGEST:BUILD]") {
+        Some(ModeHint::Build)
+    } else if reply_text.contains("[SUGGEST:PLAN]") {
+        Some(ModeHint::Plan)
+    } else {
+        None
+    };
+    let Some(h) = hint else {
+        return Ok(None);
+    };
+    if report::is_json() || !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    tui::line("");
+    let suggestion = match h {
+        ModeHint::Build => "switch to BUILD mode and implement this?",
+        ModeHint::Plan => "switch to PLAN mode and break this down?",
+    };
+    tui::line(&tui::yellow(&format!("  ↪ AI suggests: {suggestion}")));
+    tui::line(&tui::dim("  (y to switch, anything else to keep chatting)"));
+    let ans = tui::ask("  ").unwrap_or_default();
+    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
+        return Ok(Some(h));
+    }
+    Ok(None)
+}
+
+// Consumes tool calls until the model gives a text answer, which it returns
+// (already pushed to `msgs`).
+fn brainstorm_reply(
+    p: &Provider,
+    cwd: &Path,
+    question: &str,
+    msgs: &mut Vec<Msg>,
+) -> Result<String, String> {
     let defs = tools::defs_readonly(); // brainstorm inspects but never writes
-    let mut msgs: Vec<Msg> = vec![Msg::System(sys)];
-    let mut question = first.to_string();
-    let mut images = images;
     let mut loop_guard = ToolLoopGuard::default();
-
+    maybe_compact(p, msgs);
+    let mut tool_rounds = 0usize;
     loop {
-        // Attached images ride on the first question only.
-        msgs.push(user_msg(question.clone(), std::mem::take(&mut images)));
-        maybe_compact(p, &mut msgs);
+        tool_rounds += 1;
+        if tool_rounds > MAX_CHAT_TOOL_ROUNDS {
+            let text = format!(
+                "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
+            );
+            report::assistant(&text);
+            msgs.push(Msg::Assistant {
+                text: text.clone(),
+                calls: vec![],
+            });
+            return Ok(text);
+        }
+        if budget_exhausted() {
+            return Ok(String::new());
+        }
+        tui::line("");
+        let reply = request_reply(p, msgs, &defs, "thinking")?;
+        let reply = normalize_text_tool_calls(reply, &defs, question);
 
-        // Keep consuming tool calls until the model gives a text response.
-        let mut tool_rounds = 0usize;
-        let reply_text = loop {
-            tool_rounds += 1;
-            if tool_rounds > MAX_CHAT_TOOL_ROUNDS {
-                break format!(
-                    "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
-                );
+        if reply.calls.is_empty() {
+            msgs.push(Msg::Assistant {
+                text: reply.text.clone(),
+                calls: vec![],
+            });
+            if !report::is_json() {
+                tui::context_meter(context_used(msgs), p.context_tokens);
             }
-            if budget_exhausted() {
-                return Ok(None);
-            }
-            tui::line("");
-            let reply = request_reply(p, &msgs, &defs, "thinking")?;
-            let reply = normalize_text_tool_calls(reply, &defs, &question);
+            return Ok(reply.text);
+        }
 
-            if reply.calls.is_empty() {
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
-                if !report::is_json() {
-                    tui::context_meter(context_used(&msgs), p.context_tokens);
-                }
-                break reply.text;
-            }
-
-            // Execute tool calls inline.
-            let mut results = Vec::new();
-            let mut loop_summary: Option<String> = None;
-            let mut loop_nudge: Option<String> = None;
-            for call in &reply.calls {
-                if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
-                    let msg = invalid_args_feedback(&call.name, raw, &defs);
-                    report::tool_denied(&msg);
-                    note_loop_result(
-                        &mut loop_guard,
-                        &call.name,
-                        &call.input,
-                        &msg,
-                        true,
-                        &mut loop_nudge,
-                        &mut loop_summary,
-                    );
-                    results.push(ToolResult {
-                        id: call.id.clone(),
-                        content: msg,
-                        is_error: true,
-                    });
-                    continue;
-                }
-                let call_input = tool_input_for_execution(
-                    &call.name,
-                    &call.input,
-                    cwd,
-                    "brainstorm",
-                    0,
-                    &question,
-                );
-                report::tool_call(
-                    &call.name,
-                    &tools::preview(&call.name, &call_input),
-                    &call_input,
-                );
-                trace_tool_call(&call.name, &call_input, "brainstorm", 0);
-                if call.name == "question" || call.name == "AskUserQuestion" {
-                    let (answer, is_error) = answer_question(&call_input);
-                    report::tool_result(&call.name, &answer, is_error);
-                    trace_tool_result(&call.name, &answer, is_error, "brainstorm", 0);
-                    note_loop_result(
-                        &mut loop_guard,
-                        &call.name,
-                        &call_input,
-                        &answer,
-                        is_error,
-                        &mut loop_nudge,
-                        &mut loop_summary,
-                    );
-                    results.push(ToolResult {
-                        id: call.id.clone(),
-                        content: answer,
-                        is_error,
-                    });
-                    continue;
-                }
-                // Read-only regardless of the session gate, like run_plan.
-                let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
-                    phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
-                });
-                if let Some(reason) = reason {
-                    report::tool_denied(&reason);
-                    trace::record_visible(
-                        "tool_denied",
-                        format!("{} denied", call.name),
-                        serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "brainstorm", "depth": 0}),
-                    );
-                    note_loop_result(
-                        &mut loop_guard,
-                        &call.name,
-                        &call_input,
-                        &reason,
-                        true,
-                        &mut loop_nudge,
-                        &mut loop_summary,
-                    );
-                    results.push(ToolResult {
-                        id: call.id.clone(),
-                        content: reason,
-                        is_error: true,
-                    });
-                    continue;
-                }
-                if call.name == "save_memory" {
-                    if let Some(note) = call_input["note"].as_str() {
-                        config::append_memory(note);
-                        let msg = "memory saved".to_string();
-                        report::tool_result(&call.name, &msg, false);
-                        trace_tool_result(&call.name, &msg, false, "brainstorm", 0);
-                        results.push(ToolResult {
-                            id: call.id.clone(),
-                            content: msg,
-                            is_error: false,
-                        });
-                        continue;
-                    }
-                }
-                let out = tools::run(&call.name, &call_input, cwd);
-                hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
-                report::tool_result(&call.name, &out.content, out.is_error);
-                trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
+        // Execute tool calls inline.
+        let mut results = Vec::new();
+        let mut loop_summary: Option<String> = None;
+        let mut loop_nudge: Option<String> = None;
+        for call in &reply.calls {
+            if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                let msg = invalid_args_feedback(&call.name, raw, &defs);
+                report::tool_denied(&msg);
                 note_loop_result(
                     &mut loop_guard,
                     &call.name,
-                    &call_input,
-                    &out.content,
-                    out.is_error,
+                    &call.input,
+                    &msg,
+                    true,
                     &mut loop_nudge,
                     &mut loop_summary,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
-                    content: out.content,
-                    is_error: out.is_error,
+                    content: msg,
+                    is_error: true,
                 });
+                continue;
             }
-            msgs.push(Msg::Assistant {
-                text: assistant_tool_turn_text(reply.text, &reply.calls),
-                calls: reply.calls,
+            let call_input =
+                tool_input_for_execution(&call.name, &call.input, cwd, "brainstorm", 0, question);
+            report::tool_call(
+                &call.name,
+                &tools::preview(&call.name, &call_input),
+                &call_input,
+            );
+            trace_tool_call(&call.name, &call_input, "brainstorm", 0);
+            if call.name == "question" || call.name == "AskUserQuestion" {
+                let (answer, is_error) = answer_question(&call_input);
+                report::tool_result(&call.name, &answer, is_error);
+                trace_tool_result(&call.name, &answer, is_error, "brainstorm", 0);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &answer,
+                    is_error,
+                    &mut loop_nudge,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: answer,
+                    is_error,
+                });
+                continue;
+            }
+            // Read-only regardless of the session gate, like run_plan.
+            let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
+                phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
             });
-            msgs.push(Msg::Tool(results));
-            if !report::is_json() {
-                tui::context_meter(context_used(&msgs), p.context_tokens);
-                tui::poll_typeahead();
+            if let Some(reason) = reason {
+                report::tool_denied(&reason);
+                trace::record_visible(
+                    "tool_denied",
+                    format!("{} denied", call.name),
+                    serde_json::json!({"tool": call.name, "reason": reason, "input": &call_input, "phase": "brainstorm", "depth": 0}),
+                );
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call_input,
+                    &reason,
+                    true,
+                    &mut loop_nudge,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: reason,
+                    is_error: true,
+                });
+                continue;
             }
-            if let Some(loop_msg) = loop_summary {
-                break loop_msg;
+            if call.name == "save_memory" {
+                if let Some(note) = call_input["note"].as_str() {
+                    config::append_memory(note);
+                    let msg = "memory saved".to_string();
+                    report::tool_result(&call.name, &msg, false);
+                    trace_tool_result(&call.name, &msg, false, "brainstorm", 0);
+                    results.push(ToolResult {
+                        id: call.id.clone(),
+                        content: msg,
+                        is_error: false,
+                    });
+                    continue;
+                }
             }
-            if let Some(nudge) = loop_nudge {
-                msgs.push(Msg::User(nudge));
-            }
-        };
-
-        // The reply is complete — the agent stopped responding for this turn.
-        hooks::notify("Stop", cwd);
-
-        drop(running.take());
-
-        // Check for mode-transition suggestion embedded in the reply.
-        let hint = if reply_text.contains("[SUGGEST:BUILD]") {
-            Some(ModeHint::Build)
-        } else if reply_text.contains("[SUGGEST:PLAN]") {
-            Some(ModeHint::Plan)
-        } else {
-            None
-        };
-
-        if let Some(ref h) = hint {
-            tui::line("");
-            let suggestion = match h {
-                ModeHint::Build => "switch to BUILD mode and implement this?",
-                ModeHint::Plan => "switch to PLAN mode and break this down?",
-                ModeHint::CycleMode | ModeHint::Handoff(_) => "cycle to the next mode?",
-            };
-            tui::line(&tui::yellow(&format!("  ↪ AI suggests: {suggestion}")));
-            tui::line(&tui::dim("  (y to switch, anything else to keep chatting)"));
-            let ans = tui::ask("  ").unwrap_or_default();
-            if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
-                return Ok(Some(h.clone()));
-            }
+            let out = tools::run(&call.name, &call_input, cwd);
+            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            report::tool_result(&call.name, &out.content, out.is_error);
+            trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
+            note_loop_result(
+                &mut loop_guard,
+                &call.name,
+                &call_input,
+                &out.content,
+                out.is_error,
+                &mut loop_nudge,
+                &mut loop_summary,
+            );
+            results.push(ToolResult {
+                id: call.id.clone(),
+                content: out.content,
+                is_error: out.is_error,
+            });
         }
-
-        tui::line("");
-        match tui::ask_task(&format!("{} ", tui::blue("you ›"))) {
-            None => return Ok(None),
-            Some(tui::InputEvent::CycleMode) => return Ok(Some(ModeHint::CycleMode)),
-            Some(tui::InputEvent::Text(f)) => {
-                let t = f.trim();
-                if t.is_empty() || t == "exit" || t == "done" {
-                    return Ok(None);
-                }
-                // Commands belong to the REPL, not the model: /exit, /model,
-                // /undo and `!ls` typed here used to be sent as questions.
-                if t.starts_with('/') || t.starts_with('!') {
-                    return Ok(Some(ModeHint::Handoff(t.to_string())));
-                }
-                question = t.to_string();
-                running.get_or_insert_with(AgentRunningGuard::new);
-            }
+        msgs.push(Msg::Assistant {
+            text: assistant_tool_turn_text(reply.text, &reply.calls),
+            calls: reply.calls,
+        });
+        msgs.push(Msg::Tool(results));
+        if !report::is_json() {
+            tui::context_meter(context_used(msgs), p.context_tokens);
+            tui::poll_typeahead();
+        }
+        if let Some(loop_msg) = loop_summary {
+            report::assistant(&loop_msg);
+            msgs.push(Msg::Assistant {
+                text: loop_msg.clone(),
+                calls: vec![],
+            });
+            return Ok(loop_msg);
+        }
+        if let Some(nudge) = loop_nudge {
+            msgs.push(Msg::User(nudge));
         }
     }
 }
 
+/// A conversational turn in BUILD or PLAN ("what does this project do?"),
+/// answered on the session's conversation and saved with it.
 pub fn run_chat_turn(
     p: &Provider,
     perm: Permission,
     cwd: &Path,
     question: &str,
     images: Vec<(String, String)>,
+    msgs: &mut Vec<Msg>,
+    sid: &str,
 ) -> Result<(), String> {
+    crate::session::set_current(sid);
     let _running_guard = AgentRunningGuard::new();
     hooks::set_permission_mode(permission_name(perm));
-    let r = chat_turn_inner(p, perm, cwd, question, images);
-    hooks::notify("Stop", cwd);
-    r
-}
-
-fn chat_turn_inner(
-    p: &Provider,
-    perm: Permission,
-    cwd: &Path,
-    question: &str,
-    images: Vec<(String, String)>,
-) -> Result<(), String> {
-    // Role identity + mode contract come first; environment sections follow.
-    let prefix = context_prefix(cwd, p.context_tokens);
-    let sys = format!(
+    // A chat question keeps whatever prompt the conversation already has;
+    // only a fresh conversation gets the chat prompt.
+    if msgs.is_empty() {
+        let prefix = context_prefix(cwd, p.context_tokens);
+        let sys = format!(
         "You are buildwithnexus in a coding terminal. Answer the user's current message naturally and concisely. \
         If the user asks a normal conversational question or greeting, answer in plain text and do not call tools. \
         If answering well requires inspecting the workspace or environment, use tools, then summarize the result. \
         Do not emit JSON unless a tool call is actually required by the tool protocol.\n\n{prefix}"
     );
+        msgs.push(Msg::System(sys));
+    }
+    msgs.push(user_msg(question.to_string(), images));
+    let r = chat_reply(p, perm, cwd, question, msgs);
+    hooks::notify("Stop", cwd);
+    crate::session::save(sid, cwd, &p.model, msgs);
+    match r {
+        Err(e) if interrupted_turn(&e) => Ok(()),
+        r => r,
+    }
+}
 
+/// `/ask`: answers a side question with the conversation as context,
+/// read-only, and leaves no trace: nothing is added to the transcript or
+/// saved to the session.
+pub fn ask_aside(
+    p: &Provider,
+    cwd: &Path,
+    question: &str,
+    transcript: &[Msg],
+) -> Result<(), String> {
+    let _running_guard = AgentRunningGuard::new();
+    let mut msgs = transcript.to_vec();
+    if msgs.is_empty() {
+        let prefix = context_prefix(cwd, p.context_tokens);
+        msgs.push(Msg::System(format!(
+            "{CHAT_HEAD}. Answer the user's question naturally and concisely.\n\n{prefix}"
+        )));
+    }
+    msgs.push(Msg::User(format!(
+        "{question}\n\n(A side question: answer it briefly; do not change any files.)"
+    )));
+    match chat_reply(p, Permission::ReadOnly, cwd, question, &mut msgs) {
+        Err(e) if interrupted_turn(&e) => Ok(()),
+        r => r,
+    }
+}
+
+// A question can still lead to an edit: what it left each file as is
+// recorded, so /undo asks before overwriting a later hand edit.
+fn chat_reply(
+    p: &Provider,
+    perm: Permission,
+    cwd: &Path,
+    question: &str,
+    msgs: &mut Vec<Msg>,
+) -> Result<(), String> {
+    let started = checkpoint::now_ms();
+    let r = chat_rounds(p, perm, cwd, question, msgs);
+    checkpoint::seal_since(cwd, started);
+    r
+}
+
+fn chat_rounds(
+    p: &Provider,
+    perm: Permission,
+    cwd: &Path,
+    question: &str,
+    msgs: &mut Vec<Msg>,
+) -> Result<(), String> {
     let defs = tools::defs_for_context(false, p.context_tokens);
-    let mut msgs: Vec<Msg> = vec![Msg::System(sys), user_msg(question.to_string(), images)];
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
         if budget_exhausted() {
             return Ok(());
         }
-        maybe_compact(p, &mut msgs);
-        let reply = request_reply(p, &msgs, &defs, "thinking")?;
+        maybe_compact(p, msgs);
+        let reply = request_reply(p, msgs, &defs, "thinking")?;
         let reply = normalize_text_tool_calls(reply, &defs, question);
 
         if reply.calls.is_empty() {
+            msgs.push(Msg::Assistant {
+                text: reply.text.clone(),
+                calls: vec![],
+            });
             if !reply.text.trim().is_empty() && !report::is_json() {
-                tui::context_meter(context_used(&msgs), p.context_tokens);
+                tui::context_meter(context_used(msgs), p.context_tokens);
             }
             return Ok(());
         }
@@ -4920,11 +5215,15 @@ fn chat_turn_inner(
         });
         msgs.push(Msg::Tool(results));
         if !report::is_json() {
-            tui::context_meter(context_used(&msgs), p.context_tokens);
+            tui::context_meter(context_used(msgs), p.context_tokens);
             tui::poll_typeahead();
         }
         if let Some(loop_msg) = loop_summary {
             report::assistant(&loop_msg);
+            msgs.push(Msg::Assistant {
+                text: loop_msg,
+                calls: vec![],
+            });
             return Ok(());
         }
         if let Some(nudge) = loop_nudge {
@@ -4932,10 +5231,65 @@ fn chat_turn_inner(
         }
     }
 
-    report::assistant(&format!(
-        "I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response."
-    ));
+    let text =
+        format!("I stopped after {MAX_CHAT_TOOL_ROUNDS} tool rounds without a final response.");
+    report::assistant(&text);
+    msgs.push(Msg::Assistant {
+        text,
+        calls: vec![],
+    });
     Ok(())
+}
+
+// ── /commit ──────────────────────────────────────────────────────────────────
+// The model only drafts the message. The request carries no tools, so it
+// cannot run `git commit` (or anything else); bwn shows the draft and commits
+// after the person says so.
+const MAX_COMMIT_DIFF_CHARS: usize = 40_000;
+
+fn commit_draft_msgs(stat: &str, diff: &str) -> Vec<Msg> {
+    let cut = truncate_at_char_boundary(diff, MAX_COMMIT_DIFF_CHARS);
+    let more = if cut.len() < diff.len() {
+        "\n[diff truncated]"
+    } else {
+        ""
+    };
+    vec![
+        Msg::System(
+            "You write git commit messages. Reply with the commit message only: a \
+             conventional-commit subject line (`type: summary`, under 72 characters), then \
+             optionally a blank line and a short body. No code fences, quotes or commentary."
+                .into(),
+        ),
+        Msg::User(format!(
+            "Write a commit message for these staged changes.\n\n\
+             [git diff --staged --stat]\n{stat}\n\n[git diff --staged]\n{cut}{more}"
+        )),
+    ]
+}
+
+/// Drafts a commit message for the staged changes. Nothing is committed.
+pub fn draft_commit_message(p: &Provider, stat: &str, diff: &str) -> Result<String, String> {
+    let msgs = commit_draft_msgs(stat, diff);
+    let reply = tui::with_spinner("drafting commit message", || complete(p, &msgs, &[]))?;
+    let text = clean_commit_message(&reply.text);
+    if text.is_empty() {
+        return Err("the model returned an empty commit message".into());
+    }
+    Ok(text)
+}
+
+// Models wrap messages in fences or quotes despite being asked not to.
+fn clean_commit_message(text: &str) -> String {
+    let t = text.trim();
+    let t = match t.strip_prefix("```") {
+        Some(rest) => {
+            let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
+            rest.trim_end().trim_end_matches("```")
+        }
+        None => t,
+    };
+    t.trim().trim_matches(['"', '`']).trim().to_string()
 }
 
 fn trace_tool_call(name: &str, input: &serde_json::Value, phase: &str, depth: usize) {
@@ -4954,20 +5308,173 @@ fn trace_tool_result(name: &str, content: &str, is_error: bool, phase: &str, dep
     );
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeHint {
     Build,
     Plan,
-    CycleMode,
-    /// A slash command or `!shell` line typed at the follow-up prompt; the
-    /// REPL runs it as if it had been typed there.
-    Handoff(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // An OpenAI-compatible server that streams each scripted SSE body in
+    // turn, one per POST.
+    fn sse_server(bodies: Vec<String>) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut bodies = bodies.into_iter();
+            for stream in l.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut first, mut len) = (String::new(), 0usize);
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let _ = reader.read_exact(&mut vec![0u8; len]);
+                if !first.starts_with("POST") {
+                    let _ = write!(stream, "HTTP/1.1 404 X\r\ncontent-length: 0\r\n\r\n");
+                    continue;
+                }
+                let Some(body) = bodies.next() else { break };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn an_edit_in_a_conversational_turn_is_asked_about_before_undo_overwrites_it() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-agent-chat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let args = json!({"path": "notes.txt", "content": "from the agent\n"}).to_string();
+        let call = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "type": "function",
+            "function": {"name": "write_file", "arguments": args}}]}}]});
+        let base = sse_server(vec![
+            format!("data: {call}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Wrote notes.txt.\"}}]}\n\ndata: [DONE]\n\n".to_string(),
+        ]);
+        let p = Provider {
+            protocol: config::Protocol::OpenAi,
+            base_url: base,
+            api_key: None,
+            model: "m".into(),
+            context_tokens: 128_000,
+            temperature: None,
+            max_tokens: None,
+            effort: config::Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        // The chat turn's own loop (run_chat_turn also names the session,
+        // which is process-wide state other tests read).
+        let mut msgs = vec![Msg::User("what notes do we keep?".into())];
+        chat_reply(
+            &p,
+            Permission::Auto,
+            &proj,
+            "what notes do we keep?",
+            &mut msgs,
+        )
+        .unwrap();
+        let notes = proj.join("notes.txt");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "from the agent\n");
+        // Then I edit the file by hand: /undo must see it.
+        std::fs::write(&notes, "from the agent\nand from me\n").unwrap();
+        let all = checkpoint::list(&proj);
+        assert_eq!(all.len(), 1);
+        assert_eq!(checkpoint::changed_after_agent(&proj, &all), vec![notes]);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_conversation_keeps_its_messages_and_takes_each_modes_prompt() {
+        let mut msgs = vec![
+            Msg::System(format!("{BRAINSTORM_HEAD} with read access…")),
+            Msg::User("what does this do?".into()),
+            Msg::Assistant {
+                text: "It greets.".into(),
+                calls: vec![],
+            },
+        ];
+        // BUILD after BRAINSTORM: the build prompt replaces the brainstorm one.
+        open_turn(&mut msgs, || "BUILD PROMPT".into(), "add a flag", vec![]);
+        assert!(matches!(&msgs[0], Msg::System(s) if s == "BUILD PROMPT"));
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(&msgs[1], Msg::User(t) if t == "what does this do?"));
+        // Another BUILD turn keeps it (no rebuild of the prompt).
+        open_turn(&mut msgs, || panic!("kept"), "and tests", vec![]);
+        assert_eq!(msgs.len(), 5);
+        // BRAINSTORM again: its own prompt back at the head, history kept.
+        use_system(&mut msgs, BRAINSTORM_HEAD, || {
+            format!("{BRAINSTORM_HEAD} again")
+        });
+        assert!(matches!(&msgs[0], Msg::System(s) if s.starts_with(BRAINSTORM_HEAD)));
+        assert_eq!(msgs.len(), 5);
+        use_system(&mut msgs, BRAINSTORM_HEAD, || panic!("kept"));
+        // A conversation recorded without a prompt gets one first.
+        let mut bare = vec![Msg::User("hi".into())];
+        open_turn(&mut bare, || "BUILD PROMPT".into(), "go", vec![]);
+        assert!(matches!(&bare[0], Msg::System(_)) && bare.len() == 3);
+    }
+
+    #[test]
+    fn a_revision_carries_the_current_plan_and_the_feedback() {
+        let mut msgs = vec![
+            Msg::System(format!("{PLAN_HEAD}: …")),
+            Msg::User("add a greet function".into()),
+        ];
+        let steps = vec!["Add greet(name)".to_string(), "Add a test".to_string()];
+        push_revision(&mut msgs, &numbered_plan(&steps), "also add a docstring");
+        assert!(matches!(&msgs[2], Msg::Assistant { text, .. }
+            if text == "1. Add greet(name)\n2. Add a test"));
+        assert!(matches!(&msgs[3], Msg::User(t)
+            if t.starts_with("Revise the plan: also add a docstring")
+                && t.contains("Keep the steps that still apply")));
+    }
+
+    #[test]
+    fn commit_drafts_carry_the_diff_and_ask_for_the_message_only() {
+        let msgs = commit_draft_msgs(" app.py | 1 +", "+def greet(): pass");
+        let Msg::System(sys) = &msgs[0] else {
+            panic!("system prompt first")
+        };
+        assert!(sys.contains("commit message only"));
+        let Msg::User(user) = &msgs[1] else {
+            panic!("then the staged diff")
+        };
+        assert!(user.contains(" app.py | 1 +") && user.contains("+def greet(): pass"));
+        let big = "x".repeat(MAX_COMMIT_DIFF_CHARS + 10);
+        let Msg::User(user) = &commit_draft_msgs("", &big)[1] else {
+            panic!()
+        };
+        assert!(user.ends_with("[diff truncated]"));
+        assert_eq!(
+            clean_commit_message("```text\nfeat: add greet helper\n```"),
+            "feat: add greet helper"
+        );
+        assert_eq!(clean_commit_message("\"fix: quote\""), "fix: quote");
+    }
 
     #[test]
     fn answer_input_prompt_is_single_line() {

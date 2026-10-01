@@ -890,8 +890,14 @@ fn hook_payload_carries_session_id_transcript_path_and_permission_mode() {
     let sid = payload["session_id"]
         .as_str()
         .expect("session_id is a string");
-    assert_eq!(sid.len(), 16, "{sid}");
-    assert!(sid.chars().all(|c| c.is_ascii_digit()), "{sid}");
+    // Milliseconds, then a random tag so parallel runs never share a file.
+    let (ms, tag) = sid.split_once('-').expect("time-tag id");
+    assert_eq!(ms.len(), 16, "{sid}");
+    assert!(ms.chars().all(|c| c.is_ascii_digit()), "{sid}");
+    assert!(
+        tag.len() == 8 && tag.chars().all(|c| c.is_ascii_hexdigit()),
+        "{sid}"
+    );
     let transcript = PathBuf::from(payload["transcript_path"].as_str().unwrap());
     assert_eq!(
         transcript,
@@ -2939,4 +2945,286 @@ fn a_file_bigger_than_the_loaded_window_is_refused_before_sending() {
         !posts[1].contains("quick brown fox"),
         "the refused message was sent"
     );
+}
+
+// ── conversation-sessions ───────────────────────────────────────────────────
+
+// Four headless runs started together share one home; each keeps its own
+// session file (ids are time plus a random tag, not the millisecond alone).
+#[test]
+fn parallel_runs_sharing_a_home_keep_separate_sessions() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve((0..8).map(|i| finish(&format!("done {i}"))).collect());
+    write_config(&home, "ollama", "auto", port);
+    let tasks = ["first task", "second task", "third task", "fourth task"];
+    let children: Vec<_> = tasks
+        .iter()
+        .map(|task| {
+            let mut cmd = Command::new(BIN);
+            for var in NET_VARS {
+                cmd.env_remove(var);
+            }
+            cmd.args(["--json", "run", task])
+                .current_dir(&cwd)
+                .env("NEXUS_HOME", &home)
+                .env("NO_COLOR", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn binary")
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let mut titles: Vec<String> = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .map(|p| {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            v["title"].as_str().unwrap().to_string()
+        })
+        .collect();
+    titles.sort();
+    let mut want: Vec<String> = tasks.iter().map(|t| t.to_string()).collect();
+    want.sort();
+    assert_eq!(titles, want);
+}
+
+// A task with quotes, a line break and a tab reaches the model byte for byte,
+// next to an attached file.
+#[test]
+fn a_quoted_multi_line_task_reaches_the_model_unchanged() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("app.py"), "print(int(\"abc\"))\n").unwrap();
+    let (port, posts) = serve_recording(vec![finish("explained")]);
+    write_config(&home, "llamacpp", "auto", port);
+    let task = "why does int(\"abc\") fail with 'abc'?\nsee @app.py\tplease";
+    let r = run(&home, &cwd, task);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    let body: Value = serde_json::from_str(&posts[0]).unwrap();
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .expect("a user message");
+    let content = user["content"].as_str().unwrap();
+    let file = format!("[file: {}]", cwd.join("app.py").display());
+    assert!(
+        content.starts_with(&format!(
+            "why does int(\"abc\") fail with 'abc'?\nsee {file}\tplease\n\n[attached files]\n"
+        )),
+        "{content}"
+    );
+}
+
+// A BRAINSTORM question is saved as a session, and `continue` carries it:
+// the next request holds the earlier question and answer.
+#[test]
+fn a_brainstorm_turn_is_saved_and_continue_carries_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![
+        text("It is a tiny CLI that greets people."),
+        finish("answered"),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+    let first = run_args(
+        &home,
+        &cwd,
+        &["--json", "brainstorm", "what does this project do?"],
+    );
+    assert!(first.success, "stderr: {}", first.stderr);
+    let second = run_args(
+        &home,
+        &cwd,
+        &["--json", "continue", "and how would I add a flag?"],
+    );
+    assert!(second.success, "stderr: {}", second.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    let body: Value = serde_json::from_str(&posts[1]).unwrap();
+    let msgs = body["messages"].as_array().unwrap();
+    let text_of = |m: &Value| m["content"].as_str().unwrap_or("").to_string();
+    let users: Vec<String> = msgs
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(text_of)
+        .collect();
+    assert!(users[0].contains("what does this project do?"), "{users:?}");
+    assert!(users.last().unwrap().contains("how would I add a flag?"));
+    assert!(msgs
+        .iter()
+        .any(|m| m["role"] == "assistant" && text_of(m).contains("tiny CLI that greets")));
+    // The BUILD turn runs under the build prompt, not the brainstorm one.
+    assert!(!text_of(&msgs[0]).starts_with("You are a sharp, concise thought partner"));
+}
+
+// `--json brainstorm` writes only JSON lines, even when the model suggests
+// switching modes (there is nobody to ask), and the result event is last.
+#[test]
+fn json_brainstorm_stdout_is_all_json_ending_with_the_result() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![text("Sounds ready to build.\n[SUGGEST:BUILD]")]);
+    write_config(&home, "llamacpp", "auto", port);
+    let out = Command::new(BIN)
+        .args(["--json", "brainstorm", "should we add a cache?"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(!lines.is_empty());
+    for l in &lines {
+        assert!(serde_json::from_str::<Value>(l).is_ok(), "not JSON: {l:?}");
+    }
+    let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "result", "{stdout}");
+}
+
+// `continue` picks this folder's latest session, and says so when it has to
+// fall back to another folder's.
+#[test]
+fn continue_stays_in_the_folder_or_says_where_it_went() {
+    let home = tmp("home");
+    let a = tmp("proj-a");
+    let b = tmp("proj-b");
+    let (port, posts) = serve_recording(vec![
+        finish("did A"),
+        finish("did B"),
+        finish("continued A"),
+        finish("continued B"),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+    assert!(run(&home, &a, "task in folder A").success);
+    assert!(run(&home, &b, "task in folder B").success);
+    // B was used last, but `continue` in A continues A's session.
+    let r = run_args(&home, &a, &["--json", "continue", "and then?"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let first_user = |body: &str| -> String {
+        let v: Value = serde_json::from_str(body).unwrap();
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    assert!(first_user(&posts.lock().unwrap()[2]).contains("task in folder A"));
+    assert!(
+        !r.stderr.contains("no session in this folder"),
+        "{}",
+        r.stderr
+    );
+    // A folder with no session of its own continues the latest and says so.
+    let c = tmp("proj-c");
+    let r = run_args(&home, &c, &["--json", "continue", "and now?"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("no session in this folder — continuing"),
+        "{}",
+        r.stderr
+    );
+}
+
+// `resume <unknown id>` says so and nothing else, before any startup output.
+#[test]
+fn resume_of_an_unknown_id_says_so_and_nothing_else() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_config(&home, "llamacpp", "auto", 9);
+    let out = Command::new(BIN)
+        .args(["resume", "123"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "no session '123' — bwn sessions lists them"
+    );
+}
+
+// `resume` with no id opens the /resume picker, which needs a terminal:
+// without one it is a usage error, like `continue` with no task.
+#[test]
+fn resume_with_no_id_and_no_terminal_is_a_usage_error() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_config(&home, "llamacpp", "auto", 9);
+    let out = Command::new(BIN)
+        .args(["resume"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bwn sessions lists them"), "{err}");
+}
+
+// `sessions export <id>` writes the conversation as Markdown and prints the
+// path; an unknown id says so.
+#[test]
+fn sessions_export_writes_markdown_and_prints_the_path() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![text("It greets people.")]);
+    write_config(&home, "llamacpp", "auto", port);
+    assert!(run_args(&home, &cwd, &["--json", "brainstorm", "what does it do?"]).success);
+    let id = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap()
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let out = Command::new(BIN)
+        .args(["sessions", "export", &id])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(path, home.join("exports").join(format!("{id}.md")));
+    let md = std::fs::read_to_string(&path).unwrap();
+    assert!(md.starts_with("# what does it do?\n"), "{md}");
+    assert!(md.contains("## You\n\nwhat does it do?\n"), "{md}");
+    assert!(md.contains("## bwn\n\nIt greets people.\n"), "{md}");
+    let missing = Command::new(BIN)
+        .args(["sessions", "export", "123"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no session '123'"));
 }

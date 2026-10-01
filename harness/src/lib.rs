@@ -226,52 +226,9 @@ pub fn run() {
             let (task, images) = headless_attachments(p, &rest(), &cwd);
             agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
         }),
-        "sessions" => {
-            let all = session::list();
-            if all.is_empty() {
-                // Empty output reads as "broken"; say why the list is empty.
-                println!("no saved sessions yet — BUILD sessions are saved as they run.");
-                return;
-            }
-            for s in &all {
-                // Titles come from task text and cwd from the checkout's
-                // folder name, so neither reaches the terminal raw.
-                let title: String = tui::sanitize_terminal(&s.title).chars().take(48).collect();
-                println!(
-                    "  {}  {:<48}  {}",
-                    s.id,
-                    title,
-                    tui::sanitize_terminal(&s.cwd)
-                );
-            }
-            println!();
-            println!(
-                "{}",
-                tui::dim("resume one:  buildwithnexus resume <id> <task>  ·  the latest:  buildwithnexus continue <task>")
-            );
-        }
-        "continue" | "-c" | "--continue" => {
-            headless(&opts, |p, perm, cwd| match session::latest() {
-                Some(s) => {
-                    agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id)
-                }
-                None => Err("no sessions to continue".into()),
-            })
-        }
-        "resume" | "-r" | "--resume" => {
-            let id = args.get(1).cloned().unwrap_or_default();
-            let task = if args.len() > 2 {
-                args[2..].join(" ")
-            } else {
-                String::new()
-            };
-            headless(&opts, |p, perm, cwd| match session::load(&id) {
-                Some(s) => {
-                    agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id)
-                }
-                None => Err(format!("no session '{id}'")),
-            })
-        }
+        "sessions" => sessions_command(&args[1..]),
+        "continue" | "-c" | "--continue" => continue_command(opts.clone(), rest()),
+        "resume" | "-r" | "--resume" => resume_command(opts.clone(), &args[1..]),
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
@@ -979,9 +936,15 @@ fn repl(
     std::thread::spawn(|| check_and_offer_install_dependencies(false));
     update::spawn_check(&settings.auto_update);
 
-    let mut transcript: Vec<provider::Msg> = Vec::new();
-    // The REPL owns the id SessionStart already announced.
-    let mut sid = session::current_or_new();
+    // The REPL owns the id SessionStart already announced: a fresh one, or
+    // the session `bwn continue` / `bwn resume <id>` asked to open.
+    let (mut transcript, mut sid) = match session::take_resume_on_start() {
+        Some(s) => {
+            show_resumed(&s, cwd);
+            (s.msgs, s.id)
+        }
+        None => (Vec::new(), session::current_or_new()),
+    };
     session::set_current(&sid);
     trace::set_session(&sid);
     let mut mode = Mode::Brainstorm;
@@ -991,6 +954,8 @@ fn repl(
     let mut pending_prompt = initial_prompt;
     // The workflow count the queue line last showed.
     let mut shown_active = 0usize;
+    // Where each prompt of this run started, for /rewind.
+    let mut rewind_points: Vec<RewindPoint> = Vec::new();
 
     loop {
         // Tick background workflows and surface any completion notifications
@@ -1288,17 +1253,19 @@ fn repl(
             continue;
         }
 
-        // /btw <context> — inject context into the next agent turn without stopping current work.
+        // /btw <context> — added to the next message sent, without a turn
+        // of its own. /ask is the side question that answers now.
         if let Some(ctx) = t.strip_prefix("/btw ") {
             let ctx = ctx.trim();
             if ctx.is_empty() {
                 tui::line(&tui::red(
-                    "  usage: /btw <context>  e.g. /btw also update the tests",
+                    "  usage: /btw <note>  — adds the note to your next message (e.g. /btw also update the tests); /ask <question> asks aside now",
                 ));
             } else {
                 btw_ctx = Some(ctx.to_string());
                 tui::line(&tui::dim(&format!(
-                    "  ⚑ context queued for next turn: {ctx}"
+                    "  ⚑ noted for your next message: {} — /ask <question> asks aside now",
+                    tui::sanitize_terminal(ctx)
                 )));
             }
             continue;
@@ -1348,6 +1315,7 @@ fn repl(
             "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
             "/clear" => {
                 transcript.clear();
+                rewind_points.clear();
                 usage::forget_last();
                 sid = session::new_id();
                 session::set_current(&sid);
@@ -1358,6 +1326,7 @@ fn repl(
             }
             "/new" => {
                 transcript.clear();
+                rewind_points.clear();
                 usage::forget_last();
                 sid = session::new_id();
                 session::set_current(&sid);
@@ -1366,7 +1335,8 @@ fn repl(
                 continue;
             }
             "/resume" => {
-                handle_resume(&mut transcript, &mut sid);
+                rewind_points.clear();
+                handle_resume(&mut transcript, &mut sid, cwd);
                 usage::forget_last();
                 session::set_current(&sid);
                 trace::set_session(&sid);
@@ -1421,20 +1391,7 @@ fn repl(
                 continue;
             }
             "/commit" => {
-                let task = "Generate a conventional git commit message for the staged changes. Run `git diff --staged` to see what's staged. Then run `git commit -m \"<message>\"` with the generated message. If nothing is staged, remind the user to `git add` files first.";
-                tui::line("");
-                if let Err(e) = agent::run_build_session(
-                    &provider,
-                    perm,
-                    "engineer",
-                    task,
-                    cwd,
-                    &mut transcript,
-                    &sid,
-                ) {
-                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-                }
-                tui::bell();
+                handle_commit(&provider, cwd);
                 continue;
             }
             "/pr" => {
@@ -1467,7 +1424,7 @@ fn repl(
                 continue;
             }
             "/diff" => {
-                handle_diff(cwd);
+                handle_diff(cwd, "");
                 continue;
             }
             "/context" => {
@@ -1490,8 +1447,18 @@ fn repl(
                 handle_checkpoints(cwd);
                 continue;
             }
-            "/undo" | "/rewind" => {
+            "/undo" => {
                 handle_undo(cwd, "");
+                continue;
+            }
+            "/rewind" => {
+                handle_rewind(
+                    &mut transcript,
+                    &mut rewind_points,
+                    &sid,
+                    cwd,
+                    &provider.model,
+                );
                 continue;
             }
             "/grill-me" | "/align" | "/interview" => {
@@ -1629,6 +1596,35 @@ fn repl(
             }
         }
 
+        if let Some(arg) = t.strip_prefix("/diff ") {
+            handle_diff(cwd, arg);
+            continue;
+        }
+
+        if t == "/export" || t.starts_with("/export ") {
+            handle_export(
+                &transcript,
+                &sid,
+                cwd,
+                &provider.model,
+                &t["/export".len()..],
+            );
+            continue;
+        }
+        if t == "/copy" {
+            handle_copy(&transcript);
+            continue;
+        }
+        if t == "/ask" || t.starts_with("/ask ") {
+            handle_ask(&provider, cwd, &transcript, &t["/ask".len()..]);
+            continue;
+        }
+
+        if t == "/rename" || t.starts_with("/rename ") {
+            handle_rename(&sid, &t["/rename".len()..]);
+            continue;
+        }
+
         if let Some(arg) = t
             .strip_prefix("/undo ")
             .or_else(|| t.strip_prefix("/rewind "))
@@ -1730,19 +1726,12 @@ fn repl(
             continue;
         }
 
-        // Mode routing: auto-switch out of BRAINSTORM when the task clearly
-        // demands real work (chat mode can't fulfill "build X"); elsewhere only
-        // hint, and stay quiet for greetings and ordinary questions.
+        // Mode routing: the mode changes only when the person changes it
+        // (Shift+Tab, /mode, "switch to build mode"). A task typed in another
+        // mode gets a one-time hint and is answered where it was typed; a
+        // long paste of notes must never move the session on its own.
         if should_answer_conversationally(t, &mode) {
             last_suggested_mode = None;
-        } else if let Some(new_mode) = auto_switch_mode(t, &mode) {
-            mode = new_mode;
-            last_suggested_mode = None;
-            tui::line(&tui::dim(&format!(
-                "  auto-switched to {} for this task — /mode to switch back",
-                mode_label(&mode)
-            )));
-            tui::show_mode_change(mode_label(&mode));
         } else {
             suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
         }
@@ -1774,21 +1763,41 @@ fn repl(
         }
 
         tui::line("");
+        rewind_points.push(RewindPoint {
+            index: transcript.len(),
+            started_ms: checkpoint::now_ms(),
+            prompt: t.to_string(),
+        });
+        // Every mode reads and extends the one conversation, saved as the
+        // session after each turn.
         let r = if conversational {
-            agent::run_chat_turn(&provider, perm, cwd, t, std::mem::take(&mut image_data))
+            agent::run_chat_turn(
+                &provider,
+                perm,
+                cwd,
+                t,
+                std::mem::take(&mut image_data),
+                &mut transcript,
+                &sid,
+            )
         } else {
             match &mode {
-                Mode::Plan => match agent::run_plan(
+                Mode::Plan => match agent::plan_turn(
                     &provider,
                     perm,
                     t,
                     cwd,
                     false,
                     std::mem::take(&mut image_data),
+                    &mut transcript,
+                    &sid,
                 ) {
-                    Ok(()) => {
-                        mode = Mode::Build;
-                        tui::show_mode_change("BUILD");
+                    Ok(end) => {
+                        let next = mode_after_plan(end);
+                        if !matches!(next, Mode::Plan) {
+                            mode = next;
+                            tui::show_mode_change(mode_label(&mode));
+                        }
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -1803,12 +1812,14 @@ fn repl(
                     &sid,
                     std::mem::take(&mut image_data),
                 ),
-                Mode::Brainstorm => match agent::run_brainstorm(
+                // The person answered y to the model's suggestion to switch.
+                Mode::Brainstorm => match agent::brainstorm_turn(
                     &provider,
-                    perm,
                     cwd,
                     t,
                     std::mem::take(&mut image_data),
+                    &mut transcript,
+                    &sid,
                 ) {
                     Err(e) => Err(e),
                     Ok(None) => Ok(()),
@@ -1820,15 +1831,6 @@ fn repl(
                     Ok(Some(agent::ModeHint::Plan)) => {
                         mode = Mode::Plan;
                         tui::show_mode_change("PLAN");
-                        Ok(())
-                    }
-                    Ok(Some(agent::ModeHint::CycleMode)) => {
-                        mode = mode.next();
-                        tui::show_mode_change(mode_label(&mode));
-                        Ok(())
-                    }
-                    Ok(Some(agent::ModeHint::Handoff(line))) => {
-                        pending_prompt = Some(line);
                         Ok(())
                     }
                 },
@@ -1849,36 +1851,42 @@ fn mode_label(mode: &Mode) -> &'static str {
     }
 }
 
-// Auto-switch when the task phrasing clearly demands a different mode.
-// Conservative matrix: only ever escalates out of BRAINSTORM — a chat mode
-// can't fulfill a build/plan request. A deliberate PLAN gate is never bypassed
-// silently; build-shaped tasks there still get the tip below.
-fn auto_switch_mode(task: &str, current: &Mode) -> Option<Mode> {
-    let target = classify(task);
-    match (&target, current) {
-        // Never auto-switch directly from BRAINSTORM to BUILD — always step through PLAN first.
-        (Mode::Build, Mode::Brainstorm) => Some(Mode::Plan),
-        (Mode::Plan, Mode::Brainstorm) => Some(Mode::Plan),
+// The mode after a PLAN turn: BUILD only when the person chose to execute
+// the plan; Cancel, Esc and a plain answer stay in PLAN.
+fn mode_after_plan(end: agent::PlanEnd) -> Mode {
+    match end {
+        agent::PlanEnd::Executed => Mode::Build,
+        agent::PlanEnd::Cancelled | agent::PlanEnd::Answered => Mode::Plan,
+    }
+}
+
+// A hint when the task phrasing suggests another mode. Only a hint: the
+// mode itself changes only when the person changes it.
+fn mode_hint(task: &str, current: &Mode) -> Option<(&'static str, String)> {
+    match (classify(task), current) {
+        (Mode::Build | Mode::Plan, Mode::Brainstorm) => Some((
+            "PLAN",
+            "  tip: this looks like a task — Shift+Tab for PLAN".to_string(),
+        )),
+        (Mode::Build, Mode::Plan) => Some((
+            "BUILD",
+            "  tip: this looks like a BUILD task — Shift+Tab or /mode to switch".to_string(),
+        )),
         _ => None,
     }
 }
 
-// Suggest switching modes when the task phrasing strongly implies a different mode.
-// Suppresses the tip if it was already shown for this mode combo in the current session.
+// Shows the hint once per mode combination until the mode or the kind of
+// task changes.
 fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
-    let suggested = classify(task);
-    let mismatch = matches!((&suggested, current), (Mode::Build, Mode::Plan));
-    if mismatch {
-        let sug_label = mode_label(&suggested);
-        if *last_suggested != Some(sug_label) {
-            tui::line(&tui::dim(&format!(
-                "  tip: this looks like a {} task — Shift+Tab or /mode to switch",
-                sug_label
-            )));
-            *last_suggested = Some(sug_label);
+    match mode_hint(task, current) {
+        Some((target, hint)) => {
+            if *last_suggested != Some(target) {
+                tui::line(&tui::dim(&hint));
+                *last_suggested = Some(target);
+            }
         }
-    } else {
-        *last_suggested = None;
+        None => *last_suggested = None,
     }
 }
 
@@ -1962,55 +1970,394 @@ fn looks_like_action_request(task: &str) -> bool {
     })
 }
 
-fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
-    let mut sessions = session::list();
-    if sessions.is_empty() {
+// Where a session ran, as a list shows it: "this folder", or the last two
+// parts of its path.
+fn session_folder(s: &session::Session, cwd: &std::path::Path) -> String {
+    if s.is_in(cwd) {
+        return "this folder".to_string();
+    }
+    let parts: Vec<&str> = s.cwd.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    match parts.len() {
+        0 => s.cwd.clone(),
+        1 => parts[0].to_string(),
+        n => format!("…/{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+fn session_row(n: usize, s: &session::Session, cwd: &std::path::Path) -> String {
+    // Titles come from task text and cwd from the checkout's folder name.
+    let label: String = tui::sanitize_terminal(s.label()).chars().take(56).collect();
+    format!(
+        "  {:>3}  {:<9} {:>4} msgs  {}  {}",
+        n,
+        session::ago(s.updated_ms),
+        s.msgs.len(),
+        label,
+        tui::dim(&tui::sanitize_terminal(&session_folder(s, cwd)))
+    )
+}
+
+// A sessions list filtered by what was typed: every word must appear in the
+// label or the folder.
+fn filter_sessions<'a>(all: &'a [session::Session], filter: &str) -> Vec<&'a session::Session> {
+    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
+    all.iter()
+        .filter(|s| {
+            let hay = format!("{} {}", s.label(), s.cwd).to_lowercase();
+            words.iter().all(|w| hay.contains(w))
+        })
+        .collect()
+}
+
+// What a /resume answer means: a pick, a new filter, or cancel.
+#[derive(Debug, PartialEq)]
+enum ResumePick {
+    Cancel,
+    Pick(usize),
+    Missing(usize),
+    Filter(String),
+}
+
+fn resume_pick(answer: Option<&str>, shown: usize) -> ResumePick {
+    let a = answer.map(str::trim).unwrap_or("");
+    if a.is_empty() {
+        return ResumePick::Cancel;
+    }
+    match a.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= shown => ResumePick::Pick(n - 1),
+        Ok(n) => ResumePick::Missing(n),
+        Err(_) => ResumePick::Filter(a.to_string()),
+    }
+}
+
+const RESUME_ROWS: usize = 15;
+
+// /resume: sessions from this folder first, with age, message count and
+// folder; a number picks, text filters, Enter cancels.
+fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String, cwd: &std::path::Path) {
+    let all = session::list_here_first(cwd);
+    if all.is_empty() {
         tui::line(&tui::dim("  no saved sessions yet"));
         return;
     }
-    tui::line(&tui::dim("  recent sessions:"));
-    for (i, s) in sessions.iter().take(15).enumerate() {
-        tui::line(&format!(
-            "  {}  {}",
-            tui::bold(&(i + 1).to_string()),
-            tui::sanitize_terminal(&s.title)
-        ));
-    }
-    let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
-        .as_deref()
-        .map(str::trim)
-        .and_then(|x| x.parse::<usize>().ok());
-    if let Some(n) = pick {
-        if n >= 1 && n <= sessions.len().min(15) {
-            let s = sessions.swap_remove(n - 1);
-            let title = s.title.clone();
-            *transcript = s.msgs;
-            *sid = s.id;
-            tui::line(&tui::green(&format!(
-                "  ✓ resumed: {}",
-                tui::sanitize_terminal(&title)
+    let mut filter = String::new();
+    loop {
+        let shown = filter_sessions(&all, &filter);
+        if shown.is_empty() {
+            tui::line(&tui::yellow(&format!(
+                "  no session matches '{}'",
+                tui::sanitize_terminal(&filter)
             )));
-            tui::line(&tui::dim("  ── restored history ──"));
-            for msg in transcript.iter() {
-                match msg {
-                    // Saved sessions are files on disk: replay them through
-                    // the same sanitizer as live model and tool output.
-                    provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
-                        tui::line(&format!(
-                            "{} {}",
-                            tui::accent("›"),
-                            tui::sanitize_terminal(text)
-                        ));
-                    }
-                    provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
-                        tui::line(&tui::render_md(text));
-                    }
-                    _ => {}
-                }
+        } else {
+            let heading = if filter.is_empty() {
+                "  sessions (this folder first):".to_string()
+            } else {
+                format!("  sessions matching '{}':", tui::sanitize_terminal(&filter))
+            };
+            tui::line(&tui::dim(&heading));
+            for (i, s) in shown.iter().take(RESUME_ROWS).enumerate() {
+                tui::line(&session_row(i + 1, s, cwd));
             }
-            tui::line(&tui::dim("  ────────────────────"));
+            if shown.len() > RESUME_ROWS {
+                tui::line(&tui::dim(&format!(
+                    "  … {} more — type words to filter",
+                    shown.len() - RESUME_ROWS
+                )));
+            }
+        }
+        let answer = tui::ask(&tui::dim("  resume # · text to filter · Enter to cancel: "));
+        match resume_pick(answer.as_deref(), shown.len().min(RESUME_ROWS)) {
+            ResumePick::Cancel => return,
+            ResumePick::Missing(n) => {
+                tui::line(&tui::yellow(&format!("  no session {n}")));
+            }
+            ResumePick::Filter(f) => filter = f,
+            ResumePick::Pick(i) => {
+                let Some(picked) = session::load(&shown[i].id) else {
+                    tui::line(&tui::yellow("  that session file can no longer be read"));
+                    return;
+                };
+                show_resumed(&picked, cwd);
+                *transcript = picked.msgs;
+                *sid = picked.id;
+                return;
+            }
         }
     }
+}
+
+// The confirmation and history replay for a session opened by /resume,
+// `bwn continue` or `bwn resume <id>`.
+fn show_resumed(s: &session::Session, cwd: &std::path::Path) {
+    tui::line(&tui::green(&format!(
+        "  ✓ resumed: {}",
+        tui::sanitize_terminal(s.label())
+    )));
+    if !s.is_in(cwd) {
+        tui::line(&tui::yellow(&format!(
+            "  this session ran in {} — its files are not in this folder",
+            tui::sanitize_terminal(&s.cwd)
+        )));
+    }
+    tui::line(&tui::dim("  ── restored history ──"));
+    for msg in &s.msgs {
+        match msg {
+            // Saved sessions are files on disk: replay them through
+            // the same sanitizer as live model and tool output.
+            provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
+                tui::line(&format!(
+                    "{} {}",
+                    tui::accent("›"),
+                    tui::sanitize_terminal(text)
+                ));
+            }
+            provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
+                tui::line(&tui::render_md(text));
+            }
+            _ => {}
+        }
+    }
+    tui::line(&tui::dim("  ────────────────────"));
+}
+
+// /export [path]: the conversation as Markdown. The session is saved first
+// so the file matches what /resume would open.
+fn handle_export(
+    transcript: &[provider::Msg],
+    sid: &str,
+    cwd: &std::path::Path,
+    model: &str,
+    arg: &str,
+) {
+    if transcript.is_empty() {
+        tui::line(&tui::dim("  nothing to export yet"));
+        return;
+    }
+    session::save(sid, cwd, model, transcript);
+    let Some(s) = session::load(sid) else {
+        tui::line(&tui::red("  could not read the saved session back"));
+        return;
+    };
+    let arg = arg.trim();
+    let path = (!arg.is_empty()).then(|| cwd.join(arg));
+    match session::export(&s, path.as_deref()) {
+        Ok(p) => tui::line(&tui::green(&format!(
+            "  ✓ exported to {}",
+            tui::sanitize_terminal(&p.display().to_string())
+        ))),
+        Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
+    }
+}
+
+// The last answer with any text, for /copy.
+fn last_answer(transcript: &[provider::Msg]) -> Option<&str> {
+    transcript.iter().rev().find_map(|m| match m {
+        provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    })
+}
+
+// The OSC 52 sequence that puts `text` on the terminal's clipboard.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", media::b64_encode(text.as_bytes()))
+}
+
+// /copy: the last answer to the clipboard through the terminal (OSC 52),
+// which also works over SSH; terminals that do not support it ignore it.
+fn handle_copy(transcript: &[provider::Msg]) {
+    let Some(answer) = last_answer(transcript) else {
+        tui::line(&tui::dim("  no answer to copy yet"));
+        return;
+    };
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc52(answer).as_bytes());
+    let _ = out.flush();
+    let n = answer.chars().count();
+    tui::flash_footer(&format!("copied the last answer ({n} chars)"));
+    tui::line(&tui::dim(&format!(
+        "  ⧉ copied the last answer ({n} chars) — if nothing pasted, your terminal does not allow clipboard writes (OSC 52)"
+    )));
+}
+
+// /ask <question>: a side question answered with the conversation as
+// context; it is not added to the conversation or the session.
+fn handle_ask(provider: &Provider, cwd: &std::path::Path, transcript: &[provider::Msg], q: &str) {
+    let q = q.trim();
+    if q.is_empty() {
+        tui::line(&tui::red(
+            "  usage: /ask <question>  — answered aside; it is not added to the conversation",
+        ));
+        return;
+    }
+    tui::line("");
+    if let Err(e) = agent::ask_aside(provider, cwd, q, transcript) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::line(&tui::dim("  (asked aside — not added to the conversation)"));
+}
+
+fn handle_rename(sid: &str, name: &str) {
+    if name.trim().is_empty() {
+        tui::line(&tui::red("  usage: /rename <name>"));
+        return;
+    }
+    match session::rename(sid, name) {
+        Ok(()) => tui::line(&tui::green(&format!(
+            "  ✓ session named '{}'",
+            tui::sanitize_terminal(name.trim())
+        ))),
+        Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+    }
+}
+
+// `bwn sessions [rm <id>]`.
+fn sessions_command(args: &[String]) {
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("rm" | "remove" | "delete") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("usage: buildwithnexus sessions rm <id>");
+                std::process::exit(2);
+            };
+            match session::remove(id) {
+                Ok(s) => println!(
+                    "deleted session {id}: {}",
+                    tui::sanitize_terminal(s.label())
+                ),
+                Err(e) => {
+                    eprintln!("buildwithnexus: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("export") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("usage: buildwithnexus sessions export <id> [file.md]");
+                std::process::exit(2);
+            };
+            let Some(s) = session::load(id) else {
+                eprintln!(
+                    "no session '{}' — bwn sessions lists them",
+                    tui::sanitize_terminal(id)
+                );
+                std::process::exit(1);
+            };
+            match session::export(&s, args.get(2).map(std::path::Path::new)) {
+                Ok(p) => println!("{}", p.display()),
+                Err(e) => {
+                    eprintln!("buildwithnexus: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some(other) => {
+            eprintln!(
+                "buildwithnexus sessions: unknown subcommand '{other}' — try: rm <id>, export <id>"
+            );
+            std::process::exit(2);
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let all = session::list_here_first(&cwd);
+    if all.is_empty() {
+        // Empty output reads as "broken"; say why the list is empty.
+        println!("no saved sessions yet — every conversation is saved as it runs.");
+        return;
+    }
+    for s in &all {
+        // Titles come from task text and cwd from the checkout's
+        // folder name, so neither reaches the terminal raw.
+        let title: String = tui::sanitize_terminal(s.label()).chars().take(48).collect();
+        println!(
+            "  {}  {:<9} {:>4} msgs  {:<48}  {}",
+            s.id,
+            session::ago(s.updated_ms),
+            s.msgs.len(),
+            title,
+            tui::sanitize_terminal(&s.cwd)
+        );
+    }
+    println!();
+    println!(
+        "{}",
+        tui::dim("open one:  buildwithnexus resume <id>  ·  this folder's latest:  buildwithnexus continue  ·  add a task to run it headless  ·  sessions export <id> | rm <id>")
+    );
+}
+
+// Opens `s` in the terminal UI, or runs `task` on it headless.
+fn open_session(opts: CliOptions, s: session::Session, task: String, verb: &str) {
+    if !task.trim().is_empty() {
+        let (msgs, id) = (s.msgs, s.id);
+        headless(&opts, move |p, perm, cwd| {
+            agent::run_build_resumed(p, perm, "engineer", &task, &cwd, msgs, &id)
+        });
+        return;
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!(
+            "buildwithnexus: `{verb}` with no task opens the session in the terminal UI, and there is no terminal here.\n  \
+             Add a task to run it headless: buildwithnexus {verb} <task>"
+        );
+        std::process::exit(2);
+    }
+    session::resume_on_start(s);
+    interactive(opts.prompt.clone(), opts);
+}
+
+// `bwn continue [task]`: this folder's latest session, or the latest
+// anywhere with a note saying which.
+fn continue_command(opts: CliOptions, task: String) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let s = match session::latest_for(&cwd) {
+        Some(s) => s,
+        None => match session::latest() {
+            Some(s) => {
+                eprintln!(
+                    "{}",
+                    tui::yellow(&format!(
+                        "no session in this folder — continuing '{}' from {}",
+                        tui::sanitize_terminal(s.label()),
+                        tui::sanitize_terminal(&session_folder(&s, &cwd))
+                    ))
+                );
+                s
+            }
+            None => {
+                eprintln!(
+                    "buildwithnexus: no saved sessions to continue — bwn sessions lists them"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
+    open_session(opts, s, task, "continue");
+}
+
+// `bwn resume <id> [task]`; with no id, the /resume picker.
+fn resume_command(opts: CliOptions, args: &[String]) {
+    let Some(id) = args.first() else {
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            eprintln!(
+                "buildwithnexus: `resume` with no id opens the session picker in the terminal UI, and there is no terminal here.\n  \
+                 Pass an id and a task to run one headless (bwn sessions lists them): buildwithnexus resume <id> <task>"
+            );
+            std::process::exit(2);
+        }
+        let prompt = opts.prompt.clone().or_else(|| Some("/resume".to_string()));
+        interactive(prompt, opts);
+        return;
+    };
+    let Some(s) = session::load(id) else {
+        eprintln!(
+            "no session '{}' — bwn sessions lists them",
+            tui::sanitize_terminal(id)
+        );
+        std::process::exit(1);
+    };
+    open_session(opts, s, args[1..].join(" "), "resume");
 }
 
 fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
@@ -4148,15 +4495,449 @@ fn handle_mouse(arg: Option<&str>) {
     }
 }
 
-fn handle_diff(cwd: &std::path::Path) {
-    let out = tools::run(
-        "run_command",
-        &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}),
-        cwd,
+// Git for bwn's own commands (/commit, /diff), never for the model. A
+// repository's config can name programs git runs (fsmonitor, an external
+// diff, textconv, filters), so unless every repository-level key is known
+// to be inert the person is asked first.
+fn git_may_run(cwd: &std::path::Path, ask: &mut dyn FnMut(&str) -> Option<String>) -> bool {
+    if tools::skips_prompt_safely("git status", cwd) {
+        return true;
+    }
+    let a = ask(
+        "  this repository's git config can run programs (hooks, filters, an external diff) — run git here anyway? [y/N]: ",
     );
-    // File names in the stat come from the checkout.
-    for line in tui::sanitize_terminal(&out.content).lines() {
-        tui::line(&tui::dim(&format!("  {line}")));
+    matches!(a.as_deref().map(str::trim), Some("y" | "Y" | "yes" | "YES"))
+}
+
+fn git_text(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+// `/commit`: the model drafts the message, bwn shows it, and nothing is
+// committed until the person answers c.
+fn handle_commit(provider: &Provider, cwd: &std::path::Path) {
+    commit_flow(
+        cwd,
+        |stat, diff| agent::draft_commit_message(provider, stat, diff),
+        &mut |q| tui::ask(q),
+    );
+}
+
+// Returns the new commit's one-line summary when a commit was made.
+fn commit_flow(
+    cwd: &std::path::Path,
+    draft: impl FnOnce(&str, &str) -> Result<String, String>,
+    ask: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    if !git_may_run(cwd, ask) {
+        tui::line(&tui::dim("  cancelled — nothing committed"));
+        return None;
+    }
+    let stat = match git_text(cwd, &["diff", "--staged", "--stat", "--no-ext-diff"]) {
+        Ok(s) => s,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  /commit needs a git repository: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return None;
+        }
+    };
+    if stat.trim().is_empty() {
+        tui::line(&tui::yellow(
+            "  nothing is staged — `git add <files>` first, then /commit",
+        ));
+        return None;
+    }
+    let diff =
+        git_text(cwd, &["diff", "--staged", "--no-ext-diff", "--no-textconv"]).unwrap_or_default();
+    let mut msg = match draft(&stat, &diff) {
+        Ok(m) => m,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  could not draft a commit message: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return None;
+        }
+    };
+    loop {
+        tui::line(&tui::accent("  proposed commit message:"));
+        // The draft is model text.
+        for l in tui::sanitize_terminal(&msg).lines() {
+            tui::line(&format!("    {l}"));
+        }
+        let answer = ask("  [c]ommit · [e]dit · [n]o: ");
+        match answer.as_deref().map(str::trim) {
+            Some("c" | "C" | "commit") => break,
+            Some("e" | "E" | "edit") => {
+                if let Some(new) = ask("  new message (Enter keeps the proposed one): ") {
+                    if !new.trim().is_empty() {
+                        msg = new.trim().to_string();
+                    }
+                }
+            }
+            _ => {
+                tui::line(&tui::dim("  not committed — the changes stay staged"));
+                return None;
+            }
+        }
+    }
+    match git_commit(cwd, &msg) {
+        Ok(summary) => {
+            checkpoint::note_commit(cwd);
+            tui::line(&tui::green(&format!(
+                "  ✓ committed {}",
+                tui::sanitize_terminal(&summary)
+            )));
+            Some(summary)
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  git commit failed: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            None
+        }
+    }
+}
+
+fn git_commit(cwd: &std::path::Path, msg: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "commit", "-q", "-F", "-"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(msg.as_bytes());
+    }
+    let o = child
+        .wait_with_output()
+        .map_err(|e| format!("git commit: {e}"))?;
+    if !o.status.success() {
+        let mut out = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        if out.is_empty() {
+            out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        }
+        return Err(out);
+    }
+    Ok(git_text(cwd, &["log", "-1", "--oneline", "--no-decorate"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default())
+}
+
+// One changed path in the working tree, as /diff lists it.
+#[derive(Debug, PartialEq)]
+struct ChangedFile {
+    /// Relative to the repository root; a new folder ends with '/'.
+    path: String,
+    /// git's two status letters ("M ", " M", "??", "A ", " D", "R ").
+    status: String,
+    added: usize,
+    removed: usize,
+}
+
+impl ChangedFile {
+    fn kind(&self) -> &'static str {
+        match self.status.as_str() {
+            "??" if self.path.ends_with('/') => "new folder",
+            "??" => "new",
+            s if s.contains('D') => "deleted",
+            s if s.contains('R') => "renamed",
+            s if s.contains('A') => "added",
+            _ => "modified",
+        }
+    }
+}
+
+// `git status --porcelain=v1 -z` entries as (status, path); a rename's
+// source path is skipped.
+fn parse_porcelain(z: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut parts = z.split('\0');
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (xy, path) = (&entry[..2], &entry[3..]);
+        if xy.contains(['R', 'C']) {
+            parts.next();
+        }
+        out.push((xy.to_string(), path.to_string()));
+    }
+    out
+}
+
+// `git diff --numstat -z` (added, removed) by path; binary files count 0.
+fn parse_numstat(z: &str) -> std::collections::HashMap<String, (usize, usize)> {
+    let mut out = std::collections::HashMap::new();
+    for rec in z.split('\0') {
+        let mut f = rec.splitn(3, '\t');
+        let (Some(a), Some(r), Some(path)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        out.insert(
+            path.trim_start_matches('\n').to_string(),
+            (a.parse().unwrap_or(0), r.parse().unwrap_or(0)),
+        );
+    }
+    out
+}
+
+// Lines in a new file, or in every file under a new folder (bounded).
+fn new_lines(path: &std::path::Path) -> usize {
+    let count = |p: &std::path::Path| {
+        std::fs::read(p)
+            .ok()
+            .filter(|b| b.len() <= MAX_DIFF_BYTES)
+            .map(|b| b.iter().filter(|c| **c == b'\n').count())
+            .unwrap_or(0)
+    };
+    if !path.is_dir() {
+        return count(path);
+    }
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    let mut seen = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            seen += 1;
+            if seen > 2000 {
+                return total;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                total += count(&p);
+            }
+        }
+    }
+    total
+}
+
+const MAX_DIFF_BYTES: usize = 512 * 1024;
+
+fn changed_files(cwd: &std::path::Path) -> Result<(PathBuf, Vec<ChangedFile>), String> {
+    let top = PathBuf::from(git_text(cwd, &["rev-parse", "--show-toplevel"])?.trim());
+    let status = git_text(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )?;
+    // Against HEAD when there is one: staged and unstaged changes together.
+    let numstat = git_text(
+        cwd,
+        &[
+            "diff",
+            "HEAD",
+            "--numstat",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
+    )
+    .or_else(|_| {
+        git_text(
+            cwd,
+            &["diff", "--cached", "--numstat", "-z", "--no-ext-diff"],
+        )
+    })
+    .unwrap_or_default();
+    let counts = parse_numstat(&numstat);
+    let files = parse_porcelain(&status)
+        .into_iter()
+        .map(|(status, path)| {
+            let (added, removed) = if status == "??" {
+                (new_lines(&top.join(&path)), 0)
+            } else {
+                counts.get(&path).copied().unwrap_or((0, 0))
+            };
+            ChangedFile {
+                path,
+                status,
+                added,
+                removed,
+            }
+        })
+        .collect();
+    Ok((top, files))
+}
+
+fn diff_summary(files: &[ChangedFile]) -> String {
+    let added: usize = files.iter().map(|f| f.added).sum();
+    let removed: usize = files.iter().map(|f| f.removed).sum();
+    format!(
+        "{} file{} changed, {added} insertion{}(+), {removed} deletion{}(-)",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        if added == 1 { "" } else { "s" },
+        if removed == 1 { "" } else { "s" },
+    )
+}
+
+// /diff: every changed and new file with its line counts and one summary;
+// picking a file shows its diff. `/diff turn` shows what the last agent
+// turn changed.
+fn handle_diff(cwd: &std::path::Path, arg: &str) {
+    let mut ask = |q: &str| tui::ask(q);
+    if !git_may_run(cwd, &mut ask) {
+        tui::line(&tui::dim("  cancelled"));
+        return;
+    }
+    if arg.trim() == "turn" {
+        diff_last_turn(cwd);
+        return;
+    }
+    let (top, files) = match changed_files(cwd) {
+        Ok(v) => v,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  /diff needs a git repository: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return;
+        }
+    };
+    if files.is_empty() {
+        tui::line(&tui::dim("  no changes — the working tree matches HEAD"));
+        return;
+    }
+    // File names come from the checkout.
+    for f in &files {
+        tui::line(&format!(
+            "  {:<10} {}  {}",
+            tui::dim(f.kind()),
+            tui::sanitize_terminal(&f.path),
+            tui::dim(&format!("+{} -{}", f.added, f.removed))
+        ));
+    }
+    tui::line(&tui::dim(&format!("  {}", diff_summary(&files))));
+    // The picker draws over the rows above the composer; keep the list in view.
+    if tui::is_raw() {
+        for _ in 0..files.len() + 2 {
+            tui::line("");
+        }
+    }
+    let items: Vec<tui::SelectItem> = files
+        .iter()
+        .map(|f| tui::SelectItem {
+            label: f.path.clone(),
+            detail: format!("{} +{} -{}", f.kind(), f.added, f.removed),
+        })
+        .collect();
+    if let Some(i) = tui::select_item("Show the diff of", &items) {
+        show_file_diff(&top, &files[i]);
+    }
+}
+
+fn read_capped(p: &std::path::Path) -> Option<String> {
+    std::fs::metadata(p)
+        .ok()
+        .filter(|m| m.len() as usize <= MAX_DIFF_BYTES)?;
+    std::fs::read_to_string(p).ok()
+}
+
+fn show_file_diff(top: &std::path::Path, f: &ChangedFile) {
+    let path = top.join(&f.path);
+    if f.status == "??" && path.is_dir() {
+        let mut stack = vec![path];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Some(new) = read_capped(&p) {
+                    let shown = p.strip_prefix(top).unwrap_or(&p).display().to_string();
+                    report::diff(&shown, "", &new);
+                }
+            }
+        }
+        return;
+    }
+    let old = if f.status == "??" || f.status.contains('A') {
+        Some(String::new())
+    } else {
+        git_text(top, &["show", &format!("HEAD:{}", f.path)])
+            .ok()
+            .filter(|t| t.len() <= MAX_DIFF_BYTES)
+    };
+    let new = if f.status.contains('D') {
+        Some(String::new())
+    } else {
+        read_capped(&path)
+    };
+    match (old, new) {
+        (Some(old), Some(new)) => report::diff(&f.path, &old, &new),
+        _ => tui::line(&tui::dim(&format!(
+            "  {} is too large or not text to show here — git diff -- {}",
+            tui::sanitize_terminal(&f.path),
+            tui::sanitize_terminal(&f.path)
+        ))),
+    }
+}
+
+// What the last agent turn changed: each checkpointed file against its
+// state before the turn, and the files shell commands changed.
+fn diff_last_turn(cwd: &std::path::Path) {
+    let Some(last) = checkpoint::last_turn(cwd) else {
+        tui::line(&tui::dim("  no agent turn recorded in this folder"));
+        return;
+    };
+    tui::line(&tui::dim(&format!(
+        "  the last turn, '{}' ({}):",
+        tui::sanitize_terminal(&last.turn.task),
+        session::ago(last.turn.started_ms)
+    )));
+    // Oldest checkpoint per file holds its contents before the turn.
+    let mut firsts: Vec<&checkpoint::Checkpoint> = Vec::new();
+    for cp in last.checkpoints.iter().rev() {
+        if !firsts.iter().any(|f| f.path == cp.path) {
+            firsts.push(cp);
+        }
+    }
+    for cp in &firsts {
+        let shown = checkpoint::shown_path(&cp.path, cwd);
+        let before = if cp.existed {
+            Some(cp.content.clone())
+        } else {
+            Some(String::new())
+        };
+        match (
+            before.filter(|_| cp.snapshotted),
+            read_capped(&cp.path).or_else(|| (!cp.path.exists()).then(String::new)),
+        ) {
+            (Some(old), Some(new)) => report::diff(&shown, &old, &new),
+            _ => tui::line(&tui::dim(&format!(
+                "  {} — no snapshot to compare (too large or not text)",
+                tui::sanitize_terminal(&shown)
+            ))),
+        }
+    }
+    if !last.turn.untracked.is_empty() {
+        tui::line(&tui::dim("  changed by shell commands (against HEAD):"));
+        for rel in &last.turn.untracked {
+            tui::line(&tui::dim(&format!("    - {}", tui::sanitize_terminal(rel))));
+        }
+    }
+    if firsts.is_empty() && last.turn.untracked.is_empty() {
+        tui::line(&tui::dim("  it changed no files"));
     }
 }
 
@@ -4292,46 +5073,331 @@ fn handle_effort(provider: &mut Provider, arg: &str) {
     }
 }
 
+const CHECKPOINT_ROWS: usize = 15;
+
+// /checkpoints: newest first, grouped by the task that made them, with age
+// and paths relative to this folder.
 fn handle_checkpoints(cwd: &std::path::Path) {
+    let pruned = checkpoint::prune_once(cwd);
+    if pruned > 0 {
+        tui::line(&tui::dim(&format!(
+            "  pruned {pruned} old checkpoints — this folder keeps the newest {}",
+            checkpoint::KEEP_CHECKPOINTS
+        )));
+    }
     let items = checkpoint::list(cwd);
     if items.is_empty() {
         tui::line(&tui::dim("  no checkpoints for this directory"));
         return;
     }
-    // Paths are wherever the model wrote; checkpoint files are on disk.
-    for cp in items.iter().take(10) {
+    tui::line(&tui::dim(
+        "  checkpoints in this folder, newest first — /undo <id> restores one, /undo the last task",
+    ));
+    let mut group: Option<(Option<&str>, String)> = None;
+    for cp in items.iter().take(CHECKPOINT_ROWS) {
+        let task = cp.task.as_deref();
+        let age = session::ago(cp.created_ms);
+        if group.as_ref() != Some(&(task, age.clone())) {
+            // Task text is the person's prompt; paths are wherever the model wrote.
+            tui::line(&format!(
+                "  {}  {}",
+                tui::bold(&age),
+                tui::sanitize_terminal(task.unwrap_or("(task not recorded)"))
+            ));
+            group = Some((task, age));
+        }
         tui::line(&format!(
-            "  {}  {}  {}",
-            tui::bold(&tui::sanitize_terminal(&cp.id)),
+            "    {}  {:<11} {}",
+            tui::dim(&tui::sanitize_terminal(&cp.id)),
             tui::sanitize_terminal(&cp.action),
-            tui::sanitize_terminal(&cp.path.display().to_string())
+            tui::sanitize_terminal(&checkpoint::shown_path(&cp.path, cwd))
         ));
     }
+    if items.len() > CHECKPOINT_ROWS {
+        tui::line(&tui::dim(&format!(
+            "  … {} older — this folder keeps the newest {}",
+            items.len() - CHECKPOINT_ROWS,
+            checkpoint::KEEP_CHECKPOINTS
+        )));
+    }
+}
+
+// A prompt of this run that /rewind can go back to: where its messages
+// start in the transcript, when its turn began (checkpoints after it are its
+// changes and later ones), and the text sent.
+struct RewindPoint {
+    index: usize,
+    started_ms: u128,
+    prompt: String,
+}
+
+// Drops the point's prompt and everything after it from the conversation.
+// The prompt is found at or after its recorded index (a turn may put the
+// system prompt first); a hook may have appended context to it. False when
+// it is no longer there (compacted away), leaving the transcript alone.
+fn rewind_transcript(transcript: &mut Vec<provider::Msg>, point: &RewindPoint) -> bool {
+    let start = point.index.min(transcript.len());
+    let found = transcript[start..].iter().position(|m| match m {
+        provider::Msg::User(t) | provider::Msg::UserImages { text: t, .. } => {
+            t.starts_with(&point.prompt)
+        }
+        _ => false,
+    });
+    match found {
+        Some(i) => {
+            transcript.truncate(start + i);
+            // Nothing but a system prompt left: an empty conversation.
+            if transcript
+                .iter()
+                .all(|m| matches!(m, provider::Msg::System(_)))
+            {
+                transcript.clear();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+// /rewind: pick an earlier prompt of this run and go back to just before it
+// — the files its turn and later turns changed, the conversation from it on,
+// or both.
+fn handle_rewind(
+    transcript: &mut Vec<provider::Msg>,
+    points: &mut Vec<RewindPoint>,
+    sid: &str,
+    cwd: &std::path::Path,
+    model: &str,
+) {
+    if points.is_empty() {
+        tui::line(&tui::dim(
+            "  nothing to rewind in this session yet — /undo restores files from earlier turns",
+        ));
+        return;
+    }
+    let items: Vec<tui::SelectItem> = points
+        .iter()
+        .rev()
+        .map(|p| {
+            let first: String = p
+                .prompt
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(70)
+                .collect();
+            let files = checkpoint::list(cwd)
+                .iter()
+                .filter(|c| c.created_ms >= p.started_ms)
+                .count();
+            tui::SelectItem {
+                label: first,
+                detail: format!(
+                    "{} · {files} file change{} since",
+                    session::ago(p.started_ms),
+                    if files == 1 { "" } else { "s" }
+                ),
+            }
+        })
+        .collect();
+    let Some(pick) = tui::select_item("Rewind to before", &items) else {
+        return;
+    };
+    let at = points.len() - 1 - pick;
+    let what = [
+        tui::SelectItem {
+            label: "Code and conversation".into(),
+            detail: "restore the files and drop this prompt and everything after".into(),
+        },
+        tui::SelectItem {
+            label: "Conversation only".into(),
+            detail: "drop this prompt and everything after; files stay".into(),
+        },
+        tui::SelectItem {
+            label: "Code only".into(),
+            detail: "restore the files changed since; the conversation stays".into(),
+        },
+    ];
+    let Some(choice) = tui::select_item("Rewind what", &what) else {
+        return;
+    };
+    let (code, conversation) = (choice != 1, choice != 2);
+    if code {
+        let mut overwrite = |p: &std::path::Path| confirm_overwrite(cwd, p);
+        match checkpoint::undo_all_since(cwd, points[at].started_ms, &mut overwrite) {
+            Ok(undone) => {
+                tui::line(&tui::green(&format!(
+                    "  ✓ restored {} file{}:",
+                    undone.restored.len(),
+                    if undone.restored.len() == 1 { "" } else { "s" }
+                )));
+                show_undone(cwd, &undone);
+            }
+            Err(e) if e.starts_with("no checkpoints") => {
+                tui::line(&tui::dim("  no file changes since then"));
+            }
+            Err(e) => {
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+                return;
+            }
+        }
+    }
+    if conversation {
+        let before = transcript.len();
+        if rewind_transcript(transcript, &points[at]) {
+            if transcript.is_empty() {
+                let _ = session::remove(sid);
+            } else {
+                session::save(sid, cwd, model, transcript);
+            }
+            tui::line(&tui::green(&format!(
+                "  ✓ conversation rewound — dropped {} message{}",
+                before - transcript.len(),
+                if before - transcript.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )));
+            let prompt = points[at].prompt.clone();
+            points.truncate(at);
+            tui::line(&tui::dim(
+                "  your prompt was (type its first words and press ↑ to edit it):",
+            ));
+            for l in tui::sanitize_terminal(&prompt).lines().take(6) {
+                tui::line(&format!("    {l}"));
+            }
+        } else {
+            tui::line(&tui::yellow(
+                "  that prompt is no longer in the conversation (it was compacted) — files only",
+            ));
+        }
+    }
+}
+
+// The question /undo asks before it overwrites a file changed since the
+// agent's edit. No (or Enter, Esc) keeps the file as it is.
+fn confirm_overwrite(cwd: &std::path::Path, path: &std::path::Path) -> bool {
+    let shown = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
+    let q = format!(
+        "  {} changed after the agent edited it — overwrite your changes? [y/N]: ",
+        tui::sanitize_terminal(&shown)
+    );
+    matches!(
+        tui::ask(&q).as_deref().map(str::trim),
+        Some("y" | "Y" | "yes" | "YES")
+    )
+}
+
+fn show_undone(cwd: &std::path::Path, undone: &checkpoint::Undone) {
+    for c in &undone.restored {
+        tui::line(&format!(
+            "    - {} ({})",
+            tui::sanitize_terminal(&checkpoint::shown_path(&c.path, cwd)),
+            tui::sanitize_terminal(&c.action)
+        ));
+    }
+    for p in &undone.kept {
+        let shown = p.strip_prefix(cwd).unwrap_or(p).display().to_string();
+        tui::line(&tui::yellow(&format!(
+            "    - kept your version of {}",
+            tui::sanitize_terminal(&shown)
+        )));
+    }
+}
+
+// Bare /undo: reverts the last agent turn in this folder as a unit — the
+// recovery for a partial multi-file edit, where undoing one file would
+// quietly leave the rest changed — and says what it cannot undo: commits,
+// files changed by shell commands, a turn from an earlier run (asked first).
+fn undo_last_turn(cwd: &std::path::Path, overwrite: &mut dyn FnMut(&std::path::Path) -> bool) {
+    let last = checkpoint::last_turn(cwd);
+    let committed = checkpoint::committed_since_turn(cwd);
+    for note in undo_preamble(last.as_ref(), committed) {
+        tui::line(&tui::yellow(note));
+    }
+    let Some(last) = last else {
+        return;
+    };
+    let shell_note = |lead: &str| {
+        tui::line(&tui::yellow(&format!(
+            "  {lead} changed files with shell commands, which checkpoints do not track — git diff shows them:"
+        )));
+        for p in last.turn.untracked.iter().take(8) {
+            tui::line(&tui::dim(&format!("    - {}", tui::sanitize_terminal(p))));
+        }
+        if last.turn.untracked.len() > 8 {
+            tui::line(&tui::dim(&format!(
+                "    … and {} more",
+                last.turn.untracked.len() - 8
+            )));
+        }
+    };
+    if last.checkpoints.is_empty() {
+        if last.turn.untracked.is_empty() {
+            tui::line(&tui::yellow(
+                "  the last agent turn made no file changes — use /undo latest, /undo <id>, or /undo all",
+            ));
+        } else {
+            shell_note("that turn");
+        }
+        return;
+    }
+    let files: std::collections::HashSet<&std::path::Path> =
+        last.checkpoints.iter().map(|c| c.path.as_path()).collect();
+    if !last.this_session {
+        // A turn from an earlier run: say which before touching anything.
+        let q = format!(
+            "  undo the last task in this folder, '{}' ({}, {} file{})? [y/N]: ",
+            tui::sanitize_terminal(&last.turn.task),
+            session::ago(last.turn.started_ms),
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
+        let go = tui::ask(&q).unwrap_or_default();
+        if !matches!(go.trim(), "y" | "Y" | "yes" | "YES") {
+            tui::line(&tui::dim("  cancelled — nothing restored."));
+            return;
+        }
+    }
+    match checkpoint::undo_last_turn(cwd, overwrite) {
+        Ok(undone) => {
+            let n = undone.restored.len();
+            tui::line(&tui::green(&format!(
+                "  ✓ undid the last agent turn — restored {n} file{}:",
+                if n == 1 { "" } else { "s" }
+            )));
+            show_undone(cwd, &undone);
+            if !last.turn.untracked.is_empty() {
+                shell_note("that turn also");
+            }
+        }
+        Err(e) => tui::line(&tui::yellow(&format!("  {}", tui::sanitize_terminal(&e)))),
+    }
+}
+
+// What bare /undo says before restoring anything: that a commit (by /commit,
+// or HEAD moved since the turn) is not undone, and that there is no turn to
+// undo — a /commit with no agent turn before it still gets the first.
+fn undo_preamble(last: Option<&checkpoint::LastTurn>, committed: bool) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if committed || last.is_some_and(|l| l.head_moved) {
+        notes.push("  commits are not undone by /undo — git reset --soft HEAD~1 keeps the changes");
+    }
+    if last.is_none() {
+        notes.push(
+            "  no agent turn recorded in this folder — /checkpoints lists what can be restored",
+        );
+    }
+    notes
 }
 
 fn handle_undo(cwd: &std::path::Path, arg: &str) {
     let arg = arg.trim();
+    let mut overwrite = |p: &std::path::Path| confirm_overwrite(cwd, p);
     if arg.is_empty() {
-        // Bare /undo reverts the last agent turn as a unit — the recovery for
-        // a partial multi-file edit, where undoing one file would quietly
-        // leave the rest changed.
-        match checkpoint::undo_last_turn(cwd) {
-            Ok(cps) => {
-                tui::line(&tui::green(&format!(
-                    "  ✓ undid the last agent turn — restored {} file{}:",
-                    cps.len(),
-                    if cps.len() == 1 { "" } else { "s" }
-                )));
-                for c in cps {
-                    tui::line(&format!(
-                        "    - {} ({})",
-                        tui::sanitize_terminal(&c.path.display().to_string()),
-                        tui::sanitize_terminal(&c.action)
-                    ));
-                }
-            }
-            Err(e) => tui::line(&tui::yellow(&format!("  {}", tui::sanitize_terminal(&e)))),
-        }
+        undo_last_turn(cwd, &mut overwrite);
     } else if arg == "git" {
         // The one command here that can destroy work bwn didn't do: it
         // discards ALL unstaged changes, including the user's hand edits.
@@ -4388,24 +5454,18 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             tui::line(&tui::dim("  cancelled — nothing restored."));
             return;
         }
-        match checkpoint::undo_all_since(cwd, since) {
-            Ok(cps) => {
+        match checkpoint::undo_all_since(cwd, since, &mut overwrite) {
+            Ok(undone) => {
                 tui::line(&tui::green(&format!(
                     "  ✓ restored {} files across session:",
-                    cps.len()
+                    undone.restored.len()
                 )));
-                for c in cps {
-                    tui::line(&format!(
-                        "    - {} ({})",
-                        tui::sanitize_terminal(&c.path.display().to_string()),
-                        tui::sanitize_terminal(&c.action)
-                    ));
-                }
+                show_undone(cwd, &undone);
             }
             Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else if arg == "latest" {
-        match checkpoint::undo_latest(cwd) {
+        match checkpoint::undo_latest(cwd, &mut overwrite) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored latest {}",
                 tui::sanitize_terminal(&cp.path.display().to_string())
@@ -4413,7 +5473,7 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else {
-        match checkpoint::undo_by_id(cwd, arg) {
+        match checkpoint::undo_by_id(cwd, arg, &mut overwrite) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored checkpoint {} ({})",
                 cp.id,
@@ -4793,273 +5853,344 @@ fn extract_attachments(
     cwd: &std::path::Path,
     vision: bool,
 ) -> (String, Vec<(String, String)>) {
-    use std::io::Read;
-    let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
     let mut images: Vec<(String, String)> = Vec::new();
-    let mut clean = String::new();
     let mut text_attachments = Vec::new();
-    let words: Vec<String> = shlex::split(task)
-        .unwrap_or_else(|| task.split_whitespace().map(|s| s.to_string()).collect());
-    for word_str in &words {
+    // Attachment words are replaced where they stand; every other byte of
+    // the prompt (quotes, line breaks, tabs, runs of spaces) reaches the
+    // model exactly as typed.
+    let mut clean = String::with_capacity(task.len());
+    let mut at = 0;
+    for w in prompt_words(task) {
         // Sentence punctuation after a path ("what is in @shot.png?") is not
-        // part of the file name.
-        let word = word_str.trim_end_matches(['?', '!', '.', ',', ';', ':']);
-        let is_at = word.starts_with('@');
-        let clean_word = word.trim_matches(|c| {
-            c == '\'' || c == '"' || c == ',' || c == ';' || c == '(' || c == ')' || c == '`'
-        });
-        let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
-        let is_img = image_exts.contains(&ext.as_str());
-        let is_video = media::VIDEO_EXTS.contains(&ext.as_str());
-        if !is_at && !is_img && !is_video {
-            if !clean.is_empty() {
-                clean.push(' ');
-            }
-            clean.push_str(word_str);
+        // part of the file name; it stays in the prompt after the marker.
+        let word = w.value.trim_end_matches(['?', '!', '.', ',', ';', ':']);
+        let after = &w.value[word.len()..];
+        let Some(marker) = attach_word(word, cwd, vision, &mut images, &mut text_attachments)
+        else {
             continue;
-        }
-        if let Some(raw_path) = if is_at {
-            word.strip_prefix('@')
+        };
+        // Brackets or quotes around a bare path ("(shot.png)") stay too.
+        let (before, behind) = if word.starts_with('@') {
+            ("", "")
         } else {
-            Some(clean_word)
-        } {
-            if raw_path == "diff" || raw_path == "git:diff" {
-                if let Ok(o) = std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let diff_text = String::from_utf8_lossy(&o.stdout);
-                    if !diff_text.trim().is_empty() {
-                        text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str("[git diff HEAD]");
-                        continue;
-                    }
-                }
-            } else if raw_path == "status" || raw_path == "git:status" {
-                if let Ok(o) = std::process::Command::new("git")
-                    .args(["status", "-s"])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let stat_text = String::from_utf8_lossy(&o.stdout);
-                    if !stat_text.trim().is_empty() {
-                        text_attachments.push(format!("[git status]\n{}", stat_text));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str("[git status]");
-                        continue;
-                    }
-                }
-            } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
-                let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
-                let res = kb.search(kb_query);
-                if !res.is_empty() {
-                    let summary = res
-                        .iter()
-                        .map(|e| {
-                            format!(
-                                "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
-                                e.name,
-                                e.entity_type,
-                                e.description.as_deref().unwrap_or(""),
-                                e.path
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n---\n");
-                    text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
-                    if !clean.is_empty() {
-                        clean.push(' ');
-                    }
-                    clean.push_str(&format!("[kb: {}]", kb_query));
-                    continue;
-                }
-            } else if raw_path == "rules" || raw_path.starts_with("rule:") {
-                let engine = crate::rules::RuleEngine::load_defaults();
-                let rules_summary = engine
-                    .rules
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "Rule [{}]: {} (Severity: {})",
-                            r.id, r.description, r.severity
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
-                if !clean.is_empty() {
-                    clean.push(' ');
-                }
-                clean.push_str("[active rules]");
-                continue;
-            } else if let Some(url) = raw_path
-                .strip_prefix("url:")
-                .or_else(|| raw_path.strip_prefix("web:"))
-            {
-                // Only real web URLs, and `--` so a value like `-K file` or
-                // `file:///…` can't become curl options or a local read.
-                if !is_web_url(url) {
-                    tui::line(&tui::yellow(&format!(
-                        "  ⚠ @{} not fetched — only http:// and https:// URLs are attached",
-                        tui::sanitize_terminal(raw_path)
-                    )));
-                } else if let Ok(o) = std::process::Command::new("curl")
-                    .args(["-sL", "--max-time", "5", "--", url])
-                    .output()
-                {
-                    let web_text = String::from_utf8_lossy(&o.stdout);
-                    if !web_text.trim().is_empty() {
-                        let snippet: String = web_text.chars().take(8000).collect();
-                        text_attachments.push(format!("[web: {}]\n{}", url, snippet));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!("[web: {}]", url));
-                        continue;
-                    }
-                }
-            } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
-                if let Ok(o) = std::process::Command::new("grep")
-                    .args(["-rnI", "-e", sym_query, "--", "."])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let sym_text = String::from_utf8_lossy(&o.stdout);
-                    if !sym_text.trim().is_empty() {
-                        let snippet: String =
-                            sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
-                        text_attachments
-                            .push(format!("[symbol search: {}]\n{}", sym_query, snippet));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!("[symbol: {}]", sym_query));
-                        continue;
-                    }
-                }
-            }
-            let (raw_path, range) = split_attachment_range(raw_path);
-            let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
-            let p = if let Some(rest) = raw_path.strip_prefix("~/") {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| cwd.to_path_buf())
-                    .join(rest)
-            } else if raw_path.starts_with('/') {
-                PathBuf::from(raw_path)
-            } else {
-                cwd.join(raw_path)
-            };
-            // Credentials must never ride along in a prompt unnoticed; the
-            // token stays as typed and nothing is read.
-            if p.exists() && tools::is_sensitive(&p) {
-                tui::line(&tui::yellow(&format!(
-                    "  ⚠ {} not attached — it is a sensitive file (keys, credentials, secrets)",
-                    tui::sanitize_terminal(&p.display().to_string())
-                )));
-            } else if image_exts.contains(&ext.as_str()) && p.exists() {
-                if !vision {
-                    tui::line(&tui::yellow(
-                        "  ⚠ current model is not multimodal — image not attached",
-                    ));
-                } else if let Ok(mut f) = std::fs::File::open(&p) {
-                    let mut buf = Vec::new();
-                    if f.read_to_end(&mut buf).is_ok() {
-                        let media_type = match ext.as_str() {
-                            "jpg" | "jpeg" => "image/jpeg",
-                            "gif" => "image/gif",
-                            "webp" => "image/webp",
-                            _ => "image/png",
-                        };
-                        images.push((media_type.to_string(), media::b64_encode(&buf)));
-                        // Show the attachment in the transcript (pixel-perfect
-                        // or half-block, see tui::show_image_file); a pasted
-                        // screenshot already previewed at paste time is not
-                        // drawn twice.
-                        tui::show_image_file(&p, true);
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!(
-                            "[image: {}]",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                        continue;
-                    }
-                }
-            } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
-                if !vision {
-                    tui::line(&tui::yellow(
-                        "  ⚠ current model is not multimodal — video not attached",
-                    ));
-                } else if !media::ffmpeg_available() {
-                    tui::line(&tui::yellow(
-                        "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",
-                    ));
-                } else {
-                    tui::line(&tui::dim(&format!(
-                        "  ⎘ parsing video {} with ffmpeg…",
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    )));
-                    if let Some(v) = media::attach_video(&p) {
-                        let n = v.frames.len();
-                        images.extend(v.frames);
-                        text_attachments.push(v.summary);
-                        // First frame inline.
-                        tui::show_image_file(&p, true);
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!(
-                            "[video: {} — {n} sampled frames attached in order]",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                        continue;
-                    }
-                    tui::line(&tui::red(&format!(
-                        "  ✗ could not decode video {}",
-                        p.display()
-                    )));
-                }
-            } else if let Some(att) = read_text_attachment(&p, range) {
-                if let Some(total_kib) = att.truncated_from_kib {
-                    tui::line(&tui::yellow(&format!(
-                        "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
-                        p.display(),
-                        MAX_ATTACHED_FILE_BYTES / 1024
-                    )));
-                }
-                text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
-                if !clean.is_empty() {
-                    clean.push(' ');
-                }
-                clean.push_str(&format!("[file: {}]", p.display()));
-                continue;
-            } else if p.is_file() {
-                // Never drop an attachment silently: the token stays in the
-                // prompt as typed, and the user is told why.
-                tui::line(&tui::yellow(&format!(
-                    "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
-                    p.display()
-                )));
-            }
-        }
-        if !clean.is_empty() {
-            clean.push(' ');
-        }
-        clean.push_str(word);
+            let core = word.trim_start_matches(ATTACHMENT_WRAP);
+            let lead = &word[..word.len() - core.len()];
+            let trail = &core[core.trim_end_matches(ATTACHMENT_WRAP).len()..];
+            (lead, trail)
+        };
+        clean.push_str(&task[at..w.start]);
+        clean.push_str(before);
+        clean.push_str(&marker);
+        clean.push_str(behind);
+        clean.push_str(after);
+        at = w.end;
     }
+    clean.push_str(&task[at..]);
     if !text_attachments.is_empty() {
         clean.push_str("\n\n[attached files]\n");
         clean.push_str(&text_attachments.join("\n\n"));
     }
     (clean, images)
+}
+
+const ATTACHMENT_WRAP: &[char] = &['\'', '"', ',', ';', '(', ')', '`'];
+
+// One whitespace-separated word of a prompt: its byte range as typed and
+// its value with surrounding quotes and `\ ` escapes removed, so a quoted or
+// escaped path with spaces ('/tmp/My Shot.png', @"my notes.md",
+// My\ Shot.png) is one word. A quote with no closing match is plain text.
+struct PromptWord {
+    start: usize,
+    end: usize,
+    value: String,
+}
+
+fn prompt_words(text: &str) -> Vec<PromptWord> {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        if c.is_whitespace() {
+            i += c.len_utf8();
+            continue;
+        }
+        let start = i;
+        let mut value = String::new();
+        let mut j = i;
+        if c == '@' {
+            value.push('@');
+            j += 1;
+        }
+        if let Some((close, inner)) = quoted(text, j) {
+            value.push_str(&inner);
+            j = close + 1;
+        }
+        while let Some(ch) = text[j..].chars().next() {
+            if ch.is_whitespace() {
+                break;
+            }
+            if ch == '\\' && text[j + 1..].starts_with(' ') {
+                value.push(' ');
+                j += 2;
+                continue;
+            }
+            value.push(ch);
+            j += ch.len_utf8();
+        }
+        words.push(PromptWord {
+            start,
+            end: j,
+            value,
+        });
+        i = j;
+    }
+    words
+}
+
+// A quoted span starting at `j`: the index of its closing quote and its
+// value. Inside double quotes `\\` and `\"` are escapes, as in the tokens
+// tui::attachment_token writes; single quotes take everything literally.
+fn quoted(text: &str, j: usize) -> Option<(usize, String)> {
+    let q = text[j..]
+        .chars()
+        .next()
+        .filter(|q| *q == '"' || *q == '\'')?;
+    let mut value = String::new();
+    let mut k = j + 1;
+    while let Some(ch) = text[k..].chars().next() {
+        if ch == q {
+            return Some((k, value));
+        }
+        if q == '"' && ch == '\\' {
+            if let Some(next) = text[k + 1..]
+                .chars()
+                .next()
+                .filter(|n| matches!(n, '\\' | '"'))
+            {
+                value.push(next);
+                k += 2;
+                continue;
+            }
+        }
+        value.push(ch);
+        k += ch.len_utf8();
+    }
+    None
+}
+
+// Attaches what one prompt word names, if anything, and returns the marker
+// that replaces it in the prompt. Unreadable or unknown words return None
+// and stay as typed.
+fn attach_word(
+    word: &str,
+    cwd: &std::path::Path,
+    vision: bool,
+    images: &mut Vec<(String, String)>,
+    text_attachments: &mut Vec<String>,
+) -> Option<String> {
+    use std::io::Read;
+    let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
+    let is_at = word.starts_with('@');
+    let clean_word = word.trim_matches(ATTACHMENT_WRAP);
+    let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
+    let is_img = image_exts.contains(&ext.as_str());
+    let is_video = media::VIDEO_EXTS.contains(&ext.as_str());
+    if !is_at && !is_img && !is_video {
+        return None;
+    }
+    let raw_path = if is_at {
+        word.strip_prefix('@')?
+    } else {
+        clean_word
+    };
+    if raw_path == "diff" || raw_path == "git:diff" {
+        if let Ok(o) = std::process::Command::new("git")
+            .args(["diff", "HEAD"])
+            .current_dir(cwd)
+            .output()
+        {
+            let diff_text = String::from_utf8_lossy(&o.stdout);
+            if !diff_text.trim().is_empty() {
+                text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
+                return Some("[git diff HEAD]".to_string());
+            }
+        }
+    } else if raw_path == "status" || raw_path == "git:status" {
+        if let Ok(o) = std::process::Command::new("git")
+            .args(["status", "-s"])
+            .current_dir(cwd)
+            .output()
+        {
+            let stat_text = String::from_utf8_lossy(&o.stdout);
+            if !stat_text.trim().is_empty() {
+                text_attachments.push(format!("[git status]\n{}", stat_text));
+                return Some("[git status]".to_string());
+            }
+        }
+    } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
+        let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+        let res = kb.search(kb_query);
+        if !res.is_empty() {
+            let summary = res
+                .iter()
+                .map(|e| {
+                    format!(
+                        "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
+                        e.name,
+                        e.entity_type,
+                        e.description.as_deref().unwrap_or(""),
+                        e.path
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
+            return Some(format!("[kb: {}]", kb_query));
+        }
+    } else if raw_path == "rules" || raw_path.starts_with("rule:") {
+        let engine = crate::rules::RuleEngine::load_defaults();
+        let rules_summary = engine
+            .rules
+            .iter()
+            .map(|r| {
+                format!(
+                    "Rule [{}]: {} (Severity: {})",
+                    r.id, r.description, r.severity
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
+        return Some("[active rules]".to_string());
+    } else if let Some(url) = raw_path
+        .strip_prefix("url:")
+        .or_else(|| raw_path.strip_prefix("web:"))
+    {
+        // Only real web URLs, and `--` so a value like `-K file` or
+        // `file:///…` can't become curl options or a local read.
+        if !is_web_url(url) {
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ @{} not fetched — only http:// and https:// URLs are attached",
+                tui::sanitize_terminal(raw_path)
+            )));
+        } else if let Ok(o) = std::process::Command::new("curl")
+            .args(["-sL", "--max-time", "5", "--", url])
+            .output()
+        {
+            let web_text = String::from_utf8_lossy(&o.stdout);
+            if !web_text.trim().is_empty() {
+                let snippet: String = web_text.chars().take(8000).collect();
+                text_attachments.push(format!("[web: {}]\n{}", url, snippet));
+                return Some(format!("[web: {}]", url));
+            }
+        }
+    } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
+        if let Ok(o) = std::process::Command::new("grep")
+            .args(["-rnI", "-e", sym_query, "--", "."])
+            .current_dir(cwd)
+            .output()
+        {
+            let sym_text = String::from_utf8_lossy(&o.stdout);
+            if !sym_text.trim().is_empty() {
+                let snippet: String = sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
+                text_attachments.push(format!("[symbol search: {}]\n{}", sym_query, snippet));
+                return Some(format!("[symbol: {}]", sym_query));
+            }
+        }
+    }
+    let (raw_path, range) = split_attachment_range(raw_path);
+    let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let p = if let Some(rest) = raw_path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(rest)
+    } else if raw_path.starts_with('/') {
+        PathBuf::from(raw_path)
+    } else {
+        cwd.join(raw_path)
+    };
+    // Credentials must never ride along in a prompt unnoticed; the
+    // token stays as typed and nothing is read.
+    if p.exists() && tools::is_sensitive(&p) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} not attached — it is a sensitive file (keys, credentials, secrets)",
+            tui::sanitize_terminal(&p.display().to_string())
+        )));
+    } else if image_exts.contains(&ext.as_str()) && p.exists() {
+        if !vision {
+            tui::line(&tui::yellow(
+                "  ⚠ current model is not multimodal — image not attached",
+            ));
+        } else if let Ok(mut f) = std::fs::File::open(&p) {
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_ok() {
+                let media_type = match ext.as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => "image/png",
+                };
+                images.push((media_type.to_string(), media::b64_encode(&buf)));
+                // Show the attachment in the transcript (pixel-perfect
+                // or half-block, see tui::show_image_file); a pasted
+                // screenshot already previewed at paste time is not
+                // drawn twice.
+                tui::show_image_file(&p, true);
+                return Some(format!(
+                    "[image: {}]",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+    } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
+        if !vision {
+            tui::line(&tui::yellow(
+                "  ⚠ current model is not multimodal — video not attached",
+            ));
+        } else if !media::ffmpeg_available() {
+            tui::line(&tui::yellow(
+                "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",
+            ));
+        } else {
+            tui::line(&tui::dim(&format!(
+                "  ⎘ parsing video {} with ffmpeg…",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            )));
+            if let Some(v) = media::attach_video(&p) {
+                let n = v.frames.len();
+                images.extend(v.frames);
+                text_attachments.push(v.summary);
+                // First frame inline.
+                tui::show_image_file(&p, true);
+                return Some(format!(
+                    "[video: {} — {n} sampled frames attached in order]",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            tui::line(&tui::red(&format!(
+                "  ✗ could not decode video {}",
+                p.display()
+            )));
+        }
+    } else if let Some(att) = read_text_attachment(&p, range) {
+        if let Some(total_kib) = att.truncated_from_kib {
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
+                p.display(),
+                MAX_ATTACHED_FILE_BYTES / 1024
+            )));
+        }
+        text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
+        return Some(format!("[file: {}]", p.display()));
+    } else if p.is_file() {
+        // Never drop an attachment silently: the token stays in the
+        // prompt as typed, and the user is told why.
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
+            p.display()
+        )));
+    }
+    None
 }
 
 fn is_web_url(url: &str) -> bool {
@@ -5707,20 +6838,267 @@ mod tests {
     }
 
     #[test]
-    fn auto_switch_escalates_out_of_brainstorm_only() {
-        // Brainstorming mode escalates to Plan mode first before stepping to Build mode.
+    fn a_task_typed_in_brainstorm_gets_a_hint_never_a_mode_change() {
+        // The hint names PLAN; the mode stays where the person put it.
+        let (target, hint) = mode_hint("build me a snake game", &Mode::Brainstorm).unwrap();
+        assert_eq!(target, "PLAN");
+        assert!(hint.contains("this looks like a task — Shift+Tab for PLAN"));
+        // A long paste of notes reads as a plan-sized task: still only a hint.
+        let notes =
+            "we should build a cache layer, add retries and fix the flaky test. ".repeat(30);
+        assert!(notes.len() > 2000);
+        assert_eq!(mode_hint(&notes, &Mode::Brainstorm).unwrap().0, "PLAN");
+        // A build task in PLAN suggests BUILD; matching modes say nothing.
+        assert_eq!(
+            mode_hint("fix the parser bug", &Mode::Plan).unwrap().0,
+            "BUILD"
+        );
+        assert!(mode_hint("fix the parser bug", &Mode::Build).is_none());
+        assert!(mode_hint("what if we used sqlite?", &Mode::Brainstorm).is_none());
+    }
+
+    fn git_fixture(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(d.join("app.py"), "def main():\n    pass\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
+        d
+    }
+
+    fn log_count(d: &std::path::Path) -> usize {
+        git_text(d, &["log", "--oneline"]).unwrap().lines().count()
+    }
+
+    #[test]
+    fn commit_shows_the_draft_and_commits_only_after_c() {
+        let d = git_fixture("commit");
+        // Nothing staged: no draft is requested.
+        let mut drafted = false;
+        let r = commit_flow(
+            &d,
+            |_, _| {
+                drafted = true;
+                Ok("x".into())
+            },
+            &mut |_| Some("c".into()),
+        );
+        assert!(r.is_none() && !drafted);
+
+        std::fs::write(d.join("app.py"), "def greet():\n    pass\n").unwrap();
+        git_text(&d, &["add", "app.py"]).unwrap();
+        let draft = |stat: &str, diff: &str| {
+            assert!(stat.contains("app.py") && diff.contains("+def greet"));
+            Ok("feat: add greet helper".to_string())
+        };
+        let answer = |script: &'static [&'static str]| {
+            let mut i = 0;
+            move |q: &str| {
+                if q.contains("run git here anyway") {
+                    return Some("y".to_string());
+                }
+                i += 1;
+                script.get(i - 1).map(|a| a.to_string())
+            }
+        };
+        // n: the draft is shown, git log is unchanged and the change stays staged.
+        assert!(commit_flow(&d, draft, &mut answer(&["n"])).is_none());
+        assert_eq!(log_count(&d), 1);
+        assert!(!git_text(&d, &["diff", "--staged", "--stat"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        // e, a new message, then c: bwn commits the edited message.
+        let summary = commit_flow(&d, draft, &mut answer(&["e", "feat: greet people", "c"]))
+            .expect("committed");
+        assert!(summary.ends_with("feat: greet people"), "{summary}");
+        assert_eq!(log_count(&d), 2);
+        assert!(crate::checkpoint::committed_since_turn(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_after_a_commit_says_commits_are_not_undone() {
+        // /commit with no agent turn recorded in this folder.
+        assert_eq!(
+            undo_preamble(None, true),
+            [
+                "  commits are not undone by /undo — git reset --soft HEAD~1 keeps the changes",
+                "  no agent turn recorded in this folder — /checkpoints lists what can be restored",
+            ]
+        );
+        assert_eq!(
+            undo_preamble(None, false),
+            ["  no agent turn recorded in this folder — /checkpoints lists what can be restored"]
+        );
+        // A turn, then a commit made outside bwn (HEAD moved).
+        let last = checkpoint::LastTurn {
+            turn: checkpoint::Turn::default(),
+            checkpoints: Vec::new(),
+            this_session: true,
+            head_moved: true,
+        };
+        assert_eq!(undo_preamble(Some(&last), false).len(), 1);
+        let last = checkpoint::LastTurn {
+            head_moved: false,
+            ..last
+        };
+        assert!(undo_preamble(Some(&last), false).is_empty());
+    }
+
+    #[test]
+    fn resume_answers_pick_filter_or_say_what_is_missing() {
+        assert_eq!(resume_pick(None, 3), ResumePick::Cancel);
+        assert_eq!(resume_pick(Some("  "), 3), ResumePick::Cancel);
+        assert_eq!(resume_pick(Some("2"), 3), ResumePick::Pick(1));
+        assert_eq!(resume_pick(Some("99"), 3), ResumePick::Missing(99));
+        assert_eq!(resume_pick(Some("0"), 3), ResumePick::Missing(0));
+        assert_eq!(
+            resume_pick(Some("parser"), 3),
+            ResumePick::Filter("parser".into())
+        );
+        let mk = |title: &str, cwd: &str| session::Session {
+            schema_version: 1,
+            id: title.into(),
+            title: title.into(),
+            cwd: cwd.into(),
+            model: "m".into(),
+            created_ms: 0,
+            updated_ms: 0,
+            msgs: vec![],
+            name: None,
+        };
+        let all = vec![
+            mk("fix the parser", "/work/api"),
+            mk("add a flag", "/work/cli"),
+        ];
+        let hits = filter_sessions(&all, "PARSER");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(filter_sessions(&all, "cli flag")[0].title, "add a flag");
+        assert_eq!(filter_sessions(&all, "").len(), 2);
+        let here = std::path::Path::new("/work/api");
+        assert_eq!(session_folder(&all[0], here), "this folder");
+        assert_eq!(session_folder(&all[1], here), "…/work/cli");
+    }
+
+    #[test]
+    fn diff_lists_changed_and_new_files_with_one_summary() {
+        let d = git_fixture("diff");
+        std::fs::write(d.join("app.py"), "def main():\n    print('hi')\n").unwrap();
+        std::fs::create_dir_all(d.join("pkg")).unwrap();
+        std::fs::write(d.join("pkg/core.py"), "a = 1\nb = 2\n").unwrap();
+        std::fs::create_dir_all(d.join("tests")).unwrap();
+        std::fs::write(d.join("tests/test_core.py"), "x\n").unwrap();
+        git_text(&d, &["add", "tests/test_core.py"]).unwrap();
+        let (_, files) = changed_files(&d).unwrap();
+        let listed: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.kind())).collect();
+        assert_eq!(
+            listed,
+            [
+                ("app.py", "modified"),
+                ("tests/test_core.py", "added"),
+                ("pkg/", "new folder")
+            ]
+        );
+        let app = &files[0];
+        assert_eq!((app.added, app.removed), (1, 1));
+        assert_eq!(files[2].added, 2, "lines in the new folder count");
+        assert_eq!(
+            diff_summary(&files),
+            "3 files changed, 4 insertions(+), 1 deletion(-)"
+        );
+        // Porcelain with a rename keeps the new path only.
+        assert_eq!(
+            parse_porcelain("R  new.py\0old.py\0?? x/\0"),
+            [
+                ("R ".to_string(), "new.py".to_string()),
+                ("??".into(), "x/".into())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_takes_the_last_answer_and_wraps_it_for_the_clipboard() {
+        let t = vec![
+            provider::Msg::User("q".into()),
+            provider::Msg::Assistant {
+                text: "first answer".into(),
+                calls: vec![],
+            },
+            provider::Msg::Assistant {
+                text: "  ".into(),
+                calls: vec![],
+            },
+        ];
+        assert_eq!(last_answer(&t), Some("first answer"));
+        assert_eq!(last_answer(&[]), None);
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn rewind_cuts_the_conversation_just_before_the_prompt() {
+        use provider::Msg;
+        let answer = |t: &str| Msg::Assistant {
+            text: t.into(),
+            calls: vec![],
+        };
+        let mut t = vec![
+            Msg::System("sys".into()),
+            Msg::User("first".into()),
+            answer("a1"),
+            Msg::User("second\n\n[hook context]\nbranch main".into()),
+            answer("a2"),
+            Msg::User("third".into()),
+            answer("a3"),
+        ];
+        let point = |index, prompt: &str| RewindPoint {
+            index,
+            started_ms: 0,
+            prompt: prompt.into(),
+        };
+        // A hook appended context to "second": still found.
+        assert!(rewind_transcript(&mut t, &point(3, "second")));
+        assert_eq!(t.len(), 3);
+        assert!(matches!(t.last(), Some(Msg::Assistant { text, .. }) if text == "a1"));
+        // The first prompt of a conversation (recorded at index 0, behind the
+        // system prompt the turn added) leaves an empty conversation.
+        assert!(rewind_transcript(&mut t, &point(0, "first")));
+        assert!(t.is_empty());
+        // A prompt that is no longer there changes nothing.
+        let mut t = vec![Msg::System("sys".into()), Msg::User("summary".into())];
+        assert!(!rewind_transcript(&mut t, &point(1, "gone")));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_plan_stays_in_plan() {
         assert!(matches!(
-            auto_switch_mode("build me a snake game", &Mode::Brainstorm),
-            Some(Mode::Plan)
+            mode_after_plan(agent::PlanEnd::Executed),
+            Mode::Build
         ));
         assert!(matches!(
-            auto_switch_mode("plan the migration to sqlite", &Mode::Brainstorm),
-            Some(Mode::Plan)
+            mode_after_plan(agent::PlanEnd::Cancelled),
+            Mode::Plan
         ));
-        // A deliberate PLAN gate is never silently bypassed.
-        assert!(auto_switch_mode("fix the parser bug", &Mode::Plan).is_none());
-        // Matching mode: nothing to do.
-        assert!(auto_switch_mode("fix the parser bug", &Mode::Build).is_none());
+        assert!(matches!(
+            mode_after_plan(agent::PlanEnd::Answered),
+            Mode::Plan
+        ));
     }
 
     #[test]
@@ -6237,6 +7615,65 @@ mod tests {
     }
 
     #[test]
+    fn what_you_type_is_what_the_model_gets() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.py"), "line 1\nline 2\nline 3\n").unwrap();
+        std::fs::write(dir.join("my notes.md"), "spaced\n").unwrap();
+        // Prompts with no attachment are sent byte for byte.
+        for typed in [
+            "why does int(\"abc\") fail with 'abc'?",
+            "line one\nline two",
+            "tabs\tand  two spaces, \"double\" and 'single' quotes",
+            "unbalanced \"quote and it's fine",
+            "a \\ backslash and C:\\path\\x",
+        ] {
+            let (text, images) = extract_attachments(typed, &dir, true);
+            assert_eq!(text, typed);
+            assert!(images.is_empty());
+        }
+        // Attachments are replaced where they stand; the rest stays as typed.
+        let typed = "see @app.py:1-2,\n\tthen \"explain\" it";
+        let (text, _) = extract_attachments(typed, &dir, true);
+        let file = format!("[file: {}]", dir.join("app.py").display());
+        assert!(
+            text.starts_with(&format!(
+                "see {file},\n\tthen \"explain\" it\n\n[attached files]\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("line 1\nline 2") && !text.contains("line 3"),
+            "{text}"
+        );
+        // Quoted and escaped @paths with spaces are one attachment.
+        for typed in [
+            "read @\"my notes.md\" now",
+            "read @'my notes.md' now",
+            "read @my\\ notes.md now",
+        ] {
+            let (text, _) = extract_attachments(typed, &dir, true);
+            let file = format!("[file: {}]", dir.join("my notes.md").display());
+            assert!(
+                text.starts_with(&format!("read {file} now\n\n")),
+                "{typed}: {text}"
+            );
+        }
+        // The composer's own tokens for dropped files round-trip.
+        for name in ["my notes.md", "say \"hi\" notes.md", "back\\slash notes.md"] {
+            std::fs::write(dir.join(name), "dropped\n").unwrap();
+            let token = crate::tui::attachment_token(&dir.join(name));
+            let (text, _) = extract_attachments(&format!("read {token}"), &dir, true);
+            assert!(text.contains("dropped"), "{token}: {text}");
+        }
+        // A missing file stays exactly as typed.
+        let (text, _) = extract_attachments("open @nope.py  please", &dir, true);
+        assert_eq!(text, "open @nope.py  please");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn image_path_before_sentence_punctuation_attaches() {
         let dir = std::env::temp_dir().join(format!("bwn-attach-punct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6258,6 +7695,17 @@ mod tests {
             let (_, images) = extract_attachments(prompt, &dir, true);
             assert_eq!(images.len(), 1, "{prompt}");
         }
+        std::fs::write(dir.join("My Shot.png"), png).unwrap();
+        let typed = format!(
+            "what's in '{}'?\nand (shot.png)",
+            dir.join("My Shot.png").display()
+        );
+        let (text, images) = extract_attachments(&typed, &dir, true);
+        assert_eq!(images.len(), 2, "{text}");
+        assert_eq!(
+            text,
+            "what's in [image: My Shot.png]?\nand ([image: shot.png])"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
