@@ -944,7 +944,7 @@ fn the_key_is_not_in_bwns_own_environment_block() {
     );
     let (port, auths) = serve_auth(None);
     write_config(&home, "custom", "auto", port);
-    let key = "sk-ENVIRON-SENTINEL-0123456789";
+    let key = "sk-ENVIRON-SENTINEL-0123456789"; // gitleaks:allow (fake key for the test)
     let r = run_env(
         &home,
         &cwd,
@@ -3267,7 +3267,7 @@ fn a_rejected_key_is_not_retried_and_points_at_login() {
         &home,
         &cwd,
         &["run", "say hi"],
-        &[("CUSTOM_API_KEY", "sk-wrong-key-123456789")],
+        &[("CUSTOM_API_KEY", "sk-wrong-key-123456789")], // gitleaks:allow (fake key for the test)
     );
     assert!(start.elapsed().as_secs() < 3, "took {:?}", start.elapsed());
     assert_eq!(posts.load(Ordering::SeqCst), 1);

@@ -1,0 +1,4 @@
+# Fake keys in tests, as committed before their gitleaks:allow comment.
+# Fingerprints are commit:file:rule:line; a history rewrite changes them.
+5495b055fe6fd15d4c8faa27b0cca6ade0338d48:harness/tests/integration.rs:generic-api-key:947
+650d7c87df6d73056fa4d45fbbd9e140bea9c186:harness/tests/integration.rs:generic-api-key:2680
