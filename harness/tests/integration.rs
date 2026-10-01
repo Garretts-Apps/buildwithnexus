@@ -3545,10 +3545,13 @@ fn a_turn_that_ends_after_a_call_that_could_not_run_is_not_a_success() {
             tool_call("c1", "open_document", json!({"name": "a.txt"})),
             text("The file says hello."),
         ],
-        // A call written as text that nothing parsed.
-        vec![text(
-            r#"{"name": "open_document", "arguments": {"name": "a.txt"}}"#,
-        )],
+        // A call written as text, to a tool this run does not have: it is
+        // answered with the real tool names, and the answer that follows is
+        // not a success.
+        vec![
+            text(r#"{"name": "open_document", "arguments": {"name": "a.txt"}}"#),
+            text("The file says hello."),
+        ],
     ] {
         let home = tmp("home");
         let cwd = tmp("proj");
