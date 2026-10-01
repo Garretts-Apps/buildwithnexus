@@ -23,7 +23,8 @@ the setting that restores the old behavior is listed in
   `/proc/<pid>/environ` (Linux) and `ps eww` (macOS) show `****` for
   `*_API_KEY`, `*_API_TOKEN` and preset key variables; bwn still uses the key.
   `/proc/*/environ` (any process, globs included) is a sensitive path for the
-  file tools and for commands, so reading the parent shell's environment asks
+  file tools and for commands, and so are `/proc` and a process's folder as a
+  command argument (a recursive search reads every environ under them), so reading the parent shell's environment asks
   first in every mode and is refused headless.
 - **A call quoted in an answer never runs.** JSON, `<tool_call>` markup or a
   `tool_code` fence with prose after it, or after a paragraph or an

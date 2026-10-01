@@ -3234,6 +3234,24 @@ fn is_proc_environ(names: &[String]) -> bool {
             .is_some_and(|n| n == "environ" || component_glob_match(n, "environ"))
 }
 
+// `/proc`, `/proc/<pid>`, `/proc/self` (or a glob of a pid): a folder that
+// holds environ files.
+fn is_proc_tree(names: &[String]) -> bool {
+    match names {
+        [p] => p == "proc",
+        [p, pid] => {
+            p == "proc"
+                && (pid == "self"
+                    || pid == "thread-self"
+                    || pid.contains(['*', '?', '['])
+                    || pid.bytes().all(|b| b.is_ascii_digit())
+                    || pid.starts_with('$'))
+        }
+        [p, _, task] => p == "proc" && task == "task",
+        _ => false,
+    }
+}
+
 // `environ`, or a glob of it that spells part of the name (`env*`): a bare
 // `*` is any file.
 fn is_environ_name(n: &str) -> bool {
@@ -3378,6 +3396,11 @@ fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<Pa
                 .next()
                 .is_some_and(|n| is_environ_name(&n.to_lowercase()))
         {
+            return Some(p);
+        }
+        // `/proc` or one process's folder: a recursive search (`rg -a KEY
+        // /proc`) reads every environ under it.
+        if !windows && is_proc_tree(&path_names(&normalize(&p), false)) {
             return Some(p);
         }
         if is_sensitive_for(&p, windows) {
@@ -7827,6 +7850,12 @@ pub(crate) mod tests {
             assert!(is_sensitive(Path::new(p)), "{p}");
         }
         assert!(!is_sensitive(Path::new("/proc/self/status")));
+        for cmd in ["cat /proc/cpuinfo", "cat /proc/self/status", "free -m"] {
+            assert!(
+                command_sensitive_path(cmd, Path::new("/tmp")).is_none(),
+                "{cmd}"
+            );
+        }
         assert!(!is_sensitive_in_project(Path::new("proc/x/environ")));
         let cwd = Path::new("/tmp");
         for cmd in [
@@ -7837,6 +7866,8 @@ pub(crate) mod tests {
             "for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/environ; done",
             "cd /proc/self && cat environ",
             "grep -a KEY /proc/self/*",
+            "rg -a CUSTOM_API_KEY /proc --max-depth 2",
+            "grep -ra KEY /proc/$PPID",
         ] {
             assert!(command_sensitive_path(cmd, cwd).is_some(), "{cmd}");
         }
