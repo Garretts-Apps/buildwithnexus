@@ -799,13 +799,7 @@ fn normalize_text_tool_calls(mut reply: Reply, defs: &[tools::ToolDef], user_tex
         }
         return reply;
     }
-    if !report::is_json() {
-        report::notice(&format!(
-            "  ⟳ recovery: parsed {} tool call{} from model JSON",
-            calls.len(),
-            if calls.len() == 1 { "" } else { "s" }
-        ));
-    }
+    // The calls show as ordinary tool lines; the repair is in /trace.
     trace::record_visible(
         "tool_input_repaired",
         "parsed text JSON tool call",
@@ -1425,16 +1419,23 @@ fn answer_with(
         tui::bold(&tui::sanitize_terminal(full_prompt))
     ));
     let Some(ans) = ask(&answer_input_prompt(default)) else {
-        // Esc or Ctrl+C at the question stops the turn, as at an approval.
+        // Esc or Ctrl+C at the question stops the turn, as at an approval;
+        // the model's default is never sent as the person's answer.
         stop_turn();
         return (STOPPED_BY_USER.into(), true);
     };
-    let out = if ans.trim().is_empty() && !default.is_empty() {
+    (question_answer(ans, default), false)
+}
+
+/// What the model is told the person answered: Enter on an empty line takes
+/// the default, typed text wins. (Esc or Ctrl+C never gets here: it stops
+/// the turn, so the default is never sent as the person's choice.)
+fn question_answer(ans: String, default: &str) -> String {
+    if ans.trim().is_empty() && !default.is_empty() {
         default.to_string()
     } else {
         ans
-    };
-    (out, false)
+    }
 }
 
 // ── permissions ───────────────────────────────────────────────────────────────
@@ -5858,6 +5859,20 @@ mod tests {
             "feat: add greet helper"
         );
         assert_eq!(clean_commit_message("\"fix: quote\""), "fix: quote");
+    }
+
+    #[test]
+    fn a_dismissed_question_never_answers_with_the_default() {
+        // Esc or Ctrl+C at "Answer [yes]:" is not a yes: it stops the turn.
+        let (ans, stopped) = answer_with("ok?", "ok?", "yes", |_| None);
+        assert!(stopped);
+        assert_ne!(ans, "yes");
+        assert!(ans.contains("stopped by the user"), "{ans}");
+        assert!(turn_stopped(true));
+        // Enter on an empty line still takes the default; typed text wins.
+        assert_eq!(question_answer(" ".into(), "yes"), "yes");
+        assert_eq!(question_answer("no".into(), "yes"), "no");
+        assert_eq!(question_answer(String::new(), ""), "");
     }
 
     #[test]

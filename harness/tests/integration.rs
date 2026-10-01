@@ -4625,3 +4625,139 @@ fn a_helper_with_a_tools_list_cannot_delegate_past_it() {
     assert_eq!(posts.len(), 4);
     assert!(posts[3].contains("reader: could not hand it on"));
 }
+
+// ── terminal-ui: transcript lines ───────────────────────────────────────────
+
+// Human-mode runs stream: the scripted replies (as built by tool_call and
+// text) go out as OpenAI server-sent events, one chunk per message part.
+fn serve_streaming(script: Vec<String>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (method, _) = read_request(&mut stream);
+            let resp = if method == "POST" {
+                let reply: Value = serde_json::from_str(
+                    &script
+                        .get(served)
+                        .cloned()
+                        .unwrap_or_else(|| finish("auto")),
+                )
+                .unwrap();
+                served += 1;
+                let msg = &reply["choices"][0]["message"];
+                let mut delta = json!({"role": "assistant"});
+                if let Some(calls) = msg["tool_calls"].as_array() {
+                    let calls: Vec<Value> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let mut c = c.clone();
+                            c["index"] = json!(i);
+                            c
+                        })
+                        .collect();
+                    delta["tool_calls"] = json!(calls);
+                } else {
+                    delta["content"] = msg["content"].clone();
+                }
+                let mut body = String::new();
+                for chunk in [
+                    json!({"choices": [{"index": 0, "delta": delta}]}),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                ] {
+                    body.push_str(&format!("data: {chunk}\n\n"));
+                }
+                body.push_str("data: [DONE]\n\n");
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            } else {
+                let body = r#"{"object":"list","data":[]}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            };
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+            if method == "POST" && served >= script.len() {
+                break;
+            }
+        }
+    });
+    port
+}
+
+// Human (not --json) output of a headless run: stdout, then stderr.
+fn run_human(home: &Path, cwd: &Path, task: &str) -> (Option<i32>, String) {
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(["run", task])
+        .current_dir(cwd)
+        .env("NEXUS_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[test]
+fn human_output_shows_one_line_per_tool_call_and_the_todo_list() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let todo = |a: &str, b: &str| {
+        json!({"items": [
+            {"task": "Write out.txt", "status": a},
+            {"task": "Read it back", "status": b},
+        ]})
+    };
+    let port = serve_streaming(vec![
+        tool_call("c1", "todo_write", todo("in_progress", "pending")),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "out.txt", "content": "hello"}),
+        ),
+        tool_call("c3", "todo_write", todo("completed", "in_progress")),
+        // A call written as JSON text, as small local models do.
+        text(&json!({"name": "read_file", "arguments": {"path": "out.txt"}}).to_string()),
+        finish("wrote and read the file"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+
+    let (code, out) = run_human(&home, &cwd, "create out.txt and read it");
+    assert_eq!(code, Some(0), "{out}");
+    // Internal event names stay in /trace and --json, never in the transcript.
+    for internal in [
+        "• tool_call",
+        "• tool_result",
+        "• tool_input_repaired",
+        "• hook",
+        "recovery: parsed",
+    ] {
+        assert!(!out.contains(internal), "{internal:?} shown:\n{out}");
+    }
+    // The write shows once as its call line (the applied diff names the
+    // full path), not again under an internal name.
+    assert_eq!(out.matches("write out.txt").count(), 1, "{out}");
+    // The todo list renders as a checklist and ticks the first item.
+    assert!(out.contains("☰ todo · 0 of 2 done"), "{out}");
+    assert!(out.contains("▸ Write out.txt"), "{out}");
+    assert!(out.contains("☰ todo · 1 of 2 done"), "{out}");
+    assert!(out.contains("✓ Write out.txt"), "{out}");
+}

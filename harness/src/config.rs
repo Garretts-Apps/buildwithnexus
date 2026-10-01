@@ -320,6 +320,11 @@ pub struct Settings {
     /// modalities) and falls back to the model name; true or false decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// Colour theme: "auto" (default; the terminal's background colour when
+    /// it answers, else COLORFGBG, else dark), "dark", "light", or "ansi"
+    /// (the terminal's own 16 colours). `/theme` changes and saves it.
+    #[serde(default = "default_auto")]
+    pub theme: String,
 }
 
 /// `permissions` in settings: rule lists by effect.
@@ -410,6 +415,7 @@ impl Default for Settings {
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),
             vision: None,
+            theme: default_auto(),
         }
     }
 }

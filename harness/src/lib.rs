@@ -126,6 +126,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--json",
     "--yes",
     "--legacy-exit-codes",
+    "--plain",
     "--trust-project",
     "--worktree",
     "--help",
@@ -178,6 +179,12 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--legacy-exit-codes" {
             opts.legacy_exit_codes = true;
+            continue;
+        }
+        // Line mode: no alternate screen or cursor addressing (TERM=dumb
+        // does the same), for screen readers and plain consoles.
+        if arg == "--plain" {
+            tui::set_line_mode(true);
             continue;
         }
         let (flag, inline) = arg
@@ -737,7 +744,7 @@ const STARTUP_TIPS: &[&str] = &[
     "tip: Ctrl+V pastes a screenshot straight into the prompt — the model sees what you see",
     "tip: @ completes file paths, @kb: searches the knowledge base",
     "tip: double-click a word, triple-click a line. copied, confirmed, footer says so",
-    "tip: /checkpoint before you get brave",
+    "tip: /undo puts back the last turn's edits. go on, be brave",
     "tip: /model swaps models mid-session — it validates before it commits",
     "tip: ↑ filters history by what you've typed, and never eats your draft",
     "tip: /vim exists. you already knew, somehow",
@@ -1684,7 +1691,8 @@ fn repl(
                 tui::accent("›")
             );
             match tui::ask_task(&prompt) {
-                None => return Ok(()),
+                None if confirm_quit() => return Ok(()),
+                None => continue,
                 Some(tui::InputEvent::CycleMode) => {
                     mode = mode.next();
                     last_suggested_mode = None;
@@ -1860,8 +1868,7 @@ fn repl(
         }
 
         // /schedule <delay> <task>  e.g. `/schedule 5m git pull && cargo test`
-        if let Some(rest) = t.strip_prefix("/schedule ") {
-            let rest = rest.trim();
+        if let Some(rest) = slash_args(t, "/schedule") {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let delay_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
@@ -1888,8 +1895,7 @@ fn repl(
         }
 
         // /loop <interval> <task>  e.g. `/loop 10m cargo test`
-        if let Some(rest) = t.strip_prefix("/loop ") {
-            let rest = rest.trim();
+        if let Some(rest) = slash_args(t, "/loop") {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let interval_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
@@ -1933,6 +1939,18 @@ fn repl(
             continue;
         }
 
+        // Bare /plan, /build and /brainstorm switch the mode, as the command
+        // list says; with a task they run it in that mode (below).
+        if let Some(next) = bare_mode_command(t) {
+            mode = next;
+            last_suggested_mode = None;
+            tui::show_mode_change(mode_label(&mode));
+            continue;
+        }
+        if let Some(arg) = slash_args(t, "/theme") {
+            handle_theme(arg);
+            continue;
+        }
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
             let vision = media::model_supports_vision(&provider);
@@ -1974,7 +1992,8 @@ fn repl(
         }
 
         match t {
-            "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
+            "/exit" | "/quit" | "exit" | "quit" if confirm_quit() => return Ok(()),
+            "/exit" | "/quit" | "exit" | "quit" => continue,
             "/clear" => {
                 transcript.clear();
                 rewind_points.clear();
@@ -2326,14 +2345,20 @@ fn repl(
                 tui::bell();
                 continue;
             }
-            // UX-001: unknown slash command — show error instead of falling through to AI.
-            if !cmd_name.is_empty() {
-                tui::line(&tui::red(&format!(
-                    "  unknown command /{cmd_name} — /help for all commands"
-                )));
-                continue;
-            } else {
-                tui::line(&tui::red("  type /help for available commands"));
+            // UX-001: unknown slash command — show error instead of falling
+            // through to AI. A message that starts with an absolute path (a
+            // dropped screenshot) is a message, and goes on to the agent.
+            if !starts_with_path(t) {
+                if let Some(usage) = command_usage(cmd_name) {
+                    // A listed command that needs an argument, typed bare.
+                    tui::line(&tui::yellow(&format!("  usage: {usage}")));
+                } else if !cmd_name.is_empty() {
+                    tui::line(&tui::red(&format!(
+                        "  unknown command /{cmd_name} — /help for all commands"
+                    )));
+                } else {
+                    tui::line(&tui::red("  type /help for available commands"));
+                }
                 continue;
             }
         }
@@ -6653,31 +6678,134 @@ fn handle_doctor_tui(live: &Provider) {
     }
 }
 
+/// How to call a listed command that needs an argument, for when it is
+/// typed bare.
+fn command_usage(cmd_name: &str) -> Option<&'static str> {
+    match cmd_name {
+        "btw" => Some("/btw <context>  e.g. /btw also update the tests"),
+        _ => None,
+    }
+}
+
+/// The mode a bare `/plan`, `/build` or `/brainstorm` switches to.
+fn bare_mode_command(t: &str) -> Option<Mode> {
+    match t {
+        "/plan" => Some(Mode::Plan),
+        "/build" => Some(Mode::Build),
+        "/brainstorm" => Some(Mode::Brainstorm),
+        _ => None,
+    }
+}
+
+/// Whether input that starts with `/` is really a path: its first word has
+/// another `/` in it (`/home/me/shot.png what is this`) or names something
+/// on disk. Command names never contain a second slash.
+fn starts_with_path(t: &str) -> bool {
+    let first = t.split_whitespace().next().unwrap_or("");
+    first.len() > 1
+        && first.starts_with('/')
+        && (first[1..].contains('/') || std::path::Path::new(first).exists())
+}
+
+/// `/cmd` alone or `/cmd <args>`: the trimmed arguments ("" when bare).
+/// None for any other input, including `/cmdmore`.
+fn slash_args<'a>(t: &'a str, cmd: &str) -> Option<&'a str> {
+    match t.strip_prefix(cmd)? {
+        "" => Some(""),
+        rest if rest.starts_with(char::is_whitespace) => Some(rest.trim()),
+        _ => None,
+    }
+}
+
+/// `/theme [dark|light|ansi|auto]`: switch the colour theme and save it as
+/// the `theme` setting. Bare, it opens a picker.
+fn handle_theme(arg: &str) {
+    let choice = if arg.is_empty() {
+        let names = ["dark", "light", "ansi", "auto"];
+        let details = [
+            "for dark terminal backgrounds",
+            "for light terminal backgrounds",
+            "the terminal's own 16 colours",
+            "follow the terminal's background colour",
+        ];
+        let items: Vec<tui::SelectItem> = names
+            .iter()
+            .zip(details)
+            .map(|(n, d)| tui::SelectItem {
+                label: n.to_string(),
+                detail: d.to_string(),
+            })
+            .collect();
+        let title = format!("Theme (now: {})", tui::theme_name());
+        match tui::select_item(&title, &items) {
+            Some(i) => names[i].to_string(),
+            None => return,
+        }
+    } else {
+        arg.to_ascii_lowercase()
+    };
+    match tui::set_theme(&choice) {
+        Ok(now) => {
+            let saved = config::save_user_settings(&[("theme", Some(choice.clone().into()))]);
+            let shown = if choice == "auto" {
+                format!("auto ({now})")
+            } else {
+                now.to_string()
+            };
+            match saved {
+                Ok(()) => tui::line(&tui::green(&format!(
+                    "  ✓ theme: {shown} — saved; new output uses it"
+                ))),
+                Err(e) => tui::line(&tui::yellow(&format!(
+                    "  theme: {shown} for this session — not saved: {e}"
+                ))),
+            }
+        }
+        Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+    }
+}
+
+/// Before the session closes (Ctrl+D, a second Ctrl+C, /exit): background
+/// workflows run only while bwn is open, so name the ones that would wait
+/// and ask. True means quit. Input that has gone away quits without asking.
+fn confirm_quit() -> bool {
+    let waiting = waiting_workflows(&workflow::snapshots());
+    if waiting.is_empty() || tui::input_closed() {
+        return true;
+    }
+    let answer = tui::ask(&quit_question(&waiting)).map(|a| a.trim().to_lowercase());
+    matches!(answer.as_deref(), Some("y" | "yes"))
+}
+
+// The workflows that would not run once bwn closes.
+fn waiting_workflows(snaps: &[workflow::WorkflowSnapshot]) -> Vec<usize> {
+    snaps
+        .iter()
+        .filter(|w| matches!(w.status_str.as_str(), "pending" | "running"))
+        .map(|w| w.id)
+        .collect()
+}
+
+fn quit_question(ids: &[usize]) -> String {
+    let list: Vec<String> = ids.iter().map(|id| format!("#{id}")).collect();
+    let noun = if ids.len() == 1 {
+        "workflow"
+    } else {
+        "workflows"
+    };
+    format!(
+        "  {noun} {} will not run while bwn is closed — quit anyway? [y/N] ",
+        list.join(", ")
+    )
+}
+
 fn print_help() {
+    tui::line(&tui::bold(&tui::accent(
+        "  buildwithnexus — commands and keys",
+    )));
     tui::line(&tui::dim(
-        "  /plan <task>        Break down implementation into steps",
+        "  type a task or a question; /command runs a command; Shift+Tab changes mode",
     ));
-    tui::line(&tui::dim(
-        "  /build <task>       Agentic execution of a task",
-    ));
-    tui::line(&tui::dim(
-        "  /brainstorm <task>  Conversational thought partner",
-    ));
-    tui::line(&tui::dim("  /model <name>       Hot-swap the AI model"));
-    tui::line(&tui::dim(
-        "  /permissions        Change what the agent can do unprompted",
-    ));
-    tui::line(&tui::dim(
-        "  /schedule <delay>   Run a task later (e.g. 5m cargo test)",
-    ));
-    tui::line(&tui::dim(
-        "  /loop <interval>    Run a task repeatedly (e.g. 30m)",
-    ));
-    tui::line(&tui::dim(
-        "  /trace <id>         View detailed receipts for a turn",
-    ));
-    tui::line("");
-    tui::line(&tui::bold(&tui::accent("  commands")));
     // (command, args/aliases hint, description) grouped by section. Rendered
     // as an auto-aligned table so alignment can't drift as commands change.
     type Row = (&'static str, &'static str, &'static str);
@@ -6686,6 +6814,13 @@ fn print_help() {
             "modes",
             &[
                 ("Shift+Tab", "", "cycle PLAN → BUILD → BRAINSTORM"),
+                ("/plan", "[task]", "switch to PLAN, or plan this task"),
+                ("/build", "[task]", "switch to BUILD, or do this task"),
+                (
+                    "/brainstorm",
+                    "[task]",
+                    "switch to BRAINSTORM, or talk this through",
+                ),
                 ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
                 (
                     "/permissions",
@@ -6727,8 +6862,16 @@ fn print_help() {
         (
             "automation",
             &[
-                ("/schedule", "<delay> <task>", "one-shot scheduled workflow"),
-                ("/loop", "<interval> <task>", "repeating scheduled workflow"),
+                (
+                    "/schedule",
+                    "<delay> <task>",
+                    "run a task later (e.g. 5m cargo test)",
+                ),
+                (
+                    "/loop",
+                    "<interval> <task>",
+                    "run a task repeatedly (e.g. 30m)",
+                ),
                 ("/workflows", "(/tasks)", "list background workflows"),
                 ("/btw", "<context>", "inject context into next agent turn"),
                 ("/teamwork", "(/swarm)", "multi-agent swarm preview"),
@@ -6754,7 +6897,11 @@ fn print_help() {
                     "[name|add|remove|reload]",
                     "MCP servers and their tools",
                 ),
-                ("/trace", "", "inspect hooks, tools, skills, subagents"),
+                (
+                    "/trace",
+                    "[<id>]",
+                    "receipts: tool calls, hooks, skills, subagents",
+                ),
             ],
         ),
         (
@@ -6771,10 +6918,42 @@ fn print_help() {
                 ("/config", "", "configure hooks, memory, commands via AI"),
                 ("/voice", "[<file>]", "audio transcription & voice input"),
                 ("/vim", "", "toggle Vim modal editing"),
+                ("/theme", "[dark|light|ansi|auto]", "colour theme"),
                 ("/mouse", "[on|off]", "wheel scroll + drag-copy (/scroll)"),
                 ("/doctor", "(/debug)", "diagnose setup"),
                 ("/clear", "", "clear the screen"),
-                ("/exit", "", "exit"),
+                ("/exit", "(/quit)", "exit"),
+            ],
+        ),
+        (
+            "keys",
+            &[
+                ("Enter", "", "send · end a line with \\ to add another"),
+                (
+                    "Esc",
+                    "",
+                    "stop the agent mid-turn · cancel a question or picker",
+                ),
+                (
+                    "Ctrl+C",
+                    "",
+                    "stop the agent · clear the draft · twice on an empty line: quit",
+                ),
+                ("Ctrl+D", "", "quit (asks first if workflows are waiting)"),
+                ("Ctrl+Q / Ctrl+X", "", "edit / drop the next queued message"),
+                ("↑↓  Ctrl+R", "", "history · search history"),
+                ("Tab", "", "complete commands and @paths"),
+            ],
+        ),
+        (
+            "answering an approval (allow?)",
+            &[
+                ("y", "", "yes, this once"),
+                ("n", "", "no"),
+                ("s", "", "allow it for the rest of this session"),
+                ("a", "", "always allow it in this project"),
+                ("d <reason>", "", "deny and tell the agent why"),
+                ("Esc", "", "deny and stop the turn"),
             ],
         ),
     ];
@@ -6786,7 +6965,6 @@ fn print_help() {
         .max()
         .unwrap_or(0);
 
-    tui::line("");
     for (title, rows) in sections {
         tui::line("");
         tui::line(&tui::dim(&format!("  {title}")));
@@ -6806,12 +6984,109 @@ fn print_help() {
         "    !<cmd> shell command · @<path> attach file/image/video · @diff @kb: @symbol:",
     ));
     tui::line(&tui::dim(
-        "    ^V paste image/text · Tab complete · ↑↓ history · ^R search · ^G $EDITOR",
+        "    ^V paste image/text · ^G $EDITOR · ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank",
     ));
     tui::line(&tui::dim(
-        "    ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · PgUp/PgDn scroll",
+        "    PgUp/PgDn scroll · --plain (or TERM=dumb) for line mode without screen control",
     ));
     tui::line("");
+}
+
+#[cfg(test)]
+mod terminal_ui_tests {
+    use super::*;
+
+    #[test]
+    fn quitting_names_the_workflows_that_would_wait() {
+        assert_eq!(
+            quit_question(&[1]),
+            "  workflow #1 will not run while bwn is closed — quit anyway? [y/N] "
+        );
+        assert!(quit_question(&[2, 5]).contains("workflows #2, #5 will not run"));
+        // Built from snapshots, not the live queue: other tests schedule
+        // workflows in this process while this one runs.
+        let snap = |id: usize, status: &str| workflow::WorkflowSnapshot {
+            id,
+            task: "cargo test".into(),
+            kind_str: "once".into(),
+            status_str: status.into(),
+            iteration: 0,
+            elapsed_secs: None,
+            output_lines: 0,
+        };
+        assert!(waiting_workflows(&[]).is_empty());
+        assert_eq!(
+            waiting_workflows(&[
+                snap(1, "done"),
+                snap(2, "pending"),
+                snap(3, "running"),
+                snap(4, "cancelled"),
+            ]),
+            [2, 3]
+        );
+    }
+
+    // The REPL's source, from `fn repl(` to the end of that function.
+    fn repl_source() -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src.find("\nfn repl(").expect("fn repl");
+        let body = &src[start..];
+        &body[..body[1..].find("\n}\n").expect("end of repl") + 3]
+    }
+
+    // A listed command typed bare does something: the REPL matches it
+    // alone (an arm, slash_args), it switches the mode, or it needs an
+    // argument and its usage is printed.
+    fn handled(cmd: &str) -> bool {
+        repl_source().contains(&format!("\"{cmd}\""))
+            || bare_mode_command(cmd).is_some()
+            || command_usage(&cmd[1..]).is_some()
+    }
+
+    #[test]
+    fn every_listed_command_and_tip_has_a_handler() {
+        for cmd in tui::builtin_slash_commands() {
+            assert!(
+                handled(cmd),
+                "{cmd} is in the command list but no REPL arm handles it"
+            );
+        }
+        for tip in STARTUP_TIPS {
+            for word in tip.split_whitespace().filter(|w| w.starts_with('/')) {
+                let cmd = word.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+                assert!(
+                    handled(cmd) && tui::builtin_slash_commands().contains(&cmd),
+                    "tip names {cmd}, which is not a command: {tip}"
+                );
+            }
+        }
+        // Bare mode commands switch the mode; with a task they run it.
+        assert!(matches!(bare_mode_command("/plan"), Some(Mode::Plan)));
+        assert!(matches!(bare_mode_command("/build"), Some(Mode::Build)));
+        assert!(matches!(
+            bare_mode_command("/brainstorm"),
+            Some(Mode::Brainstorm)
+        ));
+        assert!(bare_mode_command("/plan add tests").is_none());
+        assert_eq!(slash_args("/loop", "/loop"), Some(""));
+        assert_eq!(
+            slash_args("/loop  5m cargo test ", "/loop"),
+            Some("5m cargo test")
+        );
+        assert_eq!(slash_args("/loops", "/loop"), None);
+    }
+
+    #[test]
+    fn a_message_starting_with_an_absolute_path_is_not_a_command() {
+        assert!(starts_with_path(
+            "/home/me/shot.png what is in this screenshot"
+        ));
+        assert!(starts_with_path("/home/me/my\\ shot.png what is this"));
+        assert!(starts_with_path("/tmp"));
+        assert!(!starts_with_path("/help"));
+        assert!(!starts_with_path("/frobnicate now"));
+        assert!(!starts_with_path("/"));
+    }
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────

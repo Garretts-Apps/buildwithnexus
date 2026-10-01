@@ -1263,6 +1263,11 @@ fn raw_preview(name: &str, input: &Value) -> String {
                 input["title"].as_str().unwrap_or("untitled")
             )
         }
+        "todo_write" | "todowrite" => match input["items"].as_array().map(Vec::len) {
+            Some(1) => "todo list: 1 item".to_string(),
+            Some(n) => format!("todo list: {n} items"),
+            None => "todo list".to_string(),
+        },
         _ => name.to_string(),
     }
 }
@@ -3257,10 +3262,234 @@ fn skip_dir(path: &Path) -> bool {
             | ".cache"
             | "vendor"
             | "__pycache__"
+            | ".venv"
+            | ".tox"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".ruff_cache"
     ) || is_sensitive_dir_name(&name.to_lowercase(), cfg!(windows))
+        // A Python virtualenv under any name (`venv`, `env`, `.py311`).
+        || path.join("pyvenv.cfg").is_file()
+}
+
+// ── .gitignore subset for the file walkers ──────────────────────────────────
+// Blank lines and `#` comments, `!` negation, a trailing `/` for folders
+// only, a `/` anywhere but the end anchoring the pattern to its file's
+// folder, and `*`, `?`, `[…]` and `**` globs. Nested .gitignore files apply
+// below their folder, and the last matching rule wins. Sensitive paths are
+// hidden by their own check, which no `!` pattern undoes.
+
+#[derive(Clone)]
+struct IgnoreRule {
+    base: PathBuf,
+    parts: Vec<String>,
+    anchored: bool,
+    dir_only: bool,
+    negate: bool,
+}
+
+#[derive(Clone, Default)]
+struct Ignores {
+    rules: Vec<IgnoreRule>,
+}
+
+impl Ignores {
+    // The .gitignore files from the repository top (the nearest folder up
+    // from `root` holding .git) down to `root`; only root's own outside git.
+    fn for_root(root: &Path) -> Ignores {
+        let mut chain = Vec::new();
+        let mut dir = Some(root);
+        let mut in_git = false;
+        while let Some(d) = dir {
+            chain.push(d.to_path_buf());
+            if d.join(".git").exists() {
+                in_git = true;
+                break;
+            }
+            dir = d.parent();
+        }
+        if !in_git {
+            chain.truncate(1);
+        }
+        let mut ig = Ignores::default();
+        for d in chain.iter().rev() {
+            if let Some(next) = ig.with_dir(d) {
+                ig = next;
+            }
+        }
+        ig
+    }
+
+    // The rules for walking into `dir`: these plus its own .gitignore, or
+    // None when it has none (the caller keeps using these).
+    fn with_dir(&self, dir: &Path) -> Option<Ignores> {
+        let text = fs::read_to_string(dir.join(".gitignore")).ok()?;
+        let mut next = self.clone();
+        next.rules.extend(parse_gitignore(&text, dir));
+        Some(next)
+    }
+
+    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matches(path, is_dir) {
+                ignored = !rule.negate;
+            }
+        }
+        ignored
+    }
+}
+
+fn parse_gitignore(text: &str, base: &Path) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (negate, pat) = match line.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, line.strip_prefix('\\').unwrap_or(line)),
+        };
+        let dir_only = pat.ends_with('/');
+        let pat = pat.trim_end_matches('/');
+        let anchored = pat.contains('/');
+        let parts: Vec<String> = pat
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        rules.push(IgnoreRule {
+            base: base.to_path_buf(),
+            parts,
+            anchored,
+            dir_only,
+            negate,
+        });
+    }
+    rules
+}
+
+impl IgnoreRule {
+    fn matches(&self, path: &Path, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        let Ok(rel) = path.strip_prefix(&self.base) else {
+            return false;
+        };
+        let names: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if self.anchored {
+            ignore_parts_match(&self.parts, &names)
+        } else {
+            names.last().is_some_and(|n| ignore_glob(&self.parts[0], n))
+        }
+    }
+}
+
+// `**` matches any run of folders, including none. Like ignore_glob, one
+// pass that backtracks only to the last `**`.
+fn ignore_parts_match(pat: &[String], names: &[String]) -> bool {
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < names.len() {
+        match pat.get(pi) {
+            Some(p) if p == "**" => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(p) if ignore_glob(p, &names[ni]) => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    pi = sp + 1;
+                    ni = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pat[pi..].iter().all(|p| p == "**")
+}
+
+// One name against one gitignore glob: `*` any run, `?` one char, `[…]`
+// a set (with `!` or `^` negating and `a-z` ranges). Unlike the shell, git
+// lets `*` match a leading dot. The pattern comes from the checkout, so it
+// is matched in one pass that backtracks only to the last `*`: at most
+// pattern × name steps, however the pattern is built.
+fn ignore_glob(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if p.get(pi) == Some(&'*') {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some(next) = glob_char(&p, pi, n[ni]) {
+            pi = next;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+// Where the pattern goes on after `p[pi]` matches the one character `c`.
+fn glob_char(p: &[char], pi: usize, c: char) -> Option<usize> {
+    match *p.get(pi)? {
+        '?' => Some(pi + 1),
+        '[' => {
+            // No closing bracket: the `[` is a plain character.
+            let Some(close) = p[pi + 1..]
+                .iter()
+                .position(|&x| x == ']')
+                .map(|i| pi + 1 + i)
+            else {
+                return (c == '[').then_some(pi + 1);
+            };
+            let mut set = &p[pi + 1..close];
+            let neg = matches!(set.first(), Some('!') | Some('^'));
+            if neg {
+                set = &set[1..];
+            }
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= c && c <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == c;
+                    i += 1;
+                }
+            }
+            (hit != neg).then_some(close + 1)
+        }
+        lit => (lit == c).then_some(pi + 1),
+    }
 }
 
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
+    collect_files_in(root, &Ignores::for_root(root), out, seen);
+}
+
+fn collect_files_in(root: &Path, ignores: &Ignores, out: &mut Vec<PathBuf>, seen: &mut usize) {
     if *seen >= MAX_SEARCH_FILES {
         return;
     }
@@ -3273,10 +3502,13 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
         }
         let path = entry.path();
         if path.is_dir() {
-            if !skip_dir(&path) {
-                collect_files(&path, out, seen);
+            if !skip_dir(&path) && !ignores.ignored(&path, true) {
+                match ignores.with_dir(&path) {
+                    Some(inner) => collect_files_in(&path, &inner, out, seen),
+                    None => collect_files_in(&path, ignores, out, seen),
+                }
             }
-        } else if path.is_file() && !is_sensitive(&path) {
+        } else if path.is_file() && !is_sensitive(&path) && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
@@ -3284,6 +3516,17 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
 }
 
 fn collect_paths(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize, dirs: bool, files: bool) {
+    collect_paths_in(root, &Ignores::for_root(root), out, seen, dirs, files);
+}
+
+fn collect_paths_in(
+    root: &Path,
+    ignores: &Ignores,
+    out: &mut Vec<PathBuf>,
+    seen: &mut usize,
+    dirs: bool,
+    files: bool,
+) {
     if *seen >= MAX_SEARCH_FILES {
         return;
     }
@@ -3296,17 +3539,214 @@ fn collect_paths(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize, dirs: bo
         }
         let path = entry.path();
         if path.is_dir() {
-            if dirs && !skip_dir(&path) {
+            if skip_dir(&path) || ignores.ignored(&path, true) {
+                continue;
+            }
+            if dirs {
                 *seen += 1;
                 out.push(path.clone());
             }
-            if !skip_dir(&path) {
-                collect_paths(&path, out, seen, dirs, files);
+            match ignores.with_dir(&path) {
+                Some(inner) => collect_paths_in(&path, &inner, out, seen, dirs, files),
+                None => collect_paths_in(&path, ignores, out, seen, dirs, files),
             }
-        } else if files && path.is_file() {
+        } else if files && path.is_file() && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
+    }
+}
+
+/// Every file a project walk sees (skip list, .gitignore, sensitive files
+/// hidden), relative to `cwd` with `/` separators.
+pub fn project_files(cwd: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut seen = 0;
+    collect_files(cwd, &mut files, &mut seen);
+    files.iter().map(|p| display_path(p, cwd)).collect()
+}
+
+/// The paths among `files` whose name starts with or contains `query`
+/// (case-insensitive): starts-with matches first, then shorter paths. For
+/// `@` completion by name.
+pub fn rank_by_name(files: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(bool, &String)> = files
+        .iter()
+        .filter_map(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
+            let starts = name.starts_with(&q);
+            (starts || name.contains(&q)).then_some((!starts, p))
+        })
+        .collect();
+    hits.sort_by(|a, b| (a.0, a.1.len(), a.1).cmp(&(b.0, b.1.len(), b.1)));
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, p)| p.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod walker_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-walk-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let put = |rel: &str, text: &str| {
+            let p = d.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        };
+        fs::create_dir_all(d.join(".git")).unwrap();
+        put(
+            ".gitignore",
+            "*.log\n/out/\nbuild-*/\n!keep.log\n!.env\nsecret?.txt\n",
+        );
+        put("src/app.py", "needle\n");
+        put("src/debug.log", "needle\n");
+        put("src/keep.log", "needle\n");
+        put("out/gen.py", "needle\n");
+        put("src/out/real.py", "needle\n");
+        put("build-x/a.py", "needle\n");
+        put("secret1.txt", "needle\n");
+        put(".env", "needle\n");
+        put(".venv/lib/site.py", "needle\n");
+        put("env2/pyvenv.cfg", "home = /usr\n");
+        put("env2/lib/x.py", "needle\n");
+        put("pkg/.gitignore", "fixtures/\n*.tmp\n");
+        put("pkg/fixtures/f.py", "needle\n");
+        put("pkg/a.tmp", "needle\n");
+        put("pkg/mod.py", "needle\n");
+        d
+    }
+
+    fn found(d: &Path) -> Vec<String> {
+        let r = run("grep_files", &json!({"pattern": "needle"}), d);
+        let mut v: Vec<String> = r
+            .content
+            .lines()
+            .map(|l| l.split(':').next().unwrap_or("").to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn walks_skip_gitignored_paths_and_virtualenvs() {
+        let d = fixture("ignore");
+        // Ignored: *.log (but !keep.log), /out/ only at the top, build-*/,
+        // secret?.txt, a nested .gitignore's own rules, and virtualenvs.
+        assert_eq!(
+            found(&d),
+            [
+                "pkg/mod.py",
+                "src/app.py",
+                "src/keep.log",
+                "src/out/real.py"
+            ]
+        );
+        let r = run("find_files", &json!({"pattern": "*.py"}), &d);
+        assert!(
+            !r.content.contains(".venv") && !r.content.contains("env2/"),
+            "{}",
+            r.content
+        );
+        assert!(!r.content.contains("fixtures"), "{}", r.content);
+        let r = run("find_paths", &json!({"pattern": "*"}), &d);
+        assert!(
+            !r.content.contains("build-x") && !r.content.contains("debug.log"),
+            "{}",
+            r.content
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_negation_never_shows_a_sensitive_file() {
+        let d = fixture("negate");
+        // `!.env` in .gitignore does not bring .env back.
+        assert!(!found(&d).iter().any(|p| p.contains(".env")));
+        let r = run("find_files", &json!({"pattern": "*env*"}), &d);
+        assert!(!r.content.lines().any(|l| l == ".env"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn files_are_found_by_name_anywhere_in_the_tree() {
+        let d = fixture("named");
+        let files = project_files(&d);
+        assert_eq!(rank_by_name(&files, "mod", 10), ["pkg/mod.py"]);
+        assert_eq!(rank_by_name(&files, "APP", 10), ["src/app.py"]);
+        // Ignored and sensitive files are not offered.
+        assert!(rank_by_name(&files, "debug", 10).is_empty());
+        assert!(rank_by_name(&files, ".env", 10).is_empty());
+        assert!(rank_by_name(&files, "", 10).is_empty());
+        // Names that start with the query come before names that contain it.
+        let list = ["a/xfile_1.py".to_string(), "b/file_1.py".to_string()];
+        assert_eq!(
+            rank_by_name(&list, "file_1", 10),
+            ["b/file_1.py", "a/xfile_1.py"]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gitignore_globs_follow_git() {
+        assert!(ignore_glob("*.log", "a.log"));
+        assert!(ignore_glob("*.log", ".hidden.log"));
+        assert!(ignore_glob("secret?.txt", "secret1.txt"));
+        assert!(!ignore_glob("secret?.txt", "secret12.txt"));
+        assert!(ignore_glob("[a-c]x", "bx") && !ignore_glob("[!a-c]x", "bx"));
+        let parts = |s: &str| s.split('/').map(str::to_string).collect::<Vec<_>>();
+        assert!(ignore_parts_match(&parts("**/gen"), &parts("a/b/gen")));
+        assert!(ignore_parts_match(&parts("**/gen"), &parts("gen")));
+        assert!(ignore_parts_match(
+            &parts("docs/**/*.md"),
+            &parts("docs/a/b.md")
+        ));
+        assert!(!ignore_parts_match(
+            &parts("docs/*.md"),
+            &parts("docs/a/b.md")
+        ));
+        assert!(ignore_parts_match(&parts("gen/**"), &parts("gen/x/y")));
+        assert!(ignore_glob("a*b*c", "a-b-b-c") && !ignore_glob("a*b*c", "a-b-b-d"));
+        assert!(ignore_glob("[x", "[x") && !ignore_glob("[x", "x"));
+    }
+
+    // A checkout's .gitignore is the repository's to write: a pattern built
+    // to backtrack must not stall grep_files (or @ completion) on a long name.
+    #[test]
+    fn a_hostile_gitignore_pattern_cannot_stall_a_walk() {
+        let d = std::env::temp_dir().join(format!("bwn-walk-redos-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join(".git")).unwrap();
+        let deep: PathBuf = std::iter::repeat_n("a", 30).collect();
+        fs::create_dir_all(d.join(&deep)).unwrap();
+        fs::write(d.join(&deep).join("a".repeat(60)), "needle\n").unwrap();
+        fs::write(d.join("app.py"), "needle\n").unwrap();
+        let star_pattern = format!("{}b", "*a".repeat(16));
+        let deep_pattern = format!("{}b", "**/a/".repeat(10));
+        fs::write(
+            d.join(".gitignore"),
+            format!("{star_pattern}\n{deep_pattern}\n"),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = d.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run("grep_files", &json!({"pattern": "needle"}), &root).content);
+        });
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("grep_files was still matching .gitignore patterns after 5 s");
+        let _ = fs::remove_dir_all(&d);
+        assert!(found.contains("app.py"), "{found}");
+        assert!(found.contains(&"a".repeat(60)), "{found}");
     }
 }
 
@@ -3360,6 +3800,21 @@ fn collect_tree(
     out: &mut Vec<String>,
     max_entries: usize,
 ) {
+    let ignores = Ignores::for_root(root);
+    collect_tree_in(root, &ignores, cwd, depth, max_depth, out, max_entries);
+}
+
+// Gitignored entries are left out of the tree; skipped folders (build
+// output, dependencies) are listed but not opened.
+fn collect_tree_in(
+    root: &Path,
+    ignores: &Ignores,
+    cwd: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<String>,
+    max_entries: usize,
+) {
     if out.len() >= max_entries || depth > max_depth {
         return;
     }
@@ -3373,10 +3828,16 @@ fn collect_tree(
             break;
         }
         let path = entry.path();
-        let suffix = if path.is_dir() { "/" } else { "" };
+        let is_dir = path.is_dir();
+        if ignores.ignored(&path, is_dir) {
+            continue;
+        }
+        let suffix = if is_dir { "/" } else { "" };
         out.push(format!("{}{}", display_path(&path, cwd), suffix));
-        if path.is_dir() && !skip_dir(&path) {
-            collect_tree(&path, cwd, depth + 1, max_depth, out, max_entries);
+        if is_dir && !skip_dir(&path) {
+            let inner = ignores.with_dir(&path);
+            let next = inner.as_ref().unwrap_or(ignores);
+            collect_tree_in(&path, next, cwd, depth + 1, max_depth, out, max_entries);
         }
     }
 }
@@ -4970,6 +5431,11 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             match todo_store().lock() {
                 Ok(mut todos) => {
                     *todos = next;
+                    // The person sees the list as a checklist that ticks
+                    // items off as later calls mark them completed.
+                    if !crate::report::is_json() {
+                        crate::tui::line(&crate::tui::todo_checklist(&todos));
+                    }
                     ok(format!("stored {} todo item(s)", todos.len()))
                 }
                 Err(_) => err("todo store unavailable"),
