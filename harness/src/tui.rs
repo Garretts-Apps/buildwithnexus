@@ -6162,17 +6162,23 @@ fn extra_command_desc(cmd: &str) -> String {
             if c.script.is_some() {
                 map.insert(key, "custom command".to_string());
             } else if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key) {
-                let desc = crate::config::skill_description(&c.content);
-                slot.insert(if desc.is_empty() {
-                    "custom command".to_string()
-                } else {
-                    desc
-                });
+                slot.insert(custom_command_desc(&c));
             }
         }
         map
     });
     map.get(cmd).cloned().unwrap_or_default()
+}
+
+// A prompt command's popup text: its `description:` frontmatter, else the
+// first prose line of its body (CustomCommand.description holds either; the
+// body itself no longer carries the frontmatter).
+fn custom_command_desc(c: &crate::config::CustomCommand) -> String {
+    if c.description.trim().is_empty() {
+        "custom command".to_string()
+    } else {
+        c.description.clone()
+    }
 }
 
 // Popup description for any candidate: builtin text first, then the cached
@@ -8739,5 +8745,38 @@ mod tests {
         // A long key never wraps the row: the dots stop at the width.
         let frame = secret_frame("  KEY: ", 500, 40);
         assert_eq!(frame.matches('•').count(), 40 - 7 - 1);
+    }
+}
+
+#[cfg(test)]
+mod command_desc_tests {
+    use super::*;
+
+    #[test]
+    fn a_prompt_command_shows_its_frontmatter_description() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-cmd-desc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("commands")).unwrap();
+        std::fs::write(
+            home.join("commands").join("deploy.md"),
+            "---\ndescription: Deploy to an environment\n---\nRun the deploy for $ARGUMENTS.\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("commands").join("tidy.md"), "Tidy the imports.\n").unwrap();
+        let old = std::env::var_os("NEXUS_HOME");
+        std::env::set_var("NEXUS_HOME", &home);
+        let cmds = crate::config::load_custom_commands();
+        match old {
+            Some(v) => std::env::set_var("NEXUS_HOME", v),
+            None => std::env::remove_var("NEXUS_HOME"),
+        }
+        let desc =
+            |name: &str| custom_command_desc(cmds.iter().find(|c| c.name == name).expect(name));
+        assert_eq!(desc("deploy"), "Deploy to an environment");
+        assert_eq!(desc("tidy"), "Tidy the imports.");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
