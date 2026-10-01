@@ -2298,3 +2298,311 @@ fn a_server_started_in_a_running_tmux_keeps_no_provider_key() {
     assert!(text.contains("PATH="), "the server ran: {text:?}");
     assert!(!text.contains(key), "the provider key reached the server");
 }
+
+// ── setup, keys and settings (credentials-setup) ────────────────────────────
+
+// `buildwithnexus <args>` with `input` on stdin (a pipe, not a terminal).
+fn run_stdin(home: &Path, cwd: &Path, args: &[&str], input: &str) -> Run {
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd
+        .args(args)
+        .current_dir(cwd)
+        .env("NEXUS_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    Run {
+        success: out.status.success(),
+        code: out.status.code(),
+        events: stdout
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned() + &stdout,
+    }
+}
+
+// An OpenAI-compatible server that only accepts the bearer key `good`
+// (401 otherwise), answering every accepted POST with a plain reply.
+fn serve_keyed(good: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let auths = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&auths);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            if reader.read_line(&mut first).is_err() {
+                continue;
+            }
+            let (mut len, mut auth) = (0usize, String::new());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                if lower.starts_with("authorization:") {
+                    auth = line.trim().to_string();
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = std::io::Read::read_exact(&mut reader, &mut body);
+            if first.starts_with("POST") {
+                seen.lock().unwrap().push(auth.clone());
+            }
+            let (status, reply) = if auth == format!("authorization: Bearer {good}")
+                || auth == format!("Authorization: Bearer {good}")
+            {
+                ("200 OK", text("ok"))
+            } else {
+                (
+                    "401 Unauthorized",
+                    r#"{"error":{"message":"invalid api key"}}"#.to_string(),
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (port, auths)
+}
+
+#[test]
+fn init_without_a_terminal_is_not_finished_and_saves_nothing() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let r = run_args(&home, &cwd, &["init"]);
+    assert_eq!(r.code, Some(1), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("setup not finished"), "{}", r.stderr);
+    assert!(!home.join("settings.json").exists());
+    assert!(!home.join(".env.keys").exists());
+}
+
+#[test]
+fn a_provider_typo_is_a_usage_error_that_names_the_fix() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let r = run_args(&home, &cwd, &["--provider", "antropic", "run", "say hi"]);
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "unknown provider antropic — did you mean anthropic? Providers: anthropic, openai"
+        ),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn settings_without_a_model_run_on_the_preset_default_and_take_the_model_flag() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![finish("done")]);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "custom", "base_url": format!("http://127.0.0.1:{port}/v1"), "permission": "auto"})
+            .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "say hi");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("missing field"), "{}", r.stderr);
+    let body: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
+    assert_eq!(body["model"], "local-model", "the custom preset's default");
+
+    let (port, posts) = serve_recording(vec![finish("done")]);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "custom", "base_url": format!("http://127.0.0.1:{port}/v1"), "permission": "auto"})
+            .to_string(),
+    )
+    .unwrap();
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--model", "mock-coder", "run", "say hi"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let body: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
+    assert_eq!(body["model"], "mock-coder");
+}
+
+#[test]
+fn a_hooks_only_project_file_is_not_a_broken_setup() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"hooks": {"PostToolUse": [{"matcher": "edit_file", "hooks": [{"type": "command", "command": "true"}]}]}})
+            .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "say hi");
+    assert_eq!(r.code, Some(1), "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("missing field"), "{}", r.stderr);
+    assert!(!r.stderr.contains("none could be used"), "{}", r.stderr);
+    assert!(r.stderr.contains("no provider is set up"), "{}", r.stderr);
+}
+
+#[test]
+fn the_headless_banner_names_the_preset_and_its_host() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![finish("done")]);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "lmstudio", "model": "test-model", "permission": "auto",
+               "base_url": format!("http://127.0.0.1:{port}/v1")})
+        .to_string(),
+    )
+    .unwrap();
+    // Human output (the banner is not printed under --json); only the
+    // banner is checked, so the run itself may end any way.
+    let r = run_stdin(&home, &cwd, &["run", "say hi"], "");
+    assert!(
+        r.stderr
+            .contains(&format!("model  LM Studio (127.0.0.1:{port}) · test-model")),
+        "{}",
+        r.stderr
+    );
+
+    // A custom endpoint shows its host and is never called "OpenAI".
+    let port = serve(vec![finish("done")]);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "custom", "model": "test-model", "permission": "auto",
+               "base_url": format!("http://127.0.0.1:{port}/v1"),
+               "endpoints": {"lmstudio": format!("http://127.0.0.1:{port}/v1")}})
+        .to_string(),
+    )
+    .unwrap();
+    let r = run_stdin(&home, &cwd, &["run", "say hi"], "");
+    assert!(
+        r.stderr.contains(&format!(
+            "model  custom endpoint (127.0.0.1:{port}) · test-model"
+        )),
+        "{}",
+        r.stderr
+    );
+    assert!(!r.stderr.contains("model  OpenAI"), "{}", r.stderr);
+
+    // --provider runs at the address last used with that provider and says so.
+    let r = run_stdin(
+        &home,
+        &cwd,
+        &["--provider", "lmstudio", "run", "say hi"],
+        "",
+    );
+    assert!(
+        r.stderr
+            .contains(&format!("model  LM Studio (127.0.0.1:{port}) · test-model")),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn login_checks_a_key_before_it_is_saved() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, auths) = serve_keyed("sk-GOOD-1234567890");
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "custom", "model": "m", "permission": "ask",
+               "base_url": format!("http://127.0.0.1:{port}/v1")})
+        .to_string(),
+    )
+    .unwrap();
+    // A rejected key is not saved, and the end of input cancels.
+    let r = run_stdin(&home, &cwd, &["login"], "sk-WRONG-1234567890\n");
+    assert_eq!(r.code, Some(1), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("rejected (HTTP 401) — not saved"),
+        "{}",
+        r.stderr
+    );
+    assert!(!home.join(".env.keys").exists());
+
+    // The next key works: saved, and the rejected one never was.
+    let r = run_stdin(
+        &home,
+        &cwd,
+        &["login"],
+        "sk-WRONG-1234567890\nsk-GOOD-1234567890\n",
+    );
+    assert!(r.success, "{}", r.stderr);
+    let keys = std::fs::read_to_string(home.join(".env.keys")).unwrap();
+    assert!(keys.contains("CUSTOM_API_KEY=sk-GOOD-1234567890"), "{keys}");
+    assert!(!keys.contains("WRONG"), "{keys}");
+    // Neither key is echoed back.
+    assert!(!r.stderr.contains("sk-GOOD-1234567890"), "{}", r.stderr);
+    assert!(auths
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|a| a.ends_with("sk-GOOD-1234567890")));
+}
+
+#[test]
+fn init_agents_md_goes_through_the_approval_gate() {
+    let script = || {
+        vec![
+            tool_call("c1", "read_file", json!({"path": "Makefile"})),
+            tool_call(
+                "c2",
+                "write_file",
+                json!({"path": "AGENTS.md", "content": "# AGENTS.md\n\n## Build & test\n\n- Build: `make build`\n- Test: `make test`\n"}),
+            ),
+            finish("wrote AGENTS.md"),
+        ]
+    };
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("Makefile"),
+        "build:\n\t@echo built\n\ntest:\n\t@echo ok\n",
+    )
+    .unwrap();
+
+    // Ask mode without a terminal: the write is blocked, exit 3, no file.
+    let port = serve(script());
+    write_config(&home, "custom", "ask", port);
+    let r = run_args(&home, &cwd, &["--json", "init", "--agents-md"]);
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    assert!(!cwd.join("AGENTS.md").exists());
+
+    // Auto: the file holds what the model read from the Makefile.
+    let (port, posts) = serve_recording(script());
+    write_config(&home, "custom", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "init", "--agents-md"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let written = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
+    assert!(written.contains("make test"), "{written}");
+    // The task names the repository's own build files, not a template.
+    let first: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
+    assert!(first.to_string().contains("Makefile"), "{first}");
+}

@@ -4374,7 +4374,7 @@ fn apply_lenient(body: &str, hit: &LenientHit, new: &str) -> String {
 }
 
 // Small edit distance for "did you mean" suggestions on unknown tool names.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();

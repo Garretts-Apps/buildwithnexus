@@ -4618,6 +4618,114 @@ pub fn ask(prompt: &str) -> Option<String> {
     }
 }
 
+// ── secret ask ───────────────────────────────────────────────────────────────
+/// Reads an API key without echoing it: each character shows as a dot while
+/// typing, and the submitted line keeps only the masked form, so the key
+/// never reaches the screen or the scrollback. Esc, Ctrl+C, and Ctrl+D on an
+/// empty line return None (cancel). Without a terminal it reads one line.
+pub fn ask_secret(prompt: &str) -> Option<String> {
+    let prompt = &*sanitize_prompt(prompt);
+    let _pause_guard = PauseAgentRunningGuard::new();
+    if !io::stdin().is_terminal() {
+        print!("{prompt}");
+        flush();
+        let mut buf = String::new();
+        let n = io::stdin().lock().read_line(&mut buf).unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        return Some(buf.trim_end_matches(['\n', '\r']).to_string());
+    }
+    // A cooked terminal echoes every byte itself (setup runs before the
+    // session enters raw mode), so raw mode is on for the read either way.
+    let raw_here = !is_raw() && enable_raw_mode().is_ok();
+    let alt = ALT_SCREEN.load(Ordering::Relaxed);
+    if alt {
+        cursor_show();
+    }
+    let mut scroll = 0usize;
+    let answer = read_secret(
+        || read().ok(),
+        |n| {
+            if alt {
+                let dots = vec!['•'; n];
+                render_composer(prompt, &dots, n, &mut scroll);
+            } else {
+                let width = crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
+                print!("{}", secret_frame(prompt, n, width));
+                flush();
+            }
+        },
+    );
+    let shown = answer.as_deref().map(secret_echo).unwrap_or_default();
+    if alt {
+        SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        clear_composer();
+        line(&format!("{prompt}{shown}"));
+    } else {
+        print!("\r{prompt}{shown}\x1b[K\r\n");
+        flush();
+    }
+    if raw_here {
+        let _ = disable_raw_mode();
+    }
+    answer
+}
+
+// The key loop behind ask_secret, apart from the terminal: `next` yields
+// input events (None ends the read as a cancel) and `draw` is only ever told
+// how many characters there are, never what they are.
+fn read_secret(
+    mut next: impl FnMut() -> Option<Event>,
+    mut draw: impl FnMut(usize),
+) -> Option<String> {
+    let mut buf: Vec<char> = Vec::new();
+    draw(0);
+    loop {
+        match next()? {
+            Event::Paste(s) => buf.extend(s.chars().filter(|c| !c.is_control())),
+            Event::Key(k) if k.kind != KeyEventKind::Release => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                match k.code {
+                    KeyCode::Enter => return Some(buf.into_iter().collect()),
+                    KeyCode::Esc => return None,
+                    KeyCode::Char('c') if ctrl => return None,
+                    KeyCode::Char('d') if ctrl && buf.is_empty() => return None,
+                    KeyCode::Char('u') if ctrl => buf.clear(),
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) if !ctrl && !c.is_control() => buf.push(c),
+                    _ => continue,
+                }
+            }
+            Event::Resize(..) => {}
+            _ => continue,
+        }
+        draw(buf.len());
+    }
+}
+
+// One line-mode repaint of the secret prompt: the prompt and a dot per
+// character, cut to the terminal width so a long key never wraps the row.
+fn secret_frame(prompt: &str, n: usize, width: usize) -> String {
+    let room = width
+        .saturating_sub(prompt_width(prompt) as usize)
+        .saturating_sub(1);
+    format!("\r{prompt}{}\x1b[K", "•".repeat(n.min(room)))
+}
+
+// What stays on screen after Enter: the masked key, or nothing for an
+// empty answer.
+fn secret_echo(key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        String::new()
+    } else {
+        crate::config::mask(key)
+    }
+}
+
 // Multi-line task input. A trailing `\` + Enter adds another line; plain Enter
 // submits. Shift+Tab returns CycleMode without submitting.
 // Pre-fills the first line with any keystrokes typed during agent processing.
@@ -4834,6 +4942,7 @@ const SLASH_COMMANDS_BASE: &[&str] = &[
     "/new",
     "/resume",
     "/init",
+    "/login",
     "/plan",
     "/build",
     "/brainstorm",
@@ -4988,6 +5097,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/new" => "start a fresh session",
         "/resume" => "pick a saved session to resume",
         "/init" => "reconfigure provider, model, and key",
+        "/login" => "replace the API key (checked before it is saved)",
         "/plan" => "switch to PLAN mode",
         "/build" => "switch to BUILD mode",
         "/brainstorm" => "switch to BRAINSTORM mode",
@@ -7326,5 +7436,70 @@ mod tests {
             .collect();
         assert_eq!(got, "a  b c[31md ✓");
         assert!(sanitize_paste("").is_empty());
+    }
+
+    #[test]
+    fn ask_secret_never_echoes_and_esc_or_ctrl_c_cancel() {
+        use crossterm::event::KeyEvent;
+        let key = |code, mods| Event::Key(KeyEvent::new(code, mods));
+        let typed = |s: &str| -> Vec<Event> {
+            s.chars()
+                .map(|c| key(KeyCode::Char(c), KeyModifiers::NONE))
+                .collect()
+        };
+        let secret = "sk-ant-api03-NEWCOMERfakekey0001-SECRETTAIL9";
+        let run = |events: Vec<Event>| {
+            let mut events = events.into_iter();
+            let mut screen = String::new();
+            let got = read_secret(
+                || events.next(),
+                |n| screen.push_str(&secret_frame("  ANTHROPIC_API_KEY: ", n, 200)),
+            );
+            (got, screen)
+        };
+
+        // Typed and pasted characters show only as dots; Enter returns the
+        // key, and what stays on screen is the masked form.
+        let mut evs = typed(&secret[..10]);
+        evs.push(Event::Paste(secret[10..].into()));
+        evs.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (got, screen) = run(evs);
+        assert_eq!(got.as_deref(), Some(secret));
+        for part in ["sk-ant", "NEWCOMER", "SECRETTAIL9", "AIL9"] {
+            assert!(!screen.contains(part), "{part} echoed: {screen}");
+        }
+        assert!(screen.contains(&"•".repeat(secret.len())));
+        assert_eq!(secret_echo(secret), "sk-a…AIL9");
+        assert_eq!(secret_echo("  "), "");
+
+        // Esc and Ctrl+C cancel even with text typed; Ctrl+D only on an
+        // empty line. Backspace and Ctrl+U edit what was typed.
+        let mut evs = typed("sk-partial");
+        evs.push(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(run(evs).0, None);
+        let mut evs = typed("sk-partial");
+        evs.push(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(run(evs).0, None);
+        assert_eq!(
+            run(vec![key(KeyCode::Char('d'), KeyModifiers::CONTROL)]).0,
+            None
+        );
+        let mut evs = typed("abx");
+        evs.push(key(KeyCode::Backspace, KeyModifiers::NONE));
+        evs.push(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        evs.push(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        evs.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(run(evs).0.as_deref(), Some("abc"));
+        let mut evs = typed("wrong");
+        evs.push(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        evs.extend(typed("ok"));
+        evs.push(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(run(evs).0.as_deref(), Some("ok"));
+        // The input closing (a read error) is a cancel, not an empty key.
+        assert_eq!(run(typed("sk-")).0, None);
+
+        // A long key never wraps the row: the dots stop at the width.
+        let frame = secret_frame("  KEY: ", 500, 40);
+        assert_eq!(frame.matches('•').count(), 40 - 7 - 1);
     }
 }

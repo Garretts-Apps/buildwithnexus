@@ -180,16 +180,21 @@ pub fn run() {
         report::set(report::Mode::Json);
     }
     hooks::set_trust_digest(opts.trust_project.clone());
+    if let Some(p) = opts
+        .provider
+        .as_deref()
+        .filter(|p| config::preset(p).is_none())
+    {
+        eprintln!("buildwithnexus: {}", unknown_provider_msg(p));
+        std::process::exit(2);
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
 
     match cmd {
         "" => interactive(opts.prompt.clone(), opts),
-        "init" | "da-init" | "setup" => {
-            onboarding::run();
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            offer_starter_agents_md(&cwd);
-        }
+        "init" | "da-init" | "setup" => init_cli(&opts, &args[1..]),
+        "login" => login_cli(&opts),
         "providers" => {
             for p in config::PRESETS {
                 let tag = if p.local { "local" } else { "remote" };
@@ -324,23 +329,33 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
     let mut settings = match load.settings {
-        Some(s) => s,
+        Some(s) if !s.provider.is_empty() => s,
         // Settings files exist but none were usable: refuse to fall through
         // to onboarding, which would overwrite them. Broken config is a fix,
         // not a first run.
         None if load.any_present => return Err(broken_settings_msg()),
-        // No settings yet. Without a terminal there is nobody to answer the
-        // setup questions, so take the provider from --provider or from the
-        // first API key in the environment, and fail with the fix otherwise.
-        None if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
-            unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some())
-                .ok_or_else(no_setup_headless_msg)?
+        // No provider yet (or only a project file that names none). Without
+        // a terminal there is nobody to answer the setup questions, so take
+        // the provider from --provider or from the first API key in the
+        // environment, and fail with the fix otherwise.
+        loaded if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
+            let picked =
+                unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some())
+                    .ok_or_else(no_setup_headless_msg)?;
+            Settings {
+                provider: picked.provider,
+                ..loaded.unwrap_or_default()
+            }
         }
-        None => onboarding::run().ok_or("setup cancelled")?,
+        _ => onboarding::run().ok_or("setup not finished")?,
     };
-    if let Some(p) = &opts.provider {
+    if let Some(p) = opts.provider.as_ref().filter(|p| **p != settings.provider) {
+        // The saved address belongs to the saved provider: --provider runs
+        // at the address last used with it, or at its preset default.
+        settings.base_url = remembered_endpoint(p);
         settings.provider = p.clone();
     }
+    set_active_preset(&settings.provider);
     let mut provider = build_provider(&settings)?;
     if let Some(model) = &opts.model {
         provider.model = model.clone();
@@ -495,13 +510,37 @@ fn is_loopback_url(u: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
 }
 
+/// Names an unknown provider id, the closest real one, and the full list.
+pub(crate) fn unknown_provider_msg(id: &str) -> String {
+    if id.trim().is_empty() {
+        return "no provider is set up yet; run `buildwithnexus init`, or pass --provider".into();
+    }
+    let ids: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
+    let typed = id.trim().to_ascii_lowercase();
+    let near = ids
+        .iter()
+        .map(|p| (tools::levenshtein(&typed, p), *p))
+        .min()
+        .filter(|(d, p)| *d <= 2.max(p.len() / 4) || p.starts_with(&typed));
+    let shown = tui::sanitize_terminal(id);
+    match near {
+        Some((_, p)) => format!(
+            "unknown provider {shown} — did you mean {p}? Providers: {}",
+            ids.join(", ")
+        ),
+        None => format!("unknown provider {shown} — Providers: {}", ids.join(", ")),
+    }
+}
+
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
-    let preset = config::preset(&s.provider).ok_or_else(|| {
-        format!(
-            "unknown provider '{}'; run `buildwithnexus init`",
-            s.provider
-        )
-    })?;
+    build_provider_with_key(s, None)
+}
+
+/// `build_provider` with a key that is not saved yet: it is used in place of
+/// the stored one and passes the same checks, so a key can be proven with a
+/// probe before it is written to disk.
+pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result<Provider, String> {
+    let preset = config::preset(&s.provider).ok_or_else(|| unknown_provider_msg(&s.provider))?;
     let base_url = match &s.base_url {
         Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
             return Err(format!(
@@ -519,11 +558,13 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     };
     let api_key = if preset.id == "custom" {
         // Optional — most self-hosted OpenAI-compatible servers are keyless.
-        config::load_key(config::CUSTOM_KEY)
+        key.map(str::to_string)
+            .or_else(|| config::load_key(config::CUSTOM_KEY))
     } else if preset.env_key.is_empty() {
         None
     } else {
-        config::load_key(preset.env_key)
+        key.map(str::to_string)
+            .or_else(|| config::load_key(preset.env_key))
     };
     if !preset.env_key.is_empty() && api_key.is_none() {
         return Err(format!(
@@ -621,7 +662,11 @@ fn headless(
             "{}",
             tui::dim(&format!(
                 "  model  {} · {}",
-                provider.protocol, provider.model
+                onboarding::provider_label(
+                    &active_preset().unwrap_or_default(),
+                    &provider.base_url
+                ),
+                tui::sanitize_terminal(&provider.model)
             ))
         );
         // The folder name comes from whoever made the checkout.
@@ -736,20 +781,86 @@ fn report_mcp_notices() {
     }
 }
 
+// Setup was left before a model answered: nothing was saved, so the next
+// launch starts setup again.
+fn setup_not_finished() -> ! {
+    let why = if std::io::stdin().is_terminal() {
+        ""
+    } else {
+        " (there is no terminal to answer its questions in)"
+    };
+    eprintln!(
+        "{}",
+        tui::yellow(&format!(
+            "setup not finished{why} — nothing was saved. `buildwithnexus` (or `buildwithnexus init`) starts it again."
+        ))
+    );
+    std::process::exit(1);
+}
+
+// `buildwithnexus init`: setup in a terminal; `init --agents-md` writes
+// AGENTS.md from the repository as an ordinary headless run.
+fn init_cli(opts: &CliOptions, args: &[String]) {
+    if args.iter().any(|a| a == "--agents-md") {
+        return headless(opts, |p, perm, cwd| {
+            let task = agents_md_task(&cwd);
+            agent::run_build(p, perm, "engineer", &task, &cwd, Vec::new())
+        });
+    }
+    if onboarding::run().is_none() {
+        setup_not_finished();
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !has_instruction_file(&cwd) {
+        tui::line(&tui::dim(
+            "  No AGENTS.md here: /init in a session, or `buildwithnexus init --agents-md`, writes one from this repository.",
+        ));
+    }
+}
+
+// `buildwithnexus login`: a new key for the configured provider (or
+// --provider), checked before it is saved.
+fn login_cli(opts: &CliOptions) {
+    let settings = config::load_settings().filter(|s| !s.provider.is_empty());
+    let Some(mut settings) =
+        settings.or_else(|| opts.provider.as_ref().map(|_| Settings::default()))
+    else {
+        eprintln!("{}", tui::red(&unknown_provider_msg("")));
+        std::process::exit(1);
+    };
+    if let Some(p) = opts.provider.as_ref().filter(|p| **p != settings.provider) {
+        settings.provider = p.clone();
+        settings.model = String::new();
+        settings.base_url = None;
+    }
+    if let Some(m) = &opts.model {
+        settings.model = m.clone();
+    }
+    if onboarding::login(&settings).is_none() {
+        std::process::exit(1);
+    }
+}
+
 fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // Always scaffold on interactive launch so existing users also get the
     // directory skeleton and starter Agents.md if they're missing.
     config::scaffold_home();
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
-    if load.settings.is_none() {
-        if load.any_present {
-            eprintln!("{}", tui::red(&broken_settings_msg()));
-            std::process::exit(1);
-        }
-        if onboarding::run().is_none() {
-            return;
-        }
+    // Settings that name no provider (a team repo's hooks-only file, or
+    // nothing at all) mean setup has not run yet; only files that exist and
+    // cannot be read stop startup, so they are never set up over.
+    if load.settings.is_none() && load.any_present {
+        eprintln!("{}", tui::red(&broken_settings_msg()));
+        std::process::exit(1);
+    }
+    if !load
+        .settings
+        .as_ref()
+        .is_some_and(|s| !s.provider.is_empty())
+        && onboarding::run().is_none()
+    {
+        setup_not_finished();
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -797,7 +908,10 @@ fn repl(
     // Show the full-screen header banner.
     let mode_name = "BRAINSTORM"; // default starting mode
     tui::show_banner(
-        &settings.provider,
+        &onboarding::provider_label(
+            &active_preset().unwrap_or(settings.provider.clone()),
+            &provider.base_url,
+        ),
         &provider.model,
         mode_name,
         &cwd.display().to_string(),
@@ -1079,9 +1193,9 @@ fn repl(
         if let Some(model_arg) = t.strip_prefix("/model ") {
             let new_model = model_arg.trim();
             if let Some((url, m)) = parse_model_endpoint(new_model) {
-                // `/model http://host:port/v1 <model>`: a custom endpoint,
+                // `/model http://host:port/v1 <model>`: that endpoint,
                 // persisted the same way the picker's custom entry does it.
-                swap_model(&mut provider, "custom", &m, Some(url));
+                swap_model(&mut provider, endpoint_preset(&url), &m, Some(url));
             } else if !new_model.is_empty() {
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
@@ -1241,10 +1355,11 @@ fn repl(
                 continue;
             }
             "/init" => {
-                tui::leave_alt();
-                onboarding::run();
-                offer_starter_agents_md(cwd);
-                tui::enter_alt(raw);
+                handle_init(&mut provider, perm, cwd, raw, &mut transcript, &sid);
+                continue;
+            }
+            "/login" => {
+                handle_login(&mut provider);
                 continue;
             }
             "/model" => {
@@ -2040,28 +2155,149 @@ fn handle_mcp(arg: &str) {
     }
 }
 
-/// `/init` step: offer a starter AGENTS.md when the cwd has no instruction file.
-fn offer_starter_agents_md(cwd: &std::path::Path) {
-    if cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists() {
+fn has_instruction_file(cwd: &std::path::Path) -> bool {
+    cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists()
+}
+
+/// What /init (and `init --agents-md`) asks the model to do: read this
+/// repository's own build, test and CI files and write down only what they
+/// say, or improve the AGENTS.md that is already there.
+fn agents_md_task(cwd: &std::path::Path) -> String {
+    let goal = if cwd.join("AGENTS.md").exists() {
+        "Improve the AGENTS.md at the repository root: keep everything in it that is still true, \
+         correct what the repository contradicts, and add what is missing. Change it with \
+         edit_file (or write_file with the whole improved text)."
+    } else {
+        "Write AGENTS.md at the repository root with write_file."
+    };
+    format!(
+        "{goal} AGENTS.md is the file coding agents read before working in this repository.\n\n\
+         First look at what the repository really uses: list the root, then read the README and \
+         the build and test files that exist (Makefile, package.json scripts, Cargo.toml, \
+         pyproject.toml, setup.cfg, go.mod, build.gradle, pom.xml, CMakeLists.txt, justfile, \
+         Taskfile.yml, and CI workflows such as .github/workflows/*.yml).\n\n\
+         Then write these sections, using only commands and facts you found in those files:\n\
+         - Build & test: the exact commands to build, run the tests, run one test, lint and format.\n\
+         - Layout: the main directories and what lives in each.\n\
+         - Conventions: style, naming and commit rules the code or config shows.\n\
+         - Do not: generated or vendored files that must not be edited by hand, and commands \
+           that must not be run.\n\n\
+         Keep it under 60 lines. Leave out anything you could not confirm instead of guessing. \
+         Do not run commands, and do not change any file other than AGENTS.md."
+    )
+}
+
+/// `/init` step: offer to write AGENTS.md from this repository, or improve
+/// the one there. The write always goes through the approval gate (even
+/// under auto), so the proposed file is shown as a diff before it lands.
+fn offer_agents_md(
+    provider: &Provider,
+    perm: Permission,
+    cwd: &std::path::Path,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    let exists = cwd.join("AGENTS.md").exists();
+    if !exists && cwd.join("CLAUDE.md").exists() {
         return;
     }
     tui::line("");
-    tui::line(&tui::dim(&format!(
-        "  No AGENTS.md in {} — it tells the agent your build/test commands, conventions, and do-nots.",
-        tui::sanitize_terminal(&cwd.display().to_string())
-    )));
-    let answer =
-        tui::ask("  create a starter AGENTS.md here? [Y/n] ").unwrap_or_else(|| "n".into());
-    if matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
-        match config::create_starter_agents_md(cwd) {
-            Ok(p) => tui::line(&tui::green(&format!(
-                "  ✓ created {} — fill in the placeholders",
-                tui::sanitize_terminal(&p.display().to_string())
-            ))),
-            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
-        }
+    let question = if exists {
+        "  improve AGENTS.md from this repository? [y/N] "
     } else {
+        tui::line(&tui::dim(
+            "  AGENTS.md tells the agent your build and test commands, conventions and do-nots.",
+        ));
+        "  generate AGENTS.md from this repository? [Y/n] "
+    };
+    let Some(answer) = tui::ask(question) else {
+        return;
+    };
+    let yes = match answer.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "" => !exists,
+        _ => false,
+    };
+    if !yes {
         tui::line(&tui::dim("  skipped"));
+        return;
+    }
+    if matches!(perm, Permission::ReadOnly) {
+        tui::line(&tui::yellow(
+            "  permission is read-only, so nothing can be written — /permissions ask, then /init again",
+        ));
+        return;
+    }
+    tui::line("");
+    if let Err(e) = agent::run_build_session(
+        provider,
+        Permission::Ask,
+        "engineer",
+        &agents_md_task(cwd),
+        cwd,
+        transcript,
+        sid,
+    ) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::bell();
+}
+
+// `/init`: setup again; the session then runs on what setup saved, and is
+// left as it was when setup is cancelled.
+fn handle_init(
+    provider: &mut Provider,
+    perm: Permission,
+    cwd: &std::path::Path,
+    raw: bool,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    tui::leave_alt();
+    let saved = onboarding::run();
+    tui::enter_alt(raw);
+    let Some(saved) = saved else {
+        tui::line(&tui::dim("  /init cancelled — settings unchanged"));
+        return;
+    };
+    // Project settings may still layer over what was saved; run on the merge.
+    let s = config::load_settings()
+        .filter(|s| !s.provider.is_empty())
+        .unwrap_or(saved);
+    match build_provider(&s) {
+        Ok(mut p) => {
+            p.effort = provider.effort;
+            usage::forget_last();
+            *provider = p;
+            provider::prewarm(provider);
+            set_active_preset(&s.provider);
+            tui::set_model_label(&provider.model);
+            tui::line(&tui::green(&format!(
+                "  now using {} · {}",
+                s.provider,
+                tui::sanitize_terminal(&provider.base_url)
+            )));
+        }
+        Err(e) => tui::line(&tui::red(&format!(
+            "  ✗ {} — keeping {}",
+            tui::sanitize_terminal(&e),
+            provider.model
+        ))),
+    }
+    offer_agents_md(provider, perm, cwd, transcript, sid);
+}
+
+// `/login`: a new key for the provider the session is using.
+fn handle_login(provider: &mut Provider) {
+    let mut s = config::load_settings().unwrap_or_default();
+    s.provider = active_preset().unwrap_or(s.provider);
+    s.model = provider.model.clone();
+    s.base_url = Some(provider.base_url.clone())
+        .filter(|u| config::preset(&s.provider).is_none_or(|p| p.base_url != u));
+    if let Some(mut p) = onboarding::login(&s) {
+        p.effort = provider.effort;
+        usage::forget_last();
+        *provider = p;
     }
 }
 
@@ -2076,18 +2312,27 @@ fn handle_model(provider: &mut Provider) {
     let mut options: Vec<(String, String, String)> = Vec::new();
 
     let ollama_base = if settings.provider == "ollama" {
-        settings
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:11434".into())
+        settings.base_url.clone()
     } else {
-        "http://localhost:11434".into()
-    };
+        remembered_endpoint("ollama")
+    }
+    .unwrap_or_else(|| "http://localhost:11434".into());
     let ollama_installed = provider::ollama_models(&ollama_base);
-    if !ollama_installed.is_empty() {
-        for m in ollama_installed.iter().take(12) {
-            options.push(("ollama".into(), m.clone(), "installed Ollama model".into()));
-        }
+    for m in ollama_installed.iter().take(onboarding::MODEL_LIST_MAX) {
+        options.push(("ollama".into(), m.clone(), "installed Ollama model".into()));
+    }
+    // The rest stay reachable by name: this row (no model) asks for one.
+    let more = ollama_installed
+        .len()
+        .checked_sub(onboarding::MODEL_LIST_MAX)
+        .filter(|n| *n > 0)
+        .map(onboarding::more_line);
+    if more.is_some() {
+        options.push((
+            "ollama".into(),
+            String::new(),
+            "installed Ollama models".into(),
+        ));
     }
 
     let no_server = find_llama_server_binary().is_none();
@@ -2101,10 +2346,12 @@ fn handle_model(provider: &mut Provider) {
     }
 
     for p in config::PRESETS.iter().filter(|p| !p.local) {
-        let status = if config::load_key(p.env_key).is_some() {
-            "ready".into()
-        } else {
+        let status = if config::load_key(p.env_key).is_none() {
             format!("needs {}", p.env_key)
+        } else if config::key_rejected(p.env_key) {
+            "key rejected — /login".into()
+        } else {
+            "ready".into()
         };
         options.push((
             p.id.to_string(),
@@ -2129,10 +2376,10 @@ fn handle_model(provider: &mut Provider) {
     let select_items: Vec<tui::SelectItem> = options
         .iter()
         .map(|(prov, model, desc)| {
-            let label = if model.is_empty() {
-                format!("[{prov}] custom endpoint")
-            } else {
-                format!("{prov} / {model}")
+            let label = match (prov.as_str(), model.is_empty()) {
+                ("custom", true) => format!("[{prov}] custom endpoint"),
+                (_, true) => format!("{prov} / {}", more.as_deref().unwrap_or_default()),
+                _ => format!("{prov} / {model}"),
             };
             tui::SelectItem {
                 label,
@@ -2143,22 +2390,32 @@ fn handle_model(provider: &mut Provider) {
 
     let title = format!(
         "Select AI Model (Current: {} on {})",
-        provider.model, settings.provider
+        provider.model,
+        active_preset().unwrap_or(settings.provider)
     );
 
     if let Some(idx) = tui::select_item(&title, &select_items) {
         let (target_provider, model, _) = options[idx].clone();
         if target_provider == "custom" && model.is_empty() {
-            let pick =
+            let Some(pick) =
                 tui::ask("  Enter endpoint URL & model (e.g. http://localhost:8080/v1 model): ")
-                    .unwrap_or_default();
+            else {
+                return swap_cancelled();
+            };
             let pick = pick.trim();
             if !pick.is_empty() {
                 let (url, m) = pick
                     .split_once(char::is_whitespace)
                     .map(|(u, m)| (u.trim().to_string(), m.trim().to_string()))
                     .unwrap_or((pick.to_string(), String::new()));
-                swap_model(provider, "custom", &m, Some(url));
+                swap_model(provider, endpoint_preset(&url), &m, Some(url));
+            }
+        } else if model.is_empty() {
+            let Some(m) = tui::ask("  model name: ") else {
+                return swap_cancelled();
+            };
+            if !m.trim().is_empty() {
+                swap_model(provider, &target_provider, m.trim(), None);
             }
         } else {
             swap_model(provider, &target_provider, &model, None);
@@ -2167,8 +2424,8 @@ fn handle_model(provider: &mut Provider) {
 }
 
 /// `/model <http(s)://url> [model]` → (base_url, model). A URL first token
-/// always means the custom OpenAI-compatible preset; it must never fall into
-/// the org/model → OpenRouter inference below.
+/// always names an endpoint; it must never fall into the org/model →
+/// OpenRouter inference below. `endpoint_preset` says which preset serves it.
 fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
     let pick = pick.trim();
     let (first, rest) = pick.split_once(char::is_whitespace).unwrap_or((pick, ""));
@@ -2177,6 +2434,40 @@ fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
         return None;
     }
     Some((first.to_string(), rest.trim().to_string()))
+}
+
+/// An Ollama host root is the Ollama preset, so its own API (and its model
+/// list) is used; any other URL, `…/v1` included, is the custom
+/// OpenAI-compatible preset. Ollama's port says so; a host root on another
+/// port is asked.
+fn endpoint_preset(url: &str) -> &'static str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let root = rest.trim_end_matches('/').split_once('/').is_none();
+    if root && (is_ollama_address(url) || !provider::ollama_models(url).is_empty()) {
+        "ollama"
+    } else {
+        "custom"
+    }
+}
+
+fn is_ollama_address(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .ends_with(":11434")
+}
+
+/// The address last used with `preset`, from the user's own settings only:
+/// a cloned repository never chooses where a swap sends the key.
+fn remembered_endpoint(preset: &str) -> Option<String> {
+    config::load_user_settings().and_then(|u| u.endpoints.get(preset).cloned())
+}
+
+fn swap_cancelled() {
+    tui::line(&tui::dim("  /model cancelled — nothing saved"));
 }
 
 /// Maps a typed model name to the provider that serves it. Anything
@@ -2356,6 +2647,25 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
     None
 }
 
+// The preset the live provider was built from: the settings and flags at
+// startup, then each /model, /init and /login. Banners and "now using"
+// lines read it, so they name what is really answering.
+static ACTIVE_PRESET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_active_preset(id: &str) {
+    if let Ok(mut a) = ACTIVE_PRESET.lock() {
+        *a = id.to_string();
+    }
+}
+
+fn active_preset() -> Option<String> {
+    ACTIVE_PRESET
+        .lock()
+        .ok()
+        .map(|a| a.clone())
+        .filter(|a| !a.is_empty())
+}
+
 /// Where a `/model` swap points: the base URL it probes and runs against,
 /// and what it writes to the saved `base_url`.
 #[derive(Debug, PartialEq)]
@@ -2367,11 +2677,13 @@ struct SwapTarget {
 
 /// A saved `base_url` belongs to the provider it was set for: a swap within
 /// that provider keeps it (a remote Ollama host, an LM Studio box on the
-/// LAN), a swap to another provider starts from that preset's default and
-/// clears it, and an explicit URL always wins.
+/// LAN), a swap to another provider goes back to the address last used with
+/// it (`remembered`, from `endpoints`) or else to its preset default, and an
+/// explicit URL always wins.
 fn plan_swap(
     current_provider: &str,
     saved_base_url: Option<&str>,
+    remembered: Option<&str>,
     target: &config::Preset,
     override_url: Option<&str>,
 ) -> SwapTarget {
@@ -2381,8 +2693,8 @@ fn plan_swap(
             save: Some(Some(url.to_string())),
         };
     }
-    match saved_base_url {
-        Some(url) if current_provider == target.id => SwapTarget {
+    match (saved_base_url, remembered) {
+        (Some(url), _) if current_provider == target.id => SwapTarget {
             base_url: url.to_string(),
             save: None,
         },
@@ -2390,11 +2702,41 @@ fn plan_swap(
             base_url: target.base_url.to_string(),
             save: None,
         },
+        (_, Some(url)) => SwapTarget {
+            base_url: url.to_string(),
+            save: Some(Some(url.to_string())),
+        },
         _ => SwapTarget {
             base_url: target.base_url.to_string(),
             save: Some(None),
         },
     }
+}
+
+/// The `endpoints` map after a swap from `from` to `to`, kept for the next
+/// swap back: the address the user's own settings give `from`, and for `to`
+/// the one this swap saves (`saved`), or else the user's own. A base_url a
+/// trusted project layers in serves that project only, so it is never
+/// remembered for the others.
+fn remember_endpoints(
+    user: &Settings,
+    from: &str,
+    to: &str,
+    saved: Option<Option<&str>>,
+) -> std::collections::BTreeMap<String, String> {
+    let own = |id: &str| {
+        (user.provider == id)
+            .then_some(user.base_url.as_deref())
+            .flatten()
+    };
+    let mut endpoints = user.endpoints.clone();
+    if let Some(u) = own(from).filter(|_| from != to) {
+        endpoints.insert(from.to_string(), u.to_string());
+    }
+    if let Some(u) = saved.unwrap_or_else(|| own(to)) {
+        endpoints.insert(to.to_string(), u.to_string());
+    }
+    endpoints
 }
 
 /// The swap's success line names the model actually saved, which differs
@@ -2413,7 +2755,8 @@ fn swap_success_line(requested: &str, active: &str, provider_label: &str) -> Str
 /// Applies a model swap only after the target provider is actually usable:
 /// walks the user through a missing API key (or a custom endpoint's URL),
 /// checks that a local server is reachable and has the model, and keeps the
-/// current model on any failure.
+/// current model on any failure. A key typed here is saved only once the
+/// probe accepts it; Esc or Ctrl+C at any question cancels with nothing saved.
 fn swap_model(
     provider: &mut Provider,
     target_provider: &str,
@@ -2421,90 +2764,94 @@ fn swap_model(
     base_url_override: Option<String>,
 ) {
     let Some(preset) = config::preset(target_provider) else {
-        let ids: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
         tui::line(&tui::red(&format!(
-            "  ✗ unknown provider '{target_provider}' — valid: {}",
-            ids.join(", ")
+            "  ✗ {}",
+            unknown_provider_msg(target_provider)
         )));
         return;
     };
     let mut s = config::load_settings().unwrap_or_default();
+    let (from, from_url) = (s.provider.clone(), s.base_url.clone());
+    let remembered = remembered_endpoint(preset.id);
     let mut model = model.to_string();
     let mut custom_url = base_url_override;
+    let key_name = onboarding::key_name(preset);
+    let mut new_key: Option<String> = None;
 
-    // Custom OpenAI-compatible endpoint: gather URL, optional key, and model.
+    // Custom OpenAI-compatible endpoint: the address and key are asked only
+    // for an endpoint not used before; `/model <name>` on a configured one
+    // just switches the model.
     if preset.id == "custom" {
-        if custom_url.is_none() {
-            let default_url = plan_swap(&s.provider, s.base_url.as_deref(), preset, None).base_url;
-            let url = tui::ask(&format!(
+        let current = (from == "custom").then_some(from_url.as_deref()).flatten();
+        let known = current.or(remembered.as_deref());
+        if custom_url.is_none() && known.is_none() {
+            let default_url = preset.base_url;
+            let Some(url) = tui::ask(&format!(
                 "  Endpoint base URL (OpenAI-compatible, usually ends in /v1) [{default_url}]: "
-            ))
-            .unwrap_or_default();
+            )) else {
+                return swap_cancelled();
+            };
             let url = url.trim();
             custom_url = Some(if url.is_empty() {
-                default_url
+                default_url.to_string()
             } else {
                 url.to_string()
             });
         }
-        if config::load_key(config::CUSTOM_KEY).is_none() {
-            let key =
-                tui::ask("  API key (press Enter if the server needs none): ").unwrap_or_default();
-            if !key.trim().is_empty() {
-                config::save_key(config::CUSTOM_KEY, key.trim());
-                tui::line(&tui::green(&format!("  ✓ {} saved", config::CUSTOM_KEY)));
-            }
+        let new_address = custom_url.as_deref().is_some_and(|u| Some(u) != current);
+        if new_address && config::load_key(config::CUSTOM_KEY).is_none() {
+            let Some(key) = tui::ask_secret("  API key for this endpoint (Enter for none): ")
+            else {
+                return swap_cancelled();
+            };
+            new_key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
         }
         if model.is_empty() {
-            let m = tui::ask("  Model name (as the server expects it): ").unwrap_or_default();
+            let Some(m) = tui::ask("  Model name (as the server expects it): ") else {
+                return swap_cancelled();
+            };
             model = m.trim().to_string();
             if model.is_empty() {
-                tui::line(&tui::dim(&format!(
-                    "  swap cancelled — keeping {}.",
-                    provider.model
-                )));
-                return;
+                return swap_cancelled();
             }
         }
     }
 
-    // Missing API key: configure it right here instead of failing on the
-    // next request with a raw HTTP error.
+    // Missing API key: take it right here instead of failing on the next
+    // request with a raw HTTP error. It is saved once the probe accepts it.
     if !preset.env_key.is_empty() && config::load_key(preset.env_key).is_none() {
         tui::line(&tui::yellow(&format!(
             "  {} isn't configured yet — {} is not set.",
             preset.label, preset.env_key
         )));
         tui::line(&tui::dim(
-            "  Paste an API key to set it up now, or press Enter to cancel the swap.",
+            "  Paste an API key to set it up now (it is checked before it is saved), or Esc to cancel.",
         ));
-        let key = tui::ask(&format!("  {}: ", preset.env_key)).unwrap_or_default();
-        let key = key.trim();
-        if key.is_empty() {
-            tui::line(&tui::dim(&format!(
-                "  swap cancelled — keeping {}. Configure later with `export {}=…` or `buildwithnexus init`.",
-                provider.model, preset.env_key
-            )));
-            return;
+        let Some(key) = tui::ask_secret(&format!("  {}: ", preset.env_key)) else {
+            return swap_cancelled();
+        };
+        if key.trim().is_empty() {
+            return swap_cancelled();
         }
-        config::save_key(preset.env_key, key);
-        tui::line(&tui::green(&format!("  ✓ {} saved", preset.env_key)));
+        new_key = Some(key.trim().to_string());
     }
 
     // Ollama: confirm the server is up and actually has the model before
     // committing — the alternative is an opaque failure mid-conversation.
     let mut target = plan_swap(
-        &s.provider,
-        s.base_url.as_deref(),
+        &from,
+        from_url.as_deref(),
+        remembered.as_deref(),
         preset,
         custom_url.as_deref(),
     );
     if preset.id == "ollama" {
         let base = target.base_url.clone();
+        let shown_base = tui::sanitize_terminal(&base);
         let installed = provider::ollama_models(&base);
         if installed.is_empty() {
             tui::line(&tui::yellow(&format!(
-                "  ✗ can't reach Ollama at {base} (or it has no models)."
+                "  ✗ can't reach Ollama at {shown_base} (or it has no models)."
             )));
             tui::line(&tui::dim("    1. install: https://ollama.com"));
             tui::line(&tui::dim("    2. start it:  ollama serve"));
@@ -2521,7 +2868,7 @@ fn swap_model(
             .any(|m| *m == model || m.split(':').next() == Some(model.as_str()));
         if !have {
             tui::line(&tui::yellow(&format!(
-                "  ✗ Ollama is running but '{model}' isn't installed."
+                "  ✗ Ollama at {shown_base} is running but '{model}' isn't installed."
             )));
             let shown: Vec<&str> = installed.iter().take(8).map(String::as_str).collect();
             // Model names come from whatever answers on the Ollama port.
@@ -2568,89 +2915,151 @@ fn swap_model(
         }
     }
 
-    let base_url_change = target.save;
+    let base_url_change = target.save.clone();
     if let Some(u) = &base_url_change {
         s.base_url = u.clone();
     }
     s.provider = preset.id.to_string();
     s.model = model.to_string();
-    match build_provider(&s) {
-        Ok(mut p) => {
-            // No success message without proof: a one-token probe through the
-            // real request path catches bad keys, unknown model names, and
-            // unreachable servers now instead of on the next prompt. Ollama
-            // was already validated live above (server + installed model),
-            // and a probe there could cold-load a large model.
-            if preset.id != "ollama" {
-                tui::line(&tui::dim(&format!(
-                    "  validating {model} — one-token probe…"
+    let Some(mut p) = probe_swap(&mut s, preset, &mut new_key, &provider.model) else {
+        return;
+    };
+    if let Some(k) = &new_key {
+        config::save_key(key_name, k);
+        tui::line(&tui::green(&format!("  ✓ {key_name} saved")));
+    }
+    if let Some(k) = p.api_key.as_deref() {
+        config::record_key_check(key_name, k, true);
+    }
+    // The probe's one-token usage mustn't pose as the live prompt
+    // size, and a `--effort` given on the command line outlives the swap.
+    usage::forget_last();
+    p.effort = provider.effort;
+    *provider = p;
+    let user = config::load_user_settings().unwrap_or_default();
+    let endpoints = remember_endpoints(
+        &user,
+        &from,
+        preset.id,
+        base_url_change.as_ref().map(|u| u.as_deref()),
+    );
+    let mut changes = vec![
+        ("provider", Some(s.provider.as_str().into())),
+        ("model", Some(s.model.as_str().into())),
+    ];
+    if let Some(u) = base_url_change {
+        changes.push(("base_url", u.map(Into::into)));
+    }
+    if endpoints != user.endpoints {
+        changes.push(("endpoints", serde_json::to_value(&endpoints).ok()));
+    }
+    save_user_settings(&changes);
+    provider::prewarm(provider);
+    set_active_preset(preset.id);
+    tui::set_model_label(&s.model);
+    tui::line(&tui::green(&swap_success_line(
+        &model,
+        &s.model,
+        &onboarding::provider_label(preset.id, &provider.base_url),
+    )));
+}
+
+// The proof half of a swap: builds the provider (a key typed during the swap
+// stands in for the saved one) and has it answer a one-token probe, which
+// catches bad keys, unknown model names and unreachable servers now instead
+// of on the next prompt. Ollama was already checked live by the caller, and
+// a probe there could cold-load a large model. A custom endpoint with no
+// saved key that answers 401 is asked for one here. None once it has said
+// why the current model stays.
+fn probe_swap(
+    s: &mut Settings,
+    preset: &config::Preset,
+    new_key: &mut Option<String>,
+    current_model: &str,
+) -> Option<Provider> {
+    let keeping = || {
+        tui::line(&tui::dim(&format!(
+            "    keeping the current model ({current_model})."
+        )))
+    };
+    loop {
+        let mut p = match build_provider_with_key(s, new_key.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tui::line(&tui::red(&format!(
+                    "  ✗ swap failed: {} — keeping the current model; nothing saved.",
+                    tui::sanitize_terminal(&e)
                 )));
-                match provider::validate(&p) {
-                    // The server answered only as its fallback name: run and
-                    // save that, not the name it rejected.
-                    Ok(Some(new_model)) => {
-                        s.model = new_model.clone();
-                        tui::set_model_label(&new_model);
-                        p.model = new_model;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tui::line(&tui::red(&format!(
-                            "  ✗ validation failed: {}",
-                            tui::sanitize_terminal(&e)
-                        )));
-                        let hint = if e.contains("401") || e.contains("403") {
-                            format!(
-                            "the API key was rejected — re-run /model to enter a new one, or update {}",
-                            if preset.id == "custom" { config::CUSTOM_KEY } else { preset.env_key }
-                        )
-                        } else if e.contains("404") || e.to_lowercase().contains("model") {
-                            format!("'{model}' doesn't look like a model this provider serves — check the name")
-                        } else if e.contains("Connection refused")
-                            || e.contains("connect error")
-                            || e.contains("connection failed")
-                        {
-                            format!(
-                                "nothing is answering at {} — start the server, then /model again",
-                                p.base_url
-                            )
-                        } else {
-                            "fix the issue above, then /model again".to_string()
-                        };
-                        tui::line(&tui::dim(&format!("    {hint}")));
-                        tui::line(&tui::dim(&format!(
-                            "    keeping the current model ({}).",
-                            provider.model
-                        )));
-                        return;
-                    }
+                return None;
+            }
+        };
+        if preset.id == "ollama" {
+            return Some(p);
+        }
+        tui::line(&tui::dim(&format!(
+            "  validating {} — one-token probe…",
+            s.model
+        )));
+        let e = match provider::validate(&p) {
+            // The server answered only as its fallback name: run and save
+            // that, not the name it rejected.
+            Ok(Some(new_model)) => {
+                s.model = new_model.clone();
+                p.model = new_model;
+                return Some(p);
+            }
+            Ok(None) => return Some(p),
+            Err(e) => e,
+        };
+        let fail = onboarding::Fail::from_error(&e);
+        if let onboarding::Fail::KeyRejected(code) = fail {
+            if new_key.is_some() {
+                tui::line(&tui::red(&format!(
+                    "  ✗ rejected (HTTP {code}) — not saved"
+                )));
+                keeping();
+                return None;
+            }
+            if preset.id == "custom" && config::load_key(config::CUSTOM_KEY).is_none() {
+                tui::line(&tui::yellow(&format!(
+                    "  the endpoint wants an API key (HTTP {code}) — paste it, or Esc to cancel"
+                )));
+                let key = tui::ask_secret("  API key for this endpoint: ")
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty());
+                if key.is_none() {
+                    swap_cancelled();
+                    return None;
                 }
+                *new_key = key;
+                continue;
             }
-            // The probe's one-token usage mustn't pose as the live prompt
-            // size, and a `--effort` given on the command line outlives the swap.
-            usage::forget_last();
-            p.effort = provider.effort;
-            *provider = p;
-            let mut changes = vec![
-                ("provider", Some(s.provider.as_str().into())),
-                ("model", Some(s.model.as_str().into())),
-            ];
-            if let Some(u) = base_url_change {
-                changes.push(("base_url", u.map(Into::into)));
+        }
+        tui::line(&tui::red(&format!(
+            "  ✗ validation failed: {}",
+            tui::sanitize_terminal(&e)
+        )));
+        let hint = match fail {
+            onboarding::Fail::KeyRejected(_) => {
+                let name = onboarding::key_name(preset);
+                if let Some(k) = config::load_key(name) {
+                    config::record_key_check(name, &k, false);
+                }
+                "the API key was rejected — /login to replace it".to_string()
             }
-            save_user_settings(&changes);
-            provider::prewarm(provider);
-            tui::line(&tui::green(&swap_success_line(
-                &model,
-                &s.model,
-                preset.label,
-            )));
-        }
-        Err(e) => {
-            tui::line(&tui::red(&format!(
-                "  ✗ swap failed: {e} — keeping the current model."
-            )));
-        }
+            onboarding::Fail::ModelMissing => format!(
+                "'{}' doesn't look like a model this provider serves — check the name",
+                s.model
+            ),
+            onboarding::Fail::Unreachable => format!(
+                "nothing is answering at {} — start the server, then /model again",
+                tui::sanitize_terminal(&p.base_url)
+            ),
+            onboarding::Fail::Other(_) => "fix the issue above, then /model again".to_string(),
+        };
+        tui::line(&tui::dim(&format!("    {hint}")));
+        keeping();
+        return None;
     }
 }
 
@@ -4072,6 +4481,11 @@ fn print_help() {
                 ("/new", "", "start a fresh session"),
                 ("/resume", "", "pick a saved session to resume"),
                 ("/init", "", "run setup (keys, providers, local models)"),
+                (
+                    "/login",
+                    "",
+                    "replace the API key, checked before it is saved",
+                ),
                 ("/config", "", "configure hooks, memory, commands via AI"),
                 ("/voice", "[<file>]", "audio transcription & voice input"),
                 ("/vim", "", "toggle Vim modal editing"),
@@ -4590,6 +5004,8 @@ fn usage() {
          \x20 buildwithnexus resume <id> <t> resume a specific session\n\
          \x20 buildwithnexus sessions        list saved sessions\n\
          \x20 buildwithnexus init            (re)configure provider / model / key\n\
+         \x20 buildwithnexus init --agents-md  write AGENTS.md from this repository\n\
+         \x20 buildwithnexus login           replace the provider's API key (checked first)\n\
          \x20 buildwithnexus providers       list built-in providers\n\
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
@@ -4815,33 +5231,60 @@ fn run_doctor() {
     println!("  Run `buildwithnexus init` to fix any missing configuration.");
 }
 
+/// Tools bwn can use from PATH: (binary, Homebrew package, apt package,
+/// download page, what it is for, needed by bwn itself).
+const DEPENDENCIES: &[(&str, &str, &str, &str, &str, bool)] = &[
+    (
+        "git",
+        "git",
+        "git",
+        "https://git-scm.com/downloads",
+        "/undo, /diff and checkpoints use it",
+        true,
+    ),
+    (
+        "rg",
+        "ripgrep",
+        "ripgrep",
+        "https://github.com/BurntSushi/ripgrep#installation",
+        "faster searches when the agent runs it; bwn's own search does not need it",
+        false,
+    ),
+    (
+        "node",
+        "node",
+        "nodejs",
+        "https://nodejs.org",
+        "MCP servers written for Node",
+        false,
+    ),
+    (
+        "npm",
+        "node",
+        "npm",
+        "https://nodejs.org",
+        "installing Node MCP servers",
+        false,
+    ),
+    (
+        "python3",
+        "python",
+        "python3",
+        "https://www.python.org/downloads",
+        "Python scripts and MCP servers",
+        false,
+    ),
+];
+
+/// Lists tools missing from PATH as plain advice. It never installs
+/// anything: `interactive` (doctor) lists every missing tool with its
+/// install command; otherwise (session start) only a missing tool bwn itself
+/// needs gets a line. The name is kept for its callers.
 pub fn check_and_offer_install_dependencies(interactive: bool) {
-    let tools_to_check = [
-        ("git", "git", "git", "Version control & workspace tracking"),
-        (
-            "rg",
-            "ripgrep",
-            "ripgrep",
-            "High-speed regex/pattern file searching",
-        ),
-        ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
-        ("npm", "node", "npm", "Node package manager"),
-        (
-            "python3",
-            "python",
-            "python3",
-            "Python runtime & data scripting",
-        ),
-    ];
-
-    let mut missing = Vec::new();
-    for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
-        let found = crate::tools::find_on_path(bin).is_some();
-        if !found {
-            missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
-        }
-    }
-
+    let missing: Vec<_> = DEPENDENCIES
+        .iter()
+        .filter(|d| crate::tools::find_on_path(d.0).is_none())
+        .collect();
     if missing.is_empty() {
         if interactive {
             tui::line(&tui::green(
@@ -4850,72 +5293,43 @@ pub fn check_and_offer_install_dependencies(interactive: bool) {
         }
         return;
     }
-
-    tui::line(&tui::yellow(&format!(
-        "  ⚠ Missing {} OOTB development tool(s):",
-        missing.len()
-    )));
-    for (bin, _, _, desc) in &missing {
-        tui::line(&format!("    • {} — {}", tui::bold(bin), desc));
-    }
-
-    if !interactive {
-        tui::line(&tui::dim("  Tip: Run `buildwithnexus init` or `buildwithnexus doctor` to auto-install missing dependencies."));
-        return;
-    }
-
-    let brew_available = crate::tools::find_on_path("brew").is_some();
-    let apt_available = crate::tools::find_on_path("apt-get").is_some();
-
-    for (bin, brew_pkg, apt_pkg, desc) in missing {
-        let ask_msg = format!(
-            "  Would you like to install '{}' ({}) now? [Y/n]: ",
-            bin, desc
-        );
-        let ans = match tui::ask(&ask_msg) {
-            Some(a) => a.trim().to_lowercase(),
-            None => break,
-        };
-        if ans == "n" || ans == "no" {
-            tui::line(&tui::dim(&format!("    Skipped installing {bin}.")));
+    let brew = crate::tools::find_on_path("brew").is_some();
+    let apt = crate::tools::find_on_path("apt-get").is_some();
+    for &&(bin, brew_pkg, apt_pkg, page, why, needed) in &missing {
+        if !interactive && !needed {
             continue;
         }
-
-        if brew_available {
-            tui::line(&tui::accent(&format!(
-                "    Running `brew install {brew_pkg}`..."
-            )));
-            let res = std::process::Command::new("brew")
-                .args(["install", brew_pkg])
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
-                }
-                _ => tui::line(&tui::red(&format!(
-                    "    ✗ Failed to install {brew_pkg} via Homebrew."
-                ))),
-            }
-        } else if apt_available {
-            tui::line(&tui::accent(&format!(
-                "    Running `sudo apt-get install -y {apt_pkg}`..."
-            )));
-            let res = std::process::Command::new("sudo")
-                .args(["apt-get", "install", "-y", apt_pkg])
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
-                }
-                _ => tui::line(&tui::red(&format!(
-                    "    ✗ Failed to install {apt_pkg} via apt-get."
-                ))),
-            }
+        let how = install_hint(brew_pkg, apt_pkg, page, brew, apt, cfg!(windows));
+        let line = format!(
+            "  · {bin} not found — {}{why}; install it with: {how}",
+            if needed { "" } else { "optional, " }
+        );
+        if needed {
+            tui::line(&tui::yellow(&line));
         } else {
-            tui::line(&tui::yellow(&format!(
-                "    Neither Homebrew nor apt-get found. Please install '{bin}' manually."
-            )));
+            tui::line(&tui::dim(&line));
         }
+    }
+}
+
+// The command (or page) that installs a tool here. Printed for the person to
+// run, never run by bwn. `windows` is a parameter so tests cover it anywhere.
+fn install_hint(
+    brew_pkg: &str,
+    apt_pkg: &str,
+    page: &str,
+    brew: bool,
+    apt: bool,
+    windows: bool,
+) -> String {
+    if windows {
+        page.to_string()
+    } else if brew {
+        format!("brew install {brew_pkg}")
+    } else if apt {
+        format!("sudo apt-get install {apt_pkg}")
+    } else {
+        page.to_string()
     }
 }
 
@@ -5756,6 +6170,32 @@ mod tests {
         super::check_and_offer_install_dependencies(false);
     }
 
+    #[test]
+    fn missing_tools_get_an_install_command_that_bwn_never_runs() {
+        let page = "https://github.com/BurntSushi/ripgrep#installation";
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, false, true, false),
+            "sudo apt-get install ripgrep"
+        );
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, true, true, false),
+            "brew install ripgrep"
+        );
+        // No package manager known, and Windows (where winget may be absent):
+        // the download page.
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, false, false, false),
+            page
+        );
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, true, true, true),
+            page
+        );
+        // Only git is needed by bwn itself; the rest are optional.
+        let needed: Vec<&str> = DEPENDENCIES.iter().filter(|d| d.5).map(|d| d.0).collect();
+        assert_eq!(needed, ["git"]);
+    }
+
     // A loopback HTTP server answering every request with `respond(method,
     // path, body)` → (status, JSON body). Runs until the test process exits.
     fn mock_http(respond: fn(&str, &str, &str) -> (u16, String)) -> u16 {
@@ -5974,11 +6414,131 @@ mod tests {
         ];
         for (from, saved, to, url, want) in table {
             assert_eq!(
-                plan_swap(from, saved, preset(to), url),
+                plan_swap(from, saved, None, preset(to), url),
                 want,
                 "{from} ({saved:?}) → {to} ({url:?})"
             );
         }
+    }
+
+    #[test]
+    fn plan_swap_returns_to_the_address_last_used_with_a_provider() {
+        let preset = |id| config::preset(id).unwrap();
+        let lan = "http://192.168.50.10:11434";
+        // LM Studio → Ollama: back to the LAN box, and it is saved again.
+        assert_eq!(
+            plan_swap("lmstudio", None, Some(lan), preset("ollama"), None),
+            SwapTarget {
+                base_url: lan.into(),
+                save: Some(Some(lan.into())),
+            }
+        );
+        // Within a provider the saved address still wins, and a typed URL
+        // wins over both.
+        assert_eq!(
+            plan_swap(
+                "ollama",
+                Some("http://a:11434"),
+                Some(lan),
+                preset("ollama"),
+                None
+            )
+            .base_url,
+            "http://a:11434"
+        );
+        assert_eq!(
+            plan_swap(
+                "lmstudio",
+                None,
+                Some(lan),
+                preset("ollama"),
+                Some("http://b:11434")
+            )
+            .base_url,
+            "http://b:11434"
+        );
+
+        // Leaving a provider remembers its address; arriving records the new one.
+        let own = |provider: &str, url: Option<&str>| config::Settings {
+            provider: provider.into(),
+            base_url: url.map(String::from),
+            ..Default::default()
+        };
+        let map = remember_endpoints(
+            &own("ollama", Some(lan)),
+            "ollama",
+            "lmstudio",
+            Some(Some("http://127.0.0.1:1234/v1")),
+        );
+        assert_eq!(map.get("ollama").map(String::as_str), Some(lan));
+        assert_eq!(
+            map.get("lmstudio").map(String::as_str),
+            Some("http://127.0.0.1:1234/v1")
+        );
+        // A preset default (no saved URL) adds nothing.
+        assert!(
+            remember_endpoints(&own("anthropic", None), "anthropic", "openai", Some(None))
+                .is_empty()
+        );
+        // Only the user's own addresses are remembered: a base_url a trusted
+        // project layers in serves that project, never every project.
+        let mine = own("custom", Some("http://my-gateway:8080/v1"));
+        let map = remember_endpoints(&mine, "custom", "ollama", Some(Some(lan)));
+        assert_eq!(map["custom"], "http://my-gateway:8080/v1");
+        let map = remember_endpoints(&mine, "custom", "custom", None);
+        assert_eq!(map["custom"], "http://my-gateway:8080/v1");
+        let map = remember_endpoints(&own("anthropic", None), "custom", "ollama", Some(Some(lan)));
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["ollama"]);
+    }
+
+    #[test]
+    fn ollama_addresses_pick_the_ollama_preset() {
+        assert!(is_ollama_address("http://192.168.50.10:11434"));
+        assert!(is_ollama_address("http://gpu-box:11434/"));
+        assert!(is_ollama_address("http://localhost:11434/v1"));
+        assert!(is_ollama_address("http://user:pw@host:11434"));
+        assert!(!is_ollama_address("http://127.0.0.1:8081/v1"));
+        assert!(!is_ollama_address("https://gateway.example/11434"));
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434"), "ollama");
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434/"), "ollama");
+        // Ollama's OpenAI-compatible /v1 stays the custom preset, as before.
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434/v1"), "custom");
+        // A path, or nothing answering /api/tags, means an OpenAI-compatible
+        // endpoint.
+        assert_eq!(endpoint_preset("http://127.0.0.1:9/v1"), "custom");
+        assert_eq!(endpoint_preset("http://127.0.0.1:9"), "custom");
+        // An Ollama on another port is recognised by its own API.
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        assert_eq!(
+            endpoint_preset(&format!("http://127.0.0.1:{port}")),
+            "ollama"
+        );
+    }
+
+    #[test]
+    fn swap_back_to_ollama_goes_to_the_remembered_host() {
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let lan = format!("http://127.0.0.1:{port}");
+        let (after, provider) = swap_with_saved(
+            config::Settings {
+                provider: "lmstudio".into(),
+                model: "tinycoder-7b-instruct".into(),
+                endpoints: [("ollama".to_string(), lan.clone())].into(),
+                ..Default::default()
+            },
+            "ollama",
+            "tinycoder:3b",
+        );
+        assert_eq!(after.provider, "ollama");
+        assert_eq!(after.base_url.as_deref(), Some(lan.as_str()));
+        assert_eq!(provider.base_url, lan);
+        assert_eq!(after.endpoints.get("ollama"), Some(&lan));
     }
 
     #[test]

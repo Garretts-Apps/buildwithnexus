@@ -192,8 +192,13 @@ impl std::fmt::Display for Effort {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Preset id; empty means setup has not run (a hooks-only project file).
+    #[serde(default)]
     pub provider: String,
+    /// Empty means the preset's default model.
+    #[serde(default)]
     pub model: String,
+    #[serde(default = "default_permission")]
     pub permission: String,
     /// Reasoning level: "off" (default), "low", "medium", or "high" — see
     /// [`Effort`]. `--effort` and `/effort` override and persist it.
@@ -298,6 +303,12 @@ pub struct Settings {
     /// removed before a command runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shell_env_passthrough: Vec<String>,
+    /// The address last used with each provider (`{"ollama":
+    /// "http://gpu-box:11434"}`), so a /model swap back to a provider returns
+    /// to its server without asking. Written by /model and setup; read from
+    /// the user's files only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub endpoints: BTreeMap<String, String>,
 }
 
 /// `permissions` in settings: rule lists by effect.
@@ -334,6 +345,10 @@ impl NetworkRules {
 
 fn default_auto() -> String {
     "auto".into()
+}
+
+fn default_permission() -> String {
+    "ask".into()
 }
 
 fn default_sandbox() -> String {
@@ -381,8 +396,32 @@ impl Default for Settings {
             permissions: PermissionRules::default(),
             network: NetworkRules::default(),
             shell_env_passthrough: Vec::new(),
+            endpoints: BTreeMap::new(),
         }
     }
+}
+
+/// The first settings file and key whose value has the wrong type, so a
+/// merge that fails can say where to look. Every field has a default, so a
+/// key alone fails to load only when its own value is wrong.
+fn wrong_typed_key(files: impl Iterator<Item = PathBuf>) -> Option<(PathBuf, String, String)> {
+    for p in files {
+        let Ok(text) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(m)) = serde_json::from_str(&text) else {
+            continue;
+        };
+        for (k, v) in m {
+            let one = serde_json::Value::Object([(k.clone(), v)].into_iter().collect());
+            if let Err(e) = serde_json::from_value::<Settings>(one) {
+                // Keys come from a file the user may not have written.
+                let k = crate::tui::sanitize_terminal(&k).into_owned();
+                return Some((p, k, e.to_string()));
+            }
+        }
+    }
+    None
 }
 
 fn default_max_concurrent_workflows() -> usize {
@@ -972,39 +1011,6 @@ pub fn instructions_notice(files: &[InstructionFile]) -> Option<String> {
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!("instructions: {names}"))
-}
-
-/// Starter written by `/init` when the cwd has no AGENTS.md.
-pub const STARTER_AGENTS_MD: &str = "\
-# AGENTS.md
-
-Instructions for AI coding agents working in this repository.
-
-## Build & test
-
-- Build: `<command>`
-- Test: `<command>`
-- Lint / format: `<command>`
-
-## Conventions
-
-- <language, style, and directory layout rules>
-- <how commits and pull requests are written>
-
-## Do not
-
-- <files or directories that must not be edited>
-- <commands that must not be run>
-";
-
-/// Create a starter AGENTS.md in `cwd`; refuses to overwrite an existing one.
-pub fn create_starter_agents_md(cwd: &Path) -> Result<PathBuf, String> {
-    let p = cwd.join("AGENTS.md");
-    if p.exists() {
-        return Err(format!("{} already exists", p.display()));
-    }
-    fs::write(&p, STARTER_AGENTS_MD).map_err(|e| format!("{}: {e}", p.display()))?;
-    Ok(p)
 }
 
 // ── skills ────────────────────────────────────────────────────────────────────
@@ -2100,11 +2106,23 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
             any_present,
         },
         Err(e) => {
-            issues.push(SettingsIssue {
-                source: "merged settings".into(),
-                error: format!(
-                    "{e} — check the value types in the files listed by `buildwithnexus doctor`"
-                ),
+            let project =
+                workdir.map(|w| PROJECT_SETTINGS_FILES.map(|n| w.join(".buildwithnexus").join(n)));
+            let files = user_paths
+                .iter()
+                .cloned()
+                .chain(project.into_iter().flatten());
+            issues.push(match wrong_typed_key(files) {
+                Some((file, key, why)) => SettingsIssue {
+                    source: file.display().to_string(),
+                    error: format!("\"{key}\": {why} — fix or remove that key"),
+                },
+                None => SettingsIssue {
+                    source: "merged settings".into(),
+                    error: format!(
+                        "{e} — check the value types in the files listed by `buildwithnexus doctor`"
+                    ),
+                },
             });
             SettingsLoad {
                 settings: None,
@@ -2235,6 +2253,63 @@ pub fn save_key(name: &str, value: &str) {
     map.insert(name.to_string(), value.to_string());
     let body: String = map.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     write_atomic(&keys_path(), &body, true);
+}
+
+/// True when the key comes from the process environment, which wins over
+/// the saved one: a key saved now would not be used until it is unset.
+pub fn key_from_env(name: &str) -> bool {
+    !name.is_empty() && std::env::var(name).is_ok_and(|v| !v.trim().is_empty())
+}
+
+// How the last check of each key went, so the /model picker can say "key
+// rejected" rather than "ready". Holds a hash of the key that was checked,
+// never the key, so a replaced key starts unchecked.
+fn key_checks_path() -> PathBuf {
+    home().join("key-checks.json")
+}
+
+fn key_fingerprint(key: &str) -> String {
+    // FNV-1a: stable across builds, and 64 bits say nothing about a key.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.trim().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Records whether `key` (the value of `name`) was accepted by its provider.
+pub fn record_key_check(name: &str, key: &str, accepted: bool) {
+    if name.is_empty() || key.trim().is_empty() {
+        return;
+    }
+    let path = key_checks_path();
+    let mut map: BTreeMap<String, serde_json::Value> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    map.insert(
+        name.to_string(),
+        serde_json::json!({ "key": key_fingerprint(key), "accepted": accepted }),
+    );
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        ensure_home();
+        write_atomic(&path, &text, true);
+    }
+}
+
+/// The key `name` resolves to now is the one whose last check was rejected.
+pub fn key_rejected(name: &str) -> bool {
+    let Some(key) = load_key(name) else {
+        return false;
+    };
+    let map: BTreeMap<String, serde_json::Value> = fs::read_to_string(key_checks_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    map.get(name).is_some_and(|c| {
+        c["accepted"] == false && c["key"].as_str() == Some(key_fingerprint(&key).as_str())
+    })
 }
 
 pub fn mask(key: &str) -> String {
@@ -2482,7 +2557,8 @@ mod tests {
         assert!(l.issues[0].error.contains("JSON object"));
 
         // Valid file + wrong field type: the merged deserialize fails loudly
-        // instead of silently dropping all configuration.
+        // instead of silently dropping all configuration, naming the file
+        // and the key.
         fs::write(
             h.join("settings.json"),
             r#"{"provider":"openai","model":"gpt-4o","permission":"ask","auto_update":true}"#,
@@ -2490,7 +2566,10 @@ mod tests {
         .unwrap();
         let l = load_settings_from_dir_diag(&work);
         assert!(l.settings.is_none() && l.any_present);
-        assert!(l.issues.iter().any(|i| i.source == "merged settings"));
+        assert!(l
+            .issues
+            .iter()
+            .any(|i| i.source.ends_with("settings.json") && i.error.contains("\"auto_update\"")));
 
         // Fixed file loads cleanly with zero issues.
         fs::write(
@@ -2510,6 +2589,74 @@ mod tests {
         assert!(l.settings.is_some());
         assert_eq!(l.issues.len(), 1);
 
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn a_rejected_key_is_remembered_until_it_is_replaced() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_dir("keycheck");
+        std::env::set_var("NEXUS_HOME", &h);
+        let name = "BWN_TEST_KEYCHECK_KEY";
+        std::env::remove_var(name);
+
+        save_key(name, "sk-old-0123456789");
+        assert!(!key_rejected(name), "never checked");
+        record_key_check(name, "sk-old-0123456789", false);
+        assert!(key_rejected(name));
+        // The record holds a fingerprint, never the key.
+        let text = fs::read_to_string(h.join("key-checks.json")).unwrap();
+        assert!(!text.contains("sk-old"), "{text}");
+        // A replaced key starts unchecked; an accepted one is not rejected.
+        save_key(name, "sk-new-0123456789");
+        assert!(!key_rejected(name));
+        record_key_check(name, "sk-new-0123456789", true);
+        assert!(!key_rejected(name));
+        // A key from the environment wins over the saved one and is told apart.
+        assert!(!key_from_env(name));
+        std::env::set_var(name, "sk-env-0123456789");
+        assert!(key_from_env(name));
+        std::env::remove_var(name);
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn settings_without_provider_model_or_permission_still_load() {
+        // A team repo's hooks-only file, or CI settings with no model: the
+        // merge must not fail before setup or flags can fill the gaps.
+        let s: Settings = serde_json::from_str(r#"{"hooks":{}}"#).unwrap();
+        assert!(s.provider.is_empty() && s.model.is_empty());
+        assert_eq!(s.permission, "ask");
+        let s: Settings = serde_json::from_str(
+            r#"{"provider":"custom","base_url":"http://h/v1","permission":"auto"}"#,
+        )
+        .unwrap();
+        assert_eq!((s.provider.as_str(), s.model.as_str()), ("custom", ""));
+        assert!(s.endpoints.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_settings_file_is_named_with_its_key() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_dir("wrongtype");
+        std::env::set_var("NEXUS_HOME", &h);
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"custom","model":5,"permission":"ask"}"#,
+        )
+        .unwrap();
+        let load = load_layers(None).0;
+        assert!(load.settings.is_none() && load.any_present);
+        let issue = load.issues.last().unwrap();
+        assert!(issue.source.ends_with("settings.json"), "{}", issue.source);
+        assert!(
+            issue.error.starts_with("\"model\": invalid type"),
+            "{}",
+            issue.error
+        );
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }
@@ -3436,20 +3583,6 @@ mod tests {
         let _ = fs::remove_dir_all(&user);
         let _ = std::env::set_current_dir(std::env::temp_dir());
         let _ = fs::remove_dir_all(&proj);
-    }
-
-    #[test]
-    fn starter_agents_md_is_created_once() {
-        let d = unique_dir("starter");
-        let p = create_starter_agents_md(&d).unwrap();
-        let text = fs::read_to_string(&p).unwrap();
-        assert!(text.contains("## Build & test") && text.contains("## Do not"));
-        assert!(create_starter_agents_md(&d).is_err());
-        let files = load_instructions_with(&d, &default_instruction_files());
-        // Paths come back canonical (/var is /private/var on macOS).
-        let p = p.canonicalize().unwrap();
-        assert!(files.iter().any(|f| f.path == p));
-        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
