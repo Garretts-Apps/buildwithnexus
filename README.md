@@ -444,15 +444,17 @@ yet; key and credential files are named but never sent. It is read-only in
 every permission mode, prints a `finding` event per issue with `--json`, and
 exits 9 when one is blocking. `/review` takes the same arguments in a session.
 
-**Trusting a repository in CI.** Project hooks, MCP servers and allow rules
-need folder trust, and CI has nobody to answer the prompt. Run
-`buildwithnexus trust --print` in the checkout to see what the project
-settings run and their digest, then pass `--trust-project <digest>` (or set
-`BWN_TRUST_PROJECT`): if the files change, the run stops with exit 2 and
+**Trusting a repository in CI.** Project hooks, MCP servers, allow rules and
+the repository's commands, skills and agents need folder trust, and CI has
+nobody to answer the prompt. Run `buildwithnexus trust --print` in the
+checkout to see what the project settings run, the commands, skills and
+agents it carries, and their digest, then pass `--trust-project <digest>` (or
+set `BWN_TRUST_PROJECT`): if the files change, the run stops with exit 2 and
 names them.
 
 **Custom commands headless.** `bwn run '/deploy staging'` runs a custom command
-or skill with its arguments, as in a session.
+or skill with its arguments, as in a session. A command from the repository
+that is not trusted exits 2 and says how to trust it.
 
 Each `--json` event has a `schema_version` (now `1`). What may change in a
 minor or a patch release (flags, settings keys, events, session files, exit
@@ -647,13 +649,21 @@ warning in a headless run. The prompt asks separately before a project's
 For CI, see *Trusting a repository in CI* under [Headless and CI](#headless-and-ci).
 Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
 `PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
+`PermissionRequest` (where bwn is about to ask you to approve a call),
 `PostToolUse`, `PostResponse`, `OnError`, `Stop` (after every BUILD, PLAN,
-BRAINSTORM, or chat response), and `SubagentStop` (when a `spawn_subagent` call
-returns; its payload carries the subagent's `tool_input`). Each hook command
-receives the event as JSON on stdin with Claude Code's field names:
+BRAINSTORM, or chat response), `SubagentStop` (when a `spawn_subagent` call
+returns; its payload carries the subagent's `tool_input`), `PreCompact` (before
+the conversation is summarized; `trigger` is `auto`, or `manual` for
+`/compact`), and `Notification` (where bwn raises a desktop notification,
+whatever the `notify` setting and window focus; `notification_type` is
+`permission_prompt`, `question`, `done` when a turn ends, or `idle_prompt` when
+the prompt has waited `idle_notify_secs`, default 60, `0` for never). A
+`PreCompact` or `Notification` matcher matches the trigger or the type. Each
+hook receives the event as JSON on stdin with Claude Code's field names:
 `hook_event_name`, `session_id` (the id the transcript is saved under),
 `transcript_path`, `permission_mode` (`ask` | `accept-edits` | `auto` | `readonly`), `cwd`, plus
-the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`).
+the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`,
+`stop_hook_active`, `trigger`, `notification_type`, `message`).
 
 `PreToolUse` can gate a tool: exit code **2** (or a JSON
 `permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
@@ -670,11 +680,42 @@ the failure is shown. Matchers are `*`, an exact tool name, or a
 the bwn tools that do the same thing: `Bash` (`run_command`, `bash`,
 `start_server`), `Edit`, `MultiEdit`, `Write`, `Read`, `Grep`, `Glob`, `LS`,
 `WebFetch`, `WebSearch`, `Task` and `TodoWrite`, so a matcher copied from a
-Claude Code settings file guards the same calls. A `*` or empty matcher does
+Claude Code settings file guards the same calls. `Edit` and `Write` also cover
+`multi_edit`, `remove_path`, `move_path` and `create_dir`, and a matcher
+naming the shell (`Bash`, `run_command`, `bash`) also runs for `check_work`
+and `start_server` calls that carry a command. `tool_input` carries Claude
+Code's field names beside bwn's, with the values the tool will use:
+`file_path` (absolute), `old_string`, `new_string`, `content`, `prompt`,
+`subagent_type`, `glob`, `path` and `todos`. A call that touches several
+files (`move_path`, `read_many_files`) is shown to `PreToolUse` once per
+file, and `PostToolUse` sees a move's destination. A `*` or empty matcher does
 not run on `finish` and `exit_plan`; name them to guard them. A hook under an
 event bwn does not fire, of an unknown `type`, or without its command is
 reported at startup and by `doctor` instead of being ignored. See
 [`examples/settings.json`](./examples/settings.json).
+
+Other events answer as Claude Code's do. What a `PostToolUse` hook says
+reaches the model with the call's result (the call already ran):
+`{"decision": "block", "reason": …}`,
+`{"hookSpecificOutput": {"additionalContext": …}}`, or its stderr with exit 2.
+A `Stop` or `SubagentStop` hook that exits 2 or answers
+`{"decision": "block", "reason": …}` keeps the agent (or the helper) going,
+with the reason as the next message, at most 3 rounds in a row;
+`stop_hook_active` is true while it does. It never sends on a turn you
+stopped, and in PLAN the plan waits for your approval instead.
+`PermissionRequest` may answer for you with
+`{"hookSpecificOutput": {"decision": {"behavior": "allow" | "deny" | "ask", "message": …}}}`
+(or `{"decision": …}`), and exit 2 denies. It also runs in headless runs,
+where nobody could answer the prompt; only your own hooks can allow.
+
+A hook's `type` is `command` (a shell command line), `python` or `script` (a
+file; the interpreter follows the extension), or `http`:
+`{"type": "http", "url": "https://…", "headers": {"Authorization": "…"}}`
+POSTs the payload as JSON through bwn's HTTP client (proxy and certificate
+settings apply) within the hook's `timeout`, following no redirects. The
+response body counts as the hook's output, and a status outside 2xx as a
+failed hook. A host that `network.deny` names is refused. The trust prompt
+shows a project's http hook URLs (header names only).
 
 ```json
 {
@@ -744,8 +785,9 @@ Two layouts are supported, from any of these roots:
 On a name collision a `SKILL.md` folder beats a flat file of the same name,
 and your own skills beat bundled ones. A skill from the project (the `./`
 roots above, a relative `skill_dirs` entry, or any `skill_dirs` entry a
-project settings file adds) never replaces a bundled or user skill: it loads
-as `/project:<name>` instead, with a notice at startup.
+project settings file adds) loads only once you trust the folder (see
+*Project commands, skills and agents* below), and never replaces a bundled or
+user skill: it loads as `/project:<name>` instead, with a notice at startup.
 Set `"project_skills_override": true` in `~/.buildwithnexus/settings.json` to
 let project skills replace them, as before 0.15. Add more roots with the
 `skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
@@ -763,7 +805,7 @@ A `.sh`, `.bash` or `.py` file runs as a command instead, through the same
 hooks and permission gate as `run_command`.
 
 Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
-and, once you trust the folder, from the project's `.buildwithnexus/commands/`
+and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. Skills and commands work headless too:
 `bwn run '/deploy staging'`.
 
@@ -795,11 +837,24 @@ Write tests for the module you are given. Do not change the module itself.
 ```
 
 Agent files load from `~/.buildwithnexus/agents/` and `~/.claude/agents/`,
-and, once you trust the folder, from the project's `.buildwithnexus/agents/`
+and, once you trust them, from the project's `.buildwithnexus/agents/`
 and `.claude/agents/`. A helper that runs isolated in a git worktree shows
 its branch and the merge command when it finishes (a `subagent_result` event
 in `--json` mode), and commits with your git identity. To run a whole session
 on its own branch, start it with `--worktree <name>`.
+
+### Project commands, skills and agents
+
+A repository's command files speak to the model in your name, its skills
+and agents steer it, and a script command runs code, so they stay off until
+you trust them. The folder trust prompt lists each one with its file
+(`command /deploy (.claude/commands/deploy.md)`), also when the repository
+has nothing else to trust, and trusting pins their contents: adding, editing
+or removing one asks again at the next start. Until then a startup notice
+names them and how to trust, and typing one says it is off. A file linked to
+somewhere outside its folder never loads. `buildwithnexus trust --print`
+lists them for CI. Run from your home folder, these folders are your own and
+load as such.
 
 ## MCP servers
 
@@ -850,7 +905,10 @@ connection.
 ```
 
 `buildwithnexus mcp list|<name>|add|remove|reload` mirrors this for scripts
-(`add`/`remove` only edit the settings file; `list` connects). `add` refuses
+(`add`/`remove` only edit the settings file; `list` connects). Everything after
+the server name is the server's own command line, so `buildwithnexus mcp add fs
+npx -y some-server --json` keeps `-y` and `--json` for the server; a `--` before
+the command, as Claude Code writes it, is accepted. `add` refuses
 to replace a server that already has that name (exit 1) unless you pass
 `--force`. `/doctor` and
 `buildwithnexus doctor` connect to every configured server and report the

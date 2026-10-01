@@ -1319,6 +1319,11 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
                 timeout = Some(t);
                 i += 2;
             }
+            // Claude Code's form: `mcp add <name> -- <command> [args...]`.
+            "--" => {
+                i += 1;
+                break;
+            }
             _ => break,
         }
     }
@@ -2197,6 +2202,12 @@ mod tests {
         assert_eq!(
             entry,
             json!({"type": "http", "url": "https://h/mcp", "headers": {"Authorization": "Bearer a=b"}, "timeout_secs": 7})
+        );
+        // Claude Code's `--` before the command is accepted, once.
+        let (_, entry) = parse_add(&s(&["fs", "--", "npx", "-y", "--", "p"])).unwrap();
+        assert_eq!(
+            entry,
+            json!({"type": "stdio", "command": "npx", "args": ["-y", "--", "p"]})
         );
         let (_, entry) = parse_add(&s(&["e", "--env", "TOKEN=x", "cmd"])).unwrap();
         assert_eq!(

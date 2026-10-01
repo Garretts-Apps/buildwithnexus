@@ -195,7 +195,9 @@ shows whether a given file is signed.
   `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
   the agent fetches when the model uses the web tools (each new host,
   including the search host, needs the user's approval outside `auto` mode);
-  MCP servers the user configures; and a daily `registry.npmjs.org` version
+  MCP servers the user configures; the URLs of `http` hooks the user
+  configures (a project's only once the folder is trusted; `network.deny`
+  applies); and a daily `registry.npmjs.org` version
   check unless `auto_update` is `"off"` (`BWN_UPDATE_REGISTRY` or
   `npm_config_registry` points it at a mirror). There is no telemetry or
   analytics. All of these go through the proxy named by `HTTPS_PROXY`,

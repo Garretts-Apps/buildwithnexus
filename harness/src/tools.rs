@@ -1661,8 +1661,20 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
 }
 
 // `scheme://[user@]host[:port]/…` → `host[:port]`, lowercased. The port
-// stays: approving a dev server on :3000 must not approve :2375.
+// stays: approving a dev server on :3000 must not approve :2375. The host
+// is the one the request reaches: percent-escapes decoded and a trailing
+// dot dropped, as the HTTP client and DNS treat them, so a rule naming the
+// host cannot be stepped around by spelling it differently.
 fn url_authority(url: &str) -> Option<String> {
+    if let Ok(u) = url::Url::parse(url) {
+        if let Some(host) = u.host_str().filter(|h| !h.is_empty()) {
+            let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+            return Some(match u.port() {
+                Some(p) => format!("{host}:{p}"),
+                None => host,
+            });
+        }
+    }
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#', '\\']).next()?;
     let host = authority.rsplit('@').next()?.to_ascii_lowercase();
@@ -1863,7 +1875,7 @@ pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
         | "str_replace_editor"
         | "text_editor_20241022"
         | "text_editor_20250124" => Some(resolve(cwd, path_arg(input).unwrap_or(""))),
-        "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or(""))),
+        "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or("").trim())),
         "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
             Some(resolve(cwd, root_arg(input)))
         }
@@ -1886,13 +1898,181 @@ pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
                     .collect()
             })
             .unwrap_or_default(),
+        // The paths move_path itself uses, trimmed as it trims them.
         "move_path" => ["from", "to"]
             .iter()
             .filter_map(|k| input[*k].as_str())
-            .map(|p| resolve(cwd, p))
+            .map(|p| resolve(cwd, p.trim()))
             .collect(),
+        // `git apply` reads the patch's paths from the top of the work tree
+        // (from the folder itself outside one).
+        "patch" | "apply_patch" => {
+            let base = git_top(cwd);
+            patch_files(input["patch"].as_str().unwrap_or(""))
+                .into_iter()
+                .map(|p| resolve(&base, &p))
+                .collect()
+        }
         _ => touched_path(name, input, cwd).into_iter().collect(),
     }
+}
+
+// The work tree `cwd` is in (the nearest folder up holding `.git`), else
+// `cwd` itself.
+fn git_top(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// The files a unified diff names, as `git apply` reads them: both sides of
+/// each `---`/`+++` header and of `diff --git`, with the leading component
+/// (`a/`, `b/`) removed, plus rename and copy lines; `/dev/null` is left
+/// out. Hunk bodies are skipped by their line counts, so a removed line
+/// that reads `--- x` is never taken for a header.
+pub fn patch_files(patch: &str) -> Vec<String> {
+    // git's C-style quoting of unusual names: "a/x\ty".
+    fn unquote(s: &str) -> String {
+        let Some(inner) = s
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .filter(|_| s.len() >= 2)
+        else {
+            return s.to_string();
+        };
+        let b = inner.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\\' || i + 1 >= b.len() {
+                out.push(b[i]);
+                i += 1;
+                continue;
+            }
+            let c = b[i + 1];
+            i += 2;
+            match c {
+                b'0'..=b'7' => {
+                    let mut v = u32::from(c - b'0');
+                    for _ in 0..2 {
+                        if i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                            v = v * 8 + u32::from(b[i] - b'0');
+                            i += 1;
+                        }
+                    }
+                    out.push(v as u8);
+                }
+                b'a' => out.push(7),
+                b'b' => out.push(8),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'v' => out.push(11),
+                b'f' => out.push(12),
+                b'r' => out.push(b'\r'),
+                other => out.push(other),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    // A quoted name at the start of `s` (closing quote not escaped) and
+    // what follows it.
+    fn quoted(s: &str) -> Option<(String, &str)> {
+        let b = s.as_bytes();
+        if b.first() != Some(&b'"') {
+            return None;
+        }
+        let mut i = 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Some((unquote(&s[..=i]), &s[i + 1..])),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+    // A header name: quoted, or up to a tab (a timestamp may follow).
+    fn header_name(rest: &str) -> String {
+        let rest = rest.trim_end_matches('\r');
+        match quoted(rest) {
+            Some((name, _)) => name,
+            None => rest.split('\t').next().unwrap_or("").trim_end().to_string(),
+        }
+    }
+    // git apply's default -p1: drop everything up to the first `/`.
+    fn strip_one(name: &str) -> Option<String> {
+        if name.is_empty() || name == "/dev/null" {
+            return None;
+        }
+        Some(name.split_once('/').map_or(name, |(_, r)| r).to_string())
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: Option<String>| {
+        if let Some(p) = p.filter(|p| !p.is_empty()) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    };
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    for line in patch.lines() {
+        if old_left > 0 || new_left > 0 {
+            match line.as_bytes().first() {
+                Some(b'-') => old_left = old_left.saturating_sub(1),
+                Some(b'+') => new_left = new_left.saturating_sub(1),
+                Some(b'\\') => {}
+                _ => {
+                    old_left = old_left.saturating_sub(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("@@ -") {
+            // @@ -l[,n] +l[,n] @@
+            let count = |r: &str| -> usize {
+                let r = r.split_whitespace().next().unwrap_or("");
+                r.split_once(',')
+                    .map_or(Some(1), |(_, n)| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            old_left = count(h);
+            new_left = h.split_once(" +").map_or(0, |(_, r)| count(r));
+        } else if let Some(r) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        {
+            push(strip_one(&header_name(r)));
+        } else if let Some(r) = ["rename from ", "rename to ", "copy from ", "copy to "]
+            .iter()
+            .find_map(|p| line.strip_prefix(p))
+        {
+            push(Some(header_name(r)));
+        } else if let Some(r) = line.strip_prefix("diff --git ") {
+            let r = r.trim_end_matches('\r');
+            if let Some((first, rest)) = quoted(r) {
+                push(strip_one(&first));
+                push(strip_one(&header_name(rest.trim_start())));
+            } else {
+                // `a/<name> b/<name>`: the split where both halves agree,
+                // else the only one there is.
+                let splits: Vec<usize> = r.match_indices(" b/").map(|(i, _)| i).collect();
+                let agreed = splits
+                    .iter()
+                    .find(|&&i| r.get(..i).and_then(strip_one) == strip_one(&r[i + 1..]));
+                if let Some(&i) = agreed.or(if splits.len() == 1 {
+                    splits.first()
+                } else {
+                    None
+                }) {
+                    push(strip_one(&r[..i]));
+                    push(strip_one(r[i + 1..].trim_end()));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn command_arg_for<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
@@ -2785,12 +2965,13 @@ pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<Path
         | "str_replace_editor"
         | "text_editor_20241022"
         | "text_editor_20250124" => touched_path(name, input, cwd)?,
+        // Trimmed, as move_path trims them before it moves anything.
         "move_path" => {
-            let from = resolve(cwd, input["from"].as_str().unwrap_or(""));
+            let from = resolve(cwd, input["from"].as_str().unwrap_or("").trim());
             if escapes_cwd(&from, cwd) {
                 return Some(from);
             }
-            resolve(cwd, input["to"].as_str().unwrap_or(""))
+            resolve(cwd, input["to"].as_str().unwrap_or("").trim())
         }
         _ => return None,
     };
@@ -9135,6 +9316,37 @@ print("hello " + data.get("name", "world"))
     }
 
     #[test]
+    fn a_patch_names_every_file_it_touches() {
+        let edit = "diff --git a/src/x.rs b/src/x.rs\nindex 1..2 100644\n--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n";
+        assert_eq!(patch_files(edit), ["src/x.rs"]);
+        // A hunk line that reads like a header is content, not a file.
+        let tricky = "--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1 @@\n--- a/.env\n-+++ b/.env\n";
+        assert_eq!(patch_files(tricky), ["q.sql"]);
+        let created =
+            "--- /dev/null\n+++ b/.git/hooks/pre-commit\t2024-01-01 00:00\n@@ -0,0 +1 @@\n+echo\n";
+        assert_eq!(patch_files(created), [".git/hooks/pre-commit"]);
+        let renamed = "diff --git a/old name.txt b/new.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new.txt\n";
+        assert_eq!(patch_files(renamed), ["old name.txt", "new.txt"]);
+        // An empty new file has no ---/+++ lines; diff --git names it.
+        let empty = "diff --git a/e b/e\nnew file mode 100644\nindex 0000000..e69de29\n";
+        assert_eq!(patch_files(empty), ["e"]);
+        let q = "diff --git \"a/t\\tab\" \"b/t\\tab\"\n--- \"a/t\\tab\"\n+++ \"b/t\\tab\"\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(patch_files(q), ["t\tab"]);
+        let two =
+            "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-1\n+2\n--- a/two\n+++ b/two\n@@ -3,0 +4 @@\n+x\n";
+        assert_eq!(patch_files(two), ["one", "two"]);
+        // git apply reads the names from the top of the work tree.
+        let d = tempdir();
+        fs::create_dir_all(d.join(".git")).unwrap();
+        fs::create_dir_all(d.join("sub")).unwrap();
+        let input = json!({"patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-a\n+b\n"});
+        let paths = touched_paths("apply_patch", &input, &d.join("sub"));
+        assert_eq!(paths, [d.join(".env")]);
+        assert!(paths.iter().any(|p| is_sensitive(p)));
+        assert_eq!(touched_paths("patch", &input, &d), [d.join(".env")]);
+    }
+
+    #[test]
     fn touched_paths_covers_every_read_many_files_path() {
         let cwd = Path::new("/w");
         let input = json!({"paths": ["a.txt", "/home/u/.ssh/id_rsa"]});
@@ -9554,6 +9766,16 @@ print("hello " + data.get("name", "world"))
             cwd
         )
         .is_some());
+        // move_path trims its ends: a leading space is no way out.
+        for input in [
+            json!({"from": "a.txt", "to": " ../b.txt"}),
+            json!({"from": " /etc/hosts", "to": "b.txt"}),
+        ] {
+            assert!(
+                out_of_cwd_mutation("move_path", &input, cwd).is_some(),
+                "{input}"
+            );
+        }
         assert!(out_of_cwd_mutation(
             "str_replace_editor",
             &json!({"command": "view", "path": "/etc/hosts"}),

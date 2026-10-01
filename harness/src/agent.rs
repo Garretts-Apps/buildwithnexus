@@ -313,6 +313,8 @@ fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     if tail_start <= sys_end {
         return;
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    hooks::pre_compact("auto", "", &cwd);
     report::info("  ⟳ compacting context…");
     let taken = std::mem::take(msgs);
     *msgs = compact_within(taken, budget, |middle| model_summary(p, middle));
@@ -1407,7 +1409,10 @@ fn answer_with(
     default: &str,
     ask: impl FnOnce(&str) -> Option<String>,
 ) -> (String, bool) {
-    needs_you(&format!("question: {}", trace::preview(question, 120)));
+    needs_you(
+        "question",
+        &format!("question: {}", trace::preview(question, 120)),
+    );
     // Render the question on its own transcript line, then read the answer with
     // a SINGLE-LINE composer prompt. A multi-line prompt string mis-positions
     // the alt-screen composer cursor (prompt_width counts across the newline),
@@ -1970,6 +1975,7 @@ fn set_turn_stopped(stopped: bool) {
 // loops before their next request (it is cleared when the next turn starts).
 fn stop_turn() {
     set_turn_stopped(true);
+    STOPPED_EARLY.with(|u| u.set(true));
     tui::trigger_interrupt(tui::InterruptKind::Escape);
 }
 
@@ -1988,15 +1994,34 @@ thread_local! {
 }
 
 // A desktop notification that the session is waiting on the user (an
-// approval or a question). tui::notify only fires in the interactive UI and,
-// with the default `notify: auto`, only while the terminal is unfocused.
-fn needs_you(what: &str) {
+// approval or a question), and the Notification hook of that `kind`.
+// tui::notify only fires in the interactive UI and, with the default
+// `notify: auto`, only while the terminal is unfocused; the hook always does.
+fn needs_you(kind: &str, what: &str) {
     #[cfg(test)]
     {
         NOTIFIED.with(|n| n.borrow_mut().push(what.to_string()));
     }
     #[cfg(not(test))]
     tui::notify("buildwithnexus", what);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    hooks::notification(kind, what, &cwd);
+}
+
+// The gate is about to ask about this call: PermissionRequest hooks may
+// answer first (allow, deny, or ask as usual), then the prompt.
+fn confirm_call(
+    name: &str,
+    input: &serde_json::Value,
+    label: &str,
+    tool_key: &str,
+    cwd: &Path,
+) -> Option<String> {
+    match hooks::permission_request(name, input, label, cwd) {
+        PreDecision::Allow => None,
+        PreDecision::Deny(r) => Some(r),
+        PreDecision::Continue => confirm_tool(label, tool_key, cwd),
+    }
 }
 
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
@@ -2016,7 +2041,10 @@ fn confirm_with(
     cwd: &Path,
     ask: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
-    needs_you(&format!("approval needed: {}", trace::preview(label, 120)));
+    needs_you(
+        "permission_prompt",
+        &format!("approval needed: {}", trace::preview(label, 120)),
+    );
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
     tui::line(&format!(
@@ -2140,14 +2168,18 @@ pub(crate) fn gate(
 
     let paths = tools::touched_paths(name, input, cwd);
     if let Some(p) = paths.iter().find(|p| tools::is_sensitive(p)) {
-        return confirm_tool(
+        return confirm_call(
+            name,
+            input,
             &format!("access sensitive path {}", p.display()),
             &tool_key,
             cwd,
         );
     }
     if let Some(p) = any_cmd.and_then(|c| tools::command_sensitive_path(c, cwd)) {
-        return confirm_tool(
+        return confirm_call(
+            name,
+            input,
             &format!("command touches sensitive path {}", p.display()),
             &tool_key,
             cwd,
@@ -2157,7 +2189,9 @@ pub(crate) fn gate(
     // crosses the OS boundary — always confirm, even in Auto mode.
     if let Some(p) = paths.first() {
         if tools::is_mutating_call(name, input) && tools::is_wsl_windows_mount(p) {
-            return confirm_tool(
+            return confirm_call(
+                name,
+                input,
                 &format!(
                     "write to Windows filesystem {} (WSL2 boundary)",
                     p.display()
@@ -2169,12 +2203,20 @@ pub(crate) fn gate(
     }
     if let Some(c) = any_cmd {
         if tools::catastrophic(c) {
-            return confirm_tool(&format!("run dangerous command `{c}`"), &tool_key, cwd);
+            return confirm_call(
+                name,
+                input,
+                &format!("run dangerous command `{c}`"),
+                &tool_key,
+                cwd,
+            );
         }
         // In WSL2, commands that reference /mnt/<drive>/ target the Windows
         // filesystem — confirm before running, even in Auto mode.
         if tools::is_wsl() && tools::command_touches_wsl_mount(c) {
-            return confirm_tool(
+            return confirm_call(
+                name,
+                input,
                 &format!("command targets Windows filesystem (WSL2): `{c}`"),
                 &tool_key,
                 cwd,
@@ -2185,7 +2227,9 @@ pub(crate) fn gate(
     // Ask rules prompt in every mode, even when an allow rule, a saved
     // approval or auto would let the call through.
     if let Some(r) = rule_for(&rules, config::RuleEffect::Ask, name, input, cwd, host_ref) {
-        return confirm_tool(
+        return confirm_call(
+            name,
+            input,
             &format!(
                 "{} — asks because of {}",
                 tools::approval_label(name, input),
@@ -2216,7 +2260,9 @@ pub(crate) fn gate(
         if is_pre_approved(None, &tool_key, cwd) || is_pre_approved(None, "fetch *", cwd) {
             return None;
         }
-        return confirm_tool(
+        return confirm_call(
+            name,
+            input,
             &format!(
                 "network access to {h} — {}",
                 tools::approval_label(name, input)
@@ -2255,7 +2301,7 @@ pub(crate) fn gate(
                 if let Some(note) = checkpoint::undo_note(&paths) {
                     label = format!("{label} · {note}");
                 }
-                return confirm_tool(&label, &tool_key, cwd);
+                return confirm_call(name, input, &label, &tool_key, cwd);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.
@@ -2468,6 +2514,15 @@ fn denied_by_rule(
     ))
 }
 
+/// The refusal for a request bwn makes on its own behalf (an http hook) to
+/// `host`, when network.deny names it.
+pub(crate) fn network_denied(cwd: &Path, host: &str) -> Option<String> {
+    config::policy_rules(cwd)
+        .iter()
+        .find(|r| r.network && r.effect == config::RuleEffect::Deny && host_matches(&r.rule, host))
+        .map(|r| format!("denied by {}", rule_label(r)))
+}
+
 /// How a rule names itself in a refusal: `rule run_command(git push*)
 /// (user settings)`, or `network.deny in user settings`.
 pub fn rule_label(r: &config::PolicyRule) -> String {
@@ -2544,6 +2599,15 @@ pub fn ignored_approvals_notice(cwd: &Path) -> Option<String> {
     ))
 }
 
+// PostToolUse hooks for a call that ran; what they tell the model is added
+// to its result.
+fn post_tool_hooks(name: &str, input: &serde_json::Value, out: &mut tools::Outcome, cwd: &Path) {
+    if let Some(said) = hooks::post_tool_use(name, input, &out.content, out.is_error, cwd) {
+        out.content.push_str("\n\n");
+        out.content.push_str(&said);
+    }
+}
+
 /// Run the PreToolUse hook, then the gate. A hook may deny anything, but it
 /// may only allow outside read-only mode: in PLAN, BRAINSTORM or a readonly
 /// session the ReadOnly gate always runs after it.
@@ -2556,6 +2620,19 @@ pub(crate) fn hook_gate(
     // The user stopped this turn at a prompt: run nothing else in it.
     if turn_stopped(false) {
         return Some("not run: the user stopped this turn".into());
+    }
+    // The legacy mcp_call reaches the same tools as `mcp__<server>__<tool>`:
+    // hooks and rules naming that tool see it under that name.
+    if name == "mcp_call" {
+        let server = input["server"].as_str().unwrap_or("");
+        let tool = input["tool"].as_str().unwrap_or("");
+        if !server.is_empty() && !tool.is_empty() {
+            let args = match &input["arguments"] {
+                serde_json::Value::Null => serde_json::json!({}),
+                a => a.clone(),
+            };
+            return hook_gate(perm, &crate::mcp::mangle(server, tool), &args, cwd);
+        }
     }
     gate_after_hook(
         hooks::pre_tool_use(name, input, cwd),
@@ -2677,14 +2754,89 @@ pub fn run_build_session_with_images(
         transcript,
         Some(sid),
         images,
+    );
+    let r = after_stop_hooks(
+        "Stop",
+        cwd,
+        |_| serde_json::json!({}),
+        r,
+        |reason| {
+            CONTINUING.with(|c| c.set(true));
+            build_turn(
+                p,
+                perm,
+                role_id,
+                reason,
+                cwd,
+                0,
+                transcript,
+                Some(sid),
+                Vec::new(),
+            )
+        },
     )
     .map(|_| ());
     // What the turn left each file as, so /undo can tell a later hand edit,
     // and which changes no checkpoint covers.
     checkpoint::end_turn(cwd);
-    hooks::notify("Stop", cwd);
+    turn_done(cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
+}
+
+// A Stop or SubagentStop hook may send the agent on (it exits 2, or answers
+// {"decision": "block", "reason": …}): its reason is the next user message.
+// At most this many rounds in a row, so a hook that always objects cannot
+// keep a turn going forever.
+const MAX_STOP_HOOK_ROUNDS: usize = 3;
+
+thread_local! {
+    // Set just before a Stop hook's reason starts the next round of a turn
+    // (taken by build_turn).
+    static CONTINUING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The last turn was stopped before it finished, by the user (Esc,
+    // Ctrl+C, a cancelled prompt) or a UserPromptSubmit hook; no Stop hook
+    // sends it on.
+    static STOPPED_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Runs `event`'s hooks after the reply `r` and, while one asks to go on and
+// the turn ended normally, `more` with its reason (the next round's reply).
+// `fields` adds the event's payload fields for a reply.
+fn after_stop_hooks(
+    event: &str,
+    cwd: &Path,
+    fields: impl Fn(&Result<String, String>) -> serde_json::Value,
+    mut r: Result<String, String>,
+    mut more: impl FnMut(&str) -> Result<String, String>,
+) -> Result<String, String> {
+    for round in 0..=MAX_STOP_HOOK_ROUNDS {
+        let mut payload = fields(&r);
+        payload["stop_hook_active"] = serde_json::json!(round > 0);
+        let Some(reason) = hooks::stop(event, cwd, payload) else {
+            break;
+        };
+        if r.is_err() || STOPPED_EARLY.with(|u| u.get()) || crate::usage::budget_stop().is_some() {
+            break;
+        }
+        if round == MAX_STOP_HOOK_ROUNDS {
+            report::notice(&format!(
+                "  ⚠ {event} hook still asks to continue after {MAX_STOP_HOOK_ROUNDS} rounds — stopping here"
+            ));
+            break;
+        }
+        report::notice(&format!(
+            "  ⟳ {event} hook: {}",
+            tui::sanitize_terminal(&trace::preview(&reason, 160))
+        ));
+        r = more(&reason);
+    }
+    r
+}
+
+// The Notification hook for a finished turn.
+fn turn_done(cwd: &Path) {
+    hooks::notification("done", "done — ready for your next prompt", cwd);
 }
 
 struct AgentRunningGuard;
@@ -2692,6 +2844,7 @@ struct AgentRunningGuard;
 impl AgentRunningGuard {
     fn new() -> Self {
         set_turn_stopped(false);
+        STOPPED_EARLY.with(|u| u.set(false));
         tui::set_agent_running(true);
         Self
     }
@@ -2782,14 +2935,19 @@ fn build_turn(
     images: Vec<(String, String)>,
 ) -> Result<String, String> {
     let _running_guard = (depth == 0).then(AgentRunningGuard::new);
+    // A Stop hook's reason goes on with the same turn: it is not a prompt
+    // the user submitted, and /undo still covers the whole turn.
+    let continuing = CONTINUING.with(|c| c.replace(false));
     // Top-level runs mark a turn boundary so bare /undo can revert exactly
     // this run's writes; subagent recursion must not shrink that window.
-    if depth == 0 {
+    if depth == 0 && !continuing {
         checkpoint::mark_turn_start();
     }
     let task = match hooks::user_prompt_submit(task, cwd) {
+        _ if continuing => task.to_string(),
         Err(reason) => {
             report::error(&format!("blocked by hook: {reason}"));
+            STOPPED_EARLY.with(|u| u.set(true));
             if depth == 0 {
                 stopped_short(Outcome::HookBlocked);
             }
@@ -2865,12 +3023,7 @@ fn build_turn(
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
-            let kind = tui::consume_interrupt();
-            let msg = match kind {
-                tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
-                _ => "  ⚠ interrupted",
-            };
-            report::notice(msg);
+            report::notice(take_interrupt());
             return Ok(String::new());
         }
         if budget_exhausted() {
@@ -2887,12 +3040,7 @@ fn build_turn(
             Err(e) => {
                 let lower = e.to_ascii_lowercase();
                 if lower.contains("interrupted") {
-                    let kind = tui::consume_interrupt();
-                    let msg = match kind {
-                        tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
-                        _ => "  ⚠ interrupted",
-                    };
-                    report::notice(msg);
+                    report::notice(take_interrupt());
                     return Ok(String::new());
                 }
                 // A context-overflow rejection is recoverable: force-compact the
@@ -2901,6 +3049,7 @@ fn build_turn(
                     && (lower.contains("prompt is too long") || lower.contains("context length"))
                 {
                     forced_compact_retry = true;
+                    hooks::pre_compact("auto", "", cwd);
                     report::notice("  ⟳ context overflow — force-compacting and retrying…");
                     let taken = std::mem::take(msgs);
                     *msgs = compact_within(taken, compaction_budget(p), |middle| {
@@ -3030,8 +3179,8 @@ fn build_turn(
                 }
                 report::tool_call("write_file", &tools::preview("write_file", &input), &input);
                 trace_tool_call("write_file", &input, "build", depth);
-                let out = tools::run("write_file", &input, cwd);
-                hooks::post_tool_use("write_file", &input, &out.content, out.is_error, cwd);
+                let mut out = tools::run("write_file", &input, cwd);
+                post_tool_hooks("write_file", &input, &mut out, cwd);
                 report::tool_result("write_file", &out.content, out.is_error);
                 trace_tool_result("write_file", &out.content, out.is_error, "build", depth);
                 if out.is_error {
@@ -3064,8 +3213,8 @@ fn build_turn(
                 }
                 report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
                 trace_tool_call("Artifact", &input, "build", depth);
-                let out = tools::run("Artifact", &input, cwd);
-                hooks::post_tool_use("Artifact", &input, &out.content, out.is_error, cwd);
+                let mut out = tools::run("Artifact", &input, cwd);
+                post_tool_hooks("Artifact", &input, &mut out, cwd);
                 report::tool_result("Artifact", &out.content, out.is_error);
                 trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
                 if out.is_error {
@@ -3299,8 +3448,8 @@ fn build_turn(
             if tools::is_mutating_call(&call.name, &call_input) {
                 mutating_tool_ran = true;
             }
-            let out = tools::run(&call.name, &call_input, cwd);
-            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            let mut out = tools::run(&call.name, &call_input, cwd);
+            post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             if out.is_error {
                 hooks::notify("OnError", cwd);
                 if call_could_not_run(&call.name, &call_input, &defs) {
@@ -3423,7 +3572,7 @@ fn build_turn(
                 // round is the harness's own step, so a refusal for want of a
                 // terminal is not one of the run's blocked changes.
                 let blocked_before = BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed);
-                let out = match hook_gate(perm, "check_work", &input, cwd) {
+                let mut out = match hook_gate(perm, "check_work", &input, cwd) {
                     Some(reason) => {
                         let no_terminal =
                             BLOCKED_WITHOUT_TERMINAL.load(Ordering::Relaxed) > blocked_before;
@@ -3439,8 +3588,8 @@ fn build_turn(
                     }
                     None => Some(tools::run("check_work", &input, cwd)),
                 };
-                if let Some(out) = &out {
-                    hooks::post_tool_use("check_work", &input, &out.content, out.is_error, cwd);
+                if let Some(out) = &mut out {
+                    post_tool_hooks("check_work", &input, out, cwd);
                     report::tool_result("check_work", &out.content, out.is_error);
                     trace_tool_result("check_work", &out.content, out.is_error, "build", depth);
                 }
@@ -3763,8 +3912,28 @@ pub fn run_review(
         Some(sid),
         Vec::new(),
     );
+    let r = after_stop_hooks(
+        "Stop",
+        cwd,
+        |_| serde_json::json!({}),
+        r,
+        |reason| {
+            CONTINUING.with(|c| c.set(true));
+            build_turn(
+                p,
+                Permission::ReadOnly,
+                "researcher",
+                reason,
+                cwd,
+                0,
+                transcript,
+                Some(sid),
+                Vec::new(),
+            )
+        },
+    );
     REVIEWING.store(false, Ordering::Relaxed);
-    hooks::notify("Stop", cwd);
+    turn_done(cwd);
     crate::session::save(sid, cwd, &p.model, transcript);
     r
 }
@@ -3925,6 +4094,28 @@ fn spawn_subagent(
     let mut child: Vec<Msg> = Vec::new();
     set_active_agent(depth + 1, custom);
     let outcome = build_inner(p, perm, role, task, &run_cwd, depth + 1, &mut child, None);
+    // SubagentStop carries the call and what the helper answered; a hook
+    // may send the helper on, as Stop does for the turn.
+    let outcome = after_stop_hooks(
+        "SubagentStop",
+        cwd,
+        |r| {
+            let (content, is_error) = match r {
+                Ok(t) => (t.clone(), false),
+                Err(e) => (format!("subagent error: {e}"), true),
+            };
+            serde_json::json!({
+                "tool_name": "spawn_subagent",
+                "tool_input": input,
+                "tool_response": {"content": content, "is_error": is_error},
+            })
+        },
+        outcome,
+        |reason| {
+            CONTINUING.with(|c| c.set(true));
+            build_inner(p, perm, role, reason, &run_cwd, depth + 1, &mut child, None)
+        },
+    );
     set_active_agent(depth + 1, None);
     let (result, is_error) = match outcome {
         Ok(r) => (r, false),
@@ -3938,15 +4129,6 @@ fn spawn_subagent(
         }
         None => result,
     };
-    hooks::notify_with(
-        "SubagentStop",
-        cwd,
-        serde_json::json!({
-            "tool_name": "spawn_subagent",
-            "tool_input": input,
-            "tool_response": {"content": result, "is_error": is_error},
-        }),
-    );
     trace::record_visible(
         "subagent_done",
         format!("{role}: {}", trace::preview(task, 80)),
@@ -4687,8 +4869,12 @@ pub fn plan_turn(
     msgs.push(user_msg(task.into(), images.clone()));
     let drafted = draft_plan(p, cwd, task, &mut msgs)?;
 
-    // The planning response is complete (a plan, or a natural reply).
-    hooks::notify("Stop", cwd);
+    // The planning response is complete (a plan, or a natural reply). A plan
+    // waits for the user's approval, so a Stop hook cannot send it on.
+    if hooks::stop("Stop", cwd, serde_json::json!({"stop_hook_active": false})).is_some() {
+        report::info("  (a Stop hook asked to continue; a plan waits for your approval instead)");
+    }
+    turn_done(cwd);
     let plan_text = match drafted {
         Draft::Plan(text) => text,
         Draft::Answer(text) => {
@@ -5163,12 +5349,18 @@ fn interrupted_turn(e: &str) -> bool {
     if !e.contains("interrupted") {
         return false;
     }
-    let msg = match tui::consume_interrupt() {
+    report::notice(take_interrupt());
+    true
+}
+
+// Takes the user's interrupt (Esc, Ctrl+C) and says so; a Stop hook will
+// not send this turn on.
+fn take_interrupt() -> &'static str {
+    STOPPED_EARLY.with(|u| u.set(true));
+    match tui::consume_interrupt() {
         tui::InterruptKind::CtrlC => "  ⚠ interrupted (queue cleared)",
         _ => "  ⚠ interrupted",
-    };
-    report::notice(msg);
-    true
+    }
 }
 
 // ── BRAINSTORM mode ───────────────────────────────────────────────────────────
@@ -5230,7 +5422,21 @@ pub fn brainstorm_turn(
         drop_refused_message(p, msgs);
     }
     // The reply is complete — the agent stopped responding for this turn.
-    hooks::notify("Stop", cwd);
+    let r = after_stop_hooks(
+        "Stop",
+        cwd,
+        |_| serde_json::json!({}),
+        r,
+        |reason| {
+            msgs.push(Msg::User(reason.to_string()));
+            let r = brainstorm_reply(p, cwd, reason, msgs);
+            if r.is_err() {
+                drop_refused_message(p, msgs);
+            }
+            r
+        },
+    );
+    turn_done(cwd);
     crate::session::save(sid, cwd, &p.model, msgs);
     drop(running);
     let reply_text = match r {
@@ -5403,8 +5609,8 @@ fn brainstorm_reply(
                     continue;
                 }
             }
-            let out = tools::run(&call.name, &call_input, cwd);
-            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            let mut out = tools::run(&call.name, &call_input, cwd);
+            post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
             note_loop_result(
@@ -5500,7 +5706,22 @@ pub fn run_chat_turn(
     if r.is_err() {
         drop_refused_message(p, msgs);
     }
-    hooks::notify("Stop", cwd);
+    let r = after_stop_hooks(
+        "Stop",
+        cwd,
+        |_| serde_json::json!({}),
+        r.map(|()| String::new()),
+        |reason| {
+            msgs.push(Msg::User(reason.to_string()));
+            let r = chat_reply(p, perm, cwd, reason, msgs);
+            if r.is_err() {
+                drop_refused_message(p, msgs);
+            }
+            r.map(|()| String::new())
+        },
+    )
+    .map(|_| ());
+    turn_done(cwd);
     crate::session::save(sid, cwd, &p.model, msgs);
     match r {
         Err(e) if interrupted_turn(&e) => Ok(()),
@@ -5652,8 +5873,8 @@ fn chat_rounds(
                 continue;
             }
 
-            let out = tools::run(&call.name, &call_input, cwd);
-            hooks::post_tool_use(&call.name, &call_input, &out.content, out.is_error, cwd);
+            let mut out = tools::run(&call.name, &call_input, cwd);
+            post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "chat", tool_round);
             note_loop_result(
@@ -6615,6 +6836,39 @@ mod tests {
             cwd,
         );
         assert!(r.is_some());
+    }
+
+    #[test]
+    fn gate_auto_confirms_a_move_onto_a_sensitive_path_with_spaces() {
+        // move_path trims its ends, so the check must see the trimmed path.
+        let cwd = Path::new("/proj");
+        for input in [
+            json!({"from": "a", "to": ".env "}),
+            json!({"from": " .env", "to": "b"}),
+        ] {
+            let r = gate(Permission::Auto, "move_path", &input, cwd);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("sensitive")),
+                "{input}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_is_checked_for_each_file_it_changes() {
+        let cwd = Path::new("/proj");
+        let env = json!({"patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-A=1\n+A=2\n"});
+        let r = gate(Permission::Auto, "apply_patch", &env, cwd);
+        assert!(
+            r.as_deref().is_some_and(|r| r.contains("sensitive")),
+            "{r:?}"
+        );
+        // accept-edits lets a patch inside the project through, never one
+        // into .git.
+        let git =
+            json!({"patch": "--- /dev/null\n+++ b/.git/hooks/pre-commit\n@@ -0,0 +1 @@\n+x\n"});
+        let r = gate(Permission::AcceptEdits, "apply_patch", &git, cwd);
+        assert!(r.is_some(), "{r:?}");
     }
 
     #[test]
@@ -8290,11 +8544,100 @@ mod tests {
                 Some("denied by network.deny in user settings")
             );
         }
+        // The host the request reaches, however the URL spells it.
+        for url in [
+            "https://lite.duckduckgo.com./",
+            "https://%6Cite.duckduckgo.com/",
+            "https://LITE.duckduckgo.com:443/",
+        ] {
+            assert_eq!(
+                gate(Permission::Auto, "fetch_url", &json!({"url": url}), &proj).as_deref(),
+                Some("denied by network.deny in user settings"),
+                "{url}"
+            );
+            assert!(
+                network_denied(
+                    &proj,
+                    &tools::network_host("fetch_url", &json!({"url": url})).unwrap()
+                )
+                .is_some(),
+                "{url}"
+            );
+        }
         let fetch = json!({"url": "https://docs.example.com:8443/x"});
         assert_eq!(gate(Permission::Ask, "fetch_url", &fetch, &proj), None);
         assert_eq!(gate(Permission::ReadOnly, "fetch_url", &fetch, &proj), None);
         let other = json!({"url": "https://example.org/"});
         assert!(gate(Permission::Ask, "fetch_url", &other, &proj).is_some());
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn mcp_call_is_checked_as_the_tool_it_calls() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "mcp-call",
+            json!({"permissions": {"deny": ["mcp__fake__echo"]}}),
+        );
+        let call = json!({"server": "fake", "tool": "echo", "arguments": {"text": "x"}});
+        let r = hook_gate(Permission::Auto, "mcp_call", &call, &proj);
+        assert!(
+            r.as_deref().is_some_and(|r| r.contains("denied by rule")),
+            "{r:?}"
+        );
+        let other = json!({"server": "fake", "tool": "add", "arguments": {}});
+        assert_eq!(hook_gate(Permission::Auto, "mcp_call", &other, &proj), None);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_edit_rule_covers_removing_moving_and_creating_folders() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "edit-rule",
+            json!({"permissions": {"deny": ["Edit(protected/**)", "Write(protected/**)"]}}),
+        );
+        for (name, input) in [
+            ("remove_path", json!({"path": "protected/a.txt"})),
+            (
+                "move_path",
+                json!({"from": "protected/a.txt", "to": "b.txt"}),
+            ),
+            (
+                "move_path",
+                json!({"from": "b.txt", "to": "protected/b.txt"}),
+            ),
+            // move_path trims both ends before it moves anything.
+            (
+                "move_path",
+                json!({"from": "b.txt", "to": " protected/b.txt "}),
+            ),
+            (
+                "move_path",
+                json!({"from": "protected/a.txt\n", "to": "b.txt"}),
+            ),
+            (
+                "multi_edit",
+                json!({"path": "protected/a.txt", "edits": []}),
+            ),
+            ("create_dir", json!({"path": "protected/new"})),
+            (
+                "apply_patch",
+                json!({"patch": "--- a/protected/a.txt\n+++ b/protected/a.txt\n@@ -1 +1 @@\n-a\n+b\n"}),
+            ),
+        ] {
+            let r = gate(Permission::Auto, name, &input, &proj);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("denied by rule")),
+                "{name} {input}: {r:?}"
+            );
+        }
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

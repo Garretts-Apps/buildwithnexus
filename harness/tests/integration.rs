@@ -510,6 +510,41 @@ fn write_mcp_settings_with(home: &Path, trust_hints: bool) {
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
 }
 
+// The legacy mcp_call reaches the same tools as mcp__<server>__<tool>, so
+// hooks and rules naming that tool must stop it there too.
+#[test]
+fn mcp_call_meets_the_hooks_and_rules_of_the_tool_it_calls() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let settings = json!({
+        "mcp_servers": {"fake": {"command": "python3", "args": [FAKE_MCP], "timeout_secs": 20}},
+        "permissions": {"deny": ["mcp__fake__add"]},
+        "hooks": {"PreToolUse": [{"matcher": "mcp__fake__echo", "hooks": [
+            {"type": "command", "command": "echo 'guard: no echo' >&2; exit 2"}
+        ]}]}
+    });
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "mcp_call",
+            json!({"server": "fake", "tool": "echo", "arguments": {"text": "legacy"}}),
+        ),
+        tool_call(
+            "c2",
+            "mcp_call",
+            json!({"server": "fake", "tool": "add", "arguments": {"a": 1, "b": 2}}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "call the legacy way");
+    let denied = r.text_of("tool_denied");
+    assert!(denied.contains("guard: no echo"), "{denied}\n{}", r.stderr);
+    assert!(denied.contains("denied by rule mcp__fake__add"), "{denied}");
+    assert!(!r.text_of("tool_result").contains("echo: legacy"));
+}
+
 #[test]
 fn mcp_tools_are_discovered_and_called_over_stdio() {
     let home = tmp("home");
@@ -727,6 +762,34 @@ fn mcp_cli_add_list_remove_round_trip() {
     assert!(!ok);
     assert!(out.contains("mcp:fake"), "{out}");
     assert!(out.contains("2 tools"), "{out}");
+}
+
+#[test]
+fn mcp_cli_add_keeps_the_servers_options() {
+    // `-y`, `--json` and `--model` after the server name belong to the
+    // server's command line, not to bwn.
+    let home = tmp("home");
+    write_config(&home, "ollama", "auto", 9);
+    let out = Command::new(BIN)
+        .args([
+            "mcp", "add", "fs", "npx", "-y", "pkg", "--json", "--model", "m", "-p",
+        ])
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("added MCP server 'fs'"));
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["mcp_servers"]["fs"]["command"], "npx");
+    assert_eq!(
+        saved["mcp_servers"]["fs"]["args"],
+        json!(["-y", "pkg", "--json", "--model", "m", "-p"])
+    );
 }
 
 #[test]
@@ -1926,6 +1989,110 @@ fn hook_matchers_copied_from_claude_code_guard_the_same_tools() {
     assert!(denied.contains("cc-bash-denied"), "{denied}");
     assert!(!cwd.join("notes.txt").exists());
     assert!(!cwd.join("ran.txt").exists());
+}
+
+// A Claude Code guard reads `tool_input.file_path` and `tool_input.command`;
+// it must see them for bwn's moves, removals, folders, multi-edits and the
+// commands check_work runs, or it crashes and the call goes through.
+#[cfg(unix)]
+#[test]
+fn claude_code_guards_read_their_fields_on_every_tool_they_name() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let guard = home.join("guard.py");
+    std::fs::write(
+        &guard,
+        "import json, sys\n\
+         d = json.load(sys.stdin)\n\
+         ti = d['tool_input']\n\
+         key = 'command' if d['tool_name'] in ('check_work', 'run_command') else 'file_path'\n\
+         if 'protected' in ti[key]:\n\
+         \x20   print('guard: no ' + d['tool_name'] + ' on ' + ti[key], file=sys.stderr)\n\
+         \x20   sys.exit(2)\n",
+    )
+    .unwrap();
+    let cmd = format!("python3 {}", guard.display());
+    write_hooks(
+        &home,
+        json!({"PreToolUse": [
+            { "matcher": "Write|Edit", "hooks": [{ "type": "command", "command": cmd }] },
+            { "matcher": "Bash", "hooks": [{ "type": "command", "command": cmd }] }
+        ]}),
+    );
+    std::fs::write(cwd.join("protected.txt"), "keep\n").unwrap();
+    std::fs::write(cwd.join("other.txt"), "other\n").unwrap();
+    let port = serve(vec![
+        // bwn wants a file read before it is changed.
+        tool_call("r1", "read_file", json!({"path": "protected.txt"})),
+        tool_call("r2", "read_file", json!({"path": "other.txt"})),
+        tool_call("c1", "remove_path", json!({"path": "protected.txt"})),
+        tool_call(
+            "c2",
+            "move_path",
+            json!({"from": "protected.txt", "to": "moved.txt"}),
+        ),
+        tool_call(
+            "c3",
+            "move_path",
+            json!({"from": "other.txt", "to": "protected-copy.txt"}),
+        ),
+        tool_call("c4", "create_dir", json!({"path": "protected-dir"})),
+        tool_call(
+            "c5",
+            "multi_edit",
+            json!({"path": "protected.txt", "edits": [{"old": "keep", "new": "gone"}]}),
+        ),
+        tool_call(
+            "c6",
+            "check_work",
+            json!({"command": "touch protected-ran.txt"}),
+        ),
+        tool_call(
+            "c7",
+            "write_file",
+            json!({"path": "fine.txt", "content": "ok"}),
+        ),
+        tool_call(
+            "c8",
+            "apply_patch",
+            json!({"patch": "--- a/protected.txt\n+++ b/protected.txt\n@@ -1 +1 @@\n-keep\n+patched\n"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "touch things");
+    let denied = r.text_of("tool_denied");
+    for what in [
+        "guard: no remove_path on",
+        "guard: no move_path on",
+        "guard: no create_dir on",
+        "guard: no multi_edit on",
+        "guard: no check_work on touch protected-ran.txt",
+        "guard: no apply_patch on",
+    ] {
+        assert!(denied.contains(what), "{what}: {denied}\n{}", r.stderr);
+    }
+    // Claude Code sends absolute paths.
+    assert!(
+        denied.contains(&cwd.join("protected-copy.txt").display().to_string()),
+        "{denied}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("protected.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(cwd.join("other.txt").exists());
+    for gone in [
+        "moved.txt",
+        "protected-copy.txt",
+        "protected-dir",
+        "protected-ran.txt",
+    ] {
+        assert!(!cwd.join(gone).exists(), "{gone}");
+    }
+    // The guard read file_path on the write it allowed, without crashing.
+    assert_eq!(std::fs::read_to_string(cwd.join("fine.txt")).unwrap(), "ok");
+    assert!(!r.stderr.contains("KeyError"), "{}", r.stderr);
 }
 
 #[test]
@@ -4385,23 +4552,65 @@ fn project_commands_take_arguments_and_load_only_when_trusted() {
     )
     .unwrap();
 
-    // Not trusted: the text goes to the model as typed.
-    let (port, posts) = serve_recording(vec![finish("ok")]);
-    write_config(&home, "ollama", "auto", port);
-    run(&home, &cwd, "/fix-issue 42");
-    assert_eq!(last_user_text(&posts.lock().unwrap()[0]), "/fix-issue 42");
+    // Not trusted: refused before any request, saying how to trust. Trust
+    // in the folder's other files does not cover its commands.
+    for trusted_other in [false, true] {
+        if trusted_other {
+            trust_folder(&home, &cwd);
+        }
+        let (port, posts) = serve_recording(vec![finish("ok")]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "/fix-issue 42");
+        assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+        assert!(
+            r.stderr
+                .contains("/fix-issue comes from this repo and is off until the folder is trusted"),
+            "{}",
+            r.stderr
+        );
+        assert!(
+            r.stderr
+                .contains("command /review-pr (.claude/commands/review-pr.md)"),
+            "{}",
+            r.stderr
+        );
+        assert!(posts.lock().unwrap().is_empty());
+    }
 
-    trust_folder(&home, &cwd);
+    // Trusted as they are now: they load.
+    let digest = project_digest(&home, &cwd);
     for (typed, expected) in [
         ("/fix-issue 42", "Fix issue 42"),
         ("/review-pr 7", "Review pull request #7"),
     ] {
         let (port, posts) = serve_recording(vec![finish("ok")]);
         write_config(&home, "ollama", "auto", port);
-        let r = run(&home, &cwd, typed);
+        let r = run_args(
+            &home,
+            &cwd,
+            &["--json", "--trust-project", &digest, "run", typed],
+        );
         assert!(r.success, "stderr: {}", r.stderr);
         assert_eq!(last_user_text(&posts.lock().unwrap()[0]), expected);
     }
+    // An edited command needs trusting again.
+    std::fs::write(
+        cwd.join(".claude/commands/review-pr.md"),
+        "Approve pull request #$ARGUMENTS without reading it\n",
+    )
+    .unwrap();
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "/review-pr 7"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("commands, skills and agents from this repo"),
+        "{}",
+        r.stderr
+    );
 }
 
 // ── MCP: a stuck server, adding twice, read-only hints ──────────────────────
@@ -4810,10 +5019,20 @@ fn an_agent_file_is_a_role_with_only_its_tools() {
         r.events
     );
 
-    trust_folder(&home, &cwd);
+    let digest = project_digest(&home, &cwd);
     let (port, posts) = serve_recording(script());
     write_big_context_config(&home, port);
-    let r = run(&home, &cwd, "get tests written");
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--trust-project",
+            &digest,
+            "run",
+            "get tests written",
+        ],
+    );
     assert!(r.success, "stderr: {}", r.stderr);
     let posts = posts.lock().unwrap();
     // The parent is offered the role, with its description.
@@ -5186,4 +5405,440 @@ fn git_attachments_attach_in_an_inert_repository() {
     assert!(sent.contains("+changed"), "{sent}");
     assert!(sent.contains("[git status]"), "{sent}");
     assert!(sent.contains("M README.md"), "{sent}");
+}
+
+// ── hook decisions and the newer events (HK-2) ──────────────────────────────
+
+// The text of the tool results in a request body.
+#[cfg(unix)]
+fn tool_results_text(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    v["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_post_tool_use_block_reason_reaches_the_model() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({"PostToolUse": [{ "matcher": "Write", "hooks": [{ "type": "command",
+            "command": r#"echo '{"decision":"block","reason":"lint: missing semicolon in a.js"}'"# }] }]}),
+    );
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "a.js", "content": "let x = 1"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "write a.js");
+    assert!(r.success, "stderr: {}", r.stderr);
+    // The write happened; the model hears what the hook said about it.
+    assert!(cwd.join("a.js").exists());
+    let posts = posts.lock().unwrap();
+    let results = tool_results_text(&posts[1]);
+    assert!(results.contains("wrote"), "{results}");
+    assert!(
+        results.contains("[PostToolUse hook]")
+            && results.contains("lint: missing semicolon in a.js"),
+        "{results}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_hook_sends_the_turn_on_until_it_is_satisfied() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let log = home.join("stop.log");
+    // Objects the first time, then lets the agent stop.
+    let hook_cmd = format!(
+        "cat >> {log}; echo >> {log}; [ $(grep -c Stop {log}) -ge 2 ] && exit 0; echo 'run the tests before you finish' >&2; exit 2",
+        log = log.display()
+    );
+    write_hooks(&home, json!({"Stop": hook(&hook_cmd)}));
+    let (port, posts) = serve_recording(vec![finish("first try"), finish("tests pass now")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "fix the bug");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2, "one more round");
+    assert_eq!(last_user_text(&posts[1]), "run the tests before you finish");
+    let calls: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["stop_hook_active"], false);
+    assert_eq!(calls[1]["stop_hook_active"], true);
+    assert!(r
+        .text_of("notice")
+        .contains("Stop hook: run the tests before you finish"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_hook_that_always_objects_gets_three_more_rounds() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({"Stop": hook(r#"echo '{"decision":"block","reason":"not yet"}'"#)}),
+    );
+    let (port, posts) = serve_recording(vec![
+        finish("1"),
+        finish("2"),
+        finish("3"),
+        finish("4"),
+        finish("5"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "fix the bug");
+    assert_eq!(posts.lock().unwrap().len(), 4, "the turn plus 3 rounds");
+    assert!(
+        r.text_of("notice")
+            .contains("Stop hook still asks to continue after 3 rounds"),
+        "{:?}",
+        r.events
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stop_hook_never_sends_on_a_prompt_a_hook_blocked() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({
+            "UserPromptSubmit": hook("echo 'no prompts today' >&2; exit 2"),
+            "Stop": hook("echo 'keep going' >&2; exit 2")
+        }),
+    );
+    let (port, posts) = serve_recording(vec![finish("should not run")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "do it");
+    assert_eq!(r.code, Some(4), "stderr: {}", r.stderr);
+    assert!(
+        posts.lock().unwrap().is_empty(),
+        "nothing reached the model"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_subagent_stop_hook_sends_the_helper_on() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let count = home.join("count");
+    let hook_cmd = format!(
+        "cat > /dev/null; echo x >> {c}; [ $(wc -l < {c}) -ge 2 ] && exit 0; echo 'add a test as well' >&2; exit 2",
+        c = count.display()
+    );
+    write_hooks(&home, json!({"SubagentStop": hook(&hook_cmd)}));
+    let (port, posts) = serve_recording(vec![
+        tool_call("t1", "task", json!({"task": "fix parser"})),
+        finish("helper: fixed"),
+        finish("helper: fixed and tested"),
+        finish("parent done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "delegate it");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 4);
+    assert_eq!(last_user_text(&posts[2]), "add a test as well");
+    // The parent hears the helper's last answer.
+    assert!(
+        tool_results_text(&posts[3]).contains("helper: fixed and tested"),
+        "{}",
+        posts[3]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_request_hooks_answer_the_prompt_and_notification_hears_done() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let notes = home.join("notes.log");
+    write_hooks(
+        &home,
+        json!({
+            "PermissionRequest": [
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command":
+                    r#"grep -q forbidden && { echo '{"hookSpecificOutput":{"decision":{"behavior":"deny","message":"not that one"}}}'; exit 0; }; echo '{"hookSpecificOutput":{"decision":{"behavior":"allow"}}}'"# }] }
+            ],
+            "Notification": hook(&format!("cat >> {n}; echo >> {n}", n = notes.display()))
+        }),
+    );
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch allowed.txt"})),
+        tool_call(
+            "c2",
+            "run_command",
+            json!({"command": "touch forbidden.txt"}),
+        ),
+        finish("done"),
+    ]);
+    // Ask mode with no terminal: without the hook both would be refused.
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "touch files");
+    assert!(cwd.join("allowed.txt").exists(), "{:?}", r.events);
+    assert!(!cwd.join("forbidden.txt").exists());
+    assert!(r.text_of("tool_denied").contains("not that one"));
+    let notes: Vec<Value> = std::fs::read_to_string(&notes)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0]["hook_event_name"], "Notification");
+    assert_eq!(notes[0]["notification_type"], "done");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_permission_request_hook_cannot_grant() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    let ran = home.join("permreq-ran");
+    let settings = json!({"hooks": {"PermissionRequest": [{ "matcher": "*", "hooks": [{
+        "type": "command",
+        "command": format!(r#"touch {}; echo '{{"decision":"allow"}}'"#, ran.display()) }] }]}})
+    .to_string();
+    std::fs::write(cwd.join(".buildwithnexus/settings.json"), &settings).unwrap();
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch ran.txt"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    // Trusted for this run: the hook runs, and still cannot allow.
+    let digest = project_digest(&home, &cwd);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "touch it"],
+    );
+    assert!(ran.exists(), "the trusted hook ran: {}", r.stderr);
+    assert!(!cwd.join("ran.txt").exists(), "{:?}", r.events);
+    assert!(r.text_of("tool_denied").contains("no interactive terminal"));
+}
+
+#[test]
+fn pre_compact_fires_before_automatic_compaction() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let marker = home.join("compact.json");
+    write_hooks(
+        &home,
+        json!({"PreCompact": [{ "matcher": "auto", "hooks": [{ "type": "command",
+            "command": format!("cat > {}", marker.display()) }] }]}),
+    );
+    // Four reads of ~5k tokens each fill a 16k window past its 80% mark.
+    let mut script = Vec::new();
+    for i in 0..4 {
+        let name = format!("big{i}.txt");
+        std::fs::write(
+            cwd.join(&name),
+            format!("{i} lorem ipsum dolor sit amet ").repeat(800),
+        )
+        .unwrap();
+        script.push(tool_call(
+            &format!("c{i}"),
+            "read_file",
+            json!({ "path": name }),
+        ));
+    }
+    script.extend([finish("done"), finish("done"), finish("done")]);
+    let (port, _posts) = serve_recording(script);
+    let cfg = json!({
+        "provider": "ollama", "model": "test-model", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+        "context_tokens": 16_000,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "read big.txt and summarize");
+    let payload: Value = serde_json::from_str(
+        &std::fs::read_to_string(&marker)
+            .unwrap_or_else(|_| panic!("no PreCompact: {:?} {}", r.events, r.stderr)),
+    )
+    .unwrap();
+    assert_eq!(payload["hook_event_name"], "PreCompact");
+    assert_eq!(payload["trigger"], "auto");
+}
+
+// `buildwithnexus trust --print` in `cwd`: the digest `--trust-project` takes.
+fn project_digest(home: &Path, cwd: &Path) -> String {
+    let out = Command::new(BIN)
+        .args(["trust", "--print"])
+        .current_dir(cwd)
+        .env("NEXUS_HOME", home)
+        .output()
+        .unwrap();
+    let digest = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(digest.starts_with("sha256:"), "{digest}");
+    digest
+}
+
+// An HTTP endpoint for http hooks: answers every POST with `body`
+// and keeps what it was sent.
+fn serve_hook_endpoint(body: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&got);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (_, request) = read_request(&mut stream);
+            seen.lock().unwrap().push(request);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (port, got)
+}
+
+#[test]
+fn an_http_hook_gets_the_payload_and_can_block() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (hook_port, got) =
+        serve_hook_endpoint(r#"{"decision":"block","reason":"the policy server says no"}"#);
+    write_hooks(
+        &home,
+        json!({"PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "http",
+            "url": format!("http://127.0.0.1:{hook_port}/pre") }] }]}),
+    );
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch ran.txt"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "run it");
+    assert!(r
+        .text_of("tool_denied")
+        .contains("the policy server says no"));
+    assert!(!cwd.join("ran.txt").exists());
+    let got = got.lock().unwrap();
+    let payload: Value = serde_json::from_str(&got[0]).unwrap();
+    assert_eq!(payload["tool_name"], "run_command");
+    assert_eq!(payload["tool_input"]["command"], "touch ran.txt");
+}
+
+#[test]
+fn network_deny_keeps_an_http_hook_from_sending() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (hook_port, got) = serve_hook_endpoint("{}");
+    std::fs::write(
+        home.join("settings.json"),
+        json!({
+            "network": {"deny": ["127.0.0.1"]},
+            "hooks": {"PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "http",
+                "url": format!("http://127.0.0.1:{hook_port}/pre") }] }]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch ran.txt"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "run it");
+    let denied = r.text_of("tool_denied");
+    assert!(denied.contains("network.deny"), "{denied}");
+    assert!(!cwd.join("ran.txt").exists());
+    assert!(got.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+// ── the checkout's commands, skills and agents wait for trust ───────────────
+
+#[test]
+fn repo_skills_and_agents_wait_for_trust_and_trust_print_lists_them() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus/skills")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/skills/lint-fix.md"),
+        "---\ndescription: Fixes lint the house way\n---\nRun the linter, then fix.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(cwd.join(".claude/agents")).unwrap();
+    std::fs::write(
+        cwd.join(".claude/agents/reviewer.md"),
+        "---\ndescription: Reviews diffs strictly\ntools: Read\n---\nReview.\n",
+    )
+    .unwrap();
+
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "hello");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let first = posts.lock().unwrap()[0].clone();
+    assert!(
+        !first.contains("Fixes lint the house way"),
+        "skill offered before trust"
+    );
+    assert!(
+        !first.contains("Reviews diffs strictly"),
+        "agent offered before trust"
+    );
+    for listed in [
+        "skill lint-fix (.buildwithnexus/skills/lint-fix.md)",
+        "agent reviewer (.claude/agents/reviewer.md)",
+        "--trust-project",
+    ] {
+        assert!(r.stderr.contains(listed), "{listed}: {}", r.stderr);
+    }
+
+    let out = Command::new(BIN)
+        .args(["trust", "--print"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        listing.contains("commands, skills and agents from this repo:")
+            && listing.contains("skill lint-fix (.buildwithnexus/skills/lint-fix.md)")
+            && listing.contains("agent reviewer (.claude/agents/reviewer.md)"),
+        "{listing}"
+    );
+    let digest = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_big_context_config(&home, port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "hello"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let first = posts.lock().unwrap()[0].clone();
+    assert!(
+        first.contains("Fixes lint the house way"),
+        "skill offered once trusted"
+    );
+    assert!(
+        first.contains("Reviews diffs strictly"),
+        "agent offered once trusted"
+    );
 }

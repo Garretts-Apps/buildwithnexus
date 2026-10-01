@@ -280,6 +280,10 @@ pub struct Settings {
     /// only while the terminal window is unfocused), "always", or "off".
     #[serde(default = "default_auto")]
     pub notify: String,
+    /// Seconds the prompt waits untouched before Notification hooks hear
+    /// `idle_prompt` (default 60; 0 never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_notify_secs: Option<u64>,
     /// How a trusted project's `.buildwithnexus/system.md` combines with
     /// `~/.buildwithnexus/system.md`: "append" (default; the project text
     /// follows the user's) or "replace". Read from the user's files only.
@@ -408,6 +412,7 @@ impl Default for Settings {
             sandbox: default_sandbox(),
             images: default_auto(),
             notify: default_auto(),
+            idle_notify_secs: None,
             sandbox_network: true,
             project_system_prompt: None,
             project_skills_override: false,
@@ -1289,6 +1294,15 @@ fn scan_skill_root(dir: &Path, source: SkillSource, out: &mut Vec<Skill>) {
     }
 }
 
+// Run from the home folder, the project folders are the user's own.
+fn in_home_folder(cwd: &Path) -> bool {
+    let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    user_home().is_some_and(|u| same(&u, cwd))
+}
+
 /// Skill roots in precedence order (lowest first): user-level `.agents`,
 /// `.claude`, `~/.buildwithnexus/skills`, then `skill_dirs` from settings,
 /// then the project-level `.agents`, `.claude`, `.buildwithnexus/skills`.
@@ -1324,12 +1338,7 @@ fn skill_roots(cwd: &Path) -> Vec<(PathBuf, SkillSource, bool)> {
             roots.push((p, SkillSource::Custom, repo));
         }
     }
-    // Run from the home folder, the project roots are the user's own.
-    let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    };
-    let repo = !user_home().is_some_and(|u| same(&u, cwd));
+    let repo = !in_home_folder(cwd);
     roots.push((
         cwd.join(".agents").join("skills"),
         SkillSource::Agents,
@@ -1371,8 +1380,13 @@ fn discover_skills_noting_shadowed(cwd: &Path) -> (Vec<Skill>, Vec<String>) {
     // A cloned repo must not swap out `security-review` for its own copy
     // unless the user's own settings allow it.
     let override_ok = load_user_settings().is_some_and(|s| s.project_skills_override);
+    // The checkout's skills load only once the folder is trusted.
+    let repo_ok = project_extensions_trusted(cwd);
     let mut from_repo = Vec::new();
     for (dir, source, repo) in skill_roots(cwd) {
+        if repo && !repo_ok {
+            continue;
+        }
         if repo && !override_ok {
             scan_skill_root(&dir, source, &mut from_repo);
         } else {
@@ -1583,44 +1597,63 @@ pub struct CustomCommand {
     pub skill: bool,
 }
 
-/// Has the user trusted anything in this folder (`trusted.json` holds an
-/// entry for it)? Commands from the checkout load only then: a script runs
-/// code, and a prompt file speaks with the user's voice.
-pub fn project_folder_trusted(cwd: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(home().join("trusted.json")) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    match &v[project_key(cwd)] {
-        serde_json::Value::Object(m) => !m.is_empty(),
-        serde_json::Value::String(s) => !s.is_empty(),
-        _ => false,
-    }
-}
-
 // Command folders in precedence order: the user's own first, then the
-// checkout's once the folder is trusted. A name already taken is skipped.
-fn command_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![commands_dir()];
+// checkout's once its commands are trusted (marked true: read as project
+// files). A name already taken is skipped.
+fn command_dirs(cwd: &Path) -> Vec<(PathBuf, bool)> {
+    let mut dirs = vec![(commands_dir(), false)];
     if let Some(u) = user_home() {
-        dirs.push(u.join(".claude").join("commands"));
+        dirs.push((u.join(".claude").join("commands"), false));
     }
-    if project_folder_trusted(cwd) {
-        dirs.push(cwd.join(".buildwithnexus").join("commands"));
-        dirs.push(cwd.join(".claude").join("commands"));
+    if project_extensions_trusted(cwd) {
+        dirs.extend(project_command_dirs(cwd).map(|d| (d, true)));
     }
     dirs
 }
 
-fn scan_commands(dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<CustomCommand>) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+fn project_command_dirs(cwd: &Path) -> [PathBuf; 2] {
+    [
+        cwd.join(".buildwithnexus").join("commands"),
+        cwd.join(".claude").join("commands"),
+    ]
+}
+
+fn project_agent_dirs(cwd: &Path) -> [PathBuf; 2] {
+    [
+        cwd.join(".buildwithnexus").join("agents"),
+        cwd.join(".claude").join("agents"),
+    ]
+}
+
+// A folder's entries, sorted.
+fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
     paths.sort();
-    for path in paths {
+    paths
+}
+
+// A file the loader reads: a checkout's (`in_project`) only as a regular
+// file inside `dir`, never through a link out of it.
+fn read_listed(path: &Path, dir: &Path, in_project: bool) -> Option<String> {
+    if in_project {
+        read_project_file(path, dir)
+    } else {
+        fs::read_to_string(path).ok()
+    }
+}
+
+fn scan_commands(
+    dir: &Path,
+    in_project: bool,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<CustomCommand>,
+) {
+    if !dir.is_dir() {
+        return;
+    }
+    for path in sorted_entries(dir) {
         let ext = path
             .extension()
             .map(|x| x.to_string_lossy().to_lowercase())
@@ -1634,7 +1667,7 @@ fn scan_commands(dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<CustomCom
         }
         match ext.as_str() {
             "md" => {
-                if let Ok(text) = fs::read_to_string(&path) {
+                if let Some(text) = read_listed(&path, dir, in_project) {
                     let (fm, body) = parse_frontmatter(&text);
                     let body = body.trim().to_string();
                     seen.insert(stem.clone());
@@ -1651,7 +1684,8 @@ fn scan_commands(dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<CustomCom
                     });
                 }
             }
-            "sh" | "py" | "bash" => {
+            // A checkout's script runs only from inside its folder.
+            "sh" | "py" | "bash" if !in_project || read_project_file(&path, dir).is_some() => {
                 seen.insert(stem.clone());
                 out.push(CustomCommand {
                     name: stem,
@@ -1670,8 +1704,8 @@ pub fn load_custom_commands() -> Vec<CustomCommand> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for dir in command_dirs(&cwd) {
-        scan_commands(&dir, &mut seen, &mut out);
+    for (dir, in_project) in command_dirs(&cwd) {
+        scan_commands(&dir, in_project, &mut seen, &mut out);
     }
     // Every discovered skill (bundled, user, project, .claude, .agents) is a
     // slash command too; an explicit commands/ entry of the same name wins.
@@ -1817,32 +1851,24 @@ fn parse_agent_file(path: &Path, text: &str) -> Option<AgentDef> {
 
 /// Agent files the model may delegate to: NEXUS_HOME/agents and
 /// ~/.claude/agents, then the checkout's .buildwithnexus/agents and
-/// .claude/agents once the folder is trusted. A name already taken (or a
+/// .claude/agents once they are trusted. A name already taken (or a
 /// built-in role) is skipped.
 pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDef> {
-    let mut dirs = vec![home().join("agents")];
+    let mut dirs = vec![(home().join("agents"), false)];
     if let Some(u) = user_home() {
-        dirs.push(u.join(".claude").join("agents"));
+        dirs.push((u.join(".claude").join("agents"), false));
     }
-    if project_folder_trusted(cwd) {
-        dirs.push(cwd.join(".buildwithnexus").join("agents"));
-        dirs.push(cwd.join(".claude").join("agents"));
+    if project_extensions_trusted(cwd) {
+        dirs.extend(project_agent_dirs(cwd).map(|d| (d, true)));
     }
     let mut out: Vec<AgentDef> = Vec::new();
-    for dir in dirs {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "md"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Some(def) = fs::read_to_string(&path)
-                .ok()
-                .and_then(|t| parse_agent_file(&path, &t))
+    for (dir, in_project) in dirs {
+        for path in sorted_entries(&dir) {
+            if !path.extension().is_some_and(|x| x == "md") {
+                continue;
+            }
+            let Some(def) =
+                read_listed(&path, &dir, in_project).and_then(|t| parse_agent_file(&path, &t))
             else {
                 continue;
             };
@@ -1859,6 +1885,182 @@ pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDef> {
         }
     }
     out
+}
+
+// ── the checkout's commands, skills and agents ───────────────────────────────
+// They speak with the user's voice (a command's body is the prompt), steer
+// the model (skills, agents) or run code (script commands), so they load
+// only once the folder is trusted, pinned by content like hook scripts.
+
+/// Trust-store name of the checkout's command, skill and agent files.
+pub const PROJECT_EXTENSIONS: &str = "extensions";
+
+/// One command, skill or agent file from the checkout.
+struct ProjectExtension {
+    /// "command", "skill" or "agent".
+    kind: &'static str,
+    /// `/deploy`, or the skill's or agent's name.
+    name: String,
+    /// Its path inside the project, as shown.
+    shown: String,
+    /// What the loader would read; None when it would not load.
+    text: Option<String>,
+}
+
+// Every command, skill and agent file the checkout carries, in a stable
+// order. None in the home folder, whose folders are the user's own.
+fn project_extension_files(cwd: &Path) -> Vec<ProjectExtension> {
+    if in_home_folder(cwd) {
+        return Vec::new();
+    }
+    let shown = |p: &Path| {
+        p.strip_prefix(cwd)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
+    let stem = |p: &Path| {
+        p.file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let ext = |p: &Path| {
+        p.extension()
+            .map(|x| x.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for dir in project_command_dirs(cwd) {
+        for path in sorted_entries(&dir) {
+            let name = stem(&path);
+            if name.is_empty() || name.starts_with('.') {
+                continue;
+            }
+            if matches!(ext(&path).as_str(), "md" | "sh" | "py" | "bash") {
+                out.push(ProjectExtension {
+                    kind: "command",
+                    name: format!("/{name}"),
+                    shown: shown(&path),
+                    text: read_project_file(&path, &dir),
+                });
+            }
+        }
+    }
+    for (dir, source, repo) in skill_roots(cwd) {
+        if !repo {
+            continue;
+        }
+        for path in sorted_entries(&dir) {
+            let name = stem(&path);
+            if name.is_empty() || name.starts_with('.') {
+                continue;
+            }
+            let (file, folder) = if path.is_dir() {
+                (path.join("SKILL.md"), Some(path.clone()))
+            } else if ext(&path) == "md" {
+                (path.clone(), None)
+            } else {
+                continue;
+            };
+            if !file.is_file() {
+                continue;
+            }
+            let text = read_project_file(&file, &dir);
+            let name = text
+                .as_deref()
+                .and_then(|t| skill_from_text(&name, t, source, folder))
+                .map_or(name, |s| s.name);
+            out.push(ProjectExtension {
+                kind: "skill",
+                name,
+                shown: shown(&file),
+                text,
+            });
+        }
+    }
+    for dir in project_agent_dirs(cwd) {
+        for path in sorted_entries(&dir) {
+            if ext(&path) != "md" || stem(&path).starts_with('.') {
+                continue;
+            }
+            let text = read_project_file(&path, &dir);
+            let name = text
+                .as_deref()
+                .and_then(|t| parse_agent_file(&path, t))
+                .map_or_else(|| stem(&path), |a| a.name);
+            out.push(ProjectExtension {
+                kind: "agent",
+                name,
+                shown: shown(&path),
+                text,
+            });
+        }
+    }
+    out
+}
+
+/// The checkout's commands, skills and agents as the trust store covers
+/// them: `text` holds one line per file with a digest of its contents (so
+/// adding, editing or removing one asks again), `keys` one label per file.
+/// None when the checkout has none.
+pub fn project_extensions(cwd: &Path) -> Option<UntrustedProjectFile> {
+    let files = project_extension_files(cwd);
+    if files.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    let mut keys = Vec::new();
+    for f in &files {
+        let digest = f.text.as_deref().map_or_else(
+            || "-".to_string(),
+            |t| crate::hooks::sha256_hex(t.as_bytes()),
+        );
+        text.push_str(&format!("{}\t{}\t{}\t{digest}\n", f.kind, f.name, f.shown));
+        keys.push(format!("{} {} ({})", f.kind, f.name, f.shown));
+    }
+    Some(UntrustedProjectFile {
+        name: PROJECT_EXTENSIONS,
+        text,
+        keys,
+    })
+}
+
+/// Whether the checkout's commands, skills and agents may load: trusted as
+/// they are now, or there are none.
+pub fn project_extensions_trusted(cwd: &Path) -> bool {
+    project_extensions(cwd)
+        .is_none_or(|e| crate::hooks::project_file_trusted(cwd, PROJECT_EXTENSIONS, &e.text))
+}
+
+/// The one-line notice for the checkout's commands, skills and agents that
+/// stay off until the folder is trusted, naming them and how to trust.
+pub fn untrusted_extensions_notice(cwd: &Path) -> Option<String> {
+    let e = project_extensions(cwd)?;
+    if crate::hooks::project_file_trusted(cwd, PROJECT_EXTENSIONS, &e.text) {
+        return None;
+    }
+    let names: Vec<String> = project_extension_files(cwd)
+        .into_iter()
+        .map(|f| match f.kind {
+            "command" => f.name,
+            kind => format!("{kind} {}", f.name),
+        })
+        .collect();
+    Some(format!(
+        "commands, skills and agents from this repo are off until you trust this folder ({}): start bwn here again and answer y, or trust it for one run with --trust-project (`buildwithnexus trust --print`)",
+        names.join(", ")
+    ))
+}
+
+/// Whether `/name` is one of the checkout's commands or skills, off because
+/// the folder is not trusted.
+pub fn is_untrusted_repo_command(cwd: &Path, name: &str) -> bool {
+    !project_extensions_trusted(cwd)
+        && project_extension_files(cwd).iter().any(|f| match f.kind {
+            "command" => f.name.strip_prefix('/') == Some(name),
+            "skill" => f.name == name,
+            _ => false,
+        })
 }
 
 #[cfg(test)]
@@ -2100,6 +2302,7 @@ const HARMLESS_PROJECT_KEYS: &[&str] = &[
     "instruction_files",
     "images",
     "notify",
+    "idle_notify_secs",
 ];
 
 /// A project settings file the user hasn't trusted, with the keys that were
@@ -2123,6 +2326,10 @@ pub fn untrusted_project_files(workdir: &Path) -> Vec<UntrustedProjectFile> {
             });
         }
     }
+    out.extend(
+        project_extensions(workdir)
+            .filter(|e| !crate::hooks::project_file_trusted(workdir, PROJECT_EXTENSIONS, &e.text)),
+    );
     out
 }
 
@@ -3977,6 +4184,12 @@ mod tests {
             "x",
         );
 
+        // The checkout's skills wait for the folder to be trusted.
+        let before = discover_skills(&proj);
+        assert!(before
+            .iter()
+            .all(|s| !s.name.starts_with("project:") && s.name != "renamed" && s.name != "bar"));
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
         let skills = discover_skills(&proj);
         let find = |n: &str| skills.iter().find(|s| s.name == n).cloned();
 
@@ -4088,6 +4301,7 @@ mod tests {
             &proj.join(".agents/skills/lint/SKILL.md"),
             "---\ndescription: Repo lint\n---\nlint body",
         );
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
 
         let skills = discover_skills(&proj);
         let find = |n: &str| skills.iter().find(|s| s.name == n).cloned();
@@ -4148,6 +4362,91 @@ mod tests {
     }
 
     #[test]
+    fn repo_commands_and_agents_are_pinned_by_content() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        let old_home = std::env::var_os("HOME");
+        let user = unique_dir("exthome");
+        std::env::set_var("HOME", &user);
+        let proj = unique_dir("extproj");
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&proj).unwrap();
+
+        write(&proj.join(".claude/commands/ship.md"), "Ship it.");
+        write(
+            &proj.join(".buildwithnexus/agents/rev.md"),
+            "---\nname: rev\ndescription: Reviews\n---\nReview.",
+        );
+        let e = project_extensions(&proj).unwrap();
+        assert_eq!(
+            e.keys,
+            [
+                "command /ship (.claude/commands/ship.md)",
+                "agent rev (.buildwithnexus/agents/rev.md)"
+            ]
+        );
+        let loaded = || {
+            let cmds = load_custom_commands();
+            (
+                cmds.iter().any(|c| c.name == "ship"),
+                load_agent_defs(&proj).iter().any(|a| a.name == "rev"),
+            )
+        };
+        assert_eq!(loaded(), (false, false));
+        assert!(is_untrusted_repo_command(&proj, "ship"));
+        assert!(untrusted_extensions_notice(&proj)
+            .is_some_and(|n| n.contains("(/ship, agent rev)") && n.contains("--trust-project")));
+        // Trust in another file of the folder does not cover them.
+        write(&proj.join(".buildwithnexus/system.md"), "Be terse.");
+        let system = untrusted_project_files(&proj)
+            .into_iter()
+            .filter(|f| f.name == PROJECT_SYSTEM_PROMPT)
+            .collect::<Vec<_>>();
+        crate::hooks::store_trust(&proj, &system);
+        assert_eq!(loaded(), (false, false));
+
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        assert_eq!(loaded(), (true, true));
+        assert!(!is_untrusted_repo_command(&proj, "ship"));
+        assert_eq!(untrusted_extensions_notice(&proj), None);
+        // Editing, adding or removing a file asks again.
+        write(&proj.join(".claude/commands/ship.md"), "Ship it now.");
+        assert_eq!(loaded(), (false, false));
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        write(&proj.join(".claude/commands/new.md"), "New.");
+        assert!(!project_extensions_trusted(&proj));
+        fs::remove_file(proj.join(".claude/commands/new.md")).unwrap();
+        assert!(project_extensions_trusted(&proj));
+
+        // A command linked out of the checkout never loads.
+        #[cfg(unix)]
+        {
+            let secret = user.join("secret.txt");
+            write(&secret, "TOKEN=abc");
+            std::os::unix::fs::symlink(&secret, proj.join(".claude/commands/leak.md")).unwrap();
+            crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+            assert!(load_custom_commands().iter().all(|c| c.name != "leak"));
+        }
+
+        // In the home folder those folders are the user's own.
+        write(&user.join(".claude/commands/mine.md"), "Mine.");
+        assert!(project_extensions(&user).is_none());
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+        let _ = fs::remove_dir_all(&user);
+        let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
     fn trusted_project_skill_dirs_cannot_shadow_by_absolute_path() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
@@ -4177,6 +4476,17 @@ mod tests {
             &serde_json::json!({ "skill_dirs": [abs] }).to_string(),
         );
         crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        // Trusting the settings file turns its skill_dirs on; the skills in
+        // them are trusted on their own, pinned by content.
+        let pending = untrusted_project_files(&proj);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, PROJECT_EXTENSIONS);
+        assert!(
+            pending[0].keys[0].contains("evil/security-review/SKILL.md"),
+            "{:?}",
+            pending[0].keys
+        );
+        crate::hooks::store_trust(&proj, &pending);
         let skills = discover_skills(&proj);
         let sr = skills.iter().find(|s| s.name == "security-review").unwrap();
         assert_eq!(sr.source, SkillSource::Bundled);

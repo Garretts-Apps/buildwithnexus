@@ -202,7 +202,15 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--base-url" => &mut opts.base_url,
             "--worktree" => &mut opts.worktree,
             _ => {
+                let named = !looks_like_option(&arg);
                 rest.push(arg);
+                // `mcp add <name> npx -y pkg --model m`: the server's own
+                // command line, word for word, never bwn's options.
+                if named && rest.len() > 2 && rest[..2] == ["mcp", "add"] {
+                    literal_from = Some(rest.len());
+                    rest.extend(it);
+                    break;
+                }
                 continue;
             }
         };
@@ -282,6 +290,29 @@ mod cli_option_tests {
     }
 
     #[test]
+    fn an_mcp_servers_command_line_is_kept_word_for_word() {
+        let (opts, rest) = parse(&[
+            "--json", "mcp", "add", "--force", "fs", "npx", "-y", "pkg", "--json", "--model", "m",
+            "--", "x",
+        ])
+        .unwrap();
+        assert!(opts.json, "options before the name are still bwn's");
+        assert!(!opts.yes && opts.model.is_none());
+        assert_eq!(
+            rest,
+            [
+                "mcp", "add", "--force", "fs", "npx", "-y", "pkg", "--json", "--model", "m", "--",
+                "x"
+            ]
+        );
+        assert!(opts.unknown_flags.iter().all(|f| f == "--force"));
+        // Other commands still take -y and --model wherever they are.
+        let (opts, rest) = parse(&["mcp", "list", "-y"]).unwrap();
+        assert!(opts.yes);
+        assert_eq!(rest, ["mcp", "list"]);
+    }
+
+    #[test]
     fn base_url_is_an_option_and_effort_is_checked_while_parsing() {
         let (opts, rest) = parse(&["--base-url", "https://gw.example/v1", "run", "x"]).unwrap();
         assert_eq!(opts.base_url.as_deref(), Some("https://gw.example/v1"));
@@ -355,6 +386,13 @@ pub fn run() {
         "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
             let input = HeadlessInput::require(&rest());
             headless(&opts, |p, perm, cwd| {
+                if let Some(name) = untrusted_repo_command(&input.argv, &cwd) {
+                    eprintln!(
+                        "buildwithnexus: /{} comes from this repo and is off until the folder is trusted: --trust-project <digest> (`buildwithnexus trust --print` shows it)",
+                        tui::sanitize_terminal(&name)
+                    );
+                    std::process::exit(2);
+                }
                 if let Some((cmd, args)) = find_slash_command(&input.argv) {
                     if let Some(script) = &cmd.script {
                         let out = run_script_command(script, &args, perm, &cwd);
@@ -1565,6 +1603,13 @@ fn repl(
 ) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
     tui::configure_ui(&settings.images, &settings.notify);
+    let idle = settings.idle_notify_secs.unwrap_or(60);
+    if idle > 0 {
+        let dir = cwd.to_path_buf();
+        tui::on_idle(std::time::Duration::from_secs(idle), move || {
+            hooks::notification("idle_prompt", "waiting for your input", &dir)
+        });
+    }
     tui::set_permission_mode(permission_label(&perm));
     tui::set_model_label(&provider.model);
 
@@ -1590,6 +1635,9 @@ fn repl(
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
+    }
+    if let Some(n) = config::untrusted_extensions_notice(cwd) {
+        report::notice(&format!("  {}", tui::sanitize_terminal(&n)));
     }
     if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
         report::notice(&format!("  {n}"));
@@ -2393,6 +2441,11 @@ fn repl(
                 if let Some(usage) = command_usage(cmd_name) {
                     // A listed command that needs an argument, typed bare.
                     tui::line(&tui::yellow(&format!("  usage: {usage}")));
+                } else if config::is_untrusted_repo_command(cwd, cmd_name) {
+                    tui::line(&tui::yellow(&format!(
+                        "  /{} comes from this repo and is off until you trust this folder: start bwn here again and answer y",
+                        tui::sanitize_terminal(cmd_name)
+                    )));
                 } else if !cmd_name.is_empty() {
                     tui::line(&tui::red(&format!(
                         "  unknown command /{cmd_name} — /help for all commands"
@@ -3391,6 +3444,14 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
     config::load_custom_commands()
         .into_iter()
         .find(|c| c.name == name)
+}
+
+// `/name …` naming one of the checkout's commands or skills that is off
+// because the folder is not trusted.
+fn untrusted_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    (find_custom_command(name).is_none() && config::is_untrusted_repo_command(cwd, name))
+        .then(|| name.to_string())
 }
 
 /// `/name args` naming a command or skill: that command and its arguments.
@@ -5104,6 +5165,8 @@ fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
         return;
     }
     let before = transcript.len();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    hooks::pre_compact("manual", "", &cwd);
     let taken = std::mem::take(transcript);
     *transcript = agent::compact_msgs(provider, taken);
     usage::forget_last();

@@ -7,6 +7,8 @@
 //   type: "python"   — path to a Python script (uses python3 or python)
 //   type: "script"   — any executable script path; runtime detected by extension
 //                      (.sh/.bash/.py/.rs everywhere; .ps1/.cmd/.bat on Windows)
+//   type: "http"     — POSTs the payload as JSON to `url`; the response body is
+//                      the hook's stdout
 //
 // Scripts in ~/.buildwithnexus/hooks/<Event>/*.{sh,py} are auto-discovered
 // without requiring settings.json entries.
@@ -32,11 +34,16 @@ enum Source {
     Project,
 }
 
-// Resolved command to run: either a shell command string or an interpreter+path.
+// Resolved command to run: a shell command string, an interpreter+path, or
+// a URL to POST to.
 #[derive(Clone)]
 enum HookCmd {
     Shell(String),   // run via sh -c / cmd /C
     Script(PathBuf), // auto-detected interpreter by extension
+    Http {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 // Watchdog defaults: a hung hook would otherwise freeze the single-threaded
@@ -154,10 +161,13 @@ const EVENTS: &[&str] = &[
     "PrePrompt",
     "PostResponse",
     "PreToolUse",
+    "PermissionRequest",
     "PostToolUse",
     "OnError",
     "Stop",
     "SubagentStop",
+    "PreCompact",
+    "Notification",
 ];
 
 // Claude Code's tool names and the bwn tools each stands for, so a matcher
@@ -165,20 +175,28 @@ const EVENTS: &[&str] = &[
 // same calls here.
 const CLAUDE_CODE_TOOLS: &[(&str, &[&str])] = &[
     ("Bash", &["run_command", "bash", "start_server"]),
+    // Claude Code changes files only with Write and Edit, so a guard on
+    // those two must also see bwn's other ways to change one.
     (
         "Edit",
         &[
             "edit_file",
             "edit",
+            "multi_edit",
             "patch",
             "apply_patch",
             "str_replace_editor",
             "text_editor_20241022",
             "text_editor_20250124",
+            "remove_path",
+            "move_path",
         ],
     ),
     ("MultiEdit", &["multi_edit"]),
-    ("Write", &["write_file", "write", "create_docx"]),
+    (
+        "Write",
+        &["write_file", "write", "create_docx", "create_dir"],
+    ),
     ("Read", &["read_file", "read", "read_many_files"]),
     ("Grep", &["grep_files", "grep"]),
     ("Glob", &["find_files", "find_paths", "glob"]),
@@ -336,19 +354,23 @@ fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut V
                         .as_str()
                         .or_else(|| h["script"].as_str())
                         .map(|p| HookCmd::Script(PathBuf::from(p))),
+                    Some("http") => http_hook(h),
                     _ => None,
                 };
                 let Some(cmd) = cmd else {
                     issues.push(match ty {
+                        Some("http") => format!(
+                            "a {event} hook of type http needs an http:// or https:// \"url\" — skipped"
+                        ),
                         Some(t @ ("command" | "python" | "script")) => {
                             let field = if t == "command" { "command" } else { "path" };
                             format!("a {event} hook of type {t} has no \"{field}\" — skipped")
                         }
                         Some(t) => format!(
-                            "unknown hook type {t} in {event} (use command, python or script) — skipped"
+                            "unknown hook type {t} in {event} (use command, python, script or http) — skipped"
                         ),
                         None => format!(
-                            "a {event} hook has no \"type\" (use command, python or script) — skipped"
+                            "a {event} hook has no \"type\" (use command, python, script or http) — skipped"
                         ),
                     });
                     continue;
@@ -381,6 +403,24 @@ fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut V
             }
         }
     }
+}
+
+// An `http` hook: its `url` (http or https) and any string `headers`.
+fn http_hook(h: &Value) -> Option<HookCmd> {
+    let url = h["url"].as_str().map(str::trim)?;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let headers = h["headers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+        .collect();
+    Some(HookCmd::Http {
+        url: url.to_string(),
+        headers,
+    })
 }
 
 // The known name a typo was most likely meant to be: same letters in another
@@ -422,6 +462,116 @@ fn matches(matcher: &str, tool: &str) -> bool {
         return !CONTROL_TOOLS.contains(&tool);
     }
     tool_matches(m, tool)
+}
+
+// `matches` for one call: a matcher naming the shell (`Bash`, `run_command`,
+// `bash`) also covers check_work and start_server when they carry a command,
+// as permission rules do, so a shell guard cannot be stepped around.
+fn matches_call(matcher: &str, tool: &str, input: Option<&Value>) -> bool {
+    matches(matcher, tool)
+        || input.is_some_and(|i| runs_a_command(tool, i))
+            && ["run_command", "bash"]
+                .iter()
+                .any(|t| tool_matches(matcher.trim(), t))
+}
+
+fn runs_a_command(tool: &str, input: &Value) -> bool {
+    matches!(tool, "check_work" | "start_server")
+        && input["command"]
+            .as_str()
+            .is_some_and(|c| !c.trim().is_empty())
+}
+
+// Claude Code's names for bwn's input fields, so a guard copied from a
+// Claude Code settings file finds `tool_input.file_path` (absolute, as
+// Claude Code sends it), `old_string`, `new_string`, `prompt` and the rest
+// beside bwn's own. Each alias carries the value the tool will use, never
+// one the model sent under the Claude Code name. A call that touches
+// several files (a move, read_many_files) gives one input per file, since
+// a guard checks one `file_path`.
+fn claude_code_inputs(tool: &str, input: &Value, cwd: &Path) -> Vec<Value> {
+    let Some(obj) = input.as_object() else {
+        return vec![input.clone()];
+    };
+    let mut obj = obj.clone();
+    // (Claude Code's field, bwn's fields in the order the tool reads them)
+    let aliases: &[(&str, &[&str])] = match tool {
+        "edit_file" | "edit" => &[
+            ("old_string", &["old", "oldString"]),
+            ("new_string", &["new", "newString"]),
+        ],
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => &[
+            ("old_string", &["old_str"]),
+            ("new_string", &["new_str"]),
+            ("content", &["file_text"]),
+        ],
+        "grep_files" => &[("glob", &["file_pattern"]), ("path", &["root"])],
+        "grep" => &[("glob", &["include"]), ("path", &["root"])],
+        "find_files" | "find_paths" | "glob" => &[("path", &["root"])],
+        "task" | "spawn_subagent" => &[("prompt", &["task"]), ("subagent_type", &["role"])],
+        _ => &[],
+    };
+    for (cc, ours) in aliases {
+        if let Some(v) = ours
+            .iter()
+            .find_map(|k| obj.get(*k).filter(|v| !v.is_null()))
+        {
+            obj.insert(cc.to_string(), v.clone());
+        }
+    }
+    if tool == "multi_edit" {
+        for e in obj
+            .get_mut("edits")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object_mut)
+        {
+            for (cc, ours) in [("old_string", "old"), ("new_string", "new")] {
+                if let Some(v) = e.get(ours).cloned() {
+                    e.insert(cc.to_string(), v);
+                }
+            }
+        }
+    }
+    if matches!(tool, "todo_write" | "todowrite") {
+        let todos: Vec<Value> = obj
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|i| json!({"content": i["task"], "status": i["status"]}))
+            .collect();
+        obj.insert("todos".into(), json!(todos));
+    }
+    // A search or listing names a folder (`path` above), not a file.
+    let folder = matches!(
+        tool,
+        "glob"
+            | "find_paths"
+            | "find_files"
+            | "grep"
+            | "grep_files"
+            | "list"
+            | "list_dir"
+            | "list_tree"
+    );
+    let paths = if folder {
+        Vec::new()
+    } else {
+        crate::tools::touched_paths(tool, input, cwd)
+    };
+    if paths.is_empty() {
+        return vec![Value::Object(obj)];
+    }
+    paths
+        .into_iter()
+        .map(|p| {
+            let mut one = obj.clone();
+            one.insert("file_path".into(), json!(p.to_string_lossy()));
+            Value::Object(one)
+        })
+        .collect()
 }
 
 /// Whether a matcher (`write_file|edit_file`, `Write|Edit`, `mcp__*`,
@@ -523,26 +673,28 @@ struct Selected {
     deny_on_error: bool,
 }
 
-fn commands_for(event: &str, tool: Option<&str>) -> Vec<Selected> {
+// The hooks for `event`; for a tool event, those whose matcher covers the
+// call (`call` is the tool and its input).
+fn commands_for(event: &str, call: Option<(&str, &Value)>) -> Vec<Selected> {
     #[cfg(test)]
     if let Some(found) = TEST_HOOKS.with(|t| {
         t.borrow()
             .as_ref()
-            .map(|list| select_hooks(list, event, tool))
+            .map(|list| select_hooks(list, event, call))
     }) {
         return found;
     }
     let Some(h) = HOOKS.get() else {
         return Vec::new();
     };
-    select_hooks(&h.list, event, tool)
+    select_hooks(&h.list, event, call)
 }
 
-fn select_hooks(list: &[Hook], event: &str, tool: Option<&str>) -> Vec<Selected> {
+fn select_hooks(list: &[Hook], event: &str, call: Option<(&str, &Value)>) -> Vec<Selected> {
     list.iter()
         .enumerate()
         .filter(|(_, hk)| hk.event == event)
-        .filter(|(_, hk)| tool.is_none_or(|t| matches(&hk.matcher, t)))
+        .filter(|(_, hk)| call.is_none_or(|(t, i)| matches_call(&hk.matcher, t, Some(i))))
         .map(|(index, hk)| Selected {
             index,
             cmd: hk.cmd.clone(),
@@ -563,6 +715,7 @@ fn hook_pins(cwd: &Path, cmd: &HookCmd) -> Vec<Pin> {
             path: p.to_string_lossy().into_owned(),
             if_present: false,
         }),
+        HookCmd::Http { .. } => {}
     }
     // A bare word that may name a file is pinned too: creating it later is
     // a change.
@@ -652,6 +805,7 @@ fn cmd_label(cmd: &HookCmd) -> String {
     match cmd {
         HookCmd::Shell(s) => trace::preview(s, 100),
         HookCmd::Script(path) => path.display().to_string(),
+        HookCmd::Http { url, .. } => format!("POST {}", trace::preview(url, 100)),
     }
 }
 
@@ -736,6 +890,11 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `sha256:<hex>` of `data`.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    format!("sha256:{}", hex(&sha256(data)))
 }
 
 // Project files a runner reads its targets from: `npm run x` runs whatever
@@ -1038,6 +1197,10 @@ const SYSTEM_MD_PREVIEW_LINES: usize = 8;
 // of a command.
 fn trust_details(f: &config::UntrustedProjectFile) -> Vec<String> {
     let mut out = Vec::new();
+    if f.name == config::PROJECT_EXTENSIONS {
+        // One `kind name (path)` per file.
+        return f.keys.iter().map(|k| shown(k)).collect();
+    }
     if f.name == config::PROJECT_SYSTEM_PROMPT {
         let lines: Vec<&str> = f.text.trim().lines().collect();
         for l in lines.iter().take(SYSTEM_MD_PREVIEW_LINES) {
@@ -1078,6 +1241,22 @@ fn trust_details(f: &config::UntrustedProjectFile) -> Vec<String> {
                                 Some(t @ ("python" | "script")) => {
                                     script().map(|p| format!("{t} {p}"))
                                 }
+                                // Where the payload goes; header names only,
+                                // as for MCP servers.
+                                Some("http") => match http_hook(h) {
+                                    Some(HookCmd::Http { url, headers }) if headers.is_empty() => {
+                                        Some(format!("http POST {url}"))
+                                    }
+                                    Some(HookCmd::Http { url, headers }) => {
+                                        let names: Vec<&str> =
+                                            headers.iter().map(|(k, _)| k.as_str()).collect();
+                                        Some(format!(
+                                            "http POST {url} (headers: {})",
+                                            names.join(", ")
+                                        ))
+                                    }
+                                    _ => None,
+                                },
                                 _ => None,
                             };
                             if let Some(what) = what {
@@ -1132,13 +1311,22 @@ fn trust_details(f: &config::UntrustedProjectFile) -> Vec<String> {
     out
 }
 
+// How a trust entry is named on screen.
+fn entry_label(name: &str) -> String {
+    if name == config::PROJECT_EXTENSIONS {
+        "commands, skills and agents from this repo".into()
+    } else {
+        format!(".buildwithnexus/{name}")
+    }
+}
+
 /// The body of the trust prompt: each file with what trusting it allows,
 /// then the project files those commands run, which the trust also pins.
 pub fn trust_prompt_lines(cwd: &Path, pending: &[config::UntrustedProjectFile]) -> Vec<String> {
     let mut out = Vec::new();
     let mut pinned: Vec<String> = Vec::new();
     for f in pending {
-        out.push(format!(".buildwithnexus/{}:", f.name));
+        out.push(format!("{}:", entry_label(f.name)));
         out.extend(trust_details(f).into_iter().map(|d| format!("  {d}")));
         for (r, _, canon) in project_refs(cwd, &f.text) {
             if canon.is_some_and(|c| c.is_file()) && !pinned.contains(&r) {
@@ -1196,6 +1384,7 @@ fn project_files(cwd: &Path) -> Vec<config::UntrustedProjectFile> {
             keys: vec!["system prompt".into()],
         });
     }
+    out.extend(config::project_extensions(cwd));
     out
 }
 
@@ -1225,7 +1414,7 @@ pub fn trust_cli(args: &[String]) -> i32 {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let Some(digest) = project_digest(&cwd) else {
-        eprintln!("no project settings here (.buildwithnexus/settings.json, settings.local.json or system.md)");
+        eprintln!("no project settings here (.buildwithnexus/settings.json, settings.local.json or system.md, or commands, skills or agents)");
         return 0;
     };
     println!("{digest}");
@@ -1253,10 +1442,7 @@ fn apply_run_trust(cwd: &Path) {
         }
         return;
     }
-    let mut covered: Vec<String> = files
-        .iter()
-        .map(|f| format!(".buildwithnexus/{}", f.name))
-        .collect();
+    let mut covered: Vec<String> = files.iter().map(|f| entry_label(f.name)).collect();
     for f in &files {
         for (r, _, canon) in project_refs(cwd, &f.text) {
             if canon.is_some_and(|c| c.is_file()) && !covered.contains(&r) {
@@ -1298,7 +1484,7 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     }
     let listing: Vec<String> = pending
         .iter()
-        .map(|f| format!(".buildwithnexus/{}: {}", f.name, f.keys.join(", ")))
+        .map(|f| format!("{}: {}", entry_label(f.name), f.keys.join(", ")))
         .map(|l| tui::sanitize_terminal(&l).into_owned())
         .collect();
     // The folder name comes from whoever made the checkout.
@@ -1318,18 +1504,27 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
     }
     let dir = config::project_key(cwd);
     let changed = read_trust_store().get(&dir).is_some();
+    // Only the repo's commands, skills and agents wait for a yes.
+    let only_extensions = pending.iter().all(|f| f.name == config::PROJECT_EXTENSIONS);
     tui::line("");
-    tui::line(&tui::yellow(&format!(
-        "  ⚠ {} has project settings that can run commands, send your API key elsewhere, loosen approvals, or add to the system prompt:",
-        shown_cwd
-    )));
+    tui::line(&tui::yellow(&if only_extensions {
+        format!(
+            "  ⚠ {shown_cwd} has commands, skills or agents that speak to the model for you or run code:"
+        )
+    } else {
+        format!(
+            "  ⚠ {shown_cwd} has project settings that can run commands, send your API key elsewhere, loosen approvals, or add to the system prompt:"
+        )
+    }));
     for l in trust_prompt_lines(cwd, &pending) {
         tui::line(&format!("    {l}"));
     }
     if changed {
-        tui::line(&tui::dim(
-            "    (settings for this folder changed since you last trusted them)",
-        ));
+        tui::line(&tui::dim(if only_extensions {
+            "    (new or changed since you last trusted this folder)"
+        } else {
+            "    (settings for this folder changed since you last trusted them)"
+        }));
     }
     let yes = |q: &str| {
         tui::ask(&format!("  {q} {} ", tui::dim("[y/N]")))
@@ -1343,10 +1538,17 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             .iter()
             .any(|k| !SEPARATE_TRUST_KEYS.contains(&k.as_str()))
     });
-    if general && !yes("Trust these project settings (hooks, MCP servers and the rest above)?") {
-        tui::line(&tui::dim(
-            "  (untrusted project settings ignored; harmless ones like model still apply)",
-        ));
+    let question = if only_extensions {
+        "Trust this repo's commands, skills and agents (above)?"
+    } else {
+        "Trust these project settings (hooks, MCP servers and the rest above)?"
+    };
+    if general && !yes(question) {
+        tui::line(&tui::dim(if only_extensions {
+            "  (not trusted: the repo's commands, skills and agents stay off; you'll be asked again next time)"
+        } else {
+            "  (untrusted project settings ignored; harmless ones like model still apply)"
+        }));
         return;
     }
     let mut declined: Vec<&str> = Vec::new();
@@ -1374,6 +1576,12 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             "  (trusted, except {} — your own settings apply there)",
             declined.join(" and ")
         )));
+    }
+    // A trusted settings file can add skill folders (`skill_dirs`): their
+    // skills are asked about now, not at the next start.
+    let more = config::untrusted_project_files(cwd);
+    if !only_extensions && more.iter().any(|f| f.name == config::PROJECT_EXTENSIONS) {
+        trust_project(cwd, interactive);
     }
 }
 
@@ -1476,6 +1684,74 @@ fn run_hook_cmd(cmd: &HookCmd, payload: &Value, cwd: &Path, timeout: Duration) -
     match cmd {
         HookCmd::Shell(s) => run_shell(s, payload, cwd, timeout),
         HookCmd::Script(path) => run_script(path, payload, cwd, timeout),
+        HookCmd::Http { url, headers } => run_http(url, headers, payload, cwd, timeout),
+    }
+}
+
+// An http hook: the payload POSTed as JSON through bwn's HTTP client (proxy
+// and certificate settings as for every request), within the hook's
+// timeout, following no redirects. The response body is the hook's stdout;
+// a status outside 2xx reads as exit 1. A host that network.deny names is
+// refused, as a hook that cannot start.
+fn run_http(
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+    cwd: &Path,
+    timeout: Duration,
+) -> HookRun {
+    static CLIENT: OnceLock<crate::net::Client> = OnceLock::new();
+    let host = crate::tools::network_host("fetch_url", &json!({ "url": url })).unwrap_or_default();
+    if let Some(why) = crate::agent::network_denied(cwd, &host) {
+        return HookRun::not_started(format!("{why}: {host}"));
+    }
+    let client = CLIENT.get_or_init(|| crate::net::Client::new(|b| b.redirects(0)));
+    let mut req = client
+        .post(url)
+        .timeout(timeout)
+        .set("Content-Type", "application/json");
+    for (k, v) in headers {
+        req = req.set(k, v);
+    }
+    let answered = |status: u16, body: String| {
+        let ok = (200..300).contains(&status);
+        HookRun {
+            code: if ok { 0 } else { 1 },
+            stderr: if ok {
+                String::new()
+            } else {
+                format!("HTTP {status}: {}", trace::preview(body.trim(), 300))
+            },
+            stdout: if ok { body } else { String::new() },
+            failure: None,
+        }
+    };
+    match req.send_string(&payload.to_string()) {
+        Ok(resp) => {
+            let status = resp.status();
+            answered(status, resp.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            answered(status, resp.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Transport(t)) => {
+            let why = t.to_string();
+            let failure = if why.contains("timed out") {
+                HookFailure::TimedOut(timeout)
+            } else {
+                HookFailure::NotStarted(trace::preview(&why, 200))
+            };
+            HookRun {
+                code: if matches!(failure, HookFailure::TimedOut(_)) {
+                    HOOK_TIMEOUT_CODE
+                } else {
+                    HOOK_SPAWN_FAILED_CODE
+                },
+                stdout: String::new(),
+                stderr: why,
+                failure: Some(failure),
+            }
+        }
     }
 }
 
@@ -1818,84 +2094,136 @@ fn decision_field(j: &Value) -> Option<&str> {
 }
 
 pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
-    let payload = with_fields(
-        base_payload("PreToolUse", cwd),
-        json!({"tool_name": tool, "tool_input": input}),
+    if commands_for("PreToolUse", Some((tool, input))).is_empty() {
+        return PreDecision::Continue;
+    }
+    // Every input (one per file the call touches) must pass, and the call
+    // counts as allowed only when the hooks allowed each one.
+    let mut allowed = true;
+    for tool_input in claude_code_inputs(tool, input, cwd) {
+        match pre_tool_use_with(tool, input, &tool_input, cwd) {
+            PreDecision::Deny(r) => return PreDecision::Deny(r),
+            PreDecision::Allow => {}
+            PreDecision::Continue => allowed = false,
+        }
+    }
+    if allowed {
+        PreDecision::Allow
+    } else {
+        PreDecision::Continue
+    }
+}
+
+// Runs one chosen hook for `event` and records it in the trace; `about` is
+// what the event is about (`("tool", "write_file")`), for the trace. None
+// when a project hook's files changed and the user did not agree to run it.
+fn run_selected(
+    event: &str,
+    about: Option<(&str, &str)>,
+    s: &Selected,
+    payload: &Value,
+    cwd: &Path,
+) -> Option<HookRun> {
+    if !still_trusted(s.index, event) {
+        return None;
+    }
+    let title = match about {
+        Some((_, what)) => format!("{event}:{what}"),
+        None => event.to_string(),
+    };
+    let mut fields = json!({
+        "event": event,
+        "matcher": s.matcher,
+        "source": source_label(s.source),
+        "command": cmd_label(&s.cmd),
+    });
+    if let Some((key, what)) = about {
+        fields[key] = json!(what);
+    }
+    trace::record_visible(
+        "hook",
+        format!("{title} {}", cmd_label(&s.cmd)),
+        with_fields(fields.clone(), json!({"trigger": payload})),
     );
-    for Selected {
-        index,
-        cmd,
-        source,
-        matcher,
-        timeout,
-        deny_on_error,
-    } in commands_for("PreToolUse", Some(tool))
-    {
-        if !still_trusted(index, "PreToolUse") {
-            continue;
-        }
-        if !report::is_json() {
-            tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
-        }
-        trace::record_visible(
-            "hook",
-            format!("PreToolUse:{tool} {}", cmd_label(&cmd)),
+    let run = run_hook_cmd(&s.cmd, payload, cwd, s.timeout);
+    trace::record_visible(
+        "hook_result",
+        format!("{title} {}", run.status()),
+        with_fields(
+            fields,
             json!({
-                "event": "PreToolUse",
-                "tool": tool,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "trigger": payload,
-            }),
-        );
-        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
-        trace::record_visible(
-            "hook_result",
-            format!("PreToolUse:{tool} {}", run.status()),
-            json!({
-                "event": "PreToolUse",
-                "tool": tool,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
                 "exit_code": run.code,
                 "error": run.failure.as_ref().map(HookFailure::describe),
                 "stdout": run.stdout,
                 "stderr": run.stderr,
             }),
-        );
+        ),
+    );
+    Some(run)
+}
+
+// A hook's stdout as JSON, when it is JSON.
+fn stdout_json(run: &HookRun) -> Option<Value> {
+    serde_json::from_str::<Value>(run.stdout.trim()).ok()
+}
+
+// A non-empty string field, trimmed.
+fn text_field(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+// What a hook that exited 2 says: its stderr, or `default`.
+fn exit2_reason(run: &HookRun, default: &str) -> String {
+    text_field(&json!(run.stderr)).unwrap_or_else(|| default.to_string())
+}
+
+// PreToolUse for one call, its hooks chosen by `input` and sent `tool_input`.
+fn pre_tool_use_with(tool: &str, input: &Value, tool_input: &Value, cwd: &Path) -> PreDecision {
+    let cmds = commands_for("PreToolUse", Some((tool, input)));
+    if cmds.is_empty() {
+        return PreDecision::Continue;
+    }
+    let payload = with_fields(
+        base_payload("PreToolUse", cwd),
+        json!({"tool_name": tool, "tool_input": tool_input}),
+    );
+    for s in &cmds {
+        if !report::is_json() {
+            tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
+        }
+        let Some(run) = run_selected("PreToolUse", Some(("tool", tool)), s, &payload, cwd) else {
+            continue;
+        };
+        let (cmd, source) = (&s.cmd, s.source);
         // Fail closed: a guard that timed out, never started or was killed
         // gave no answer, and no answer must not let the call through.
         if let Some(f) = &run.failure {
             return PreDecision::Deny(format!(
                 "PreToolUse hook `{}` {}, so this {tool} call was blocked. {}",
-                cmd_label(&cmd),
+                cmd_label(cmd),
                 f.describe(),
-                fix_hint(source, &cmd, Some(f))
+                fix_hint(source, cmd, Some(f))
             ));
         }
         if run.code == 2 {
-            let r = run.stderr.trim();
-            return PreDecision::Deny(if r.is_empty() {
-                "blocked by PreToolUse hook".into()
-            } else {
-                r.to_string()
-            });
+            return PreDecision::Deny(exit2_reason(&run, "blocked by PreToolUse hook"));
         }
         // A guard that crashed gave no answer: with `"on_error": "deny"`
         // that blocks the call, otherwise it is a loud warning.
-        if run.code != 0 && deny_on_error {
+        if run.code != 0 && s.deny_on_error {
             return PreDecision::Deny(format!(
                 "PreToolUse hook `{}` exited {}{}, so this {tool} call was blocked (on_error: deny). {}",
-                cmd_label(&cmd),
+                cmd_label(cmd),
                 run.code,
                 stderr_detail(&run.stderr),
-                fix_hint(source, &cmd, None)
+                fix_hint(source, cmd, None)
             ));
         }
-        report_problem("PreToolUse", source, &cmd, &run);
-        if let Ok(j) = serde_json::from_str::<Value>(&run.stdout) {
+        report_problem("PreToolUse", source, cmd, &run);
+        if let Some(j) = stdout_json(&run) {
             match decision_field(&j) {
                 Some("deny") | Some("block") => {
                     let reason = j["hookSpecificOutput"]["permissionDecisionReason"]
@@ -1912,60 +2240,66 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
     PreDecision::Continue
 }
 
-pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, cwd: &Path) {
-    let cmds = commands_for("PostToolUse", Some(tool));
+/// PostToolUse, after a call ran. Returns what its hooks tell the model,
+/// to add to the call's result (Claude Code compatible): the reason of
+/// `{"decision": "block", "reason": …}`, `additionalContext` from
+/// `hookSpecificOutput`, or the stderr of a hook that exited 2. The call
+/// itself already happened either way.
+pub fn post_tool_use(
+    tool: &str,
+    input: &Value,
+    response: &str,
+    is_error: bool,
+    cwd: &Path,
+) -> Option<String> {
+    let cmds = commands_for("PostToolUse", Some((tool, input)));
     if cmds.is_empty() {
-        return;
+        return None;
     }
+    // After a move, the file that is there now.
+    let tool_input = claude_code_inputs(tool, input, cwd).pop();
     let payload = with_fields(
         base_payload("PostToolUse", cwd),
         json!({
-            "tool_name": tool, "tool_input": input,
+            "tool_name": tool, "tool_input": tool_input,
             "tool_response": {"content": response, "is_error": is_error},
         }),
     );
-    for Selected {
-        index,
-        cmd,
-        source,
-        matcher,
-        timeout,
-        ..
-    } in cmds
-    {
-        if !still_trusted(index, "PostToolUse") {
+    let mut said = Vec::new();
+    for s in &cmds {
+        let Some(run) = run_selected("PostToolUse", Some(("tool", tool)), s, &payload, cwd) else {
+            continue;
+        };
+        if run.failure.is_none() && run.code == 2 {
+            said.push(exit2_reason(
+                &run,
+                "a PostToolUse hook objected to this result",
+            ));
             continue;
         }
-        trace::record_visible(
-            "hook",
-            format!("PostToolUse:{tool} {}", cmd_label(&cmd)),
-            json!({
-                "event": "PostToolUse",
-                "tool": tool,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "trigger": payload,
-            }),
-        );
-        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
-        trace::record_visible(
-            "hook_result",
-            format!("PostToolUse:{tool} {}", run.status()),
-            json!({
-                "event": "PostToolUse",
-                "tool": tool,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "exit_code": run.code,
-                "error": run.failure.as_ref().map(HookFailure::describe),
-                "stdout": run.stdout,
-                "stderr": run.stderr,
-            }),
-        );
-        report_problem("PostToolUse", source, &cmd, &run);
+        report_problem("PostToolUse", s.source, &s.cmd, &run);
+        let Some(j) = stdout_json(&run) else {
+            continue;
+        };
+        if j["decision"].as_str() == Some("block") {
+            said.push(
+                text_field(&j["reason"])
+                    .unwrap_or_else(|| "a PostToolUse hook objected to this result".into()),
+            );
+        }
+        said.extend(text_field(&j["hookSpecificOutput"]["additionalContext"]));
     }
+    if said.is_empty() {
+        return None;
+    }
+    let text = cap_hook_context(&said.join("\n"));
+    if !report::is_json() {
+        tui::line(&tui::dim(&format!(
+            "  [hook] PostToolUse:{tool} → {}",
+            tui::sanitize_terminal(&trace::preview(&text, 160))
+        )));
+    }
+    Some(format!("[PostToolUse hook]\n{text}"))
 }
 
 pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
@@ -1974,59 +2308,143 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
         json!({"prompt": prompt}),
     );
     let mut ctx = String::new();
-    for Selected {
-        index,
-        cmd,
-        source,
-        matcher,
-        timeout,
-        ..
-    } in commands_for("UserPromptSubmit", None)
-    {
-        if !still_trusted(index, "UserPromptSubmit") {
+    for s in &commands_for("UserPromptSubmit", None) {
+        let Some(run) = run_selected("UserPromptSubmit", None, s, &payload, cwd) else {
             continue;
-        }
-        trace::record_visible(
-            "hook",
-            format!("UserPromptSubmit {}", cmd_label(&cmd)),
-            json!({
-                "event": "UserPromptSubmit",
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "trigger": payload,
-            }),
-        );
-        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
-        trace::record_visible(
-            "hook_result",
-            format!("UserPromptSubmit {}", run.status()),
-            json!({
-                "event": "UserPromptSubmit",
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "exit_code": run.code,
-                "error": run.failure.as_ref().map(HookFailure::describe),
-                "stdout": run.stdout,
-                "stderr": run.stderr,
-            }),
-        );
+        };
         if run.failure.is_none() && run.code == 2 {
-            let r = run.stderr.trim();
-            return Err(if r.is_empty() {
-                "blocked by UserPromptSubmit hook".into()
-            } else {
-                r.to_string()
-            });
+            return Err(exit2_reason(&run, "blocked by UserPromptSubmit hook"));
         }
-        report_problem("UserPromptSubmit", source, &cmd, &run);
+        report_problem("UserPromptSubmit", s.source, &s.cmd, &run);
         if !run.stdout.trim().is_empty() {
             ctx.push_str(&cap_hook_context(run.stdout.trim()));
             ctx.push('\n');
         }
     }
     Ok(ctx)
+}
+
+/// Stop or SubagentStop, when the agent (or a helper) is done answering.
+/// Returns why a hook wants it to go on instead (Claude Code compatible: it
+/// exited 2, or answered `{"decision": "block", "reason": …}`), every such
+/// reason joined; the caller sends that as the next user message. `extra`
+/// carries the event's own fields, such as `stop_hook_active`.
+pub fn stop(event: &str, cwd: &Path, extra: Value) -> Option<String> {
+    let cmds = commands_for(event, None);
+    if cmds.is_empty() {
+        return None;
+    }
+    let payload = with_fields(base_payload(event, cwd), extra);
+    let default = format!("a {event} hook asked to continue");
+    let mut reasons = Vec::new();
+    for s in &cmds {
+        let Some(run) = run_selected(event, None, s, &payload, cwd) else {
+            continue;
+        };
+        if run.failure.is_none() && run.code == 2 {
+            reasons.push(exit2_reason(&run, &default));
+            continue;
+        }
+        report_problem(event, s.source, &s.cmd, &run);
+        if let Some(j) = stdout_json(&run).filter(|j| j["decision"].as_str() == Some("block")) {
+            reasons.push(text_field(&j["reason"]).unwrap_or_else(|| default.clone()));
+        }
+    }
+    (!reasons.is_empty()).then(|| cap_hook_context(&reasons.join("\n")))
+}
+
+/// PermissionRequest, where bwn is about to ask the user to approve a call
+/// (`label` is what the prompt says). A hook may answer for the user
+/// (Claude Code compatible): `{"hookSpecificOutput": {"decision":
+/// {"behavior": "allow" | "deny" | "ask", "message": …}}}`, or
+/// `{"decision": …}` / `permissionDecision`; exit 2 denies with its stderr.
+/// Only the user's own hooks can allow: a project hook may deny, never
+/// grant. Continue means ask as usual, as does a hook that fails.
+pub fn permission_request(tool: &str, input: &Value, label: &str, cwd: &Path) -> PreDecision {
+    let cmds = commands_for("PermissionRequest", Some((tool, input)));
+    if cmds.is_empty() {
+        return PreDecision::Continue;
+    }
+    // As for PreToolUse: every input must pass, and each must be allowed.
+    let mut allowed = true;
+    for tool_input in claude_code_inputs(tool, input, cwd) {
+        let payload = with_fields(
+            base_payload("PermissionRequest", cwd),
+            json!({"tool_name": tool, "tool_input": tool_input, "message": label}),
+        );
+        match permission_request_with(tool, &cmds, &payload, cwd) {
+            PreDecision::Deny(r) => return PreDecision::Deny(r),
+            PreDecision::Allow => {}
+            PreDecision::Continue => allowed = false,
+        }
+    }
+    if allowed {
+        PreDecision::Allow
+    } else {
+        PreDecision::Continue
+    }
+}
+
+fn permission_request_with(
+    tool: &str,
+    cmds: &[Selected],
+    payload: &Value,
+    cwd: &Path,
+) -> PreDecision {
+    for s in cmds {
+        let Some(run) = run_selected("PermissionRequest", Some(("tool", tool)), s, payload, cwd)
+        else {
+            continue;
+        };
+        if run.failure.is_none() && run.code == 2 {
+            return PreDecision::Deny(exit2_reason(&run, "denied by PermissionRequest hook"));
+        }
+        report_problem("PermissionRequest", s.source, &s.cmd, &run);
+        let Some(j) = stdout_json(&run) else {
+            continue;
+        };
+        let d = &j["hookSpecificOutput"]["decision"];
+        let behavior = d["behavior"]
+            .as_str()
+            .or_else(|| d.as_str())
+            .or_else(|| decision_field(&j));
+        match behavior {
+            Some("deny") | Some("block") => {
+                let reason = text_field(&d["message"])
+                    .or_else(|| text_field(&j["reason"]))
+                    .or_else(|| text_field(&j["hookSpecificOutput"]["permissionDecisionReason"]))
+                    .unwrap_or_else(|| "denied by PermissionRequest hook".into());
+                return PreDecision::Deny(reason);
+            }
+            Some("allow") if s.source == Source::Home => return PreDecision::Allow,
+            _ => {}
+        }
+    }
+    PreDecision::Continue
+}
+
+/// PreCompact, before the conversation is summarized to free context:
+/// `trigger` is "auto" or "manual" (`/compact`), and a matcher matches it.
+pub fn pre_compact(trigger: &str, instructions: &str, cwd: &Path) {
+    fire(
+        "PreCompact",
+        Some(("trigger", trigger)),
+        cwd,
+        json!({"trigger": trigger, "custom_instructions": instructions}),
+    );
+}
+
+/// Notification, where bwn would raise a desktop notification: `kind` is
+/// "permission_prompt" (an approval is waiting), "question" (the model
+/// asked something), "idle_prompt" (the prompt has waited) or "done" (a
+/// turn ended), and a matcher matches it.
+pub fn notification(kind: &str, message: &str, cwd: &Path) {
+    fire(
+        "Notification",
+        Some(("notification_type", kind)),
+        cwd,
+        json!({"notification_type": kind, "message": message, "title": "buildwithnexus"}),
+    );
 }
 
 // Hook stdout is injected into the model prompt; an unbounded hook could blow
@@ -2110,6 +2528,7 @@ pub fn list_active() -> Vec<String> {
             let cmd_str = match &h.cmd {
                 HookCmd::Shell(s) => s.clone(),
                 HookCmd::Script(p) => p.display().to_string(),
+                HookCmd::Http { url, .. } => format!("POST {url}"),
             };
             out.push(format!("{} ({}): {}", h.event, h.matcher, cmd_str));
         }
@@ -2121,53 +2540,25 @@ pub fn notify(event: &str, cwd: &Path) {
     notify_with(event, cwd, json!({}));
 }
 
-// Lifecycle notification carrying extra payload fields, e.g. SubagentStop's
-// `tool_name`/`tool_input` — the completed subagent call.
+// Lifecycle notification carrying extra payload fields.
 pub fn notify_with(event: &str, cwd: &Path, extra: Value) {
-    let cmds = commands_for(event, None);
+    fire(event, None, cwd, extra);
+}
+
+// Runs `event`'s hooks, which only notify: a failure is shown, never acted
+// on. `about` is what a matcher matches (`("trigger", "auto")`), if the
+// event has one.
+fn fire(event: &str, about: Option<(&str, &str)>, cwd: &Path, extra: Value) {
+    static NO_INPUT: Value = Value::Null;
+    let cmds = commands_for(event, about.map(|(_, what)| (what, &NO_INPUT)));
     if cmds.is_empty() {
         return;
     }
     let payload = with_fields(base_payload(event, cwd), extra);
-    for Selected {
-        index,
-        cmd,
-        source,
-        matcher,
-        timeout,
-        ..
-    } in cmds
-    {
-        if !still_trusted(index, event) {
-            continue;
+    for s in &cmds {
+        if let Some(run) = run_selected(event, about, s, &payload, cwd) {
+            report_problem(event, s.source, &s.cmd, &run);
         }
-        trace::record_visible(
-            "hook",
-            format!("{event} {}", cmd_label(&cmd)),
-            json!({
-                "event": event,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "trigger": payload,
-            }),
-        );
-        let run = run_hook_cmd(&cmd, &payload, cwd, timeout);
-        trace::record_visible(
-            "hook_result",
-            format!("{event} {}", run.status()),
-            json!({
-                "event": event,
-                "matcher": matcher,
-                "source": source_label(source),
-                "command": cmd_label(&cmd),
-                "exit_code": run.code,
-                "error": run.failure.as_ref().map(HookFailure::describe),
-                "stdout": run.stdout,
-                "stderr": run.stderr,
-            }),
-        );
-        report_problem(event, source, &cmd, &run);
     }
 }
 
@@ -2244,6 +2635,132 @@ mod tests {
     }
 
     #[test]
+    fn shell_and_file_matchers_cover_bwns_other_tools() {
+        let cmd = json!({"command": "make test"});
+        for m in ["Bash", "run_command", "bash"] {
+            assert!(matches_call(m, "check_work", Some(&cmd)), "{m}");
+            assert!(matches_call(m, "start_server", Some(&cmd)), "{m}");
+        }
+        // check_work without a command runs the project's own checks.
+        assert!(!matches_call(
+            "Bash",
+            "check_work",
+            Some(&json!({"only": "test"}))
+        ));
+        assert!(!matches_call("Write", "check_work", Some(&cmd)));
+        for t in ["remove_path", "move_path", "create_dir", "multi_edit"] {
+            assert!(matches("Write|Edit", t), "{t}");
+        }
+        assert!(!matches("Write|Edit", "read_file"));
+    }
+
+    #[test]
+    fn claude_code_field_names_ride_along_with_bwns() {
+        let cwd = Path::new("/proj");
+        let at = |p: &str| cwd.join(p).to_string_lossy().into_owned();
+        let one = |tool: &str, input: Value| {
+            let mut v = claude_code_inputs(tool, &input, cwd);
+            assert_eq!(v.len(), 1, "{tool}: {v:?}");
+            v.remove(0)
+        };
+        let w = one("write_file", json!({"path": "a.txt", "content": "x"}));
+        assert_eq!(w["file_path"], at("a.txt"));
+        assert_eq!(
+            (w["path"].as_str(), w["content"].as_str()),
+            (Some("a.txt"), Some("x"))
+        );
+        let e = one(
+            "edit_file",
+            json!({"path": "a.txt", "old": "o", "new": "n"}),
+        );
+        assert_eq!(
+            (e["old_string"].as_str(), e["new_string"].as_str()),
+            (Some("o"), Some("n"))
+        );
+        // The model cannot show a guard another file or other text.
+        let e = one(
+            "edit_file",
+            json!({"path": "a.txt", "file_path": "/elsewhere", "old": "o", "old_string": "x"}),
+        );
+        assert_eq!(e["file_path"], at("a.txt"));
+        assert_eq!(e["old_string"], "o");
+        let e = one(
+            "edit",
+            json!({"filePath": "a.txt", "oldString": "o", "newString": "n"}),
+        );
+        assert_eq!(
+            (e["old_string"].as_str(), e["file_path"].as_str()),
+            (Some("o"), Some(&*at("a.txt")))
+        );
+        let m = one(
+            "multi_edit",
+            json!({"path": "a", "edits": [{"old": "1", "new": "2"}]}),
+        );
+        assert_eq!(m["edits"][0]["old_string"], "1");
+        assert_eq!(m["edits"][0]["new_string"], "2");
+        let c = one(
+            "str_replace_editor",
+            json!({"command": "create", "path": "a", "file_text": "t"}),
+        );
+        assert_eq!(c["content"], "t");
+        for (tool, input) in [
+            ("remove_path", json!({"path": "gone"})),
+            ("create_dir", json!({"path": "gone"})),
+            ("read_file", json!({"path": "gone"})),
+        ] {
+            assert_eq!(one(tool, input)["file_path"], at("gone"), "{tool}");
+        }
+        let moved = claude_code_inputs("move_path", &json!({"from": "a", "to": "b"}), cwd);
+        let paths: Vec<&str> = moved
+            .iter()
+            .filter_map(|v| v["file_path"].as_str())
+            .collect();
+        assert_eq!(paths, [at("a"), at("b")]);
+        // The paths the move uses: it trims what it was sent.
+        let moved = claude_code_inputs("move_path", &json!({"from": " a", "to": ".env "}), cwd);
+        let paths: Vec<&str> = moved
+            .iter()
+            .filter_map(|v| v["file_path"].as_str())
+            .collect();
+        assert_eq!(paths, [at("a"), at(".env")]);
+        // A patch is shown once per file it changes.
+        let patched = claude_code_inputs(
+            "apply_patch",
+            &json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-1\n+2\n--- /dev/null\n+++ b/y\n@@ -0,0 +1 @@\n+n\n"}),
+            cwd,
+        );
+        let paths: Vec<&str> = patched
+            .iter()
+            .filter_map(|v| v["file_path"].as_str())
+            .collect();
+        assert_eq!(paths, [at("x"), at("y")]);
+        let g = one(
+            "grep_files",
+            json!({"root": "src", "pattern": "x", "file_pattern": "*.rs"}),
+        );
+        assert_eq!(
+            (g["path"].as_str(), g["glob"].as_str()),
+            (Some("src"), Some("*.rs"))
+        );
+        assert!(g.get("file_path").is_none(), "a search names a folder");
+        let t = one("task", json!({"task": "do it", "role": "researcher"}));
+        assert_eq!(
+            (t["prompt"].as_str(), t["subagent_type"].as_str()),
+            (Some("do it"), Some("researcher"))
+        );
+        let todo = one(
+            "todo_write",
+            json!({"items": [{"task": "a", "status": "pending"}]}),
+        );
+        assert_eq!(
+            todo["todos"][0],
+            json!({"content": "a", "status": "pending"})
+        );
+        let r = json!({"command": "ls"});
+        assert_eq!(one("run_command", r.clone()), r);
+    }
+
+    #[test]
     fn catch_all_matchers_leave_control_tools_alone() {
         for m in ["*", "", ".*"] {
             assert!(matches(m, "write_file"), "{m:?}");
@@ -2273,7 +2790,9 @@ mod tests {
             "{all}"
         );
         assert!(
-            all.contains("unknown hook type cmd in PostToolUse (use command, python or script)"),
+            all.contains(
+                "unknown hook type cmd in PostToolUse (use command, python, script or http)"
+            ),
             "{all}"
         );
         assert!(all.contains("has no \"command\""), "{all}");
@@ -2656,8 +3175,12 @@ mod tests {
     // Makes `settings` (a settings.json with a "hooks" block) the only hooks
     // this thread sees while `f` runs.
     fn with_hooks<T>(settings: &str, f: impl FnOnce() -> T) -> T {
+        with_hooks_from(Source::Home, settings, f)
+    }
+
+    fn with_hooks_from<T>(source: Source, settings: &str, f: impl FnOnce() -> T) -> T {
         let mut list = Vec::new();
-        parse_into(settings, Source::Home, &mut list);
+        parse_into(settings, source, &mut list);
         assert!(!list.is_empty(), "no hooks parsed from {settings}");
         TEST_HOOKS.with(|t| *t.borrow_mut() = Some(list));
         let out = f();
@@ -2688,6 +3211,263 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ── decision control and the newer events ───────────────────────────
+
+    // Settings with `event` hooks running each command line, in order.
+    #[cfg(unix)]
+    fn event_settings(event: &str, matcher: &str, commands: &[&str]) -> String {
+        let hooks: Vec<Value> = commands
+            .iter()
+            .map(|c| json!({"type": "command", "command": c}))
+            .collect();
+        json!({"hooks": {event: [{"matcher": matcher, "hooks": hooks}]}}).to_string()
+    }
+
+    #[test]
+    fn newer_events_and_http_hooks_parse() {
+        let text = json!({"hooks": {
+            "PreCompact": [{"matcher": "manual", "hooks": [{"type": "command", "command": "a"}]}],
+            "Notification": [{"hooks": [{"type": "http", "url": "https://h.example/n",
+                "headers": {"Authorization": "Bearer t"}}]}],
+            "PermissionRequest": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "b"}]}],
+            "Stop": [{"hooks": [{"type": "http"}, {"type": "http", "url": "ftp://x"}]}]
+        }})
+        .to_string();
+        let (mut out, mut issues) = (Vec::new(), Vec::new());
+        parse_checked(&text, Source::Home, &mut out, &mut issues);
+        let mut events: Vec<&str> = out.iter().map(|h| h.event.as_str()).collect();
+        events.sort_unstable();
+        assert_eq!(events, ["Notification", "PermissionRequest", "PreCompact"]);
+        let http = out.iter().find(|h| h.event == "Notification").unwrap();
+        assert!(matches!(&http.cmd, HookCmd::Http { url, headers }
+            if url == "https://h.example/n" && headers == &[("Authorization".to_string(), "Bearer t".to_string())]));
+        assert_eq!(cmd_label(&http.cmd), "POST https://h.example/n");
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues
+            .iter()
+            .all(|i| i.contains("type http needs an http:// or https:// \"url\"")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn post_tool_use_feedback_is_added_for_the_model() {
+        let dir = hook_test_dir("post-feedback");
+        let settings = event_settings(
+            "PostToolUse",
+            "Write|Edit",
+            &[
+                r#"echo '{"decision":"block","reason":"lint: missing semicolon"}'"#,
+                r#"echo '{"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"formatted with prettier"}}'"#,
+                "echo 'tests broke' >&2; exit 2",
+                "echo plain text is not feedback",
+            ],
+        );
+        let said = with_hooks(&settings, || {
+            post_tool_use(
+                "write_file",
+                &json!({"path": "a.js", "content": "x"}),
+                "wrote",
+                false,
+                &dir,
+            )
+        })
+        .expect("feedback");
+        assert!(said.starts_with("[PostToolUse hook]\n"), "{said}");
+        for part in [
+            "lint: missing semicolon",
+            "formatted with prettier",
+            "tests broke",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert!(!said.contains("plain text"), "{said}");
+        let quiet = event_settings("PostToolUse", "*", &["echo ok"]);
+        let none = with_hooks(&quiet, || {
+            post_tool_use("write_file", &json!({"path": "a.js"}), "wrote", false, &dir)
+        });
+        assert_eq!(none, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stop_hooks_can_ask_to_go_on() {
+        let dir = hook_test_dir("stop");
+        // Asks once, then lets the agent stop when it is already going on.
+        let once = event_settings(
+            "Stop",
+            "*",
+            &[
+                r#"grep -q '"stop_hook_active":true' && exit 0; echo 'run the tests first' >&2; exit 2"#,
+            ],
+        );
+        let first = with_hooks(&once, || {
+            stop("Stop", &dir, json!({"stop_hook_active": false}))
+        });
+        assert_eq!(first.as_deref(), Some("run the tests first"));
+        let again = with_hooks(&once, || {
+            stop("Stop", &dir, json!({"stop_hook_active": true}))
+        });
+        assert_eq!(again, None);
+        let json_block = event_settings(
+            "SubagentStop",
+            "*",
+            &[r#"echo '{"decision":"block","reason":"also update the docs"}'"#],
+        );
+        let r = with_hooks(&json_block, || stop("SubagentStop", &dir, json!({})));
+        assert_eq!(r.as_deref(), Some("also update the docs"));
+        // A crash is shown, never read as "go on".
+        let broken = event_settings("Stop", "*", &["exit 1"]);
+        assert_eq!(with_hooks(&broken, || stop("Stop", &dir, json!({}))), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn permission_request_answers_for_the_user() {
+        let dir = hook_test_dir("permreq");
+        let call = json!({"command": "npm test"});
+        let ask = |source: Source, cmd: &str| {
+            let settings = event_settings("PermissionRequest", "Bash", &[cmd]);
+            with_hooks_from(source, &settings, || {
+                permission_request("run_command", &call, "run npm test", &dir)
+            })
+        };
+        let allow = r#"echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'"#;
+        assert!(matches!(ask(Source::Home, allow), PreDecision::Allow));
+        // A project hook can refuse, never grant.
+        assert!(matches!(ask(Source::Project, allow), PreDecision::Continue));
+        let deny = r#"echo '{"hookSpecificOutput":{"decision":{"behavior":"deny","message":"no tests on Fridays"}}}'"#;
+        assert_eq!(
+            deny_reason(ask(Source::Project, deny)),
+            "no tests on Fridays"
+        );
+        assert_eq!(
+            deny_reason(ask(Source::Home, "echo nope >&2; exit 2")),
+            "nope"
+        );
+        assert!(matches!(
+            ask(Source::Home, r#"echo '{"decision":"ask"}'"#),
+            PreDecision::Continue
+        ));
+        // A hook that fails leaves it to the prompt.
+        assert!(matches!(ask(Source::Home, "exit 7"), PreDecision::Continue));
+        // The payload is the call, with Claude Code's names and the prompt.
+        let seen = dir.join("seen.json");
+        let log = format!("cat > {}", seen.display());
+        ask(Source::Home, &log);
+        let payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        assert_eq!(payload["hook_event_name"], "PermissionRequest");
+        assert_eq!(payload["tool_input"]["command"], "npm test");
+        assert_eq!(payload["message"], "run npm test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_compact_and_notification_match_their_kind() {
+        let dir = hook_test_dir("subjects");
+        let marker = dir.join("ran.txt");
+        let append = format!("cat >> {}; echo >> {}", marker.display(), marker.display());
+        let ran = || std::fs::read_to_string(&marker).unwrap_or_default();
+        let settings = event_settings("PreCompact", "manual", &[&append]);
+        with_hooks(&settings, || pre_compact("auto", "", &dir));
+        assert_eq!(ran(), "", "matcher manual skips an automatic compaction");
+        with_hooks(&settings, || pre_compact("manual", "", &dir));
+        assert!(ran().contains(r#""trigger":"manual""#), "{}", ran());
+        let settings = event_settings("Notification", "permission_prompt|idle_prompt", &[&append]);
+        with_hooks(&settings, || notification("done", "done", &dir));
+        assert!(!ran().contains("Notification"), "{}", ran());
+        with_hooks(&settings, || {
+            notification("permission_prompt", "approval needed: run x", &dir)
+        });
+        let n: Value = serde_json::from_str(ran().lines().last().unwrap()).unwrap();
+        assert_eq!(n["notification_type"], "permission_prompt");
+        assert_eq!(n["message"], "approval needed: run x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A one-request HTTP server answering `status` and `body`; the request
+    // it got comes back on the channel.
+    fn http_once(status: &'static str, body: &'static str) -> (u16, mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0
+                    || line == "\r\n"
+                {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+                head.push_str(&line);
+            }
+            let mut buf = vec![0u8; len];
+            let _ = reader.read_exact(&mut buf);
+            let _ = tx.send(format!("{head}\r\n{}", String::from_utf8_lossy(&buf)));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn http_hooks_post_the_payload_and_read_the_answer() {
+        let dir = hook_test_dir("http");
+        let (port, got) = http_once("200 OK", r#"{"decision":"block","reason":"from the web"}"#);
+        let settings = json!({"hooks": {"Stop": [{"hooks": [{"type": "http",
+            "url": format!("http://127.0.0.1:{port}/hook"), "headers": {"X-Token": "t1"}}]}]}})
+        .to_string();
+        let r = with_hooks(&settings, || {
+            stop("Stop", &dir, json!({"stop_hook_active": false}))
+        });
+        assert_eq!(r.as_deref(), Some("from the web"));
+        let req = got.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(req.starts_with("POST /hook "), "{req}");
+        assert!(req.to_ascii_lowercase().contains("x-token: t1"), "{req}");
+        assert!(req.contains(r#""hook_event_name":"Stop""#), "{req}");
+
+        let (port, _got) = http_once("500 Internal Server Error", "oops");
+        let cmd = HookCmd::Http {
+            url: format!("http://127.0.0.1:{port}/"),
+            headers: Vec::new(),
+        };
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        assert!(run.failure.is_none() && run.code == 1, "{}", run.status());
+        assert_eq!(
+            problem_message("Stop", Source::Home, &cmd, &run).as_deref(),
+            Some(&*format!(
+                "Stop hook `POST http://127.0.0.1:{port}/` exited 1: HTTP 500: oops"
+            ))
+        );
+        // Nothing listening: the hook could not run, so a guard blocks.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let settings = json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "http",
+            "url": format!("http://127.0.0.1:{port}/")}]}]}})
+        .to_string();
+        let d = with_hooks(&settings, || {
+            pre_tool_use("run_command", &json!({"command": "ls"}), &dir)
+        });
+        assert!(deny_reason(d).contains("could not start"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

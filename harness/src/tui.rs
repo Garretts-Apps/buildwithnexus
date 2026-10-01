@@ -8,7 +8,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
@@ -122,6 +122,15 @@ fn osc9_4_is_progress() -> bool {
     tp == "ghostty"
         || std::env::var_os("WT_SESSION").is_some()
         || std::env::var_os("ConEmuANSI").is_some()
+}
+
+// What the prompt does when left waiting (the Notification hook's
+// `idle_prompt`): after how long, and what to call. Set once by the REPL.
+static IDLE_NOTIFIER: OnceLock<(Duration, Box<dyn Fn() + Send + Sync>)> = OnceLock::new();
+
+/// Calls `f` once each time the prompt has waited `after` without a key.
+pub fn on_idle(after: Duration, f: impl Fn() + Send + Sync + 'static) {
+    let _ = IDLE_NOTIFIER.set((after, Box::new(f)));
 }
 
 /// Send a desktop notification if the `notify` setting and focus state allow.
@@ -6010,25 +6019,12 @@ fn load_slash_commands() -> Vec<String> {
 
 fn load_slash_commands_uncached() -> Vec<String> {
     let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    for skill in crate::config::discover_skills(&cwd) {
-        let cmd = format!("/{}", skill.name);
+    // Every command file the session loads (the user's, and a trusted
+    // checkout's) and every skill.
+    for c in crate::config::load_custom_commands() {
+        let cmd = format!("/{}", c.name);
         if !cmds.contains(&cmd) {
             cmds.push(cmd);
-        }
-    }
-    // Merge user-defined commands from ~/.buildwithnexus/commands/
-    if let Ok(rd) = std::fs::read_dir(crate::config::home().join("commands")) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let stem = name
-                .trim_end_matches(".md")
-                .trim_end_matches(".sh")
-                .trim_end_matches(".py");
-            let cmd = format!("/{stem}");
-            if !cmds.contains(&cmd) {
-                cmds.push(cmd);
-            }
         }
     }
     cmds
@@ -6740,6 +6736,9 @@ fn read_line_raw_prefill(
             redraw(prompt, start, &buf, cursor, &mut scroll);
         }};
     }
+    // When the last key came, and whether this wait was already announced.
+    let mut idle_since = Instant::now();
+    let mut idle_told = false;
 
     loop {
         // Refresh the autocomplete popup against the current buffer. Runs
@@ -6771,8 +6770,27 @@ fn read_line_raw_prefill(
             }
             sug_rows = show;
         }
+        // The composer has waited untouched: tell the idle notifier, once
+        // per wait.
+        if let Some((after, notify_idle)) = IDLE_NOTIFIER.get().filter(|_| composer && !idle_told) {
+            loop {
+                let left = after.saturating_sub(idle_since.elapsed());
+                if left.is_zero() {
+                    idle_told = true;
+                    notify_idle();
+                    reline!();
+                    break;
+                }
+                if poll(left).unwrap_or(true) {
+                    break;
+                }
+            }
+        }
         let ev = match read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                idle_since = Instant::now();
+                k
+            }
             Ok(Event::Paste(s)) => {
                 // Drag a screenshot onto the terminal (or paste its path):
                 // the path becomes an @attachment token and the image shows
