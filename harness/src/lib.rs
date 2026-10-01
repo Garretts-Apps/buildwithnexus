@@ -748,7 +748,14 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
     }
-    agent::set_max_parallel_helpers(settings.max_parallel_helpers);
+    let local = config::preset(&settings.provider).is_some_and(|p| p.local)
+        || is_loopback_url(&provider.base_url);
+    agent::set_max_parallel_helpers(settings.max_parallel_helpers.unwrap_or_else(|| {
+        agent::default_parallel_helpers(local, provider::served_slots(&provider))
+    }));
+    if let Some(note) = agent::max_parallel_helpers_note(settings.max_parallel_helpers) {
+        eprintln!("{}", tui::yellow(&format!("buildwithnexus: {note}")));
+    }
     workflow::set_launch(
         &settings.provider,
         &provider.model,
@@ -1024,6 +1031,9 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
         }
         if let Some(v) = served.vision {
             provider::remember_vision(&provider, v);
+        }
+        if let Some(n) = served.slots {
+            provider::remember_slots(&provider, n);
         }
     }
     media::set_vision_override(s.vision);
@@ -1367,7 +1377,17 @@ fn headless(
     // Nobody can answer an approval prompt here, so `ask` blocks every edit
     // and command. Say so before the run, not after it looks successful.
     let unattended = report::is_json() || !std::io::stdin().is_terminal();
-    if unattended && perm == Permission::Ask {
+    // A PermissionRequest or PreToolUse hook may answer for the terminal.
+    let hook_answers = hooks::has_event("PermissionRequest") || hooks::has_event("PreToolUse");
+    if unattended && perm == Permission::Ask && hook_answers {
+        eprintln!(
+            "{}",
+            tui::yellow(
+                "buildwithnexus: no terminal to approve changes: edits and commands your \
+                 PermissionRequest or PreToolUse hooks do not allow will be blocked."
+            )
+        );
+    } else if unattended && perm == Permission::Ask {
         eprintln!(
             "{}",
             tui::yellow(
@@ -2297,7 +2317,7 @@ fn repl(
                 continue;
             }
             "/context" => {
-                handle_context(&transcript, provider.context_tokens);
+                handle_context(&transcript, &provider);
                 continue;
             }
             "/cost" => {
@@ -2335,7 +2355,7 @@ fn repl(
                 continue;
             }
             "/teamwork" | "/teamwork-preview" | "/swarm" => {
-                handle_teamwork();
+                handle_teamwork(&provider);
                 continue;
             }
             "/mode" => {
@@ -6286,7 +6306,44 @@ fn context_in_use(transcript: &[provider::Msg], total: usize) -> usize {
     })
 }
 
-fn handle_context(transcript: &[provider::Msg], total: usize) {
+// Whether `p`'s window is bwn's guess for an endpoint that did not say: a
+// local server or a custom endpoint, where the guess is 8k. A hosted
+// preset's window is the provider's documented one.
+fn window_guessed(p: &Provider) -> bool {
+    !provider::window_is_known(p)
+        && (is_loopback_url(&p.base_url)
+            || active_preset()
+                .is_some_and(|id| id == "custom" || config::preset(&id).is_some_and(|pr| pr.local)))
+}
+
+// For /context and /teamwork: whether the window is a guess, and what the
+// compact tool set it leads to leaves out. Empty when neither applies.
+fn window_notes(p: &Provider) -> Vec<String> {
+    let window = provider::short_tokens(p.context_tokens);
+    let mut out = Vec::new();
+    if window_guessed(p) {
+        out.push(format!(
+            "this endpoint did not report its context window, so bwn assumes {window} tokens"
+        ));
+    }
+    if tools::compact_surface(p.context_tokens) {
+        out.push(format!(
+            "at {window} tokens the model gets the compact tool set: no helpers, todo list \
+             or screenshots"
+        ));
+    }
+    if !out.is_empty() {
+        out.push(
+            "set \"context_tokens\" in settings.json to the model's real window \
+             (above 32k offers every tool)"
+                .into(),
+        );
+    }
+    out
+}
+
+fn handle_context(transcript: &[provider::Msg], p: &Provider) {
+    let total = p.context_tokens;
     let tools = tools::defs_for_context(true, total);
     let b = context_breakdown(transcript, &tools);
     let estimate = b.total();
@@ -6332,6 +6389,9 @@ fn handle_context(transcript: &[provider::Msg], total: usize) {
         tui::line(&tui::yellow(
             "  nearly full — /compact summarizes the conversation to make room",
         ));
+    }
+    for note in window_notes(p) {
+        tui::line(&tui::yellow(&format!("  {note}")));
     }
 }
 
@@ -6904,10 +6964,16 @@ fn handle_align(cwd: &std::path::Path) {
 
 // What delegation really is: the model hands a subtask to a helper with the
 // task tool; helpers are the two built-in roles and any agent files.
-fn handle_teamwork() {
+fn handle_teamwork(p: &Provider) {
     tui::line(&tui::accent(
         "  teamwork — helpers the model can delegate to",
     ));
+    // The compact tool set has no task tool: say so first.
+    if tools::compact_surface(p.context_tokens) {
+        for note in window_notes(p) {
+            tui::line(&tui::yellow(&format!("  {note}")));
+        }
+    }
     tui::line(&tui::dim(
         "  In BUILD the model can hand a self-contained subtask to a helper with the task tool \
          (spawn_subagent). The helper gets a fresh context, works, and reports back.",
@@ -6928,11 +6994,17 @@ fn handle_teamwork() {
         "    • {} — `read_only: true` (or an agent file's) lets it read and search, never change",
         tui::bold("read-only")
     ));
-    tui::line(&tui::dim(
-        "  Read-only and isolated helpers from one reply run at the same time (max_parallel_helpers, \
-         default 3) and each shows its work when it finishes; Esc stops them all. Helpers that \
-         write in your folder run one after another.",
-    ));
+    let together = match agent::max_parallel_helpers() {
+        1 => "one at a time (max_parallel_helpers is 1 — a local server is \
+              given one helper at a time unless it reports more slots or you set it)"
+            .to_string(),
+        n => format!("up to {n} at the same time (max_parallel_helpers)"),
+    };
+    tui::line(&tui::dim(&format!(
+        "  Read-only and isolated helpers from one reply run {together}, and each shows its \
+         work when it finishes; Esc stops them all. Helpers that write in your folder run one \
+         after another."
+    )));
     tui::line(&tui::dim(&format!(
         "  Your own helpers: <name>.md files (name, description, tools, read_only in frontmatter; \
          instructions as the body) in {}/agents or ~/.claude/agents, and in a trusted project's \
@@ -7918,8 +7990,17 @@ fn attach_word(
             tui::sanitize_terminal(&p.display().to_string())
         )));
     } else if image_exts.contains(&ext.as_str()) && p.exists() {
+        let too_big = std::fs::metadata(&p)
+            .ok()
+            .and_then(|m| tools::image_too_big(raw_path, m.len()));
         if let Vision::No(why) = vision {
             tui::line(&tui::yellow(&format!("  ⚠ {why}")));
+        } else if let Some(why) = too_big {
+            // As read_file refuses it: nothing that size is sent.
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ {} and attach that.",
+                tui::sanitize_terminal(&why)
+            )));
         } else if let Ok(mut f) = std::fs::File::open(&p) {
             let mut buf = Vec::new();
             if f.read_to_end(&mut buf).is_ok() {
@@ -8482,6 +8563,12 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
     }
     let (glyph, text) = sandbox::doctor_summary();
     out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
+    if let Some(note) = settings
+        .as_ref()
+        .and_then(|s| agent::max_parallel_helpers_note(s.max_parallel_helpers))
+    {
+        out.push(DoctorCheck::note("helpers", note));
+    }
 
     out.push(match config::load_memory() {
         None => DoctorCheck::note("memory.md", "(empty)"),

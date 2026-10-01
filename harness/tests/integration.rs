@@ -5593,11 +5593,13 @@ fn tools_offered(body: &str) -> Vec<String> {
 
 // A model with room for the whole tool surface (small local windows get a
 // compact one without the task tool).
+// A local server that serves helpers three at a time: a local server
+// otherwise gets one at a time, unless it reports more slots.
 fn write_big_context_config(home: &Path, port: u16) {
     let cfg = json!({
         "provider": "ollama", "model": "test-model", "permission": "auto",
         "base_url": format!("http://127.0.0.1:{port}/v1"),
-        "context_tokens": 1_000_000,
+        "context_tokens": 1_000_000, "max_parallel_helpers": 3,
     });
     std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
 }
@@ -5670,7 +5672,9 @@ fn an_agent_file_is_a_role_with_only_its_tools() {
             "get tests written",
         ],
     );
-    assert!(r.success, "stderr: {}", r.stderr);
+    // The helper's refused run_command is the run's denial.
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    assert_eq!(r.find("result").unwrap()["denied"], 1);
     let posts = posts.lock().unwrap();
     // The parent is offered the role, with its description.
     assert!(posts[0].contains("test-writer") && posts[0].contains("Writes focused unit tests"));
@@ -5719,7 +5723,8 @@ fn a_helper_with_a_tools_list_cannot_delegate_past_it() {
     ]);
     write_big_context_config(&home, port);
     let r = run(&home, &cwd, "look around");
-    assert!(r.success, "stderr: {}", r.stderr);
+    // The refused hand-off is the run's denial.
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
     let posts = posts.lock().unwrap();
     let mut helper_tools = tools_offered(&posts[1]);
     helper_tools.sort();
@@ -6910,6 +6915,9 @@ fn screenshot_url_stays_on_this_machine_unless_settings_allow_a_host() {
         let cwd = tmp("proj");
         let port = serve(vec![shot(url), finish("done")]);
         write_config(&home, "llamacpp", permission, port);
+        // A model that takes images: others are refused before the gate.
+        let mut settings = settings;
+        settings["vision"] = json!(true);
         std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
         run(&home, &cwd, "screenshot it")
     };
@@ -7288,7 +7296,8 @@ fn agent_file_helpers_that_only_read_run_side_by_side_and_cannot_write() {
     );
     write_big_context_config(&home, m.port);
     let r = run(&home, &cwd, "survey the code");
-    assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
+    // The auditor's refused write is the run's denial.
+    assert_eq!(r.code, Some(3), "stderr: {}\n{:?}", r.stderr, r.events);
     assert_eq!(m.peak(), 3, "agent-file helpers did not overlap");
     assert!(!cwd.join("audit.txt").exists(), "a read-only helper wrote");
     let denied = r.find("tool_denied").expect("refusal");
@@ -8925,4 +8934,392 @@ fn unreviewed_repo_instructions_are_one_stderr_line_headless() {
     assert!(r.success, "{}", r.stderr);
     assert_eq!(r.stderr.matches(note).count(), 1, "{}", r.stderr);
     assert_eq!(r.stderr.lines().filter(|l| l.contains(note)).count(), 1);
+}
+
+// A `name(...)` in the middle of an answer, or bwn's own refusal quoted back,
+// is prose: in auto nothing runs, in ask nothing is proposed, and the answer
+// is the run's result. A reply that is nothing but the call still runs.
+#[test]
+fn a_call_written_inside_prose_is_shown_not_run() {
+    for permission in ["auto", "ask"] {
+        for (i, prose) in [
+            "You could clean up with run_command(touch PWNED_MID) later if you want.",
+            "Tool result I received: denied by rule run_command(touch PWNED_MID) (user settings)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let home = tmp("home");
+            let cwd = tmp("proj");
+            let port = serve(vec![text(prose)]);
+            write_config(&home, "ollama", permission, port);
+            let r = run(&home, &cwd, &format!("mention a call mid sentence {i}"));
+            assert!(r.success, "{permission}: {prose}: {}", r.stderr);
+            assert!(!cwd.join("PWNED_MID").exists(), "{permission}: {prose}");
+            assert!(!r.has_event("tool_call"), "{permission}: {prose}");
+            assert!(!r.has_event("tool_denied"), "{permission}: {prose}");
+            assert!(r.text_of("assistant").contains("PWNED_MID"), "{prose}");
+        }
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![text("run_command(\"touch MADE\")\n"), text("made it")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "make the file");
+    assert!(r.success, "{}", r.stderr);
+    assert!(cwd.join("MADE").exists());
+}
+
+// Starting a read-only helper only reads: read-only mode runs it and ask
+// mode needs no approval for it. The helper is read-only all the same: its
+// write is refused.
+#[test]
+fn read_only_helpers_run_in_readonly_and_ask_without_approval() {
+    for mode in ["readonly", "ask"] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let m = serve_concurrent(three_helpers(json!({"read_only": true})), 3, hold(2_000));
+        write_big_context_config(&home, m.port);
+        let r = run_args(
+            &home,
+            &cwd,
+            &["--json", "run", "--permission-mode", mode, "count words"],
+        );
+        assert!(r.success, "{mode}: {}\n{:?}", r.stderr, r.events);
+        assert!(!r.has_event("tool_denied"), "{mode}: {:?}", r.events);
+        assert_eq!(r.find("result").unwrap()["denied"], 0, "{mode}");
+        assert_eq!(m.peak(), 3, "{mode}: helpers did not run side by side");
+        assert!(m.posts()[4].contains("SUMMARY-C"), "{mode}");
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "spawn_subagent",
+            json!({"task": "look", "read_only": true}),
+        ),
+        tool_call("w1", "write_file", json!({"path": "x.txt", "content": "x"})),
+        finish("helper done"),
+        finish("parent done"),
+    ]);
+    write_config(&home, "ollama", "readonly", port);
+    let r = run(&home, &cwd, "look around");
+    assert!(!cwd.join("x.txt").exists());
+    assert!(
+        r.text_of("tool_denied").contains("read-only"),
+        "{:?}",
+        r.events
+    );
+}
+
+// BRAINSTORM offers finish, so a finish call ends the turn with its summary
+// as the answer, after one request, not twelve.
+#[test]
+fn finish_ends_a_brainstorm_turn_with_its_summary() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("README.md"), "# demo\n").unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call("r1", "read_file", json!({"path": "README.md"})),
+        finish("it is a demo"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(&home, &cwd, &["--json", "brainstorm", "what is this repo?"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(posts.lock().unwrap().len(), 2, "{:?}", r.events);
+    assert!(
+        r.text_of("assistant").contains("it is a demo"),
+        "{:?}",
+        r.events
+    );
+    assert!(!r.text_of("assistant").contains("tool rounds"));
+}
+
+// A helper's refused call is the run's denial too (exit 3), and the parent
+// hears that it was not done, whatever the helper's summary claims.
+#[test]
+fn a_helpers_refused_call_is_a_denial_and_the_parent_is_told() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    std::fs::write(
+        home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Reviews\ntools: Read, Grep\n---\nReview.\n",
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call(
+            "t1",
+            "task",
+            json!({"role": "reviewer", "task": "write sub.txt"}),
+        ),
+        tool_call(
+            "w1",
+            "write_file",
+            json!({"path": "sub.txt", "content": "x\n"}),
+        ),
+        finish("sub: wrote sub.txt"),
+        finish("parent done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "review via helper");
+    assert!(!cwd.join("sub.txt").exists());
+    assert_eq!(r.code, Some(3), "{}\n{:?}", r.stderr, r.events);
+    let result = r.find("result").unwrap();
+    assert_eq!(result["denied"], 1, "{result}");
+    assert_eq!(result["denials"][0]["tool"], "write_file", "{result}");
+    let parent = posts.lock().unwrap()[3].clone();
+    assert!(parent.contains("was not done: write sub.txt"), "{parent}");
+}
+
+// A call BRAINSTORM did not offer is refused before anything is shown or
+// asked: no diff of an edit it will not apply, and the model hears the
+// tools it does have.
+#[test]
+fn brainstorm_refuses_a_tool_it_did_not_offer_before_the_gate() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("app.py"), "print('hi')\n").unwrap();
+    let port = serve(vec![
+        tool_call(
+            "e1",
+            "edit_file",
+            json!({"path": "app.py", "old": "hi", "new": "bye"}),
+        ),
+        text("ok, read-only here"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "brainstorm", "change app.py"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(!r.has_event("tool_call"), "{:?}", r.events);
+    assert!(
+        r.text_of("tool_denied").contains("BRAINSTORM is read-only"),
+        "{:?}",
+        r.events
+    );
+    assert_eq!(r.find("result").unwrap()["denied"], 0);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("app.py")).unwrap(),
+        "print('hi')\n"
+    );
+    // A name that is not a tool at all is answered with the tools offered.
+    let (port, posts) = serve_recording(vec![
+        tool_call("o1", "open_file", json!({"path": "app.py"})),
+        text("ok"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "brainstorm", "show app.py"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(!r.has_event("tool_call"), "{:?}", r.events);
+    let post = posts.lock().unwrap()[1].clone();
+    let at = post.find("Tools here: ").expect("the offered tools");
+    let told = &post[at..at + post[at..].find('"').unwrap()];
+    assert!(told.contains("read_file"), "{told}");
+    assert!(
+        !told.contains("write_file") && !told.contains("bash"),
+        "{told}"
+    );
+}
+
+// A write the tool refuses whatever the answer (outside the working folder)
+// is not put to the person first.
+#[test]
+fn a_write_outside_the_project_is_refused_without_asking() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            json!({"path": "../outside.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "write outside");
+    assert!(!cwd.parent().unwrap().join("outside.txt").exists());
+    assert!(!r.text_of("tool_denied").contains("no interactive terminal"));
+    assert!(
+        r.text_of("tool_result")
+            .contains("refusing to write outside the working directory"),
+        "{:?}",
+        r.events
+    );
+}
+
+// screenshot_url names the URLs it takes; a file:// URL is not a network
+// host to approve.
+#[test]
+fn screenshot_url_with_a_file_url_says_which_urls_it_takes() {
+    for url in ["file:///etc/passwd", "FILE:///etc/passwd"] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call("s1", "screenshot_url", json!({"url": url})),
+            finish("done"),
+        ]);
+        let cfg = json!({
+            "provider": "llamacpp", "model": "gemma3:4b", "permission": "ask",
+            "base_url": format!("http://127.0.0.1:{port}/v1"), "context_tokens": 131_072,
+        });
+        std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+        let r = run(&home, &cwd, "screenshot it");
+        assert!(!r.has_event("tool_denied"), "{url}: {:?}", r.events);
+        assert!(
+            r.text_of("tool_result")
+                .contains("screenshot_url takes an http:// or https:// URL"),
+            "{url}: {:?}",
+            r.events
+        );
+    }
+}
+
+// Headless ask mode with a hook that can approve does not claim that every
+// edit will be blocked.
+#[test]
+fn the_no_terminal_notice_mentions_hooks_that_can_approve() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({"PermissionRequest": [{ "matcher": "*", "hooks": [{ "type": "command",
+            "command": r#"echo '{"hookSpecificOutput":{"decision":{"behavior":"allow"}}}'"# }] }]}),
+    );
+    let port = serve(vec![
+        tool_call(
+            "w1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "write notes");
+    assert!(r.success, "{}", r.stderr);
+    assert!(cwd.join("notes.txt").exists());
+    assert!(
+        !r.stderr.contains("so edits and commands will be blocked"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("PermissionRequest or PreToolUse hooks"),
+        "{}",
+        r.stderr
+    );
+}
+
+// max_parallel_helpers 0 reads like "no limit"; bwn says what it does.
+#[test]
+fn max_parallel_helpers_of_zero_is_explained() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![finish("done")]);
+    write_config(&home, "ollama", "auto", port);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"max_parallel_helpers": 0}).to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "hello there");
+    assert!(
+        r.stderr.contains("max_parallel_helpers is 0"),
+        "{}",
+        r.stderr
+    );
+    let (_, out) = doctor(&home, &["doctor"], &[]);
+    assert!(out.contains("max_parallel_helpers is 0"), "{out}");
+}
+
+// A local server often answers one request at a time, so without the
+// setting helpers there run one after another; a hosted one gets three.
+#[test]
+fn helpers_on_a_local_server_run_one_at_a_time_unless_set() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let m = serve_concurrent(three_helpers(json!({"read_only": true})), 2, hold(400));
+    let cfg = json!({
+        "provider": "ollama", "model": "test-model", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{}/v1", m.port),
+        "context_tokens": 1_000_000,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "look at three things");
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(m.peak(), 1);
+    assert!(m.posts()[4].contains("SUMMARY-C"));
+}
+
+// A picture attached in the prompt meets read_file's limit: one over 5 MB is
+// not sent, and the reason says how to make a smaller copy.
+#[test]
+fn an_attached_picture_over_5_mb_is_not_sent() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let mut png = PNG.to_vec();
+    png.resize(6 * 1024 * 1024, 0);
+    std::fs::write(cwd.join("diagram.png"), &png).unwrap();
+    let (port, posts) = serve_recording(vec![text("no picture here")]);
+    let cfg = json!({
+        "provider": "llamacpp", "model": "gemma3:4b", "permission": "ask",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let (_, out) = run_human(&home, &cwd, "what is in @diagram.png");
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 1, "{out}");
+    assert!(posts[0].len() < 100_000, "{} bytes sent", posts[0].len());
+    assert!(!posts[0].contains("data:image/png"));
+    assert!(out.contains("pictures over 5 MB are not sent"), "{out}");
+}
+
+// A model that does not take images is told so when it calls screenshot_url,
+// before anyone is asked about the host or a browser starts.
+#[test]
+fn screenshot_url_for_a_text_only_model_is_refused_before_the_gate() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "s1",
+            "screenshot_url",
+            json!({"url": "http://127.0.0.1:9/"}),
+        ),
+        finish("no picture"),
+    ]);
+    let cfg = json!({
+        "provider": "llamacpp", "model": "tinycoder:3b", "permission": "ask",
+        "base_url": format!("http://127.0.0.1:{port}/v1"), "context_tokens": 131_072,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run(&home, &cwd, "check how my page renders");
+    assert!(r.success, "{}\n{:?}", r.stderr, r.events);
+    assert!(
+        !r.text_of("tool_call").contains("screenshot_url"),
+        "{:?}",
+        r.events
+    );
+    assert!(
+        r.text_of("tool_denied").contains("does not accept images"),
+        "{:?}",
+        r.events
+    );
+    assert_eq!(r.find("result").unwrap()["denied"], 0);
+}
+
+// An overflow on the first request has nothing compaction could shrink: the
+// same request is not sent again.
+#[test]
+fn an_overflow_with_nothing_to_compact_is_not_resent() {
+    let (port, posts) = serve_status(
+        400,
+        r#"{"error":{"message":"the request exceeds the available context length"}}"#,
+    );
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_gateway_config(&home, port);
+    let r = run(&home, &cwd, "describe the project");
+    assert!(!r.success);
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "{}", r.stderr);
 }

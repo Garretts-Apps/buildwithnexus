@@ -241,6 +241,8 @@ pub struct Served {
     pub window: Option<usize>,
     /// Whether the model takes images, when the server says.
     pub vision: Option<bool>,
+    /// How many requests the server answers at once (llama.cpp's slots).
+    pub slots: Option<usize>,
 }
 
 /// Ask a local OpenAI-compatible server about `model`: llama.cpp's /props
@@ -278,6 +280,7 @@ pub fn served_model(base_url: &str, model: &str) -> Served {
             return Served {
                 window: size(n),
                 vision: v["modalities"]["vision"].as_bool(),
+                slots: size(v["total_slots"].as_u64()),
             };
         }
     }
@@ -289,12 +292,14 @@ pub fn served_model(base_url: &str, model: &str) -> Served {
                 Some("llm") => Some(false),
                 _ => None,
             },
+            slots: None,
         };
     }
     match get(format!("{}/models", base_url.trim_end_matches('/'))).and_then(entry) {
         Some(m) => Served {
             window: size(m["max_model_len"].as_u64()),
             vision: None,
+            slots: None,
         },
         None => Served::default(),
     }
@@ -343,6 +348,30 @@ pub fn remember_window(p: &Provider) {
     if let Ok(mut m) = known_windows().lock() {
         m.insert(window_key(p), p.context_tokens);
     }
+}
+
+// Requests a local server reported it answers at once, by "origin#model".
+fn reported_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Record how many requests the server said it answers at once.
+pub fn remember_slots(p: &Provider, n: usize) {
+    if let Ok(mut m) = reported_slots().lock() {
+        m.insert(window_key(p), n);
+    }
+}
+
+/// How many requests `p`'s server said it answers at once, if it did.
+pub fn served_slots(p: &Provider) -> Option<usize> {
+    reported_slots().lock().ok()?.get(&window_key(p)).copied()
+}
+
+/// Whether `p.context_tokens` is the real window, not a preset's guess.
+pub fn window_is_known(p: &Provider) -> bool {
+    known_window(p).is_some()
 }
 
 fn known_window(p: &Provider) -> Option<usize> {
@@ -4910,13 +4939,15 @@ mod tests {
     fn served_windows_come_from_what_each_server_reports() {
         let served = |base: &str, model: &str| served_model(&format!("{base}/v1"), model);
         // llama.cpp: /props, per-slot n_ctx and its modalities.
-        let props = r#"{"default_generation_settings":{"n_ctx":2048},"modalities":{"vision":false},"total_slots":1}"#;
+        // total_slots: how many requests it answers at once.
+        let props = r#"{"default_generation_settings":{"n_ctx":2048},"modalities":{"vision":false},"total_slots":2}"#;
         let (base, handle) = mock_server(vec![(200, props)]);
         assert_eq!(
             served(&base, "tiny.gguf"),
             Served {
                 window: Some(2_048),
-                vision: Some(false)
+                vision: Some(false),
+                slots: Some(2),
             }
         );
         handle.join().unwrap();
@@ -4927,7 +4958,8 @@ mod tests {
             served(&base, "tinycoder-7b-instruct"),
             Served {
                 window: Some(4_096),
-                vision: Some(true)
+                vision: Some(true),
+                slots: None,
             }
         );
         handle.join().unwrap();

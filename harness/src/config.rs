@@ -249,10 +249,11 @@ pub struct Settings {
     #[serde(default = "default_max_concurrent_workflows")]
     pub max_concurrent_workflows: usize,
     /// How many helpers (`task` calls from one reply that only read, or
-    /// that work in their own git worktree) run at once (default 3; 1 runs
-    /// every helper one after another).
-    #[serde(default = "default_max_parallel_helpers")]
-    pub max_parallel_helpers: usize,
+    /// that work in their own git worktree) run at once; 1 runs every
+    /// helper one after another. Unset: 3, or on a local server as many as
+    /// it answers at once (one unless it reports more).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_helpers: Option<usize>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -410,7 +411,7 @@ impl Default for Settings {
             allowed_commands: Vec::new(),
             project_allowed: BTreeMap::new(),
             max_concurrent_workflows: default_max_concurrent_workflows(),
-            max_parallel_helpers: default_max_parallel_helpers(),
+            max_parallel_helpers: None,
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             instruction_files: default_instruction_files(),
@@ -458,10 +459,6 @@ fn wrong_typed_key(files: impl Iterator<Item = PathBuf>) -> Option<(PathBuf, Str
 
 fn default_max_concurrent_workflows() -> usize {
     2
-}
-
-fn default_max_parallel_helpers() -> usize {
-    3
 }
 
 // Only unambiguously read-only binaries auto-approve in Ask mode by default.

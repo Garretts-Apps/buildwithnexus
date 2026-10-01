@@ -2,6 +2,7 @@
 // one structured event per line so the harness can be driven by an orchestrator.
 // Process-global mode set once at startup — the call sites just say what happened.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -811,6 +812,31 @@ pub fn denials() -> Vec<Denial> {
 pub fn clear_denials() {
     if let Ok(mut d) = DENIALS.lock() {
         d.clear();
+    }
+}
+
+// How many refusals there were when the current turn started.
+static TURN_DENIALS_FROM: AtomicUsize = AtomicUsize::new(0);
+
+/// Starts counting this turn's refusals (`refused_this_turn`).
+pub fn mark_turn_denials() {
+    let n = DENIALS.lock().map(|d| d.len()).unwrap_or(0);
+    TURN_DENIALS_FROM.store(n, Ordering::Relaxed);
+}
+
+/// Under the turn's answer in the terminal: the calls refused during it, so
+/// a summary that claims the work cannot pass for the whole story.
+pub fn refused_this_turn() {
+    if mode() != Mode::Human {
+        return;
+    }
+    let from = TURN_DENIALS_FROM.load(Ordering::Relaxed);
+    let d: Vec<Denial> = denials().into_iter().skip(from).collect();
+    if let Some(line) = denials_line(&d) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} — not done this turn",
+            tui::sanitize_terminal(&line)
+        )));
     }
 }
 

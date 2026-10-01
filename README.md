@@ -955,7 +955,9 @@ A helper started with `read_only: true`, or from an agent file with
 can read and search but never change anything. Read-only helpers and
 isolated ones (`isolate: true`) that the model starts in the same reply run
 at the same time, up to `max_parallel_helpers` at once (default 3; `1`
-runs them one after another). Isolated helpers take turns while folders
+runs them one after another). On a local server the default is one at a
+time, or as many as the server reports it answers at once (llama.cpp's
+slots): a server with one slot queues the others until they time out. Isolated helpers take turns while folders
 added with `--add-dir` are in use: a worktree does not cover those, and each
 helper may write there. Each shows its work in one labelled block
 when it finishes, a helper that needs an approval says which one it is,

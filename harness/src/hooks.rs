@@ -2571,6 +2571,13 @@ pub fn doctor_lines() -> Vec<String> {
         .collect()
 }
 
+/// Whether any active hook answers `event`.
+pub fn has_event(event: &str) -> bool {
+    HOOKS
+        .get()
+        .is_some_and(|hooks| hooks.list.iter().any(|h| h.event == event))
+}
+
 pub fn list_active() -> Vec<String> {
     let mut out = Vec::new();
     if let Some(hooks) = HOOKS.get() {

@@ -356,9 +356,15 @@ fn mcp_defs() -> Vec<ToolDef> {
 // frontier providers report much larger contexts and keep the full set.
 const COMPACT_TOOLS_MAX_CONTEXT: usize = 32_768;
 
+/// Whether a model with this window gets the compact tool set: no helpers,
+/// todo list or screenshots.
+pub fn compact_surface(context_tokens: usize) -> bool {
+    context_tokens <= COMPACT_TOOLS_MAX_CONTEXT
+}
+
 pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<ToolDef> {
     let all = defs(include_subagent);
-    if context_tokens > COMPACT_TOOLS_MAX_CONTEXT {
+    if !compact_surface(context_tokens) {
         return all;
     }
     all.into_iter().filter(|d| compact_tool(d.name)).collect()
@@ -475,6 +481,30 @@ pub fn is_mutating(name: &str) -> bool {
     )
 }
 
+/// The tool an alias stands for (`bash` for run_command), else the name.
+pub fn canonical_name(name: &str) -> &str {
+    match name {
+        "bash" => "run_command",
+        "read" => "read_file",
+        "write" => "write_file",
+        "edit" => "edit_file",
+        "patch" => "apply_patch",
+        "glob" => "find_paths",
+        "grep" => "grep_files",
+        "list" => "list_dir",
+        "webfetch" => "fetch_url",
+        "websearch" => "web_search",
+        "todowrite" => "todo_write",
+        "todoread" => "todo_read",
+        "skill" => "load_skill",
+        "AskUserQuestion" => "question",
+        "ExitPlanMode" => "exit_plan",
+        "publish_artifact" => "Artifact",
+        "task" => "spawn_subagent",
+        other => other,
+    }
+}
+
 pub fn is_mutating_call(name: &str, input: &Value) -> bool {
     if matches!(
         name,
@@ -482,6 +512,11 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
     ) {
         let cmd = input["command"].as_str().unwrap_or("view");
         cmd != "view"
+    } else if matches!(name, "task" | "spawn_subagent") {
+        // A helper started with read_only: true is read-only itself (its
+        // tools and its gate, see agent::helper_reads_only), so starting
+        // one is a read.
+        input["read_only"].as_bool() != Some(true)
     } else {
         is_mutating(name)
     }
@@ -1676,6 +1711,13 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
         .as_str()
         .map(str::trim)
         .filter(|u| !u.is_empty())?;
+    // screenshot_url opens http(s) pages only and refuses anything else
+    // itself, with that reason; there is no host to approve.
+    if name == "screenshot_url"
+        && !url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+    {
+        return None;
+    }
     Some(url_authority(url).unwrap_or_else(|| "?".to_string()))
 }
 
@@ -5629,6 +5671,19 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const PDF_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Why a picture of `len` bytes is not sent to a model, if it is too big:
+/// the same limit for read_file and a picture attached in the prompt. The
+/// caller ends the sentence ("… and read that.").
+pub(crate) fn image_too_big(shown: &str, len: u64) -> Option<String> {
+    (len > MAX_IMAGE_BYTES).then(|| {
+        format!(
+            "{shown} is {}; pictures over 5 MB are not sent to the model. Make a smaller copy \
+             (for example `ffmpeg -i {shown} -vf scale=1280:-1 small.png`)",
+            human_bytes(len)
+        )
+    })
+}
+
 // read_file on a picture or a PDF. None for anything else, a file that is
 // not there (the usual error follows), and a file whose bytes are not what
 // its extension says (it is read as text).
@@ -5642,12 +5697,8 @@ fn read_media(p: &Path, input: &Value, cwd: &Path) -> Option<Outcome> {
     }
     let meta = fs::metadata(p).ok().filter(|m| m.is_file())?;
     let shown = display_path(p, cwd);
-    if meta.len() > MAX_IMAGE_BYTES {
-        return Some(err(format!(
-            "{shown} is {}; pictures over 5 MB are not sent to the model. Make a smaller copy \
-             (for example `ffmpeg -i {shown} -vf scale=1280:-1 small.png`) and read that.",
-            human_bytes(meta.len())
-        )));
+    if let Some(why) = image_too_big(&shown, meta.len()) {
+        return Some(err(format!("{why} and read that.")));
     }
     let bytes = fs::read(p).ok()?;
     // The bytes decide the media type: APIs refuse one that does not match.

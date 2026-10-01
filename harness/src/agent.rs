@@ -450,10 +450,8 @@ fn note_loop_result(
             report::notice("  ⟳ repeated tool result — nudging the model to change course");
             *nudge = Some(msg);
         }
-        Some(LoopSignal::Stop(msg)) => {
-            report::assistant(&msg);
-            *stop = Some(msg);
-        }
+        // Shown once, by the loop that ends on it.
+        Some(LoopSignal::Stop(msg)) => *stop = Some(msg),
         None => {}
     }
 }
@@ -857,21 +855,10 @@ fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<prov
             // the reply itself or sits in call markup: JSON quoted inside an
             // answer (how function calling works) is an example.
             calls.retain(|c| is_reply || names.contains(c.name.as_str()));
+            // A name that is not a tool is answered with the tools offered
+            // (unoffered_call), so the turn goes on instead of ending on an
+            // unusable reply.
             if !calls.is_empty() {
-                let known = tools::defs(true);
-                let unknown: Vec<&str> = calls
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .filter(|n| !names.contains(n) && !known.iter().any(|d| d.name == *n))
-                    .collect();
-                // Answered by the tool runner with the real tool list, so
-                // the turn goes on instead of ending on an unusable reply.
-                if !unknown.is_empty() {
-                    report::info(&format!(
-                        "  ⟳ the model asked for {}, which is not a tool here — telling it which tools exist",
-                        unknown.join(", ")
-                    ));
-                }
                 return Some(calls);
             }
         }
@@ -931,24 +918,51 @@ fn parse_tool_code_call(
     text: &str,
     allowed: &HashSet<&'static str>,
 ) -> Option<Vec<provider::ToolCall>> {
-    let scope = tool_code_scope(text);
-    let (name, after) = find_tool_call(scope, allowed)?;
-    let inside = balanced_parens(after)?;
+    let (name, inside) = match tool_code_fence(text) {
+        Some(scope) => {
+            let (name, after) = find_tool_call(scope, allowed)?;
+            (name, balanced_parens(after)?)
+        }
+        None => whole_reply_call(text, allowed)?,
+    };
     let args = parse_python_args(inside);
     let input = tool_code_args_to_input(name, args);
     Some(vec![text_tool_call(name, input)])
 }
 
-// The region to scan: inside a ```tool_code fence when present, else the whole
-// text (Gemma sometimes omits the fence).
-fn tool_code_scope(text: &str) -> &str {
-    if let Some(pos) = text.find("```tool_code") {
-        let after = &text[pos + "```tool_code".len()..];
-        let end = after.find("```").unwrap_or(after.len());
-        &after[..end]
-    } else {
-        text
+// The inside of a ```tool_code fence, when the reply has one.
+fn tool_code_fence(text: &str) -> Option<&str> {
+    let pos = text.find("```tool_code")?;
+    let after = &text[pos + "```tool_code".len()..];
+    let end = after.find("```").unwrap_or(after.len());
+    Some(&after[..end])
+}
+
+// Without the fence (Gemma sometimes omits it) the reply must be nothing but
+// the call, optionally inside `print(...)`. A name and `(` in a sentence
+// ("you could run_command(touch x) later"), or bwn's own refusal quoted back
+// ("denied by rule run_command(rm *)"), is prose, not a call. Returns the
+// name and the argument text.
+fn whole_reply_call<'a>(
+    text: &'a str,
+    allowed: &HashSet<&'static str>,
+) -> Option<(&'static str, &'a str)> {
+    let t = text.trim();
+    let (body, wrapped) = match t.strip_prefix("print(") {
+        Some(rest) => (rest.trim_start(), true),
+        None => (t, false),
+    };
+    let (name, after) = find_tool_call(body, allowed)?;
+    // The call opens the reply: only its name comes before the `(`.
+    if body[..body.len() - after.len() - 1].trim_end() != name {
+        return None;
     }
+    let inside = balanced_parens(after)?;
+    let mut rest = after[inside.len() + 1..].trim();
+    if wrapped {
+        rest = rest.strip_prefix(')')?.trim();
+    }
+    rest.is_empty().then_some((name, inside))
 }
 
 // Find the earliest occurrence of a known tool name immediately followed by
@@ -2310,29 +2324,45 @@ pub(crate) fn gate(
     if matches!(perm, Permission::ReadOnly) && tools::is_mutating_call(name, input) {
         let readonly_shell = shell
             .is_some_and(|c| tools::is_readonly_command(c) && tools::skips_prompt_safely(c, cwd));
-        if !readonly_shell {
+        // A helper started in read-only mode is read-only too.
+        let delegation = matches!(name, "task" | "spawn_subagent");
+        if !readonly_shell && !delegation {
             return Some(READONLY_SKIP.into());
         }
     }
+    // A write outside the working folders is refused by the tool itself
+    // (tools::run), whatever the answer: asking first would offer an
+    // approval that cannot work.
+    if tools::out_of_cwd_mutation(name, input, cwd).is_some() {
+        return None;
+    }
 
+    // A sensitive path is approved by itself: `s` and `a` cover that path,
+    // not the tool or the command that reached it.
     let paths = tools::touched_paths(name, input, cwd);
     if let Some(p) = paths.iter().find(|p| tools::is_sensitive(p)) {
-        return confirm_call(
-            name,
-            input,
-            &format!("access sensitive path {}", p.display()),
-            &tool_key,
-            cwd,
-        );
+        let key = format!("access {}", p.display());
+        if !is_pre_approved(None, &key, cwd) {
+            return confirm_call(
+                name,
+                input,
+                &format!("access sensitive path {}", p.display()),
+                &key,
+                cwd,
+            );
+        }
     }
     if let Some(p) = any_cmd.and_then(|c| tools::command_sensitive_path(c, cwd)) {
-        return confirm_call(
-            name,
-            input,
-            &format!("command touches sensitive path {}", p.display()),
-            &tool_key,
-            cwd,
-        );
+        let key = format!("access {}", p.display());
+        if !is_pre_approved(None, &key, cwd) {
+            return confirm_call(
+                name,
+                input,
+                &format!("command touches sensitive path {}", p.display()),
+                &key,
+                cwd,
+            );
+        }
     }
     // In WSL2, writing to a Windows drive mount (/mnt/c/, /mnt/d/, etc.)
     // crosses the OS boundary — always confirm, even in Auto mode.
@@ -3111,6 +3141,7 @@ fn build_turn(
     // this run's writes; subagent recursion must not shrink that window.
     if depth == 0 && !continuing {
         checkpoint::mark_turn_start();
+        report::mark_turn_denials();
     }
     let task = match hooks::user_prompt_submit(task, cwd) {
         _ if continuing => task.to_string(),
@@ -3131,7 +3162,7 @@ fn build_turn(
     let defs = offered(
         p,
         if matches!(perm, Permission::ReadOnly) || helper.read_only {
-            tools::defs_readonly()
+            readonly_build_defs(perm, depth, p.context_tokens)
         } else {
             tools::defs_for_context(depth < MAX_DEPTH, p.context_tokens)
         },
@@ -3230,13 +3261,18 @@ fn build_turn(
                     && (lower.contains("prompt is too long") || lower.contains("context length"))
                 {
                     forced_compact_retry = true;
-                    hooks::pre_compact("auto", "", cwd);
-                    report::notice("  ⟳ context overflow — force-compacting and retrying…");
-                    let taken = std::mem::take(msgs);
-                    *msgs = compact_within(taken, compaction_budget(p), |middle| {
-                        model_summary(p, middle)
-                    });
-                    continue;
+                    // Compaction keeps the system prompt and the newest
+                    // message: with nothing in between to shrink, the same
+                    // request would only be sent again.
+                    if msgs.len() > 2 {
+                        hooks::pre_compact("auto", "", cwd);
+                        report::notice("  ⟳ context overflow — force-compacting and retrying…");
+                        let taken = std::mem::take(msgs);
+                        *msgs = compact_within(taken, compaction_budget(p), |middle| {
+                            model_summary(p, middle)
+                        });
+                        continue;
+                    }
                 }
                 drop_refused_message(p, msgs);
                 hooks::notify("OnError", cwd);
@@ -3451,6 +3487,7 @@ fn build_turn(
                     report::notice(&note);
                     stopped_short(Outcome::Failed);
                 }
+                report::refused_this_turn();
             }
             return Ok(reply.text);
         }
@@ -3494,6 +3531,32 @@ fn build_turn(
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: msg,
+                    is_error: true,
+                    images: Vec::new(),
+                });
+                continue;
+            }
+            let refusal = text_only_refusal(p, &call.name).or_else(|| {
+                let r = unoffered_call(&call.name, &defs, false);
+                if r.is_some() {
+                    round_unrun.get_or_insert_with(|| format!("{} (not a tool here)", call.name));
+                }
+                r
+            });
+            if let Some((shown, told)) = refusal {
+                report::tool_denied(&shown);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &told,
+                    true,
+                    &mut loop_nudge,
+                    &mut loop_stop,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: told,
                     is_error: true,
                     images: Vec::new(),
                 });
@@ -3546,7 +3609,9 @@ fn build_turn(
                     .then(|| read_only_helper_refusal(&call.name, &call_input, cwd))
                     .flatten()
             });
-            let counted = off_surface.is_none() && !reviewing;
+            // A helper's refused call is one too: the parent's run did not
+            // do what the helper was asked, whatever its summary says.
+            let counted = !reviewing;
             let mut checks_unapproved = false;
             let reason = off_surface.or_else(|| {
                 if call.name != "check_work" {
@@ -3593,6 +3658,9 @@ fn build_turn(
                             &reason,
                             tools::is_mutating_call(&call.name, &call_input),
                         );
+                    }
+                    if depth > 0 {
+                        note_helper_refusal(depth, &tools::preview(&call.name, &call_input));
                     }
                     reason
                 };
@@ -3755,6 +3823,9 @@ fn build_turn(
             }
             if out.finished {
                 report::finish(&out.content);
+                if depth == 0 {
+                    report::refused_this_turn();
+                }
                 summary = Some(out.content.clone());
             } else {
                 note_loop_result(
@@ -3789,10 +3860,8 @@ fn build_turn(
         if let Some(sid) = sid {
             crate::session::save(sid, cwd, &p.model, msgs);
         }
+        // The refused call's own line already says the turn stopped.
         if turn_stopped(depth == 0) {
-            if depth == 0 {
-                report::notice("  stopped — tell me what to do instead");
-            }
             return Ok(String::new());
         }
         if !report::is_json() {
@@ -3949,7 +4018,11 @@ fn build_turn(
         }
         if let Some(stop_msg) = loop_stop {
             // A stopped loop (or exhausted artifact recovery) is not success —
-            // surface it as a failure with the honest summary.
+            // surface it as a failure with the honest summary. The terminal
+            // shows the error itself; --json also gets it as the answer.
+            if report::is_json() {
+                report::assistant(&stop_msg);
+            }
             return Err(stop_msg);
         }
         if let Some(recovery) = artifact_recovery {
@@ -4017,6 +4090,95 @@ fn check_work_found_no_project(report: &str) -> bool {
 
 // Feedback for a tool call whose arguments failed to parse: name the tool,
 // show the parse error and the schema's required params, and demand a re-send.
+// A call to a tool this turn does not offer, refused before the gate so no
+// approval is asked and no change previewed for it: what the screen shows
+// and what the model is told, which names only the tools offered here.
+// `strict` (the read-only and conversational loops) refuses every name not
+// offered; BUILD still runs an alias or a catalogue tool a small model
+// insists on (see tools::compact_tool) and refuses only unknown names.
+fn unoffered_call(name: &str, defs: &[tools::ToolDef], strict: bool) -> Option<(String, String)> {
+    // finish only ends the turn, so a model may always call it.
+    let canonical = tools::canonical_name(name);
+    if name == "finish"
+        || defs
+            .iter()
+            .any(|d| d.name == name || tools::canonical_name(d.name) == canonical)
+    {
+        return None;
+    }
+    let known = crate::mcp::is_mcp_tool(name) || tools::defs(true).iter().any(|d| d.name == name);
+    if known && !strict {
+        return None;
+    }
+    let mut here: Vec<&str> = Vec::new();
+    for d in defs {
+        let c = tools::canonical_name(d.name);
+        if !here.contains(&c) {
+            here.push(c);
+        }
+    }
+    let list = here.join(", ");
+    if known {
+        return Some((
+            format!("{name} is not offered here"),
+            format!("{name} is not offered here. Tools here: {list}"),
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    let nearest = here
+        .iter()
+        .min_by_key(|n| tools::levenshtein(&lower, &n.to_ascii_lowercase()))
+        .map(|n| format!(" Did you mean `{n}`?"))
+        .unwrap_or_default();
+    Some((
+        format!("{name} is not a tool here"),
+        format!("unknown tool: {name}.{nearest} Tools here: {list}"),
+    ))
+}
+
+// screenshot_url for a model that does not take images: refused before
+// anyone is asked or a browser starts. It can be offered before the server
+// says so, which it may do only once the turn's first request is answered.
+fn text_only_refusal(p: &Provider, name: &str) -> Option<(String, String)> {
+    if name != "screenshot_url" || crate::media::model_supports_vision(p) {
+        return None;
+    }
+    let why = crate::media::vision_refusal(p);
+    let why = why.trim_end_matches(" — image not attached");
+    Some((
+        format!("screenshot_url not run: {why}"),
+        format!("screenshot_url was not run: {why}, so a screenshot would not reach it."),
+    ))
+}
+
+// In a read-only mode, a change it did not offer is refused with that
+// mode's own reason, which says how to get out of it.
+fn read_only_refusal(
+    name: &str,
+    input: &serde_json::Value,
+    mode_reason: Option<&str>,
+    refusal: (String, String),
+) -> (String, String) {
+    match mode_reason {
+        Some(r) if tools::is_mutating_call(name, input) => (r.to_string(), r.to_string()),
+        _ => refusal,
+    }
+}
+
+// The tools of a read-only BUILD turn. In read-only mode it may also start
+// helpers where BUILD offers them: each one is read-only too.
+fn readonly_build_defs(perm: Permission, depth: usize, context: usize) -> Vec<tools::ToolDef> {
+    let mut defs = tools::defs_readonly();
+    if matches!(perm, Permission::ReadOnly) {
+        defs.extend(
+            tools::defs_for_context(depth + 1 < MAX_DEPTH, context)
+                .into_iter()
+                .filter(|d| d.name == "spawn_subagent"),
+        );
+    }
+    defs
+}
+
 fn invalid_args_feedback(name: &str, raw: &str, defs: &[tools::ToolDef]) -> String {
     let parse_err = match serde_json::from_str::<serde_json::Value>(raw) {
         Err(e) => e.to_string(),
@@ -4267,6 +4429,46 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    // The refused calls of each running helper depth on this thread, so its
+    // parent hears that they were not done.
+    static HELPER_REFUSED: std::cell::RefCell<Vec<Vec<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn note_helper_refusal(depth: usize, what: &str) {
+    HELPER_REFUSED.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() <= depth {
+            r.resize(depth + 1, Vec::new());
+        }
+        r[depth].push(what.to_string());
+    });
+}
+
+fn take_helper_refusals(depth: usize) -> Vec<String> {
+    HELPER_REFUSED.with(|r| {
+        r.borrow_mut()
+            .get_mut(depth)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    })
+}
+
+// What the parent is told after a helper's own summary when some of its
+// calls were refused: a summary can claim work that never happened.
+fn helper_refusal_note(refused: &[String]) -> Option<String> {
+    let first = refused.first()?;
+    let more = match refused.len() {
+        1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    Some(format!(
+        "\n[bwn: this helper's call was refused, so it was not done: {first}{more}. \
+         Do not count on it.]"
+    ))
+}
+
 fn set_helper_ctx(depth: usize, ctx: Option<HelperCtx>) {
     HELPER_CTX.with(|a| {
         let mut a = a.borrow_mut();
@@ -4364,6 +4566,34 @@ static MAX_PARALLEL_HELPERS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_PARALLEL
 /// Sets `max_parallel_helpers`; zero counts as one (one at a time).
 pub fn set_max_parallel_helpers(n: usize) {
     MAX_PARALLEL_HELPERS.store(n.max(1), Ordering::Relaxed);
+}
+
+/// `max_parallel_helpers` when settings leave it out. A local server often
+/// answers one request at a time (OLLAMA_NUM_PARALLEL=1, one llama.cpp
+/// slot), so helpers sent together queue there and time out waiting for
+/// each other: on one, as many as it reports it answers at once, else one.
+pub fn default_parallel_helpers(local: bool, slots: Option<usize>) -> usize {
+    if local {
+        slots.unwrap_or(1).clamp(1, DEFAULT_MAX_PARALLEL_HELPERS)
+    } else {
+        DEFAULT_MAX_PARALLEL_HELPERS
+    }
+}
+
+/// How many helpers from one reply run at once.
+pub fn max_parallel_helpers() -> usize {
+    MAX_PARALLEL_HELPERS.load(Ordering::Relaxed)
+}
+
+/// What a `max_parallel_helpers` of 0 does, said at startup and by doctor:
+/// 0 reads like "no limit", but it runs one helper at a time.
+pub fn max_parallel_helpers_note(n: Option<usize>) -> Option<String> {
+    (n == Some(0)).then(|| {
+        format!(
+            "max_parallel_helpers is 0, which runs helpers one at a time — there is no \
+             unlimited setting; set a number such as {DEFAULT_MAX_PARALLEL_HELPERS}"
+        )
+    })
 }
 
 // A `task` / `spawn_subagent` call, checked and resolved: what the helper is
@@ -4538,6 +4768,7 @@ fn run_helper(
         }),
     );
     let mut child: Vec<Msg> = Vec::new();
+    take_helper_refusals(depth + 1);
     set_helper_ctx(
         depth + 1,
         Some(HelperCtx {
@@ -4579,12 +4810,15 @@ fn run_helper(
         },
     );
     set_helper_ctx(depth + 1, None);
-    let (result, is_error) = match outcome {
+    let (mut result, is_error) = match outcome {
         // Esc or Ctrl+C ended it: say so, rather than an empty success.
         Ok(r) if r.is_empty() && tui::interrupted() => (HELPER_STOPPED.to_string(), true),
         Ok(r) => (r, false),
         Err(e) => (format!("subagent error: {e}"), true),
     };
+    if let Some(note) = helper_refusal_note(&take_helper_refusals(depth + 1)) {
+        result.push_str(&note);
+    }
     let result = match &h.worktree {
         Some(wt) => {
             let done = finish_worktree(cwd, wt);
@@ -4664,6 +4898,22 @@ fn run_helpers(
         .into_iter()
         .map(|r| r.unwrap_or_else(|| (HELPER_NOT_STARTED.into(), true)))
         .collect()
+}
+
+// A helper whose request timed out while others ran beside it may have
+// waited behind them at a server that answers one request at a time.
+fn queued_timeout_note((text, is_error): (String, bool), together: usize) -> (String, bool) {
+    if !is_error || together < 2 || !text.contains("no answer from") {
+        return (text, is_error);
+    }
+    (
+        format!(
+            "{text}\n[{together} helpers ran at the same time; a server that answers one \
+             request at a time queues them, so this one may have waited for the others. \
+             \"max_parallel_helpers\": 1 in settings runs them one after another.]"
+        ),
+        true,
+    )
 }
 
 const HELPER_NOT_STARTED: &str = "not started: the user stopped the turn";
@@ -4772,7 +5022,7 @@ fn run_side_by_side(
                     ((HELPER_NOT_STARTED.to_string(), true), Vec::new())
                 } else {
                     tui::capture_start();
-                    let r = run_helper(p, perm, h, cwd, depth);
+                    let r = queued_timeout_note(run_helper(p, perm, h, cwd, depth), width);
                     (r, tui::capture_take())
                 };
                 let done = HelperDone {
@@ -6270,6 +6520,7 @@ fn brainstorm_reply(
         let mut results = Vec::new();
         let mut loop_summary: Option<String> = None;
         let mut loop_nudge: Option<String> = None;
+        let mut finished: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
                 let msg = invalid_args_feedback(&call.name, raw, &defs);
@@ -6286,6 +6537,29 @@ fn brainstorm_reply(
                 results.push(ToolResult {
                     id: call.id.clone(),
                     content: msg,
+                    is_error: true,
+                    images: Vec::new(),
+                });
+                continue;
+            }
+            if let Some((shown, told)) = text_only_refusal(p, &call.name).or_else(|| {
+                unoffered_call(&call.name, &defs, true).map(|r| {
+                    read_only_refusal(&call.name, &call.input, Some(BRAINSTORM_READONLY), r)
+                })
+            }) {
+                report::tool_denied(&shown);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &told,
+                    true,
+                    &mut loop_nudge,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: told,
                     is_error: true,
                     images: Vec::new(),
                 });
@@ -6366,6 +6640,9 @@ fn brainstorm_reply(
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "brainstorm", 0);
+            if out.finished {
+                finished.get_or_insert_with(|| out.content.clone());
+            }
             note_loop_result(
                 &mut loop_guard,
                 &call.name,
@@ -6391,13 +6668,14 @@ fn brainstorm_reply(
             tui::context_meter(context_used(msgs), p.context_tokens);
             tui::poll_typeahead();
         }
-        if let Some(loop_msg) = loop_summary {
-            report::assistant(&loop_msg);
+        // finish is offered here too: its summary is the answer.
+        if let Some(summary) = finished.or(loop_summary) {
+            report::assistant(&summary);
             msgs.push(Msg::Assistant {
-                text: loop_msg.clone(),
+                text: summary.clone(),
                 calls: vec![],
             });
-            return Ok(loop_msg);
+            return Ok(summary);
         }
         if let Some(nudge) = loop_nudge {
             msgs.push(Msg::User(nudge));
@@ -6566,6 +6844,7 @@ fn chat_rounds(
         let mut results = Vec::new();
         let mut loop_summary: Option<String> = None;
         let mut loop_nudge: Option<String> = None;
+        let mut finished: Option<String> = None;
         for call in &reply.calls {
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
                 let msg = invalid_args_feedback(&call.name, raw, &defs);
@@ -6588,6 +6867,28 @@ fn chat_rounds(
                 continue;
             }
 
+            if let Some((shown, told)) = text_only_refusal(p, &call.name).or_else(|| {
+                unoffered_call(&call.name, &defs, true)
+                    .map(|r| read_only_refusal(&call.name, &call.input, readonly, r))
+            }) {
+                report::tool_denied(&shown);
+                note_loop_result(
+                    &mut loop_guard,
+                    &call.name,
+                    &call.input,
+                    &told,
+                    true,
+                    &mut loop_nudge,
+                    &mut loop_summary,
+                );
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: told,
+                    is_error: true,
+                    images: Vec::new(),
+                });
+                continue;
+            }
             let call_input = tool_input_for_execution(
                 &call.name,
                 &call.input,
@@ -6636,6 +6937,9 @@ fn chat_rounds(
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "chat", tool_round);
+            if out.finished {
+                finished.get_or_insert_with(|| out.content.clone());
+            }
             note_loop_result(
                 &mut loop_guard,
                 &call.name,
@@ -6662,10 +6966,10 @@ fn chat_rounds(
             tui::context_meter(context_used(msgs), p.context_tokens);
             tui::poll_typeahead();
         }
-        if let Some(loop_msg) = loop_summary {
-            report::assistant(&loop_msg);
+        if let Some(summary) = finished.or(loop_summary) {
+            report::assistant(&summary);
             msgs.push(Msg::Assistant {
-                text: loop_msg,
+                text: summary,
                 calls: vec![],
             });
             return Ok(());
@@ -7350,6 +7654,56 @@ mod tests {
     }
 
     #[test]
+    fn an_unfenced_call_counts_only_when_it_is_the_whole_reply() {
+        let defs = tools::defs_for_context(true, 8192);
+        for text in [
+            "run_command(\"touch A\")",
+            "  print(run_command(command=\"touch A\"))\n",
+        ] {
+            let calls = parse_text_tool_calls(text, &defs).expect(text);
+            assert_eq!(calls[0].name, "run_command", "{text}");
+            assert_eq!(calls[0].input["command"], "touch A", "{text}");
+        }
+        for text in [
+            "You could clean up with run_command(touch PWNED_MID) later if you want.",
+            "Tool result I received: denied by rule run_command(touch PWNED_PROSE) (user settings)",
+            "denied by rule run_command(rm *)",
+            "run_command(\"touch A\") would do it.",
+            "print(run_command(\"touch A\")) and then",
+        ] {
+            assert!(parse_text_tool_calls(text, &defs).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_call_to_a_tool_not_offered_names_only_the_tools_offered() {
+        let compact = tools::defs_for_context(true, 8192);
+        let (shown, told) = unoffered_call("open_file", &compact, false).unwrap();
+        assert_eq!(shown, "open_file is not a tool here");
+        assert!(told.starts_with("unknown tool: open_file."), "{told}");
+        assert!(told.contains("Tools here: "), "{told}");
+        // Only the compact set, no aliases or the rest of the catalogue.
+        for absent in ["bash", "text_editor_20241022", "spawn_subagent", "mcp_call"] {
+            assert!(!told.contains(absent), "{absent}: {told}");
+        }
+        assert!(told.len() < 300, "{told}");
+        // BUILD still runs a catalogue tool or alias it did not offer.
+        assert!(unoffered_call("bash", &compact, false).is_none());
+        assert!(unoffered_call("list_tree", &compact, false).is_none());
+        // A conversational turn without helpers refuses one, before the gate.
+        let chat = tools::defs_for_context(false, 128_000);
+        let (shown, told) = unoffered_call("spawn_subagent", &chat, true).unwrap();
+        assert_eq!(shown, "spawn_subagent is not offered here");
+        assert!(!told.contains("Did you mean"), "{told}");
+        assert!(!told.contains("spawn_subagent,"), "{told}");
+        // Aliases of offered tools, and finish, always pass.
+        let ro = tools::defs_readonly();
+        assert!(unoffered_call("read", &ro, true).is_none());
+        assert!(unoffered_call("finish", &ro, true).is_none());
+        assert!(unoffered_call("edit_file", &ro, true).is_some());
+    }
+
+    #[test]
     fn python_value_and_arg_parsing_helpers() {
         assert_eq!(parse_py_value("\"\"\"hi, there\"\"\""), json!("hi, there"));
         assert_eq!(parse_py_value("'x'"), json!("x"));
@@ -7766,7 +8120,6 @@ mod tests {
         let cwd = Path::new("/proj");
         for (name, input) in [
             ("edit_file", json!({"path": "a.rs", "old": "x", "new": "y"})),
-            ("spawn_subagent", json!({"task": "do it"})),
             ("check_work", json!({})),
             ("run_command", json!({"command": "npm install"})),
             ("run_command", json!({"command": "cat x; rm -rf ~"})),
@@ -7777,6 +8130,45 @@ mod tests {
                 "{name} {input}: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn helpers_on_a_local_server_follow_its_slots() {
+        assert_eq!(default_parallel_helpers(false, None), 3);
+        assert_eq!(default_parallel_helpers(true, None), 1);
+        assert_eq!(default_parallel_helpers(true, Some(2)), 2);
+        assert_eq!(default_parallel_helpers(true, Some(16)), 3);
+        let timed_out =
+            "subagent error: no answer from http://localhost:11434 within 5 s".to_string();
+        let (note, is_error) = queued_timeout_note((timed_out.clone(), true), 3);
+        assert!(is_error && note.contains("max_parallel_helpers"), "{note}");
+        assert_eq!(
+            queued_timeout_note((timed_out.clone(), true), 1).0,
+            timed_out
+        );
+    }
+
+    #[test]
+    fn a_read_only_helper_is_a_read() {
+        let cwd = Path::new("/proj");
+        // A helper started in read-only mode is read-only itself.
+        for input in [
+            json!({"task": "look"}),
+            json!({"task": "look", "read_only": true}),
+        ] {
+            assert_eq!(
+                gate(Permission::ReadOnly, "spawn_subagent", &input, cwd),
+                None
+            );
+        }
+        // Ask mode starts a read-only helper without asking.
+        let ro = json!({"task": "look", "read_only": true});
+        assert_eq!(gate(Permission::Ask, "task", &ro, cwd), None);
+        assert!(!tools::is_mutating_call("spawn_subagent", &ro));
+        assert!(tools::is_mutating_call(
+            "spawn_subagent",
+            &json!({"task": "fix"})
+        ));
     }
 
     #[test]
@@ -9137,16 +9529,17 @@ mod tests {
         ] {
             assert_eq!(gate(perm, name, &input, &proj), None, "{name}");
         }
-        // Commands, deletions, the network, edits outside the project and
-        // sensitive files still ask (a refusal here: no terminal).
+        // An edit outside the project is not asked about: the tool refuses
+        // it whatever the answer.
+        let outside = json!({"path": "../elsewhere.txt", "content": "x"});
+        assert_eq!(gate(perm, "write_file", &outside, &proj), None);
+        assert!(tools::run("write_file", &outside, &proj).is_error);
+        // Commands, deletions, the network and sensitive files still ask (a
+        // refusal here: no terminal).
         for (name, input) in [
             ("run_command", json!({"command": "npm test"})),
             ("remove_path", json!({"path": "app.py"})),
             ("fetch_url", json!({"url": "https://example.com/"})),
-            (
-                "write_file",
-                json!({"path": "../elsewhere.txt", "content": "x"}),
-            ),
             ("write_file", json!({"path": ".env", "content": "K=1"})),
         ] {
             let r = gate(perm, name, &input, &proj);
@@ -9174,29 +9567,31 @@ mod tests {
         let in_other = |rel: &str| other.join(rel).display().to_string();
         let write = |path: String| json!({"path": path, "content": "x"});
         let perm = Permission::AcceptEdits;
-        // Before the folder is added, an edit there asks.
+        // Before the folder is added, an edit there is outside the project:
+        // the tool refuses it, so nobody is asked.
         crate::workdirs::clear();
-        let before = gate(perm, "write_file", &write(in_other("lib.rs")), &proj);
-        assert!(before.is_some_and(|r| r.contains("blocked")));
+        assert!(
+            tools::out_of_cwd_mutation("write_file", &write(in_other("lib.rs")), &proj).is_some()
+        );
         crate::workdirs::add(&other.display().to_string(), &proj).unwrap();
         assert_eq!(
             gate(perm, "write_file", &write(in_other("lib.rs")), &proj),
             None
         );
-        // Its .git, and a link out of it, still ask.
+        // Its .git still asks; a link out of it is outside, which the tool
+        // refuses.
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, other.join("out")).unwrap();
-        let mut asks = vec![in_other(".git/config")];
-        if cfg!(unix) {
-            asks.push(in_other("out/x.txt"));
+        {
+            std::os::unix::fs::symlink(&outside, other.join("out")).unwrap();
+            let out = write(in_other("out/x.txt"));
+            assert!(tools::out_of_cwd_mutation("write_file", &out, &proj).is_some());
         }
-        for path in asks {
-            let r = gate(perm, "write_file", &write(path.clone()), &proj);
-            assert!(
-                r.as_deref().is_some_and(|r| r.contains("blocked")),
-                "{path}: {r:?}"
-            );
-        }
+        let git_config = in_other(".git/config");
+        let r = gate(perm, "write_file", &write(git_config.clone()), &proj);
+        assert!(
+            r.as_deref().is_some_and(|r| r.contains("blocked")),
+            "{git_config}: {r:?}"
+        );
         crate::workdirs::clear();
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);

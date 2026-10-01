@@ -954,7 +954,8 @@ class ParallelHelperHarness(TerminalHarness):
     def settings(self):
         return {**self.config(),
                 "base_url": f"http://127.0.0.1:{self.model.port}/v1",
-                "permission": "auto", "context_tokens": 1000000}
+                "permission": "auto", "context_tokens": 1000000,
+                "max_parallel_helpers": 3}
 
     def calls(self):
         return None
@@ -1309,6 +1310,109 @@ class RewindTests(ModelHarness):
         self.send("\x1b")
         self.rewind_conversation()
         self.resend_edited()
+
+
+def tool_results(messages):
+    return sum(1 for m in messages if m.get("role") == "tool")
+
+
+class EscAtApprovalTests(ModelHarness):
+    """Esc at an approval refuses the call and ends the turn, said once."""
+
+    def settings(self):
+        return {**super().settings(), "permission": "ask"}
+
+    def reply(self, messages):
+        if last_is_tool_result(messages):
+            return ("text", "after the refusal")
+        return ("tool", "run_command", {"command": "touch made.txt"})
+
+    def test_one_line_says_the_turn_stopped(self):
+        self.send("/build make the file\r")
+        self.wait_for(lambda: b"allow?" in self.output, "approval prompt")
+        self.send("\x1b")
+        self.wait_for(lambda: b"stopped by the user" in self.output, "the refusal")
+        self.pump(1.0)
+        self.assertNotIn(b"tell me what to do instead", self.output)
+        self.assertFalse((self.root / "made.txt").exists())
+
+
+class SensitivePathApprovalTests(ModelHarness):
+    """`s` at a sensitive-path prompt names, and allows, that path only."""
+
+    def args(self):
+        return ["--plain"]
+
+    def files(self):
+        return {".env": "A=1\n", ".env.local": "B=2\n"}
+
+    def settings(self):
+        return {**super().settings(), "permission": "ask"}
+
+    def reply(self, messages):
+        done = tool_results(messages)
+        path = [".env", ".env", ".env.local"]
+        if done < len(path):
+            return ("tool", "read_file", {"path": path[done]})
+        return ("text", "read them all")
+
+    def test_s_covers_the_path_it_names(self):
+        self.send("/build read the env files\r")
+        self.wait_for(lambda: b"allow?" in self.output, "first approval prompt")
+        self.assertIn(b".env` this session", self.output)
+        self.assertNotIn(b"allow `read_file` this session", self.output)
+        self.send("s\r")
+        self.wait_for(lambda: self.output.count(b"allow?") >= 2, "the .env.local prompt")
+        self.assertIn(b".env.local` this session", self.output)
+        self.send("y\r")
+        self.wait_for(lambda: b"read them all" in self.output, "the turn ends")
+        self.assertEqual(self.output.count(b"access sensitive path"), 2)
+
+
+class RefusedChangeSummaryTests(ModelHarness):
+    """A turn whose change a hook refused says so under its answer."""
+
+    def args(self):
+        return ["--plain"]
+
+    def prepare(self):
+        (self.home / "settings.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "write_file", "hooks": [{"type": "command",
+             "command": "echo 'policy: no writes here' >&2; exit 2"}]}]}}))
+
+    def settings(self):
+        return {**super().settings(), "permission": "auto"}
+
+    def reply(self, messages):
+        if last_is_tool_result(messages):
+            return ("tool", "finish", {"summary": "wrote notes.txt"})
+        return ("tool", "write_file", {"path": "notes.txt", "content": "x\n"})
+
+    def test_the_refusal_is_listed_under_the_summary(self):
+        self.send("/build create notes.txt\r")
+        self.wait_for(lambda: b"not done this turn" in self.output, "the refusal under the answer")
+        out = bytes(self.output)
+        self.assertLess(out.rindex(b"wrote notes.txt"), out.rindex(b"not done this turn"))
+        self.assertIn(b"write notes.txt (policy: no writes here)", out)
+        self.assertFalse((self.root / "notes.txt").exists())
+
+
+class UnknownWindowTests(ModelHarness):
+    """A custom endpoint that does not report its window: /context and
+    /teamwork say the window is assumed, what the compact tool set leaves
+    out, and the setting that changes it."""
+
+    def settings(self):
+        return {**super().settings(), "provider": "custom", "model": "mock-coder"}
+
+    def test_context_and_teamwork_name_context_tokens(self):
+        self.send("/context\r")
+        self.wait_for(lambda: b"did not report its context window" in self.output, "/context note")
+        self.wait_for(lambda: b"context_tokens" in self.output, "the setting")
+        self.output.clear()
+        self.send("/teamwork\r")
+        self.wait_for(lambda: b"no helpers, todo list" in self.output, "/teamwork note")
+        self.assertIn(b"context_tokens", self.output)
 
 
 class RepoInstructionsTests(TerminalHarness):
