@@ -753,7 +753,12 @@ fn run_mode(
 ) -> Result<(), String> {
     let (p, perm, cwd) = (&rt.provider, rt.perm, rt.cwd.as_path());
     if crate::should_answer_conversationally(task, &mode) {
-        return agent::run_chat_turn(p, perm, cwd, task, images, transcript, sid);
+        let within = match mode {
+            Mode::Build => agent::ChatIn::Build,
+            Mode::Plan => agent::ChatIn::Plan,
+            Mode::Brainstorm => agent::ChatIn::Brainstorm,
+        };
+        return agent::run_chat_turn(p, perm, within, cwd, task, images, transcript, sid);
     }
     match mode {
         Mode::Build => agent::run_build_session_with_images(
@@ -1696,6 +1701,7 @@ mod tests {
                 id: "c1".into(),
                 content: "hello".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
             Msg::Assistant {
                 text: String::new(),

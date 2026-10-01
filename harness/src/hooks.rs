@@ -1603,7 +1603,6 @@ fn decide_trust(
             "  (untrusted project settings ignored; harmless ones like model still apply)"
         });
         return false;
-        return;
     }
     let mut declined: Vec<&str> = Vec::new();
     if has("base_url") {

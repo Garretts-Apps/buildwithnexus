@@ -2130,7 +2130,9 @@ fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<S
 /// (`bwn acp` serves many turns).
 pub fn reset_turn_outcome() {
     STOPPED_SHORT.store(0, Ordering::Relaxed);
-    BLOCKED_WITHOUT_TERMINAL.store(0, Ordering::Relaxed);
+    if let Ok(mut b) = BLOCKED_WITHOUT_TERMINAL.lock() {
+        b.clear();
+    }
 }
 
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
