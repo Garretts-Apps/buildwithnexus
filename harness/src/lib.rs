@@ -356,6 +356,8 @@ mod cli_option_tests {
 }
 
 pub fn run() {
+    #[cfg(unix)]
+    sandbox::hide_startup_credentials();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = match parse_cli_options(args) {
         Ok(parsed) => parsed,
@@ -6471,7 +6473,7 @@ fn window_notes(p: &Provider) -> Vec<String> {
     if !out.is_empty() {
         out.push(
             "set \"context_tokens\" in settings.json to the model's real window \
-             (above 32k offers every tool)"
+             (a window over 32,768 tokens offers every tool)"
                 .into(),
         );
     }

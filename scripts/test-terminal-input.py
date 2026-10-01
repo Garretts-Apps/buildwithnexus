@@ -676,8 +676,7 @@ class ModelSwapWordingTests(TerminalHarness):
 
     def test_two_words_are_not_a_model_name(self):
         self.send("/model nonsense-provider some-model\r")
-        self.wait_for(lambda: b"keeping the current model" in self.output, "the refusal")
-        self.assertIn("is not a provider or a model name", self.text())
+        self.wait_for(lambda: b"unknown provider 'nonsense-provider'" in self.output, "the refusal")
         self.assertFalse(self.model.posts())
 
     def test_a_server_that_answers_any_name_is_flagged(self):

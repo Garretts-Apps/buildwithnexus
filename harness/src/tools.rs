@@ -852,6 +852,9 @@ fn git_key_is_inert(key: &str) -> bool {
         // is a file it writes on the next fetch.
         ("http", _) => !matches!(var, "cookiefile" | "savecookies"),
         ("diff", None) => var != "external",
+        // Signing runs the user's own gpg.program, which repo config could
+        // only name under `gpg.*` (not inert).
+        ("commit", None) => matches!(var, "gpgsign" | "verbose" | "status" | "cleanup"),
         (
             "user" | "pull" | "push" | "fetch" | "init" | "log" | "color" | "advice" | "status"
             | "rerere" | "gc" | "index" | "feature" | "extensions" | "column" | "lfs",
@@ -3217,6 +3220,25 @@ fn sensitive_names(names: &[String], windows: bool, in_project: bool) -> bool {
     }) || names
         .last()
         .is_some_and(|n| is_sensitive_file_name(n, windows))
+        || (!windows && !in_project && is_proc_environ(names))
+}
+
+// `/proc/<pid>/environ` (or `/proc/<pid>/task/<tid>/environ`, or a glob of
+// either): another process's environment holds the keys bwn scrubs from the
+// commands it runs, the parent shell's included.
+fn is_proc_environ(names: &[String]) -> bool {
+    names.len() >= 3
+        && names[0] == "proc"
+        && names
+            .last()
+            .is_some_and(|n| n == "environ" || component_glob_match(n, "environ"))
+}
+
+// `environ`, or a glob of it that spells part of the name (`env*`): a bare
+// `*` is any file.
+fn is_environ_name(n: &str) -> bool {
+    n == "environ"
+        || (n.contains(['*', '?', '[']) && n.contains("env") && component_glob_match(n, "environ"))
 }
 
 /// Sensitivity of a path inside a project tree, relative to its root: the
@@ -3347,6 +3369,16 @@ fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<Pa
         let p = resolve(cwd, &tok);
         if is_script_command(&p) {
             continue;
+        }
+        // Any `…/environ` word: a loop variable (`$p/environ`) or a `cd
+        // /proc/1` first hides the `/proc` the path check needs.
+        if !windows
+            && tok
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| is_environ_name(&n.to_lowercase()))
+        {
+            return Some(p);
         }
         if is_sensitive_for(&p, windows) {
             return Some(p);
@@ -7779,6 +7811,34 @@ pub(crate) mod tests {
             "/proj/environment.txt",
         ] {
             assert!(!is_sensitive(Path::new(p)), "{p} should not be sensitive");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_environment_is_sensitive() {
+        for p in [
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "/proc/self/task/7/environ",
+            "/proc/*/environ",
+            "/proc/self/../self/environ",
+        ] {
+            assert!(is_sensitive(Path::new(p)), "{p}");
+        }
+        assert!(!is_sensitive(Path::new("/proc/self/status")));
+        assert!(!is_sensitive_in_project(Path::new("proc/x/environ")));
+        let cwd = Path::new("/tmp");
+        for cmd in [
+            "grep -a -h -o CUSTOM_API_KEY=. /proc/*/environ",
+            "cat /proc/$PPID/environ",
+            "tr '\\0' '\\n' < /proc/self/environ",
+            "head -c 4096 /proc/1/env*",
+            "for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/environ; done",
+            "cd /proc/self && cat environ",
+            "grep -a KEY /proc/self/*",
+        ] {
+            assert!(command_sensitive_path(cmd, cwd).is_some(), "{cmd}");
         }
     }
 

@@ -19,6 +19,24 @@ the setting that restores the old behavior is listed in
 [docs/UPGRADING-0.15.md](docs/UPGRADING-0.15.md).
 
 ### Security
+- **The key bwn was started with is not in its own environment block.**
+  `/proc/<pid>/environ` (Linux) and `ps eww` (macOS) show `****` for
+  `*_API_KEY`, `*_API_TOKEN` and preset key variables; bwn still uses the key.
+  `/proc/*/environ` (any process, globs included) is a sensitive path for the
+  file tools and for commands, so reading the parent shell's environment asks
+  first in every mode and is refused headless.
+- **A call quoted in an answer never runs.** JSON, `<tool_call>` markup or a
+  `tool_code` fence with prose after it, or after a paragraph or an
+  "example"/"you could" lead-in, is the model describing a call and stays
+  text in every mode. The reply's own call still runs when it opens the
+  reply or ends one short lead-in line.
+- **Isolated helpers run no repository hooks.** A helper's worktree is made
+  with hooks and fsmonitor off, and not at all when the repository's git config
+  can run programs (filters and the like). A read-only helper gets no worktree:
+  making one is a write.
+- **network rules match every spelling of an address.** IPv4 in any URL-parser
+  form, IPv4-mapped and -compatible IPv6 and trailing dots match the rule they
+  spell, and a redirect to a denied host is refused before it is followed.
 - **Repo prompts and skills need folder trust.** A project's
   `.buildwithnexus/system.md` takes effect only after you trust the folder, and
   is added after your own `~/.buildwithnexus/system.md` instead of replacing it.
@@ -536,8 +554,10 @@ the setting that restores the old behavior is listed in
 - **`doctor` names each missing tool once,** on its check line with the
   install command, in place of a separate advice block. The blocked-run line
   suggests `--permission-mode auto` only when auto would allow the calls.
-- **Text tool calls need the whole reply.** Outside a `tool_code` fence a
-  call runs only when the reply is nothing but that call. A call to a tool
+- **Text tool calls need to be the reply's own.** A Python-style call outside
+  a `tool_code` fence runs only when the reply is nothing but that call; JSON,
+  tagged and fenced calls run only when they open the reply or end a one-line
+  lead-in (see Security). A call to a tool
   that was not offered is refused before the gate with a short list of the
   offered tools. `finish` ends a BRAINSTORM turn and the first ACP prompt turn.
 - **Read-only helpers are reads for the gate.** A helper started with

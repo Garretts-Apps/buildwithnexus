@@ -339,6 +339,48 @@ fn env_names() -> impl Iterator<Item = String> {
     std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())
 }
 
+/// Moves the provider keys bwn was started with to the heap and blanks the
+/// originals, which `/proc/<pid>/environ` (Linux) and `ps eww` (macOS) read:
+/// a command or tool that reads bwn's own environment finds `****`, while
+/// `std::env::var` still returns the key. Runs first in `run`, before any
+/// thread starts.
+#[cfg(unix)]
+pub fn hide_startup_credentials() {
+    extern "C" {
+        static mut environ: *const *mut libc::c_char;
+    }
+    let saved: Vec<(String, std::ffi::OsString)> = credential_env(env_names(), &[])
+        .into_iter()
+        .filter_map(|n| std::env::var_os(&n).map(|v| (n, v)))
+        .collect();
+    if saved.is_empty() {
+        return;
+    }
+    // SAFETY: single-threaded at this point; each entry is a NUL-terminated
+    // `NAME=value` string the process owns, overwritten within its length.
+    unsafe {
+        let mut p = environ;
+        while !p.is_null() && !(*p).is_null() {
+            let entry = *p;
+            let bytes = std::ffi::CStr::from_ptr(entry).to_bytes();
+            if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
+                if saved.iter().any(|(n, _)| n.as_bytes() == &bytes[..eq]) {
+                    for i in eq + 1..bytes.len() {
+                        *entry.add(i) = b'*' as libc::c_char;
+                    }
+                }
+            }
+            p = p.add(1);
+        }
+    }
+    // Unset first: BSD setenv may copy a value back over the old one in
+    // place; a fresh setenv always allocates.
+    for (n, v) in saved {
+        std::env::remove_var(&n);
+        std::env::set_var(n, v);
+    }
+}
+
 /// Removes provider keys from a command the agent is about to run without
 /// the sandbox, so an approved `env` or `printenv` cannot hand the key to the
 /// model.

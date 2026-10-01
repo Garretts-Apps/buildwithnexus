@@ -930,6 +930,42 @@ fn sessions_and_doctor_neutralize_escapes_in_titles_and_paths() {
 
 // ── hooks: payload, matchers, lifecycle events ──────────────────────────────
 
+// bwn's own environment block, which /proc/<pid>/environ shows to any
+// process of the user, holds no provider key: the key a run was started
+// with is still used, but the original bytes are blanked.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_key_is_not_in_bwns_own_environment_block() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_hooks(
+        &home,
+        json!({ "SessionStart": hook("tr '\\0' '\\n' < /proc/$PPID/environ > bwn-environ.txt") }),
+    );
+    let (port, auths) = serve_auth(None);
+    write_config(&home, "custom", "auto", port);
+    let key = "sk-ENVIRON-SENTINEL-0123456789";
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "hi"],
+        &[("CUSTOM_API_KEY", key)],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let environ = std::fs::read_to_string(cwd.join("bwn-environ.txt")).unwrap();
+    assert!(
+        environ.contains("NEXUS_HOME="),
+        "the hook read bwn's block: {environ}"
+    );
+    assert!(!environ.contains(key), "{environ}");
+    assert!(environ.contains("CUSTOM_API_KEY=****"), "{environ}");
+    let sent = auths.lock().unwrap().clone();
+    assert!(
+        sent.iter().any(|a| a.ends_with(key)),
+        "the key is still used: {sent:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn hook_payload_carries_session_id_transcript_path_and_permission_mode() {

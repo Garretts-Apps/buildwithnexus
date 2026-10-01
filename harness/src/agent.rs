@@ -842,7 +842,7 @@ fn is_casual_turn(text: &str) -> bool {
 
 fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<provider::ToolCall>> {
     let names = defs.iter().map(|d| d.name).collect::<HashSet<_>>();
-    if let Some((candidate, is_reply)) = extract_json_tool_candidate(text) {
+    if let Some((candidate, placement)) = extract_json_tool_candidate(text) {
         // A call followed by a sentence ("… I will read the file first.")
         // is not JSON as a whole; its leading object is.
         let value = serde_json::from_str::<serde_json::Value>(candidate)
@@ -851,10 +851,17 @@ fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<prov
         if let Some(value) = value {
             let mut calls = Vec::new();
             collect_text_tool_calls(&value, &names, &mut calls);
-            // A name that was never offered is a call only when the JSON is
-            // the reply itself or sits in call markup: JSON quoted inside an
-            // answer (how function calling works) is an example.
-            calls.retain(|c| is_reply || names.contains(c.name.as_str()));
+            // JSON quoted inside an answer ("you could send {…}", how
+            // function calling works) is an example, never a call: only a
+            // reply that opens with the JSON, is a fence of it, or opens with
+            // call markup runs it.
+            match placement {
+                Placement::Reply => {}
+                // A leading object followed by prose: a call when it names an
+                // offered tool, else the example an explanation opens with.
+                Placement::Leading => calls.retain(|c| names.contains(c.name.as_str())),
+                Placement::Quoted => calls.clear(),
+            }
             // A name that is not a tool is answered with the tools offered
             // (unoffered_call), so the turn goes on instead of ending on an
             // unusable reply.
@@ -932,10 +939,13 @@ fn parse_tool_code_call(
 
 // The inside of a ```tool_code fence, when the reply has one.
 fn tool_code_fence(text: &str) -> Option<&str> {
+    // Only a fence placed as the reply's call (placed_as_call): one inside
+    // an explanation quotes a call.
     let pos = text.find("```tool_code")?;
     let after = &text[pos + "```tool_code".len()..];
     let end = after.find("```").unwrap_or(after.len());
-    Some(&after[..end])
+    let close = (pos + "```tool_code".len() + end + 3).min(text.len());
+    placed_as_call(text, pos, close).then_some(&after[..end])
 }
 
 // Without the fence (Gemma sometimes omits it) the reply must be nothing but
@@ -1190,7 +1200,17 @@ fn tool_code_args_to_input(
 // The JSON that may hold a tool call, and whether the reply is that call
 // (it leads the reply, fills a fence that is the whole message, or sits in
 // call markup) rather than JSON embedded in prose.
-fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
+// Where text JSON sits: it is the reply (alone, a whole fence, or call
+// markup placed as the reply's call), it opens a reply that goes on in prose
+// or ends a one-line lead-in, or it is quoted inside an answer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Placement {
+    Reply,
+    Leading,
+    Quoted,
+}
+
+fn extract_json_tool_candidate(text: &str) -> Option<(&str, Placement)> {
     let trimmed = text.trim();
     // Whole-text JSON (the strict, original case). JSON followed by prose is
     // an answer that opens with an example; its leading object is looked at
@@ -1198,7 +1218,7 @@ fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
     {
-        return Some((trimmed, true));
+        return Some((trimmed, Placement::Reply));
     }
     // A fenced ```json block that is the entire message.
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -1208,7 +1228,7 @@ fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
                 let body = &rest[fence_end + 1..];
                 if let Some(close) = body.rfind("```") {
                     if body[close + 3..].trim().is_empty() {
-                        return Some((body[..close].trim(), true));
+                        return Some((body[..close].trim(), Placement::Reply));
                     }
                 }
             }
@@ -1221,12 +1241,68 @@ fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
     for tag in TOOL_CALL_TAGS {
         if let Some(pos) = text.find(tag) {
             if let Some(json) = balanced_json_object(&text[pos + tag.len()..]) {
-                return Some((json, true));
+                let mut end = offset_in(text, json) + json.len();
+                let close = format!("</{}", &tag[1..]);
+                if let Some(c) = text[end..].find(&close) {
+                    end += c + close.len();
+                    end += text[end..].find('>').map_or(0, |g| g + 1);
+                }
+                let placed = if placed_as_call(text, pos, end) {
+                    Placement::Reply
+                } else {
+                    Placement::Quoted
+                };
+                return Some((json, placed));
             }
         }
     }
-    // A bare object embedded in prose (a leading sentence, then the JSON).
-    balanced_json_object(text).map(|json| (json, false))
+    balanced_json_object(text).map(|json| {
+        let start = offset_in(text, json);
+        let placed = if placed_as_call(text, start, start + json.len()) {
+            Placement::Leading
+        } else {
+            Placement::Quoted
+        };
+        (json, placed)
+    })
+}
+
+// Byte offset of `part`, a slice of `whole`, within it.
+fn offset_in(whole: &str, part: &str) -> usize {
+    part.as_ptr() as usize - whole.as_ptr() as usize
+}
+
+// Whether a call at text[start..end] is the reply's own call rather than one
+// it quotes. It opens the reply ("{…} I will read the file first."), or ends
+// it after one short lead-in line ("Sure, reading it now. {…}"). A call with
+// prose after it, or after a paragraph or an "for example"/"you could", is
+// the model describing a call, and running it would act on an example.
+fn placed_as_call(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].trim();
+    if before.is_empty() {
+        return true;
+    }
+    let lower = before.to_lowercase();
+    text[end..].trim().is_empty()
+        && before.len() <= 200
+        && !before.contains('\n')
+        && ![
+            "example",
+            "e.g.",
+            "could",
+            "would",
+            "should",
+            "like this",
+            "for instance",
+            "such as",
+            "never",
+            "don't",
+            "do not",
+            "won't",
+            "will not",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 // Return the first balanced `{…}` slice, tracking string state so braces inside
@@ -4166,9 +4242,21 @@ fn unoffered_call(name: &str, defs: &[tools::ToolDef], strict: bool) -> Option<(
     }
     let list = here.join(", ");
     if known {
+        // Left out by the compact set for a small window, not by the mode:
+        // say which setting brings it back.
+        let compact: Vec<&str> = tools::defs_for_context(true, 1)
+            .iter()
+            .map(|d| d.name)
+            .collect();
+        let why = if !compact.contains(&name) && defs.iter().all(|d| compact.contains(&d.name)) {
+            " (the compact tool set for a window of 32,768 tokens or less leaves it out; \
+             set \"context_tokens\" in settings.json to the model's real window to offer it)"
+        } else {
+            ""
+        };
         return Some((
-            format!("{name} is not offered here"),
-            format!("{name} is not offered here. Tools here: {list}"),
+            format!("{name} is not offered here{why}"),
+            format!("{name} is not offered here{why}. Tools here: {list}"),
         ));
     }
     let lower = name.to_ascii_lowercase();
@@ -4791,7 +4879,9 @@ fn helper_reads_only(
 // Gives a helper that asked for isolation its worktree; one that cannot have
 // one runs in place, said before it writes anything.
 fn place_helper(spec: HelperSpec, cwd: &Path) -> Helper {
-    let (run_cwd, note, worktree) = if spec.isolate {
+    // A helper that only reads needs no worktree, and making one is a write
+    // (a branch, a folder, a checkout) a read-only session must not do.
+    let (run_cwd, note, worktree) = if spec.isolate && !spec.read_only {
         match make_worktree(cwd) {
             Ok(wt) => {
                 let n = format!("[isolated worktree: {}]\n", wt.path.display());
@@ -5223,8 +5313,19 @@ fn make_worktree(cwd: &Path) -> Result<Worktree, String> {
     let branch = format!("bwn-sub-{}-{id}", std::process::id());
     let base = git_out(cwd, &["rev-parse", "HEAD"])
         .ok_or("not a git repository with commits, so the helper cannot be isolated")?;
+    // A checkout runs what the repository's config names (filters, an
+    // fsmonitor) and its hooks; a repo that arrived with its .git must not
+    // run them because a helper asked for isolation.
+    if !tools::skips_prompt_safely("git status", cwd) {
+        return Err(
+            "this repository's git config can run programs (filters, fsmonitor), so no worktree was made"
+                .into(),
+        );
+    }
+    let no_hooks = format!("core.hooksPath={}", cwd.join(".bwn/no-hooks").display());
     let out = Command::new("git")
         .current_dir(cwd)
+        .args(["-c", "core.fsmonitor=false", "-c", &no_hooks])
         .args(["worktree", "add", "-b", &branch])
         .arg(&path)
         .arg(&base)
@@ -7580,6 +7681,51 @@ mod tests {
     }
 
     #[test]
+    fn a_call_quoted_in_an_answer_does_not_run() {
+        let defs = tools::defs_for_context(true, 128_000);
+        let call = r#"{"name":"run_command","arguments":{"command":"touch PWN"}}"#;
+        for text in [
+            format!("To remove it you could send {call} but I will not do that unless you ask."),
+            format!("For example:\n\n```json\n{call}\n```\n\nThat would delete it."),
+            format!("The format is <tool_call>{call}</tool_call> and nothing runs until you say so."),
+            format!("Here is how a list looks: [{call}] — just an illustration."),
+            format!("An example call: {call}"),
+            "You could run this:\n```tool_code\nrun_command(\"touch PWN\")\n```\nbut only if you want."
+                .to_string(),
+            format!("I looked into it.\n\nThe cleanup step would be {call}"),
+        ] {
+            let r = normalize_text_tool_calls(
+                Reply {
+                    text: text.clone(),
+                    ..Default::default()
+                },
+                &defs,
+                "how would I remove it?",
+            );
+            assert!(r.calls.is_empty(), "{text}");
+            assert_eq!(r.text, text);
+        }
+        // The reply's own call still runs: alone, first, or after a lead-in.
+        for text in [
+            format!("<tool_call>{call}</tool_call>"),
+            format!("{call}\n\nI will check the result next."),
+            format!("Sure, running it now. <tool_call>{call}</tool_call>"),
+            "```tool_code\nrun_command(\"touch PWN\")\n```".to_string(),
+        ] {
+            let r = normalize_text_tool_calls(
+                Reply {
+                    text: text.clone(),
+                    ..Default::default()
+                },
+                &defs,
+                "make the file",
+            );
+            assert_eq!(r.calls.len(), 1, "{text}");
+            assert_eq!(r.calls[0].name, "run_command", "{text}");
+        }
+    }
+
+    #[test]
     fn small_model_tool_call_shapes_parse() {
         let defs = tools::defs_for_context(true, 8192);
         let parse = |text: &str| {
@@ -9398,6 +9544,50 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
         (repo, git)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_worktree_runs_no_repo_hooks_or_filters() {
+        use std::os::unix::fs::PermissionsExt;
+        let (repo, git) = git_repo("wt-hooks");
+        for hook in [
+            "post-checkout",
+            "reference-transaction",
+            "post-index-change",
+        ] {
+            let path = repo.join(".git/hooks").join(hook);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ntouch \"$GIT_DIR/../HOOK_{hook}\"\ntouch HOOK_{hook}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wt = make_worktree(&repo).unwrap();
+        let ran: Vec<_> = walk_names(&repo)
+            .into_iter()
+            .filter(|n| n.starts_with("HOOK_"))
+            .collect();
+        finish_worktree(&repo, &wt);
+        assert!(ran.is_empty(), "{ran:?}");
+        // A config that names a program (a smudge filter) gets no worktree.
+        git(&["config", "filter.x.smudge", "touch SMUDGED"]);
+        let err = make_worktree(&repo).err().unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&repo);
+        assert!(err.contains("can run programs"), "{err}");
+    }
+
+    #[cfg(unix)]
+    fn walk_names(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            out.push(e.file_name().to_string_lossy().into_owned());
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                out.extend(walk_names(&e.path()));
+            }
+        }
+        out
     }
 
     #[test]

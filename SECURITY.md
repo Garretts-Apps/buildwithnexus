@@ -391,8 +391,11 @@ never auto-updated.
   `auto` (also when they are the command of `check_work` or `start_server`),
   API keys are refused over non-HTTPS endpoints, typed hidden and saved only
   after the provider accepts them, key-like tokens are redacted from surfaced
-  errors, and provider keys are removed from the environment of the commands
-  the agent runs.
+  errors, provider keys are removed from the environment of the commands
+  the agent runs and blanked in bwn's own environment block (which
+  `/proc/<pid>/environ` shows), any process's `/proc/<pid>/environ` is a
+  sensitive path, a tool call quoted inside an answer never runs, and an
+  isolated helper's worktree runs no repository hooks.
 
 ## Permission Gates and the Optional Sandbox
 
