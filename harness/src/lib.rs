@@ -7491,11 +7491,10 @@ impl DoctorCheck {
     }
 }
 
-// Seam with trust-approvals (hooks::doctor_lines): each configured hook, and
-// a line starting with ⚠ for every problem (unknown events and types,
-// untrusted files). Returns nothing until that lands.
+// Each configured hook, and a line starting with ⚠ for every problem
+// (unknown events and types, untrusted files).
 fn hook_doctor_lines() -> Vec<String> {
-    Vec::new()
+    hooks::doctor_lines()
 }
 
 // `ollama list` names carry a tag; a configured name without one means

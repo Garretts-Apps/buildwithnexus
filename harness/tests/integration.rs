@@ -1949,6 +1949,26 @@ fn unknown_hook_event_and_type_warn_on_stderr() {
         r.stderr
     );
     assert!(r.stderr.contains("unknown hook type cmd"), "{}", r.stderr);
+    // doctor lists the hooks and warns about the same problems.
+    let (_, out) = doctor(&home, &["doctor"], &[]);
+    assert!(
+        out.contains("unknown hook event PreToolUSe (did you mean PreToolUse?)"),
+        "{out}"
+    );
+    assert!(out.contains("unknown hook type cmd"), "{out}");
+    let (_, out) = doctor(&home, &["--json", "doctor"], &[]);
+    let hooks: Vec<Value> = out
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["type"] == "check" && e["name"] == "hooks")
+        .collect();
+    assert!(
+        hooks
+            .iter()
+            .any(|c| c["status"] == "warn"
+                && c["detail"].as_str().unwrap_or("").contains("PreToolUSe")),
+        "{hooks:?}"
+    );
 }
 
 #[cfg(unix)]
