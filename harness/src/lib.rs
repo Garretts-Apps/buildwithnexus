@@ -816,7 +816,8 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
 
 /// `build_provider` with a key that is not saved yet: it is used in place of
 /// the stored one and passes the same checks, so a key can be proven with a
-/// probe before it is written to disk.
+/// probe before it is written to disk. For the custom endpoint an empty key
+/// means none, not the saved one.
 pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result<Provider, String> {
     let preset = config::preset(&s.provider).ok_or_else(|| unknown_provider_msg(&s.provider))?;
     let base_url = match &s.base_url {
@@ -836,8 +837,18 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
     };
     let api_key = if preset.id == "custom" {
         // Optional — most self-hosted OpenAI-compatible servers are keyless.
-        key.map(str::to_string)
-            .or_else(|| config::load_key(config::CUSTOM_KEY))
+        // Each endpoint has its own saved key.
+        let api_key = match key {
+            Some(k) => Some(k.to_string()).filter(|k| !k.is_empty()),
+            None => config::load_custom_key(&base_url),
+        };
+        if api_key.is_none() && key.is_none() && config::unbound_custom_key().is_some() {
+            report::notice(&format!(
+                "  a CUSTOM_API_KEY saved by an earlier version is not tied to an endpoint, so it is not sent to {} — /model offers it for an endpoint, and `buildwithnexus login` saves one for this one",
+                config::endpoint_origin(&base_url)
+            ));
+        }
+        api_key
     } else if preset.env_key.is_empty() {
         None
     } else {
@@ -1484,6 +1495,9 @@ fn login_cli(opts: &CliOptions) {
     }
     if let Some(m) = &opts.model {
         settings.model = m.clone();
+    }
+    if let Some(u) = &opts.base_url {
+        settings.base_url = Some(u.clone());
     }
     if onboarding::login(&settings).is_none() {
         std::process::exit(1);
@@ -2447,9 +2461,15 @@ fn repl(
         // Every mode reads and extends the one conversation, saved as the
         // session after each turn.
         let r = if conversational {
+            let within = match mode {
+                Mode::Build => agent::ChatIn::Build,
+                Mode::Plan => agent::ChatIn::Plan,
+                Mode::Brainstorm => agent::ChatIn::Brainstorm,
+            };
             agent::run_chat_turn(
                 &provider,
                 perm,
+                within,
                 cwd,
                 t,
                 std::mem::take(&mut image_data),
@@ -3902,7 +3922,7 @@ fn swap_model(
     let remembered = remembered_endpoint(preset.id);
     let mut model = model.to_string();
     let mut custom_url = base_url_override;
-    let key_name = onboarding::key_name(preset);
+    // For the custom endpoint, Some("") is "no key", not the saved one.
     let mut new_key: Option<String> = None;
 
     // Custom OpenAI-compatible endpoint: the address and key are asked only
@@ -3925,13 +3945,14 @@ fn swap_model(
                 url.to_string()
             });
         }
-        let new_address = custom_url.as_deref().is_some_and(|u| Some(u) != current);
-        if new_address && config::load_key(config::CUSTOM_KEY).is_none() {
-            let Some(key) = tui::ask_secret("  API key for this endpoint (Enter for none): ")
-            else {
+        // Keys are kept per endpoint: a new address gets its own key (or
+        // none), never the key of the one before.
+        let new_address = custom_url.as_deref().filter(|u| Some(*u) != current);
+        if let Some(url) = new_address.filter(|u| config::saved_custom_key(u).is_none()) {
+            let Some(key) = onboarding::ask_custom_key(url) else {
                 return swap_cancelled();
             };
-            new_key = Some(key.trim().to_string()).filter(|k| !k.is_empty());
+            new_key = Some(key);
         }
         if model.is_empty() {
             let Some(m) = tui::ask("  Model name (as the server expects it): ") else {
@@ -4057,12 +4078,21 @@ fn swap_model(
     let Some(mut p) = probe_swap(&mut s, preset, &mut new_key, &provider.model) else {
         return;
     };
-    if let Some(k) = &new_key {
-        config::save_key(key_name, k);
-        tui::line(&tui::green(&format!("  ✓ {key_name} saved")));
+    let key_name = onboarding::key_slot(preset, &p.base_url);
+    if let Some(k) = new_key.as_deref().filter(|k| !k.is_empty()) {
+        if preset.id == "custom" {
+            config::save_custom_key(&p.base_url, k);
+            tui::line(&tui::green(&format!(
+                "  ✓ key saved for {}",
+                tui::sanitize_terminal(&config::endpoint_origin(&p.base_url))
+            )));
+        } else {
+            config::save_key(&key_name, k);
+            tui::line(&tui::green(&format!("  ✓ {key_name} saved")));
+        }
     }
     if let Some(k) = p.api_key.as_deref() {
-        config::record_key_check(key_name, k, true);
+        config::record_key_check(&key_name, k, true);
     }
     // The probe's one-token usage mustn't pose as the live prompt
     // size, and a `--effort` given on the command line outlives the swap.
@@ -4146,14 +4176,14 @@ fn probe_swap(
         };
         let fail = onboarding::Fail::from_error(&e);
         if let onboarding::Fail::KeyRejected(code) = fail {
-            if new_key.is_some() {
+            if new_key.as_deref().is_some_and(|k| !k.is_empty()) {
                 tui::line(&tui::red(&format!(
                     "  ✗ rejected (HTTP {code}) — not saved"
                 )));
                 keeping();
                 return None;
             }
-            if preset.id == "custom" && config::load_key(config::CUSTOM_KEY).is_none() {
+            if preset.id == "custom" && p.api_key.is_none() {
                 tui::line(&tui::yellow(&format!(
                     "  the endpoint wants an API key (HTTP {code}) — paste it, or Esc to cancel"
                 )));
@@ -4174,9 +4204,8 @@ fn probe_swap(
         )));
         let hint = match fail {
             onboarding::Fail::KeyRejected(_) => {
-                let name = onboarding::key_name(preset);
-                if let Some(k) = config::load_key(name) {
-                    config::record_key_check(name, &k, false);
+                if let Some(k) = &p.api_key {
+                    config::record_key_check(&onboarding::key_slot(preset, &p.base_url), k, false);
                 }
                 "the API key was rejected — /login to replace it".to_string()
             }
@@ -5554,6 +5583,22 @@ fn git_may_run(cwd: &std::path::Path, ask: &mut dyn FnMut(&str) -> Option<String
         "  this repository's git config can run programs (hooks, filters, an external diff) — run git here anyway? [y/N]: ",
     );
     matches!(a.as_deref().map(str::trim), Some("y" | "Y" | "yes" | "YES"))
+}
+
+// `@diff` and `@status` run git as /diff does: in a repository whose config
+// can name programs the person is asked first, and without a terminal to
+// ask, nothing is attached and the notice says why.
+fn git_attachment_may_run(word: &str, cwd: &std::path::Path) -> bool {
+    if tools::skips_prompt_safely("git status", cwd) {
+        return true;
+    }
+    if report::is_json() || !std::io::stdin().is_terminal() {
+        report::notice(&format!(
+            "  {word} not attached: this repository's git config can run programs (hooks, filters, an external diff)"
+        ));
+        return false;
+    }
+    git_may_run(cwd, &mut |q| tui::ask(q))
 }
 
 fn git_text(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
@@ -7364,24 +7409,20 @@ fn attach_word(
         clean_word
     };
     if raw_path == "diff" || raw_path == "git:diff" {
-        if let Ok(o) = std::process::Command::new("git")
-            .args(["diff", "HEAD"])
-            .current_dir(cwd)
-            .output()
-        {
-            let diff_text = String::from_utf8_lossy(&o.stdout);
+        if !git_attachment_may_run(word, cwd) {
+            return None;
+        }
+        if let Ok(diff_text) = git_text(cwd, &["diff", "HEAD", "--no-ext-diff", "--no-textconv"]) {
             if !diff_text.trim().is_empty() {
                 text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
                 return Some("[git diff HEAD]".to_string());
             }
         }
     } else if raw_path == "status" || raw_path == "git:status" {
-        if let Ok(o) = std::process::Command::new("git")
-            .args(["status", "-s"])
-            .current_dir(cwd)
-            .output()
-        {
-            let stat_text = String::from_utf8_lossy(&o.stdout);
+        if !git_attachment_may_run(word, cwd) {
+            return None;
+        }
+        if let Ok(stat_text) = git_text(cwd, &["status", "-s"]) {
             if !stat_text.trim().is_empty() {
                 text_attachments.push(format!("[git status]\n{}", stat_text));
                 return Some("[git status]".to_string());
@@ -7977,15 +8018,19 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
     }
 
     // The key of the provider in use, and no other.
-    if let Some(preset) = settings.as_ref().and_then(|s| config::preset(&s.provider)) {
+    if let Some((s, preset)) = settings
+        .as_ref()
+        .and_then(|s| config::preset(&s.provider).map(|p| (s, p)))
+    {
         if preset.id == "custom" {
-            let set = config::load_key(config::CUSTOM_KEY).is_some();
+            let url = s.base_url.as_deref().unwrap_or(preset.base_url);
+            let origin = config::endpoint_origin(url);
             out.push(DoctorCheck::note(
                 config::CUSTOM_KEY,
-                if set {
-                    "set"
+                if config::load_custom_key(url).is_some() {
+                    format!("set for {origin}")
                 } else {
-                    "not set (optional for most servers)"
+                    format!("not set for {origin} (optional for most servers)")
                 },
             ));
         } else if !preset.env_key.is_empty() {
@@ -8313,15 +8358,27 @@ mod tests {
         assert_eq!(p.model, "my-vllm-model");
 
         // With a key configured, plain http to a REMOTE host is refused…
-        config::save_key(config::CUSTOM_KEY, "sk-custom");
         let mut remote = s.clone();
         remote.base_url = Some("http://gateway.example.com/v1".into());
+        config::save_custom_key("http://gateway.example.com/v1", "sk-custom");
         assert!(build_provider(&remote).is_err());
         // …but loopback and https are both fine.
-        assert!(build_provider(&s).unwrap().api_key.is_some());
+        config::save_custom_key("http://localhost:8000/v1", "sk-local");
+        assert_eq!(
+            build_provider(&s).unwrap().api_key.as_deref(),
+            Some("sk-local")
+        );
         let mut tls = s.clone();
         tls.base_url = Some("https://gateway.example.com/v1".into());
-        assert!(build_provider(&tls).is_ok());
+        config::save_custom_key("https://gateway.example.com/v1", "sk-tls");
+        assert_eq!(
+            build_provider(&tls).unwrap().api_key.as_deref(),
+            Some("sk-tls")
+        );
+        // Each endpoint gets its own key, or none.
+        let mut other = s.clone();
+        other.base_url = Some("http://127.0.0.1:9000/v1".into());
+        assert_eq!(build_provider(&other).unwrap().api_key, None);
 
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&h);

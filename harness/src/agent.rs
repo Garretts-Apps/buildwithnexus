@@ -2313,36 +2313,27 @@ fn rule_covers(
     if rule.network {
         return host.is_some_and(|h| host_matches(&rule.rule, h));
     }
-    let (tool, pattern) = split_rule(&rule.rule);
-    // A rule for the shell tool (`run_command`, `bash`, Claude Code's `Bash`)
-    // covers every tool that runs a command, so check_work and start_server
-    // cannot step around `run_command(git push*)`.
-    let shell = command_of(name, input);
-    let names_shell = || {
-        ["run_command", "bash"]
-            .iter()
-            .any(|t| hooks::tool_matches(tool, t))
-    };
-    if !hooks::tool_matches(tool, name) && !(shell.is_some() && names_shell()) {
+    let Some(pattern) = rule_pattern_for(rule, name, input) else {
         return false;
-    }
+    };
     let Some(pat) = pattern.filter(|p| !p.is_empty() && *p != "*") else {
         return true;
     };
     let allow = rule.effect == config::RuleEffect::Allow;
-    if let Some(cmd) = shell {
-        // Claude Code's prefix form `git push:*` means `git push*`.
-        let pat = match pat.strip_suffix(":*") {
-            Some(p) => format!("{p}*"),
-            None => pat.to_string(),
-        };
-        let subjects = tools::rule_subjects(cmd);
+    if let Some(cmd) = command_of(name, input) {
+        let pat = command_pattern(pat);
+        // An allow rule covers the command exactly as written; deny and ask
+        // rules see through wrappers, shells and git's own options.
         return if allow {
             tools::is_plain_command(cmd)
                 && tools::skips_prompt_safely(cmd, cwd)
-                && subjects.first().is_some_and(|c| hooks::glob_match(&pat, c))
+                && tools::rule_subjects(cmd)
+                    .first()
+                    .is_some_and(|c| hooks::glob_match(&pat, c))
         } else {
-            subjects.iter().any(|c| hooks::glob_match(&pat, c))
+            tools::guard_subjects(cmd)
+                .iter()
+                .any(|c| hooks::glob_match(&pat, c))
         };
     }
     if matches!(name, "web_search" | "websearch") {
@@ -2361,6 +2352,53 @@ fn rule_covers(
         } else {
             paths.iter().any(hit)
         }
+}
+
+// The pattern part of a rule (None inside: a bare `Tool` rule) when the
+// rule's tool covers this call. A rule for the shell tool (`run_command`,
+// `bash`, Claude Code's `Bash`) covers every tool that runs a command, so
+// check_work and start_server cannot step around `run_command(git push*)`.
+fn rule_pattern_for<'a>(
+    rule: &'a config::PolicyRule,
+    name: &str,
+    input: &serde_json::Value,
+) -> Option<Option<&'a str>> {
+    let (tool, pattern) = split_rule(&rule.rule);
+    let names_shell = || {
+        ["run_command", "bash"]
+            .iter()
+            .any(|t| hooks::tool_matches(tool, t))
+    };
+    (hooks::tool_matches(tool, name) || (command_of(name, input).is_some() && names_shell()))
+        .then_some(pattern)
+}
+
+// Claude Code's prefix form `git push:*` means `git push*`.
+fn command_pattern(pat: &str) -> String {
+    match pat.strip_suffix(":*") {
+        Some(p) => format!("{p}*"),
+        None => pat.to_string(),
+    }
+}
+
+// A deny rule for a shell command whose program a compound command names
+// anywhere (`make && git $(echo push)` under `run_command(git push*)`):
+// what that command runs cannot be read from its text.
+fn compound_denied<'a>(
+    rules: &'a [config::PolicyRule],
+    name: &str,
+    input: &serde_json::Value,
+) -> Option<(&'a config::PolicyRule, String)> {
+    let cmd = command_of(name, input)?;
+    rules
+        .iter()
+        .filter(|r| r.effect == config::RuleEffect::Deny && !r.network)
+        .find_map(|r| {
+            let pat = rule_pattern_for(r, name, input)??;
+            let pat = command_pattern(pat.trim());
+            let program = pat.split_whitespace().next()?.to_string();
+            tools::compound_mentions(cmd, &program).then_some((r, program))
+        })
 }
 
 // Host patterns are case-insensitive and may leave out the port.
@@ -2418,9 +2456,16 @@ fn denied_by_rule(
     cwd: &Path,
     host: Option<&str>,
 ) -> Option<String> {
-    let r = rule_for(rules, config::RuleEffect::Deny, name, input, cwd, host)?;
+    if let Some(r) = rule_for(rules, config::RuleEffect::Deny, name, input, cwd, host) {
+        stopped_short(Outcome::ApprovalBlocked);
+        return Some(format!("denied by {}", rule_label(r)));
+    }
+    let (r, program) = compound_denied(rules, name, input)?;
     stopped_short(Outcome::ApprovalBlocked);
-    Some(format!("denied by {}", rule_label(r)))
+    Some(format!(
+        "denied by {}: `{program}` appears in a compound command, where what runs cannot be checked — run that command on its own",
+        rule_label(r)
+    ))
 }
 
 /// How a rule names itself in a refusal: `rule run_command(git push*)
@@ -5319,9 +5364,8 @@ fn brainstorm_reply(
                 continue;
             }
             // Read-only regardless of the session gate, like run_plan.
-            let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd).map(|r| {
-                phase_readonly_reason(r, "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes")
-            });
+            let reason = hook_gate(Permission::ReadOnly, &call.name, &call_input, cwd)
+                .map(|r| phase_readonly_reason(r, BRAINSTORM_READONLY));
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
@@ -5401,11 +5445,27 @@ fn brainstorm_reply(
     }
 }
 
-/// A conversational turn in BUILD or PLAN ("what does this project do?"),
-/// answered on the session's conversation and saved with it.
+const BRAINSTORM_READONLY: &str =
+    "BRAINSTORM is read-only: switch to BUILD (Shift+Tab or /build) to make changes";
+const PLAN_CHAT_READONLY: &str =
+    "PLAN is read-only: switch to BUILD (Shift+Tab or /build) to make changes";
+
+/// The mode a conversational turn was typed in. BUILD answers under the
+/// session permission; PLAN and BRAINSTORM are read-only whatever it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatIn {
+    Build,
+    Plan,
+    Brainstorm,
+}
+
+/// A conversational turn ("what does this project do?"), answered on the
+/// session's conversation and saved with it.
+#[allow(clippy::too_many_arguments)]
 pub fn run_chat_turn(
     p: &Provider,
     perm: Permission,
+    within: ChatIn,
     cwd: &Path,
     question: &str,
     images: Vec<(String, String)>,
@@ -5414,7 +5474,15 @@ pub fn run_chat_turn(
 ) -> Result<(), String> {
     crate::session::set_current(sid);
     let _running_guard = AgentRunningGuard::new();
-    hooks::set_permission_mode(permission_name(perm));
+    let (perm, readonly) = match within {
+        ChatIn::Build => (perm, None),
+        ChatIn::Plan => (Permission::ReadOnly, Some(PLAN_CHAT_READONLY)),
+        ChatIn::Brainstorm => (Permission::ReadOnly, Some(BRAINSTORM_READONLY)),
+    };
+    hooks::set_permission_mode(match within {
+        ChatIn::Plan => "plan",
+        _ => permission_name(perm),
+    });
     // A chat question keeps whatever prompt the conversation already has;
     // only a fresh conversation gets the chat prompt.
     if msgs.is_empty() {
@@ -5428,7 +5496,7 @@ pub fn run_chat_turn(
         msgs.push(Msg::System(sys));
     }
     msgs.push(user_msg(question.to_string(), images));
-    let r = chat_reply(p, perm, cwd, question, msgs);
+    let r = chat_reply(p, perm, readonly, cwd, question, msgs);
     if r.is_err() {
         drop_refused_message(p, msgs);
     }
@@ -5460,23 +5528,25 @@ pub fn ask_aside(
     msgs.push(Msg::User(format!(
         "{question}\n\n(A side question: answer it briefly; do not change any files.)"
     )));
-    match chat_reply(p, Permission::ReadOnly, cwd, question, &mut msgs) {
+    match chat_reply(p, Permission::ReadOnly, None, cwd, question, &mut msgs) {
         Err(e) if interrupted_turn(&e) => Ok(()),
         r => r,
     }
 }
 
 // A question can still lead to an edit: what it left each file as is
-// recorded, so /undo asks before overwriting a later hand edit.
+// recorded, so /undo asks before overwriting a later hand edit. `readonly`
+// names the read-only mode in a refusal.
 fn chat_reply(
     p: &Provider,
     perm: Permission,
+    readonly: Option<&str>,
     cwd: &Path,
     question: &str,
     msgs: &mut Vec<Msg>,
 ) -> Result<(), String> {
     let started = checkpoint::now_ms();
-    let r = chat_rounds(p, perm, cwd, question, msgs);
+    let r = chat_rounds(p, perm, readonly, cwd, question, msgs);
     checkpoint::seal_since(cwd, started);
     r
 }
@@ -5484,11 +5554,16 @@ fn chat_reply(
 fn chat_rounds(
     p: &Provider,
     perm: Permission,
+    readonly: Option<&str>,
     cwd: &Path,
     question: &str,
     msgs: &mut Vec<Msg>,
 ) -> Result<(), String> {
-    let defs = tools::defs_for_context(false, p.context_tokens);
+    let defs = if matches!(perm, Permission::ReadOnly) {
+        tools::defs_readonly()
+    } else {
+        tools::defs_for_context(false, p.context_tokens)
+    };
     let mut loop_guard = ToolLoopGuard::default();
 
     for tool_round in 1..=MAX_CHAT_TOOL_ROUNDS {
@@ -5549,7 +5624,10 @@ fn chat_rounds(
             );
             trace_tool_call(&call.name, &call_input, "chat", tool_round);
 
-            let reason = hook_gate(perm, &call.name, &call_input, cwd);
+            let reason = hook_gate(perm, &call.name, &call_input, cwd).map(|r| match readonly {
+                Some(msg) => phase_readonly_reason(r, msg),
+                None => r,
+            });
             if let Some(reason) = reason {
                 report::tool_denied(&reason);
                 trace::record_visible(
@@ -5776,6 +5854,7 @@ mod tests {
         chat_reply(
             &p,
             Permission::Auto,
+            None,
             &proj,
             "what notes do we keep?",
             &mut msgs,
@@ -7822,6 +7901,40 @@ mod tests {
     }
 
     #[test]
+    fn session_answer_covers_exactly_the_approved_destructive_git_command() {
+        for (n, (cmd, other)) in tools::tests::DESTRUCTIVE_GIT.iter().enumerate() {
+            let cwd = PathBuf::from(format!("/proj-gitscope-{n}"));
+            let key = tools::approval_key(cmd);
+            assert!(confirm_with(cmd, &key, &cwd, |_| Some("s".into())).is_none());
+            assert!(is_pre_approved(Some(cmd), &key, &cwd), "{cmd}");
+            let other_key = tools::approval_key(other);
+            assert!(
+                !is_pre_approved(Some(other), &other_key, &cwd),
+                "s on {cmd} approved {other}"
+            );
+        }
+        // `s` on the everyday form of a subcommand never covers its
+        // destructive form.
+        let cwd = Path::new("/proj-gitscope-plain");
+        for plain in [
+            "git push origin main",
+            "git reset HEAD a.rs",
+            "git branch x",
+        ] {
+            let key = tools::approval_key(plain);
+            assert!(confirm_with(plain, &key, cwd, |_| Some("s".into())).is_none());
+        }
+        for cmd in [
+            "git push --force origin main",
+            "git reset --hard HEAD~1",
+            "git branch -D x",
+        ] {
+            let key = tools::approval_key(cmd);
+            assert!(!is_pre_approved(Some(cmd), &key, cwd), "{cmd}");
+        }
+    }
+
+    #[test]
     fn cancelling_an_approval_denies_it_and_stops_the_turn() {
         let cwd = Path::new("/proj-cancel");
         set_turn_stopped(false);
@@ -7994,6 +8107,169 @@ mod tests {
             &proj
         )
         .is_some_and(|r| r.contains("denied by rule")));
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn deny_and_ask_rules_see_through_wrappers_shells_and_git_options() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "wrappers",
+            json!({"permissions": {
+                "deny": ["run_command(git push*)"],
+                "ask": ["Bash(npm publish:*)"]
+            }}),
+        );
+        let run = |cmd: &str| {
+            gate(
+                Permission::Auto,
+                "run_command",
+                &json!({"command": cmd}),
+                &proj,
+            )
+        };
+        let denied = "denied by rule run_command(git push*) (user settings)";
+        for cmd in [
+            "git -C . push",
+            "git -C sub push origin main",
+            "git -c push.default=current push",
+            "git --git-dir=.git push",
+            "git --git-dir .git --work-tree . push",
+            "git --no-pager push",
+            "env git push",
+            "env -i HOME=/tmp git push",
+            "env -u GIT_DIR -- git push",
+            "env -S 'git push'",
+            "FOO=1 git push",
+            "nice git push",
+            "nice -n 10 git push",
+            "command git push",
+            "command -p git push",
+            "builtin command git push",
+            "time git push",
+            "time -p git push",
+            "sudo git push",
+            "sudo -u deploy -E git push",
+            "doas -u deploy git push",
+            "nohup git push",
+            "timeout 30 git push",
+            "timeout -s KILL 30 git push",
+            "stdbuf -oL git push",
+            "setsid git push",
+            "exec git push",
+            "eval git push",
+            "eval 'git push'",
+            "watch -n 5 git push",
+            "sh -c 'git push'",
+            "bash -lc \"git push origin main\"",
+            "bash -o pipefail -c 'git push'",
+            "bash -c 'cd sub && git push'",
+            "zsh -c 'nice git push'",
+            "dash -ec 'sudo env git -C . push'",
+            "busybox sh -c 'git push'",
+            "cmd /c git push",
+            "pwsh -Command \"git push\"",
+            "xargs git push",
+            "xargs -n 1 -I{} git push {}",
+            "/usr/bin/git push",
+            "/usr/bin/env /usr/bin/git push",
+            "GIT.EXE push",
+            "\"git\" push",
+            "git 'push'",
+            "g\\it push",
+            "{ git push; }",
+            "if true; then git push; fi",
+            "echo $(git push)",
+            "echo `git push`",
+            "(git push)",
+            "echo main | xargs git push origin",
+            "git -c alias.p=push p origin main",
+            "git -c 'alias.p=!git push' p",
+            "/usr/lib/git-core/git-push origin main",
+            "git --attr-source HEAD push",
+            "git --shallow-file x push",
+            "git --config-env core.editor=EDITOR push",
+            "find . -maxdepth 0 -exec git push {} +",
+            "fakeroot git push",
+            "firejail --quiet git push",
+            "bwrap --bind / / git push",
+            "proxychains4 -q git push",
+            "torsocks git push",
+            "numactl -N 0 git push",
+            "chronic git push",
+            "run0 git push",
+            "sg staff 'git push'",
+            "ssh-agent git push",
+            "dbus-run-session git push",
+            "systemd-inhibit git push",
+            "uv run git push",
+            "poetry run git push",
+            "pipenv run git push",
+            "bundle exec git push",
+            "direnv exec . git push",
+            "mise exec -- git push",
+            "nix-shell --run 'git push'",
+        ] {
+            assert_eq!(run(cmd).as_deref(), Some(denied), "{cmd}");
+        }
+        // Padding in front of the command does not hide it.
+        for cmd in [
+            format!("sudo {}git push", "-E ".repeat(300)),
+            format!("{}git push", "nice ".repeat(300)),
+            format!("env {}git push", "A=1 ".repeat(300)),
+            format!("sudo git push origin {}--force", "x ".repeat(2000)),
+        ] {
+            assert_eq!(run(&cmd).as_deref(), Some(denied), "{}", &cmd[..40]);
+        }
+        // A deny rule's program anywhere in a pipeline or a compound
+        // command: what runs cannot be read from the text.
+        for cmd in [
+            "make deploy && git $(echo push)",
+            "cat refs | git `echo pu``echo sh`",
+            "true; x=git; $x push",
+            "printf push | xargs -I{} sh -c 'git {}'",
+            "cargo fmt && git status",
+            // Quoting that bash decodes, and code handed to an interpreter.
+            "git $'push'",
+            "git $'\\x70ush'",
+            "ruby -e 'system \"git push\"'",
+            "perl -e 'system \"git push\"'",
+            "sudo perl -e 'exec \"git\", \"push\"'",
+        ] {
+            let r = run(cmd).expect("denied");
+            assert!(r.starts_with(denied), "{cmd}: {r}");
+            assert!(r.contains("`git` appears in a compound command"), "{r}");
+        }
+        // Ask rules see through the same wrappers.
+        for cmd in [
+            "sudo npm publish",
+            "env NODE_ENV=production npm publish --access public",
+            "sh -c 'npm publish'",
+            "make && nice npm publish",
+        ] {
+            let r = run(cmd).expect("asks");
+            assert!(
+                r.contains("asks because of rule Bash(npm publish:*)"),
+                "{cmd}: {r}"
+            );
+        }
+        // A simple command that only mentions the program is not a push, and
+        // other git commands still run.
+        for cmd in [
+            "git status",
+            "git -C sub log --oneline",
+            "git log --grep push",
+            "echo git push",
+            "grep -rn 'git push' docs",
+            "sudo git status",
+            "sh -c 'git status'",
+            "npm test",
+        ] {
+            assert_eq!(run(cmd), None, "{cmd}");
+        }
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

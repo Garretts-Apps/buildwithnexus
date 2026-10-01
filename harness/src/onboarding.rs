@@ -158,16 +158,33 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
         Vec::new()
     };
     let name = key_name(pick);
-    let stored = config::load_key(name);
+    let url_now = |b: &Option<String>| b.clone().unwrap_or_else(|| pick.base_url.to_string());
+    let stored_for = |url: &str| {
+        if pick.id == "custom" {
+            config::load_custom_key(url)
+        } else {
+            config::load_key(name)
+        }
+    };
+    let mut stored = stored_for(&url_now(&base_url));
     // A key typed here is saved only once the model has answered with it.
     let mut key = if wants_key {
-        choose_key(pick, stored.as_deref())?
+        choose_key(pick, stored.as_deref(), &url_now(&base_url))?
     } else {
         None
     };
+    let mut key_origin = config::endpoint_origin(&url_now(&base_url));
     let mut model = choose_model(pick, &detected)?;
 
     loop {
+        // A custom endpoint's key belongs to its address: one typed for
+        // another address is not sent to this one.
+        let origin = config::endpoint_origin(&url_now(&base_url));
+        if pick.id == "custom" && origin != key_origin {
+            key = None;
+            stored = stored_for(&url_now(&base_url));
+            key_origin = origin;
+        }
         let settings = Settings {
             provider: pick.id.to_string(),
             model: model.clone(),
@@ -178,7 +195,7 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
         tui::line(&tui::dim(&format!(
             "  checking {} at {}…",
             tui::sanitize_terminal(&model),
-            tui::sanitize_terminal(host_of(url))
+            tui::sanitize_terminal(&host_of(url))
         )));
         let fail = match check(&settings, key.as_deref()) {
             Ok(served) => {
@@ -213,7 +230,12 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
                         "  the key was rejected (HTTP {code}) — paste it again, or Esc to stop"
                     )));
                 }
-                key = Some(ask_key(pick)?).filter(|k| !k.is_empty());
+                key = if pick.id == "custom" {
+                    Some(ask_custom_key(&url_now(&base_url)).ok_or(Exit::Stop)?)
+                } else {
+                    Some(ask_key(pick)?)
+                }
+                .filter(|k| !k.is_empty());
             }
             Fail::ModelMissing => {
                 model = replace_model(pick, url, &model)?;
@@ -233,15 +255,18 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
     }
 
     let permission = choose_permission()?;
+    let url = url_now(&base_url);
+    let slot = key_slot(pick, &url);
     if let Some(k) = &key {
-        config::save_key(name, k);
+        if pick.id == "custom" {
+            config::save_custom_key(&url, k);
+        } else {
+            config::save_key(&slot, k);
+        }
     }
     if let Some(k) = key.as_deref().or(stored.as_deref()) {
-        config::record_key_check(name, k, true);
+        config::record_key_check(&slot, k, true);
     }
-    let url = base_url
-        .clone()
-        .unwrap_or_else(|| pick.base_url.to_string());
     tui::line("");
     match save_setup(pick.id, model.clone(), permission, base_url) {
         Ok(settings) => {
@@ -448,7 +473,7 @@ pub(crate) fn more_line(hidden: usize) -> String {
     format!("+{hidden} more — type a name")
 }
 
-/// The saved key a preset uses: CUSTOM_API_KEY for the custom endpoint,
+/// The key variable a preset uses: CUSTOM_API_KEY for the custom endpoint,
 /// none for the keyless local servers.
 pub(crate) fn key_name(p: &Preset) -> &'static str {
     if p.id == "custom" {
@@ -458,8 +483,37 @@ pub(crate) fn key_name(p: &Preset) -> &'static str {
     }
 }
 
+/// Where a preset's key is saved: its variable, or for the custom endpoint
+/// one entry per endpoint (`config::custom_key_name`).
+pub(crate) fn key_slot(p: &Preset, base_url: &str) -> String {
+    if p.id == "custom" {
+        config::custom_key_name(base_url)
+    } else {
+        p.env_key.to_string()
+    }
+}
+
+/// The key for a custom endpoint that has none saved, asked for that
+/// endpoint alone: Some("") for no key, None for Esc. A key an earlier
+/// version saved for no endpoint in particular is offered first.
+pub(crate) fn ask_custom_key(url: &str) -> Option<String> {
+    let host = tui::sanitize_terminal(&host_of(url)).into_owned();
+    if let Some(old) = config::unbound_custom_key() {
+        tui::line(&tui::dim(&format!(
+            "  a CUSTOM_API_KEY saved by an earlier version ({}) is not tied to an endpoint",
+            config::mask(&old)
+        )));
+        let a = tui::ask(&format!("  send it to {host}? [y/N]: "))?;
+        if matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Some(old);
+        }
+    }
+    let k = tui::ask_secret("  API key for this endpoint (Enter for none): ")?;
+    Some(k.trim().to_string())
+}
+
 // A key typed now (Some) or the stored one (None).
-fn choose_key(pick: &Preset, stored: Option<&str>) -> Result<Option<String>, Exit> {
+fn choose_key(pick: &Preset, stored: Option<&str>, url: &str) -> Result<Option<String>, Exit> {
     let name = key_name(pick);
     if name.is_empty() {
         return Ok(None);
@@ -477,9 +531,8 @@ fn choose_key(pick: &Preset, stored: Option<&str>) -> Result<Option<String>, Exi
         return Ok(None);
     }
     if pick.id == "custom" {
-        let k =
-            tui::ask_secret("  API key for this endpoint (Enter for none): ").ok_or(Exit::Stop)?;
-        return Ok(Some(k.trim().to_string()).filter(|k| !k.is_empty()));
+        let k = ask_custom_key(url).ok_or(Exit::Stop)?;
+        return Ok(Some(k).filter(|k| !k.is_empty()));
     }
     tui::line("");
     tui::line(&tui::dim(&format!(
@@ -552,7 +605,7 @@ fn replace_model(pick: &Preset, url: &str, model: &str) -> Result<String, Exit> 
     } else {
         tui::line(&tui::yellow(&format!(
             "  '{model}' isn't served at {}",
-            tui::sanitize_terminal(host_of(url))
+            tui::sanitize_terminal(&host_of(url))
         )));
     }
     if !served.is_empty() {
@@ -664,6 +717,8 @@ pub(crate) fn login(settings: &Settings) -> Option<Provider> {
         return None;
     };
     let name = key_name(preset);
+    let url = settings.base_url.as_deref().unwrap_or(preset.base_url);
+    let slot = key_slot(preset, url);
     let model = if settings.model.is_empty() {
         preset.default_model
     } else {
@@ -676,9 +731,14 @@ pub(crate) fn login(settings: &Settings) -> Option<Provider> {
         )));
         return None;
     }
+    // A custom endpoint's key is for that endpoint alone.
+    let label = if preset.id == "custom" {
+        tui::sanitize_terminal(&config::endpoint_origin(url)).into_owned()
+    } else {
+        preset.label.to_string()
+    };
     tui::line(&tui::dim(&format!(
-        "  a new {name} for {}: it is checked with {} before it is saved · Esc cancels",
-        preset.label,
+        "  a new {name} for {label}: it is checked with {} before it is saved · Esc cancels",
         tui::sanitize_terminal(model)
     )));
     loop {
@@ -695,12 +755,13 @@ pub(crate) fn login(settings: &Settings) -> Option<Provider> {
         }
         match check(settings, Some(key)) {
             Ok(served) => {
-                config::save_key(name, key);
-                config::record_key_check(name, key, true);
-                tui::line(&tui::green(&format!(
-                    "  ✓ {name} saved — {} answered",
-                    preset.label
-                )));
+                if preset.id == "custom" {
+                    config::save_custom_key(url, key);
+                } else {
+                    config::save_key(&slot, key);
+                }
+                config::record_key_check(&slot, key, true);
+                tui::line(&tui::green(&format!("  ✓ {name} saved — {label} answered")));
                 if config::key_from_env(name) {
                     tui::line(&tui::yellow(&format!(
                         "  {name} is also set in your environment, which wins at the next launch — unset it to keep using this key"
@@ -745,14 +806,17 @@ pub(crate) fn provider_label(preset_id: &str, base_url: &str) -> String {
         Some(p) => p.label.split(" (").next().unwrap_or(p.label),
         None => preset_id,
     };
-    format!("{name} ({})", tui::sanitize_terminal(host_of(base_url)))
+    format!("{name} ({})", tui::sanitize_terminal(&host_of(base_url)))
 }
 
-// host[:port] of a URL, without scheme, path or credentials.
-fn host_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    authority.rsplit('@').next().unwrap_or(authority)
+// host[:port] of a URL, without scheme, path or credentials: the host the
+// request goes to, as the key for it is filed (`config::endpoint_origin`).
+fn host_of(url: &str) -> String {
+    let origin = config::endpoint_origin(url);
+    match origin.split_once("://") {
+        Some((_, host)) => host.to_string(),
+        None => origin,
+    }
 }
 
 // Only the four answered keys change: allowed_commands, project_allowed,
@@ -790,6 +854,19 @@ fn save_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_named_is_the_one_the_request_goes_to() {
+        assert_eq!(
+            host_of("http://a.example.com\\@b.example.com/v1"),
+            "a.example.com"
+        );
+        assert_eq!(host_of("http://u:p@localhost:1234/v1"), "localhost:1234");
+        assert_eq!(
+            provider_label("custom", "https://gw.example.com/v1"),
+            "custom endpoint (gw.example.com)"
+        );
+    }
 
     #[test]
     fn probe_errors_say_what_to_do_next() {

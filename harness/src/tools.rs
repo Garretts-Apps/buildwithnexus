@@ -799,6 +799,10 @@ fn git_key_is_inert(key: &str) -> bool {
             )
         }
         ("submodule", Some(_)) => matches!(var, "url" | "active" | "branch"),
+        // Network settings, such as the auth header actions/checkout
+        // stores: none of them names a program. A cookie file git saves to
+        // is a file it writes on the next fetch.
+        ("http", _) => !matches!(var, "cookiefile" | "savecookies"),
         ("diff", None) => var != "external",
         (
             "user" | "pull" | "push" | "fetch" | "init" | "log" | "color" | "advice" | "status"
@@ -938,6 +942,25 @@ const RUNS_ARBITRARY_CODE: &[&str] = &[
     "systemd-run",
     "caffeinate",
     "start",
+    "fakeroot",
+    "fakechroot",
+    "faketime",
+    "firejail",
+    "bwrap",
+    "proot",
+    "proxychains",
+    "torsocks",
+    "tsocks",
+    "numactl",
+    "chronic",
+    "ifne",
+    "sg",
+    "ssh-agent",
+    "dbus-run-session",
+    "systemd-inhibit",
+    "catchsegv",
+    "cgexec",
+    "chpst",
     "eval",
     "exec",
 ];
@@ -979,12 +1002,107 @@ pub fn approval_key(cmd: &str) -> String {
     } else {
         bin.clone()
     };
+    if bin == "git" {
+        return match git_subcommand(&args) {
+            Some((sub, rest)) if git_is_destructive(sub, rest) => {
+                cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+            }
+            Some((sub, _)) => format!("{ident} {sub}"),
+            None => ident,
+        };
+    }
     if MULTI_VERB.contains(&bin.as_str()) {
         if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
             return format!("{ident} {sub}");
         }
     }
     ident
+}
+
+// Git's own options that take the next word as their value (`git -C dir`).
+const GIT_OPTIONS_WITH_VALUE: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+    "--list-cmds",
+    "--attr-source",
+    "--shallow-file",
+];
+
+/// The subcommand of a git command line and the words after it, past git's
+/// own options: `git -C sub -c k=v push -f` → (`push`, [`-f`]).
+pub(crate) fn git_subcommand<'a, 'b>(args: &'b [&'a str]) -> Option<(&'a str, &'b [&'a str])> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if !a.starts_with('-') {
+            return Some((a, &args[i + 1..]));
+        }
+        i += if GIT_OPTIONS_WITH_VALUE.contains(a) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+// Git subcommands, or the forms of them, whose arguments name what they
+// discard or rewrite: `s` on `git push --force origin main` or
+// `git rm -r src` must not approve the next force push or removal, so
+// their approvals are stored per exact command, like rm's.
+fn git_is_destructive(sub: &str, rest: &[&str]) -> bool {
+    // A long option, alone or with `=value`.
+    let long = |names: &[&str]| {
+        rest.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| *a == *n || a.strip_prefix(n).is_some_and(|v| v.starts_with('=')))
+        })
+    };
+    // A letter in a cluster of short options (`-uf`).
+    let short = |letters: &str| {
+        rest.iter().any(|a| {
+            a.len() > 1
+                && a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|c| letters.contains(c))
+        })
+    };
+    let action = rest.iter().find(|a| !a.starts_with('-')).copied();
+    match sub {
+        "rm" | "clean" | "checkout" | "restore" | "filter-branch" | "filter-repo" | "prune"
+        | "update-ref" => true,
+        "reset" => long(&["--hard", "--merge", "--keep"]),
+        "push" => {
+            long(&[
+                "--force",
+                "--force-with-lease",
+                "--force-if-includes",
+                "--delete",
+                "--mirror",
+                "--prune",
+            ]) || short("fd")
+                || rest
+                    .iter()
+                    .any(|a| a.starts_with('+') || (a.starts_with(':') && a.len() > 1))
+        }
+        "branch" => long(&["--delete", "--force", "--move", "--copy"]) || short("dDfmMcC"),
+        "switch" => long(&["--discard-changes", "--force", "--force-create"]) || short("fC"),
+        "tag" => long(&["--delete", "--force"]) || short("df"),
+        "stash" => matches!(action, Some("drop" | "clear")),
+        "reflog" => matches!(action, Some("expire" | "delete")),
+        "worktree" => matches!(action, Some("remove" | "prune")),
+        "submodule" => matches!(action, Some("deinit")),
+        "notes" => matches!(action, Some("remove" | "prune")),
+        "read-tree" => long(&["--reset"]) || short("u"),
+        "checkout-index" => long(&["--force"]) || short("f"),
+        "gc" => long(&["--prune"]),
+        _ => false,
+    }
 }
 
 /// `p` relative to the project root, with `/` separators, when it lies
@@ -1003,12 +1121,11 @@ pub fn project_relative(p: &Path, cwd: &Path) -> Option<String> {
     )
 }
 
-/// The commands a permission rule is checked against: each part of a
-/// compound command (split at `;`, `&&`, `||`, `|`, `&` and line breaks),
-/// whitespace collapsed and the program reduced to its name, so
-/// `run_command(git push*)` also catches `make && /usr/bin/git  push`.
-/// The whole command comes first. Best effort: a program started by
-/// another one (`sh -c 'git push'`) is not unpacked.
+/// The commands an allow rule is checked against: each part of a compound
+/// command (split at `;`, `&&`, `||`, `|`, `&` and line breaks), whitespace
+/// collapsed and the program reduced to its name. The whole command comes
+/// first, and an allow rule only ever matches that. Deny and ask rules use
+/// `guard_subjects`.
 pub fn rule_subjects(cmd: &str) -> Vec<String> {
     let flat = |c: &str| -> Option<String> {
         let mut words = c.split_whitespace();
@@ -1029,6 +1146,377 @@ pub fn rule_subjects(cmd: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// Programs that run a command given by their later words (`sudo git push`,
+// `xargs git push`, `sh -c 'git push'`, `cmd /c git push`), and the shell
+// words that start one. Their own options cannot all be known, so a deny
+// or ask rule takes every later word as a possible start of the command.
+const RUNS_A_COMMAND: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "mksh",
+    "ash",
+    "csh",
+    "tcsh",
+    "nu",
+    "busybox",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "wsl",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "xargs",
+    "parallel",
+    "nohup",
+    "nice",
+    "ionice",
+    "chrt",
+    "taskset",
+    "stdbuf",
+    "setsid",
+    "unbuffer",
+    "script",
+    "flock",
+    "timeout",
+    "time",
+    "watch",
+    "watchexec",
+    "entr",
+    "hyperfine",
+    "strace",
+    "ltrace",
+    "valgrind",
+    "gdb",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "pkexec",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "systemd-run",
+    "caffeinate",
+    "start",
+    "find",
+    "fakeroot",
+    "fakechroot",
+    "faketime",
+    "firejail",
+    "bwrap",
+    "proot",
+    "proxychains",
+    "proxychains4",
+    "torsocks",
+    "tsocks",
+    "numactl",
+    "chronic",
+    "ifne",
+    "run0",
+    "sg",
+    "ssh-agent",
+    "dbus-run-session",
+    "systemd-inhibit",
+    "catchsegv",
+    "cgexec",
+    "chpst",
+    "uv",
+    "poetry",
+    "pipenv",
+    "pdm",
+    "hatch",
+    "bundle",
+    "direnv",
+    "mise",
+    "asdf",
+    "nix-shell",
+    "{",
+    "}",
+    "!",
+    "if",
+    "then",
+    "else",
+    "elif",
+    "do",
+    "while",
+    "until",
+];
+
+// How deep `guard_subjects` follows a command inside a command
+// (`sh -c "sudo sh -c 'git push'"`).
+const MAX_NESTED_COMMANDS: usize = 4;
+
+// Bounds on `guard_subjects` for one part of a command: the words after a
+// wrapper that may start its command (options never do, and a wrapper takes
+// at most a few operands of its own), how many starts are followed, and how
+// many words of each are matched.
+const STARTS_AFTER_WRAPPER: usize = 16;
+const MAX_STARTS: usize = 256;
+const MAX_SUBJECT_WORDS: usize = 1024;
+
+// A shell variable assignment before a command (`FOO=1 git push`).
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+// The words of a command as the program receives them where that can be
+// known, else split at whitespace with the quotes dropped.
+fn loose_words(cmd: &str) -> Vec<String> {
+    match shell_words(cmd) {
+        Some(words) => words.into_iter().map(|w| w.text).collect(),
+        None => cmd
+            .split_whitespace()
+            .map(|w| w.replace(['\'', '"'], ""))
+            .collect(),
+    }
+}
+
+/// The commands a deny or ask rule is checked against: every
+/// `rule_subjects` entry, and each command as it runs once the wrappers in
+/// front of it are taken off (`env`, `sudo -u x`, `nice -n 5`, `xargs`,
+/// `timeout 30`, `FOO=1`, a path such as `/usr/bin/git`), with the command
+/// inside `sh -c '…'`, `bash -lc "…"`, `cmd /c`, `$(…)` and backquotes, and
+/// git's own options (`-C dir`, `-c k=v`, `--git-dir`) taken out before its
+/// subcommand. `git -C . push` and `sudo sh -c 'git push'` both give
+/// `git push`.
+pub fn guard_subjects(cmd: &str) -> std::rc::Rc<[String]> {
+    thread_local! {
+        // Every deny and ask rule checks the same command in turn.
+        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<[String]>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = LAST.with_borrow(|l| {
+        l.as_ref()
+            .filter(|(c, _)| c == cmd)
+            .map(|(_, s)| std::rc::Rc::clone(s))
+    }) {
+        return hit;
+    }
+    let out: std::rc::Rc<[String]> = guard_subjects_for(cmd, cfg!(windows)).into();
+    LAST.set(Some((cmd.to_string(), std::rc::Rc::clone(&out))));
+    out
+}
+
+fn guard_subjects_for(cmd: &str, windows: bool) -> Vec<String> {
+    let mut out = rule_subjects(cmd);
+    let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
+    add_guard_subjects(cmd, 0, &mut out, &mut seen);
+    // cmd.exe, which runs commands on Windows, drops `^` and expands
+    // `%VAR%` before the program sees them: `g^it push` runs `git push`.
+    if windows && cmd_exe_rewrites(cmd) {
+        let plain = cmd_exe_plain(cmd);
+        for s in rule_subjects(&plain) {
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+        add_guard_subjects(&plain, 0, &mut out, &mut seen);
+    }
+    out
+}
+
+// A command as cmd.exe hands it on, as far as its text tells: `^` escapes
+// dropped and each `%VAR%` taken as empty.
+fn cmd_exe_plain(cmd: &str) -> String {
+    let text = cmd.replace('^', "");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        match rest[i + 1..].find('%') {
+            Some(j) => rest = &rest[i + j + 2..],
+            None => {
+                out.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn add_guard_subjects(
+    cmd: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if depth > MAX_NESTED_COMMANDS {
+        return;
+    }
+    let push = |s: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if !s.is_empty() && seen.insert(s.clone()) {
+            out.push(s);
+        }
+    };
+    // The whole command keeps quoted separators inside their word
+    // (`bash -c 'a && b'`); its parts catch the rest.
+    let parts = std::iter::once(cmd).chain(cmd.split(['\n', '\r', ';', '|', '&', '(', ')', '`']));
+    for part in parts {
+        let words = loose_words(part);
+        // Every word a command may start at: the first, the one after an
+        // assignment, and the words after a program that runs a command.
+        let mut starts = vec![0usize];
+        let mut visited = vec![false; words.len()];
+        let mut unpacked = vec![false; words.len()];
+        let mut followed = 0;
+        while let Some(i) = starts.pop() {
+            if i >= words.len() || visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            let word = &words[i];
+            if is_assignment(word) {
+                starts.push(i + 1);
+                continue;
+            }
+            followed += 1;
+            if followed > MAX_STARTS {
+                break;
+            }
+            let bin = normalized_bin(word);
+            if RUNS_A_COMMAND.contains(&bin.as_str()) {
+                starts.extend(
+                    (i + 1..words.len())
+                        .filter(|&j| !words[j].starts_with('-'))
+                        .take(STARTS_AFTER_WRAPPER),
+                );
+                // A command handed over as one word: `sh -c 'git push'`,
+                // `env -S 'git push'`, `watch 'git push'`.
+                for j in i + 1..words.len() {
+                    let w = &words[j];
+                    if !unpacked[j]
+                        && (w.contains(char::is_whitespace) || w.contains([';', '|', '&']))
+                    {
+                        unpacked[j] = true;
+                        add_guard_subjects(w, depth + 1, out, seen);
+                    }
+                }
+            }
+            let end = words.len().min(i + 1 + MAX_SUBJECT_WORDS);
+            let rest: Vec<&str> = words[i + 1..end].iter().map(String::as_str).collect();
+            push(
+                std::iter::once(bin.as_str())
+                    .chain(rest.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                out,
+                seen,
+            );
+            // `git-push`, as git's own programs are named.
+            let bin = match bin.strip_prefix("git-") {
+                Some(sub) if !sub.is_empty() => {
+                    let dashed = std::iter::once(sub)
+                        .chain(rest.iter().copied())
+                        .collect::<Vec<_>>();
+                    push(format!("git {}", dashed.join(" ")), out, seen);
+                    continue;
+                }
+                _ => bin,
+            };
+            if bin == "git" {
+                if let Some((sub, args)) = git_subcommand(&rest) {
+                    push(
+                        ["git", sub]
+                            .into_iter()
+                            .chain(args.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        out,
+                        seen,
+                    );
+                    // An alias given on the command line
+                    // (`git -c alias.p=push p`): what it stands for.
+                    if let Some(value) = git_inline_alias(&rest, sub) {
+                        let expanded = match value.strip_prefix('!') {
+                            Some(shell) => shell.to_string(),
+                            None => format!("git {value}"),
+                        };
+                        let line = std::iter::once(expanded.as_str())
+                            .chain(args.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        add_guard_subjects(&line, depth + 1, out, seen);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The value of `-c alias.<sub>=…` among git's own options, if given.
+fn git_inline_alias<'a>(args: &[&'a str], sub: &str) -> Option<&'a str> {
+    let key = format!("alias.{sub}=");
+    args.windows(2)
+        .take_while(|w| w[0] != sub)
+        .filter(|w| w[0] == "-c")
+        .find_map(|w| {
+            w[1].get(..key.len())
+                .filter(|k| k.eq_ignore_ascii_case(&key))
+                .map(|_| &w[1][key.len()..])
+        })
+}
+
+/// Whether `cmd` is more than one simple command (a pipeline, a list, a
+/// subshell or a substitution), or hands code to an interpreter or spells a
+/// word in bash's `$'…'` quoting, and any word of it names a program
+/// matching `program` (a `*`/`?` pattern for a program name). Such a command
+/// can build what it runs from parts no rule sees (`git $(echo push)`,
+/// `ruby -e 'system "git push"'`), so a deny rule for that program refuses
+/// it.
+pub fn compound_mentions(cmd: &str, program: &str) -> bool {
+    compound_mentions_for(cmd, program, cfg!(windows))
+}
+
+// An interpreter given code as a word (`perl -e 'system "git push"'`):
+// what that code runs is not read here. Shells are left out, as
+// guard_subjects reads the command they are handed.
+fn hands_code_to_interpreter(cmd: &str) -> bool {
+    let words = loose_words(cmd);
+    words.iter().enumerate().any(|(i, w)| {
+        let bin = normalized_bin(w);
+        runs_arbitrary_code(&bin)
+            && !RUNS_A_COMMAND.contains(&bin.as_str())
+            && words[i + 1..]
+                .iter()
+                .any(|w| w.contains(char::is_whitespace))
+    })
+}
+
+// On Windows a command cmd.exe rewrites (`^`, `%VAR%`) counts as compound
+// too, and its words are read with the `^` escapes dropped.
+fn compound_mentions_for(cmd: &str, program: &str, windows: bool) -> bool {
+    let rewritten = windows && cmd_exe_rewrites(cmd);
+    let compound = rewritten
+        || cmd.contains(['\n', '\r', ';', '|', '&', '(', ')', '`'])
+        || cmd.contains("$'")
+        || cmd.contains("$\"")
+        || hands_code_to_interpreter(cmd);
+    let program = normalized_bin(program);
+    let text = if rewritten {
+        cmd.replace('^', "")
+    } else {
+        cmd.to_string()
+    };
+    compound
+        && !program.is_empty()
+        && text
+            .split(|c: char| c.is_whitespace() || ";|&()`'\"<>={}$!%".contains(c))
+            .filter(|w| !w.is_empty())
+            .any(|w| crate::hooks::glob_match(&program, &normalized_bin(w)))
 }
 
 /// A saved approval naming a shell or interpreter on its own (`python3`), as
@@ -6361,7 +6849,7 @@ fn http_get_with_retry(url: &str, user_agent: Option<&str>) -> Result<ureq::Resp
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -7913,6 +8401,13 @@ print("hello " + data.get("name", "world"))
             "python3.12 -c print(1)",
             "nodejs -e 1",
             "sed '1e id' README.md",
+            // Wrappers run whatever command follows them.
+            "fakeroot ls",
+            "firejail --quiet make",
+            "torsocks curl example.com",
+            "proxychains4 -q git fetch",
+            "chronic make",
+            "systemd-inhibit make",
         ] {
             assert_eq!(approval_key(cmd), cmd);
         }
@@ -8045,6 +8540,21 @@ print("hello " + data.get("name", "world"))
         assert!(skips_prompt_safely("ls", &dir));
         git(&["config", "--unset", "core.fsmonitor"]);
         git(&["config", "include.path", "../evil.cfg"]);
+        assert!(!skips_prompt_safely("git diff", &dir));
+        git(&["config", "--unset", "include.path"]);
+        // What actions/checkout stores is network configuration.
+        git(&[
+            "config",
+            "http.https://github.com/.extraheader",
+            "AUTHORIZATION: basic eDp5",
+        ]);
+        git(&["config", "http.sslVerify", "true"]);
+        assert!(skips_prompt_safely("git diff", &dir));
+        git(&["config", "http.saveCookies", "true"]);
+        assert!(!skips_prompt_safely("git diff", &dir));
+        git(&["config", "--unset", "http.saveCookies"]);
+        // A credential helper is a program.
+        git(&["config", "credential.helper", "!touch pwned"]);
         assert!(!skips_prompt_safely("git diff", &dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8219,6 +8729,142 @@ print("hello " + data.get("name", "world"))
         // Multi-verb tools still key on the subcommand.
         assert_eq!(approval_key("git status -s"), "git status");
         assert_eq!(approval_key("npm test -- --watch"), "npm test");
+    }
+
+    // Destructive git commands, each with another call of the same kind.
+    pub(crate) const DESTRUCTIVE_GIT: &[(&str, &str)] = &[
+        ("git rm -r src", "git rm -r docs"),
+        ("git rm --cached secrets.env", "git rm README.md"),
+        ("git clean -fdx", "git clean -fd docs"),
+        ("git reset --hard HEAD~1", "git reset --hard origin/main"),
+        ("git reset --merge ORIG_HEAD", "git reset --keep HEAD~2"),
+        (
+            "git push --force origin main",
+            "git push --force origin release",
+        ),
+        ("git push -f origin main", "git push -f origin release"),
+        ("git push -uf origin main", "git push -f origin release"),
+        (
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main:abc origin main",
+        ),
+        ("git push origin +main", "git push origin +release"),
+        (
+            "git push origin --delete feature",
+            "git push origin :release",
+        ),
+        ("git checkout -- src/app.rs", "git checkout -- src/lib.rs"),
+        ("git checkout HEAD~3 src/app.rs", "git checkout ."),
+        (
+            "git restore src/app.rs",
+            "git restore --staged --worktree .",
+        ),
+        ("git branch -D feature", "git branch -D main"),
+        ("git branch --delete --force feature", "git branch -d main"),
+        ("git stash drop", "git stash drop stash@{3}"),
+        ("git stash clear", "git stash drop"),
+        (
+            "git filter-branch --tree-filter 'rm -f x' HEAD",
+            "git filter-branch --index-filter 'git rm --cached y' HEAD",
+        ),
+        (
+            "git filter-repo --path secrets --invert-paths",
+            "git filter-repo --path docs --invert-paths",
+        ),
+        (
+            "git reflog expire --expire=now --all",
+            "git reflog expire --expire=now refs/heads/main",
+        ),
+        ("git gc --prune=now", "git gc --prune=all"),
+        ("git gc --aggressive --prune", "git gc --prune=now"),
+        (
+            "git submodule deinit -f libs/a",
+            "git submodule deinit --all",
+        ),
+        ("git notes remove HEAD", "git notes prune"),
+        (
+            "git read-tree --reset -u HEAD",
+            "git read-tree -u -m HEAD~1",
+        ),
+        (
+            "git checkout-index -a -f",
+            "git checkout-index --force src/a.rs",
+        ),
+    ];
+
+    #[test]
+    fn approval_key_keeps_the_arguments_of_destructive_git_commands() {
+        for (cmd, other) in DESTRUCTIVE_GIT {
+            let key = approval_key(cmd);
+            assert_eq!(key, *cmd, "{cmd}");
+            assert_ne!(key, approval_key(other), "{cmd} vs {other}");
+        }
+        assert_eq!(
+            approval_key("git  push   --force origin main"),
+            "git push --force origin main"
+        );
+        // Git's own options come before the subcommand they modify.
+        assert_eq!(
+            approval_key("git -C sub push --force origin main"),
+            "git -C sub push --force origin main"
+        );
+        assert_eq!(approval_key("git -C sub status"), "git status");
+        assert_eq!(approval_key("git -c core.quotepath=off log"), "git log");
+        // Options git reads a separate value for never become the subcommand.
+        assert_eq!(
+            approval_key("git --attr-source HEAD push --force"),
+            "git --attr-source HEAD push --force"
+        );
+        assert_eq!(
+            approval_key("git --shallow-file x rm -r a"),
+            "git --shallow-file x rm -r a"
+        );
+        assert_eq!(approval_key("git --attr-source HEAD status"), "git status");
+        // Everyday forms of the same subcommands still key on the subcommand.
+        for (cmd, key) in [
+            ("git push origin main", "git push"),
+            ("git push -u origin feature", "git push"),
+            ("git reset HEAD src/app.rs", "git reset"),
+            ("git reset --soft HEAD~1", "git reset"),
+            ("git branch -a", "git branch"),
+            ("git branch feature", "git branch"),
+            ("git stash", "git stash"),
+            ("git stash list", "git stash"),
+            ("git reflog show", "git reflog"),
+            ("git gc", "git gc"),
+            ("git gc --no-prune", "git gc"),
+            ("git submodule update --init", "git submodule"),
+            ("git notes add -m x", "git notes"),
+        ] {
+            assert_eq!(approval_key(cmd), key, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn cmd_exe_escapes_do_not_hide_a_command_from_deny_and_ask_rules() {
+        let pushes = |subjects: &[String]| {
+            subjects
+                .iter()
+                .any(|s| crate::hooks::glob_match("git push*", s))
+        };
+        for cmd in [
+            "g^it push",
+            "git p^ush origin main",
+            "%NOPE%git push",
+            "gi%X:~0,0%t push",
+            "cmd /c g^it push",
+        ] {
+            assert!(pushes(&guard_subjects_for(cmd, true)), "{cmd}");
+            // Elsewhere `^` and `%` are ordinary characters of the word.
+            assert!(!pushes(&guard_subjects_for(cmd, false)), "{cmd}");
+        }
+        // A command cmd.exe rewrites counts as compound for a deny rule.
+        assert!(compound_mentions_for("%X%git status", "git", true));
+        assert!(compound_mentions_for("g^it status", "git", true));
+        assert!(!compound_mentions_for("g^it status", "git", false));
+        assert!(!compound_mentions_for("git status", "git", true));
+        assert!(compound_mentions_for("make && git status", "git", false));
+        assert!(!compound_mentions_for("make && cargo test", "git", false));
     }
 
     // Every read-only-classifier bypass we have ever fixed, in one place.

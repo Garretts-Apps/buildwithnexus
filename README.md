@@ -204,9 +204,15 @@ bwn run --provider ollama --model llama3.2 "summarize this repo"
 Default endpoints: Ollama `http://localhost:11434`, llama.cpp server
 `http://localhost:8080/v1`, LM Studio `http://localhost:1234/v1`. For any
 other OpenAI-compatible server (vLLM, TGI, LiteLLM, a gateway), choose the
-`custom` provider (default `http://localhost:8000/v1`) and set
-`CUSTOM_API_KEY` if it needs a key. To change where any provider connects,
-set `base_url` in `~/.buildwithnexus/settings.json`:
+`custom` provider (default `http://localhost:8000/v1`); setup, `/model` and
+`/login` ask for its key if it needs one. A custom endpoint's key is saved
+for that endpoint only (`CUSTOM_API_KEY@<scheme://host:port>` in
+`.env.keys`), so `/model` to a new address asks for that address's own key
+(Enter for none) and never sends another server's. `CUSTOM_API_KEY` in the
+environment is the key of the custom endpoint a run starts on; a `/model`
+to another address does not get it.
+To change where any provider connects, set `base_url` in
+`~/.buildwithnexus/settings.json`:
 
 ```json
 { "provider": "ollama", "model": "qwen2.5-coder", "base_url": "http://gpu-box:11434" }
@@ -482,9 +488,12 @@ The prompt shows the whole command, with line breaks marked `⏎`, and names
 what `s` / `a` would allow from then on: a binary (`cargo`), a subcommand
 (`git status`), a host, or, for shells, interpreters and other programs that
 run what they are given (`sh`, `python3`, `python3.12`, `node`, `awk`, `sed`,
-`env`, …), and for programs whose arguments decide what they destroy or stop
+`env`, `fakeroot`, …), and for programs whose arguments decide what they destroy or stop
 (`rm`, `mv`, `cp`, `ln`, `chmod`, `chown`, `dd`, `truncate`, `kill`, `pkill`,
-`killall`, `del`, `robocopy`, …), only that exact command. Answering `y`
+`killall`, `del`, `robocopy`, …) or git commands that discard or rewrite
+(`git rm`, `git clean`, `git checkout`, `git restore`, `git reset --hard`,
+`git push --force`, `git branch -D`, `git stash drop`, `git filter-branch`,
+`git reflog expire`, `git submodule deinit`, `git gc --prune`, …), only that exact command. Answering `y`
 allows the call once; `d <reason>` refuses it and tells the model why; `Esc`
 or `Ctrl+C` refuses it and stops the turn. Answering `a` (always allow) remembers it
 **for the current project only** (`project_allowed` in
@@ -535,7 +544,20 @@ against the command for shell tools (Claude Code's `git push:*` means
 for `web_search`, and the touched paths for file tools: project-relative
 (`migrations/**`), or absolute or `~/` for any path. An allow rule must cover
 a whole plain command (no chaining or redirection) and every path; ask and
-deny rules match any part of a compound command and any path. `network`
+deny rules match any part of a compound command and any path. Ask and deny
+rules also see the command behind a wrapper (`env`, `sudo`, `nice`,
+`command`, `time`, `timeout`, `xargs`, `FOO=1`, `/usr/bin/git`), inside
+`sh -c '…'`, `bash -lc "…"`, `cmd /c`, `$(…)` and backquotes, past git's
+own options and through an alias given with `-c alias.<name>=…`, so
+`run_command(git push*)` also refuses `git -C . push` and
+`sudo sh -c 'git push'`. An alias saved in git's config is not seen. A deny rule also refuses a pipeline or compound
+command that names its program anywhere (`make && git status` under
+`run_command(git push*)`), since such a command can build what it runs from
+parts, and so does code handed to an interpreter (`perl -e 'system "git push"'`)
+or a word in bash's `$'…'` quoting; the refusal says to run that command on
+its own. Rules are a guard against mistakes, not a sandbox: a program the
+list of wrappers does not know, or a script file, can still run what a rule
+names. `network`
 entries are host patterns (`example.com`, `*.example.com`) for the network
 tools. A refusal names the rule and whether it came from user or project
 settings, and a headless run refused by one exits 3.

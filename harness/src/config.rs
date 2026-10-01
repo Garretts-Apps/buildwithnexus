@@ -140,7 +140,9 @@ pub const PRESETS: &[Preset] = &[
 ];
 
 /// Optional key for the `custom` preset — not wired through `env_key` so the
-/// key stays optional (env_key drives the "must be set" checks).
+/// key stays optional (env_key drives the "must be set" checks). Saved once
+/// per endpoint (see `custom_key_name`); in the environment it is the key of
+/// whatever custom endpoint the run is configured for.
 pub const CUSTOM_KEY: &str = "CUSTOM_API_KEY";
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
@@ -2567,11 +2569,148 @@ pub fn load_key(name: &str) -> Option<String> {
 }
 
 pub fn save_key(name: &str, value: &str) {
-    ensure_home();
     let mut map = read_keys_file();
     map.insert(name.to_string(), value.to_string());
+    write_keys_file(&map);
+}
+
+fn write_keys_file(map: &BTreeMap<String, String>) {
+    ensure_home();
     let body: String = map.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
     write_atomic(&keys_path(), &body, true);
+}
+
+/// `scheme://host[:port]` of a URL, lowercased, without credentials, path
+/// or the scheme's default port: the endpoint a custom key belongs to.
+/// Read the way the HTTP client reads it, so `http://a\\@b/` is `a`.
+pub fn endpoint_origin(url: &str) -> String {
+    let url = url.trim();
+    if let Ok(u) = url::Url::parse(url) {
+        if matches!(u.scheme(), "http" | "https") && u.host().is_some() {
+            return u.origin().ascii_serialization();
+        }
+    }
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => "",
+    };
+    let host = match host.strip_suffix(default_port) {
+        Some(h) if !default_port.is_empty() => h,
+        _ => host.as_str(),
+    };
+    format!("{scheme}://{host}")
+}
+
+/// Where the custom endpoint's key for `base_url` is saved:
+/// `CUSTOM_API_KEY@<origin>`, one key per endpoint, so a key never travels
+/// to a server it was not given for.
+pub fn custom_key_name(base_url: &str) -> String {
+    format!("{CUSTOM_KEY}@{}", endpoint_origin(base_url))
+}
+
+// The endpoint `CUSTOM_API_KEY` from the environment belongs to: the first
+// custom endpoint this run asks a key for, the one it starts on.
+static ENV_CUSTOM_KEY_ORIGIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The key for the custom endpoint at `base_url`: `CUSTOM_API_KEY` from the
+/// environment for the endpoint the run started on, else the key saved for
+/// that endpoint. A `/model` to another address never gets the variable.
+pub fn load_custom_key(base_url: &str) -> Option<String> {
+    if key_from_env(CUSTOM_KEY) {
+        let origin = endpoint_origin(base_url);
+        let mut pinned = ENV_CUSTOM_KEY_ORIGIN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pinned.get_or_insert_with(|| origin.clone()) == &origin {
+            return std::env::var(CUSTOM_KEY).ok();
+        }
+    }
+    saved_custom_key(base_url)
+}
+
+#[cfg(test)]
+pub(crate) fn forget_env_custom_key_origin() {
+    *ENV_CUSTOM_KEY_ORIGIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The key saved for the custom endpoint at `base_url`, environment aside.
+pub fn saved_custom_key(base_url: &str) -> Option<String> {
+    migrate_custom_key();
+    read_keys_file()
+        .remove(&custom_key_name(base_url))
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Saves `key` for the custom endpoint at `base_url`. The key an earlier
+/// version saved for no endpoint in particular is now tied to this one when
+/// it is the same key.
+pub fn save_custom_key(base_url: &str, key: &str) {
+    let mut map = read_keys_file();
+    map.insert(custom_key_name(base_url), key.to_string());
+    if map
+        .get(UNBOUND_CUSTOM_KEY)
+        .is_some_and(|old| old.trim() == key.trim())
+    {
+        map.remove(UNBOUND_CUSTOM_KEY);
+    }
+    write_keys_file(&map);
+}
+
+// Where a CUSTOM_API_KEY from before per-endpoint keys waits when the
+// endpoint it was saved with is not known.
+const UNBOUND_CUSTOM_KEY: &str = "CUSTOM_API_KEY@unbound";
+
+/// A `CUSTOM_API_KEY` saved before keys were kept per endpoint, whose
+/// endpoint is not known: it is never sent until the person says which
+/// endpoint it belongs to.
+pub fn unbound_custom_key() -> Option<String> {
+    migrate_custom_key();
+    read_keys_file()
+        .remove(UNBOUND_CUSTOM_KEY)
+        .filter(|v| !v.trim().is_empty())
+}
+
+// 0.14 kept one CUSTOM_API_KEY for every custom endpoint. The first time
+// this version sees it, it moves to the endpoint the user's own settings
+// give the custom preset (the active one, or the one last used with it; a
+// project's settings never decide), or else to UNBOUND_CUSTOM_KEY. Once,
+// because a later /model changes those settings.
+fn migrate_custom_key() {
+    let mut map = read_keys_file();
+    let Some(key) = map.get(CUSTOM_KEY).cloned() else {
+        return;
+    };
+    let user = load_user_settings().unwrap_or_default();
+    let url = if user.provider == "custom" {
+        Some(
+            user.base_url
+                .clone()
+                .unwrap_or_else(|| preset("custom").map_or("", |p| p.base_url).to_string()),
+        )
+    } else {
+        user.endpoints.get("custom").cloned()
+    };
+    let slot = match url.filter(|u| !u.trim().is_empty()) {
+        Some(url) => custom_key_name(&url),
+        None => UNBOUND_CUSTOM_KEY.to_string(),
+    };
+    // A slot already taken keeps its key; the old line then stays as it is,
+    // unused, rather than be lost.
+    if key.trim().is_empty() || !map.contains_key(&slot) {
+        map.remove(CUSTOM_KEY);
+        if !key.trim().is_empty() {
+            map.insert(slot, key);
+        }
+        write_keys_file(&map);
+    }
 }
 
 /// True when the key comes from the process environment, which wins over
@@ -4126,6 +4265,123 @@ mod tests {
             "approvals",
             "ignoring saved approvals for node, python3"
         ));
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn an_endpoint_origin_is_scheme_host_and_port() {
+        for (url, origin) in [
+            ("http://localhost:8000/v1", "http://localhost:8000"),
+            ("HTTPS://GW.Example.com/v1/", "https://gw.example.com"),
+            ("https://gw.example.com:443/v1", "https://gw.example.com"),
+            ("http://gw.example.com:80", "http://gw.example.com"),
+            (
+                "https://user:pw@gw.example.com:8443/v1?x=1",
+                "https://gw.example.com:8443",
+            ),
+            ("http://[::1]:8000/v1", "http://[::1]:8000"),
+            (
+                "http://a.example.com\\@b.example.com/v1",
+                "http://a.example.com",
+            ),
+            ("http://LOCALHOST.:8000", "http://localhost.:8000"),
+            ("localhost:8000/v1", "http://localhost:8000"),
+        ] {
+            assert_eq!(endpoint_origin(url), origin, "{url}");
+        }
+        assert_ne!(
+            custom_key_name("http://localhost:8000/v1"),
+            custom_key_name("http://localhost:8001/v1")
+        );
+    }
+
+    #[test]
+    fn a_custom_key_from_before_moves_once_to_the_users_own_endpoint() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-custom-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        std::env::remove_var(CUSTOM_KEY);
+        let keys = || fs::read_to_string(h.join(".env.keys")).unwrap_or_default();
+
+        // The endpoint the custom preset was last used with.
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"openai","endpoints":{"custom":"https://gw.example.com/v1"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            h.join(".env.keys"),
+            "CUSTOM_API_KEY=sk-old\nOPENAI_API_KEY=sk-o\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_custom_key("https://gw.example.com/v1").as_deref(),
+            Some("sk-old")
+        );
+        assert_eq!(
+            keys(),
+            "CUSTOM_API_KEY@https://gw.example.com=sk-old\nOPENAI_API_KEY=sk-o\n"
+        );
+        assert_eq!(load_custom_key("https://other.example.com/v1"), None);
+
+        // No known endpoint: unbound, never sent, and it stays unbound when
+        // the settings later name one.
+        fs::write(h.join("settings.json"), r#"{"provider":"openai"}"#).unwrap();
+        fs::write(h.join(".env.keys"), "CUSTOM_API_KEY=sk-old\n").unwrap();
+        assert_eq!(load_custom_key("http://localhost:8000/v1"), None);
+        fs::write(
+            h.join("settings.json"),
+            r#"{"provider":"custom","base_url":"http://localhost:8000/v1"}"#,
+        )
+        .unwrap();
+        assert_eq!(load_custom_key("http://localhost:8000/v1"), None);
+        assert_eq!(unbound_custom_key().as_deref(), Some("sk-old"));
+        // Saving the same key for an endpoint ties it there.
+        save_custom_key("http://localhost:8000/v1", "sk-old");
+        assert_eq!(unbound_custom_key(), None);
+        assert_eq!(keys(), "CUSTOM_API_KEY@http://localhost:8000=sk-old\n");
+
+        // A project's settings never decide where the key goes.
+        let proj = h.join("proj");
+        fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            r#"{"provider":"custom","base_url":"https://evil.example.com/v1"}"#,
+        )
+        .unwrap();
+        fs::write(h.join("settings.json"), r#"{"provider":"openai"}"#).unwrap();
+        fs::write(h.join(".env.keys"), "CUSTOM_API_KEY=sk-old\n").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&proj).unwrap();
+        let sent = load_custom_key("https://evil.example.com/v1");
+        std::env::set_current_dir(cwd).unwrap();
+        assert_eq!(sent, None);
+        assert_eq!(keys(), "CUSTOM_API_KEY@unbound=sk-old\n");
+
+        // The environment's key is the key of the endpoint the run starts
+        // on, and of no other.
+        std::env::set_var(CUSTOM_KEY, "sk-env");
+        forget_env_custom_key_origin();
+        assert_eq!(
+            load_custom_key("https://any.example.com/v1").as_deref(),
+            Some("sk-env")
+        );
+        assert_eq!(
+            load_custom_key("https://any.example.com:443/v2").as_deref(),
+            Some("sk-env")
+        );
+        assert_eq!(saved_custom_key("https://any.example.com/v1"), None);
+        assert_eq!(load_custom_key("https://other.example.com/v1"), None);
+        save_custom_key("https://other.example.com/v1", "sk-other");
+        assert_eq!(
+            load_custom_key("https://other.example.com/v1").as_deref(),
+            Some("sk-other")
+        );
+        forget_env_custom_key_origin();
+        std::env::remove_var(CUSTOM_KEY);
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }

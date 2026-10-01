@@ -2049,6 +2049,46 @@ fn deny_rule_refuses_in_auto_and_names_the_rule() {
     assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
 }
 
+// Wrappers, shells and a program's own options in front of the command a
+// deny rule names do not step around it, in a real run.
+#[cfg(unix)]
+#[test]
+fn a_deny_rule_sees_through_wrappers_in_a_run() {
+    for cmd in [
+        "env touch denied.txt",
+        "nice -n 5 touch denied.txt",
+        "sh -c 'touch denied.txt'",
+        "bash -lc \"command touch denied.txt\"",
+        "echo denied.txt | xargs touch",
+        "/usr/bin/env FOO=1 /usr/bin/touch denied.txt",
+        "true && t=touch && $t denied.txt",
+        "find . -maxdepth 0 -exec touch denied.txt {} +",
+        "perl -e 'system \"touch denied.txt\"'",
+    ] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::write(
+            home.join("settings.json"),
+            json!({"permissions": {"deny": ["run_command(touch denied*)"]}}).to_string(),
+        )
+        .unwrap();
+        let port = serve(vec![
+            tool_call("c1", "run_command", json!({"command": cmd})),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "touch it");
+        assert!(
+            r.text_of("tool_denied")
+                .contains("denied by rule run_command(touch denied*) (user settings)"),
+            "{cmd}: {}",
+            r.text_of("tool_denied")
+        );
+        assert!(!cwd.join("denied.txt").exists(), "{cmd} ran");
+        assert_eq!(r.code, Some(3), "{cmd}: {}", r.stderr);
+    }
+}
+
 #[test]
 fn web_search_asks_before_sending_and_network_deny_refuses() {
     let home = tmp("home");
@@ -2372,6 +2412,12 @@ fn run_stdin(home: &Path, cwd: &Path, args: &[&str], input: &str) -> Run {
 // An OpenAI-compatible server that only accepts the bearer key `good`
 // (401 otherwise), answering every accepted POST with a plain reply.
 fn serve_keyed(good: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
+    serve_auth(Some(good))
+}
+
+// `serve_keyed`, or with None a server that takes any key or none; either
+// way every POST's Authorization header (empty without one) is kept.
+fn serve_auth(good: Option<&'static str>) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let auths = Arc::new(Mutex::new(Vec::new()));
@@ -2403,9 +2449,10 @@ fn serve_keyed(good: &'static str) -> (u16, Arc<Mutex<Vec<String>>>) {
             if first.starts_with("POST") {
                 seen.lock().unwrap().push(auth.clone());
             }
-            let (status, reply) = if auth == format!("authorization: Bearer {good}")
-                || auth == format!("Authorization: Bearer {good}")
-            {
+            let (status, reply) = if good.is_none_or(|good| {
+                auth == format!("authorization: Bearer {good}")
+                    || auth == format!("Authorization: Bearer {good}")
+            }) {
                 ("200 OK", text("ok"))
             } else {
                 (
@@ -2589,7 +2636,12 @@ fn login_checks_a_key_before_it_is_saved() {
     );
     assert!(r.success, "{}", r.stderr);
     let keys = std::fs::read_to_string(home.join(".env.keys")).unwrap();
-    assert!(keys.contains("CUSTOM_API_KEY=sk-GOOD-1234567890"), "{keys}");
+    assert!(
+        keys.contains(&format!(
+            "CUSTOM_API_KEY@http://127.0.0.1:{port}=sk-GOOD-1234567890"
+        )),
+        "{keys}"
+    );
     assert!(!keys.contains("WRONG"), "{keys}");
     // Neither key is echoed back.
     assert!(!r.stderr.contains("sk-GOOD-1234567890"), "{}", r.stderr);
@@ -2598,6 +2650,168 @@ fn login_checks_a_key_before_it_is_saved() {
         .unwrap()
         .iter()
         .any(|a| a.ends_with("sk-GOOD-1234567890")));
+}
+
+// ── a custom endpoint's key goes to that endpoint only ──────────────────────
+const FIRST_KEY: &str = "sk-FIRST-0123456789";
+const NO_ENV_KEY: &[(&str, &str)] = &[("CUSTOM_API_KEY", "")];
+
+fn keys_file(home: &Path) -> String {
+    std::fs::read_to_string(home.join(".env.keys")).unwrap_or_default()
+}
+
+#[test]
+fn a_custom_key_goes_only_to_the_endpoint_it_was_saved_for() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (first, first_auths) = serve_keyed(FIRST_KEY);
+    let (second, second_auths) = serve_auth(None);
+    std::fs::write(
+        home.join(".env.keys"),
+        format!("CUSTOM_API_KEY@http://127.0.0.1:{first}={FIRST_KEY}\n"),
+    )
+    .unwrap();
+    write_custom_config(&home, &format!("http://127.0.0.1:{second}/v1"));
+    let _ = run_env(&home, &cwd, &["--json", "run", "hi"], NO_ENV_KEY);
+    let sent = second_auths.lock().unwrap().clone();
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(String::is_empty), "{sent:?}");
+
+    write_custom_config(&home, &format!("http://127.0.0.1:{first}/v1"));
+    let _ = run_env(&home, &cwd, &["--json", "run", "hi"], NO_ENV_KEY);
+    let sent = first_auths.lock().unwrap().clone();
+    assert!(sent.iter().any(|a| a.ends_with(FIRST_KEY)), "{sent:?}");
+}
+
+#[test]
+fn a_custom_key_follows_the_host_the_request_goes_to() {
+    // `\\` ends the host for the HTTP client, so this address reaches the
+    // second server: the key saved for the first must not go with it.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (first, _) = serve_keyed(FIRST_KEY);
+    let (second, second_auths) = serve_auth(None);
+    std::fs::write(
+        home.join(".env.keys"),
+        format!("CUSTOM_API_KEY@http://localhost:{first}={FIRST_KEY}\n"),
+    )
+    .unwrap();
+    write_custom_config(
+        &home,
+        &format!("http://127.0.0.1:{second}\\@localhost:{first}/v1"),
+    );
+    let _ = run_env(&home, &cwd, &["--json", "run", "hi"], NO_ENV_KEY);
+    let sent = second_auths.lock().unwrap().clone();
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|a| !a.contains(FIRST_KEY)), "{sent:?}");
+}
+
+#[test]
+fn a_custom_key_saved_before_0_15_moves_to_the_endpoint_in_settings() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (first, first_auths) = serve_keyed(FIRST_KEY);
+    let (second, second_auths) = serve_auth(None);
+    std::fs::write(
+        home.join(".env.keys"),
+        format!("CUSTOM_API_KEY={FIRST_KEY}\n"),
+    )
+    .unwrap();
+    write_custom_config(&home, &format!("http://127.0.0.1:{first}/v1"));
+    let _ = run_env(&home, &cwd, &["--json", "run", "hi"], NO_ENV_KEY);
+    assert!(first_auths
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|a| a.ends_with(FIRST_KEY)));
+    assert_eq!(
+        keys_file(&home),
+        format!("CUSTOM_API_KEY@http://127.0.0.1:{first}={FIRST_KEY}\n")
+    );
+    // A run pointed elsewhere goes without it.
+    let other = format!("http://127.0.0.1:{second}/v1");
+    let _ = run_env(
+        &home,
+        &cwd,
+        &["--json", "--base-url", &other, "run", "hi"],
+        NO_ENV_KEY,
+    );
+    let sent = second_auths.lock().unwrap().clone();
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(String::is_empty), "{sent:?}");
+}
+
+#[test]
+fn a_custom_key_with_no_known_endpoint_is_not_sent_and_login_ties_it() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (second, second_auths) = serve_auth(None);
+    std::fs::write(
+        home.join(".env.keys"),
+        format!("CUSTOM_API_KEY={FIRST_KEY}\n"),
+    )
+    .unwrap();
+    // Settings that moved on to another provider: which endpoint the key
+    // was for is not known.
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"provider": "ollama", "model": "llama3.2", "permission": "auto"}).to_string(),
+    )
+    .unwrap();
+    let url = format!("http://127.0.0.1:{second}/v1");
+    let r = run_env(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--provider",
+            "custom",
+            "--base-url",
+            &url,
+            "run",
+            "hi",
+        ],
+        NO_ENV_KEY,
+    );
+    let sent = second_auths.lock().unwrap().clone();
+    assert!(!sent.is_empty(), "{}", r.stderr);
+    assert!(sent.iter().all(String::is_empty), "{sent:?}");
+    assert!(
+        r.text_of("notice").contains("not tied to an endpoint"),
+        "{:?}",
+        r.events
+    );
+    assert_eq!(
+        keys_file(&home),
+        format!("CUSTOM_API_KEY@unbound={FIRST_KEY}\n")
+    );
+
+    // `login --base-url` saves a key for that endpoint alone.
+    let (third, third_auths) = serve_keyed("sk-THIRD-0123456789");
+    let third_url = format!("http://127.0.0.1:{third}/v1");
+    let r = run_stdin(
+        &home,
+        &cwd,
+        &["--provider", "custom", "--base-url", &third_url, "login"],
+        "sk-THIRD-0123456789\n",
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert!(third_auths
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|a| a.ends_with("sk-THIRD-0123456789")));
+    let keys = keys_file(&home);
+    assert!(
+        keys.contains(&format!(
+            "CUSTOM_API_KEY@http://127.0.0.1:{third}=sk-THIRD-0123456789"
+        )),
+        "{keys}"
+    );
+    assert!(
+        keys.contains(&format!("CUSTOM_API_KEY@unbound={FIRST_KEY}")),
+        "{keys}"
+    );
 }
 
 #[test]
@@ -4799,4 +5013,177 @@ fn human_output_shows_one_line_per_tool_call_and_the_todo_list() {
     assert!(out.contains("▸ Write out.txt"), "{out}");
     assert!(out.contains("☰ todo · 1 of 2 done"), "{out}");
     assert!(out.contains("✓ Write out.txt"), "{out}");
+}
+
+// A repository whose config runs a program on every git call that reads
+// the working tree (core.fsmonitor), with an uncommitted change: the
+// program touches `ran` in the repository.
+#[cfg(unix)]
+fn repo_with_fsmonitor() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = git_repo();
+    let marker = cwd.join("ran");
+    let script = cwd.join("fsmonitor.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        &cwd,
+        &["config", "core.fsmonitor", &script.to_string_lossy()],
+    );
+    std::fs::write(cwd.join("README.md"), "# demo\nchanged\n").unwrap();
+    (cwd, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn git_attachments_never_run_a_repositorys_programs_unasked() {
+    for word in ["@diff", "@status"] {
+        let home = tmp("home");
+        let (cwd, marker) = repo_with_fsmonitor();
+        let (port, posts) = serve_recording(vec![finish("summarized")]);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, &format!("summarize {word}"));
+        assert!(r.success, "{word}: {}", r.stderr);
+        assert!(!marker.exists(), "{word} ran the repository's fsmonitor");
+        assert!(
+            r.text_of("notice").contains("git config can run programs"),
+            "{word}: {:?}",
+            r.events
+        );
+        // Nothing git printed reaches the model; the word stays as typed.
+        let sent = posts.lock().unwrap()[0].clone();
+        assert!(!sent.contains("[git "), "{word}: {sent}");
+        assert!(sent.contains(&format!("summarize {word}")), "{sent}");
+    }
+}
+
+// A checkout as actions/checkout leaves it: its auth header is network
+// configuration, not a program, so @diff still attaches in CI.
+#[test]
+fn git_attachments_attach_in_a_ci_checkout() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    git(&cwd, &["config", "--unset", "commit.gpgsign"]);
+    git(
+        &cwd,
+        &[
+            "config",
+            "http.https://github.com/.extraheader",
+            "AUTHORIZATION: basic eDp5",
+        ],
+    );
+    git(&cwd, &["config", "gc.auto", "0"]);
+    std::fs::write(cwd.join("README.md"), "# demo\nchanged\n").unwrap();
+    let (port, posts) = serve_recording(vec![finish("summarized")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "summarize @diff");
+    assert!(r.success, "{}", r.stderr);
+    let sent = posts.lock().unwrap()[0].clone();
+    assert!(sent.contains("[git diff HEAD]"), "{sent}");
+}
+
+// A git repository over dumb HTTP, each reply setting a cookie.
+fn serve_git_dir(root: PathBuf) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let _ = read_request_from(&mut reader);
+            let path = first.split_whitespace().nth(1).unwrap_or("/");
+            let path = path
+                .split('?')
+                .next()
+                .unwrap_or(path)
+                .trim_start_matches('/');
+            let (status, body) = match std::fs::read(root.join(path)) {
+                Ok(b) if !path.contains("..") => ("200 OK", b),
+                _ => ("404 Not Found", Vec::new()),
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nSet-Cookie: s=1; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        }
+    });
+    port
+}
+
+// http.cookieFile with http.saveCookies has git write the file the
+// repository names on its next fetch, so a saved `git fetch` approval
+// must ask in such a repository.
+#[test]
+fn a_repository_that_saves_cookies_asks_before_a_saved_git_fetch() {
+    let home = tmp("home");
+    let upstream = git_repo();
+    git(&upstream, &["update-server-info"]);
+    let port = serve_git_dir(upstream.join(".git"));
+    let cwd = git_repo();
+    git(&cwd, &["config", "--unset", "commit.gpgsign"]);
+    let url = format!("http://127.0.0.1:{port}/");
+    git(&cwd, &["remote", "add", "origin", &url]);
+    let victim = home.join("victim.txt");
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"allowed_commands": ["git fetch"]}).to_string(),
+    )
+    .unwrap();
+    let fetch = || {
+        let port = serve(vec![
+            tool_call("c1", "run_command", json!({"command": "git fetch origin"})),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", "ask", port);
+        run(&home, &cwd, "fetch")
+    };
+    // In an inert repository the saved approval covers the fetch.
+    let r = fetch();
+    assert!(
+        r.text_of("tool_result").contains("[exit 0]"),
+        "{}",
+        r.text_of("tool_result")
+    );
+    git(
+        &cwd,
+        &["config", "http.cookieFile", victim.to_str().unwrap()],
+    );
+    git(&cwd, &["config", "http.saveCookies", "true"]);
+    let r = fetch();
+    assert!(
+        r.text_of("tool_denied").contains("no interactive terminal"),
+        "{}",
+        r.text_of("tool_denied")
+    );
+    assert!(
+        !victim.exists(),
+        "git fetch wrote the repository's cookie file"
+    );
+}
+
+// With inert config the attachments work as before.
+#[test]
+fn git_attachments_attach_in_an_inert_repository() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    // commit.* is not on the inert list.
+    git(&cwd, &["config", "--unset", "commit.gpgsign"]);
+    std::fs::write(cwd.join("README.md"), "# demo\nchanged\n").unwrap();
+    let (port, posts) = serve_recording(vec![finish("summarized")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "summarize @diff and @status");
+    assert!(r.success, "{}", r.stderr);
+    let sent = posts.lock().unwrap()[0].clone();
+    assert!(sent.contains("[git diff HEAD]"), "{sent}");
+    assert!(sent.contains("+changed"), "{sent}");
+    assert!(sent.contains("[git status]"), "{sent}");
+    assert!(sent.contains("M README.md"), "{sent}");
 }
