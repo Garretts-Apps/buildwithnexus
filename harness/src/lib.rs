@@ -106,6 +106,10 @@ struct CliOptions {
     /// `--trust-project <digest>` (or BWN_TRUST_PROJECT): trust exactly this
     /// project settings content for this run (`buildwithnexus trust --print`).
     trust_project: Option<String>,
+    /// `--trust-project-allow <keys>` (or BWN_TRUST_PROJECT_ALLOW): the keys
+    /// asked about on their own (base_url, permission) that the digest may
+    /// trust too.
+    trust_project_allow: Option<String>,
     /// `--base-url <url>`: the model endpoint, over the settings value.
     base_url: Option<String>,
     /// Words before `--` that look like options but are none of ours, in
@@ -135,6 +139,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--legacy-exit-codes",
     "--plain",
     "--trust-project",
+    "--trust-project-allow",
     "--worktree",
     "--add-dir",
     "--help",
@@ -216,6 +221,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--effort" => &mut opts.effort,
             "--max-budget-usd" => &mut budget_raw,
             "--trust-project" => &mut opts.trust_project,
+            "--trust-project-allow" => &mut opts.trust_project_allow,
             "--base-url" => &mut opts.base_url,
             "--worktree" => &mut opts.worktree,
             _ => {
@@ -361,7 +367,7 @@ pub fn run() {
     if opts.json {
         report::set(report::Mode::Json);
     }
-    hooks::set_trust_digest(opts.trust_project.clone());
+    hooks::set_trust_digest(opts.trust_project.clone(), opts.trust_project_allow.clone());
     if let Some(p) = opts
         .provider
         .as_deref()
@@ -437,6 +443,10 @@ pub fn run() {
                         "buildwithnexus: /{} comes from this repo and is off until the folder is trusted: --trust-project <digest> (`buildwithnexus trust --print` shows it)",
                         tui::sanitize_terminal(&name)
                     );
+                    std::process::exit(2);
+                }
+                if let Some(msg) = unloaded_repo_command(&input.argv, &cwd) {
+                    eprintln!("buildwithnexus: {msg}");
                     std::process::exit(2);
                 }
                 if let Some((cmd, args)) = find_slash_command(&input.argv) {
@@ -867,7 +877,7 @@ fn startup_tip() -> &'static str {
     STARTUP_TIPS[nanos % STARTUP_TIPS.len()]
 }
 
-fn is_loopback_url(u: &str) -> bool {
+pub(crate) fn is_loopback_url(u: &str) -> bool {
     let rest = u
         .strip_prefix("http://")
         .or_else(|| u.strip_prefix("https://"))
@@ -1354,7 +1364,7 @@ fn headless(
         println!();
         // Off the critical path: five `which` probes cost real startup latency,
         // and with interactive=false this only prints when something is missing.
-        std::thread::spawn(|| check_and_offer_install_dependencies(false));
+        std::thread::spawn(check_and_offer_install_dependencies);
     }
     // Added folders, and the instruction files they bring, are named
     // before the model reads them (a `notice` event in --json mode).
@@ -1411,7 +1421,10 @@ fn headless(
     let blocked_calls = agent::blocked_without_terminal();
     let blocked = blocked_calls.len();
     if r.is_ok() && blocked > 0 {
-        r = Err(blocked_line(&blocked_calls));
+        r = Err(blocked_line(
+            &blocked_calls,
+            agent::blocked_needing_a_person().len(),
+        ));
     }
     // Refusals by a hook, a rule or read-only mode: the run did not do what
     // it was asked, though nothing failed.
@@ -1479,19 +1492,33 @@ fn headless(
 
 // The closing line of a run whose changes nobody could approve: what was
 // blocked, by its approval label, and nothing about the rest of the run.
-fn blocked_line(calls: &[String]) -> String {
+// `need_person` of them are calls auto mode asks about too (sensitive
+// paths, dangerous commands, ask rules), so auto is not offered for those.
+fn blocked_line(calls: &[String], need_person: usize) -> String {
     let n = calls.len();
     let shown: Vec<&str> = calls.iter().take(3).map(String::as_str).collect();
     let more = match n.saturating_sub(shown.len()) {
         0 => String::new(),
         k => format!(" and {k} more"),
     };
+    let it = if n == 1 { "it" } else { "them" };
+    let advice = if need_person == 0 {
+        format!("Re-run with --permission-mode auto to allow {it}.")
+    } else if need_person >= n {
+        format!(
+            "{} always {} a person to approve, even with --permission-mode auto: run bwn in a terminal to approve {it}.",
+            if n == 1 { "This one" } else { "These" },
+            if n == 1 { "needs" } else { "need" }
+        )
+    } else {
+        format!(
+            "{need_person} of them always need a person to approve, even with --permission-mode auto (run bwn in a terminal for those); auto allows the rest."
+        )
+    };
     format!(
-        "{n} change{} blocked for lack of approval and not made: {}{more}. \
-         Re-run with --permission-mode auto to allow {}.",
+        "{n} change{} blocked for lack of approval and not made: {}{more}. {advice}",
         if n == 1 { " was" } else { "s were" },
         shown.join("; "),
-        if n == 1 { "it" } else { "them" }
     )
 }
 
@@ -1656,9 +1683,6 @@ fn login_cli(opts: &CliOptions) {
 fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // MCP login hints say /mcp login here, not `bwn mcp login`.
     mcp_auth::set_in_session();
-    // Always scaffold on interactive launch so existing users also get the
-    // directory skeleton and starter Agents.md if they're missing.
-    config::scaffold_home();
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
     // Settings that name no provider (a team repo's hooks-only file, or
@@ -1676,6 +1700,10 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     {
         setup_not_finished();
     }
+    // Every launch past setup scaffolds, so existing users also get the
+    // directory skeleton and starter Agents.md if they're missing; setup
+    // left early writes nothing.
+    config::scaffold_home();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Before the provider is built: base_url, permission and sandbox may
@@ -1756,6 +1784,9 @@ fn repl(
         report::notice(&format!("  {n}"));
     }
     review_repo_instructions(cwd);
+    if let Some(n) = config::custom_key_move_notice() {
+        report::notice(&format!("  {n}"));
+    }
     if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
         report::notice(&format!("  {n}"));
     }
@@ -1781,7 +1812,7 @@ fn repl(
     }
     // Off the critical path: five `which` probes cost real startup latency,
     // and with interactive=false this only prints when something is missing.
-    std::thread::spawn(|| check_and_offer_install_dependencies(false));
+    std::thread::spawn(check_and_offer_install_dependencies);
     update::spawn_check(&settings.auto_update);
 
     // The REPL owns the id SessionStart already announced: a fresh one, or
@@ -2578,6 +2609,8 @@ fn repl(
                 if let Some(usage) = command_usage(cmd_name) {
                     // A listed command that needs an argument, typed bare.
                     tui::line(&tui::yellow(&format!("  usage: {usage}")));
+                } else if let Some(msg) = unloaded_repo_command(t, cwd) {
+                    tui::line(&tui::yellow(&format!("  {msg}")));
                 } else if config::is_untrusted_repo_command(cwd, cmd_name) {
                     tui::line(&tui::yellow(&format!(
                         "  /{} comes from this repo and is off until you trust this folder: start bwn here again and answer y",
@@ -3495,7 +3528,15 @@ fn offer_agents_md(
     let yes = match answer.trim().to_lowercase().as_str() {
         "y" | "yes" => true,
         "" => !exists,
-        _ => false,
+        "n" | "no" => false,
+        // A message typed while the question was up is not an answer.
+        _ => {
+            tui::prefill_composer(&answer);
+            tui::line(&tui::dim(
+                "  skipped — that was not y or n; your text is back in the input box",
+            ));
+            return;
+        }
     };
     if !yes {
         tui::line(&tui::dim("  skipped"));
@@ -3594,6 +3635,22 @@ fn untrusted_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
         .then(|| name.to_string())
 }
 
+// `/name` naming a command or skill file of the checkout that does not
+// load: what to tell the person instead of sending the line on.
+fn unloaded_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    if find_custom_command(name).is_some() {
+        return None;
+    }
+    let path = config::unloaded_repo_command(cwd, name)?;
+    Some(format!(
+        "/{} ({}) is {}",
+        tui::sanitize_terminal(name),
+        tui::sanitize_terminal(&path),
+        config::NOT_LOADED
+    ))
+}
+
 /// `/name args` naming a command or skill: that command and its arguments.
 /// A task that merely starts with a path (`/usr/bin/foo fails`) is not one.
 fn find_slash_command(text: &str) -> Option<(config::CustomCommand, String)> {
@@ -3620,10 +3677,12 @@ fn run_script_command(
         format!("'{escaped}' {args}")
     };
     let tool_input = serde_json::json!({"command": shell_cmd});
-    if let Some(reason) = agent::hook_gate(perm, "run_command", &tool_input, cwd) {
-        return Err(reason);
-    }
-    let out = tools::run("run_command", &tool_input, cwd);
+    let out = tools::with_script_command(script, || {
+        match agent::hook_gate(perm, "run_command", &tool_input, cwd) {
+            Some(reason) => Err(reason),
+            None => Ok(tools::run("run_command", &tool_input, cwd)),
+        }
+    })?;
     if out.is_error {
         Err(out.content)
     } else {
@@ -4150,10 +4209,11 @@ fn swap_model(
         // none), never the key of the one before.
         let new_address = custom_url.as_deref().filter(|u| Some(*u) != current);
         if let Some(url) = new_address.filter(|u| config::saved_custom_key(u).is_none()) {
-            let Some(key) = onboarding::ask_custom_key(url) else {
-                return swap_cancelled();
-            };
-            new_key = Some(key);
+            new_key = Some(match onboarding::ask_custom_key(url) {
+                onboarding::KeyAnswer::Key(k) => k,
+                onboarding::KeyAnswer::Empty => String::new(),
+                onboarding::KeyAnswer::Cancel => return swap_cancelled(),
+            });
         }
         if model.is_empty() {
             let Some(m) = tui::ask("  Model name (as the server expects it): ") else {
@@ -4176,13 +4236,10 @@ fn swap_model(
         tui::line(&tui::dim(
             "  Paste an API key to set it up now (it is checked before it is saved), or Esc to cancel.",
         ));
-        let Some(key) = tui::ask_secret(&format!("  {}: ", preset.env_key)) else {
-            return swap_cancelled();
-        };
-        if key.trim().is_empty() {
-            return swap_cancelled();
+        match onboarding::read_key(&format!("  {}: ", preset.env_key)) {
+            onboarding::KeyAnswer::Key(k) => new_key = Some(k),
+            _ => return swap_cancelled(),
         }
-        new_key = Some(key.trim().to_string());
     }
 
     // Ollama: confirm the server is up and actually has the model before
@@ -4377,25 +4434,41 @@ fn probe_swap(
         };
         let fail = onboarding::Fail::from_error(&e);
         if let onboarding::Fail::KeyRejected(code) = fail {
-            if new_key.as_deref().is_some_and(|k| !k.is_empty()) {
-                tui::line(&tui::red(&format!(
-                    "  ✗ rejected (HTTP {code}) — not saved"
-                )));
-                keeping();
-                return None;
-            }
-            if preset.id == "custom" && p.api_key.is_none() {
-                tui::line(&tui::yellow(&format!(
-                    "  the endpoint wants an API key (HTTP {code}) — paste it, or Esc to cancel"
-                )));
-                let key = tui::ask_secret("  API key for this endpoint: ")
-                    .map(|k| k.trim().to_string())
-                    .filter(|k| !k.is_empty());
-                if key.is_none() {
-                    swap_cancelled();
+            // A key typed here and refused is asked for again, as setup and
+            // /login do: the next paste must not land in the message box.
+            let typed = new_key.as_deref().is_some_and(|k| !k.is_empty());
+            let wants = preset.id == "custom" && p.api_key.is_none();
+            if typed || wants {
+                if let Some(why) = onboarding::plain_http_key_refusal(&p.base_url)
+                    .filter(|_| preset.id == "custom")
+                {
+                    tui::line(&tui::yellow(&format!(
+                        "  the endpoint wants an API key (HTTP {code}) — {why}"
+                    )));
+                    keeping();
                     return None;
                 }
-                *new_key = key;
+                tui::line(&if typed {
+                    tui::red(&format!(
+                        "  ✗ rejected (HTTP {code}) — not saved. Paste it again, or Esc to cancel"
+                    ))
+                } else {
+                    tui::yellow(&format!(
+                        "  the endpoint wants an API key (HTTP {code}) — paste it, or Esc to cancel"
+                    ))
+                });
+                let prompt = if preset.id == "custom" {
+                    "  API key for this endpoint: ".to_string()
+                } else {
+                    format!("  {}: ", preset.env_key)
+                };
+                match onboarding::read_key(&prompt) {
+                    onboarding::KeyAnswer::Key(k) => *new_key = Some(k),
+                    _ => {
+                        swap_cancelled();
+                        return None;
+                    }
+                }
                 continue;
             }
         }
@@ -6477,8 +6550,10 @@ fn handle_checkpoints(cwd: &std::path::Path) {
 }
 
 // The repository's instruction files steer the model: the first launch
-// with this folder and content asks, with one key, to review or use them;
-// after that they are named in a dim line.
+// with this folder and content asks whether to use them, and they are used
+// only on a yes (No is the default, as for every trust question). After a
+// yes they are named in a dim line. The question takes whole answers, so a
+// task typed meanwhile is never read as one: it is kept for the input box.
 fn review_repo_instructions(cwd: &std::path::Path) {
     let Some(repo) = config::repo_instructions(cwd) else {
         return;
@@ -6494,26 +6569,39 @@ fn review_repo_instructions(cwd: &std::path::Path) {
         tui::line(&tui::dim(&format!("  {notice} (not reviewed)")));
         return;
     }
-    loop {
-        tui::line(&tui::yellow(&format!(
-            "  {notice} — press r to review or Enter to use them"
-        )));
-        match tui::ask_key("  r review · Enter use them › ", &['r']) {
-            Some('r') => show_instruction_files(&repo.files),
-            Some(_) => {
-                repo.acknowledge(cwd);
-                tui::line(&tui::dim(&format!(
-                    "  ✓ using {notice} — asked again when they change"
-                )));
-                return;
-            }
-            None => {
-                tui::line(&tui::dim(&format!(
-                    "  {notice} (not reviewed) — asked again next time"
-                )));
-                return;
+    tui::line(&tui::yellow(&format!(
+        "  {notice} — the model follows these files from the checkout"
+    )));
+    let mut held: Vec<String> = Vec::new();
+    let used = loop {
+        let Some(answer) = tui::ask("  use them? y yes · n no · r review [N]: ") else {
+            break false;
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => break true,
+            "" | "n" | "no" => break false,
+            "r" | "review" => show_instruction_files(&repo.files),
+            _ => {
+                held.push(answer);
+                tui::line(&tui::dim(
+                    "  (answer y or n first — your text is kept for the input box)",
+                ));
             }
         }
+    };
+    if used {
+        repo.acknowledge(cwd);
+        tui::line(&tui::dim(&format!(
+            "  ✓ using {notice} — asked again when they change"
+        )));
+    } else {
+        config::decline_repo_instructions();
+        tui::line(&tui::dim(&format!(
+            "  ✗ not using {notice} this session — asked again next time"
+        )));
+    }
+    if !held.is_empty() {
+        tui::prefill_composer(&held.join("\n"));
     }
 }
 
@@ -8267,6 +8355,9 @@ fn usage_text() -> String {
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
          \x20 --trust-project <digest>      trust exactly this project settings content for this\n\
          \x20                               run (from `trust --print`; or BWN_TRUST_PROJECT)\n\
+         \x20 --trust-project-allow <keys>  let that digest trust base_url and/or permission\n\
+         \x20                               too, e.g. base_url,permission (or\n\
+         \x20                               BWN_TRUST_PROJECT_ALLOW)\n\
          \x20 --plain                       line mode: no alternate screen or cursor control\n\
          \x20                               (TERM=dumb does the same)\n\
          \x20 --json                        structured headless output\n\
@@ -8601,7 +8692,12 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
         out.push(if crate::tools::find_on_path(bin).is_some() {
             DoctorCheck::pass(bin, label)
         } else {
-            DoctorCheck::note(bin, format!("{label} — not found"))
+            match install_command(bin) {
+                Some(how) => {
+                    DoctorCheck::note(bin, format!("{label} — not found; install it with: {how}"))
+                }
+                None => DoctorCheck::note(bin, format!("{label} — not found")),
+            }
         });
     }
 
@@ -8666,10 +8762,6 @@ fn run_doctor(opts: &CliOptions) {
         if let Some(summary) = doctor_summary_line(&checks) {
             println!("{summary}");
         }
-        // Offering installs needs someone to answer.
-        if std::io::stdin().is_terminal() {
-            check_and_offer_install_dependencies(true);
-        }
     }
     if failed {
         std::process::exit(1);
@@ -8721,40 +8813,34 @@ const DEPENDENCIES: &[(&str, &str, &str, &str, &str, bool)] = &[
     ),
 ];
 
-/// Lists tools missing from PATH as plain advice. It never installs
-/// anything: `interactive` (doctor) lists every missing tool with its
-/// install command; otherwise (session start) only a missing tool bwn itself
-/// needs gets a line. The name is kept for its callers.
-pub fn check_and_offer_install_dependencies(interactive: bool) {
-    let missing: Vec<_> = DEPENDENCIES
-        .iter()
-        .filter(|d| crate::tools::find_on_path(d.0).is_none())
-        .collect();
-    if missing.is_empty() {
-        if interactive {
-            tui::line(&tui::green(
-                "  ✓ dependencies installed (git, rg, node, npm, python3)",
-            ));
-        }
-        return;
-    }
+/// Lists a missing tool bwn itself needs (git) as plain advice at session
+/// start; it never installs anything. `doctor` names every missing tool with
+/// its install command in its own checks. The name is kept for its callers.
+pub fn check_and_offer_install_dependencies() {
     let brew = crate::tools::find_on_path("brew").is_some();
     let apt = crate::tools::find_on_path("apt-get").is_some();
-    for &&(bin, brew_pkg, apt_pkg, page, why, needed) in &missing {
-        if !interactive && !needed {
+    for &(bin, brew_pkg, apt_pkg, page, why, needed) in DEPENDENCIES {
+        if !needed || crate::tools::find_on_path(bin).is_some() {
             continue;
         }
         let how = install_hint(brew_pkg, apt_pkg, page, brew, apt, cfg!(windows));
-        let line = format!(
-            "  · {bin} not found — {}{why}; install it with: {how}",
-            if needed { "" } else { "optional, " }
-        );
-        if needed {
-            tui::line(&tui::yellow(&line));
-        } else {
-            tui::line(&tui::dim(&line));
-        }
+        tui::line(&tui::yellow(&format!(
+            "  · {bin} not found — {why}; install it with: {how}"
+        )));
     }
+}
+
+// How to install `bin` here, when it is one of DEPENDENCIES.
+fn install_command(bin: &str) -> Option<String> {
+    let &(_, brew_pkg, apt_pkg, page, _, _) = DEPENDENCIES.iter().find(|d| d.0 == bin)?;
+    Some(install_hint(
+        brew_pkg,
+        apt_pkg,
+        page,
+        crate::tools::find_on_path("brew").is_some(),
+        crate::tools::find_on_path("apt-get").is_some(),
+        cfg!(windows),
+    ))
 }
 
 // The command (or page) that installs a tool here. Printed for the person to
@@ -9393,14 +9479,26 @@ mod tests {
             .map(str::to_string)
             .to_vec();
         assert_eq!(
-            blocked_line(&calls[..1]),
+            blocked_line(&calls[..1], 0),
             "1 change was blocked for lack of approval and not made: write a.txt. \
              Re-run with --permission-mode auto to allow it."
         );
         assert_eq!(
-            blocked_line(&calls),
+            blocked_line(&calls, 0),
             "5 changes were blocked for lack of approval and not made: write a.txt; \
              run: npm test; remove b and 2 more. Re-run with --permission-mode auto to allow them."
+        );
+        // Auto would not allow these either: it is not offered.
+        let one = blocked_line(&calls[..1], 1);
+        assert!(!one.contains("Re-run with --permission-mode auto"), "{one}");
+        assert!(
+            one.ends_with("This one always needs a person to approve, even with --permission-mode auto: run bwn in a terminal to approve it."),
+            "{one}"
+        );
+        let mixed = blocked_line(&calls, 2);
+        assert!(
+            mixed.ends_with("2 of them always need a person to approve, even with --permission-mode auto (run bwn in a terminal for those); auto allows the rest."),
+            "{mixed}"
         );
     }
 
@@ -9958,7 +10056,7 @@ mod tests {
 
     #[test]
     fn test_check_and_offer_install_dependencies() {
-        super::check_and_offer_install_dependencies(false);
+        super::check_and_offer_install_dependencies();
     }
 
     #[test]

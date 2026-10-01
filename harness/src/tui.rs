@@ -5930,6 +5930,14 @@ pub fn prefill_composer(text: &str) {
     }
 }
 
+/// Sends `text` as the next input, as if typed and submitted: a `/command`
+/// typed at a key question runs once the question has closed.
+pub fn queue_message(text: &str) {
+    if let Ok(mut mq) = message_queue().lock() {
+        mq.push(text.to_string());
+    }
+}
+
 // ── secret ask ───────────────────────────────────────────────────────────────
 /// Reads an API key without echoing it: each character shows as a dot while
 /// typing, and the submitted line keeps only the masked form, so the key
@@ -5998,7 +6006,7 @@ fn read_secret(
     draw(0);
     loop {
         match next()? {
-            Event::Paste(s) => buf.extend(s.chars().filter(|c| !c.is_control())),
+            Event::Paste(s) => buf.extend(sanitize_paste(&s)),
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 match k.code {
@@ -9493,6 +9501,14 @@ mod tests {
         assert_eq!(run(evs).0.as_deref(), Some("ok"));
         // The input closing (a read error) is a cancel, not an empty key.
         assert_eq!(run(typed("sk-")).0, None);
+
+        // A paste of several lines is not glued into one key: its line
+        // breaks become spaces, which the key question then refuses.
+        let (got, _) = run(vec![
+            Event::Paste("sk-first\nsk-second\n".into()),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ]);
+        assert_eq!(got.as_deref(), Some("sk-first sk-second "));
 
         // A long key never wraps the row: the dots stop at the width.
         let frame = secret_frame("  KEY: ", 500, 40);

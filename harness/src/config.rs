@@ -1564,6 +1564,34 @@ impl RepoInstructions {
     }
 }
 
+// Set when the person said no to the repository's instruction files for
+// this session: only their own ~/.buildwithnexus/AGENTS.md is then sent.
+static REPO_INSTRUCTIONS_DECLINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps the checkout's instruction files out of the prompt for the rest of
+/// this session.
+pub fn decline_repo_instructions() {
+    REPO_INSTRUCTIONS_DECLINED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The instruction files the model is sent: `load_instructions`, without
+/// the repository's own files once they were declined.
+pub fn prompt_instructions(cwd: &Path) -> Vec<InstructionFile> {
+    let declined = REPO_INSTRUCTIONS_DECLINED.load(std::sync::atomic::Ordering::Relaxed);
+    without_declined(load_instructions(cwd), declined)
+}
+
+fn without_declined(files: Vec<InstructionFile>, declined: bool) -> Vec<InstructionFile> {
+    if !declined {
+        return files;
+    }
+    files
+        .into_iter()
+        .filter(|f| f.path.starts_with(home()))
+        .collect()
+}
+
 pub fn repo_instructions(cwd: &Path) -> Option<RepoInstructions> {
     let files: Vec<InstructionFile> = load_instructions(cwd)
         .into_iter()
@@ -2134,7 +2162,11 @@ pub fn project_extensions(cwd: &Path) -> Option<UntrustedProjectFile> {
             |t| crate::hooks::sha256_tagged(t.as_bytes()),
         );
         text.push_str(&format!("{}\t{}\t{}\t{digest}\n", f.kind, f.name, f.shown));
-        keys.push(format!("{} {} ({})", f.kind, f.name, f.shown));
+        keys.push(if f.text.is_some() {
+            format!("{} {} ({})", f.kind, f.name, f.shown)
+        } else {
+            format!("{} {} ({}) — {NOT_LOADED}", f.kind, f.name, f.shown)
+        });
     }
     Some(UntrustedProjectFile {
         name: PROJECT_EXTENSIONS,
@@ -2169,6 +2201,25 @@ pub fn untrusted_extensions_notice(cwd: &Path) -> Option<String> {
         names.join(", ")
     ))
 }
+
+/// The path of the checkout's command or skill `/name` when its file does
+/// not load (it links outside its folder, or cannot be read).
+pub fn unloaded_repo_command(cwd: &Path, name: &str) -> Option<String> {
+    project_extension_files(cwd)
+        .into_iter()
+        .find(|f| {
+            f.text.is_none()
+                && match f.kind {
+                    "command" => f.name.strip_prefix('/') == Some(name),
+                    "skill" => f.name == name,
+                    _ => false,
+                }
+        })
+        .map(|f| f.shown)
+}
+
+/// Why a command, skill or agent file is listed but does not load.
+pub const NOT_LOADED: &str = "not loaded: it links outside its folder or cannot be read";
 
 /// Whether `/name` is one of the checkout's commands or skills, off because
 /// the folder is not trusted.
@@ -3030,8 +3081,11 @@ fn migrate_custom_key() {
     } else {
         user.endpoints.get("custom").cloned()
     };
-    let slot = match url.filter(|u| !u.trim().is_empty()) {
-        Some(url) => custom_key_name(&url),
+    let origin = url
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| endpoint_origin(&u));
+    let slot = match &origin {
+        Some(o) => format!("{CUSTOM_KEY}@{o}"),
         None => UNBOUND_CUSTOM_KEY.to_string(),
     };
     // A slot already taken keeps its key; the old line then stays as it is,
@@ -3039,10 +3093,30 @@ fn migrate_custom_key() {
     if key.trim().is_empty() || !map.contains_key(&slot) {
         map.remove(CUSTOM_KEY);
         if !key.trim().is_empty() {
+            if let Some(o) = &origin {
+                // Said once, at the next session start (custom_key_move_notice).
+                record_notice(KEY_MOVED, o);
+            }
             map.insert(slot, key);
         }
         write_keys_file(&map);
     }
+}
+
+// notices.json entries: the endpoint a 0.14 CUSTOM_API_KEY was filed under,
+// and whether the session has said so.
+const KEY_MOVED: &str = "custom-key-moved";
+
+/// Once: where the CUSTOM_API_KEY of an earlier version now applies, since
+/// it no longer goes to every custom endpoint.
+pub fn custom_key_move_notice() -> Option<String> {
+    let origin = notices()[KEY_MOVED].as_str()?.to_string();
+    if notice_seen("custom-key-moved-shown", &origin) {
+        return None;
+    }
+    Some(format!(
+        "your CUSTOM_API_KEY from an earlier version is now kept for {origin} only — /model to another endpoint asks for that endpoint's key"
+    ))
 }
 
 /// True when the key comes from the process environment, which wins over
@@ -4683,6 +4757,12 @@ mod tests {
         assert!(!repo.acknowledged(&proj));
         repo.acknowledge(&proj);
         assert!(repo_instructions(&proj).unwrap().acknowledged(&proj));
+        // A no keeps the repository's file out of the prompt, not the
+        // person's own.
+        let sent = without_declined(load_instructions(&proj), true);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].content.contains("# Mine"), "{sent:?}");
+        assert_eq!(without_declined(load_instructions(&proj), false).len(), 2);
         // Another folder with the same text is its own question.
         assert!(!repo_instructions(&other).unwrap().acknowledged(&other));
         // Changed text is asked about again.
@@ -4780,6 +4860,13 @@ mod tests {
             "CUSTOM_API_KEY@https://gw.example.com=sk-old\nOPENAI_API_KEY=sk-o\n"
         );
         assert_eq!(load_custom_key("https://other.example.com/v1"), None);
+        // The move is said once, naming the endpoint.
+        let said = custom_key_move_notice().expect("a notice about the moved key");
+        assert!(
+            said.contains("now kept for https://gw.example.com only"),
+            "{said}"
+        );
+        assert_eq!(custom_key_move_notice(), None);
 
         // No known endpoint: unbound, never sent, and it stays unbound when
         // the settings later name one.

@@ -1975,6 +1975,42 @@ fn accept_edits_applies_edits_and_blocks_commands() {
     );
 }
 
+// In auto mode the only calls left to block are ones auto never allows, so
+// the closing line does not tell the person to re-run with auto.
+#[test]
+fn a_call_auto_never_allows_is_not_sent_back_to_auto() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "rm -rf /"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "run", "--permission-mode", "auto", "clean up"],
+    );
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("blocked for lack of approval and not made: run dangerous command"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("Re-run with --permission-mode auto"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .contains("always needs a person to approve, even with --permission-mode auto"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
 // accept-edits with no terminal, and the model runs check_work itself, as
 // bwn's system prompt tells it to: the edit is made, the checks cannot be
 // approved. Checks are verification, not a change, so the run is a success
@@ -2727,6 +2763,11 @@ fn init_without_a_terminal_is_not_finished_and_saves_nothing() {
     assert!(r.stderr.contains("setup not finished"), "{}", r.stderr);
     assert!(!home.join("settings.json").exists());
     assert!(!home.join(".env.keys").exists());
+    // "Nothing was saved" means nothing was written: no starter files either.
+    let written: Vec<_> = std::fs::read_dir(&home)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(written.is_empty(), "{written:?}");
 }
 
 #[test]
@@ -4449,6 +4490,20 @@ fn doctor_for_a_hosted_provider_without_its_key_names_only_that_key() {
     ] {
         assert!(!out.contains(other), "{other}: {out}");
     }
+}
+
+#[test]
+fn doctor_names_each_missing_tool_once_with_its_install_command() {
+    let home = tmp("home");
+    write_custom_config(&home, "http://127.0.0.1:9/v1");
+    let empty = tmp("empty-path");
+    let (_, out) = doctor(&home, &["doctor"], &[("PATH", empty.to_str().unwrap())]);
+    let rg: Vec<&str> = out.lines().filter(|l| l.contains("rg ")).collect();
+    assert_eq!(rg.len(), 1, "{out}");
+    assert!(
+        rg[0].contains("ripgrep (fast search, optional) — not found; install it with: "),
+        "{out}"
+    );
 }
 
 // ── delegated work says where it went ───────────────────────────────────────
@@ -6489,6 +6544,266 @@ fn repo_skills_and_agents_wait_for_trust_and_trust_print_lists_them() {
         first.contains("Reviews diffs strictly"),
         "agent offered once trusted"
     );
+}
+
+// `trust --print` in `cwd`: (digest, the listing on stderr).
+fn trust_print(home: &Path, cwd: &Path) -> (String, String) {
+    let out = Command::new(BIN)
+        .args(["trust", "--print"])
+        .current_dir(cwd)
+        .env("NEXUS_HOME", home)
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_digest_trusts_permission_and_base_url_only_when_they_are_named() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"permission": "auto", "allowed_commands": ["make"]}).to_string(),
+    )
+    .unwrap();
+    let (digest, listing) = trust_print(&home, &cwd);
+    assert!(
+        listing.contains("permission: \"auto\" — edits and commands run without asking you")
+            && listing.contains("--trust-project-allow permission"),
+        "{listing}"
+    );
+    let port = serve(vec![
+        tool_call("c1", "run_command", json!({"command": "touch ran.txt"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "go"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("also set permission auto (edits and commands run without asking you)")
+            && r.stderr.contains("--trust-project-allow permission"),
+        "{}",
+        r.stderr
+    );
+    assert!(!cwd.join("ran.txt").exists());
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--trust-project",
+            &digest,
+            "--trust-project-allow",
+            "permission",
+            "run",
+            "go",
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(
+        cwd.join("ran.txt").exists(),
+        "the repo's auto applied once named"
+    );
+
+    // base_url says where the key goes, and needs its own name too.
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"base_url": "https://gw.example.com/v1"}).to_string(),
+    )
+    .unwrap();
+    let (digest, listing) = trust_print(&home, &cwd);
+    assert!(
+        listing.contains("your requests and API key go to this address"),
+        "{listing}"
+    );
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--trust-project",
+            &digest,
+            "--trust-project-allow",
+            "permission",
+            "run",
+            "go",
+        ],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("--trust-project-allow base_url"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_digest_needs_no_name_for_a_permission_that_only_tightens() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"permission": "readonly", "allowed_commands": ["make"]}).to_string(),
+    )
+    .unwrap();
+    let (digest, listing) = trust_print(&home, &cwd);
+    assert!(!listing.contains("--trust-project-allow"), "{listing}");
+    let port = serve(vec![finish("done")]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "go"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn a_mistyped_or_cut_digest_is_not_called_a_change() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"allowed_commands": ["make"]}).to_string(),
+    )
+    .unwrap();
+    let digest = project_digest(&home, &cwd);
+    write_config(&home, "ollama", "ask", serve(vec![finish("done")]));
+    let hex = digest.trim_start_matches("sha256:").to_string();
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &hex, "run", "go"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("no sha256: prefix"), "{}", r.stderr);
+    let last = hex.chars().last().unwrap();
+    let typo = format!(
+        "sha256:{}{}",
+        &hex[..hex.len() - 1],
+        if last == '0' { '1' } else { '0' }
+    );
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &typo, "run", "go"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("differs from this folder's in 1 character")
+            && !r.stderr.contains("changed since"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_trusted_repo_script_command_runs_headless() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus/commands")).unwrap();
+    let script = cwd.join(".buildwithnexus/commands/stamp.sh");
+    std::fs::write(&script, "#!/bin/sh\ntouch stamped.txt\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write_config(&home, "ollama", "ask", serve(vec![finish("done")]));
+    let digest = project_digest(&home, &cwd);
+    let r = run_args(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "--trust-project",
+            &digest,
+            "run",
+            "--permission-mode",
+            "auto",
+            "/stamp",
+        ],
+    );
+    assert!(r.success, "stderr: {} {:?}", r.stderr, r.events);
+    assert!(cwd.join("stamped.txt").exists());
+}
+
+#[test]
+fn a_skill_folder_named_in_project_settings_is_in_the_digest() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::create_dir_all(cwd.join("team-skills/tidy")).unwrap();
+    std::fs::write(
+        cwd.join("team-skills/tidy/SKILL.md"),
+        "---\nname: tidy\ndescription: Tidies the house way\n---\nTidy.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        json!({"skill_dirs": ["./team-skills"]}).to_string(),
+    )
+    .unwrap();
+    let (digest, listing) = trust_print(&home, &cwd);
+    assert!(
+        listing.contains("skill tidy (team-skills/tidy/SKILL.md)"),
+        "{listing}"
+    );
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_big_context_config(&home, port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "hello"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(!r.stderr.contains("ignoring untrusted"), "{}", r.stderr);
+    assert!(posts.lock().unwrap()[0].contains("Tidies the house way"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_repo_command_that_links_outside_says_it_does_not_load() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let outside = tmp("outside");
+    std::fs::write(outside.join(".env"), "SECRET=1\n").unwrap();
+    std::fs::create_dir_all(cwd.join(".claude/commands")).unwrap();
+    std::os::unix::fs::symlink(outside.join(".env"), cwd.join(".claude/commands/linked.md"))
+        .unwrap();
+    std::fs::write(cwd.join(".claude/commands/fine.md"), "Say fine.\n").unwrap();
+    let (digest, listing) = trust_print(&home, &cwd);
+    assert!(
+        listing.contains("command /linked (.claude/commands/linked.md) — not loaded: it links outside its folder"),
+        "{listing}"
+    );
+    let (port, posts) = serve_recording(vec![finish("ok")]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--trust-project", &digest, "run", "/linked"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("/linked (.claude/commands/linked.md) is not loaded"),
+        "{}",
+        r.stderr
+    );
+    assert!(posts.lock().unwrap().is_empty(), "nothing was sent");
 }
 
 // ── tools that return images ────────────────────────────────────────────────

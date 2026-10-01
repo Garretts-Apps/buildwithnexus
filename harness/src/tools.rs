@@ -3285,6 +3285,28 @@ pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
     command_sensitive_path_for(cmd, cwd, cfg!(windows))
 }
 
+thread_local! {
+    // The script command being run (`with_script_command`): its own path is
+    // not a sensitive path to touch, though it sits in `.buildwithnexus`.
+    static SCRIPT_COMMAND: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (the gate and run of a custom script command) with `script`
+/// exempt from the sensitive-path check: the file was trusted to load as a
+/// command, so running it is not a touch of `.buildwithnexus`. Its arguments
+/// are still checked.
+pub fn with_script_command<T>(script: &Path, f: impl FnOnce() -> T) -> T {
+    SCRIPT_COMMAND.with(|s| *s.borrow_mut() = Some(script.to_path_buf()));
+    let r = f();
+    SCRIPT_COMMAND.with(|s| *s.borrow_mut() = None);
+    r
+}
+
+fn is_script_command(p: &Path) -> bool {
+    SCRIPT_COMMAND.with(|s| s.borrow().as_deref() == Some(p))
+}
+
 fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -3299,7 +3321,8 @@ fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<Pa
             Some(p) => p.split_once(':').map_or("", |(_, v)| v),
             None => win,
         };
-        if (windows || win.contains('\\')) && !win.is_empty() {
+        if (windows || win.contains('\\')) && !win.is_empty() && !is_script_command(Path::new(win))
+        {
             let names = path_names(Path::new(win), true);
             if sensitive_names(&names, true, false)
                 || names
@@ -3323,6 +3346,9 @@ fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<Pa
             None => tok,
         };
         let p = resolve(cwd, &tok);
+        if is_script_command(&p) {
+            continue;
+        }
         if is_sensitive_for(&p, windows) {
             return Some(p);
         }
@@ -7622,6 +7648,22 @@ pub(crate) mod tests {
     }
 
     // ── is_sensitive ────────────────────────────────────────────────────────
+    #[test]
+    fn a_trusted_script_command_is_not_a_sensitive_path_but_its_arguments_are() {
+        let cwd = Path::new("/w/proj");
+        let script = cwd.join(".buildwithnexus/commands/fmt.sh");
+        let cmd = format!("'{}' src", script.display());
+        assert!(command_sensitive_path(&cmd, cwd).is_some());
+        assert_eq!(
+            with_script_command(&script, || command_sensitive_path(&cmd, cwd)),
+            None
+        );
+        let leak = format!("'{}' ~/.ssh/id_rsa", script.display());
+        assert!(with_script_command(&script, || command_sensitive_path(&leak, cwd)).is_some());
+        // Only while it runs.
+        assert!(command_sensitive_path(&cmd, cwd).is_some());
+    }
+
     #[test]
     fn sensitive_paths() {
         for p in [

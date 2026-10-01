@@ -25,7 +25,6 @@ fn ask(prompt: &str) -> Result<String, Exit> {
 }
 
 pub fn run() -> Option<Settings> {
-    config::scaffold_home();
     tui::clear();
     tui::line(&tui::accent("  buildwithnexus"));
     tui::line(&tui::dim(
@@ -50,7 +49,10 @@ pub fn run() -> Option<Settings> {
     loop {
         let pick = pick_provider(!ollama_models.is_empty())?;
         match configure(pick, &ollama_models) {
-            Ok(settings) => return Some(settings),
+            Ok(settings) => {
+                config::scaffold_home();
+                return Some(settings);
+            }
             Err(Exit::Back) => continue,
             Err(Exit::Stop) => return None,
         }
@@ -174,6 +176,20 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
         None
     };
     let mut key_origin = config::endpoint_origin(&url_now(&base_url));
+    // A gateway that lists its models only to a caller with its key: list
+    // them now that there is one, so the default is a model it serves.
+    let mut detected = detected;
+    if pick.id == "custom" && detected.is_empty() {
+        let url = url_now(&base_url);
+        if let Some(k) = key.as_deref().or(stored.as_deref()) {
+            if plain_http_key_refusal(&url).is_none() {
+                detected = provider::openai_models_keyed(&url, Some(k)).unwrap_or_default();
+                if !detected.is_empty() {
+                    list_models(&detected);
+                }
+            }
+        }
+    }
     let mut model = choose_model(pick, &detected)?;
 
     loop {
@@ -215,6 +231,13 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
                 retry(&mut base_url, pick)?;
             }
             Fail::KeyRejected(code) => {
+                if let Some(why) = plain_http_key_refusal(url).filter(|_| pick.id == "custom") {
+                    tui::line(&tui::yellow(&format!(
+                        "  the endpoint wants an API key (HTTP {code}) — {why}"
+                    )));
+                    retry(&mut base_url, pick)?;
+                    continue;
+                }
                 if key.is_none() && config::key_from_env(name) {
                     tui::line(&tui::red(&format!(
                         "  {name} from your environment was rejected (HTTP {code}) — fix or unset it, then run setup again"
@@ -231,11 +254,10 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
                     )));
                 }
                 key = if pick.id == "custom" {
-                    Some(ask_custom_key(&url_now(&base_url)).ok_or(Exit::Stop)?)
+                    custom_key(&url_now(&base_url))?
                 } else {
                     Some(ask_key(pick)?)
-                }
-                .filter(|k| !k.is_empty());
+                };
             }
             Fail::ModelMissing => {
                 model = replace_model(pick, url, &model)?;
@@ -451,7 +473,7 @@ fn pull_model(model: &str) -> bool {
 }
 
 fn list_models(found: &[String]) {
-    tui::line(&tui::dim("  detected local models:"));
+    tui::line(&tui::dim("  detected models:"));
     for (i, m) in found.iter().take(MODEL_LIST_MAX).enumerate() {
         // Names come from whatever answers on the local port.
         tui::line(&format!(
@@ -493,23 +515,122 @@ pub(crate) fn key_slot(p: &Preset, base_url: &str) -> String {
     }
 }
 
+/// What a key question was answered with.
+#[derive(Debug, PartialEq)]
+pub(crate) enum KeyAnswer {
+    Key(String),
+    /// Enter on an empty line.
+    Empty,
+    /// Esc, Ctrl+C, the end of input, or a `/command`.
+    Cancel,
+}
+
+// Longest answer taken as a key; the longest real tokens (signed JWTs) are
+// a couple of thousand characters.
+const MAX_KEY_LEN: usize = 4096;
+
+/// Why `s` (trimmed, not empty) cannot be an API key, or None when it could
+/// be one: a question, a `/command`, a menu number or a provider name typed
+/// at the key question is refused here instead of being sent as the key.
+pub(crate) fn not_a_key(s: &str) -> Option<&'static str> {
+    if s.starts_with('/') {
+        Some("it is a command")
+    } else if s.chars().any(char::is_whitespace) {
+        Some("it has spaces")
+    } else if s.chars().all(|c| c.is_ascii_digit()) {
+        Some("it is a number, like a menu choice")
+    } else if s.len() > MAX_KEY_LEN {
+        Some("it is far longer than any key")
+    } else if s.chars().any(|c| !c.is_ascii_graphic()) {
+        Some("it has characters keys do not use")
+    } else if PRESETS.iter().any(|p| p.id.eq_ignore_ascii_case(s)) {
+        Some("it is a provider name")
+    } else {
+        None
+    }
+}
+
+/// The key question of setup, /login and /model: masked, and asked again
+/// until the answer could be a key, so nothing else typed there is sent to
+/// the provider. A `/command` closes the question: in a session it runs
+/// next, during setup it stops setup.
+pub(crate) fn read_key(prompt: &str) -> KeyAnswer {
+    loop {
+        let Some(k) = tui::ask_secret(prompt) else {
+            return KeyAnswer::Cancel;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            return KeyAnswer::Empty;
+        }
+        if k.starts_with('/') {
+            leave_for_command(k);
+            return KeyAnswer::Cancel;
+        }
+        match not_a_key(k) {
+            None => return KeyAnswer::Key(k.to_string()),
+            Some(why) => tui::line(&tui::yellow(&format!(
+                "  that does not look like a key ({why}) — not sent. You are still at the key question: paste the key, or Esc to cancel"
+            ))),
+        }
+    }
+}
+
+// A `/command` typed at a key question: the question closes with nothing
+// sent or saved. In a session the command runs next; setup has no commands.
+fn leave_for_command(cmd: &str) {
+    if tui::is_raw() {
+        tui::line(&tui::dim("  key question closed — nothing sent or saved"));
+        tui::queue_message(cmd);
+    } else {
+        tui::line(&tui::dim(&format!(
+            "  {} is a command, not a key — stopped here, nothing sent or saved",
+            tui::sanitize_terminal(cmd)
+        )));
+    }
+}
+
+/// Before asking for a key: None when a key may be sent to `url`, or the
+/// reason it cannot, with what to do instead. A key never travels over
+/// plain http to another machine.
+pub(crate) fn plain_http_key_refusal(url: &str) -> Option<String> {
+    // The same test build_provider_with_key applies when the key is sent.
+    if url.starts_with("https://") || crate::is_loopback_url(url) {
+        return None;
+    }
+    let host = host_of(url);
+    let port = host.rsplit_once(':').map_or("80", |(_, p)| p);
+    Some(format!(
+        "{} is plain http on another machine, so no API key is sent there. Use https://, \
+         or reach it through a loopback tunnel (ssh -L {port}:localhost:{port} <that machine>, \
+         then http://127.0.0.1:{port}/v1), or run the server without a key",
+        tui::sanitize_terminal(&host)
+    ))
+}
+
 /// The key for a custom endpoint that has none saved, asked for that
-/// endpoint alone: Some("") for no key, None for Esc. A key an earlier
-/// version saved for no endpoint in particular is offered first.
-pub(crate) fn ask_custom_key(url: &str) -> Option<String> {
+/// endpoint alone. A key an earlier version saved for no endpoint in
+/// particular is offered first. Over plain http to another machine no key
+/// is asked: it could not be sent.
+pub(crate) fn ask_custom_key(url: &str) -> KeyAnswer {
+    if let Some(why) = plain_http_key_refusal(url) {
+        tui::line(&tui::dim(&format!("  {why}")));
+        return KeyAnswer::Empty;
+    }
     let host = tui::sanitize_terminal(&host_of(url)).into_owned();
     if let Some(old) = config::unbound_custom_key() {
         tui::line(&tui::dim(&format!(
             "  a CUSTOM_API_KEY saved by an earlier version ({}) is not tied to an endpoint",
             config::mask(&old)
         )));
-        let a = tui::ask(&format!("  send it to {host}? [y/N]: "))?;
+        let Some(a) = tui::ask(&format!("  send it to {host}? [y/N]: ")) else {
+            return KeyAnswer::Cancel;
+        };
         if matches!(a.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            return Some(old);
+            return KeyAnswer::Key(old);
         }
     }
-    let k = tui::ask_secret("  API key for this endpoint (Enter for none): ")?;
-    Some(k.trim().to_string())
+    read_key("  API key for this endpoint (Enter for none): ")
 }
 
 // A key typed now (Some) or the stored one (None).
@@ -531,8 +652,7 @@ fn choose_key(pick: &Preset, stored: Option<&str>, url: &str) -> Result<Option<S
         return Ok(None);
     }
     if pick.id == "custom" {
-        let k = ask_custom_key(url).ok_or(Exit::Stop)?;
-        return Ok(Some(k).filter(|k| !k.is_empty()));
+        return custom_key(url);
     }
     tui::line("");
     tui::line(&tui::dim(&format!(
@@ -542,29 +662,27 @@ fn choose_key(pick: &Preset, stored: Option<&str>, url: &str) -> Result<Option<S
     ask_key(pick).map(Some)
 }
 
+// Setup's custom-endpoint key: Some(key), None for no key; Esc stops.
+fn custom_key(url: &str) -> Result<Option<String>, Exit> {
+    match ask_custom_key(url) {
+        KeyAnswer::Key(k) => Ok(Some(k)),
+        KeyAnswer::Empty => Ok(None),
+        KeyAnswer::Cancel => Err(Exit::Stop),
+    }
+}
+
 // Asks until a key is pasted; an empty answer is refused, `b` goes back.
 fn ask_key(pick: &Preset) -> Result<String, Exit> {
     let name = key_name(pick);
     loop {
-        let prompt = if pick.id == "custom" {
-            "  API key for this endpoint (Enter for none): ".to_string()
-        } else {
-            format!("  {name}: ")
-        };
-        let k = tui::ask_secret(&prompt).ok_or(Exit::Stop)?;
-        let k = k.trim();
-        if pick.id == "custom" {
-            return Ok(k.to_string());
+        match read_key(&format!("  {name}: ")) {
+            KeyAnswer::Cancel => return Err(Exit::Stop),
+            KeyAnswer::Key(k) if k.eq_ignore_ascii_case("b") => return Err(Exit::Back),
+            KeyAnswer::Key(k) => return Ok(k),
+            KeyAnswer::Empty => tui::line(&tui::yellow(
+                "  a key is required for this provider — or pick a local one (b)",
+            )),
         }
-        if k.eq_ignore_ascii_case("b") {
-            return Err(Exit::Back);
-        }
-        if !k.is_empty() {
-            return Ok(k.to_string());
-        }
-        tui::line(&tui::yellow(
-            "  a key is required for this provider — or pick a local one (b)",
-        ));
     }
 }
 
@@ -631,12 +749,28 @@ fn choose_permission() -> Result<String, Exit> {
         "    {}  read-only — never modify anything",
         tui::bold("3")
     ));
-    Ok(match ask("  choice [1]: ")?.as_str() {
-        "2" => "auto",
-        "3" => "readonly",
-        _ => "ask",
+    // Numbered as in /permissions.
+    tui::line(&format!(
+        "    {}  accept edits — file edits in this project without asking; commands still ask",
+        tui::bold("4")
+    ));
+    loop {
+        match permission_choice(&ask("  choice [1]: ")?) {
+            Some(p) => return Ok(p.to_string()),
+            None => tui::line(&tui::yellow("  choose 1, 2, 3 or 4 (Enter for 1)")),
+        }
     }
-    .to_string())
+}
+
+// A setup permission answer: a row number or the mode's name.
+fn permission_choice(answer: &str) -> Option<&'static str> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "1" | "ask" => Some("ask"),
+        "2" | "auto" => Some("auto"),
+        "3" | "readonly" | "read-only" => Some("readonly"),
+        "4" | "accept-edits" | "accept edits" => Some("accept-edits"),
+        _ => None,
+    }
 }
 
 /// How a check of a provider failed, so the next step can say what to do.
@@ -742,17 +876,20 @@ pub(crate) fn login(settings: &Settings) -> Option<Provider> {
         tui::sanitize_terminal(model)
     )));
     loop {
-        let Some(key) = tui::ask_secret(&format!("  {name}: ")) else {
-            tui::line(&tui::dim("  /login cancelled — nothing saved"));
-            return None;
+        let key = match read_key(&format!("  {name}: ")) {
+            KeyAnswer::Key(k) => k,
+            KeyAnswer::Empty => {
+                tui::line(&tui::yellow(
+                    "  a key is required — paste it, or Esc to cancel",
+                ));
+                continue;
+            }
+            KeyAnswer::Cancel => {
+                tui::line(&tui::dim("  /login cancelled — nothing saved"));
+                return None;
+            }
         };
-        let key = key.trim();
-        if key.is_empty() {
-            tui::line(&tui::yellow(
-                "  a key is required — paste it, or Esc to cancel",
-            ));
-            continue;
-        }
+        let key = key.as_str();
         match check(settings, Some(key)) {
             Ok(served) => {
                 if preset.id == "custom" {
@@ -854,6 +991,59 @@ fn save_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_what_could_be_a_key_is_sent_as_one() {
+        for typed in [
+            "what does this project do?",
+            "/init",
+            "/model",
+            "5",
+            "12",
+            "anthropic",
+            "OpenAI",
+            "hello, what can you do?",
+            "sk-ant café",
+            &"k".repeat(5000),
+        ] {
+            assert!(not_a_key(typed).is_some(), "{typed}");
+        }
+        for key in [
+            "sk-ant-api03-abc_DEF-123",
+            "sk-proj-Zx9",
+            "gsk_0123456789",
+            "hf_abcdef",
+            "lm-studio-token",
+        ] {
+            assert_eq!(not_a_key(key), None, "{key}");
+        }
+        assert_eq!(not_a_key("hello there"), Some("it has spaces"));
+    }
+
+    #[test]
+    fn setup_offers_every_permission_mode_and_refuses_the_rest() {
+        assert_eq!(permission_choice(""), Some("ask"));
+        assert_eq!(permission_choice("2"), Some("auto"));
+        assert_eq!(permission_choice("3"), Some("readonly"));
+        assert_eq!(permission_choice("4"), Some("accept-edits"));
+        assert_eq!(permission_choice(" Accept-Edits "), Some("accept-edits"));
+        assert_eq!(permission_choice("5"), None);
+        assert_eq!(permission_choice("yolo"), None);
+    }
+
+    #[test]
+    fn no_key_is_asked_for_plain_http_to_another_machine() {
+        let why = plain_http_key_refusal("http://192.168.50.10:1234/v1").unwrap();
+        assert!(
+            why.contains("ssh -L 1234:localhost:1234")
+                && why.contains("http://127.0.0.1:1234/v1")
+                && why.contains("https://"),
+            "{why}"
+        );
+        assert_eq!(plain_http_key_refusal("https://gw.example.com/v1"), None);
+        assert_eq!(plain_http_key_refusal("http://127.0.0.1:8080/v1"), None);
+        assert_eq!(plain_http_key_refusal("http://localhost:1234/v1"), None);
+    }
 
     #[test]
     fn the_host_named_is_the_one_the_request_goes_to() {

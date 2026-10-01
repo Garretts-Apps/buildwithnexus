@@ -1650,7 +1650,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
 
     // Project instructions (AGENTS.md / CLAUDE.md) come before memory and the
     // Agents.md roles: repository conventions frame everything that follows.
-    let instructions = config::load_instructions(cwd);
+    let instructions = config::prompt_instructions(cwd);
     if let Some(text) = config::instructions_prompt(&instructions) {
         trace::record_visible(
             "instructions",
@@ -2010,6 +2010,37 @@ pub fn blocked_without_terminal() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Of `blocked_without_terminal`, the ones --permission-mode auto would not
+/// allow either: sensitive paths, dangerous commands, ask rules.
+static BLOCKED_NEEDS_PERSON: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn blocked_needing_a_person() -> Vec<String> {
+    BLOCKED_NEEDS_PERSON
+        .lock()
+        .map(|b| b.clone())
+        .unwrap_or_default()
+}
+
+thread_local! {
+    // Set around a confirmation that auto mode would have skipped, so a
+    // headless run that blocks it can say auto would allow it.
+    static AUTO_WOULD_ALLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// `confirm_call` for a call that --permission-mode auto lets through.
+fn confirm_call_auto_allows(
+    name: &str,
+    input: &serde_json::Value,
+    label: &str,
+    tool_key: &str,
+    cwd: &Path,
+) -> Option<String> {
+    AUTO_WOULD_ALLOW.with(|a| a.set(true));
+    let r = confirm_call(name, input, label, tool_key, cwd);
+    AUTO_WOULD_ALLOW.with(|a| a.set(false));
+    r
+}
+
 thread_local! {
     // Set while the project's checks are gated: Some(true) once a refusal
     // for want of a terminal happened. Checks verify the work; they change
@@ -2147,6 +2178,9 @@ pub fn reset_turn_outcome() {
     if let Ok(mut b) = BLOCKED_WITHOUT_TERMINAL.lock() {
         b.clear();
     }
+    if let Ok(mut b) = BLOCKED_NEEDS_PERSON.lock() {
+        b.clear();
+    }
 }
 
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
@@ -2161,8 +2195,15 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
         let checks = GATING_CHECKS.with(|g| g.get().is_some());
         if checks {
             GATING_CHECKS.with(|g| g.set(Some(true)));
-        } else if let Ok(mut b) = BLOCKED_WITHOUT_TERMINAL.lock() {
-            b.push(label.to_string());
+        } else {
+            if let Ok(mut b) = BLOCKED_WITHOUT_TERMINAL.lock() {
+                b.push(label.to_string());
+            }
+            if !AUTO_WOULD_ALLOW.with(|a| a.get()) {
+                if let Ok(mut b) = BLOCKED_NEEDS_PERSON.lock() {
+                    b.push(label.to_string());
+                }
+            }
         }
         return Some(format!(
             "blocked (no interactive terminal to confirm: {label})"
@@ -2439,7 +2480,7 @@ pub(crate) fn gate(
         if is_pre_approved(None, &tool_key, cwd) || is_pre_approved(None, "fetch *", cwd) {
             return None;
         }
-        return confirm_call(
+        return confirm_call_auto_allows(
             name,
             input,
             &format!(
@@ -2480,7 +2521,7 @@ pub(crate) fn gate(
                 if let Some(note) = checkpoint::undo_note(&paths) {
                     label = format!("{label} · {note}");
                 }
-                return confirm_call(name, input, &label, &tool_key, cwd);
+                return confirm_call_auto_allows(name, input, &label, &tool_key, cwd);
             }
             // Out-of-cwd reads: just note it instead of hard-blocking.
             // The user asked for full filesystem access.

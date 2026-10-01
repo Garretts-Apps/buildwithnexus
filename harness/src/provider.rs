@@ -216,13 +216,19 @@ pub fn openai_models(base_url: &str) -> Vec<String> {
 
 /// `openai_models`, with None when nothing answered.
 pub fn openai_models_checked(base_url: &str) -> Option<Vec<String>> {
-    let v: Value = agent()
+    openai_models_keyed(base_url, None)
+}
+
+/// `openai_models_checked` for a gateway that lists its models only to a
+/// caller with its key.
+pub fn openai_models_keyed(base_url: &str, key: Option<&str>) -> Option<Vec<String>> {
+    let mut req = agent()
         .get(&format!("{}/models", base_url.trim_end_matches('/')))
-        .timeout(Duration::from_secs(2))
-        .call()
-        .ok()?
-        .into_json()
-        .ok()?;
+        .timeout(Duration::from_secs(2));
+    if let Some(k) = key {
+        req = req.set("Authorization", &format!("Bearer {k}"));
+    }
+    let v: Value = req.call().ok()?.into_json().ok()?;
     Some(
         v["data"]
             .as_array()?
