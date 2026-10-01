@@ -2515,7 +2515,21 @@ fn repl(
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
         }
+        follow_reported_window(&mut provider, &transcript);
         tui::bell();
+    }
+}
+
+// An Ollama started after bwn reports its window on the first request that
+// reaches it, and the requests use it from then on; the footer total and
+// /context follow instead of keeping the startup guess.
+fn follow_reported_window(provider: &mut Provider, transcript: &[provider::Msg]) {
+    if let Some(Some(n)) = provider.ollama_ctx.get() {
+        let n = *n as usize;
+        if n != provider.context_tokens {
+            provider.context_tokens = n;
+            tui::context_meter(context_in_use(transcript, n), n);
+        }
     }
 }
 
@@ -6023,6 +6037,19 @@ fn context_breakdown(msgs: &[provider::Msg], tools: &[tools::ToolDef]) -> Contex
         }
     }
     b
+}
+
+// Tokens the next request would carry, as /context counts them.
+fn context_in_use(transcript: &[provider::Msg], total: usize) -> usize {
+    let measured = if transcript.is_empty() {
+        None
+    } else {
+        usage::last_context_tokens()
+    };
+    measured.unwrap_or_else(|| {
+        let tools = tools::defs_for_context(true, total);
+        context_breakdown(transcript, &tools).total()
+    })
 }
 
 fn handle_context(transcript: &[provider::Msg], total: usize) {
