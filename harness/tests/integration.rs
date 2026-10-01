@@ -3203,6 +3203,24 @@ fn a_failing_gateway_is_retried_three_times_then_named() {
 }
 
 #[test]
+fn a_headless_failure_names_flags_not_slash_commands() {
+    // Nothing listens on the port: the hint is one a CI script can use.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_gateway_config(&home, port);
+    let r = run_env(&home, &cwd, &["run", "say hi"], &[("BWN_MAX_RETRIES", "0")]);
+    assert_eq!(r.code, Some(1), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("--base-url <url>") && !r.stderr.contains("/model"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
 fn a_rejected_key_is_not_retried_and_points_at_login() {
     let (port, posts) = serve_status(401, r#"{"error":{"message":"invalid api key"}}"#);
     let home = tmp("home");
@@ -3218,8 +3236,9 @@ fn a_rejected_key_is_not_retried_and_points_at_login() {
     assert!(start.elapsed().as_secs() < 3, "took {:?}", start.elapsed());
     assert_eq!(posts.load(Ordering::SeqCst), 1);
     assert!(
-        r.stderr
-            .contains("the API key was rejected by the provider — /login to replace it"),
+        r.stderr.contains(
+            "the API key was rejected by the provider — `buildwithnexus login` replaces it"
+        ) && !r.stderr.contains("/login"),
         "{}",
         r.stderr
     );
@@ -4185,7 +4204,8 @@ fn sigterm_and_sigint_end_with_an_interrupted_result_and_a_saved_session() {
     for (sig, code) in [("-TERM", 143), ("-INT", 130)] {
         let home = tmp("home");
         let cwd = tmp("proj");
-        write_config(&home, "ollama", "auto", serve_silent());
+        // Not the ollama preset: a hung /v1 address is probed for Ollama first.
+        write_config(&home, "llamacpp", "auto", serve_silent());
         let child = Command::new(BIN)
             .args(["--json", "run", "wait for the slow model"])
             .current_dir(&cwd)
@@ -4697,6 +4717,42 @@ fn a_skill_runs_headless_with_its_argument_once() {
     assert!(sent.contains("[Skill: deploy]"), "{sent}");
     assert!(sent.contains("Run the release checklist"), "{sent}");
     assert_eq!(sent.matches("staging").count(), 1, "{sent}");
+}
+
+#[test]
+fn a_mistyped_command_is_refused_and_piped_text_fills_a_missing_argument() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("commands")).unwrap();
+    std::fs::write(
+        home.join("commands/deploy.md"),
+        "Deploy to $1 then report on: $ARGUMENTS\n",
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![finish("done"), finish("done")]);
+    write_config(&home, "ollama", "auto", port);
+    // A mistyped name exits 2 before any request.
+    let r = run(&home, &cwd, "/deplyo staging");
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("unknown command /deplyo (did you mean /deploy?)"),
+        "{}",
+        r.stderr
+    );
+    assert!(posts.lock().unwrap().is_empty());
+    // A path is still a task.
+    let r = run(&home, &cwd, "/no/such/dir looks wrong");
+    assert!(r.success, "stderr: {}", r.stderr);
+    // Piped text fills the arguments once.
+    let r = run_stdin(&home, &cwd, &["--json", "run", "/deploy"], "staging\n");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = last_user_text(&posts.lock().unwrap()[1]);
+    assert!(
+        sent.contains("Deploy to staging then report on: staging"),
+        "{sent}"
+    );
+    assert!(!sent.contains("[stdin]"), "{sent}");
 }
 
 #[test]
@@ -5341,6 +5397,10 @@ fn mcp_oauth_login_without_a_browser_waits_for_the_printed_url() {
     let out = seen.join("\n");
     assert!(status.success(), "{out}");
     assert!(out.contains("Could not open a browser"), "{out}");
+    assert!(
+        out.contains("ssh -L") && out.contains("mcp-auth/remote.json"),
+        "{out}"
+    );
     assert!(out.contains("signed in to remote"), "{out}");
     assert!(saved_login(&home)["access_token"]
         .as_str()
@@ -5467,7 +5527,9 @@ fn update_check_reports_current_and_latest_with_its_exit_code() {
     let (code, out) = update_cmd(bin, &home, serve_registry("99.0.0"), &["update"], None);
     assert_eq!(code, Some(10), "{out}");
     assert!(
-        out.contains("cargo install buildwithnexus --locked"),
+        out.contains("cargo install buildwithnexus --locked")
+            && out.contains("npm install -g buildwithnexus@99.0.0")
+            && out.contains("/releases/tag/v99.0.0"),
         "{out}"
     );
 }
@@ -5597,6 +5659,47 @@ fn review_without_blocking_findings_or_without_changes_succeeds() {
     assert_eq!(r.code, Some(0), "stderr: {}", r.stderr);
     assert!(!r.has_event("finding"));
     assert!(last_user_text(&posts.lock().unwrap()[0]).contains("NEW.md"));
+}
+
+#[test]
+fn review_against_a_missing_or_unrelated_base_names_the_ref_and_the_fetch() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    let (port, posts) = serve_recording(vec![]);
+    write_config(&home, "ollama", "auto", port);
+    // A fetch-depth 1 checkout: origin/main was never fetched.
+    let r = run_args(&home, &cwd, &["--json", "review", "--base", "origin/main"]);
+    assert_eq!(r.code, Some(1), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("`origin/main` is not in this checkout")
+            && r.stderr.contains("git fetch origin main")
+            && r.stderr.contains("fetch-depth: 0"),
+        "{}",
+        r.stderr
+    );
+    // A base with no history in common with HEAD (as a shallow clone has).
+    git(&cwd, &["checkout", "-q", "--orphan", "other"]);
+    git(
+        &cwd,
+        &[
+            "-c",
+            "user.name=dev",
+            "-c",
+            "user.email=d@e",
+            "commit",
+            "-qm",
+            "unrelated",
+        ],
+    );
+    let r = run_args(&home, &cwd, &["--json", "review", "--base", "main"]);
+    assert_eq!(r.code, Some(1), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains("no history in common with `main`")
+            && r.stderr.contains("git fetch --unshallow"),
+        "{}",
+        r.stderr
+    );
+    assert!(posts.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -6864,6 +6967,9 @@ fn answer_protocol(
                 .cloned()
                 .unwrap_or_else(|| finish("auto"))
         }
+        "GET" if path.ends_with("/api/tags") => {
+            json!({"models": [{"name": "gemma3:4b"}]}).to_string()
+        }
         _ => r#"{"object":"list","data":[]}"#.to_string(),
     };
     let resp = format!(
@@ -7110,6 +7216,48 @@ fn read_file_reads_a_pdf_through_pdftotext_or_names_it() {
         let sent = posts.lock().unwrap()[1].to_string();
         assert!(sent.contains(expect), "{sent}");
     }
+}
+
+// Ollama addressed as `…/v1` still gets num_ctx (its OpenAI-compatible
+// endpoint takes none), and doctor says what window is sent.
+#[test]
+fn ollama_at_a_v1_address_is_sent_num_ctx() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let reply = json!({
+        "model": "gemma3:4b", "done": true, "done_reason": "stop",
+        "message": {"role": "assistant", "content": "hi"}
+    })
+    .to_string();
+    let (port, posts) = serve_protocols(vec![reply], None);
+    let cfg = json!({
+        "provider": "ollama", "model": "gemma3:4b", "permission": "readonly",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run_env(&home, &cwd, &["run", "say hi"], &[]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let sent = posts.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0]["options"]["num_ctx"].as_u64().unwrap() >= 8_192,
+        "{}",
+        sent[0]
+    );
+}
+
+// The same server named as a custom endpoint is the case doctor flags.
+#[test]
+fn doctor_flags_ollama_behind_a_v1_endpoint() {
+    let home = tmp("home");
+    let port = serve_ollama_tags(&["gemma3:4b"]);
+    let cfg = json!({
+        "provider": "custom", "model": "gemma3:4b", "permission": "readonly",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let (_, out) = doctor(&home, &["doctor"], &[("BWN_MAX_RETRIES", "0")]);
+    assert!(out.contains("takes no num_ctx"), "{out}");
 }
 
 // Serves one HTML page on loopback until the test ends, counting requests.

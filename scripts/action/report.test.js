@@ -91,6 +91,25 @@ test('a run that ended before its result event is named from the exit code', () 
   }
 });
 
+test('a failed run says why in its annotation and comment', () => {
+  const dir = tmp();
+  const stderr = path.join(dir, 'stderr.txt');
+  fs.writeFileSync(stderr, 'warning: something earlier\n'
+    + 'nothing is answering at http://127.0.0.1:29099 — is the model server running?\n'
+    + '  Ollama: `ollama serve`\n');
+  const s = summarize([result('failed', 1)], 1, { BWN_STDERR: stderr });
+  assert.match(s.printed,
+    /^::error title=bwn%3A failed \(exit 1\)::the run failed: nothing is answering at http:\/\/127\.0\.0\.1:29099 — is the model server running\?$/m);
+  assert.match(s.comment, /^> nothing is answering at http:\/\/127\.0\.0\.1:29099/m);
+  // An error event wins over stderr; a missing stderr file is no reason.
+  const e = summarize([{ type: 'error', message: '`origin/main` is not in this checkout' }], 1,
+    { BWN_STDERR: path.join(dir, 'missing.txt') });
+  assert.match(e.printed, /::the run failed: `origin\/main` is not in this checkout$/m);
+  // A run that passed carries no reason.
+  const ok = summarize([result('success', 0)], 0, { BWN_STDERR: stderr });
+  assert.match(ok.printed, /::done$/m);
+});
+
 test('review findings become annotations on their lines', () => {
   const s = summarize([
     { type: 'finding', severity: 'blocking', path: 'src/a,b.rs', line: 7, message: 'drops 100% of\nwrites' },

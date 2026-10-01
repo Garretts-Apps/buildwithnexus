@@ -376,6 +376,57 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// `host` or `host:port` spelled the one way a connection reads it, so a
+/// `network` rule or a saved approval cannot be stepped around by another
+/// spelling: lowercased, a trailing dot dropped, an IPv4 address in any
+/// form the URL parser takes (`2130706433`, `0x7f.1`, `0177.0.0.1`) written
+/// as dotted decimal, and an IPv4-mapped or -compatible IPv6 address
+/// (`[::ffff:7f00:1]`) written as the IPv4 address it reaches. Other IPv6
+/// addresses are bracketed. Wildcard patterns are only lowercased.
+pub(crate) fn canonical_authority(s: &str) -> String {
+    let s = s.trim().to_ascii_lowercase();
+    let (host, port) = match s.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((h, rest)) => (h, rest.strip_prefix(':')),
+        // One colon is a port; more is a bare IPv6 address.
+        None if s.matches(':').count() == 1 => {
+            let (h, p) = s.split_once(':').unwrap_or((&s, ""));
+            (h, Some(p))
+        }
+        None => (s.as_str(), None),
+    };
+    let host = canonical_host(host);
+    match port.filter(|p| !p.is_empty()) {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    }
+}
+
+fn canonical_host(host: &str) -> String {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.contains(['*', '?']) {
+        return host.to_string();
+    }
+    let ip = match host.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(_) => match url::Host::parse(host) {
+            Ok(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
+            _ => None,
+        },
+    };
+    match ip.map(|ip| match canonical(ip) {
+        // ::a.b.c.d (deprecated, but some stacks still route it); :: and ::1
+        // keep their own meaning.
+        IpAddr::V6(v6) if v6.segments()[..6] == [0; 6] && u128::from(v6) > 1 => {
+            IpAddr::V4(std::net::Ipv4Addr::from(u128::from(v6) as u32))
+        }
+        ip => ip,
+    }) {
+        Some(IpAddr::V4(v4)) => v4.to_string(),
+        Some(IpAddr::V6(v6)) => format!("[{v6}]"),
+        None => host.to_string(),
+    }
+}
+
 fn full_bits(ip: IpAddr) -> u8 {
     if canonical(ip).is_ipv4() {
         32
@@ -513,6 +564,32 @@ fn client_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_authority_spells_an_address_one_way() {
+        for (input, want) in [
+            ("127.0.0.1", "127.0.0.1"),
+            ("2130706433", "127.0.0.1"),
+            ("0x7f.0.0.1:80", "127.0.0.1:80"),
+            ("0177.0.0.1", "127.0.0.1"),
+            ("127.1", "127.0.0.1"),
+            ("127.0.0.1.", "127.0.0.1"),
+            ("[::ffff:7f00:1]:29123", "127.0.0.1:29123"),
+            ("::ffff:127.0.0.1", "127.0.0.1"),
+            ("[::127.0.0.1]", "127.0.0.1"),
+            ("::1", "[::1]"),
+            ("[0:0::1]:3000", "[::1]:3000"),
+            ("::", "[::]"),
+            ("[FE80::1]", "[fe80::1]"),
+            ("Example.COM.", "example.com"),
+            ("example.com:8443", "example.com:8443"),
+            ("*.Example.com", "*.example.com"),
+            ("127.0.0.*", "127.0.0.*"),
+        ] {
+            assert_eq!(canonical_authority(input), want, "{input}");
+        }
+    }
+
     use std::io::{BufRead, BufReader, Write};
     use std::sync::Mutex;
 

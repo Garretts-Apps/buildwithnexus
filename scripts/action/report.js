@@ -51,8 +51,17 @@ function readEvents(file) {
   return events;
 }
 
-// What the run came to, from its events and exit code.
-function summarize(events, exitCode, allowed) {
+// Why a failed run failed: its last error event, or the last unindented
+// line bwn wrote to stderr (indented lines are hints under it).
+function failureReason(events, stderr) {
+  const err = [...events].reverse().find((e) => e.type === 'error' && String(e.message || '').trim());
+  if (err) return String(err.message).trim();
+  const lines = String(stderr || '').split('\n').filter((l) => l.trim() && !/^\s/.test(l));
+  return lines.length ? lines[lines.length - 1].trim().slice(0, 500) : '';
+}
+
+// What the run came to, from its events, exit code and stderr.
+function summarize(events, exitCode, allowed, stderr = '') {
   const result = [...events].reverse().find((e) => e.type === 'result') || null;
   const outcome = (result && result.outcome) || BY_EXIT_CODE[exitCode] || 'failed';
   const finish = [...events].reverse().find((e) => e.type === 'finish');
@@ -72,6 +81,7 @@ function summarize(events, exitCode, allowed) {
     denials: (result && Array.isArray(result.denials)) ? result.denials : [],
     summary: finish ? String(finish.summary || '') : reply ? String(reply.text) : '',
     findings,
+    reason: ok ? '' : failureReason(events, stderr),
   };
 }
 
@@ -104,6 +114,8 @@ function annotations(r) {
   let detail = r.label;
   if (r.denials.length) {
     detail += ': ' + r.denials.map((d) => `${d.summary} (${d.reason})`).join('; ');
+  } else if (r.reason) {
+    detail += ': ' + r.reason;
   }
   const level = r.outcome === 'success' ? 'notice' : r.passed ? 'warning' : 'error';
   out.push(annotation(level, detail, { title: `bwn: ${r.outcome} (exit ${r.exitCode})` }));
@@ -118,6 +130,7 @@ function quietMentions(s) {
 function markdown(r, { command, artifact, tag }) {
   const lines = [MARKER(tag), `### buildwithnexus ${command}: ${r.label}`, ''];
   if (r.summary.trim()) lines.push(quietMentions(r.summary.trim()), '');
+  if (r.reason && !r.denials.length) lines.push('> ' + quietMentions(r.reason), '');
   if (r.findings.length) {
     lines.push('| severity | where | finding |', '|---|---|---|');
     for (const f of r.findings) {
@@ -153,7 +166,13 @@ const stdout = (line) => process.stdout.write(line + '\n');
 function runSummarize(env, print = stdout) {
   const exitCode = Number.parseInt(env.BWN_EXIT_CODE || '1', 10);
   const allowed = (env.BWN_ALLOW_OUTCOMES || '').split(/[\s,]+/).filter(Boolean);
-  const r = summarize(readEvents(env.BWN_EVENTS || ''), exitCode, allowed);
+  let stderr = '';
+  try {
+    stderr = env.BWN_STDERR ? fs.readFileSync(env.BWN_STDERR, 'utf8') : '';
+  } catch {
+    // No stderr file: the reason comes from the events alone.
+  }
+  const r = summarize(readEvents(env.BWN_EVENTS || ''), exitCode, allowed, stderr);
   for (const a of annotations(r)) print(a);
   const body = markdown(r, {
     command: env.BWN_COMMAND || 'run', artifact: env.BWN_ARTIFACT || '', tag: env.BWN_COMMENT_TAG || 'bwn',

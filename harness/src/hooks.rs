@@ -405,17 +405,61 @@ fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut V
     }
 }
 
-// An `http` hook: its `url` (http or https) and any string `headers`.
+// `$NAME` and `${NAME}` in a header value, from the environment, for the
+// names the hook lists in `allowed_env_vars` only: a settings file in a
+// repository must not read the rest of the environment out to its URL.
+// A listed variable that is not set expands to nothing.
+fn expand_header_env(value: &str, allowed: &[String]) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let (name, used) = match after.strip_prefix('{') {
+            Some(inner) => match inner.find('}') {
+                Some(end) => (&inner[..end], end + 2),
+                None => ("", 0),
+            },
+            None => {
+                let n = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                (&after[..n], n)
+            }
+        };
+        if !name.is_empty() && allowed.iter().any(|a| a == name) {
+            out.push_str(&std::env::var(name).unwrap_or_default());
+            rest = &after[used..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// An `http` hook: its `url` (http or https) and any string `headers`, whose
+// values may name variables listed in `allowed_env_vars`.
 fn http_hook(h: &Value) -> Option<HookCmd> {
     let url = h["url"].as_str().map(str::trim)?;
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return None;
     }
+    let allowed: Vec<String> = ["allowed_env_vars", "allowedEnvVars"]
+        .iter()
+        .filter_map(|k| h[*k].as_array())
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
     let headers = h["headers"]
         .as_object()
         .into_iter()
         .flatten()
-        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+        .filter_map(|(k, v)| {
+            v.as_str()
+                .map(|v| (k.clone(), expand_header_env(v, &allowed)))
+        })
         .collect();
     Some(HookCmd::Http {
         url: url.to_string(),
@@ -425,7 +469,7 @@ fn http_hook(h: &Value) -> Option<HookCmd> {
 
 // The known name a typo was most likely meant to be: same letters in another
 // case, or at most two edits away.
-fn did_you_mean<'a>(word: &str, known: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn did_you_mean<'a>(word: &str, known: &[&'a str]) -> Option<&'a str> {
     if let Some(k) = known.iter().find(|k| k.eq_ignore_ascii_case(word)) {
         return Some(k);
     }
@@ -2067,8 +2111,15 @@ fn run_http(
             code: if ok { 0 } else { 1 },
             stderr: if ok {
                 String::new()
+            } else if (300..400).contains(&status) {
+                format!(
+                    "HTTP {status} (redirects are not followed; point the hook at the final URL)"
+                )
             } else {
-                format!("HTTP {status}: {}", trace::preview(body.trim(), 300))
+                match trace::preview(body.trim(), 300) {
+                    b if b.is_empty() => format!("HTTP {status}"),
+                    b => format!("HTTP {status}: {b}"),
+                }
             },
             stdout: if ok { body } else { String::new() },
             failure: None,
@@ -2292,11 +2343,18 @@ fn problem_message(event: &str, source: Source, cmd: &HookCmd, run: &HookRun) ->
     if run.code == 0 {
         return None;
     }
-    Some(format!(
-        "{event} hook `{label}` exited {}{}",
-        run.code,
-        stderr_detail(&run.stderr)
-    ))
+    Some(format!("{event} hook `{label}` {}", outcome(cmd, run)))
+}
+
+// What a failed hook did, in the terms of its kind: a process exited with a
+// code; an http hook's server answered with a status.
+fn outcome(cmd: &HookCmd, run: &HookRun) -> String {
+    match cmd {
+        HookCmd::Http { .. } if run.stderr.starts_with("HTTP ") => {
+            format!("answered {}", run.stderr.trim())
+        }
+        _ => format!("exited {}{}", run.code, stderr_detail(&run.stderr)),
+    }
 }
 
 // The end of a failed hook's stderr, where a traceback names the error
@@ -2563,10 +2621,9 @@ fn pre_tool_use_with(tool: &str, input: &Value, tool_input: &Value, cwd: &Path) 
         // that blocks the call, otherwise it is a loud warning.
         if run.code != 0 && s.deny_on_error {
             return PreDecision::Deny(format!(
-                "PreToolUse hook `{}` exited {}{}, so this {tool} call was blocked (on_error: deny). {}",
+                "PreToolUse hook `{}` {}, so this {tool} call was blocked (on_error: deny). {}",
                 cmd_label(cmd),
-                run.code,
-                stderr_detail(&run.stderr),
+                outcome(cmd, &run),
                 fix_hint(source, cmd, None)
             ));
         }
@@ -3783,6 +3840,38 @@ mod tests {
     }
 
     #[test]
+    fn http_hook_headers_expand_only_the_variables_the_hook_lists() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("BWN_TEST_HOOK_TOKEN", "s3cret");
+        std::env::set_var("BWN_TEST_HOOK_OTHER", "leak");
+        let hook = json!({"type": "http", "url": "https://h.example/n",
+            "allowed_env_vars": ["BWN_TEST_HOOK_TOKEN", "BWN_TEST_HOOK_UNSET"],
+            "headers": {"Authorization": "Bearer $BWN_TEST_HOOK_TOKEN",
+                        "X-Braced": "${BWN_TEST_HOOK_TOKEN}!", "X-Other": "$BWN_TEST_HOOK_OTHER",
+                        "X-Unset": "a$BWN_TEST_HOOK_UNSET.b", "X-Price": "$5"}});
+        let Some(HookCmd::Http { headers, .. }) = http_hook(&hook) else {
+            panic!("not an http hook")
+        };
+        let get = |k: &str| headers.iter().find(|(n, _)| n == k).unwrap().1.clone();
+        assert_eq!(get("Authorization"), "Bearer s3cret");
+        assert_eq!(get("X-Braced"), "s3cret!");
+        assert_eq!(get("X-Other"), "$BWN_TEST_HOOK_OTHER");
+        assert_eq!(get("X-Unset"), "a.b");
+        assert_eq!(get("X-Price"), "$5");
+        // Without the list nothing expands.
+        let bare = json!({"type": "http", "url": "https://h.example/n",
+            "headers": {"Authorization": "Bearer $BWN_TEST_HOOK_TOKEN"}});
+        let Some(HookCmd::Http { headers, .. }) = http_hook(&bare) else {
+            panic!("not an http hook")
+        };
+        assert_eq!(headers[0].1, "Bearer $BWN_TEST_HOOK_TOKEN");
+        std::env::remove_var("BWN_TEST_HOOK_TOKEN");
+        std::env::remove_var("BWN_TEST_HOOK_OTHER");
+    }
+
+    #[test]
     fn http_hooks_post_the_payload_and_read_the_answer() {
         let dir = hook_test_dir("http");
         let (port, got) = http_once("200 OK", r#"{"decision":"block","reason":"from the web"}"#);
@@ -3808,8 +3897,19 @@ mod tests {
         assert_eq!(
             problem_message("Stop", Source::Home, &cmd, &run).as_deref(),
             Some(&*format!(
-                "Stop hook `POST http://127.0.0.1:{port}/` exited 1: HTTP 500: oops"
+                "Stop hook `POST http://127.0.0.1:{port}/` answered HTTP 500: oops"
             ))
+        );
+        let (port, _got) = http_once("302 Found", "");
+        let cmd = HookCmd::Http {
+            url: format!("http://127.0.0.1:{port}/"),
+            headers: Vec::new(),
+        };
+        let run = run_hook_cmd(&cmd, &json!({}), &dir, Duration::from_secs(5));
+        let m = problem_message("Stop", Source::Home, &cmd, &run).unwrap();
+        assert!(
+            m.contains("answered HTTP 302 (redirects are not followed") && !m.contains("exited"),
+            "{m}"
         );
         // Nothing listening: the hook could not run, so a guard blocks.
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

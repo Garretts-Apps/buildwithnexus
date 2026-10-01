@@ -272,6 +272,17 @@ fn human_secs(s: u64) -> String {
 
 static IN_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// What to do when no browser could be opened here. The sign-in comes back to
+/// this machine's loopback port, so a browser elsewhere needs that port
+/// forwarded, or the saved login copied over from a machine that has one.
+fn no_browser_hint(server: &str, port: u16) -> String {
+    format!(
+        "The sign-in returns to http://127.0.0.1:{port} on this machine: open the URL above \
+         in a browser that can reach it (over SSH: ssh -L {port}:127.0.0.1:{port} <host>), or sign in \
+         on a machine with a browser and copy its mcp-auth/{server}.json into this one's."
+    )
+}
+
 /// The interactive UI is running: login hints name `/mcp login`, which
 /// reconnects the session, rather than `bwn mcp login`.
 pub fn set_in_session() {
@@ -1287,7 +1298,8 @@ pub fn login(
                 };
                 if let Some(p) = problem {
                     say(&format!(
-                        "Could not open a browser ({p}); open the URL above to continue."
+                        "Could not open a browser ({p}). {}",
+                        no_browser_hint(server, port)
                     ));
                 }
                 say(&format!(
@@ -1395,6 +1407,14 @@ fn token_request_status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_browser_says_where_the_sign_in_returns_and_the_other_ways() {
+        let m = no_browser_hint("remote", 4711);
+        assert!(m.contains("http://127.0.0.1:4711"), "{m}");
+        assert!(m.contains("ssh -L 4711:127.0.0.1:4711"), "{m}");
+        assert!(m.contains("mcp-auth/remote.json"), "{m}");
+    }
+
     use super::*;
 
     fn url(s: &str) -> Url {

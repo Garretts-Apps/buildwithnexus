@@ -654,7 +654,10 @@ entries are host patterns (`example.com`, `*.example.com`) for the network
 tools and `http` hooks. Rules and saved approvals see the host a URL
 reaches: percent-escapes decoded, a trailing dot dropped and a default port
 written out (`:443` on https) left off, so `https://%6Cite.example.:443/` is
-`lite.example`. A refusal names the rule and whether it came from user or project
+`lite.example`, and an IP address in any spelling (`2130706433`, `0x7f.1`,
+`[::ffff:7f00:1]`) is the dotted address it reaches, `127.0.0.1`. Names are
+not resolved: to refuse this machine, list `localhost` as well as
+`127.0.0.1` and `::1`. A refusal names the rule and whether it came from user or project
 settings, and a headless run refused by one exits 3.
 
 Rules add up across `~/.buildwithnexus/settings.json`, `settings.local.json`
@@ -842,8 +845,12 @@ file; the interpreter follows the extension), or `http`:
 POSTs the payload as JSON through bwn's HTTP client (proxy and certificate
 settings apply) within the hook's `timeout`, following no redirects. The
 response body counts as the hook's output, and a status outside 2xx as a
-failed hook. A host that `network.deny` names is refused. The trust prompt
-shows a project's http hook URLs (header names only).
+failed hook (reported as `answered HTTP <status>`). A host that `network.deny`
+names is refused. The trust prompt shows a project's http hook URLs (header
+names only). A header value can take a secret from the environment:
+`"Authorization": "Bearer $HOOK_TOKEN"` with `"allowed_env_vars": ["HOOK_TOKEN"]`
+fills in only the variables that list names, so a repository's settings cannot
+read the rest of your environment.
 
 ```json
 {

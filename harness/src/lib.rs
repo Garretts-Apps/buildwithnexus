@@ -449,6 +449,10 @@ pub fn run() {
                     eprintln!("buildwithnexus: {msg}");
                     std::process::exit(2);
                 }
+                if let Some(msg) = unknown_slash_command(&input.argv) {
+                    eprintln!("buildwithnexus: {msg}");
+                    std::process::exit(2);
+                }
                 if let Some((cmd, args)) = find_slash_command(&input.argv) {
                     if let Some(script) = &cmd.script {
                         let out = run_script_command(script, &args, perm, &cwd);
@@ -1000,11 +1004,15 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
     // surface (`…/v1`) keeps the OpenAI protocol — configs saved before the
     // native Ollama path existed (and users deliberately targeting a /v1
     // proxy) must not switch wire formats. Native is for root URLs only.
+    // The exception is a `…/v1` address that Ollama itself answers: its
+    // OpenAI-compat endpoint cannot take num_ctx, so the prompt is silently
+    // cut to the server's default window. That one is sent natively.
     let mut protocol = preset.protocol;
     if protocol == config::Protocol::OllamaNative
         && s.base_url
             .as_deref()
             .is_some_and(|u| u.trim_end_matches('/').ends_with("/v1"))
+        && provider::ollama_models_checked(&base_url).is_none()
     {
         protocol = config::Protocol::OpenAi;
     }
@@ -1143,6 +1151,17 @@ impl HeadlessInput {
         }
         // `/deploy staging` runs the deploy command or skill, as in a session.
         if let Some((cmd, args)) = find_slash_command(&self.argv) {
+            // A command that takes an argument and got none is filled from
+            // the piped text; with neither, it is run empty and says so.
+            if args.is_empty() && config::command_takes_arguments(&cmd) {
+                match stdin.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(piped) => return (config::command_prompt(&cmd, piped), Vec::new()),
+                    None => report::notice(&format!(
+                        "  /{} takes an argument and none was given — it runs with the gap empty",
+                        tui::sanitize_terminal(&cmd.name)
+                    )),
+                }
+            }
             let prompt = config::command_prompt(&cmd, &args);
             return match stdin {
                 Some(s) => (format!("{prompt}\n\n[stdin]\n{s}"), Vec::new()),
@@ -1683,6 +1702,7 @@ fn login_cli(opts: &CliOptions) {
 fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // MCP login hints say /mcp login here, not `bwn mcp login`.
     mcp_auth::set_in_session();
+    provider::set_in_session();
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
     // Settings that name no provider (a team repo's hooks-only file, or
@@ -3651,6 +3671,26 @@ fn unloaded_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
     ))
 }
 
+/// A `/word` task that names no command or skill, as the session says it:
+/// a path (`/etc/hosts is wrong`) is a task, anything else is a mistyped
+/// command and no request is made for it.
+fn unknown_slash_command(text: &str) -> Option<String> {
+    let t = text.trim();
+    let name = t.strip_prefix('/')?.split_whitespace().next()?;
+    if starts_with_path(t) || find_custom_command(name).is_some() {
+        return None;
+    }
+    let commands = config::load_custom_commands();
+    let known: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+    let name = tui::sanitize_terminal(name);
+    Some(match hooks::did_you_mean(&name, &known) {
+        Some(near) => format!("unknown command /{name} (did you mean /{near}?)"),
+        None => format!(
+            "unknown command /{name} — a headless run takes your own commands and skills, not the session's built-in ones"
+        ),
+    })
+}
+
 /// `/name args` naming a command or skill: that command and its arguments.
 /// A task that merely starts with a path (`/usr/bin/foo fails`) is not one.
 fn find_slash_command(text: &str) -> Option<(config::CustomCommand, String)> {
@@ -4403,6 +4443,16 @@ fn probe_swap(
             "    keeping the current model ({current_model})."
         )))
     };
+    // `/model nonsense-provider some-model` is one name with a space in it.
+    if s.model.split_whitespace().nth(1).is_some() {
+        tui::line(&tui::red(&format!(
+            "  ✗ '{}' is not a provider or a model name — /model <name>, or /model <provider> <name> with one of {}",
+            tui::sanitize_terminal(&s.model),
+            config::PRESETS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
+        )));
+        keeping();
+        return None;
+    }
     loop {
         let mut p = match build_provider_with_key(s, new_key.as_deref()) {
             Ok(p) => p,
@@ -4429,7 +4479,12 @@ fn probe_swap(
                 p.model = new_model;
                 return Some(p);
             }
-            Ok(None) => return Some(p),
+            Ok(None) => {
+                if let Some(note) = provider::unlisted_note(&p.model, &provider::served_names(&p)) {
+                    tui::line(&tui::yellow(&format!("  ⚠ {note}")));
+                }
+                return Some(p);
+            }
             Err(e) => e,
         };
         let fail = onboarding::Fail::from_error(&e);
@@ -4471,6 +4526,22 @@ fn probe_swap(
                 }
                 continue;
             }
+        }
+        // One line for a model the server does not know: it names what the
+        // server serves, not the raw status and a second hint.
+        if fail == onboarding::Fail::ModelMissing {
+            let names = provider::served_names(&p);
+            tui::line(&tui::red(&format!(
+                "  ✗ the server does not know model {}{}",
+                tui::sanitize_terminal(&s.model),
+                if names.is_empty() {
+                    " — check the name".to_string()
+                } else {
+                    format!(" — it serves: {}", provider::served_summary(&names))
+                }
+            )));
+            keeping();
+            return None;
         }
         tui::line(&tui::red(&format!(
             "  ✗ validation failed: {}",
@@ -5045,6 +5116,9 @@ impl ReviewRequest {
 
 // The diff text for `req`, each part headed; empty when nothing changed.
 fn review_diff(req: &ReviewRequest, cwd: &std::path::Path) -> Result<String, String> {
+    if let Some(base) = &req.base {
+        check_review_base(base, cwd)?;
+    }
     let mut out = String::new();
     for (what, args) in req.diffs() {
         let mut cmd = vec!["--no-pager", "diff", "--no-color", "--no-ext-diff"];
@@ -5067,6 +5141,42 @@ fn review_diff(req: &ReviewRequest, cwd: &std::path::Path) -> Result<String, Str
         out.push_str("\n…(diff cut at 200 KiB — read the files for the rest)\n");
     }
     Ok(out)
+}
+
+// `base...HEAD` needs the base and a commit both sides share. A CI
+// checkout (actions/checkout's default fetch-depth 1) has neither, and
+// git's own error is a usage line naming nothing.
+fn check_review_base(base: &str, cwd: &std::path::Path) -> Result<(), String> {
+    const CI: &str = "in GitHub Actions, give actions/checkout `fetch-depth: 0`";
+    if git_in(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .is_err()
+    {
+        let remotes = git_in(cwd, &["remote"]).unwrap_or_default();
+        let fetch = match base.split_once('/') {
+            Some((remote, branch)) if remotes.lines().any(|r| r == remote) => {
+                format!("git fetch {remote} {branch}")
+            }
+            Some(("origin", branch)) => format!("git fetch origin {branch}"),
+            _ => format!("git fetch origin {base}"),
+        };
+        return Err(format!(
+            "`{base}` is not in this checkout — fetch it (`{fetch}`), or {CI}"
+        ));
+    }
+    if git_in(cwd, &["merge-base", base, "HEAD"]).is_err() {
+        return Err(format!(
+            "HEAD has no history in common with `{base}` here — in a shallow clone, `git fetch --unshallow`; {CI}"
+        ));
+    }
+    Ok(())
 }
 
 // Files git neither tracks nor ignores, each as a new-file diff. Key and
@@ -8534,6 +8644,31 @@ fn provider_check(p: &Provider, id: &str) -> DoctorCheck {
     }
 }
 
+// What an Ollama setup sends as its context window. Ollama's OpenAI-compatible
+// `/v1` endpoint takes no num_ctx, so a prompt past the server's default
+// window is cut without a word; only the native API carries it.
+fn ollama_window_check(p: &Provider) -> Option<DoctorCheck> {
+    match p.protocol {
+        config::Protocol::OllamaNative => Some(DoctorCheck::note(
+            "context",
+            format!("{} tokens, sent as num_ctx", p.context_tokens),
+        )),
+        config::Protocol::OpenAi
+            if p.base_url.trim_end_matches('/').ends_with("/v1")
+                && provider::ollama_models_checked(&p.base_url).is_some() =>
+        {
+            Some(DoctorCheck::from_glyph(
+                "context",
+                "⚠",
+                "this is Ollama addressed through its /v1 endpoint, which takes no num_ctx: \
+                 prompts are cut at the server's default window and the footer's window is a guess. \
+                 Use provider ollama (`buildwithnexus init`), or set context_tokens",
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Every doctor check, in order. `live` is the session's provider (/doctor);
 /// otherwise the provider is built as a headless run would build it.
 fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck> {
@@ -8637,9 +8772,15 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
 
     if let Some(s) = &settings {
         match live {
-            Some(p) => out.push(provider_check(p, &s.provider)),
+            Some(p) => {
+                out.push(provider_check(p, &s.provider));
+                out.extend(ollama_window_check(p));
+            }
             None => match build_provider(s) {
-                Ok(p) => out.push(provider_check(&p, &s.provider)),
+                Ok(p) => {
+                    out.push(provider_check(&p, &s.provider));
+                    out.extend(ollama_window_check(&p));
+                }
                 Err(e) => out.push(DoctorCheck::fail("provider", e)),
             },
         }

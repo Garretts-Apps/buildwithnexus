@@ -1729,11 +1729,10 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
 fn url_authority(url: &str) -> Option<String> {
     if let Ok(u) = url::Url::parse(url) {
         if let Some(host) = u.host_str().filter(|h| !h.is_empty()) {
-            let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-            return Some(match u.port() {
+            return Some(crate::net::canonical_authority(&match u.port() {
                 Some(p) => format!("{host}:{p}"),
-                None => host,
-            });
+                None => host.to_string(),
+            }));
         }
     }
     let rest = url.split_once("://")?.1;
@@ -5955,6 +5954,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             cwd.display()
         ));
     }
+    let _fetch_policy = network_host(name, input).map(|_| FetchPolicy::set(cwd));
     match name {
         "read" | "read_file" => {
             let p_str = path_arg(input).unwrap_or("").trim();
@@ -7312,6 +7312,16 @@ const METADATA_HOSTS: &[&str] = &[
 ];
 
 fn url_host(url: &str) -> Option<String> {
+    // The host the request reaches, as the URL parser reads it: `2852039166`,
+    // `0xa9.254.169.254`, `%31%36%39.254.169.254` and a backslash before an
+    // `@` all name an address that a hand-cut authority would miss.
+    if let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().filter(|h| !h.is_empty()).map(String::from))
+    {
+        let host = crate::net::canonical_authority(&host);
+        return Some(host.trim_matches(['[', ']']).to_string());
+    }
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next()?;
     let hostport = authority.rsplit('@').next()?;
@@ -7372,6 +7382,37 @@ impl std::fmt::Display for WebError {
 
 const MAX_REDIRECTS: usize = 5;
 
+thread_local! {
+    // The folder whose network.deny rules the running fetch tool answers to,
+    // so a redirect cannot lead it somewhere a rule refuses.
+    static FETCH_CWD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct FetchPolicy;
+
+impl FetchPolicy {
+    fn set(cwd: &Path) -> FetchPolicy {
+        FETCH_CWD.with_borrow_mut(|c| *c = Some(cwd.to_path_buf()));
+        FetchPolicy
+    }
+}
+
+impl Drop for FetchPolicy {
+    fn drop(&mut self) {
+        FETCH_CWD.with_borrow_mut(|c| *c = None);
+    }
+}
+
+// network.deny for a redirect's target: the call itself was checked before
+// it ran, but where the server sends it on was not.
+fn redirect_denied(to: &url::Url) -> Option<String> {
+    let cwd = FETCH_CWD.with_borrow(|c| c.clone())?;
+    let host = url_authority(to.as_str())?;
+    let why = crate::agent::network_denied(&cwd, &host)?;
+    Some(format!("refusing to follow the redirect to {to}: {why}"))
+}
+
 fn web_get(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
     web_get_with(web_client(), url, user_agent)
 }
@@ -7396,7 +7437,12 @@ fn web_get_with(
             .flatten()
             .and_then(|to| url::Url::parse(&url).ok()?.join(to).ok());
         match next {
-            Some(next) => url = next.to_string(),
+            Some(next) => {
+                if let Some(why) = redirect_denied(&next) {
+                    return Err(WebError::Blocked(why));
+                }
+                url = next.to_string();
+            }
             None => return Ok(resp),
         }
     }
@@ -9999,6 +10045,63 @@ print("hello " + data.get("name", "world"))
         );
     }
 
+    // network.deny is checked for the call before it runs; a redirect to a
+    // host it names, in whatever spelling, is refused too.
+    #[test]
+    fn a_redirect_to_a_denied_host_is_not_followed() {
+        use std::io::{Read, Write};
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let serve = |reply: String| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = hits.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            });
+            (port, hits)
+        };
+        let (target, target_hits) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret".into());
+        let (front, _) = serve(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://2130706433:{target}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let home = tempdir();
+        let d = tempdir();
+        std::env::set_var("NEXUS_HOME", &home);
+        let url = json!({"url": format!("http://127.0.0.1:{front}/")});
+        // Without a rule the redirect is followed.
+        let r = run("fetch_url", &url, &d);
+        assert!(!r.is_error && r.content == "secret", "{}", r.content);
+        fs::write(
+            home.join("settings.json"),
+            json!({"network": {"deny": [format!("127.0.0.1:{target}")]}}).to_string(),
+        )
+        .unwrap();
+        let before = target_hits.load(std::sync::atomic::Ordering::SeqCst);
+        let r = run("fetch_url", &url, &d);
+        std::env::remove_var("NEXUS_HOME");
+        assert!(
+            r.is_error && r.content.contains("network.deny"),
+            "{}",
+            r.content
+        );
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn fetch_tools_refuse_link_local_and_metadata_hosts() {
         for u in [
@@ -10010,6 +10113,13 @@ print("hello " + data.get("name", "world"))
             "http://metadata.google.internal/computeMetadata/v1/",
             "http://user@METADATA.google.internal./",
             "http://100.100.100.200/",
+            "http://2852039166/latest/meta-data/",
+            "http://0xa9.254.169.254/",
+            "http://0251.0376.0251.0376/",
+            "http://%31%36%39.254.169.254/",
+            "http://169.254.169.254\\@docs.example/",
+            "http://[::ffff:a9fe:a9fe]/",
+            "http://[::169.254.169.254]/",
         ] {
             assert!(blocked_url(u).is_some(), "{u} should be blocked");
         }

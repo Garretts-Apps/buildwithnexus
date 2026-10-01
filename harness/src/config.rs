@@ -1896,6 +1896,11 @@ pub fn expand_command_args(text: &str, args: &str) -> Option<String> {
     Some(out)
 }
 
+/// Whether the command's text takes arguments (`$ARGUMENTS`, `$1`…`$9`).
+pub fn command_takes_arguments(cmd: &CustomCommand) -> bool {
+    expand_command_args(&cmd.content, "").is_some()
+}
+
 /// The prompt for `/name args`: a commands/ file's body with its arguments
 /// filled in (or listed after it), or a skill's text after the typed line,
 /// the arguments sent once either way.

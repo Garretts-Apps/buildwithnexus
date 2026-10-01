@@ -31,7 +31,7 @@ inputs:
     description: Model endpoint, such as a gateway (`--base-url`).
     default: ""
   review-base:
-    description: For `review`, also review the branch since this git ref (for example `origin/main`).
+    description: For `review`, also review the branch since this git ref (for example `origin/main`). A shallow checkout is deepened and a missing `<remote>/<branch>` fetched first.
     default: ""
   args:
     description: More bwn options, separated by spaces (for example `--sandbox auto --effort low`).
@@ -168,7 +168,23 @@ runs:
             ;;
           review)
             args+=(review)
-            if [ -n "$INPUT_REVIEW_BASE" ]; then args+=(--base "$INPUT_REVIEW_BASE"); fi
+            if [ -n "$INPUT_REVIEW_BASE" ]; then
+              args+=(--base "$INPUT_REVIEW_BASE")
+              # actions/checkout fetches one commit of one ref by default; the
+              # review needs the base and the history it shares with HEAD.
+              if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+                echo "fetching the full history for review-base"
+                git fetch --quiet --no-tags --unshallow || true
+              fi
+              if ! git rev-parse --verify --quiet "$INPUT_REVIEW_BASE^{commit}" >/dev/null; then
+                remote="${INPUT_REVIEW_BASE%%/*}"
+                branch="${INPUT_REVIEW_BASE#*/}"
+                if [ "$remote" != "$INPUT_REVIEW_BASE" ] && git remote | grep -qxF -- "$remote"; then
+                  echo "fetching $INPUT_REVIEW_BASE"
+                  git fetch --quiet --no-tags "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch" || true
+                fi
+              fi
+            fi
             if [ -n "$INPUT_PROMPT" ]; then args+=("$INPUT_PROMPT"); fi
             ;;
           *)
@@ -180,12 +196,13 @@ runs:
         # The step itself does not fail here, so the log is uploaded and the
         # comment posted; the last step passes or fails on the outcome.
         code=0
-        "$BWN" "${args[@]}" < /dev/null > "$events" || code=$?
+        "$BWN" "${args[@]}" < /dev/null > "$events" 2> "$dir/stderr.txt" || code=$?
+        cat "$dir/stderr.txt" >&2
         {
           echo "events=$events"
           echo "artifact=$artifact"
         } >> "$GITHUB_OUTPUT"
-        BWN_EVENTS="$events" BWN_EXIT_CODE="$code" BWN_COMMAND="$INPUT_COMMAND" \
+        BWN_EVENTS="$events" BWN_STDERR="$dir/stderr.txt" BWN_EXIT_CODE="$code" BWN_COMMAND="$INPUT_COMMAND" \
           BWN_ARTIFACT="$artifact" BWN_COMMENT_FILE="$dir/comment.md" \
           node "$ACTION_PATH/scripts/action/report.js" summarize
         echo "comment-file=$dir/comment.md" >> "$GITHUB_OUTPUT"

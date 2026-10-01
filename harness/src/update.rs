@@ -184,13 +184,26 @@ fn registry() -> String {
         .unwrap_or_else(|| "https://registry.npmjs.org".into())
 }
 
+const RELEASES: &str = "https://github.com/Garretts-Apps/buildwithnexus/releases";
+const MIN_RUST: &str = "1.94";
+
+// The transport error already names the address; say it once.
+fn at(url: &str, e: impl std::fmt::Display) -> String {
+    let e = e.to_string();
+    if e.contains(url) {
+        e
+    } else {
+        format!("{url}: {e}")
+    }
+}
+
 fn fetch_latest() -> Result<String, String> {
     let url = format!("{}/{PKG}/latest", registry());
     let resp = crate::net::shared()
         .get(&url)
         .timeout(Duration::from_secs(10))
         .call()
-        .map_err(|e| format!("{url}: {e}"))?;
+        .map_err(|e| at(&url, e))?;
     let body: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("{url}: not JSON ({e})"))?;
@@ -257,8 +270,10 @@ pub fn cli(args: &[String]) -> i32 {
         .map(|p| installed_via_npm(&p, &crate::config::home()))
         .unwrap_or(false);
     if !npm_install {
-        println!("this copy was not installed with npm; update it with:");
-        println!("  cargo install {PKG} --locked");
+        println!("this copy was not installed with npm; update it the way you installed it:");
+        println!("  release download  {RELEASES}/tag/v{latest}");
+        println!("  npm               npm install -g {PKG}@{latest}");
+        println!("  cargo (Rust {MIN_RUST}+)  cargo install {PKG} --locked");
         return EXIT_BEHIND;
     }
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
@@ -350,8 +365,16 @@ pub fn spawn_check(policy: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_lookup_names_the_address_once() {
+        let url = "http://127.0.0.1:1/buildwithnexus/latest";
+        let e = at(url, format!("{url}: Connection Failed"));
+        assert_eq!(e.matches(url).count(), 1, "{e}");
+        assert_eq!(at(url, "timed out"), format!("{url}: timed out"));
+    }
+
     use super::{
-        effective_policy, installed_via_npm, installs, newer, pending_notice, resolve_policy,
+        at, effective_policy, installed_via_npm, installs, newer, pending_notice, resolve_policy,
     };
     use serde_json::json;
     use std::path::Path;

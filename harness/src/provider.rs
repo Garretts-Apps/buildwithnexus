@@ -461,6 +461,42 @@ fn is_local_url(url: &str) -> bool {
         || url.contains("0.0.0.0")
 }
 
+/// The model names a server says it serves (Ollama's installed list, or an
+/// OpenAI-compatible /models); empty when it says nothing.
+pub fn served_names(p: &Provider) -> Vec<String> {
+    match p.protocol {
+        Protocol::OllamaNative => ollama_models(&p.base_url),
+        _ => openai_models(&p.base_url),
+    }
+}
+
+/// The names to offer for a model the server does not know: up to eight.
+pub fn served_summary(names: &[String]) -> String {
+    let shown: Vec<String> = names
+        .iter()
+        .take(8)
+        .map(|n| crate::tui::sanitize_terminal(n).into_owned())
+        .collect();
+    match names.len().saturating_sub(shown.len()) {
+        0 => shown.join(", "),
+        more => format!("{}, and {more} more", shown.join(", ")),
+    }
+}
+
+/// A local server that lists what it serves, none of it the model asked
+/// for, yet answered the probe: llama.cpp's server runs whatever it loaded
+/// and ignores the name, so the footer would name a model that is not
+/// answering.
+pub fn unlisted_note(model: &str, names: &[String]) -> Option<String> {
+    if names.is_empty() || names.iter().any(|n| n.eq_ignore_ascii_case(model)) {
+        return None;
+    }
+    Some(format!(
+        "the server lists only {}; it answered the probe, but a server like llama.cpp's answers with whatever it loaded, whatever name is sent",
+        served_summary(names)
+    ))
+}
+
 /// One-token probe through the real completion path — proves the key is
 /// accepted, the model exists, and the server is reachable, so a model swap
 /// can be validated before it's declared successful. Costs ≤1 output token.
@@ -1403,6 +1439,11 @@ fn jitter(ms: u64) -> u64 {
 // get the start-the-server advice; a hosted API gets the network one.
 fn server_down_msg(url: &str) -> String {
     let base = origin(url);
+    let wrong = if in_session() {
+        "/model <name> or `buildwithnexus init` sets a new one."
+    } else {
+        "--base-url <url> (or base_url in settings.json) sets another; `buildwithnexus init` sets it up again."
+    };
     if url.starts_with("https://") && !is_local_url(url) {
         return format!(
             "nothing is answering at {base} — check the address (base_url) and your network or VPN"
@@ -1411,11 +1452,24 @@ fn server_down_msg(url: &str) -> String {
     format!(
         "nothing is answering at {base} — is the model server running?\n  \
          Ollama: `ollama serve` · LM Studio / llama.cpp: start its server\n  \
-         Wrong address? /model <name> or `buildwithnexus init` sets a new one."
+         Wrong address? {wrong}"
     )
 }
 
 // ── failure wording ────────────────────────────────────────────────────────
+
+static IN_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The interactive UI is running: failure hints may name its slash commands.
+/// Elsewhere (`bwn run`, `review`, the Action) they name flags, settings and
+/// environment variables, which a script can use.
+pub fn set_in_session() {
+    IN_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn in_session() -> bool {
+    IN_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Who was asked, for the wording of a failure.
 struct FailureContext<'a> {
@@ -1423,6 +1477,8 @@ struct FailureContext<'a> {
     base: &'a str,
     has_key: bool,
     ollama: bool,
+    /// Hints name slash commands (the terminal UI) rather than flags.
+    in_session: bool,
 }
 
 /// A failed request in the person's terms: what happened and what to do on
@@ -1434,6 +1490,7 @@ fn explain_failure(p: &Provider, e: String) -> String {
         base: origin(&p.base_url),
         has_key: p.api_key.is_some(),
         ollama: p.protocol == Protocol::OllamaNative,
+        in_session: in_session(),
     };
     let Some((code, body)) = e
         .strip_prefix("HTTP ")
@@ -1491,22 +1548,36 @@ fn status_advice(code: u16, body: &str, ctx: &FailureContext) -> String {
         1 => " after 1 retry".to_string(),
         n => format!(" after {n} retries"),
     };
+    // What replaces a key or picks a model: a slash command in a session,
+    // otherwise what a script can use.
+    let (replace, add, pick) = if ctx.in_session {
+        (
+            "/login to replace it",
+            "/login to add one",
+            "/model to pick an installed one",
+        )
+    } else {
+        (
+            "`buildwithnexus login` replaces it, or set the provider's API key variable (CUSTOM_API_KEY for --base-url)",
+            "`buildwithnexus login` adds one, or set CUSTOM_API_KEY",
+            "--model <name> to use an installed one",
+        )
+    };
     match code {
-        401 if ctx.has_key => {
-            "the API key was rejected by the provider — /login to replace it".to_string()
-        }
-        401 => format!("the server at {} wants an API key — /login to add one", ctx.base),
+        401 if ctx.has_key => format!("the API key was rejected by the provider — {replace}"),
+        401 => format!("the server at {} wants an API key — {add}", ctx.base),
         403 => format!(
-            "the provider refused access to {} — check what the key is allowed to use, or /login to replace it",
+            "the provider refused access to {} — check what the key is allowed to use, or {replace}",
             ctx.model
         ),
         404 if model_missing(&lower) && ctx.ollama => format!(
-            "model {} is not installed on {} — ollama pull {}, or /model to pick an installed one",
+            "model {} is not installed on {} — ollama pull {}, or {pick}",
             ctx.model, ctx.base, ctx.model
         ),
         404 if model_missing(&lower) => format!(
-            "the server does not know model {} — /model lists what it serves, or check the name",
-            ctx.model
+            "the server does not know model {} — {}, or check the name",
+            ctx.model,
+            if ctx.in_session { "/model lists what it serves" } else { "--model <name> picks one it serves" }
         ),
         404 => format!(
             "the server has nothing at this address — check base_url ({}); OpenAI-compatible servers usually end in /v1",
@@ -1518,7 +1589,7 @@ fn status_advice(code: u16, body: &str, ctx: &FailureContext) -> String {
             "rate-limited by the provider{} — wait a minute and try again (BWN_MAX_RETRIES sets the retries)",
             retried(retries_for(code, body))
         ),
-        _ if out_of_memory(body) => memory_advice(body, ctx.model),
+        _ if out_of_memory(body) => memory_advice(body, ctx.model, ctx.in_session),
         503 if lower.contains("loading") => format!(
             "the server is still loading {}{} — wait for it to finish, then send again",
             ctx.model,
@@ -1604,7 +1675,12 @@ fn overflow_advice(body: &str) -> String {
 
 // "model requires more system memory (5.6 GiB) than is available (3.1 GiB)"
 // is Ollama's; anything else that says out of memory gets the general line.
-fn memory_advice(body: &str, model: &str) -> String {
+fn memory_advice(body: &str, model: &str, in_session: bool) -> String {
+    let smaller = if in_session {
+        "/model"
+    } else {
+        "--model <name>"
+    };
     let text = server_message(body);
     let sizes: Vec<&str> = text
         .split('(')
@@ -1614,10 +1690,10 @@ fn memory_advice(body: &str, model: &str) -> String {
         .collect();
     match sizes.as_slice() {
         [need, free, ..] => format!(
-            "the model needs {need} but {free} is free — pick a smaller model with /model"
+            "the model needs {need} but {free} is free — pick a smaller model with {smaller}"
         ),
         _ => format!(
-            "the server ran out of memory running {model} — pick a smaller model with /model, or close other programs"
+            "the server ran out of memory running {model} — pick a smaller model with {smaller}, or close other programs"
         ),
     }
 }
@@ -2777,8 +2853,9 @@ fn missing_model_msg(p: &Provider) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "model {m} is not installed on {base} — installed: {shown} · ollama pull {m}, or /model {first}",
-                m = p.model
+                "model {m} is not installed on {base} — installed: {shown} · ollama pull {m}, or {use_}{first}",
+                m = p.model,
+                use_ = if in_session() { "/model " } else { "--model " }
             )
         }
         None => format!(
@@ -3088,6 +3165,23 @@ fn ollama_stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_the_server_does_not_list_is_noted_and_the_list_is_short() {
+        let names = vec!["tinycoder-7b-q4_k_m.gguf".to_string()];
+        assert!(unlisted_note("TinyCoder-7B-Q4_K_M.gguf", &names).is_none());
+        assert!(unlisted_note("anything", &[]).is_none());
+        let m = unlisted_note("tinycoder:9b", &names).unwrap();
+        assert!(
+            m.starts_with("the server lists only tinycoder-7b-q4_k_m.gguf;"),
+            "{m}"
+        );
+        let many: Vec<String> = (0..11).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            served_summary(&many),
+            "m0, m1, m2, m3, m4, m5, m6, m7, and 3 more"
+        );
+    }
+
     use super::*;
     use std::io::Cursor;
 
@@ -3113,6 +3207,7 @@ mod tests {
             base: "http://192.168.50.10:11434",
             has_key,
             ollama,
+            in_session: true,
         }
     }
 
@@ -3122,6 +3217,53 @@ mod tests {
             status_advice(code, body, c),
             server_message(body)
         )
+    }
+
+    #[test]
+    fn a_script_is_told_flags_and_variables_not_slash_commands() {
+        let mut c = ctx("gpt-4o", true, false);
+        c.in_session = false;
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with("the API key was rejected by the provider — `buildwithnexus login`")
+                && m.contains("CUSTOM_API_KEY")
+                && !m.contains("/login"),
+            "{m}"
+        );
+        c.has_key = false;
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.contains("wants an API key") && !m.contains("/login"),
+            "{m}"
+        );
+        let m = explained(404, r#"{"error":"model not found"}"#, &c);
+        assert!(m.contains("--model <name>") && !m.contains("/model"), "{m}");
+        let m = explained(
+            500,
+            r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            &ctx("m", false, true),
+        );
+        assert!(
+            m.contains("smaller model with /model"),
+            "session wording stays: {m}"
+        );
+        let mut o = ctx("m", false, true);
+        o.in_session = false;
+        let m = explained(
+            500,
+            r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            &o,
+        );
+        assert!(
+            m.contains("smaller model with --model <name>") && !m.contains("with /model"),
+            "{m}"
+        );
+        // Not in a session (the default here): the unreachable-server hint names --base-url.
+        let m = server_down_msg("http://127.0.0.1:1/v1");
+        assert!(
+            m.contains("--base-url <url>") && !m.contains("/model"),
+            "{m}"
+        );
     }
 
     #[test]
@@ -5042,7 +5184,7 @@ mod tests {
         );
         assert!(e.contains("installed: tinycoder:3b, plainchat:2b"), "{e}");
         assert!(
-            e.contains("ollama pull tinycoder:7b, or /model tinycoder:3b"),
+            e.contains("ollama pull tinycoder:7b, or --model tinycoder:3b"),
             "{e}"
         );
         assert!(!e.contains("/api/show"), "{e}");

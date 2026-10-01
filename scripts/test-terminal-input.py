@@ -646,6 +646,50 @@ class KeyQuestionTests(TerminalHarness):
         self.assertNotIn(b"API key for this endpoint", self.output)
 
 
+class ModelSwapWordingTests(TerminalHarness):
+    """/model on a local server says one thing for a model it does not know,
+    and warns when a server answers whatever name it is sent."""
+
+    def prepare(self):
+        self.model = MockModel(lambda body: {"status": 404, "error": "model not found"}
+                               if body.get("model") != "mock-model" else {"text": "pong"})
+        self.lax = MockModel(lambda body: {"text": "pong"})
+        self.addCleanup(self.model.close)
+        self.addCleanup(self.lax.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model", "base_url": self.model.url,
+                "permission": "ask", "auto_update": "off"}
+
+    def text(self):
+        return self.output.decode("utf-8", "replace")
+
+    def test_an_unknown_model_is_one_line_naming_what_the_server_serves(self):
+        self.send("/model typo-model\r")
+        self.wait_for(lambda: b"keeping the current model" in self.output, "the refusal",
+                      timeout=15)
+        text = self.text()
+        self.assertIn("does not know model typo-model", text)
+        self.assertIn("it serves: mock-model", text)
+        self.assertNotIn("HTTP 404", text)
+        self.assertNotIn("doesn't look like a model", text)
+
+    def test_two_words_are_not_a_model_name(self):
+        self.send("/model nonsense-provider some-model\r")
+        self.wait_for(lambda: b"keeping the current model" in self.output, "the refusal")
+        self.assertIn("is not a provider or a model name", self.text())
+        self.assertFalse(self.model.posts())
+
+    def test_a_server_that_answers_any_name_is_flagged(self):
+        self.send(f"/model {self.lax.url} other-name\r")
+        self.wait_for(lambda: b"hot-swapped" in self.output or b"API key for" in self.output,
+                      "the swap", timeout=15)
+        if b"API key for" in self.output:
+            self.send("\r")
+            self.wait_for(lambda: b"hot-swapped" in self.output, "the swap", timeout=15)
+        self.assertIn("the server lists only mock-model", self.text())
+
+
 class SetupCustomKeyTests(TerminalHarness):
     """Setup on an OpenAI-compatible endpoint that wants a key: the key is
     saved for that endpoint, and never sent to another address."""

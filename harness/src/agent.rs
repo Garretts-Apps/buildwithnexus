@@ -2674,12 +2674,15 @@ fn compound_denied<'a>(
 
 // Host patterns are case-insensitive and may leave out the port.
 fn host_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.trim().to_ascii_lowercase();
+    // Both sides spelled one way: `::ffff:127.0.0.1` in a rule or a URL is
+    // 127.0.0.1.
+    let pattern = crate::net::canonical_authority(pattern);
+    let host = crate::net::canonical_authority(host);
     let bare = host
         .rsplit_once(':')
         .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
-        .map_or(host, |(h, _)| h);
-    hooks::glob_match(&pattern, host) || hooks::glob_match(&pattern, bare)
+        .map_or(host.as_str(), |(h, _)| h);
+    hooks::glob_match(&pattern, &host) || hooks::glob_match(&pattern, bare)
 }
 
 // A relative pattern names project paths (`migrations/**`, `*.lock`); an
@@ -4303,11 +4306,26 @@ fn unparsed_tool_call(text: &str, defs: &[tools::ToolDef]) -> Option<String> {
         None => t,
     };
     let v: serde_json::Value = serde_json::from_str(t).ok()?;
-    let call = v.get("function").unwrap_or(&v);
-    let name = call.get("name")?.as_str()?;
-    (defs.iter().any(|d| d.name == name)
-        && (call.get("arguments").is_some() || call.get("parameters").is_some()))
-    .then(|| name.to_string())
+    // One call, a list of them (`[…]` or `{"tool_calls": […]}`), or one
+    // under `function_call`: the first offered name stands for the reply.
+    let calls: Vec<&serde_json::Value> = match (v.as_array(), v.get("tool_calls")) {
+        (Some(list), _) => list.iter().collect(),
+        (None, Some(list)) => list.as_array()?.iter().collect(),
+        (None, None) => vec![v.get("function_call").unwrap_or(&v)],
+    };
+    let mut first = None;
+    for c in &calls {
+        let call = c.get("function").unwrap_or(c);
+        let name = call.get("name")?.as_str()?;
+        let has_args = ["arguments", "parameters", "args", "input"]
+            .iter()
+            .any(|k| call.get(k).is_some());
+        if !(defs.iter().any(|d| d.name == name) && has_args) {
+            return None;
+        }
+        first.get_or_insert(name);
+    }
+    first.map(str::to_string)
 }
 
 // Why a turn that ends on text is not a success: the last tool round held a
@@ -4371,6 +4389,20 @@ mod unrun_call_tests {
             unparsed_tool_call(wrapped, &defs).as_deref(),
             Some("grep_files")
         );
+        // Several calls, or one under another key, are still calls.
+        for text in [
+            format!("[{call}, {call}]"),
+            format!("```json\n[{call}]\n```"),
+            format!(r#"{{"tool_calls": [{call}]}}"#),
+            r#"{"function_call": {"name": "read_file", "arguments": "{}"}}"#.to_string(),
+            r#"{"name": "read_file", "args": {"path": "a.txt"}}"#.to_string(),
+        ] {
+            assert_eq!(
+                unparsed_tool_call(&text, &defs).as_deref(),
+                Some("read_file"),
+                "{text}"
+            );
+        }
         assert_eq!(unparsed_tool_call("The file says hello.", &defs), None);
         assert!(
             unrun_call_note(Some("read_file (path argument is required)"), "ok", &defs)
@@ -4390,6 +4422,11 @@ mod unrun_call_tests {
             "{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}\n\nThat is a call.",
             r#"{"type":"function","function":{"name":"grep_files","parameters":{}}} then prose"#,
             r#"{"name": "Ada"} is the author"#,
+            // A list holding one name this run does not offer, or none.
+            r#"[{"name": "read_file", "arguments": {}}, {"name": "get_weather", "arguments": {}}]"#,
+            "[]",
+            r#"["read_file"]"#,
+            r#"{"tool_calls": "read_file"}"#,
         ] {
             assert_eq!(unparsed_tool_call(text, &defs), None, "{text}");
             assert_eq!(unrun_call_note(None, text, &defs), None, "{text}");
@@ -9929,6 +9966,59 @@ mod tests {
         assert_eq!(gate(Permission::ReadOnly, "fetch_url", &fetch, &proj), None);
         let other = json!({"url": "https://example.org/"});
         assert!(gate(Permission::Ask, "fetch_url", &other, &proj).is_some());
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn network_deny_sees_every_spelling_of_an_address() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "net-spell",
+            json!({"network": {"deny": ["127.0.0.1", "::ffff:10.0.0.9", "[::1]"]}}),
+        );
+        let denied = "denied by network.deny in user settings";
+        for url in [
+            "http://127.0.0.1:29123/a",
+            "http://2130706433:29123/b",
+            "http://0x7f.0.0.1:29123/c",
+            "http://127.1:29123/d",
+            "http://[::ffff:127.0.0.1]:29123/e",
+            "http://[::ffff:7f00:1]:29123/e",
+            "http://[0:0:0:0:0:ffff:7f00:1]/e",
+            "http://[::127.0.0.1]/e",
+            "http://0177.0.0.1:29123/f",
+            "http://%31%32%37.0.0.1:29123/g",
+            "http://127.0.0.1.:29123/h",
+            "http://user@127.0.0.1:29123/i",
+            // The rules themselves are read the same way.
+            "http://10.0.0.9/",
+            "http://167772169/",
+            "http://[::1]:8080/",
+            "http://[0::1]/",
+        ] {
+            assert_eq!(
+                gate(Permission::Auto, "fetch_url", &json!({"url": url}), &proj).as_deref(),
+                Some(denied),
+                "{url}"
+            );
+            let host = tools::network_host("fetch_url", &json!({"url": url})).unwrap();
+            assert!(network_denied(&proj, &host).is_some(), "{url} -> {host}");
+        }
+        for url in [
+            "http://127.0.0.2/",
+            "http://[::ffff:7f00:2]/",
+            "http://[::2]/",
+            "http://10.0.0.10/",
+        ] {
+            assert_eq!(
+                gate(Permission::Auto, "fetch_url", &json!({"url": url}), &proj),
+                None,
+                "{url}"
+            );
+        }
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
