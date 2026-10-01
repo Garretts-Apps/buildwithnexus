@@ -6,6 +6,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Release process
+- The npm publish step passes the tarball as `./dist/…`. npm 12 read
+  `dist/buildwithnexus-0.15.0.tgz` as GitHub shorthand and refused it
+  (`EALLOWGIT`), so 0.15.0's first publish run failed after its GitHub
+  release was out.
+
 ## [0.15.0] - 2026-10-01
 
 An install IT can approve, and trust you grant explicitly: approvals, rules
