@@ -9,7 +9,7 @@ Nothing changes without opting in for these new features: `accept-edits`,
 `permissions` and `network` rules, `on_error`, `shell_env_passthrough`,
 `prices`, `vision`, `buildwithnexus trust --print`, `--trust-project` /
 `BWN_TRUST_PROJECT`, `--base-url`, `--worktree`, `--add-dir` and
-`/add-dir`, agent files and `buildwithnexus update`.
+`/add-dir`, agent files, `buildwithnexus update` and `buildwithnexus mcp login`.
 
 ## Install and update
 
@@ -179,6 +179,8 @@ Nothing changes without opting in for these new features: `accept-edits`,
 | A `commands/*.md` file's body, with frontmatter stripped and arguments filled in, is the prompt; it used to be wrapped as `/name args [Skill: name]`, and arguments are no longer sent twice. | Make the file a skill to keep the wrapping. |
 | A headless run waits 5 s for MCP servers (it was up to the 30 s default per server). | Set `timeout_secs` on a server to wait longer for it. |
 | `mcp add <existing-name>` exits 1 instead of overwriting. | Add `--force`. |
+| An http MCP server that answers 401 with a `Bearer` challenge is listed as `needs login`, with `bwn mcp login <name>` (`/mcp login <name>` in a session), instead of `failed: initialize failed: HTTP 401`. After a login bwn sends it the saved token and refreshes it. | None needed: such a server could not be used before, and nothing is sent until you log in. An `Authorization` header in the server's `headers` opts it out of OAuth and is sent as before. |
+| `/mcp` and `buildwithnexus mcp list` show whether an http server is signed in, `mcp <name>` adds an `auth:` line, and the status column is one character wider. | None needed (additive). A script that cuts the table by column should split on whitespace. |
 | `/review` no longer prompts for a focus, and is read-only even in auto. `/review` and `buildwithnexus review` (default and `--base`) also send untracked, non-ignored files as new-file diffs, so a review that said "nothing to review" may now run and exit 9. | Put the focus after the command. `--staged` reviews only staged changes. Apply fixes from BUILD. |
 | Background workflows (`/schedule`, `/loop`) run under the session's permission, provider and model, not the ones in settings.json. A `/loop` run that has a change refused stops the loop with `✗ workflow #N blocked: …`. | A workflow that should edit unattended needs `/permissions auto` in the session that schedules it, or remove the rule that refused it. |
 

@@ -28,6 +28,7 @@
 //! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
 //! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
 //! | [`mcp`] | Model Context Protocol client: stdio / HTTP servers, discovery, `mcp__*` dispatch |
+//! | [`mcp_auth`] | OAuth for HTTP MCP servers: discovery, PKCE login, saved tokens, refresh |
 //! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
 //! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
 //! | [`session`] | save/resume of conversations |
@@ -51,6 +52,7 @@ pub mod hooks;
 pub mod knowledge;
 pub mod local;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod media;
 pub mod net;
 pub mod onboarding;
@@ -489,7 +491,7 @@ pub fn run() {
             headless(&opts, |p, _perm, cwd| headless_review(p, &req, &cwd))
         }
         "update" => std::process::exit(update::cli(&args[1..])),
-        "mcp" => match mcp::manage(&args[1..], false) {
+        "mcp" => match mcp::manage(&args[1..], false, &mut |l| println!("  {l}")) {
             Ok(lines) => {
                 for l in lines {
                     println!("  {l}");
@@ -497,8 +499,9 @@ pub fn run() {
             }
             Err(e) => {
                 eprintln!("buildwithnexus mcp: {e}");
-                // A refusal to overwrite is not a usage mistake.
-                std::process::exit(if e.ends_with(mcp::EXISTS) { 1 } else { 2 });
+                // A refusal to overwrite or a failed login is not a usage
+                // mistake.
+                std::process::exit(mcp::exit_code(&e));
             }
         },
         // A stray flag must not become an interactive prompt: `bwn --modle x`
@@ -1606,6 +1609,8 @@ fn login_cli(opts: &CliOptions) {
 }
 
 fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
+    // MCP login hints say /mcp login here, not `bwn mcp login`.
+    mcp_auth::set_in_session();
     // Always scaffold on interactive launch so existing users also get the
     // directory skeleton and starter Agents.md if they're missing.
     config::scaffold_home();
@@ -3357,7 +3362,8 @@ fn handle_tools() {
 fn handle_mcp(arg: &str) {
     let args = shlex::split(arg.trim()).unwrap_or_default();
     // Server names, server_info and errors are server- or config-supplied.
-    match mcp::manage(&args, true) {
+    let mut say = |l: &str| tui::line(&format!("  {l}"));
+    match mcp::manage(&args, true, &mut say) {
         Ok(lines) => {
             for l in lines {
                 tui::line(&format!("  {}", tui::sanitize_terminal(&l)));
@@ -6958,6 +6964,16 @@ fn mcp_checks() -> Vec<DoctorCheck> {
                 mcp::Status::Failed(e) | mcp::Status::Invalid(e) => {
                     DoctorCheck::fail(name, e.chars().take(160).collect::<String>())
                 }
+                mcp::Status::NeedsAuth(why) => {
+                    let hint = mcp_auth::login_hint(&r.name, &why);
+                    DoctorCheck::fail(
+                        name,
+                        format!(
+                            "needs login: {}",
+                            hint.chars().take(150).collect::<String>()
+                        ),
+                    )
+                }
             }
         })
         .collect()
@@ -7963,7 +7979,7 @@ fn usage() {
          \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
          \x20 buildwithnexus update [--check] install the latest release (--check: exit 10 if behind)\n\
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
-         \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
+         \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers\n\
          \x20 buildwithnexus version | help\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
@@ -8011,7 +8027,7 @@ fn usage() {
          \x20 /memory                view and edit session memory\n\
          \x20 /skills                browse available skills and custom commands\n\
          \x20 /tools                 browse callable tools\n\
-         \x20 /mcp [name|add|remove|reload]  MCP servers and their tools\n\
+         \x20 /mcp [name|add|remove|login|logout|reload]  MCP servers and their tools\n\
          \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
          \x20 /agents /checkpoints /undo /doctor\n\
          \x20 /help /clear /new /resume /init /exit\n\

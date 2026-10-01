@@ -912,7 +912,8 @@ client. Configure servers under `mcp_servers` in `~/.buildwithnexus/settings.jso
 |---|---|
 | `type` | `"stdio"` or `"http"` (Streamable HTTP). Optional: a `url` means http, a `command` means stdio. |
 | `command`, `args`, `env` | stdio: the process to spawn, kept alive for the whole session; stderr is captured for diagnostics. |
-| `url`, `headers` | http: the endpoint and extra request headers (auth tokens go here). `Mcp-Session-Id` is tracked automatically. |
+| `url`, `headers` | http: the endpoint and extra request headers (a static token goes here). `Mcp-Session-Id` is tracked automatically. |
+| `oauth` | http: a client registered ahead of time, for a server whose authorization server has no dynamic registration: `client_id`, optional `client_secret`, `scopes`, and `callback_port` when the redirect URI must be exact. |
 | `timeout_secs` | Per-request deadline (default `30`). A server that hangs or exits is reported once and its tools drop out for the session. |
 | `enabled` | `false` keeps the entry but never connects. |
 
@@ -934,19 +935,41 @@ connection.
 /mcp <name>                            a server's tools with descriptions
 /mcp add [--force] <name> <command> [args...]   stdio server → settings.json, then reconnect
 /mcp add [--force] <name> --url <url> [--header K=V]... [--timeout <secs>]
+        [--client-id <id>] [--callback-port <port>]
 /mcp remove <name>
+/mcp login <name>                      sign in to an http server that asks for OAuth
+/mcp logout <name>                     revoke and forget that sign-in
 /mcp reload                            reconnect every server
 ```
 
-`buildwithnexus mcp list|<name>|add|remove|reload` mirrors this for scripts
-(`add`/`remove` only edit the settings file; `list` connects). Everything after
-the server name is the server's own command line, so `buildwithnexus mcp add fs
-npx -y some-server --json` keeps `-y` and `--json` for the server; a `--` before
-the command, as Claude Code writes it, is accepted. `add` refuses
+`buildwithnexus mcp list|<name>|add|remove|login|logout|reload` mirrors this
+for scripts (`add`/`remove` only edit the settings file; `list` connects).
+Everything after the server name is the server's own command line, so
+`buildwithnexus mcp add fs npx -y some-server --json` keeps `-y` and `--json`
+for the server; a `--` before the command, as Claude Code writes it, is
+accepted. `add` refuses
 to replace a server that already has that name (exit 1) unless you pass
 `--force`. `/doctor` and
 `buildwithnexus doctor` connect to every configured server and report the
 outcome. Legacy SSE-only (`type: "sse"`) servers are not supported.
+
+**Servers that ask you to sign in (OAuth).** An http server that answers
+`401` with a `Bearer` challenge is listed as `needs login`; connecting never
+opens a browser, and a headless run skips the server with a notice naming
+`bwn mcp login <name>`. `bwn mcp login <name>` (or `/mcp login <name>` in a
+session, which reconnects it) follows the MCP authorization spec: it reads
+the server's protected-resource metadata and its authorization server's
+metadata, registers bwn as a client when the server allows that (otherwise
+set `oauth.client_id`), and opens the browser on an authorization-code + PKCE
+(S256) sign-in that comes back to a one-shot listener on `127.0.0.1`. The
+URL is printed too, for a browser elsewhere. The tokens are saved owner-only
+in `~/.buildwithnexus/mcp-auth/<name>.json`, only for the server's URL as
+configured, are refreshed when they expire, and are sent only over HTTPS or
+to this machine. A server that echoes its token back gets `[redacted]` in
+place of it before the model, the transcript or the terminal sees it.
+`bwn mcp logout <name>` asks the authorization server to revoke the token
+and deletes the file. A server with an `Authorization` header in `headers`
+is left as configured.
 
 ## Build from source
 

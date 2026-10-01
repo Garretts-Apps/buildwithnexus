@@ -2677,6 +2677,22 @@ const BROWSER_FILE_EXTS: &[&str] = &[
     "html", "htm", "xhtml", "svg", "pdf", "png", "jpg", "jpeg", "gif", "webp", "txt", "md", "json",
 ];
 
+/// Hands `target` (a URL or a file the checks above allowed) to the OS
+/// opener and waits for the opener, not the browser, to exit.
+pub fn spawn_opener(target: &str) -> std::io::Result<std::process::ExitStatus> {
+    if cfg!(target_os = "macos") {
+        Command::new("open").arg(target).status()
+    } else if cfg!(windows) {
+        // Not `cmd /C start`: cmd re-parses the target, so `&` in a URL
+        // would run a second command.
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", target])
+            .status()
+    } else {
+        Command::new("xdg-open").arg(target).status()
+    }
+}
+
 fn open_browser(input: &Value, cwd: &Path) -> Outcome {
     let target = if let Some(url) = input["url"].as_str().filter(|s| !s.trim().is_empty()) {
         let url = url.trim();
@@ -2701,18 +2717,7 @@ fn open_browser(input: &Value, cwd: &Path) -> Outcome {
     } else {
         return err("url or path is required");
     };
-    let status = if cfg!(target_os = "macos") {
-        Command::new("open").arg(&target).status()
-    } else if cfg!(windows) {
-        // Not `cmd /C start`: cmd re-parses the target, so `&` in a URL
-        // would run a second command.
-        Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &target])
-            .status()
-    } else {
-        Command::new("xdg-open").arg(&target).status()
-    };
-    match status {
+    match spawn_opener(&target) {
         Ok(s) if s.success() => ok(format!("opened in browser: {target}")),
         Ok(s) => err(format!("browser opener exited with status {s}: {target}")),
         Err(e) => err(format!("cannot open browser for {target}: {e}")),

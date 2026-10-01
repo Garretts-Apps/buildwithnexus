@@ -118,6 +118,7 @@ dependencies = [
  "crossterm",
  "libc",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

@@ -183,7 +183,9 @@ shows whether a given file is signed.
   `icacls` to restrict its settings and key files to the current user, and `tasklist`/`taskkill` for dev servers it started; the user's own
   hook scripts, with
   `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
-  -File <script>`; and `npm install -g buildwithnexus` only when the user
+  -File <script>`; the OS URL opener (`open`, `xdg-open`, or `rundll32
+  url.dll,FileProtocolHandler`) for `open_browser` and for the sign-in page
+  of `buildwithnexus mcp login`; and `npm install -g buildwithnexus` only when the user
   runs `buildwithnexus update` or sets `auto_update` to `"install"` or
   `"install-any"`. It never installs other software: `buildwithnexus doctor`
   prints the install command for a missing tool and runs none. Commands the
@@ -195,7 +197,9 @@ shows whether a given file is signed.
   `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
   the agent fetches when the model uses the web tools (each new host,
   including the search host, needs the user's approval outside `auto` mode);
-  MCP servers the user configures; the URLs of `http` hooks the user
+  MCP servers the user configures, and the OAuth authorization servers they
+  name when the user runs `mcp login` (only over HTTPS, or to this machine;
+  sign-in tokens are sent to nothing else); the URLs of `http` hooks the user
   configures (a project's only once the folder is trusted; `network.deny`
   applies); and a daily `registry.npmjs.org` version
   check unless `auto_update` is `"off"` (`BWN_UPDATE_REGISTRY` or
@@ -211,7 +215,9 @@ shows whether a given file is signed.
   metadata address is the proxy's to make; bwn still refuses those
   addresses and the metadata host names given literally, at every redirect
   hop.
-- **Files:** its settings, keys (`.env.keys`), sessions, checkpoints,
+- **Files:** its settings, keys (`.env.keys`), MCP sign-ins
+  (`mcp-auth/<server>.json`, owner-only like the key file, each bound to its
+  server's URL), sessions, checkpoints,
   traces, conversation exports (`exports/`), which upgrade notices were shown
   (`notices.json`) and whether each saved key passed its last check
   (`key-checks.json`, a hash, never the key) under `~/.buildwithnexus` (or

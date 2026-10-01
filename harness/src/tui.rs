@@ -6242,7 +6242,7 @@ fn slash_command_desc(cmd: &str) -> &'static str {
         "/permissions" => "tool permission level (ask/auto/readonly)",
         "/sandbox" => "OS sandbox for shell commands (off/auto/require)",
         "/add-dir" => "also read and change files in another folder",
-        "/mcp" => "MCP servers: list, <name>, add, remove, reload",
+        "/mcp" => "MCP servers: list, <name>, add, remove, login, logout, reload",
         "/scroll" => "wheel scrolling on/off",
         "/mouse" => "mouse capture on/off",
         "/compact" => "compress context to free token budget",
@@ -8727,6 +8727,8 @@ mod tests {
     fn popup_desc_covers_skills_and_custom_commands() {
         // Builtins keep their static text.
         assert_eq!(popup_desc("/help"), slash_command_desc("/help"));
+        // `/mcp login` is how a server that wants OAuth is used at all.
+        assert!(slash_command_desc("/mcp").contains("login"));
         assert_eq!(
             popup_desc("/local"),
             "probe local servers and list GGUF models"

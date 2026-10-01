@@ -3067,6 +3067,20 @@ pub fn mask(key: &str) -> String {
     format!("{head}…{tail}")
 }
 
+/// Writes a secrets file the way the key file is written: atomically, and
+/// owner-only (0600, or an ACL for the current user alone on Windows).
+pub(crate) fn write_private(path: &std::path::Path, contents: &str) -> bool {
+    write_atomic(path, contents, true)
+}
+
+/// Creates `dir` under NEXUS_HOME, owner-only like the home itself.
+pub(crate) fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    ensure_home();
+    fs::create_dir_all(dir)?;
+    restrict(dir);
+    Ok(())
+}
+
 // Atomic write for user data (settings, keys, memory, history): temp file in
 // the same directory, then rename — a crash mid-save can never truncate the
 // file it replaces. With `restricted`, permissions are tightened on the TEMP

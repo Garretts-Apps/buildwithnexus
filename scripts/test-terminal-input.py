@@ -1034,6 +1034,58 @@ class HelperPromptStopTests(ParallelHelperHarness):
         self.assertEqual(self.output.count(b"allow?"), 1, bytes(self.output[-1500:]))
 
 
+FIXTURES = Path(__file__).resolve().parent.parent / "harness" / "tests" / "fixtures"
+
+
+class McpLoginTests(TerminalHarness):
+    """`/mcp login` inside the TUI against the OAuth fixture server, with a
+    fake `xdg-open` / `open` that loads the URL as a browser would."""
+
+    def extra_env(self):
+        fixture_temp = tempfile.TemporaryDirectory(prefix="bwn-oauth-pty-")
+        self.addCleanup(fixture_temp.cleanup)
+        self.fixture_dir = Path(fixture_temp.name)
+        self.server = subprocess.Popen(
+            [sys.executable, str(FIXTURES / "oauth_mcp_server.py"),
+             "--log", str(self.fixture_dir / "server.log")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self.stop_server)
+        port = int(self.server.stdout.readline().split()[1])
+        self.url = f"http://127.0.0.1:{port}/mcp"
+        bin_dir = self.fixture_dir / "bin"
+        bin_dir.mkdir()
+        for name in ("xdg-open", "open"):
+            opener = bin_dir / name
+            opener.write_text(
+                f"#!/bin/sh\nexec {sys.executable} {FIXTURES / 'fake_browser.py'} \"$@\"\n")
+            opener.chmod(0o755)
+        self.browser_log = self.fixture_dir / "browser.log"
+        return {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+                "FAKE_BROWSER_LOG": str(self.browser_log)}
+
+    def stop_server(self):
+        self.server.kill()
+        self.server.wait()
+        self.server.stdin.close()
+        self.server.stdout.close()
+
+    def test_login_from_the_tui(self):
+        # Configure the server from inside the session, as a user would.
+        self.send(f"/mcp add remote --url {self.url}\r")
+        self.wait_for(lambda: b"needs login: type /mcp login remote" in self.output,
+                      "needs-login notice")
+        self.assertFalse(self.browser_log.exists(), "connecting must not open a browser")
+        self.send("/mcp login remote\r")
+        self.wait_for(lambda: b"signed in to remote" in self.output, "login finished")
+        self.wait_for(lambda: b"remote connected, 2 tools" in self.output, "reconnected")
+        self.assertIn("status 200", self.browser_log.read_text())
+        saved = json.loads((self.home / "mcp-auth" / "remote.json").read_text())
+        self.assertNotIn(saved["access_token"].encode(), bytes(self.output))
+        self.send("/mcp remote\r")
+        self.wait_for(lambda: b"auth: signed in" in self.output, "auth state in /mcp")
+
+
 class CliArgumentTests(unittest.TestCase):
     def run_cli(self, *args):
         with tempfile.TemporaryDirectory(prefix="bwn-cli-test-") as home:

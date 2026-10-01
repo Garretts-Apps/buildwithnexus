@@ -4810,6 +4810,514 @@ fn a_blocked_read_only_mcp_tool_names_the_setting_that_trusts_its_hint() {
     assert!(denied.contains("fake/add says it is read-only"), "{denied}");
 }
 
+// ── MCP OAuth: login, use, refresh, logout ──────────────────────────────────
+// An OAuth-protected HTTP MCP server and its authorization server in one
+// Python process (see the script header), and a fake `xdg-open` / `open`
+// that loads the authorization URL the way a browser would.
+#[cfg(unix)]
+const OAUTH_MCP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/oauth_mcp_server.py"
+);
+#[cfg(unix)]
+const FAKE_BROWSER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fake_browser.py"
+);
+
+#[cfg(unix)]
+struct OAuthFixture {
+    child: std::process::Child,
+    port: u16,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl OAuthFixture {
+    fn start(dir: &Path, extra: &[&str]) -> OAuthFixture {
+        let log = dir.join("oauth-server.log");
+        let mut child = Command::new("python3")
+            .arg(OAUTH_MCP)
+            .arg("--log")
+            .arg(&log)
+            .args(extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the OAuth fixture");
+        let mut first = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut first)
+            .unwrap();
+        let port = first
+            .trim()
+            .strip_prefix("port ")
+            .and_then(|p| p.parse().ok())
+            .expect("fixture prints its port");
+        OAuthFixture { child, port, log }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
+    fn events(&self, kind: &str) -> Vec<Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|e| e["kind"] == kind)
+            .collect()
+    }
+
+    // Every access token stops working, as when the server expires them.
+    fn expire_access_tokens(&self) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        s.write_all(b"POST /_admin/expire HTTP/1.0\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut s, &mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.0 200"), "{reply}");
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OAuthFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+// A directory whose `xdg-open` and `open` are the fake browser, and the log
+// it writes: "open <url>" when started, "status <code> <page>" once loaded.
+#[cfg(unix)]
+fn fake_browser(dir: &Path) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["xdg-open", "open"] {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\nexec python3 {FAKE_BROWSER} \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (path, dir.join("browser.log"))
+}
+
+#[cfg(unix)]
+fn browser_log(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+// Waits for the fake browser's page load to land in its log.
+#[cfg(unix)]
+fn browser_loaded(log: &Path) -> String {
+    for _ in 0..100 {
+        let text = browser_log(log);
+        if text
+            .lines()
+            .any(|l| l.starts_with("status ") || l.starts_with("error "))
+        {
+            return text;
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    browser_log(log)
+}
+
+// `buildwithnexus <args>` with the fake browser first on PATH.
+#[cfg(unix)]
+fn oauth_cli(
+    home: &Path,
+    path: &str,
+    browser: &Path,
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args(args)
+        .current_dir(home)
+        .env("NEXUS_HOME", home)
+        .env("NO_COLOR", "1")
+        .env("PATH", path)
+        .env("FAKE_BROWSER_LOG", browser)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+fn write_oauth_settings(home: &Path, server: Value) {
+    let settings = json!({"mcp_servers": {"remote": server}});
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+}
+
+#[cfg(unix)]
+fn saved_login(home: &Path) -> Value {
+    let text = std::fs::read_to_string(home.join("mcp-auth").join("remote.json"))
+        .expect("the login was saved");
+    serde_json::from_str(&text).unwrap()
+}
+
+// Every file under `dir` except the saved login, as text.
+#[cfg(unix)]
+fn files_besides_login(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            files_besides_login(&p, out);
+        } else if p.parent().and_then(Path::file_name) != Some("mcp-auth".as_ref()) {
+            let bytes = std::fs::read(&p).unwrap_or_default();
+            out.push((p, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_login_use_and_logout() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let fx = OAuthFixture::start(&home, &[]);
+    let (path, blog) = fake_browser(&home);
+    write_oauth_settings(&home, json!({"url": fx.url(), "timeout_secs": 10}));
+    let cli = |args: &[&str]| oauth_cli(&home, &path, &blog, args);
+
+    // Before login the server says what to run instead of an HTTP 401.
+    let (code, out, err) = cli(&["mcp", "list"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("needs login"), "{out}");
+    assert!(out.contains("bwn mcp login remote"), "{out}");
+
+    let (code, out, err) = cli(&["mcp", "login", "remote"]);
+    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    assert!(out.contains("signed in to remote"), "{out}");
+    assert!(out.contains("connected, 2 tools"), "{out}");
+    let opened = browser_loaded(&blog);
+    let auth_url = format!("open http://127.0.0.1:{}/auth/authorize?", fx.port);
+    assert!(opened.contains(&auth_url), "{opened}");
+    assert!(opened.contains("status 200"), "{opened}");
+    // The URL is printed too, for a browser on another screen.
+    assert!(out.contains("/auth/authorize?"), "{out}");
+
+    // Discovery, registration, PKCE and the resource indicator.
+    assert_eq!(fx.events("prm").len(), 1);
+    assert_eq!(fx.events("as_metadata").len(), 1);
+    let reg = &fx.events("register")[0]["request"];
+    let redirect = reg["redirect_uris"][0].as_str().unwrap().to_string();
+    assert!(redirect.starts_with("http://127.0.0.1:"), "{reg}");
+    assert!(redirect.ends_with("/callback"), "{reg}");
+    assert_ne!(redirect, format!("http://127.0.0.1:{}/callback", fx.port));
+    assert_eq!(reg["token_endpoint_auth_method"], "none");
+    let q = &fx.events("authorize")[0]["query"];
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["resource"], fx.url());
+    assert_eq!(q["scope"], "mcp:tools");
+    assert_eq!(q["redirect_uri"], redirect.as_str());
+    assert!(q["state"].as_str().unwrap().len() >= 32, "{q}");
+    let grant = &fx.events("token")[0]["form"];
+    assert_eq!(grant["grant_type"], "authorization_code");
+    assert!(grant["code_verifier"].as_str().unwrap().len() >= 43);
+
+    // Saved owner-only, bound to the server's URL.
+    let file = home.join("mcp-auth").join("remote.json");
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+    let dir_mode = std::fs::metadata(home.join("mcp-auth"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(dir_mode, 0o700, "{dir_mode:o}");
+    let login = saved_login(&home);
+    assert_eq!(login["url"], fx.url());
+    let access = login["access_token"].as_str().unwrap().to_string();
+    let refresh = login["refresh_token"].as_str().unwrap().to_string();
+    assert!(access.starts_with("at-"), "{login}");
+
+    let (code, out, _) = cli(&["mcp", "list"]);
+    assert_eq!(code, Some(0));
+    assert!(out.contains("connected"), "{out}");
+    assert!(out.contains("signed in"), "{out}");
+    let (_, out, _) = cli(&["mcp", "remote"]);
+    assert!(out.contains("auth: signed in"), "{out}");
+    assert!(!out.contains(&access) && !out.contains(&refresh), "{out}");
+
+    // A headless run uses the token; the server echoing it back does not
+    // put it in front of the model, the transcript or the logs.
+    let (port, posts) = serve_recording(vec![
+        tool_call("c1", "mcp__remote__whoami", json!({})),
+        tool_call("c2", "mcp__remote__echo_header", json!({})),
+        finish("used the remote mcp"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "use the tools"],
+        &[("PATH", &path)],
+    );
+    assert!(r.success, "stderr: {}\nevents: {:?}", r.stderr, r.events);
+    let result = |name: &str| {
+        r.events
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["name"] == name)
+            .unwrap_or_else(|| panic!("{name} ran: {:?}", r.events))
+            .clone()
+    };
+    let who = result("mcp__remote__whoami");
+    let client = fx.events("register")[0]["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(who["content"], format!("hello {client}"));
+    let echoed = result("mcp__remote__echo_header");
+    assert_eq!(echoed["content"], "you sent: Bearer [redacted]");
+    let stdout_all: String = r.events.iter().map(|e| e.to_string()).collect();
+    assert!(!stdout_all.contains(&access));
+    assert!(!r.stderr.contains(&access));
+    for body in posts.lock().unwrap().iter() {
+        assert!(!body.contains(&access), "the model was sent the token");
+    }
+    let mut files = Vec::new();
+    files_besides_login(&home, &mut files);
+    files_besides_login(&cwd, &mut files);
+    for (p, text) in &files {
+        if p.ends_with("oauth-server.log") || p.ends_with("browser.log") {
+            continue; // the fixture's own records
+        }
+        assert!(!text.contains(&access), "token in {}", p.display());
+        assert!(!text.contains(&refresh), "refresh token in {}", p.display());
+    }
+
+    let (code, out, err) = cli(&["mcp", "logout", "remote"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("signed out of remote"), "{out}");
+    assert!(!file.exists());
+    let revoked: Vec<String> = fx
+        .events("revoke")
+        .iter()
+        .filter_map(|e| e["token"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(revoked, [refresh]);
+    let (_, out, _) = cli(&["mcp", "list"]);
+    assert!(out.contains("needs login"), "{out}");
+    let (code, _, err) = cli(&["mcp", "logout", "remote"]);
+    assert_eq!(code, Some(1));
+    assert!(err.contains("not signed in to remote"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_refreshes_an_expired_token() {
+    let home = tmp("home");
+    let fx = OAuthFixture::start(&home, &[]);
+    let (path, blog) = fake_browser(&home);
+    write_oauth_settings(&home, json!({"url": fx.url(), "timeout_secs": 10}));
+    let cli = |args: &[&str]| oauth_cli(&home, &path, &blog, args);
+    let (code, out, err) = cli(&["mcp", "login", "remote"]);
+    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    let first = saved_login(&home);
+
+    // The server stops honoring the token: a 401 refreshes it and retries.
+    fx.expire_access_tokens();
+    let (_, out, _) = cli(&["mcp", "list"]);
+    assert!(out.contains("connected"), "{out}");
+    let refreshes = |fx: &OAuthFixture| {
+        fx.events("token")
+            .into_iter()
+            .filter(|e| e["form"]["grant_type"] == "refresh_token")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(refreshes(&fx).len(), 1);
+    assert_eq!(
+        refreshes(&fx)[0]["form"]["refresh_token"],
+        first["refresh_token"]
+    );
+    assert_eq!(refreshes(&fx)[0]["form"]["resource"], fx.url());
+    let second = saved_login(&home);
+    assert_ne!(second["access_token"], first["access_token"]);
+    assert_ne!(second["refresh_token"], first["refresh_token"]);
+
+    // A token past its expiry is refreshed before it is sent at all.
+    let mut aged = second.clone();
+    aged["expires_at"] = json!(1);
+    std::fs::write(home.join("mcp-auth").join("remote.json"), aged.to_string()).unwrap();
+    let unauthorized = |fx: &OAuthFixture| {
+        fx.events("mcp")
+            .iter()
+            .filter(|e| e["status"] == 401)
+            .count()
+    };
+    let before = unauthorized(&fx);
+    let (_, out, _) = cli(&["mcp", "list"]);
+    assert!(out.contains("connected"), "{out}");
+    assert_eq!(refreshes(&fx).len(), 2);
+    assert_eq!(unauthorized(&fx), before, "the expired token was sent");
+    let third = saved_login(&home);
+    assert_ne!(third["access_token"], second["access_token"]);
+    assert!(third["expires_at"].as_u64().unwrap() > 1);
+
+    // A refresh token the server no longer knows means signing in again.
+    fx.expire_access_tokens();
+    let mut dead = third.clone();
+    dead["refresh_token"] = json!("rt-unknown");
+    std::fs::write(home.join("mcp-auth").join("remote.json"), dead.to_string()).unwrap();
+    let (_, out, _) = cli(&["mcp", "list"]);
+    assert!(out.contains("needs login"), "{out}");
+    assert!(out.contains("bwn mcp login remote"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_headless_run_never_opens_a_browser() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let fx = OAuthFixture::start(&home, &[]);
+    let (path, blog) = fake_browser(&home);
+    write_oauth_settings(&home, json!({"url": fx.url(), "timeout_secs": 10}));
+    let port = serve(vec![finish("done")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "use the tools"],
+        &[
+            ("PATH", &path),
+            ("FAKE_BROWSER_LOG", &blog.to_string_lossy()),
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let notices = r.text_of("notice");
+    assert!(
+        notices.contains("mcp: remote needs login: run `bwn mcp login remote`"),
+        "{notices}"
+    );
+    assert!(
+        !blog.exists(),
+        "a browser was opened: {}",
+        browser_log(&blog)
+    );
+    assert!(fx.events("authorize").is_empty());
+    assert!(fx.events("register").is_empty());
+    assert!(!home.join("mcp-auth").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_login_rejects_a_state_mismatch() {
+    let home = tmp("home");
+    let fx = OAuthFixture::start(&home, &["--bad-state"]);
+    let (path, blog) = fake_browser(&home);
+    write_oauth_settings(&home, json!({"url": fx.url(), "timeout_secs": 10}));
+    let (code, out, err) = oauth_cli(&home, &path, &blog, &["mcp", "login", "remote"]);
+    assert_eq!(code, Some(1), "stdout: {out}\nstderr: {err}");
+    assert!(err.contains("state"), "{err}");
+    let page = browser_loaded(&blog);
+    assert!(page.contains("status 400"), "{page}");
+    // The forged redirect's code was never exchanged.
+    assert!(fx.events("token").is_empty());
+    assert!(!home.join("mcp-auth").join("remote.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_login_without_a_browser_waits_for_the_printed_url() {
+    let home = tmp("home");
+    let fx = OAuthFixture::start(&home, &[]);
+    write_oauth_settings(&home, json!({"url": fx.url()}));
+    // No opener on PATH, as over SSH: the URL printed is the way in.
+    let empty = home.join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let mut child = cmd
+        .args(["mcp", "login", "remote"])
+        .current_dir(&home)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .env("PATH", &empty)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut seen = Vec::new();
+    let url = loop {
+        let line = lines.next().expect("a line").unwrap();
+        seen.push(line.clone());
+        if let Some(u) = line.split("visit ").nth(1) {
+            break u.trim().to_string();
+        }
+    };
+    let opened = Command::new("python3")
+        .args([
+            "-c",
+            "import sys, urllib.request; urllib.request.urlopen(sys.argv[1])",
+            &url,
+        ])
+        .status()
+        .unwrap();
+    assert!(opened.success());
+    seen.extend(lines.map_while(Result::ok));
+    let status = child.wait().unwrap();
+    let out = seen.join("\n");
+    assert!(status.success(), "{out}");
+    assert!(out.contains("Could not open a browser"), "{out}");
+    assert!(out.contains("signed in to remote"), "{out}");
+    assert!(saved_login(&home)["access_token"]
+        .as_str()
+        .unwrap()
+        .starts_with("at-"));
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_oauth_uses_a_configured_client_id_without_registration() {
+    let home = tmp("home");
+    let fx = OAuthFixture::start(&home, &["--no-registration", "--static-client", "cli-123"]);
+    let (path, blog) = fake_browser(&home);
+
+    // No registration endpoint and no client id: say which setting to add.
+    write_oauth_settings(&home, json!({"url": fx.url()}));
+    let (code, _, err) = oauth_cli(&home, &path, &blog, &["mcp", "login", "remote"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("oauth.client_id"), "{err}");
+    assert!(!blog.exists());
+
+    write_oauth_settings(
+        &home,
+        json!({"url": fx.url(), "oauth": {"client_id": "cli-123"}}),
+    );
+    let (code, out, err) = oauth_cli(&home, &path, &blog, &["mcp", "login", "remote"]);
+    assert_eq!(code, Some(0), "stdout: {out}\nstderr: {err}");
+    assert!(fx.events("register").is_empty());
+    assert_eq!(fx.events("authorize")[0]["query"]["client_id"], "cli-123");
+    assert_eq!(saved_login(&home)["client_id"], "cli-123");
+}
+
 // ── update ──────────────────────────────────────────────────────────────────
 
 // A registry that says `version` is the latest buildwithnexus.

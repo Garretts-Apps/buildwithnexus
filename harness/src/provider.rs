@@ -1638,7 +1638,7 @@ fn retry_after_ms(header: Option<&str>) -> Option<u64> {
 
 // Defense-in-depth: blank out anything that looks like an API key/token before
 // surfacing an upstream error body to the user or logs.
-fn redact(s: &str) -> String {
+pub(crate) fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
         .map(|tok| {
             let core =

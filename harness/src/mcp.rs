@@ -58,6 +58,8 @@ pub struct ServerConfig {
     /// `timeout_secs` was set for this server: a headless run waits for it
     /// that long instead of HEADLESS_WAIT.
     pub timeout_set: bool,
+    /// `oauth`: a pre-registered client for `mcp login` (http only).
+    pub oauth: crate::mcp_auth::OAuthSettings,
 }
 
 impl ServerConfig {
@@ -166,6 +168,12 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
             }
         },
     };
+    if kind == "stdio" && obj.get("oauth").is_some_and(|o| !o.is_null()) {
+        return Err(format!(
+            "mcp_servers.{name}: oauth applies to http servers only"
+        ));
+    }
+    let oauth = crate::mcp_auth::parse_settings(name, obj.get("oauth"))?;
     let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     let trust_read_only_hints = obj
         .get("trust_read_only_hints")
@@ -178,6 +186,7 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         enabled,
         trust_read_only_hints,
         timeout_set: !matches!(obj.get("timeout_secs"), None | Some(Value::Null)),
+        oauth,
     })
 }
 
@@ -339,12 +348,15 @@ pub enum RpcError {
     Remote(String),
     /// Timeout, exit, or I/O failure: the connection is unusable.
     Transport(String),
+    /// HTTP 401 with no token that works; holds why (empty when the server
+    /// was never signed in to).
+    Unauthorized(String),
 }
 
 impl RpcError {
     pub fn message(&self) -> &str {
         match self {
-            RpcError::Remote(m) | RpcError::Transport(m) => m,
+            RpcError::Remote(m) | RpcError::Transport(m) | RpcError::Unauthorized(m) => m,
         }
     }
 }
@@ -528,6 +540,8 @@ pub struct HttpConn {
     session_id: Option<String>,
     agent: ureq::Agent,
     next_id: u64,
+    // OAuth for a server whose settings send no Authorization header.
+    auth: Option<crate::mcp_auth::Session>,
 }
 
 impl HttpConn {
@@ -540,50 +554,100 @@ impl HttpConn {
                 .agent_for(url)
                 .clone(),
             next_id: 1,
+            auth: None,
         }
+    }
+
+    /// Sends `server`'s saved OAuth token (see mcp_auth) and answers a 401
+    /// with a refresh or a needs-login error. An Authorization header in
+    /// settings wins: that server is left as configured.
+    pub fn with_oauth(mut self, server: &str) -> Self {
+        if !has_authorization(&self.headers) {
+            self.auth = Some(crate::mcp_auth::Session::new(server, &self.url));
+        }
+        self
     }
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
 
-    fn post(&mut self, body: &Value) -> Result<ureq::Response, RpcError> {
-        let mut req = self
-            .agent
-            .post(&self.url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json, text/event-stream")
-            .set("MCP-Protocol-Version", PROTOCOL_VERSION);
-        for (k, v) in &self.headers {
-            req = req.set(k, v);
+    fn scrub(&self, s: &str) -> String {
+        match &self.auth {
+            Some(a) => a.scrub(s),
+            None => s.to_string(),
         }
-        if let Some(sid) = &self.session_id {
-            req = req.set("Mcp-Session-Id", sid);
-        }
-        let resp = match req.send_string(&body.to_string()) {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, r)) => {
-                let text = r.into_string().unwrap_or_default();
-                let snippet: String = text.chars().take(200).collect();
-                let hint = if code == 404 && self.session_id.is_some() {
-                    " (session expired)"
-                } else {
-                    ""
-                };
-                return Err(RpcError::Transport(format!(
-                    "HTTP {code}{hint}: {}",
-                    snippet.trim()
-                )));
-            }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(RpcError::Transport(format!("{t}")));
-            }
-        };
-        if let Some(sid) = resp.header("mcp-session-id") {
-            self.session_id = Some(sid.to_string());
-        }
-        Ok(resp)
     }
+
+    fn post(&mut self, body: &Value) -> Result<ureq::Response, RpcError> {
+        let mut retried = false;
+        loop {
+            let bearer = self.auth.as_mut().and_then(|a| a.bearer());
+            let mut req = self
+                .agent
+                .post(&self.url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream")
+                .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+            for (k, v) in &self.headers {
+                req = req.set(k, v);
+            }
+            if let Some(t) = &bearer {
+                req = req.set("Authorization", &format!("Bearer {t}"));
+            }
+            if let Some(sid) = &self.session_id {
+                req = req.set("Mcp-Session-Id", sid);
+            }
+            let resp = match req.send_string(&body.to_string()) {
+                Ok(r) => r,
+                // A login is what is missing when a token was refused or
+                // the server asks for one; any other 401 (an API key the
+                // settings lack) is reported as it came.
+                Err(ureq::Error::Status(401, r))
+                    if self.auth.is_some() && (bearer.is_some() || asks_for_bearer(&r)) =>
+                {
+                    let auth = self.auth.as_mut().expect("checked above");
+                    if !retried && auth.recover(bearer.as_deref()) {
+                        retried = true;
+                        continue;
+                    }
+                    return Err(RpcError::Unauthorized(auth.login_reason()));
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    let text = r.into_string().unwrap_or_default();
+                    let snippet: String = text.chars().take(200).collect();
+                    let hint = if code == 404 && self.session_id.is_some() {
+                        " (session expired)"
+                    } else {
+                        ""
+                    };
+                    return Err(RpcError::Transport(
+                        self.scrub(&format!("HTTP {code}{hint}: {}", snippet.trim())),
+                    ));
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    return Err(RpcError::Transport(self.scrub(&format!("{t}"))));
+                }
+            };
+            if let Some(sid) = resp.header("mcp-session-id") {
+                self.session_id = Some(sid.to_string());
+            }
+            return Ok(resp);
+        }
+    }
+}
+
+fn asks_for_bearer(r: &ureq::Response) -> bool {
+    r.all("www-authenticate").iter().any(|h| {
+        h.split(|c: char| c == ',' || c.is_whitespace())
+            .any(|w| w.eq_ignore_ascii_case("bearer"))
+    })
+}
+
+fn has_authorization(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
 }
 
 /// Finds the response with `id` in a JSON body — a single object, or a
@@ -647,7 +711,36 @@ pub fn read_sse_response(reader: impl Read, id: u64) -> Result<Value, RpcError> 
 }
 
 impl Rpc for HttpConn {
+    // Whatever the server sends back reaches the model, the transcript and
+    // the terminal: a server echoing the token it was sent has it scrubbed.
     fn request(&mut self, method: &str, params: Option<&Value>) -> Result<Value, RpcError> {
+        let result = self.request_raw(method, params);
+        let Some(auth) = &self.auth else {
+            return result;
+        };
+        match result {
+            Ok(mut v) => {
+                auth.scrub_value(&mut v);
+                Ok(v)
+            }
+            Err(RpcError::Remote(m)) => Err(RpcError::Remote(auth.scrub(&m))),
+            Err(RpcError::Transport(m)) => Err(RpcError::Transport(auth.scrub(&m))),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Option<&Value>) -> Result<(), RpcError> {
+        let mut body = json!({"jsonrpc": "2.0", "method": method});
+        if let Some(p) = params {
+            body["params"] = p.clone();
+        }
+        // 202 Accepted with no body is the normal answer; any 2xx is fine.
+        self.post(&body).map(|_| ())
+    }
+}
+
+impl HttpConn {
+    fn request_raw(&mut self, method: &str, params: Option<&Value>) -> Result<Value, RpcError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut body = json!({"jsonrpc": "2.0", "id": id, "method": method});
@@ -679,15 +772,6 @@ impl Rpc for HttpConn {
                 "response did not answer request {id}"
             ))),
         }
-    }
-
-    fn notify(&mut self, method: &str, params: Option<&Value>) -> Result<(), RpcError> {
-        let mut body = json!({"jsonrpc": "2.0", "method": method});
-        if let Some(p) = params {
-            body["params"] = p.clone();
-        }
-        // 202 Accepted with no body is the normal answer; any 2xx is fine.
-        self.post(&body).map(|_| ())
     }
 }
 
@@ -788,9 +872,19 @@ pub enum Status {
     Connecting,
     Connected,
     Failed(String),
+    /// The server wants an OAuth login; holds why, as `Unauthorized` does.
+    NeedsAuth(String),
 }
 
 impl Status {
+    /// The error a failed status carries, empty otherwise.
+    pub fn detail(&self) -> &str {
+        match self {
+            Status::Invalid(e) | Status::Failed(e) | Status::NeedsAuth(e) => e,
+            _ => "",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Status::Disabled => "disabled",
@@ -798,6 +892,7 @@ impl Status {
             Status::Connecting => "connecting",
             Status::Connected => "connected",
             Status::Failed(_) => "failed",
+            Status::NeedsAuth(_) => "needs login",
         }
     }
 }
@@ -838,17 +933,23 @@ fn lock_state(s: &Arc<Mutex<ServerState>>) -> std::sync::MutexGuard<'_, ServerSt
 // A live connection plus the server's "name version" and its tools.
 type Connected = (Box<dyn Rpc>, String, Vec<McpTool>);
 
-fn connect(cfg: &ServerConfig) -> Result<Connected, String> {
+// Never signs in: a server that wants a login comes back NeedsAuth, and only
+// `mcp login` opens a browser.
+fn connect(cfg: &ServerConfig) -> Result<Connected, Status> {
     let mut conn: Box<dyn Rpc> = match &cfg.transport {
         Transport::Stdio { command, args, env } => {
-            Box::new(StdioConn::spawn(command, args, env, cfg.timeout)?)
+            Box::new(StdioConn::spawn(command, args, env, cfg.timeout).map_err(Status::Failed)?)
         }
-        Transport::Http { url, headers } => Box::new(HttpConn::new(url, headers, cfg.timeout)),
+        Transport::Http { url, headers } => {
+            Box::new(HttpConn::new(url, headers, cfg.timeout).with_oauth(&cfg.name))
+        }
     };
-    let info =
-        handshake(conn.as_mut()).map_err(|e| format!("initialize failed: {}", e.message()))?;
-    let tools = list_tools(conn.as_mut(), &cfg.name)
-        .map_err(|e| format!("tools/list failed: {}", e.message()))?;
+    let failed = |step: &str, e: RpcError| match e {
+        RpcError::Unauthorized(m) => Status::NeedsAuth(m),
+        e => Status::Failed(format!("{step} failed: {}", e.message())),
+    };
+    let info = handshake(conn.as_mut()).map_err(|e| failed("initialize", e))?;
+    let tools = list_tools(conn.as_mut(), &cfg.name).map_err(|e| failed("tools/list", e))?;
     Ok((conn, info, tools))
 }
 
@@ -918,12 +1019,19 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
                         true,
                     )
                 }
-                Err(e) => {
+                Err(status) => {
+                    let notice = match &status {
+                        Status::NeedsAuth(why) => format!(
+                            "mcp: {name} needs login: {}",
+                            crate::mcp_auth::login_hint(&name, why)
+                        ),
+                        other => format!("mcp: {name} failed: {}", other.detail()),
+                    };
                     let mut st = lock_state(&state);
                     if generation == reg.generation {
-                        st.status = Status::Failed(e.clone());
+                        st.status = status;
                     }
-                    (format!("mcp: {name} failed: {e}"), false)
+                    (notice, false)
                 }
             };
             if generation == reg.generation {
@@ -1104,6 +1212,12 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), St
         Status::Invalid(e) | Status::Failed(e) => {
             return Err(format!("MCP server '{server}' is unavailable: {e}"))
         }
+        Status::NeedsAuth(why) => {
+            return Err(format!(
+                "MCP server '{server}' needs login: {}",
+                crate::mcp_auth::login_hint(server, why)
+            ))
+        }
     }
     let Some(conn) = st.conn.as_mut() else {
         return Err(format!("MCP server '{server}' has no connection"));
@@ -1111,6 +1225,18 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), St
     match call_tool(conn.as_mut(), tool, args) {
         Ok(r) => Ok(r),
         Err(RpcError::Remote(m)) => Err(format!("MCP server '{server}' error: {m}")),
+        Err(RpcError::Unauthorized(why)) => {
+            st.conn = None;
+            st.tools.clear();
+            st.status = Status::NeedsAuth(why.clone());
+            drop(st);
+            let hint = crate::mcp_auth::login_hint(server, &why);
+            registry().notices.push((
+                format!("mcp: {server} needs login: {hint}; its tools are gone until then"),
+                false,
+            ));
+            Err(format!("MCP server '{server}' needs login: {hint}"))
+        }
         Err(RpcError::Transport(m)) => {
             st.conn = None;
             st.tools.clear();
@@ -1162,6 +1288,20 @@ pub struct ServerReport {
     pub status: Status,
     pub server_info: String,
     pub tools: Vec<McpTool>,
+    /// How an http server is signed in to; None for stdio.
+    pub auth: Option<String>,
+}
+
+// "signed in (token expires in 50m)", "not signed in", or the header that
+// stands in for a login. Never the token.
+fn auth_state(cfg: &ServerConfig) -> Option<String> {
+    match &cfg.transport {
+        Transport::Http { headers, .. } if has_authorization(headers) => {
+            Some("Authorization header from settings".into())
+        }
+        Transport::Http { url, .. } => Some(crate::mcp_auth::describe(&cfg.name, url)),
+        Transport::Stdio { .. } => None,
+    }
 }
 
 pub fn report() -> Vec<ServerReport> {
@@ -1179,6 +1319,7 @@ pub fn report() -> Vec<ServerReport> {
                 status: st.status.clone(),
                 server_info: st.server_info.clone(),
                 tools: st.tools.clone(),
+                auth: st.config.as_ref().and_then(auth_state),
             }
         })
         .collect()
@@ -1217,9 +1358,16 @@ fn status_lines() -> Vec<String> {
     let mut lines = Vec::new();
     for r in reports {
         let n = r.tools.len();
+        // A login is worth a mention only where there is one.
+        let signed_in = r
+            .auth
+            .as_deref()
+            .filter(|a| a.starts_with("signed in"))
+            .map(|a| format!(" · {a}"))
+            .unwrap_or_default();
         let detail = match &r.status {
             Status::Connected => format!(
-                "{n} tool{}{}",
+                "{n} tool{}{}{signed_in}",
                 plural(n),
                 if r.server_info.is_empty() {
                     String::new()
@@ -1228,11 +1376,12 @@ fn status_lines() -> Vec<String> {
                 }
             ),
             Status::Failed(e) | Status::Invalid(e) => clip(e, 100),
+            Status::NeedsAuth(why) => clip(&crate::mcp_auth::login_hint(&r.name, why), 100),
             Status::Disabled => "enabled: false".into(),
             Status::Connecting => "discovery in progress".into(),
         };
         lines.push(format!(
-            "{:<16} {:<6} {:<10} {detail}",
+            "{:<16} {:<6} {:<11} {detail}",
             r.name,
             r.transport,
             r.status.label()
@@ -1253,9 +1402,13 @@ fn server_lines(name: &str) -> Result<Vec<String>, String> {
         r.status.label(),
         match &r.status {
             Status::Failed(e) | Status::Invalid(e) => format!(": {e}"),
+            Status::NeedsAuth(why) => format!(": {}", crate::mcp_auth::login_hint(name, why)),
             _ => String::new(),
         }
     )];
+    if let Some(auth) = &r.auth {
+        lines.push(format!("  auth: {auth}"));
+    }
     if r.status == Status::Connected {
         if r.tools.is_empty() {
             lines.push("  (no tools)".into());
@@ -1271,8 +1424,9 @@ fn server_lines(name: &str) -> Result<Vec<String>, String> {
 
 /// Parses `add <name> <command> [args...]` / `add <name> --url <url>
 /// [--header K=V]…` into a settings entry. Options (`--url`, `--header`,
-/// `--env`, `--timeout`) are read until the first bare token, which starts
-/// the stdio command; everything after it belongs to the server.
+/// `--env`, `--timeout`, `--client-id`, `--callback-port`) are read until the
+/// first bare token, which starts the stdio command; everything after it
+/// belongs to the server.
 pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
     let usage = "usage: mcp add <name> <command> [args...]  |  mcp add <name> --url <url> [--header K=V]...";
     let name = args.first().map(|s| s.trim()).unwrap_or("");
@@ -1283,6 +1437,7 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
     let mut headers = serde_json::Map::new();
     let mut env = serde_json::Map::new();
     let mut timeout: Option<u64> = None;
+    let mut oauth = serde_json::Map::new();
     let mut i = 1;
     let kv = |flag: &str, raw: &str| -> Result<(String, Value), String> {
         match raw.split_once('=') {
@@ -1324,6 +1479,19 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
                 i += 1;
                 break;
             }
+            "--client-id" => {
+                oauth.insert("client_id".into(), json!(value(i)?));
+                i += 2;
+            }
+            "--callback-port" => {
+                let p: u16 = value(i)?
+                    .parse()
+                    .ok()
+                    .filter(|p| *p > 0)
+                    .ok_or("--callback-port expects a port number")?;
+                oauth.insert("callback_port".into(), json!(p));
+                i += 2;
+            }
             _ => break,
         }
     }
@@ -1343,10 +1511,16 @@ pub fn parse_add(args: &[String]) -> Result<(String, Value), String> {
             if !headers.is_empty() {
                 entry.insert("headers".into(), Value::Object(headers));
             }
+            if !oauth.is_empty() {
+                entry.insert("oauth".into(), Value::Object(oauth));
+            }
         }
         (None, false) => {
             if !headers.is_empty() {
                 return Err("--header only applies to --url servers".into());
+            }
+            if !oauth.is_empty() {
+                return Err("--client-id and --callback-port only apply to --url servers".into());
             }
             entry.insert("type".into(), json!("stdio"));
             entry.insert("command".into(), json!(command[0]));
@@ -1385,7 +1559,8 @@ fn take_force(args: &[String]) -> (bool, Vec<String>) {
             continue;
         }
         match a.as_str() {
-            "--url" | "--header" | "-H" | "--env" | "-e" | "--timeout" => {
+            "--url" | "--header" | "-H" | "--env" | "-e" | "--timeout" | "--client-id"
+            | "--callback-port" => {
                 out.extend(it.next().cloned());
             }
             _ => {
@@ -1397,20 +1572,100 @@ fn take_force(args: &[String]) -> (bool, Vec<String>) {
     (force, out)
 }
 
+// How `mcp login` / `mcp logout` errors start when the command was right
+// but could not be carried out.
+const LOGIN_FAILED: &str = "login failed";
+const LOGOUT_FAILED: &str = "logout failed";
+const NOT_SIGNED_IN: &str = "not signed in to";
+
+/// The exit status for a `buildwithnexus mcp` error: 1 when the command was
+/// fine but could not be carried out, 2 for a usage mistake.
+pub fn exit_code(err: &str) -> i32 {
+    let failed = [LOGIN_FAILED, LOGOUT_FAILED, NOT_SIGNED_IN]
+        .iter()
+        .any(|p| err.starts_with(p));
+    if failed || err.ends_with(EXISTS) {
+        1
+    } else {
+        2
+    }
+}
+
 /// Runs one management command and returns the lines to print. `connect`
-/// makes `add`/`remove` reload the live session afterwards (the REPL); the
-/// CLI passes false so scripting never spawns servers.
-pub fn manage(args: &[String], connect: bool) -> Result<Vec<String>, String> {
+/// makes `add`/`remove`/`login` reload the live session afterwards (the
+/// REPL); the CLI passes false so scripting never spawns servers. `say`
+/// prints progress a command shows before it returns (the login URL).
+pub fn manage(
+    args: &[String],
+    connect: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, String> {
     // Server names, serverInfo, tool descriptions and error text come from
     // servers and settings files: neutralize them here, once, for both
     // `/mcp` and `buildwithnexus mcp`.
     let safe = |s: String| crate::tui::sanitize_terminal(&s).into_owned();
-    manage_lines(args, connect)
+    let mut say_safe = |s: &str| say(&safe(s.to_string()));
+    manage_lines(args, connect, &mut say_safe)
         .map(|lines| lines.into_iter().map(safe).collect())
         .map_err(safe)
 }
 
-fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
+// The configured server `name`, as settings (user and trusted project
+// layers) define it now.
+fn configured(name: &str) -> Result<ServerConfig, String> {
+    let servers = config::load_settings()
+        .map(|s| s.mcp_servers)
+        .unwrap_or_default();
+    let raw = servers
+        .get(name)
+        .ok_or_else(|| format!("no MCP server named '{name}' — /mcp to list them"))?;
+    parse_server(name, raw)
+}
+
+fn login(name: &str, connect: bool, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, String> {
+    let cfg = configured(name)?;
+    let failed = |e: String| format!("{LOGIN_FAILED} for {name}: {e}");
+    let Transport::Http { url, headers } = &cfg.transport else {
+        return Err(failed(
+            "it is a stdio server; signing in applies to http servers".into(),
+        ));
+    };
+    if has_authorization(headers) {
+        return Err(failed(format!(
+            "it sends an Authorization header from settings; remove it from \
+             mcp_servers.{name}.headers to sign in with OAuth instead"
+        )));
+    }
+    let path = crate::mcp_auth::login(name, url, &cfg.oauth, say).map_err(failed)?;
+    let mut lines = vec![format!("signed in to {name}; saved to {}", path.display())];
+    if connect {
+        reload();
+        wait_ready(wait_budget());
+        lines.extend(drain_notices().into_iter().map(|(m, _)| m));
+    } else {
+        // An http server spawns nothing, so the CLI can prove the token.
+        lines.push(match connect_once(&cfg) {
+            Ok(n) => format!("{name} connected, {n} tool{}", plural(n)),
+            Err(e) => format!("{name} did not connect with the new login: {e}"),
+        });
+    }
+    Ok(lines)
+}
+
+fn connect_once(cfg: &ServerConfig) -> Result<usize, String> {
+    connect(cfg)
+        .map(|(_, _, tools)| tools.len())
+        .map_err(|s| match s {
+            Status::NeedsAuth(why) if why.is_empty() => "it still asks for a login".into(),
+            other => other.detail().to_string(),
+        })
+}
+
+fn manage_lines(
+    args: &[String],
+    connect: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<Vec<String>, String> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
         "list" | "ls" | "status" => {
@@ -1479,12 +1734,37 @@ fn manage_lines(args: &[String], connect: bool) -> Result<Vec<String>, String> {
             }
             Ok(lines)
         }
+        "login" => {
+            let name = args.get(1).map(|s| s.trim()).unwrap_or("");
+            if name.is_empty() {
+                return Err("usage: mcp login <name>".into());
+            }
+            login(name, connect, say)
+        }
+        "logout" => {
+            let name = args.get(1).map(|s| s.trim()).unwrap_or("");
+            if name.is_empty() {
+                return Err("usage: mcp logout <name>".into());
+            }
+            let mut lines = crate::mcp_auth::logout(name)
+                .map_err(|e| format!("{LOGOUT_FAILED} for {name}: {e}"))?
+                .ok_or_else(|| format!("{NOT_SIGNED_IN} {name}"))?;
+            if connect {
+                reload();
+                wait_ready(wait_budget());
+                lines.extend(drain_notices().into_iter().map(|(m, _)| m));
+            }
+            Ok(lines)
+        }
         "help" | "-h" | "--help" => Ok(vec![
             "mcp                       list servers (transport, status, tool count)".into(),
             "mcp <name>                list a server's tools".into(),
             "mcp add [--force] <name> <command> [args...]".into(),
             "mcp add <name> --url <url> [--header K=V]... [--timeout <secs>]".into(),
+            "        [--client-id <id>] [--callback-port <port>]".into(),
             "mcp remove <name>".into(),
+            "mcp login <name>          sign in to an http server that asks for OAuth".into(),
+            "mcp logout <name>         revoke and forget that sign-in".into(),
             "mcp reload                reconnect every server".into(),
         ]),
         name => {
@@ -1582,6 +1862,45 @@ mod tests {
                 .unwrap_err()
                 .contains("timeout_secs")
         );
+    }
+
+    #[test]
+    fn oauth_settings_belong_to_http_servers() {
+        let cfg = parse_server(
+            "h",
+            &json!({"url": "https://h/mcp", "oauth": {"client_id": "cli", "callback_port": 9876}}),
+        )
+        .unwrap();
+        assert_eq!(cfg.oauth.client_id.as_deref(), Some("cli"));
+        assert_eq!(cfg.oauth.callback_port, Some(9876));
+        assert_eq!(
+            parse_server("h", &json!({"url": "https://h/mcp"}))
+                .unwrap()
+                .oauth,
+            crate::mcp_auth::OAuthSettings::default()
+        );
+        assert!(
+            parse_server("s", &json!({"command": "x", "oauth": {"client_id": "c"}}))
+                .unwrap_err()
+                .contains("http servers only")
+        );
+        assert!(parse_server(
+            "h",
+            &json!({"url": "https://h", "oauth": {"callback_port": "x"}})
+        )
+        .unwrap_err()
+        .contains("callback_port"));
+    }
+
+    #[test]
+    fn login_failures_exit_1_and_mistakes_exit_2() {
+        assert_eq!(exit_code(&format!("fs {EXISTS}")), 1);
+        assert_eq!(exit_code("login failed for h: state mismatch"), 1);
+        assert_eq!(exit_code("logout failed for h: cannot remove"), 1);
+        assert_eq!(exit_code("not signed in to h"), 1);
+        assert_eq!(exit_code("usage: mcp login <name>"), 2);
+        assert_eq!(exit_code("no MCP server named 'x' — /mcp to list them"), 2);
+        assert_eq!(Status::NeedsAuth(String::new()).label(), "needs login");
     }
 
     // ── naming ──────────────────────────────────────────────────────────
@@ -2027,6 +2346,74 @@ mod tests {
         assert_eq!(header(&seen[2].0, "mcp-session-id"), Some("sess-42"));
     }
 
+    type Seen = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+    // One canned reply per connection, for the 401 paths; returns the port
+    // and each request's headers.
+    fn serve_replies(replies: Vec<String>) -> (u16, Seen) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for (stream, reply) in listener.incoming().zip(replies) {
+                let mut stream = stream.unwrap();
+                let (headers, _) = read_http_request(&mut stream);
+                seen2.lock().unwrap().push(headers);
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        (port, seen)
+    }
+
+    fn unauthorized(challenge: Option<&str>) -> String {
+        let h = challenge
+            .map(|c| format!("WWW-Authenticate: {c}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 401 Unauthorized\r\n{h}Content-Length: 6\r\nConnection: close\r\n\r\nno-key"
+        )
+    }
+
+    #[test]
+    fn a_bearer_challenge_means_needs_login_and_other_401s_stay_errors() {
+        // No saved login can exist under this name.
+        let server = format!("unit-401-{}", std::process::id());
+        let bearer =
+            r#"Bearer resource_metadata="http://127.0.0.1:1/.well-known/oauth-protected-resource""#;
+        let (port, seen) = serve_replies(vec![unauthorized(Some(bearer))]);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let mut conn = HttpConn::new(&url, &[], Duration::from_secs(5)).with_oauth(&server);
+        assert_eq!(
+            handshake(&mut conn).unwrap_err(),
+            RpcError::Unauthorized(String::new())
+        );
+        assert_eq!(header(&seen.lock().unwrap()[0], "authorization"), None);
+
+        // An API-key server that refuses: what it said, not a login hint.
+        let (port, _) = serve_replies(vec![unauthorized(Some("Basic realm=\"k\""))]);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let mut conn = HttpConn::new(&url, &[], Duration::from_secs(5)).with_oauth(&server);
+        assert!(matches!(
+            handshake(&mut conn).unwrap_err(),
+            RpcError::Transport(m) if m.contains("HTTP 401") && m.contains("no-key")
+        ));
+
+        // An Authorization header in settings opts the server out of OAuth.
+        let (port, seen) = serve_replies(vec![unauthorized(Some(bearer))]);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let headers = vec![("authorization".to_string(), "Bearer static".to_string())];
+        let mut conn = HttpConn::new(&url, &headers, Duration::from_secs(5)).with_oauth(&server);
+        assert!(matches!(
+            handshake(&mut conn).unwrap_err(),
+            RpcError::Transport(m) if m.contains("HTTP 401")
+        ));
+        assert_eq!(
+            header(&seen.lock().unwrap()[0], "authorization"),
+            Some("Bearer static")
+        );
+    }
+
     // ── registry: one end-to-end pass over the real fixture ─────────────
     // A single test owns the process-wide registry so parallel tests never
     // race on reload; `mcp_call`'s "not found" test only needs its server to
@@ -2175,6 +2562,30 @@ mod tests {
             take_force(&s(&["fs", "srv", "--force"])),
             (false, s(&["fs", "srv", "--force"]))
         );
+        assert_eq!(
+            take_force(&s(&[
+                "h",
+                "--client-id",
+                "c",
+                "--callback-port",
+                "9",
+                "--force",
+                "--url",
+                "https://h"
+            ])),
+            (
+                true,
+                s(&[
+                    "h",
+                    "--client-id",
+                    "c",
+                    "--callback-port",
+                    "9",
+                    "--url",
+                    "https://h"
+                ])
+            )
+        );
         let set = parse_server("x", &json!({"command": "c", "timeout_secs": 9})).unwrap();
         let unset = parse_server("x", &json!({"command": "c"})).unwrap();
         assert!(set.timeout_set && !unset.timeout_set);
@@ -2214,6 +2625,21 @@ mod tests {
             entry,
             json!({"type": "stdio", "command": "cmd", "env": {"TOKEN": "x"}})
         );
+        let (_, entry) = parse_add(&s(&[
+            "o",
+            "--url",
+            "https://o/mcp",
+            "--client-id",
+            "my-app",
+            "--callback-port",
+            "33418",
+        ]))
+        .unwrap();
+        assert_eq!(
+            entry,
+            json!({"type": "http", "url": "https://o/mcp", "oauth": {"client_id": "my-app", "callback_port": 33418}})
+        );
+        assert!(parse_server("o", &entry).is_ok());
     }
 
     #[test]
@@ -2240,5 +2666,13 @@ mod tests {
         assert!(parse_add(&s(&["x", "--url"]))
             .unwrap_err()
             .contains("needs a value"));
+        assert!(parse_add(&s(&["x", "--client-id", "c", "cmd"]))
+            .unwrap_err()
+            .contains("--url"));
+        assert!(
+            parse_add(&s(&["x", "--callback-port", "0", "--url", "http://h"]))
+                .unwrap_err()
+                .contains("port number")
+        );
     }
 }
