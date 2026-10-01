@@ -2784,8 +2784,9 @@ fn build_turn(
         images,
     );
     // Saved before the first request too, so a run killed mid-request
-    // still leaves its task on disk to resume.
-    if let Some(sid) = sid {
+    // still leaves its task on disk to resume; not a message the request
+    // will refuse as bigger than the window, which never joins it.
+    if let Some(sid) = sid.filter(|_| provider::oversized_message(p, msgs).is_none()) {
         crate::session::save(sid, cwd, &p.model, msgs);
     }
 
