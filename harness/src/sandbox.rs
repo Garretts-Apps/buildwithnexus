@@ -339,6 +339,33 @@ fn env_names() -> impl Iterator<Item = String> {
     std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())
 }
 
+/// Marks every descriptor above 2 that bwn inherited close-on-exec, so no
+/// command, hook, MCP server or tmux session it starts gets them. A CI
+/// runner hands its control pipe down to the job's processes, and a command
+/// that wrote to it would end the job. Runs first in `run`.
+#[cfg(unix)]
+pub fn cloexec_inherited_fds() {
+    let fds: Vec<i32> = ["/proc/self/fd", "/dev/fd"]
+        .iter()
+        .find_map(|d| std::fs::read_dir(d).ok())
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| (3..1024).collect());
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
+        // SAFETY: fcntl on a descriptor number; an unused one fails with
+        // EBADF and is skipped.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 /// Moves the provider keys bwn was started with to the heap and blanks the
 /// originals, which `/proc/<pid>/environ` (Linux) and `ps eww` (macOS) read:
 /// a command or tool that reads bwn's own environment finds `****`, while

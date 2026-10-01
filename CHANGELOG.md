@@ -26,6 +26,11 @@ the setting that restores the old behavior is listed in
   file tools and for commands, and so are `/proc` and a process's folder as a
   command argument (a recursive search reads every environ under them), so reading the parent shell's environment asks
   first in every mode and is refused headless.
+- **Commands get no descriptor bwn inherited.** On Linux and macOS every
+  descriptor above 2 that bwn starts with is made close-on-exec, so no
+  command, hook, MCP server or tmux session gets it. A CI runner passes its
+  own control pipe down to the job, and a command that wrote to it ended the
+  job.
 - **A call quoted in an answer never runs.** JSON, `<tool_call>` markup or a
   `tool_code` fence with prose after it, or after a paragraph or an
   "example"/"you could" lead-in, is the model describing a call and stays

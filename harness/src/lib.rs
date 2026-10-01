@@ -357,7 +357,10 @@ mod cli_option_tests {
 
 pub fn run() {
     #[cfg(unix)]
-    sandbox::hide_startup_credentials();
+    {
+        sandbox::cloexec_inherited_fds();
+        sandbox::hide_startup_credentials();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = match parse_cli_options(args) {
         Ok(parsed) => parsed,

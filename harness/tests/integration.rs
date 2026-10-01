@@ -930,6 +930,65 @@ fn sessions_and_doctor_neutralize_escapes_in_titles_and_paths() {
 
 // ── hooks: payload, matchers, lifecycle events ──────────────────────────────
 
+// A descriptor bwn inherits (a CI runner's control pipe, say) reaches no
+// command it runs: the command that writes to every descriptor it has
+// writes nothing there.
+#[cfg(unix)]
+#[test]
+fn commands_get_no_descriptor_bwn_inherited() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let pipe = cwd.join("runner-pipe.txt");
+    let sink = std::fs::File::create(&pipe).unwrap();
+    let script = cwd.join("forge.sh");
+    std::fs::write(
+        &script,
+        "for fd in /dev/fd/*; do n=${fd##*/}; \
+         [ \"$n\" -gt 2 ] 2>/dev/null && echo forged > \"$fd\"; done 2>/dev/null; echo tried-it\n",
+    )
+    .unwrap();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": format!("sh '{}'", script.display())}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let raw = sink.as_raw_fd();
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    // SAFETY: dup2 between fork and exec, onto a descriptor without
+    // close-on-exec, as a runner passes its pipe.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(raw, 7) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd
+        .args(["--json", "run", "write everywhere"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tried-it\\n"),
+        "the command did not run: {stdout}"
+    );
+    assert_eq!(std::fs::read_to_string(&pipe).unwrap(), "", "{stdout}");
+}
+
 // bwn's own environment block, which /proc/<pid>/environ shows to any
 // process of the user, holds no provider key: the key a run was started
 // with is still used, but the original bytes are blanked.

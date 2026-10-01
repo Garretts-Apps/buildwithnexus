@@ -394,7 +394,8 @@ never auto-updated.
   errors, provider keys are removed from the environment of the commands
   the agent runs and blanked in bwn's own environment block (which
   `/proc/<pid>/environ` shows), any process's `/proc/<pid>/environ` is a
-  sensitive path, a tool call quoted inside an answer never runs, and an
+  sensitive path, descriptors bwn inherited (a CI runner's pipe) reach no
+  command it starts, a tool call quoted inside an answer never runs, and an
   isolated helper's worktree runs no repository hooks.
 
 ## Permission Gates and the Optional Sandbox
