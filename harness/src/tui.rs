@@ -6820,7 +6820,7 @@ fn extra_command_desc(cmd: &str) -> String {
 // A prompt command's popup text: its `description:` frontmatter, else the
 // first prose line of its body (CustomCommand.description holds either; the
 // body itself no longer carries the frontmatter).
-fn custom_command_desc(c: &crate::config::CustomCommand) -> String {
+pub(crate) fn custom_command_desc(c: &crate::config::CustomCommand) -> String {
     if c.description.trim().is_empty() {
         "custom command".to_string()
     } else {
@@ -7011,18 +7011,17 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
             }
         }
     }
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with(prefix) && !name.starts_with('.') {
-                let mut full = format!("{base}{name}");
-                if e.path().is_dir() {
-                    full.push('/');
-                } else {
-                    full.push_str(range_suffix);
-                }
-                out.push(full);
+    // Same rules as the file tools: what .gitignore or the skip list hides,
+    // and sensitive files, are not offered by name either.
+    for (name, is_dir) in crate::tools::visible_entries(cwd, &dir) {
+        if name.starts_with(prefix) && !name.starts_with('.') {
+            let mut full = format!("{base}{name}");
+            if is_dir {
+                full.push('/');
+            } else {
+                full.push_str(range_suffix);
             }
+            out.push(full);
         }
     }
     out.sort();
@@ -8283,6 +8282,31 @@ mod tests {
         assert!(path_candidates("zebra_w", &cwd).contains(&want));
         crate::workdirs::clear();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn at_completion_skips_what_gitignore_and_the_file_tools_skip() {
+        let cwd = std::env::temp_dir().join(format!("bwn-at-ignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        for f in [
+            "gen/out.py",
+            "src/app.py",
+            "src/debug.log",
+            "node_modules/x.js",
+        ] {
+            std::fs::create_dir_all(cwd.join(f).parent().unwrap()).unwrap();
+            std::fs::write(cwd.join(f), "").unwrap();
+        }
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join("id_rsa"), "").unwrap();
+        std::fs::write(cwd.join(".gitignore"), "gen/\n*.log\n").unwrap();
+        // The folder and the files inside it are hidden, by name or by path.
+        assert!(path_candidates("ge", &cwd).is_empty());
+        assert!(path_candidates("gen/", &cwd).is_empty());
+        assert!(path_candidates("node_m", &cwd).is_empty());
+        assert!(path_candidates("id_r", &cwd).is_empty());
+        assert_eq!(path_candidates("src/", &cwd), vec!["src/app.py"]);
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]

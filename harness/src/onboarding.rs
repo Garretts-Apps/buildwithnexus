@@ -33,19 +33,15 @@ pub fn run() -> Option<Settings> {
     tui::line("");
     wsl_notice();
     tui::line("");
-    let ollama_models = provider::ollama_models(default_ollama_url());
+    let checked = provider::ollama_models_checked(default_ollama_url());
+    let ollama_models = checked.clone().unwrap_or_default();
     tui::line(&tui::accent("  Local model check"));
-    if ollama_models.is_empty() {
-        tui::line(&tui::dim(
-            "  no Ollama answering on this machine; local models need a running server (Ollama, LM Studio, llama.cpp).",
-        ));
+    let found = local_check_line(checked.as_deref());
+    tui::line(&if ollama_models.is_empty() {
+        tui::dim(&found)
     } else {
-        tui::line(&tui::green(&format!(
-            "  found Ollama with {} model{}",
-            ollama_models.len(),
-            if ollama_models.len() == 1 { "" } else { "s" }
-        )));
-    }
+        tui::green(&found)
+    });
     loop {
         let pick = pick_provider(!ollama_models.is_empty())?;
         match configure(pick, &ollama_models) {
@@ -56,6 +52,20 @@ pub fn run() -> Option<Settings> {
             Err(Exit::Back) => continue,
             Err(Exit::Stop) => return None,
         }
+    }
+}
+
+// What the first screen says about Ollama: not answering, answering with no
+// models (a different fix), or the models found.
+fn local_check_line(found: Option<&[String]>) -> String {
+    match found {
+        None => "  no Ollama answering on this machine; local models need a running server (Ollama, LM Studio, llama.cpp).".into(),
+        Some([]) => "  Ollama is running but has no models — pull one with  ollama pull <model>".into(),
+        Some(models) => format!(
+            "  found Ollama with {} model{}",
+            models.len(),
+            if models.len() == 1 { "" } else { "s" }
+        ),
     }
 }
 
@@ -1043,6 +1053,15 @@ mod tests {
         assert_eq!(plain_http_key_refusal("https://gw.example.com/v1"), None);
         assert_eq!(plain_http_key_refusal("http://127.0.0.1:8080/v1"), None);
         assert_eq!(plain_http_key_refusal("http://localhost:1234/v1"), None);
+    }
+
+    #[test]
+    fn the_first_screen_tells_an_empty_ollama_from_a_missing_one() {
+        assert!(local_check_line(None).contains("no Ollama answering"));
+        let empty = local_check_line(Some(&[]));
+        assert!(empty.contains("running but has no models"), "{empty}");
+        let two = local_check_line(Some(&["a".to_string(), "b".to_string()]));
+        assert!(two.contains("found Ollama with 2 models"), "{two}");
     }
 
     #[test]

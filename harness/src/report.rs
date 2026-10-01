@@ -145,6 +145,22 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The header line just printed for a call (its sanitized preview), kept
+// until something else prints under it, so the approval question does not
+// say the same thing again right below it.
+thread_local! {
+    static LAST_HEADER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the line directly above is the header of the call named `label`;
+/// forgets it either way.
+pub fn header_is_just_above(label: &str) -> bool {
+    LAST_HEADER
+        .take()
+        .is_some_and(|h| h == *tui::sanitize_terminal(label))
+}
+
 /// Shows the held diff of the announced write or edit, once: before its
 /// approval question, or above the reason it was refused.
 pub fn show_held_preview() {
@@ -153,6 +169,7 @@ pub fn show_held_preview() {
             // One tui::line call for the whole body → one repaint.
             tui::line(body);
             *shown = true;
+            LAST_HEADER.take();
         }
     });
 }
@@ -216,6 +233,7 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         _ => ("•", tui::dim(preview)),
     };
     tui::line(&format!("  {} {}", tui::accent(icon), head));
+    LAST_HEADER.set(Some(preview.to_string()));
 
     // Inline diff for edits/writes — the user sees exactly what will change
     // before approving it, rendered by the same clean renderer as applied

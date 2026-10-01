@@ -2103,6 +2103,16 @@ fn repl(
                 // `/model http://host:port/v1 <model>`: that endpoint,
                 // persisted the same way the picker's custom entry does it.
                 swap_model(&mut provider, endpoint_preset(&url), &m, Some(url));
+            } else if let Some(word) = unknown_provider_word(new_model) {
+                tui::line(&tui::red(&format!(
+                    "  unknown provider '{}' — try: {}, or /model <name> for this endpoint",
+                    tui::sanitize_terminal(word),
+                    config::PRESETS
+                        .iter()
+                        .map(|p| p.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             } else if !new_model.is_empty() {
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
@@ -2939,106 +2949,41 @@ fn session_folder(s: &session::Session, cwd: &std::path::Path) -> String {
     }
 }
 
-fn session_row(n: usize, s: &session::Session, cwd: &std::path::Path) -> String {
+// One picker row for a saved session: its title, then age, message count
+// and folder.
+fn session_item(s: &session::Session, cwd: &std::path::Path) -> tui::SelectItem {
     // Titles come from task text and cwd from the checkout's folder name.
     let label: String = tui::sanitize_terminal(s.label()).chars().take(56).collect();
-    format!(
-        "  {:>3}  {:<9} {:>4} msgs  {}  {}",
-        n,
-        session::ago(s.updated_ms),
-        s.msgs.len(),
+    tui::SelectItem {
         label,
-        tui::dim(&tui::sanitize_terminal(&session_folder(s, cwd)))
-    )
-}
-
-// A sessions list filtered by what was typed: every word must appear in the
-// label or the folder.
-fn filter_sessions<'a>(all: &'a [session::Session], filter: &str) -> Vec<&'a session::Session> {
-    let words: Vec<String> = filter.split_whitespace().map(str::to_lowercase).collect();
-    all.iter()
-        .filter(|s| {
-            let hay = format!("{} {}", s.label(), s.cwd).to_lowercase();
-            words.iter().all(|w| hay.contains(w))
-        })
-        .collect()
-}
-
-// What a /resume answer means: a pick, a new filter, or cancel.
-#[derive(Debug, PartialEq)]
-enum ResumePick {
-    Cancel,
-    Pick(usize),
-    Missing(usize),
-    Filter(String),
-}
-
-fn resume_pick(answer: Option<&str>, shown: usize) -> ResumePick {
-    let a = answer.map(str::trim).unwrap_or("");
-    if a.is_empty() {
-        return ResumePick::Cancel;
-    }
-    match a.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= shown => ResumePick::Pick(n - 1),
-        Ok(n) => ResumePick::Missing(n),
-        Err(_) => ResumePick::Filter(a.to_string()),
+        detail: format!(
+            "{} · {} msgs · {}",
+            session::ago(s.updated_ms),
+            s.msgs.len(),
+            tui::sanitize_terminal(&session_folder(s, cwd))
+        ),
     }
 }
 
-const RESUME_ROWS: usize = 15;
-
-// /resume: sessions from this folder first, with age, message count and
-// folder; a number picks, text filters, Enter cancels.
+// /resume: the shared picker over sessions from this folder first; arrows
+// move, text filters, Enter opens the highlighted session, Esc closes.
 fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String, cwd: &std::path::Path) {
     let all = session::list_here_first(cwd);
     if all.is_empty() {
         tui::line(&tui::dim("  no saved sessions yet"));
         return;
     }
-    let mut filter = String::new();
-    loop {
-        let shown = filter_sessions(&all, &filter);
-        if shown.is_empty() {
-            tui::line(&tui::yellow(&format!(
-                "  no session matches '{}'",
-                tui::sanitize_terminal(&filter)
-            )));
-        } else {
-            let heading = if filter.is_empty() {
-                "  sessions (this folder first):".to_string()
-            } else {
-                format!("  sessions matching '{}':", tui::sanitize_terminal(&filter))
-            };
-            tui::line(&tui::dim(&heading));
-            for (i, s) in shown.iter().take(RESUME_ROWS).enumerate() {
-                tui::line(&session_row(i + 1, s, cwd));
-            }
-            if shown.len() > RESUME_ROWS {
-                tui::line(&tui::dim(&format!(
-                    "  … {} more — type words to filter",
-                    shown.len() - RESUME_ROWS
-                )));
-            }
-        }
-        let answer = tui::ask(&tui::dim("  resume # · text to filter · Enter to cancel: "));
-        match resume_pick(answer.as_deref(), shown.len().min(RESUME_ROWS)) {
-            ResumePick::Cancel => return,
-            ResumePick::Missing(n) => {
-                tui::line(&tui::yellow(&format!("  no session {n}")));
-            }
-            ResumePick::Filter(f) => filter = f,
-            ResumePick::Pick(i) => {
-                let Some(picked) = session::load(&shown[i].id) else {
-                    tui::line(&tui::yellow("  that session file can no longer be read"));
-                    return;
-                };
-                show_resumed(&picked, cwd);
-                *transcript = picked.msgs;
-                *sid = picked.id;
-                return;
-            }
-        }
-    }
+    let items: Vec<tui::SelectItem> = all.iter().map(|s| session_item(s, cwd)).collect();
+    let Some(i) = tui::select_item("Resume a session (this folder first)", &items) else {
+        return;
+    };
+    let Some(picked) = session::load(&all[i].id) else {
+        tui::line(&tui::yellow("  that session file can no longer be read"));
+        return;
+    };
+    show_resumed(&picked, cwd);
+    *transcript = picked.msgs;
+    *sid = picked.id;
 }
 
 // The confirmation and history replay for a session opened by /resume,
@@ -3925,6 +3870,14 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
         return ("openrouter".into(), pick.to_string());
     }
     (current_provider.to_string(), pick.to_string())
+}
+
+/// The first word of a `/model <word> <model>` pick whose first word names
+/// no provider. A model name has no spaces, so two words are a provider and
+/// a model, and swapping to the pair as one name only ends in a 404.
+fn unknown_provider_word(pick: &str) -> Option<&str> {
+    let (first, rest) = pick.split_once(char::is_whitespace)?;
+    (!rest.trim().is_empty() && config::preset(first).is_none()).then_some(first)
 }
 
 fn find_active_local_base_url(preferred: &str) -> Option<String> {
@@ -7488,11 +7441,13 @@ fn print_help() {
     }
 }
 
+const HELP_CUSTOM_ROWS: usize = 12;
+
 // The /help text: every built-in command by section, then the keys and the
 // answers to an approval, as an aligned table.
 fn help_lines() -> Vec<String> {
     // (command or key, its arguments and aliases, what it does)
-    type Row = (String, String, &'static str);
+    type Row = (String, String, String);
     let mut sections: Vec<(&str, Vec<Row>)> = Vec::new();
     for c in tui::COMMANDS {
         let aliases = c.aliases.join(", ");
@@ -7501,7 +7456,7 @@ fn help_lines() -> Vec<String> {
             (false, true) => format!("({aliases})"),
             (false, false) => format!("({aliases}) {}", c.args),
         };
-        let row = (c.name.to_string(), args, c.desc);
+        let row = (c.name.to_string(), args, c.desc.to_string());
         match sections.iter_mut().find(|(t, _)| *t == c.section) {
             Some((_, rows)) => rows.push(row),
             None => sections.push((c.section, vec![row])),
@@ -7509,9 +7464,30 @@ fn help_lines() -> Vec<String> {
     }
     let rows = |r: &[(&str, &'static str)]| -> Vec<Row> {
         r.iter()
-            .map(|(k, d)| (k.to_string(), String::new(), *d))
+            .map(|(k, d)| (k.to_string(), String::new(), d.to_string()))
             .collect()
     };
+    // Command files and skills the popup also offers; a long list is cut
+    // and /skills has the rest.
+    let mut mine: Vec<Row> = Vec::new();
+    let custom = config::load_custom_commands();
+    for c in custom.iter().take(HELP_CUSTOM_ROWS) {
+        mine.push((
+            format!("/{}", c.name),
+            String::new(),
+            tui::custom_command_desc(c),
+        ));
+    }
+    if custom.len() > HELP_CUSTOM_ROWS {
+        let more = format!(
+            "… {} more — /skills lists them all",
+            custom.len() - HELP_CUSTOM_ROWS
+        );
+        mine.push((String::new(), String::new(), more));
+    }
+    if !mine.is_empty() {
+        sections.push(("your commands and skills", mine));
+    }
     sections.push((
         "keys",
         rows(&[
@@ -8266,8 +8242,24 @@ fn attach_word(
             "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
             p.display()
         )));
+    } else if is_at && !p.exists() && !is_special_mention(raw_path) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} not found — sent as typed",
+            tui::sanitize_terminal(word)
+        )));
     }
     None
+}
+
+// The `@` words that are not file names: they have their own meaning (and
+// their own notice) when they attach nothing.
+fn is_special_mention(raw_path: &str) -> bool {
+    matches!(
+        raw_path,
+        "" | "diff" | "git:diff" | "status" | "git:status" | "rules"
+    ) || ["kb:", "rule:", "url:", "web:", "symbol:"]
+        .iter()
+        .any(|p| raw_path.starts_with(p))
 }
 
 fn is_web_url(url: &str) -> bool {
@@ -9296,16 +9288,17 @@ mod tests {
     }
 
     #[test]
-    fn resume_answers_pick_filter_or_say_what_is_missing() {
-        assert_eq!(resume_pick(None, 3), ResumePick::Cancel);
-        assert_eq!(resume_pick(Some("  "), 3), ResumePick::Cancel);
-        assert_eq!(resume_pick(Some("2"), 3), ResumePick::Pick(1));
-        assert_eq!(resume_pick(Some("99"), 3), ResumePick::Missing(99));
-        assert_eq!(resume_pick(Some("0"), 3), ResumePick::Missing(0));
+    fn a_model_pick_with_an_unknown_provider_word_is_named() {
         assert_eq!(
-            resume_pick(Some("parser"), 3),
-            ResumePick::Filter("parser".into())
+            unknown_provider_word("nonsense some-model"),
+            Some("nonsense")
         );
+        assert_eq!(unknown_provider_word("ollama tinycoder:3b"), None);
+        assert_eq!(unknown_provider_word("tinycoder:3b"), None);
+    }
+
+    #[test]
+    fn resume_rows_name_age_messages_and_folder() {
         let mk = |title: &str, cwd: &str| session::Session {
             schema_version: 1,
             id: title.into(),
@@ -9317,14 +9310,17 @@ mod tests {
             msgs: vec![],
             name: None,
         };
-        let all = vec![
+        let all = [
             mk("fix the parser", "/work/api"),
             mk("add a flag", "/work/cli"),
         ];
-        let hits = filter_sessions(&all, "PARSER");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(filter_sessions(&all, "cli flag")[0].title, "add a flag");
-        assert_eq!(filter_sessions(&all, "").len(), 2);
+        let item = session_item(&all[0], std::path::Path::new("/work/api"));
+        assert_eq!(item.label, "fix the parser");
+        assert!(
+            item.detail.ends_with("0 msgs · this folder"),
+            "{}",
+            item.detail
+        );
         let here = std::path::Path::new("/work/api");
         assert_eq!(session_folder(&all[0], here), "this folder");
         assert_eq!(session_folder(&all[1], here), "…/work/cli");
@@ -9944,6 +9940,21 @@ mod tests {
         assert!(!text.contains("sk-live-secret"), "{text}");
         assert!(!text.contains("[attached files]"), "{text}");
         assert!(text.contains("@.env.local"), "token stays as typed: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_at_word_naming_no_file_says_so() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        tui::capture_start();
+        let (text, _) = extract_attachments("explain @nosuchfile.py and @diff", &dir, false);
+        let shown = tui::capture_take().join("\n");
+        assert_eq!(text, "explain @nosuchfile.py and @diff");
+        assert!(shown.contains("@nosuchfile.py not found"), "{shown}");
+        // @diff with no changes keeps its own meaning and stays quiet.
+        assert!(!shown.contains("@diff not found"), "{shown}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

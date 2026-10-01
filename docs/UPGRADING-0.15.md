@@ -189,6 +189,7 @@ Nothing changes without opting in for these new features: `accept-edits`,
 | `/rewind` opens the prompt picker (code, conversation or both) instead of being an alias of `/undo`. After a conversation rewind the chosen prompt is back in the input box to edit and send. Esc twice within a second on an empty input box (in vim mode, in NORMAL) opens the same picker. | Bare `/undo` is unchanged, and `/rewind <id>` still works like `/undo <id>`. Esc in the picker closes it without changing anything; Ctrl+U clears a prompt you do not want back. |
 | BUILD turns in a git repository whose config is inert run `git status` at the start and end of each turn to report files changed by shell commands. In very large repositories this adds that time to each turn. | No setting yet. |
 | `/btw` adds a note to the next message as before; only its wording changed. | None needed. |
+| `/resume` opens the same picker as `/model` and `/mode` (↑↓ or a digit to move, text to filter, Enter opens the highlighted session, Esc closes) instead of a numbered list with a typed answer. `bwn resume` with no id opens it. | `bwn resume <id>` or `bwn continue` open a session without a picker. No setting: Enter at the old prompt cancelled, unlike every other picker. |
 
 ## Terminal UI
 
@@ -206,6 +207,13 @@ Nothing changes without opting in for these new features: `accept-edits`,
 | `grep_files`, `find_files`, `find_paths` and `list_tree` no longer list gitignored files or virtualenv folders. | Read such a file by path with `read_file`, or search with a command such as `rg -uu`. |
 | A message that starts with an absolute path is sent to the model instead of being refused as an unknown command. | None (defect). |
 | A turn in which a hook, a rule or the gate refused a call ends with `⚠ changes were denied: … — not done this turn` under its answer, so a summary that claims the change is not the last word. | None (additive line). |
+| `@` completion leaves out what the file tools leave out: files and folders `.gitignore` ignores, the skip list (`build`, `node_modules`, `target`, virtualenvs and the like) and sensitive files, whether you type a name or a folder path. | Type the full path of such a file; it still attaches. No setting: offering ignored folders contradicted the README. |
+| An `@name` that matches no file prints `@name not found — sent as typed` before the message goes out. `@diff`, `@status`, `@rules` and `@kb:`/`@url:`/`@symbol:` keep their own notices. | None needed: the text is still sent as typed. |
+| `/help` has a section for your own command files and skills (the first 12, then `/skills` lists the rest), as the `/` popup already showed them. | None needed: nothing was removed. |
+| An approval question no longer repeats the call under its own header (`⚡ run: …` then `➤ run: …`); a write or edit with a diff still ends with its `➤` line, below the diff. | None needed: the key legend and `allow?` are unchanged. |
+| `/model <word> <model>` where `<word>` is no provider says `unknown provider '<word>'` and lists the providers, instead of probing the pair as one model name. | Put the model name alone, or a provider id first. |
+| The first setup screen tells an Ollama that answers with no models (`Ollama is running but has no models`) from none answering. | None needed: text only. |
+| A workflow's `i<id>` inspect output no longer shows the run's `--permission-mode` advice, which does not apply to a background run. | Read the run's log under `NEXUS_HOME/workflows` for the raw lines. |
 
 ## Headless runs and output
 

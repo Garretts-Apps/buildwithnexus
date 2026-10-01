@@ -2233,11 +2233,14 @@ fn confirm_with(
     report::show_held_preview();
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
-    tui::line(&format!(
-        "  {} {}",
-        tui::yellow("➤"),
-        tui::bold(&tui::sanitize_terminal(label))
-    ));
+    // Right under the call's own header it would only repeat it.
+    if !report::header_is_just_above(label) {
+        tui::line(&format!(
+            "  {} {}",
+            tui::yellow("➤"),
+            tui::bold(&tui::sanitize_terminal(label))
+        ));
+    }
     // Name what `s`/`a` would allow from now on: a binary (`cargo`), a
     // subcommand (`git status`), a host, or one exact command.
     let shown_key = tui::sanitize_terminal(tool_key);

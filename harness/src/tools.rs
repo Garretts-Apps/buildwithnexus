@@ -4369,6 +4369,51 @@ fn collect_paths_in(
     }
 }
 
+/// The entries of `dir` (name, is_folder) that a project walk rooted at
+/// `root` would see: the skip list, .gitignore rules from the repository top
+/// down and sensitive files hide the rest, and so does a `dir` that sits
+/// inside a hidden folder. For `@` path completion.
+pub fn visible_entries(root: &Path, dir: &Path) -> Vec<(String, bool)> {
+    let (root, rel) = match dir.strip_prefix(root) {
+        Ok(rel) => (root, rel.to_path_buf()),
+        Err(_) => (dir, PathBuf::new()),
+    };
+    let mut ignores = Ignores::for_root(root);
+    let mut at = root.to_path_buf();
+    for part in rel.components() {
+        let std::path::Component::Normal(name) = part else {
+            // `..` or the like: no walk covers it, so nothing is hidden by one.
+            return list_entries(dir, &Ignores::default());
+        };
+        at.push(name);
+        if skip_dir(&at) || ignores.ignored(&at, true) {
+            return Vec::new();
+        }
+        if let Some(inner) = ignores.with_dir(&at) {
+            ignores = inner;
+        }
+    }
+    list_entries(dir, &ignores)
+}
+
+fn list_entries(dir: &Path, ignores: &Ignores) -> Vec<(String, bool)> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let is_dir = path.is_dir();
+            let hidden = if is_dir {
+                skip_dir(&path) || ignores.ignored(&path, true)
+            } else {
+                is_sensitive(&path) || ignores.ignored(&path, false)
+            };
+            (!hidden).then(|| (e.file_name().to_string_lossy().into_owned(), is_dir))
+        })
+        .collect()
+}
+
 /// Every file a project walk sees (skip list, .gitignore, sensitive files
 /// hidden), relative to `cwd` with `/` separators.
 pub fn project_files(cwd: &Path) -> Vec<String> {

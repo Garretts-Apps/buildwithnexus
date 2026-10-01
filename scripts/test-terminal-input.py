@@ -1606,6 +1606,107 @@ class UnknownWindowTests(ModelHarness):
         self.assertIn(b"context_tokens", self.output)
 
 
+class ApprovalHeaderTests(TerminalHarness):
+    """A call asking for approval is announced once, not again under its header."""
+
+    def prepare(self):
+        def reply(body):
+            if body["messages"][-1].get("role") == "tool":
+                return {"text": "Ran it."}
+            return {"calls": [("run_command", {"command": "touch made-approval.txt"})]}
+
+        self.model = MockModel(reply)
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model", "base_url": self.model.url,
+                "permission": "ask", "auto_update": "off"}
+
+    def test_the_command_is_not_repeated_above_the_question(self):
+        self.send("/mode build\r")
+        self.wait_for(lambda: b"[BUILD]" in self.output, "build mode")
+        self.send("create the file\r")
+        self.wait_for(lambda: b"allow?" in self.output, "the approval question")
+        shown = bytes(self.output)
+        self.assertIn(b"run: touch made-approval.txt", shown)
+        self.assertNotIn("\u27a4".encode(), shown)
+        self.send("y\r")
+        self.wait_for(lambda: b"Ran it." in self.output, "the answer")
+
+
+class ResumePickerTests(TerminalHarness):
+    """/resume is the shared picker: arrows move and Enter opens the session."""
+
+    def prepare(self):
+        sessions = self.home / "sessions"
+        sessions.mkdir()
+        now = int(time.time() * 1000)
+        for n, title in enumerate(["fix the parser", "add a greet function"]):
+            (sessions / f"{now - n:016}-0000000{n}.json").write_text(json.dumps({
+                "schema_version": 1, "id": f"{now - n:016}-0000000{n}", "title": title,
+                "cwd": str(self.root), "model": "m", "created_ms": now - n,
+                "updated_ms": now - n, "msgs": [{"User": title}],
+            }))
+
+    def test_enter_opens_the_highlighted_session(self):
+        self.send("/resume\r")
+        self.wait_for(lambda: b"Resume a session" in self.output, "session picker")
+        self.assertIn(b"add a greet function", bytes(self.output))
+        self.send("\x1b[B")  # down to the second (older) session
+        self.send("\r")
+        self.wait_for(lambda: "resumed: add a greet function".encode() in self.output,
+                      "Enter opens the session")
+
+    def test_escape_closes_without_opening(self):
+        self.send("/resume\r")
+        self.wait_for(lambda: b"Resume a session" in self.output, "session picker")
+        self.send("\x1b")
+        self.pump(0.5)
+        self.assertNotIn(b"resumed:", bytes(self.output))
+
+
+class FileMentionTests(TerminalHarness):
+    """@ completion hides what .gitignore hides; an unknown @file is flagged;
+    /help lists the user's own commands."""
+
+    def files(self):
+        return {
+            ".gitignore": "gen/\n",
+            "gen/out.py": "x = 1\n",
+            "src/app.py": "y = 2\n",
+        }
+
+    def prepare(self):
+        (self.root / ".git").mkdir()
+        (self.home / "commands").mkdir()
+        (self.home / "commands" / "deploy.md").write_text(
+            "---\ndescription: ship it to an environment\n---\nDeploy.\n")
+        self.model = MockModel(lambda body: {"text": "Looked."})
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model", "base_url": self.model.url,
+                "permission": "auto", "auto_update": "off"}
+
+    def test_at_completion_skips_ignored_folders(self):
+        self.send("explain @ge\t")
+        self.pump(0.5)
+        self.assertNotIn(b"@gen/", bytes(self.output))
+        self.send("\x15")  # clear the draft
+        self.send("explain @sr\t")
+        self.wait_for(lambda: b"@src/" in self.output, "a visible folder completes")
+
+    def test_an_unknown_at_file_is_flagged_before_sending(self):
+        self.send("explain @nosuchfile.py\r")
+        self.wait_for(lambda: b"@nosuchfile.py not found" in self.output, "the notice")
+        self.wait_for(lambda: b"Looked." in self.output, "the answer")
+
+    def test_help_lists_custom_commands(self):
+        self.send("/help\r")
+        self.wait_for(lambda: b"ship it to an environment" in self.output, "custom command")
+        self.assertIn(b"/deploy", bytes(self.output))
+
+
 class RepoInstructionsTests(TerminalHarness):
     """A repository's AGENTS.md is used only on a yes, asked once per
     content; a task typed while the question is up is not an answer."""

@@ -664,9 +664,15 @@ fn failure_reason(lines: &[String], exit_ok: bool) -> Option<String> {
 
 /// One readable line for a captured output line: the run's --json events
 /// become what they mean (a call, a refusal, the summary); stderr and other
-/// text stay as they are; bookkeeping events are dropped.
+/// text stay as they are; bookkeeping events and advice about terminal
+/// flags are dropped.
 pub fn readable(line: &str) -> Option<String> {
     let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
+        // The run's own advice to pass --permission-mode does not apply to a
+        // workflow: the refusal line above it says what to do instead.
+        if line.starts_with("[stderr]") && line.contains("--permission-mode") {
+            return None;
+        }
         return Some(line.to_string());
     };
     let s = |k: &str| e[k].as_str().unwrap_or("").trim().to_string();
@@ -1178,6 +1184,11 @@ mod tests {
         );
         assert_eq!(readable(&ev(json!({"type": "usage", "tokens": 3}))), None);
         assert_eq!(readable("[stderr] boom").as_deref(), Some("[stderr] boom"));
+        // Flags for a terminal run are no help in a background one.
+        assert_eq!(
+            readable("[stderr]   Pass --permission-mode auto to allow them"),
+            None
+        );
     }
 
     #[test]
