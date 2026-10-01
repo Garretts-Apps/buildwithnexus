@@ -282,6 +282,54 @@ pub struct Settings {
     /// the same name, as before 0.15. Read from the user's files only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub project_skills_override: bool,
+    /// Allow, ask and deny rules, checked before the permission mode
+    /// (deny > ask > allow > mode): `run_command(git push*)`,
+    /// `write_file(migrations/**)`, `WebFetch(domain:example.com)`. The gate
+    /// reads them per file (see [`policy_rules`]): a project adds ask and
+    /// deny rules on its own, allow rules only once trusted.
+    #[serde(default, skip_serializing_if = "PermissionRules::is_empty")]
+    pub permissions: PermissionRules,
+    /// Hosts the network tools (fetch_url, web_search, the browser tools)
+    /// may reach without asking (`allow`) or never (`deny`, even in auto).
+    #[serde(default, skip_serializing_if = "NetworkRules::is_empty")]
+    pub network: NetworkRules,
+    /// Environment variables the agent's commands keep although their names
+    /// look like credentials (`*_API_KEY`, `*_TOKEN`, …), which are otherwise
+    /// removed before a command runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shell_env_passthrough: Vec<String>,
+}
+
+/// `permissions` in settings: rule lists by effect.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionRules {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ask: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl PermissionRules {
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.ask.is_empty() && self.deny.is_empty()
+    }
+}
+
+/// `network` in settings: host patterns (`example.com`, `*.example.com`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkRules {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl NetworkRules {
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
 }
 
 fn default_auto() -> String {
@@ -330,6 +378,9 @@ impl Default for Settings {
             sandbox_network: true,
             project_system_prompt: None,
             project_skills_override: false,
+            permissions: PermissionRules::default(),
+            network: NetworkRules::default(),
+            shell_env_passthrough: Vec::new(),
         }
     }
 }
@@ -433,6 +484,36 @@ pub fn reset_project_allowed(cwd: &std::path::Path) -> usize {
         }
     });
     n
+}
+
+/// Drop one "always allow" entry for this project (`/permissions remove`).
+/// Returns whether it was there.
+pub fn remove_project_allowed(cwd: &std::path::Path, tool: &str) -> bool {
+    if !load_layers(None).0.any_present {
+        return false;
+    }
+    let key = project_key(cwd);
+    let mut removed = false;
+    let _ = update_settings_json(|obj| {
+        let Some(map) = obj
+            .get_mut("project_allowed")
+            .and_then(|m| m.as_object_mut())
+        else {
+            return;
+        };
+        if let Some(list) = map.get_mut(&key).and_then(|l| l.as_array_mut()) {
+            let before = list.len();
+            list.retain(|t| t.as_str() != Some(tool));
+            removed = list.len() != before;
+            if list.is_empty() {
+                map.remove(&key);
+            }
+        }
+        if map.is_empty() {
+            obj.remove("project_allowed");
+        }
+    });
+    removed
 }
 
 /// Sets (`Some`) or removes (`None`) top-level keys in the user settings
@@ -664,7 +745,7 @@ pub fn load_agents() -> Option<String> {
 pub const PROJECT_SYSTEM_PROMPT: &str = "system.md";
 
 // The project's system.md as it would be trusted; None when absent or blank.
-fn project_system_md(cwd: &Path) -> Option<String> {
+pub(crate) fn project_system_md(cwd: &Path) -> Option<String> {
     let p = cwd.join(".buildwithnexus").join(PROJECT_SYSTEM_PROMPT);
     read_project_file(&p, cwd).filter(|t| !t.trim().is_empty())
 }
@@ -1319,6 +1400,31 @@ fn first_time(warnings: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Whether this notice, with exactly this text, was already shown in an
+/// earlier session; records it as shown otherwise. Upgrade notices (ignored
+/// approvals, restored workflows) use it so they appear once, not at every
+/// launch; a notice whose text changes shows again.
+pub fn notice_seen(key: &str, text: &str) -> bool {
+    // FNV-1a: stable across builds, unlike the std hasher.
+    let digest = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let digest = format!("{digest:016x}");
+    let path = home().join("notices.json");
+    let mut seen = fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if seen[key].as_str() == Some(digest.as_str()) {
+        return true;
+    }
+    seen[key] = serde_json::json!(digest);
+    ensure_home();
+    write_atomic(&path, &seen.to_string(), false);
+    false
+}
+
 /// Returns (name, description) pairs for all skills — never the bodies, so the
 /// system prompt stays small and the model load_skill's what it needs.
 pub fn load_skill_descriptions(cwd: &Path) -> Vec<(String, String)> {
@@ -1334,8 +1440,20 @@ pub fn load_skill_descriptions(cwd: &Path) -> Vec<(String, String)> {
 /// Dim startup lines: which instruction files loaded, plus skill warnings.
 pub fn startup_context_notices(cwd: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(n) = instructions_notice(&load_instructions(cwd)) {
-        out.push(n);
+    // The checkout's own instruction files steer the model too; say they
+    // come from the repository, and that nobody vetted them unless this
+    // folder's settings were reviewed at the trust prompt.
+    let (mine, repo): (Vec<_>, Vec<_>) = load_instructions(cwd)
+        .into_iter()
+        .partition(|f| f.path.starts_with(home()));
+    out.extend(instructions_notice(&mine));
+    if let Some(n) = instructions_notice(&repo) {
+        let n = n.replacen("instructions: ", "instructions from this repo: ", 1);
+        out.push(if crate::hooks::folder_reviewed(cwd) {
+            n
+        } else {
+            format!("{n} (not reviewed)")
+        });
     }
     let (skills, shadowed) = discover_skills_noting_shadowed(cwd);
     out.extend(first_time(
@@ -1681,12 +1799,14 @@ pub fn untrusted_project_files(workdir: &Path) -> Vec<UntrustedProjectFile> {
     out
 }
 
+// Loosest first. An unknown name ranks nowhere, so a project can't use one.
 fn permission_rank(v: &serde_json::Value) -> Option<u8> {
-    let p = crate::agent::permission(v.as_str()?);
-    Some(match crate::agent::permission_name(p) {
-        "auto" => 0,
-        "ask" => 1,
-        _ => 2,
+    use crate::agent::Permission;
+    Some(match crate::agent::parse_permission(v.as_str()?).ok()? {
+        Permission::Auto => 0,
+        Permission::AcceptEdits => 1,
+        Permission::Ask => 2,
+        Permission::ReadOnly => 3,
     })
 }
 
@@ -1717,10 +1837,26 @@ fn untrusted_view(
         if k == "hooks" && v.as_object().is_none_or(|m| m.is_empty()) {
             continue;
         }
+        // Rules that only add ask or deny entries apply at once; allow
+        // entries wait for trust.
+        if let Some(tight) = match k.as_str() {
+            "permissions" => Some(&["ask", "deny"][..]),
+            "network" => Some(&["deny"][..]),
+            _ => None,
+        } {
+            let (keep_part, loosens) = tightening_part(&v, tight);
+            if let Some(part) = keep_part {
+                keep.insert(k.clone(), part);
+            }
+            if loosens {
+                ignored.push(crate::tui::sanitize_terminal(&k).into_owned());
+            }
+            continue;
+        }
         let safe = match k.as_str() {
             k if HARMLESS_PROJECT_KEYS.contains(&k) => true,
             "permission" => {
-                let cur = base.get(&k).and_then(permission_rank).unwrap_or(1);
+                let cur = base.get(&k).and_then(permission_rank).unwrap_or(2);
                 permission_rank(&v).is_some_and(|r| r >= cur)
             }
             "sandbox" => {
@@ -1743,6 +1879,140 @@ fn untrusted_view(
         }
     }
     (keep, ignored)
+}
+
+// What project settings file `name` applies on top of `base`: all of it once
+// trusted, except keys the user declined on their own, which (like an
+// untrusted file's) apply only where they tighten; otherwise only harmless
+// and tightening keys. The second value names the keys waiting for trust.
+fn project_view(
+    workdir: &Path,
+    name: &str,
+    text: &str,
+    base: &serde_json::Map<String, serde_json::Value>,
+    m: serde_json::Map<String, serde_json::Value>,
+) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let Some(declined) = crate::hooks::project_trust(workdir, name, text) else {
+        return untrusted_view(base, m);
+    };
+    let (held, mut applied): (serde_json::Map<_, _>, serde_json::Map<_, _>) =
+        m.into_iter().partition(|(k, _)| declined.contains(k));
+    applied.extend(untrusted_view(base, held).0);
+    (applied, Vec::new())
+}
+
+// The `tight` lists of a rules object (`ask`, `deny`), and whether it holds
+// anything else (an `allow` list) that only trust may apply.
+fn tightening_part(v: &serde_json::Value, tight: &[&str]) -> (Option<serde_json::Value>, bool) {
+    let Some(obj) = v.as_object() else {
+        return (None, true);
+    };
+    let mut part = serde_json::Map::new();
+    let mut loosens = false;
+    for (key, list) in obj {
+        if tight.contains(&key.as_str()) {
+            part.insert(key.clone(), list.clone());
+        } else if list.as_array().is_none_or(|a| !a.is_empty()) {
+            loosens = true;
+        }
+    }
+    (
+        (!part.is_empty()).then_some(serde_json::Value::Object(part)),
+        loosens,
+    )
+}
+
+/// Whether a rule allows, asks or denies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleEffect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl RuleEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleEffect::Allow => "allow",
+            RuleEffect::Ask => "ask",
+            RuleEffect::Deny => "deny",
+        }
+    }
+}
+
+/// One `permissions` rule or `network` host entry, with the settings layer
+/// it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+    pub effect: RuleEffect,
+    /// `Tool` or `Tool(pattern)` for a permissions rule; a host pattern for
+    /// a network entry.
+    pub rule: String,
+    /// From `network.allow` / `network.deny` rather than `permissions`.
+    pub network: bool,
+    /// "user settings" or "project settings".
+    pub source: &'static str,
+}
+
+/// Every allow, ask and deny rule in force for `workdir`, from each layer
+/// separately so a refusal can name the file it came from. Lists add up
+/// across layers (a project cannot drop a user's deny rule), and an
+/// untrusted project file contributes only its ask and deny entries.
+pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
+    let user = [
+        home().join("config.json"),
+        settings_path(),
+        home().join("settings.local.json"),
+    ];
+    let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> = user
+        .iter()
+        .filter_map(|p| fs::read_to_string(p).ok())
+        .filter_map(|t| match serde_json::from_str(&t) {
+            Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
+            _ => None,
+        })
+        .collect();
+    let dot = workdir.join(".buildwithnexus");
+    for name in PROJECT_SETTINGS_FILES {
+        let Ok(text) = fs::read_to_string(dot.join(name)) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(m)) = serde_json::from_str(&text) else {
+            continue;
+        };
+        let m = project_view(workdir, name, &text, &serde_json::Map::new(), m).0;
+        layers.push(("project settings", m));
+    }
+    let mut out = Vec::new();
+    for (source, m) in &layers {
+        for (key, network, effects) in [
+            (
+                "permissions",
+                false,
+                &[RuleEffect::Deny, RuleEffect::Ask, RuleEffect::Allow][..],
+            ),
+            ("network", true, &[RuleEffect::Deny, RuleEffect::Allow][..]),
+        ] {
+            for effect in effects {
+                let list = m
+                    .get(key)
+                    .and_then(|v| v.get(effect.as_str()))
+                    .and_then(|v| v.as_array());
+                for rule in list.into_iter().flatten().filter_map(|r| r.as_str()) {
+                    let rule = rule.trim();
+                    if !rule.is_empty() {
+                        out.push(PolicyRule {
+                            effect: *effect,
+                            rule: rule.to_string(),
+                            network,
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // `workdir: None` loads the user-level files only.
@@ -1803,17 +2073,13 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
                 continue;
             };
             any_source = true;
-            if crate::hooks::project_file_trusted(workdir, name, &text) {
-                if let Some(serde_json::Value::Object(servers)) = m.get_mut("mcp_servers") {
-                    servers.retain(|n, _| !home_servers.contains(n));
-                }
-                merge_objects(&mut merged, m);
-            } else {
-                let (keep, keys) = untrusted_view(&merged, m);
-                merge_objects(&mut merged, keep);
-                if !keys.is_empty() {
-                    untrusted.push(UntrustedProjectFile { name, text, keys });
-                }
+            if let Some(serde_json::Value::Object(servers)) = m.get_mut("mcp_servers") {
+                servers.retain(|n, _| !home_servers.contains(n));
+            }
+            let (keep, keys) = project_view(workdir, name, &text, &merged, m);
+            merge_objects(&mut merged, keep);
+            if !keys.is_empty() {
+                untrusted.push(UntrustedProjectFile { name, text, keys });
             }
         }
     }
@@ -3346,5 +3612,69 @@ mod tests {
         let _ = fs::remove_dir_all(&h);
         let _ = fs::remove_dir_all(&user);
         let _ = fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn repo_instructions_are_labelled_until_the_folder_is_reviewed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-instr-label-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        fs::create_dir_all(proj.join(".git")).unwrap();
+        fs::create_dir_all(h.join("home")).unwrap();
+        std::env::set_var("NEXUS_HOME", h.join("home"));
+        fs::write(proj.join("AGENTS.md"), "# Rules\nalways use tabs\n").unwrap();
+        let notices = startup_context_notices(&proj);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n == "instructions from this repo: AGENTS.md (not reviewed)"),
+            "{notices:?}"
+        );
+        // Once the folder's settings went through the trust prompt.
+        fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"x"}]}]}}"#,
+        )
+        .unwrap();
+        crate::hooks::store_trust(&proj, &untrusted_project_files(&proj));
+        let notices = startup_context_notices(&proj);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n == "instructions from this repo: AGENTS.md"),
+            "{notices:?}"
+        );
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn upgrade_notices_show_once_until_their_text_changes() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-notice-once-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&h);
+        std::env::set_var("NEXUS_HOME", &h);
+        assert!(!notice_seen(
+            "approvals",
+            "ignoring saved approvals for node"
+        ));
+        assert!(notice_seen(
+            "approvals",
+            "ignoring saved approvals for node"
+        ));
+        // Another notice, or new text, is shown again.
+        assert!(!notice_seen("workflows", "restored 1"));
+        assert!(!notice_seen(
+            "approvals",
+            "ignoring saved approvals for node, python3"
+        ));
+        assert!(notice_seen(
+            "approvals",
+            "ignoring saved approvals for node, python3"
+        ));
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
     }
 }

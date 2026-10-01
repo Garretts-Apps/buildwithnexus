@@ -1343,6 +1343,17 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
         );
     }
     let default = input["default"].as_str().unwrap_or("").trim();
+    answer_with(question, &full_prompt, default, tui::ask)
+}
+
+// Shows the question and reads the answer with `ask` (None: cancelled).
+fn answer_with(
+    question: &str,
+    full_prompt: &str,
+    default: &str,
+    ask: impl FnOnce(&str) -> Option<String>,
+) -> (String, bool) {
+    needs_you(&format!("question: {}", trace::preview(question, 120)));
     // Render the question on its own transcript line, then read the answer with
     // a SINGLE-LINE composer prompt. A multi-line prompt string mis-positions
     // the alt-screen composer cursor (prompt_width counts across the newline),
@@ -1351,9 +1362,13 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
     tui::line(&format!(
         "  {} {}",
         tui::yellow("?"),
-        tui::bold(&tui::sanitize_terminal(&full_prompt))
+        tui::bold(&tui::sanitize_terminal(full_prompt))
     ));
-    let ans = tui::ask(&answer_input_prompt(default)).unwrap_or_default();
+    let Some(ans) = ask(&answer_input_prompt(default)) else {
+        // Esc or Ctrl+C at the question stops the turn, as at an approval.
+        stop_turn();
+        return (STOPPED_BY_USER.into(), true);
+    };
     let out = if ans.trim().is_empty() && !default.is_empty() {
         default.to_string()
     } else {
@@ -1363,28 +1378,40 @@ fn answer_question(input: &serde_json::Value) -> (String, bool) {
 }
 
 // ── permissions ───────────────────────────────────────────────────────────────
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission {
     Ask,
+    /// File edits inside the project run without a prompt; commands,
+    /// network and everything else ask as in `Ask`.
+    AcceptEdits,
     Auto,
     ReadOnly,
 }
 
-// Wire name of the active gate — what hooks receive as `permission_mode`.
+// Wire name of the active gate — what hooks receive as `permission_mode`,
+// and what the footer and settings show.
 pub fn permission_name(perm: Permission) -> &'static str {
     match perm {
         Permission::Ask => "ask",
+        Permission::AcceptEdits => "accept-edits",
         Permission::Auto => "auto",
         Permission::ReadOnly => "readonly",
     }
 }
 
-pub fn permission(s: &str) -> Permission {
-    let normalized = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
+/// The permission named by `--permission-mode`, the `permission` setting or
+/// /permissions. An unknown name is an error, never a silent `ask`.
+pub fn parse_permission(s: &str) -> Result<Permission, String> {
+    let normalized = s.trim().to_ascii_lowercase().replace(['_', '-', ' '], "");
     match normalized.as_str() {
-        "auto" | "acceptedits" | "acceptedit" | "bypasspermissions" => Permission::Auto,
-        "readonly" | "read" | "plan" | "dontask" => Permission::ReadOnly,
-        _ => Permission::Ask,
+        "ask" | "default" => Ok(Permission::Ask),
+        "acceptedits" | "acceptedit" => Ok(Permission::AcceptEdits),
+        "auto" | "bypasspermissions" => Ok(Permission::Auto),
+        "readonly" | "read" | "plan" | "dontask" => Ok(Permission::ReadOnly),
+        _ => Err(format!(
+            "unknown permission mode {} — use ask, accept-edits, auto, readonly or plan",
+            s.trim()
+        )),
     }
 }
 
@@ -1723,6 +1750,35 @@ fn add_session_allowed_tool(cwd: &Path, key: &str) {
     }
 }
 
+/// This project's "allow this session" answers, sorted (`/permissions`).
+pub fn session_allowed(cwd: &Path) -> Vec<String> {
+    let project = config::project_key(cwd);
+    let mut keys: Vec<String> = SESSION_ALLOWED_TOOLS
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|set| {
+                set.iter()
+                    .filter(|(p, _)| *p == project)
+                    .map(|(_, k)| k.clone())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// Forget one "allow this session" answer. Returns whether it was there.
+pub fn remove_session_allowed(cwd: &Path, key: &str) -> bool {
+    let entry = (config::project_key(cwd), key.to_string());
+    SESSION_ALLOWED_TOOLS
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().map(|set| set.remove(&entry)))
+        .unwrap_or(false)
+}
+
 /// Forget this project's "allow this session" answers (`/permissions reset`).
 pub fn clear_session_allowed(cwd: &Path) {
     let project = config::project_key(cwd);
@@ -1836,6 +1892,52 @@ pub fn blocked_without_terminal() -> usize {
     BLOCKED_WITHOUT_TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    // Set when the user cancels an approval prompt (Esc, Ctrl+C, end of
+    // input): that call is refused, nothing else runs, and the build loop
+    // ends the turn once the refused call is recorded. Cleared when the turn
+    // ends. Per thread: a turn and every gate it calls run on one thread.
+    static TURN_STOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn set_turn_stopped(stopped: bool) {
+    TURN_STOPPED.with(|t| t.set(stopped));
+}
+
+// The user cancelled a prompt mid-turn. The build loop ends the turn after
+// recording the refusal; the interrupt also stops the plan and brainstorm
+// loops before their next request (it is cleared when the next turn starts).
+fn stop_turn() {
+    set_turn_stopped(true);
+    tui::trigger_interrupt(tui::InterruptKind::Escape);
+}
+
+const STOPPED_BY_USER: &str = "stopped by the user — ask what to do instead";
+
+/// Whether the user stopped this turn at an approval prompt. The top-level
+/// loop takes (clears) it; nested loops only look, so the stop reaches it.
+pub(crate) fn turn_stopped(take: bool) -> bool {
+    TURN_STOPPED.with(|t| if take { t.replace(false) } else { t.get() })
+}
+
+#[cfg(test)]
+thread_local! {
+    // What `needs_you` would have raised, in place of a real notification.
+    static NOTIFIED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// A desktop notification that the session is waiting on the user (an
+// approval or a question). tui::notify only fires in the interactive UI and,
+// with the default `notify: auto`, only while the terminal is unfocused.
+fn needs_you(what: &str) {
+    #[cfg(test)]
+    {
+        NOTIFIED.with(|n| n.borrow_mut().push(what.to_string()));
+    }
+    #[cfg(not(test))]
+    tui::notify("buildwithnexus", what);
+}
+
 fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     if report::is_json() || !std::io::stdin().is_terminal() {
         BLOCKED_WITHOUT_TERMINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1843,6 +1945,17 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
             "blocked (no interactive terminal to confirm: {label})"
         ));
     }
+    confirm_with(label, tool_key, cwd, tui::ask)
+}
+
+// The approval prompt itself; `ask` reads the answer (None: cancelled).
+fn confirm_with(
+    label: &str,
+    tool_key: &str,
+    cwd: &Path,
+    ask: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    needs_you(&format!("approval needed: {}", trace::preview(label, 120)));
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
     tui::line(&format!(
@@ -1852,28 +1965,44 @@ fn confirm_tool(label: &str, tool_key: &str, cwd: &Path) -> Option<String> {
     ));
     // Name what `s`/`a` would allow from now on: a binary (`cargo`), a
     // subcommand (`git status`), a host, or one exact command.
+    let shown_key = tui::sanitize_terminal(tool_key);
     let scope = if tool_key.is_empty() {
         String::new()
     } else {
-        format!(" `{}`", tui::sanitize_terminal(tool_key))
+        format!(" `{shown_key}`")
     };
     tui::line(&tui::dim(&format!(
-        "    y yes · n no · s allow{scope} this session · a always · d <reason> deny"
+        "    y yes · n no · s allow{scope} this session · a always in this project · d <reason> deny"
     )));
     let q = format!("  {} ", tui::yellow("allow?"));
-    let ans = tui::ask(&q).unwrap_or_default();
+    let Some(ans) = ask(&q) else {
+        // Esc or Ctrl+C: refuse this call and stop the turn, instead of
+        // handing the refusal back to the model to try something else.
+        stop_turn();
+        return Some(STOPPED_BY_USER.into());
+    };
     let trimmed = ans.trim();
     let lower = trimmed.to_lowercase();
     if matches!(lower.as_str(), "y" | "yes") {
         None
     } else if matches!(lower.as_str(), "s" | "session") {
         add_session_allowed_tool(cwd, tool_key);
+        if !tool_key.is_empty() {
+            tui::line(&tui::green(&format!(
+                "  ✓ allowed for this session: {shown_key}"
+            )));
+        }
         None
     } else if matches!(lower.as_str(), "a" | "always") {
         add_session_allowed_tool(cwd, tool_key);
         // Scoped to this project (user settings `project_allowed`), so one
         // `a` on write_file here never silences the gate elsewhere.
         crate::config::add_project_allowed(cwd, tool_key);
+        if !tool_key.is_empty() {
+            tui::line(&tui::green(&format!(
+                "  ✓ always allowed in this project: {shown_key} — /permissions to review or remove"
+            )));
+        }
         None
     } else if lower.starts_with("d ")
         || lower.starts_with("deny ")
@@ -1923,13 +2052,18 @@ pub(crate) fn gate(
         (None, Some(h)) => format!("fetch {h}"),
         (None, None) => name.to_string(),
     };
-    // start_server runs a shell command too: same catastrophic and
-    // sensitive-path checks, but approved as the tool itself.
-    let any_cmd = shell.or_else(|| {
-        (name == "start_server")
-            .then(|| input["command"].as_str())
-            .flatten()
-    });
+    // start_server and check_work run a shell command too: same
+    // catastrophic and sensitive-path checks and rules, but approved as the
+    // tool itself.
+    let any_cmd = command_of(name, input);
+
+    // Deny rules and network.deny refuse in every mode, before anything can
+    // ask or allow.
+    let rules = config::policy_rules(cwd);
+    let host_ref = host.as_deref();
+    if let Some(reason) = denied_by_rule(&rules, name, input, cwd, host_ref) {
+        return Some(reason);
+    }
 
     // Read-only: refuse every mutation outright, before the sensitive-path and
     // catastrophic-command confirmations — those return "allowed" on `y`, which
@@ -1987,14 +2121,51 @@ pub(crate) fn gate(
         }
     }
 
+    // Ask rules prompt in every mode, even when an allow rule, a saved
+    // approval or auto would let the call through.
+    if let Some(r) = rule_for(&rules, config::RuleEffect::Ask, name, input, cwd, host_ref) {
+        return confirm_tool(
+            &format!(
+                "{} — asks because of {}",
+                tools::approval_label(name, input),
+                rule_label(r)
+            ),
+            &tool_key,
+            cwd,
+        );
+    }
+    let allowed_by_rule = rule_for(
+        &rules,
+        config::RuleEffect::Allow,
+        name,
+        input,
+        cwd,
+        host_ref,
+    )
+    .is_some();
+
     // Network tools can send what the agent has read to any host and reach
     // services on the local network, so outside `auto` each new host is
-    // approved once (read-only mode included). `fetch *` allows them all.
-    if host.is_some() && !matches!(perm, Permission::Auto) {
+    // approved once (read-only mode included). `fetch *` or a network.allow
+    // entry allows them without asking.
+    if let Some(h) = host_ref {
+        if matches!(perm, Permission::Auto) || allowed_by_rule {
+            return None;
+        }
         if is_pre_approved(None, &tool_key, cwd) || is_pre_approved(None, "fetch *", cwd) {
             return None;
         }
-        return confirm_tool(&tools::approval_label(name, input), &tool_key, cwd);
+        return confirm_tool(
+            &format!(
+                "network access to {h} — {}",
+                tools::approval_label(name, input)
+            ),
+            &tool_key,
+            cwd,
+        );
+    }
+    if allowed_by_rule {
+        return None;
     }
 
     match perm {
@@ -2002,8 +2173,20 @@ pub(crate) fn gate(
         // Mutations were refused above; reads anywhere and read-only shell
         // commands are allowed in readonly mode.
         Permission::ReadOnly => None,
-        Permission::Ask => {
+        Permission::Ask | Permission::AcceptEdits => {
             if is_pre_approved(shell, &tool_key, cwd) {
+                return None;
+            }
+            // Accept-edits: a file edit inside the project needs no prompt;
+            // commands, deletions and everything else still ask. So does a
+            // change inside `.git`: git runs what its config and hooks name
+            // (fsmonitor, hooks) on its next call, bwn's own included.
+            if perm == Permission::AcceptEdits
+                && tools::is_file_edit(name, input)
+                && paths
+                    .iter()
+                    .all(|p| !tools::escapes_cwd(p, cwd) && !inside_git_dir(p, cwd))
+            {
                 return None;
             }
             if tools::is_mutating_call(name, input) {
@@ -2013,6 +2196,175 @@ pub(crate) fn gate(
             // The user asked for full filesystem access.
             None
         }
+    }
+}
+
+// The shell command a call runs: run_command's and bash's, and the command
+// start_server and check_work are given, which run through the same shell.
+fn command_of<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    tools::command_arg_for(name, input).or_else(|| {
+        matches!(name, "start_server" | "check_work")
+            .then(|| input["command"].as_str())
+            .flatten()
+            .filter(|c| !c.trim().is_empty())
+    })
+}
+
+// Whether `p` lies inside a `.git` directory of the project (its own or a
+// nested checkout's).
+fn inside_git_dir(p: &Path, cwd: &Path) -> bool {
+    tools::project_relative(p, cwd)
+        .is_some_and(|rel| rel.split('/').any(|c| c.eq_ignore_ascii_case(".git")))
+}
+
+// ── allow / ask / deny rules ─────────────────────────────────────────────────
+// `permissions` and `network` from settings, checked before the mode:
+// deny > ask > allow > mode. See config::policy_rules for where they come from.
+
+// `Tool(pattern)` → ("Tool", Some("pattern")); `Tool` → ("Tool", None).
+fn split_rule(rule: &str) -> (&str, Option<&str>) {
+    match rule.trim().split_once('(') {
+        Some((tool, rest)) if rest.ends_with(')') => {
+            (tool.trim(), Some(rest[..rest.len() - 1].trim()))
+        }
+        _ => (rule.trim(), None),
+    }
+}
+
+// Does a rule cover this call? A network entry matches the host. For a
+// permissions rule the tool part is a hook-style matcher (Claude Code names
+// included) and the pattern is matched against the command for shell tools,
+// the host for network tools (`domain:` optional), the query for web_search
+// and the touched paths (project-relative, or absolute) for file tools. An
+// allow rule must cover a whole plain command and every path; ask and deny
+// rules match any part of a compound command and any path.
+fn rule_covers(
+    rule: &config::PolicyRule,
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+    host: Option<&str>,
+) -> bool {
+    if rule.network {
+        return host.is_some_and(|h| host_matches(&rule.rule, h));
+    }
+    let (tool, pattern) = split_rule(&rule.rule);
+    // A rule for the shell tool (`run_command`, `bash`, Claude Code's `Bash`)
+    // covers every tool that runs a command, so check_work and start_server
+    // cannot step around `run_command(git push*)`.
+    let shell = command_of(name, input);
+    let names_shell = || {
+        ["run_command", "bash"]
+            .iter()
+            .any(|t| hooks::tool_matches(tool, t))
+    };
+    if !hooks::tool_matches(tool, name) && !(shell.is_some() && names_shell()) {
+        return false;
+    }
+    let Some(pat) = pattern.filter(|p| !p.is_empty() && *p != "*") else {
+        return true;
+    };
+    let allow = rule.effect == config::RuleEffect::Allow;
+    if let Some(cmd) = shell {
+        // Claude Code's prefix form `git push:*` means `git push*`.
+        let pat = match pat.strip_suffix(":*") {
+            Some(p) => format!("{p}*"),
+            None => pat.to_string(),
+        };
+        let subjects = tools::rule_subjects(cmd);
+        return if allow {
+            tools::is_plain_command(cmd)
+                && tools::skips_prompt_safely(cmd, cwd)
+                && subjects.first().is_some_and(|c| hooks::glob_match(&pat, c))
+        } else {
+            subjects.iter().any(|c| hooks::glob_match(&pat, c))
+        };
+    }
+    if matches!(name, "web_search" | "websearch") {
+        return input["query"]
+            .as_str()
+            .is_some_and(|q| hooks::glob_match(pat, q.trim()));
+    }
+    if let Some(h) = host {
+        return host_matches(pat.strip_prefix("domain:").unwrap_or(pat), h);
+    }
+    let paths = tools::touched_paths(name, input, cwd);
+    let hit = |p: &PathBuf| path_matches(pat, p, cwd);
+    !paths.is_empty()
+        && if allow {
+            paths.iter().all(hit)
+        } else {
+            paths.iter().any(hit)
+        }
+}
+
+// Host patterns are case-insensitive and may leave out the port.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let bare = host
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(host, |(h, _)| h);
+    hooks::glob_match(&pattern, host) || hooks::glob_match(&pattern, bare)
+}
+
+// A relative pattern names project paths (`migrations/**`, `*.lock`); an
+// absolute or `~/` one names any path. `*` spans `/` too.
+fn path_matches(pattern: &str, path: &Path, cwd: &Path) -> bool {
+    let pattern = pattern.trim().trim_start_matches("./");
+    if let Some(rest) = pattern.strip_prefix("~/") {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_default();
+        return !home.is_empty()
+            && hooks::glob_match(
+                &format!("{}/{rest}", home.trim_end_matches(['/', '\\'])),
+                &path.to_string_lossy(),
+            );
+    }
+    if Path::new(pattern).is_absolute() {
+        return hooks::glob_match(pattern, &path.to_string_lossy());
+    }
+    tools::project_relative(path, cwd).is_some_and(|rel| hooks::glob_match(pattern, &rel))
+}
+
+// The first rule with `effect` that covers the call (deny rules first by
+// the caller's order).
+fn rule_for<'a>(
+    rules: &'a [config::PolicyRule],
+    effect: config::RuleEffect,
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+    host: Option<&str>,
+) -> Option<&'a config::PolicyRule> {
+    rules
+        .iter()
+        .filter(|r| r.effect == effect)
+        .find(|r| rule_covers(r, name, input, cwd, host))
+}
+
+// The refusal for a call a deny rule or network.deny covers. A refusal by
+// policy counts as a blocked change for the headless outcome.
+fn denied_by_rule(
+    rules: &[config::PolicyRule],
+    name: &str,
+    input: &serde_json::Value,
+    cwd: &Path,
+    host: Option<&str>,
+) -> Option<String> {
+    let r = rule_for(rules, config::RuleEffect::Deny, name, input, cwd, host)?;
+    stopped_short(Outcome::ApprovalBlocked);
+    Some(format!("denied by {}", rule_label(r)))
+}
+
+/// How a rule names itself in a refusal: `rule run_command(git push*)
+/// (user settings)`, or `network.deny in user settings`.
+pub fn rule_label(r: &config::PolicyRule) -> String {
+    if r.network {
+        format!("network.{} in {}", r.effect.as_str(), r.source)
+    } else {
+        format!("rule {} ({})", r.rule, r.source)
     }
 }
 
@@ -2058,6 +2410,17 @@ pub fn ignored_approvals(cwd: &Path) -> Vec<String> {
     keys
 }
 
+/// `ignored_approvals_notice` at startup: shown in the first session that
+/// finds these approvals, not at every launch (/permissions always shows it).
+pub fn ignored_approvals_notice_once(cwd: &Path) -> Option<String> {
+    ignored_approvals_notice(cwd).filter(|n| {
+        !config::notice_seen(
+            &format!("ignored-approvals {}", config::project_key(cwd)),
+            n,
+        )
+    })
+}
+
 /// One line naming the ignored approvals and why, or None when there are none.
 pub fn ignored_approvals_notice(cwd: &Path) -> Option<String> {
     let keys = ignored_approvals(cwd);
@@ -2080,6 +2443,10 @@ pub(crate) fn hook_gate(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
+    // The user stopped this turn at a prompt: run nothing else in it.
+    if turn_stopped(false) {
+        return Some("not run: the user stopped this turn".into());
+    }
     gate_after_hook(
         hooks::pre_tool_use(name, input, cwd),
         perm,
@@ -2098,7 +2465,17 @@ fn gate_after_hook(
 ) -> Option<String> {
     match decision {
         PreDecision::Deny(r) => Some(r),
-        PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => None,
+        // A hook's allow skips the prompts, never a deny rule.
+        PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => {
+            let host = tools::network_host(name, input);
+            denied_by_rule(
+                &config::policy_rules(cwd),
+                name,
+                input,
+                cwd,
+                host.as_deref(),
+            )
+        }
         _ => gate(perm, name, input, cwd),
     }
 }
@@ -2194,6 +2571,7 @@ struct AgentRunningGuard;
 
 impl AgentRunningGuard {
     fn new() -> Self {
+        set_turn_stopped(false);
         tui::set_agent_running(true);
         Self
     }
@@ -2201,6 +2579,7 @@ impl AgentRunningGuard {
 
 impl Drop for AgentRunningGuard {
     fn drop(&mut self) {
+        set_turn_stopped(false);
         tui::set_agent_running(false);
     }
 }
@@ -2803,6 +3182,12 @@ fn build_turn(
         // doesn't lose the session (save is cheap and swallows I/O errors).
         if let Some(sid) = sid {
             crate::session::save(sid, cwd, &p.model, msgs);
+        }
+        if turn_stopped(depth == 0) {
+            if depth == 0 {
+                report::notice("  stopped — tell me what to do instead");
+            }
+            return Ok(String::new());
         }
         if !report::is_json() {
             tui::context_meter(context_used(msgs), p.context_tokens);
@@ -4569,15 +4954,36 @@ mod tests {
 
     #[test]
     fn permission_parsing() {
-        assert!(matches!(permission("auto"), Permission::Auto));
-        assert!(matches!(permission("acceptEdits"), Permission::Auto));
-        assert!(matches!(permission("bypass-permissions"), Permission::Auto));
-        assert!(matches!(permission("readonly"), Permission::ReadOnly));
-        assert!(matches!(permission("read-only"), Permission::ReadOnly));
-        assert!(matches!(permission("plan"), Permission::ReadOnly));
-        assert!(matches!(permission("ask"), Permission::Ask));
-        assert!(matches!(permission("anything-else"), Permission::Ask));
-        assert!(matches!(permission(""), Permission::Ask));
+        assert_eq!(parse_permission("auto"), Ok(Permission::Auto));
+        assert_eq!(parse_permission("acceptEdits"), Ok(Permission::AcceptEdits));
+        assert_eq!(
+            parse_permission("accept-edits"),
+            Ok(Permission::AcceptEdits)
+        );
+        assert_eq!(
+            parse_permission("accept_edits"),
+            Ok(Permission::AcceptEdits)
+        );
+        assert_eq!(parse_permission("bypass-permissions"), Ok(Permission::Auto));
+        assert_eq!(parse_permission("readonly"), Ok(Permission::ReadOnly));
+        assert_eq!(parse_permission("read-only"), Ok(Permission::ReadOnly));
+        assert_eq!(parse_permission("plan"), Ok(Permission::ReadOnly));
+        assert_eq!(parse_permission(" Ask "), Ok(Permission::Ask));
+        // Unknown names are errors that list the real ones, never `ask`.
+        let e = parse_permission("yolo").unwrap_err();
+        assert_eq!(
+            e,
+            "unknown permission mode yolo — use ask, accept-edits, auto, readonly or plan"
+        );
+        assert!(parse_permission("").is_err());
+        for p in [
+            Permission::Ask,
+            Permission::AcceptEdits,
+            Permission::Auto,
+            Permission::ReadOnly,
+        ] {
+            assert_eq!(parse_permission(permission_name(p)), Ok(p));
+        }
     }
 
     #[test]
@@ -5155,6 +5561,10 @@ mod tests {
 
     #[test]
     fn network_tools_ask_per_host_outside_auto() {
+        // Other tests point NEXUS_HOME at settings with network rules.
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cwd = Path::new("/proj");
         let input = json!({"url": "https://attacker.example/?k=secret"});
         for perm in [Permission::Ask, Permission::ReadOnly] {
@@ -5163,7 +5573,22 @@ mod tests {
             assert!(r.contains("attacker.example"), "{r}");
         }
         assert!(gate(Permission::Auto, "fetch_url", &input, cwd).is_none());
-        assert!(gate(Permission::Ask, "web_search", &json!({"query": "x"}), cwd).is_none());
+        // A search sends its query to the search host: it asks like a fetch.
+        for perm in [
+            Permission::Ask,
+            Permission::ReadOnly,
+            Permission::AcceptEdits,
+        ] {
+            let r = gate(
+                perm,
+                "web_search",
+                &json!({"query": "my api key is x"}),
+                cwd,
+            )
+            .expect("web_search must ask");
+            assert!(r.contains("network access to lite.duckduckgo.com"), "{r}");
+        }
+        assert!(gate(Permission::Auto, "web_search", &json!({"query": "x"}), cwd).is_none());
     }
 
     #[test]
@@ -6294,5 +6719,383 @@ mod tests {
         assert_eq!(kept.as_deref(), Some("unsaved"));
         assert!(report.contains("isolated worktree kept"), "{report}");
         assert!(report.contains(&wt.path.display().to_string()), "{report}");
+    }
+
+    #[test]
+    fn session_answer_covers_exactly_the_approved_rm() {
+        let cwd = Path::new("/proj-rmscope");
+        let key = tools::approval_key("rm -rf tests");
+        assert_eq!(key, "rm -rf tests");
+        let r = confirm_with("run: rm -rf tests", &key, cwd, |_| Some("s".into()));
+        assert!(r.is_none());
+        assert!(is_pre_approved(Some("rm -rf tests"), &key, cwd));
+        // A different folder is a different command: it asks again.
+        let other = tools::approval_key("rm -rf tools");
+        assert!(!is_pre_approved(Some("rm -rf tools"), &other, cwd));
+        assert!(session_allowed(cwd).contains(&key));
+        assert!(remove_session_allowed(cwd, &key));
+        assert!(!is_pre_approved(Some("rm -rf tests"), &key, cwd));
+    }
+
+    #[test]
+    fn cancelling_an_approval_denies_it_and_stops_the_turn() {
+        let cwd = Path::new("/proj-cancel");
+        set_turn_stopped(false);
+        let r = confirm_with("run: rm -rf tests", "rm -rf tests", cwd, |_| None)
+            .expect("a cancelled prompt refuses the call");
+        assert!(r.contains("stopped by the user"), "{r}");
+        // Nothing else runs in this turn, not even an auto-mode read.
+        let next = hook_gate(Permission::Auto, "read_file", &json!({"path": "a"}), cwd)
+            .expect("refused after a stop");
+        assert!(next.contains("stopped"), "{next}");
+        // The top-level loop takes the stop; then calls run again.
+        assert!(turn_stopped(false));
+        assert!(turn_stopped(true));
+        assert!(!turn_stopped(false));
+        assert!(hook_gate(Permission::Auto, "read_file", &json!({"path": "a"}), cwd).is_none());
+    }
+
+    #[test]
+    fn approvals_and_questions_raise_one_notification() {
+        NOTIFIED.with(|n| n.borrow_mut().clear());
+        let _ = confirm_with("edit app.py", "edit_file", Path::new("/proj-n"), |_| {
+            Some("n".into())
+        });
+        let (ans, err) = answer_with("which file?", "which file?", "a.txt", |_| {
+            Some(String::new())
+        });
+        assert_eq!((ans.as_str(), err), ("a.txt", false));
+        let got = NOTIFIED.with(|n| n.borrow().clone());
+        assert_eq!(
+            got,
+            ["approval needed: edit app.py", "question: which file?"],
+            "one notification per prompt, naming it"
+        );
+        // A headless run has nobody to notify: the gate refuses first.
+        NOTIFIED.with(|n| n.borrow_mut().clear());
+        let r = gate(
+            Permission::Ask,
+            "write_file",
+            &json!({"path": "x.txt", "content": "1"}),
+            Path::new("/proj-n"),
+        );
+        assert!(r.is_some());
+        assert!(NOTIFIED.with(|n| n.borrow().is_empty()));
+        set_turn_stopped(false);
+    }
+
+    #[test]
+    fn accept_edits_applies_project_edits_and_asks_for_the_rest() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-accept-edits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::env::set_var("NEXUS_HOME", home.join("nexus"));
+        let perm = Permission::AcceptEdits;
+        for (name, input) in [
+            ("write_file", json!({"path": "app.py", "content": "x"})),
+            (
+                "edit_file",
+                json!({"path": "app.py", "old": "x", "new": "y"}),
+            ),
+            ("create_dir", json!({"path": "pkg"})),
+        ] {
+            assert_eq!(gate(perm, name, &input, &proj), None, "{name}");
+        }
+        // Commands, deletions, the network, edits outside the project and
+        // sensitive files still ask (a refusal here: no terminal).
+        for (name, input) in [
+            ("run_command", json!({"command": "npm test"})),
+            ("remove_path", json!({"path": "app.py"})),
+            ("fetch_url", json!({"url": "https://example.com/"})),
+            (
+                "write_file",
+                json!({"path": "../elsewhere.txt", "content": "x"}),
+            ),
+            ("write_file", json!({"path": ".env", "content": "K=1"})),
+        ] {
+            let r = gate(perm, name, &input, &proj);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("blocked")),
+                "{name} {input}: {r:?}"
+            );
+        }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // NEXUS_HOME with these user settings and a project folder, under the
+    // env lock; returns (home, project).
+    fn rules_home(tag: &str, settings: serde_json::Value) -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!("bwn-rules-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        (home, proj)
+    }
+
+    #[test]
+    fn rules_deny_ask_and_allow_in_that_order() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "order",
+            json!({"permissions": {
+                "deny": ["run_command(git push*)"],
+                "ask": ["write_file(migrations/**)"],
+                "allow": [
+                    "run_command(git log*)",
+                    "run_command(git push --dry-run*)",
+                    "Bash(npm test:*)",
+                    "Write(docs/**)"
+                ]
+            }}),
+        );
+        let run = |perm, cmd: &str| gate(perm, "run_command", &json!({"command": cmd}), &proj);
+
+        // Deny wins over allow and over auto, also inside a compound command
+        // and through a path-qualified program.
+        for (perm, cmd) in [
+            (Permission::Auto, "git push origin main"),
+            (Permission::Auto, "make && /usr/bin/git  push"),
+            (Permission::Ask, "git push --dry-run"),
+        ] {
+            assert_eq!(
+                run(perm, cmd).as_deref(),
+                Some("denied by rule run_command(git push*) (user settings)"),
+                "{cmd}"
+            );
+        }
+        // Ask prompts even in auto (a refusal here: no terminal).
+        let r = gate(
+            Permission::Auto,
+            "write_file",
+            &json!({"path": "migrations/001.sql", "content": "x"}),
+            &proj,
+        )
+        .expect("asks");
+        assert!(
+            r.contains("asks because of rule write_file(migrations/**)"),
+            "{r}"
+        );
+        // Allow skips the prompt in ask mode, for whole plain commands only.
+        assert_eq!(run(Permission::Ask, "git log --oneline"), None);
+        assert_eq!(run(Permission::Ask, "npm test -- --watch"), None);
+        assert!(run(Permission::Ask, "npm test; rm -rf src").is_some());
+        assert!(
+            run(Permission::Ask, "cargo build").is_some(),
+            "no rule: asks"
+        );
+        assert_eq!(
+            gate(
+                Permission::Ask,
+                "write_file",
+                &json!({"path": "docs/a.md", "content": "x"}),
+                &proj
+            ),
+            None
+        );
+        // A hook's allow never beats a deny rule.
+        assert!(gate_after_hook(
+            PreDecision::Allow,
+            Permission::Ask,
+            "run_command",
+            &json!({"command": "git push"}),
+            &proj
+        )
+        .is_some_and(|r| r.contains("denied by rule")));
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn network_deny_and_allow_lists() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "net",
+            json!({"network": {"deny": ["lite.duckduckgo.com"], "allow": ["*.example.com"]}}),
+        );
+        let search = json!({"query": "my api key is sk-123"});
+        for perm in [Permission::Auto, Permission::Ask, Permission::ReadOnly] {
+            assert_eq!(
+                gate(perm, "web_search", &search, &proj).as_deref(),
+                Some("denied by network.deny in user settings")
+            );
+        }
+        let fetch = json!({"url": "https://docs.example.com:8443/x"});
+        assert_eq!(gate(Permission::Ask, "fetch_url", &fetch, &proj), None);
+        assert_eq!(gate(Permission::ReadOnly, "fetch_url", &fetch, &proj), None);
+        let other = json!({"url": "https://example.org/"});
+        assert!(gate(Permission::Ask, "fetch_url", &other, &proj).is_some());
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_untrusted_repository_adds_only_ask_and_deny_rules() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home("repo", json!({"permission": "ask"}));
+        std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            json!({
+                "permissions": {"allow": ["run_command(*)"], "deny": ["run_command(rm *)"]},
+                "network": {"allow": ["evil.example"], "deny": ["tracker.example"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rules = config::policy_rules(&proj);
+        assert!(
+            rules.iter().all(|r| r.effect != config::RuleEffect::Allow),
+            "{rules:?}"
+        );
+        assert_eq!(
+            gate(
+                Permission::Auto,
+                "run_command",
+                &json!({"command": "rm -rf x"}),
+                &proj
+            )
+            .as_deref(),
+            Some("denied by rule run_command(rm *) (project settings)")
+        );
+        // The repo's allow entries wait for trust: these still ask.
+        assert!(gate(
+            Permission::Ask,
+            "run_command",
+            &json!({"command": "make"}),
+            &proj
+        )
+        .is_some());
+        assert!(gate(
+            Permission::Ask,
+            "fetch_url",
+            &json!({"url": "https://evil.example/"}),
+            &proj
+        )
+        .is_some());
+        assert_eq!(
+            gate(
+                Permission::Auto,
+                "fetch_url",
+                &json!({"url": "https://tracker.example/"}),
+                &proj
+            )
+            .as_deref(),
+            Some("denied by network.deny in project settings")
+        );
+        // And the trust prompt lists the keys that wait.
+        let pending = config::untrusted_project_files(&proj);
+        assert_eq!(pending[0].keys, ["network", "permissions"]);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn commands_run_by_check_work_and_start_server_meet_the_same_checks() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home(
+            "shelltools",
+            json!({"permissions": {"deny": ["run_command(git push*)"]}}),
+        );
+        // check_work and start_server run the command they are given, so a
+        // deny rule for it holds there too, even in auto.
+        for name in ["check_work", "start_server"] {
+            assert_eq!(
+                gate(
+                    Permission::Auto,
+                    name,
+                    &json!({"command": "git push origin main"}),
+                    &proj
+                )
+                .as_deref(),
+                Some("denied by rule run_command(git push*) (user settings)"),
+                "{name}"
+            );
+        }
+        // A check that reads a key file asks even in auto, as run_command
+        // does (a refusal here: no terminal).
+        let r = gate(
+            Permission::Auto,
+            "check_work",
+            &json!({"command": "cat ~/.ssh/id_rsa > leak.txt"}),
+            &proj,
+        )
+        .expect("asks first");
+        assert!(r.contains("sensitive path"), "{r}");
+        // The project's own checks (no command) are not a command rule's
+        // business.
+        assert_eq!(
+            gate(Permission::Auto, "check_work", &json!({}), &proj),
+            None
+        );
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn accept_edits_asks_before_changing_anything_inside_git() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, proj) = rules_home("acceptgit", json!({}));
+        // git itself runs what .git/config and .git/hooks name (fsmonitor,
+        // hooks) on its next call, bwn's own included: not a plain edit.
+        for (name, input) in [
+            (
+                "write_file",
+                json!({"path": ".git/hooks/pre-commit", "content": "x"}),
+            ),
+            (
+                "edit_file",
+                json!({"path": ".git/config", "old": "a", "new": "b"}),
+            ),
+            (
+                "write_file",
+                json!({"path": "vendor/lib/.git/config", "content": "x"}),
+            ),
+            (
+                "move_path",
+                json!({"from": "hook.sh", "to": ".git/hooks/post-checkout"}),
+            ),
+        ] {
+            let r = gate(Permission::AcceptEdits, name, &input, &proj);
+            assert!(
+                r.as_deref().is_some_and(|r| r.contains("blocked")),
+                "{name} {input}: {r:?}"
+            );
+        }
+        // Lookalikes are ordinary project files.
+        for path in [
+            ".github/workflows/ci.yml",
+            ".gitignore",
+            "src/git/config.rs",
+        ] {
+            assert_eq!(
+                gate(
+                    Permission::AcceptEdits,
+                    "write_file",
+                    &json!({"path": path, "content": "x"}),
+                    &proj
+                ),
+                None,
+                "{path}"
+            );
+        }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

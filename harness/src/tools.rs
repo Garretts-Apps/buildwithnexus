@@ -933,12 +933,22 @@ fn runs_arbitrary_code(bin: &str) -> bool {
     RUNS_ARBITRARY_CODE.contains(&family)
 }
 
+// Single-verb programs whose arguments decide what they destroy, move or
+// stop: `s` on `rm -rf tests` must not approve `rm -rf tools`, so their
+// approvals are stored per exact command, like interpreters.
+const KEYS_ON_ARGUMENTS: &[&str] = &[
+    "rm", "rmdir", "unlink", "shred", "srm", "mv", "cp", "ln", "install", "rsync", "chmod",
+    "chown", "chgrp", "chattr", "setfacl", "dd", "truncate", "kill", "pkill", "killall", "del",
+    "erase", "rd", "move", "copy", "robocopy", "xcopy", "icacls", "takeown",
+];
+
 /// The key an "allow this session" / "always allow" answer is stored under:
 /// the binary, plus its subcommand for multi-verb tools (`git status`), or
-/// the whole command for shells and interpreters.
+/// the whole command for shells, interpreters and programs whose arguments
+/// name what they change (`rm -rf tests`).
 pub fn approval_key(cmd: &str) -> String {
     let (bin, args) = command_words(cmd);
-    if runs_arbitrary_code(&bin) {
+    if runs_arbitrary_code(&bin) || KEYS_ON_ARGUMENTS.contains(&bin.as_str()) {
         return cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     // Keep the path in the key for a path-qualified program, so an approval
@@ -955,6 +965,50 @@ pub fn approval_key(cmd: &str) -> String {
         }
     }
     ident
+}
+
+/// `p` relative to the project root, with `/` separators, when it lies
+/// inside the project: what a permission rule's path pattern is matched
+/// against (`migrations/**`).
+pub fn project_relative(p: &Path, cwd: &Path) -> Option<String> {
+    let rel = canonicalize_lenient(p)
+        .strip_prefix(canonicalize_lenient(cwd))
+        .ok()?
+        .to_path_buf();
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// The commands a permission rule is checked against: each part of a
+/// compound command (split at `;`, `&&`, `||`, `|`, `&` and line breaks),
+/// whitespace collapsed and the program reduced to its name, so
+/// `run_command(git push*)` also catches `make && /usr/bin/git  push`.
+/// The whole command comes first. Best effort: a program started by
+/// another one (`sh -c 'git push'`) is not unpacked.
+pub fn rule_subjects(cmd: &str) -> Vec<String> {
+    let flat = |c: &str| -> Option<String> {
+        let mut words = c.split_whitespace();
+        let first = normalized_bin(words.next()?);
+        Some(
+            std::iter::once(first.as_str())
+                .chain(words)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    };
+    let mut out: Vec<String> = flat(cmd).into_iter().collect();
+    for part in cmd.split(['\n', '\r', ';', '|', '&']) {
+        if let Some(p) = flat(part) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// A saved approval naming a shell or interpreter on its own (`python3`), as
@@ -1059,11 +1113,32 @@ pub fn approval_label(name: &str, input: &Value) -> String {
     }
 }
 
-/// The host a network tool will contact (`fetch_url`, `headless_browser`,
-/// `wait_for_url`, and `open_browser` with a URL). Fetches can carry data out
-/// (`https://evil/?k=<secret>`) and reach local services, so outside `auto`
+/// A call that only creates or changes files: what `accept-edits` lets run
+/// without a prompt inside the project. Deleting (`remove_path`) and every
+/// command still ask.
+pub fn is_file_edit(name: &str, input: &Value) -> bool {
+    match name {
+        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" | "patch" | "apply_patch"
+        | "create_dir" | "move_path" => true,
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
+            is_mutating_call(name, input)
+        }
+        _ => false,
+    }
+}
+
+// Where web_search sends its query.
+const WEB_SEARCH_HOST: &str = "lite.duckduckgo.com";
+
+/// The host a network tool will contact (`fetch_url`, `web_search`,
+/// `headless_browser`, `wait_for_url`, and `open_browser` with a URL).
+/// Fetches and search queries can carry data out (`https://evil/?k=<secret>`,
+/// "my api key is …") and fetches reach local services, so outside `auto`
 /// they are approved per host. `?` when the URL has no parsable host.
 pub fn network_host(name: &str, input: &Value) -> Option<String> {
+    if matches!(name, "websearch" | "web_search") {
+        return Some(WEB_SEARCH_HOST.to_string());
+    }
     if !matches!(
         name,
         "webfetch" | "fetch_url" | "headless_browser" | "wait_for_url" | "open_browser"
@@ -1416,6 +1491,35 @@ fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+// The variable names in the global environment of a tmux server that is
+// already running (none when there is no server).
+fn tmux_server_env() -> Vec<String> {
+    let Ok(out) = Command::new("tmux")
+        .args(["show-environment", "-g"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+        .collect()
+}
+
+// `script` run with `names` unset, whatever shell tmux starts it with.
+fn without_env(names: &[String], script: &str) -> String {
+    if names.is_empty() {
+        return script.to_string();
+    }
+    let unset: Vec<String> = names.iter().map(|n| format!("-u {n}")).collect();
+    format!("env {} sh -c {}", unset.join(" "), shell_quote(script))
+}
+
 fn tmux_running(session: &str) -> bool {
     Command::new("tmux")
         .args(["has-session", "-t", session])
@@ -1566,7 +1670,16 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
             command,
             shell_quote(&log_path.to_string_lossy())
         );
-        match Command::new("tmux")
+        // A tmux server that is already running hands the session its own
+        // environment, keys included, so the command unsets them itself.
+        let shell = without_env(
+            &crate::sandbox::credentials_to_unset(tmux_server_env()),
+            &shell,
+        );
+        let mut tmux = Command::new("tmux");
+        // A tmux server started here inherits this environment.
+        crate::sandbox::scrub_credentials(&mut tmux);
+        match tmux
             .args(["new-session", "-d", "-s", &session])
             .arg(shell)
             .output()
@@ -1617,10 +1730,12 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
         } else if cfg!(windows) {
             let mut c = Command::new("cmd");
             c.args(["/C", command]).current_dir(&run_cwd);
+            crate::sandbox::scrub_credentials(&mut c);
             c
         } else {
             let mut c = Command::new("sh");
             c.args(["-lc", command]).current_dir(&run_cwd);
+            crate::sandbox::scrub_credentials(&mut c);
             c
         };
         match cmd
@@ -3295,6 +3410,7 @@ fn python_tool_command(
     }
     let mut command = Command::new(python_interpreter());
     command.arg(script).current_dir(cwd);
+    crate::sandbox::scrub_credentials(&mut command);
     Ok(command)
 }
 
@@ -3809,6 +3925,8 @@ fn shell_command(cmd: &str, cwd: &Path) -> Result<Command, String> {
         c
     };
     command.current_dir(cwd);
+    // Provider keys stay with the agent: an approved `env` must not show them.
+    crate::sandbox::scrub_credentials(&mut command);
     Ok(command)
 }
 
@@ -7590,6 +7708,30 @@ print("hello " + data.get("name", "world"))
         assert_eq!(approval_key("npm test"), "npm test");
         assert_eq!(approval_key("cargo"), "cargo");
         assert_eq!(approval_key("cat README.md"), "cat");
+    }
+
+    #[test]
+    fn approval_key_keeps_the_arguments_of_destructive_programs() {
+        // `s` on one of these covers exactly that command, never the program.
+        for cmd in [
+            "rm -rf tests",
+            "mv a.txt b.txt",
+            "cp -r src /tmp/x",
+            "chmod 777 app.py",
+            "chown root app.py",
+            "dd if=/dev/zero of=disk.img",
+            "kill -9 1234",
+            "/bin/rm -rf tests",
+            "RM.exe tests",
+        ] {
+            let key = approval_key(cmd);
+            assert!(key.split_whitespace().count() > 1, "{cmd} → {key}");
+        }
+        assert_eq!(approval_key("rm  -rf   tests"), "rm -rf tests");
+        assert_ne!(approval_key("rm -rf tests"), approval_key("rm -rf tools"));
+        // Multi-verb tools still key on the subcommand.
+        assert_eq!(approval_key("git status -s"), "git status");
+        assert_eq!(approval_key("npm test -- --watch"), "npm test");
     }
 
     // Every read-only-classifier bypass we have ever fixed, in one place.

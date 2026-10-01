@@ -273,15 +273,79 @@ const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
 /// Environment a sandboxed child never inherits: session buses and agent
 /// sockets reach outside the sandbox, and provider keys are the agent's.
 pub fn scrubbed_env<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    scrubbed_env_keeping(names, &[])
+}
+
+fn scrubbed_env_keeping<I: IntoIterator<Item = String>>(
+    names: I,
+    passthrough: &[String],
+) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| {
-            matches!(
-                n.as_str(),
-                "DBUS_SESSION_BUS_ADDRESS" | "SSH_AUTH_SOCK" | "HF_TOKEN"
-            ) || n.ends_with("_API_KEY")
+            matches!(n.as_str(), "DBUS_SESSION_BUS_ADDRESS" | "SSH_AUTH_SOCK")
+                || (is_credential(n) && !passthrough.iter().any(|p| p == n))
         })
         .collect()
+}
+
+// A provider credential: `*_API_KEY`, `*_API_TOKEN`, or a provider preset's
+// key variable (`HF_TOKEN`). Windows names are case-insensitive.
+fn is_credential(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_API_KEY")
+        || upper.ends_with("_API_TOKEN")
+        || crate::config::PRESETS
+            .iter()
+            .any(|p| !p.env_key.is_empty() && p.env_key == upper)
+}
+
+/// The provider credentials in `names` that a command the agent runs must
+/// not inherit, sandboxed or not, minus those the user lets through with
+/// `shell_env_passthrough`. Hooks are the user's own and keep everything.
+pub fn credential_env<I: IntoIterator<Item = String>>(
+    names: I,
+    passthrough: &[String],
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| is_credential(n) && !passthrough.iter().any(|p| p == n))
+        .collect()
+}
+
+fn passthrough() -> Vec<String> {
+    crate::config::load_settings()
+        .map(|s| s.shell_env_passthrough)
+        .unwrap_or_default()
+}
+
+fn env_names() -> impl Iterator<Item = String> {
+    std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())
+}
+
+/// Removes provider keys from a command the agent is about to run without
+/// the sandbox, so an approved `env` or `printenv` cannot hand the key to the
+/// model.
+pub fn scrub_credentials(c: &mut Command) {
+    for k in credential_env(env_names(), &passthrough()) {
+        c.env_remove(k);
+    }
+}
+
+/// The provider credentials a command started in a tmux session must unset
+/// itself: a tmux server that is already running (bwn started inside tmux)
+/// gives a new session the environment it was started with, not this one,
+/// so the names in `server_env` count too. Only valid shell names.
+pub fn credentials_to_unset<I: IntoIterator<Item = String>>(server_env: I) -> Vec<String> {
+    let mut names = credential_env(env_names().chain(server_env), &passthrough());
+    names.retain(|n| {
+        !n.is_empty()
+            && !n.starts_with(|c: char| c.is_ascii_digit())
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn sbpl_quote(p: &Path) -> String {
@@ -346,7 +410,7 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
         }
     };
     c.current_dir(&cwd);
-    for k in scrubbed_env(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+    for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
     }
     c
@@ -563,6 +627,44 @@ mod tests {
                 "HF_TOKEN"
             ]
         );
+    }
+
+    #[test]
+    fn agent_commands_lose_provider_keys_unless_passed_through() {
+        let names = [
+            "PATH",
+            "ANTHROPIC_API_KEY",
+            "custom_api_key",
+            "HF_TOKEN",
+            "GROQ_API_KEY",
+            "SOME_API_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+        ]
+        .map(String::from);
+        assert_eq!(
+            credential_env(names.clone(), &[]),
+            [
+                "ANTHROPIC_API_KEY",
+                "custom_api_key",
+                "HF_TOKEN",
+                "GROQ_API_KEY",
+                "SOME_API_TOKEN"
+            ]
+        );
+        // A build that needs one names it in shell_env_passthrough.
+        let keep = ["GROQ_API_KEY".to_string()];
+        assert!(!credential_env(names.clone(), &keep).contains(&"GROQ_API_KEY".to_string()));
+        assert!(!scrubbed_env_keeping(names, &keep).contains(&"GROQ_API_KEY".to_string()));
+        // What a running tmux server holds is unset too; a name that is not
+        // a shell name never reaches the command line.
+        let unset = credentials_to_unset(
+            ["TMUXONLY_API_KEY", "PATH", "BAD;NAME_API_KEY", "1X_API_KEY"].map(String::from),
+        );
+        assert!(unset.contains(&"TMUXONLY_API_KEY".to_string()), "{unset:?}");
+        assert!(unset
+            .iter()
+            .all(|n| n != "PATH" && !n.contains(';') && !n.starts_with('1')));
     }
 
     #[test]

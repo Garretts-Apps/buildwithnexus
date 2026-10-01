@@ -98,6 +98,9 @@ struct CliOptions {
     /// `--legacy-exit-codes` (or BWN_LEGACY_EXIT_CODES=1): exit 0 when a
     /// headless run stops short without failing, as before 0.15.
     legacy_exit_codes: bool,
+    /// `--trust-project <digest>` (or BWN_TRUST_PROJECT): trust exactly this
+    /// project settings content for this run (`buildwithnexus trust --print`).
+    trust_project: Option<String>,
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
@@ -134,6 +137,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--prompt" => &mut opts.prompt,
             "--effort" => &mut opts.effort,
             "--max-budget-usd" => &mut budget_raw,
+            "--trust-project" => &mut opts.trust_project,
             _ => {
                 rest.push(arg);
                 continue;
@@ -175,6 +179,7 @@ pub fn run() {
     if opts.json {
         report::set(report::Mode::Json);
     }
+    hooks::set_trust_digest(opts.trust_project.clone());
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
 
@@ -265,6 +270,7 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(),
+        "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
         "mcp" => match mcp::manage(&args[1..], false) {
             Ok(lines) => {
                 for l in lines {
@@ -347,10 +353,7 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // The CLI flag wins over the settings key; either arms the pre-request
     // guard in the agent loop.
     usage::set_budget(opts.max_budget_usd.or(settings.max_budget_usd));
-    let perm_name = opts
-        .permission_mode
-        .as_deref()
-        .unwrap_or(&settings.permission);
+    let perm = permission_from(opts.permission_mode.as_deref(), &settings.permission);
     // A bad --sandbox flag is a hard error; a bad settings value only warns
     // (and leaves the sandbox off) so a typo can't lock the user out.
     let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
@@ -360,7 +363,35 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
     }
-    Ok((provider, agent::permission(perm_name)))
+    workflow::set_launch(
+        &settings.provider,
+        &provider.model,
+        &provider.base_url,
+        agent::permission_name(perm),
+    );
+    Ok((provider, perm))
+}
+
+// `--permission-mode` wins over the setting. A misspelt flag is a usage
+// error (exit 2) before anything is sent; a misspelt setting warns and
+// falls back to ask, so a typo can neither lock the user out nor loosen
+// the gate.
+fn permission_from(flag: Option<&str>, setting: &str) -> Permission {
+    match flag {
+        Some(name) => agent::parse_permission(name).unwrap_or_else(|e| {
+            eprintln!("{}", tui::red(&format!("buildwithnexus: {e}")));
+            std::process::exit(2);
+        }),
+        None => agent::parse_permission(setting).unwrap_or_else(|e| {
+            eprintln!(
+                "{}",
+                tui::yellow(&format!(
+                    "buildwithnexus: warning: settings: {e} — using ask"
+                ))
+            );
+            Permission::Ask
+        }),
+    }
 }
 
 /// Every ignored settings file gets one loud stderr line — a typo in a config
@@ -610,7 +641,7 @@ fn headless(
         std::thread::spawn(|| check_and_offer_install_dependencies(false));
     }
 
-    if let Some(n) = agent::ignored_approvals_notice(&cwd) {
+    if let Some(n) = agent::ignored_approvals_notice_once(&cwd) {
         report::notice(&format!("  {n}"));
     }
     // MCP tools must be on the surface before the first request; discovery
@@ -621,12 +652,19 @@ fn headless(
     // Nobody can answer an approval prompt here, so `ask` blocks every edit
     // and command. Say so before the run, not after it looks successful.
     let unattended = report::is_json() || !std::io::stdin().is_terminal();
-    if unattended && agent::permission_name(perm) == "ask" {
+    if unattended && perm == Permission::Ask {
         eprintln!(
             "{}",
             tui::yellow(
                 "buildwithnexus: no terminal to approve changes, so edits and commands will be blocked.\n  \
                  Pass --permission-mode auto to allow them, or --permission-mode readonly to only read."
+            )
+        );
+    } else if unattended && perm == Permission::AcceptEdits {
+        eprintln!(
+            "{}",
+            tui::yellow(
+                "buildwithnexus: accept-edits with no terminal: file edits run, commands and network access will be blocked."
             )
         );
     }
@@ -773,15 +811,21 @@ fn repl(
         let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
     }
-    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+    if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
         report::notice(&format!("  {n}"));
+    }
+    for issue in hooks::take_startup_issues() {
+        tui::line(&tui::yellow(&format!("  [hook] ⚠ {issue}")));
     }
     let restored = workflow::restore();
     workflow::set_max_concurrent(settings.max_concurrent_workflows);
     // Background scheduler: due workflows start while the user is idle at the
     // prompt; their completion notices are shown at the next prompt.
     workflow::start_scheduler();
-    if restored > 0 {
+    // Once per set of restored workflows, not at every launch they wait.
+    if restored > 0
+        && !config::notice_seen("restored-workflows", &workflow::pending_tasks().join("\n"))
+    {
         tui::line(&tui::green(&format!(
             "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
             if restored == 1 { "" } else { "s" }
@@ -805,16 +849,26 @@ fn repl(
     // /btw: extra context injected into the next task without interrupting.
     let mut btw_ctx: Option<String> = None;
     let mut pending_prompt = initial_prompt;
+    // The workflow count the queue line last showed.
+    let mut shown_active = 0usize;
 
     loop {
         // Tick background workflows and surface any completion notifications
         // (both those queued by the scheduler thread and this tick's own).
         // Color by outcome — a "✗ workflow failed" line must not render green.
+        // Background runs take this session's permission and model.
+        workflow::update_live(
+            agent::permission_name(perm),
+            &provider.model,
+            &provider.base_url,
+        );
         let mut notes = workflow::take_notices();
         notes.extend(workflow::tick());
         for note in notes {
             if note.contains('✗') {
                 tui::line(&tui::red(&note));
+            } else if note.contains('⚠') {
+                tui::line(&tui::yellow(&note));
             } else {
                 tui::line(&tui::green(&note));
             }
@@ -834,15 +888,17 @@ fn repl(
             }
         }
 
-        // Show workflow activity badge if any are pending/running.
+        // Workflow activity badge, when the number pending/running changes
+        // (not again after every command).
         let active = workflow::active_count();
-        if active > 0 {
+        if active > 0 && active != shown_active {
             tui::line(&tui::dim(&format!(
                 "  ⟳ {} workflow{} in queue — /workflows to manage",
                 active,
                 if active == 1 { "" } else { "s" }
             )));
         }
+        shown_active = active;
 
         let mut task = if let Some(prompted) = pending_prompt.take() {
             tui::line("");
@@ -997,15 +1053,7 @@ fn repl(
             if arg.is_empty() {
                 handle_permissions(&mut perm, cwd);
             } else {
-                match arg {
-                    "ask" | "1" => apply_permission(&mut perm, "ask"),
-                    "auto" | "2" => apply_permission(&mut perm, "auto"),
-                    "readonly" | "3" => apply_permission(&mut perm, "readonly"),
-                    "reset" => handle_permissions_reset(cwd),
-                    other => tui::line(&tui::red(&format!(
-                        "  unknown permission '{other}' — try: ask, auto, readonly, reset"
-                    ))),
-                }
+                handle_permissions_arg(&mut perm, cwd, arg);
             }
             continue;
         }
@@ -1537,7 +1585,7 @@ fn repl(
             continue;
         }
         if let Some(new_perm) = detect_permission_switch(t) {
-            apply_permission(&mut perm, new_perm);
+            apply_permission(&mut perm, new_perm, PermScope::Session);
             continue;
         }
 
@@ -3109,6 +3157,12 @@ fn handle_workflows() {
             tui::dim(&s.task),
             iter_label
         ));
+        if let Some(why) = &s.reason {
+            tui::line(&tui::dim(&format!(
+                "        {}",
+                tui::sanitize_terminal(why)
+            )));
+        }
     }
     tui::line(&tui::rule());
     tui::line(&tui::dim(
@@ -3128,7 +3182,11 @@ fn handle_workflows() {
         }
     } else if let Some(rest) = action.strip_prefix('i') {
         if let Ok(id) = rest.trim().parse::<usize>() {
-            let lines = workflow::output(id);
+            // The run's --json events, as the lines they stand for.
+            let lines: Vec<String> = workflow::output(id)
+                .iter()
+                .filter_map(|l| workflow::readable(l))
+                .collect();
             if lines.is_empty() {
                 tui::line(&tui::dim(&format!(
                     "  no output captured for workflow #{id}"
@@ -3223,6 +3281,7 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
                 .trim();
             match rest {
                 "ask" | "confirm" => return Some("ask"),
+                "accept edits" | "accept-edits" | "acceptedits" => return Some("accept-edits"),
                 "auto" | "yolo" | "approve all" => return Some("auto"),
                 "readonly" | "read only" | "read-only" | "safe" => return Some("readonly"),
                 _ => {}
@@ -3249,20 +3308,80 @@ fn save_user_settings(changes: &[(&str, Option<serde_json::Value>)]) {
     }
 }
 
-// Apply a permission string, update the in-session value, and persist to settings.json.
-fn apply_permission(perm: &mut Permission, ps: &str) {
-    *perm = agent::permission(ps);
-    hooks::set_permission_mode(agent::permission_name(*perm));
-    save_user_settings(&[("permission", Some(ps.into()))]);
+// How far a permission change reaches: a switch typed in the conversation
+// (or `/permissions <mode>`) lasts for this session; only an explicit
+// "save as default" writes the user settings file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PermScope {
+    Session,
+    Default,
+}
+
+// Apply a permission name to the session, and save it as the default only
+// when asked to.
+fn apply_permission(perm: &mut Permission, ps: &str, scope: PermScope) {
+    let new = match agent::parse_permission(ps) {
+        Ok(p) => p,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {e}")));
+            return;
+        }
+    };
+    *perm = new;
+    let name = agent::permission_name(new);
+    hooks::set_permission_mode(name);
     tui::set_permission_mode(permission_label(perm));
-    tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
+    match scope {
+        PermScope::Session => tui::line(&tui::green(&format!(
+            "  ✓ permission: {name} for this session — /permissions to make it the default"
+        ))),
+        PermScope::Default => {
+            save_user_settings(&[("permission", Some(name.into()))]);
+            tui::line(&tui::green(&format!(
+                "  ✓ permission: {name} — saved as the default for every project"
+            )));
+        }
+    }
 }
 
 fn permission_label(perm: &Permission) -> &'static str {
-    match perm {
-        Permission::Ask => "ask",
-        Permission::Auto => "auto",
-        Permission::ReadOnly => "readonly",
+    agent::permission_name(*perm)
+}
+
+// `/permissions <arg>`: a mode for this session, `default <mode>` to save
+// it, or the saved-approval commands.
+fn handle_permissions_arg(perm: &mut Permission, cwd: &std::path::Path, arg: &str) {
+    // The numbers are the picker's rows, 1-3 as in 0.14.
+    let mode = |a: &str| match a {
+        "1" => Some("ask"),
+        "2" => Some("auto"),
+        "3" => Some("readonly"),
+        "4" => Some("accept-edits"),
+        other => agent::parse_permission(other)
+            .ok()
+            .map(agent::permission_name),
+    };
+    if let Some(rest) = arg.strip_prefix("default") {
+        match mode(rest.trim()) {
+            Some(m) => apply_permission(perm, m, PermScope::Default),
+            None => tui::line(&tui::red(
+                "  usage: /permissions default <ask|accept-edits|auto|readonly>",
+            )),
+        }
+        return;
+    }
+    match arg {
+        "reset" => handle_permissions_reset(cwd),
+        "list" => print_saved_approvals(cwd),
+        other if other.starts_with("remove ") => {
+            handle_permissions_remove(cwd, &other["remove ".len()..])
+        }
+        other => match mode(other) {
+            Some(m) => apply_permission(perm, m, PermScope::Session),
+            None => tui::line(&tui::red(&format!(
+                "  unknown permission '{other}' — try: ask, accept-edits, auto, readonly, default <mode>, list, remove <entry>, reset"
+            ))),
+        },
     }
 }
 
@@ -3282,33 +3401,111 @@ fn handle_permissions_reset(cwd: &std::path::Path) {
     }
 }
 
+// What `s` and `a` answers allow in this project, and how to take them back;
+// then the allow, ask and deny rules in force, each with its file.
+fn print_saved_approvals(cwd: &std::path::Path) {
+    let rules = config::policy_rules(cwd);
+    if !rules.is_empty() {
+        tui::line("  rules (deny > ask > allow > mode):");
+        for r in &rules {
+            let what = if r.network {
+                format!("network.{}", r.effect.as_str())
+            } else {
+                r.effect.as_str().to_string()
+            };
+            tui::line(&format!(
+                "    {what:<13} {}  {}",
+                tui::sanitize_terminal(&r.rule),
+                tui::dim(&format!("— {}", r.source))
+            ));
+        }
+    }
+    let always = config::load_project_allowed(cwd);
+    let session = agent::session_allowed(cwd);
+    if always.is_empty() && session.is_empty() {
+        tui::line(&tui::dim(
+            "  no saved approvals for this project (answer s or a at an approval to add one)",
+        ));
+        return;
+    }
+    for (title, keys) in [
+        ("always allowed in this project", &always),
+        ("allowed for this session", &session),
+    ] {
+        if keys.is_empty() {
+            continue;
+        }
+        tui::line(&format!("  {title}:"));
+        for k in keys {
+            tui::line(&format!("    {}", tui::sanitize_terminal(k)));
+        }
+    }
+    tui::line(&tui::dim(
+        "  /permissions remove <entry> forgets one · /permissions reset forgets them all",
+    ));
+}
+
+// `/permissions remove <entry>`: forget one saved approval, both the
+// project's "always" entry and this session's.
+fn handle_permissions_remove(cwd: &std::path::Path, key: &str) {
+    let key = key.trim().trim_matches('`');
+    let always = config::remove_project_allowed(cwd, key);
+    let session = agent::remove_session_allowed(cwd, key);
+    let shown = tui::sanitize_terminal(key);
+    if always || session {
+        tui::line(&tui::green(&format!("  ✓ removed: {shown}")));
+    } else {
+        tui::line(&tui::yellow(&format!(
+            "  no saved approval '{shown}' — /permissions list shows them"
+        )));
+    }
+}
+
 fn handle_permissions(perm: &mut Permission, cwd: &std::path::Path) {
     if let Some(n) = agent::ignored_approvals_notice(cwd) {
         report::notice(&format!("  {n}"));
     }
+    print_saved_approvals(cwd);
     let current = permission_label(perm);
-    let items = vec![
+    // 0.14's rows keep their places; accept-edits is added last, so a row
+    // picked from memory never lands on a looser mode.
+    let modes = [
+        (
+            "ask",
+            "Confirm before each file write or command (recommended)",
+        ),
+        ("auto", "Auto-approve all safe tool operations (yolo)"),
+        ("readonly", "Never write files or run mutating commands"),
+        (
+            "accept-edits",
+            "Apply file edits in this project without asking; commands and network still ask",
+        ),
+    ];
+    let items: Vec<tui::SelectItem> = modes
+        .iter()
+        .map(|(label, detail)| tui::SelectItem {
+            label: (*label).into(),
+            detail: (*detail).into(),
+        })
+        .collect();
+    let title = format!("Select Tool Permission Mode (Current: {current})");
+    let Some(&(mode, _)) = tui::select_item(&title, &items).and_then(|i| modes.get(i)) else {
+        return;
+    };
+    let scopes = [
         tui::SelectItem {
-            label: "ask".into(),
-            detail: "Confirm before each file write or command (recommended)".into(),
+            label: "this session".into(),
+            detail: "Back to the saved default next time".into(),
         },
         tui::SelectItem {
-            label: "auto".into(),
-            detail: "Auto-approve all safe tool operations (yolo)".into(),
-        },
-        tui::SelectItem {
-            label: "readonly".into(),
-            detail: "Never write files or run mutating commands".into(),
+            label: "save as default".into(),
+            detail: "Every new session, in every project".into(),
         },
     ];
-    let title = format!("Select Tool Permission Mode (Current: {current})");
-    if let Some(idx) = tui::select_item(&title, &items) {
-        match idx {
-            0 => apply_permission(perm, "ask"),
-            1 => apply_permission(perm, "auto"),
-            2 => apply_permission(perm, "readonly"),
-            _ => {}
-        }
+    match tui::select_item(&format!("Use {mode} for"), &scopes) {
+        Some(0) => apply_permission(perm, mode, PermScope::Session),
+        Some(1) => apply_permission(perm, mode, PermScope::Default),
+        _ => {}
     }
 }
 
@@ -5817,5 +6014,57 @@ mod tests {
             Some(exe)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_typed_permission_switch_lasts_for_the_session_only() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-perm-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let file = home.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"provider":"anthropic","model":"m","permission":"ask"}"#,
+        )
+        .unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap()
+        };
+        let cwd = home.clone();
+        let mut perm = Permission::Ask;
+
+        // "use auto" and `/permissions auto` change the session only.
+        let phrase = super::detect_permission_switch("use auto").unwrap();
+        super::apply_permission(&mut perm, phrase, super::PermScope::Session);
+        assert_eq!(perm, Permission::Auto);
+        assert_eq!(saved()["permission"], "ask");
+        super::handle_permissions_arg(&mut perm, &cwd, "accept-edits");
+        assert_eq!(perm, Permission::AcceptEdits);
+        assert_eq!(saved()["permission"], "ask");
+        // Saving the default is its own, explicit choice.
+        super::handle_permissions_arg(&mut perm, &cwd, "default auto");
+        assert_eq!(perm, Permission::Auto);
+        assert_eq!(saved()["permission"], "auto");
+        // A name that isn't a mode changes nothing.
+        super::handle_permissions_arg(&mut perm, &cwd, "yolo2");
+        assert_eq!(perm, Permission::Auto);
+        // The number shortcuts keep their 0.14 meaning (3 never loosens
+        // to auto); accept-edits is the new 4.
+        for (arg, want) in [
+            ("1", Permission::Ask),
+            ("3", Permission::ReadOnly),
+            ("2", Permission::Auto),
+            ("4", Permission::AcceptEdits),
+        ] {
+            super::handle_permissions_arg(&mut perm, &cwd, arg);
+            assert_eq!(perm, want, "/permissions {arg}");
+        }
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
