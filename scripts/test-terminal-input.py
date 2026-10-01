@@ -221,7 +221,8 @@ class CliArgumentTests(unittest.TestCase):
     def test_unknown_option_exits_2_without_launching(self):
         result = self.run_cli("--modle", "x")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("buildwithnexus: unknown option '--modle'; see --help",
+        self.assertIn("buildwithnexus: unknown option --modle "
+                      "(did you mean --model?); see --help",
                       result.stderr)
         self.assertEqual(result.stdout, "")
 
