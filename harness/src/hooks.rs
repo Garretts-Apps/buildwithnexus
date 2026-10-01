@@ -892,8 +892,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// `sha256:<hex>` of `data`.
+/// SHA-256 of `data` as lowercase hex.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    hex(&sha256(data))
+}
+
+/// `sha256:<hex>` of `data`.
+pub(crate) fn sha256_tagged(data: &[u8]) -> String {
     format!("sha256:{}", hex(&sha256(data)))
 }
 
@@ -1114,14 +1119,6 @@ fn read_trust_store() -> Value {
 
 /// Has the user trusted exactly this content of `<cwd>/.buildwithnexus/<name>`?
 /// Never prompts.
-/// Whether the user has answered the trust prompt for this folder (any of
-/// its settings files, at any version).
-pub fn folder_reviewed(cwd: &Path) -> bool {
-    read_trust_store()
-        .get(config::project_key(cwd))
-        .is_some_and(|e| e.as_object().is_none_or(|m| !m.is_empty()))
-}
-
 pub fn project_file_trusted(cwd: &Path, name: &str, text: &str) -> bool {
     project_trust(cwd, name, text).is_some()
 }

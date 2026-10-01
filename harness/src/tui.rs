@@ -2322,7 +2322,7 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
                 Ok(g) => g,
                 Err(_) => return raised,
             };
-            let chars = sanitize_paste(&text);
+            let chars: Vec<char> = clean_paste(&text).chars().collect();
             let i = ta.cursor;
             ta.buf.splice(i..i, chars.iter().copied());
             ta.cursor += chars.len();
@@ -2397,8 +2397,9 @@ fn write_frame(frame: &[u8]) {
     let _ = out.flush();
 }
 
-// The composer is one line: pasted line breaks and tabs become spaces, and
-// every other control char (C0, DEL, C1, so no escape sequences) is dropped.
+// A question's answer and a picker's filter are one line: pasted line breaks
+// and tabs become spaces, and every other control char (C0, DEL, C1, so no
+// escape sequences) is dropped.
 fn sanitize_paste(s: &str) -> Vec<char> {
     s.chars()
         .filter_map(|c| match c {
@@ -2412,7 +2413,7 @@ fn sanitize_paste(s: &str) -> Vec<char> {
 // ── large pastes ─────────────────────────────────────────────────────────────
 // A paste over these limits shows in the composer as one `[pasted 20,024
 // chars]` token, and the message carries the whole paste, line breaks kept,
-// when it is sent. Smaller pastes go in as text (flattened to one line).
+// when it is sent. Smaller pastes go in as text, line breaks kept.
 const PASTE_COLLAPSE_CHARS: usize = 1_000;
 const PASTE_COLLAPSE_LINES: usize = 10;
 
@@ -2437,12 +2438,26 @@ fn thousands(n: usize) -> String {
 }
 
 // A paste as the message will carry it: CRLF and CR become LF, tabs stay,
-// and every other control character (escape sequences) is dropped.
+// and every other control character (escape sequences) is dropped. The
+// composer keeps it this way too, and shows each break as `↵`.
 fn clean_paste(s: &str) -> String {
     s.replace("\r\n", "\n")
         .replace('\r', "\n")
         .chars()
         .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
+// How the one-row composer shows its text: a line break as `↵` and a tab as
+// a space, each one column wide like the character it stands for.
+fn composer_glyphs(chars: &[char]) -> String {
+    chars
+        .iter()
+        .map(|&c| match c {
+            '\n' => '↵',
+            '\t' => ' ',
+            c => c,
+        })
         .collect()
 }
 
@@ -2513,7 +2528,7 @@ pub fn render_queued_composer() {
                     "  {} {} {} {}",
                     dim("├─"),
                     dim("queued:"),
-                    bold(msg),
+                    bold(&composer_glyphs(&msg.chars().collect::<Vec<_>>())),
                     dim(queued_row_hint(i))
                 );
             }
@@ -3061,7 +3076,7 @@ fn eat_escape(chars: &mut std::iter::Peekable<std::str::Chars>, mut out: Option<
     }
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3996,7 +4011,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         current_width += char_width(buf[end]);
         end += 1;
     }
-    let shown: String = buf[s..end].iter().collect();
+    let shown = composer_glyphs(&buf[s..end]);
     let col_width = buf[s..cursor.min(buf.len())]
         .iter()
         .copied()
@@ -5098,8 +5113,9 @@ const PICKER_HINT: &str = "↑↓ choose · Enter select · Esc close";
 
 // Keyboard state of an open picker, kept apart from the terminal so it can
 // be tested: typed text filters the list, a digit typed before any other
-// text picks that numbered row, and Enter picks only a row that is shown —
-// so a sentence typed into a forgotten picker never confirms its default.
+// text moves the highlight to that numbered row, and only Enter picks, and
+// only a row that is shown — so a sentence typed into a forgotten picker
+// ("1. add tests" at Approve Plan) never confirms anything.
 #[derive(Default)]
 struct Picker {
     filter: String,
@@ -5168,7 +5184,9 @@ impl Picker {
                 if self.filter.is_empty() {
                     if let Some(n) = c.to_digit(10).map(|d| d as usize) {
                         if (1..=items.len().min(9)).contains(&n) {
-                            return PickerStep::Choose(n - 1);
+                            // Unfiltered, row n is at position n - 1.
+                            self.selected = n - 1;
+                            return PickerStep::Redraw;
                         }
                     }
                 }
@@ -5186,7 +5204,7 @@ impl Picker {
     }
 }
 
-// Rows 1-9 carry their number: typing it picks the row.
+// Rows 1-9 carry their number: typing it moves to the row.
 fn picker_number(i: usize) -> String {
     if i < 9 {
         format!("{}", i + 1)
@@ -5197,8 +5215,8 @@ fn picker_number(i: usize) -> String {
 
 /// Opens a picker over `items` and returns the chosen index, or None when
 /// it is closed (Esc, Ctrl+C) or the input ends. While it is open it owns
-/// the keyboard: typed text filters the list, a digit picks that numbered
-/// row, ↑/↓ move, and Enter picks the highlighted row of the filtered list.
+/// the keyboard: typed text filters the list, a digit or ↑/↓ moves the
+/// highlight, and Enter picks the highlighted row of the filtered list.
 pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     if items.is_empty() {
         return None;
@@ -5309,7 +5327,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         let foot_text = if no_match {
             "  └── nothing matches — Backspace edits the filter, Esc closes ─────────────────"
         } else {
-            "  └── type to filter · 1-9 pick a numbered row ───────────────────────────────────"
+            "  └── type to filter · 1-9 or ↑↓ move · Enter select ─────────────────────────────"
         };
         let footer = clip_ansi_line(&dim(foot_text), width as usize);
         let _ = queue!(out, MoveTo(0, footer_row), Clear(ClearType::CurrentLine));
@@ -5436,12 +5454,35 @@ mod picker_tests {
     }
 
     #[test]
-    fn digits_select_and_esc_or_ctrl_c_close() {
+    fn digits_move_the_highlight_and_enter_selects() {
         let items = items();
+        // A digit moves to that row; only Enter picks it.
+        let mut p = Picker::default();
         assert_eq!(
-            press(&mut Picker::default(), &items, KeyCode::Char('2')),
-            PickerStep::Choose(1)
+            press(&mut p, &items, KeyCode::Char('2')),
+            PickerStep::Redraw
         );
+        assert_eq!(p.selected, 1);
+        assert!(p.filter.is_empty());
+        assert_eq!(press(&mut p, &items, KeyCode::Enter), PickerStep::Choose(1));
+        // "1. add tests" typed at Approve Plan never runs the plan: the 1
+        // moves the highlight, the rest filters, and Enter finds no match.
+        let mut p = Picker::default();
+        let steps = type_line(&mut p, &items, "1. add tests");
+        assert!(
+            !steps.iter().any(|s| matches!(s, PickerStep::Choose(_))),
+            "{steps:?}"
+        );
+        // A later digit moves the highlight again.
+        let mut p = Picker::default();
+        press(&mut p, &items, KeyCode::Char('3'));
+        press(&mut p, &items, KeyCode::Char('1'));
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn digits_past_the_list_filter_and_esc_or_ctrl_c_close() {
+        let items = items();
         // A number past the list is filter text, and so is a digit after text.
         let mut p = Picker::default();
         assert_eq!(
@@ -5471,6 +5512,18 @@ mod picker_tests {
         );
         assert_eq!(picker_number(0), "1");
         assert_eq!(picker_number(9), " ");
+    }
+
+    #[test]
+    fn esc_esc_rewinds_inside_its_window_and_the_prompt_comes_back() {
+        assert!(!esc_esc_rewinds(None, 5_000));
+        assert!(esc_esc_rewinds(Some(5_000), 5_900));
+        assert!(!esc_esc_rewinds(Some(5_000), 6_001));
+        prefill_composer("fix it\r\nplease");
+        let draft = task_draft().lock().unwrap().take().unwrap();
+        assert_eq!(draft.buf.iter().collect::<String>(), "fix it\nplease");
+        assert_eq!(draft.cursor, draft.buf.len());
+        assert!(draft.lines.is_empty());
     }
 
     #[test]
@@ -5736,6 +5789,8 @@ mod todo_tests {
 pub enum InputEvent {
     Text(String),
     CycleMode,
+    /// Esc Esc on an empty input box: open /rewind.
+    Rewind,
 }
 
 // ── single-line ask ──────────────────────────────────────────────────────────
@@ -5744,19 +5799,28 @@ pub enum InputEvent {
 /// line return None: callers treat None as cancel, never as an empty answer.
 /// Without a terminal it reads one line from stdin (None at end of input).
 pub fn ask(prompt: &str) -> Option<String> {
+    ask_prefilled(prompt, "")
+}
+
+/// `ask` with `text` already in the input box to edit, the cursor at its
+/// end (a plan step). Without a terminal the text cannot be shown, and an
+/// empty line keeps it.
+pub fn ask_prefilled(prompt: &str, text: &str) -> Option<String> {
     if PROTOCOL_STDIN.load(Ordering::Relaxed) {
         return None;
     }
     let prompt = &*sanitize_prompt(prompt);
     let _pause_guard = PauseAgentRunningGuard::new();
+    // The text can be the model's (a plan step): one line, no escapes.
+    let prefill = sanitize_paste(text);
     if is_raw() {
-        match read_line_raw(prompt) {
-            None => None,
+        let cursor = prefill.len();
+        match read_line_raw_prefill(prompt, prefill, cursor, false) {
             Some(RawLine::Submit(s, _)) => Some(s),
-            Some(RawLine::CycleMode(_, _)) => None,
+            _ => None,
         }
     } else if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        match read_line_plain(prompt, Vec::new(), false) {
+        match read_line_plain(prompt, prefill, false) {
             Some(RawLine::Submit(s, _)) => Some(s),
             _ => None,
         }
@@ -5769,7 +5833,100 @@ pub fn ask(prompt: &str) -> Option<String> {
             INPUT_CLOSED.store(true, Ordering::Relaxed);
             return None;
         }
-        Some(buf.trim_end_matches(['\n', '\r']).to_string())
+        let line = buf.trim_end_matches(['\n', '\r']);
+        Some(if line.is_empty() { text } else { line }.to_string())
+    }
+}
+
+/// Asks for one key: Enter gives `'\n'`, one of `keys` (either case) gives
+/// that key, and Esc, Ctrl+C or Ctrl+D give None; other keys do nothing.
+/// Without a terminal it reads a line, where an empty line is Enter.
+pub fn ask_key(prompt: &str, keys: &[char]) -> Option<char> {
+    if PROTOCOL_STDIN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let prompt = &*sanitize_prompt(prompt);
+    let _pause_guard = PauseAgentRunningGuard::new();
+    let listed = |c: char| keys.iter().copied().find(|k| k.eq_ignore_ascii_case(&c));
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        print!("{prompt}");
+        flush();
+        let mut buf = String::new();
+        if io::stdin().lock().read_line(&mut buf).unwrap_or(0) == 0 {
+            INPUT_CLOSED.store(true, Ordering::Relaxed);
+            return None;
+        }
+        let answer = buf.trim();
+        return match answer.chars().next() {
+            None => Some('\n'),
+            Some(c) => listed(c),
+        };
+    }
+    let alt = ALT_SCREEN.load(Ordering::Relaxed);
+    let _raw = RawForRead::on();
+    let _keys = keyboard_lock();
+    let owner = alt.then(|| InputOwner::open(prompt, &[], 0));
+    let mut scroll = 0usize;
+    if alt {
+        redraw(prompt, (0, 0), &[], 0, &mut scroll);
+    } else {
+        print!("{prompt}");
+        flush();
+    }
+    cursor_show();
+    let answer = loop {
+        match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                match k.code {
+                    KeyCode::Enter => break Some('\n'),
+                    KeyCode::Esc => break None,
+                    KeyCode::Char('c' | 'd') if ctrl => break None,
+                    KeyCode::Char(c) if !ctrl => {
+                        if let Some(key) = listed(c) {
+                            break Some(key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Resize(_, _)) if alt => {
+                set_output_region();
+                render_output();
+                redraw(prompt, (0, 0), &[], 0, &mut scroll);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                INPUT_CLOSED.store(true, Ordering::Relaxed);
+                break None;
+            }
+        }
+    };
+    drop(owner);
+    let shown = match answer {
+        Some('\n') => String::new(),
+        Some(c) => c.to_string(),
+        None => dim("cancelled"),
+    };
+    if alt {
+        echo_submitted(prompt, &shown);
+    } else {
+        print!("{shown}\r\n");
+        flush();
+    }
+    answer
+}
+
+/// Puts `text` in the input box of the next prompt, the cursor at its end,
+/// line breaks kept (/rewind hands back the prompt it went back to).
+pub fn prefill_composer(text: &str) {
+    let buf: Vec<char> = clean_paste(text).chars().collect();
+    if let Ok(mut draft) = task_draft().lock() {
+        *draft = Some(TaskDraft {
+            lines: Vec::new(),
+            cursor: buf.len(),
+            buf,
+        });
     }
 }
 
@@ -5951,6 +6108,9 @@ pub fn ask_task(prompt: &str) -> Option<InputEvent> {
                 }
                 return Some(InputEvent::CycleMode);
             }
+            // A continued message is not left half-sent for /rewind.
+            RawLine::Rewind if !draft.lines.is_empty() => {}
+            RawLine::Rewind => return Some(InputEvent::Rewind),
             RawLine::Submit(text, cont) => {
                 draft.lines.push(text);
                 if !cont {
@@ -5985,6 +6145,7 @@ fn history() -> &'static std::sync::Mutex<Vec<String>> {
 enum RawLine {
     Submit(String, bool), // text, continue (multiline)?
     CycleMode(Vec<char>, usize),
+    Rewind, // Esc Esc on an empty composer
 }
 
 fn viewport(buf: &[char], cursor: usize, avail: usize, scroll: usize) -> (usize, usize) {
@@ -6013,7 +6174,7 @@ fn redraw(prompt: &str, start: (u16, u16), buf: &[char], cursor: usize, scroll: 
     let (s, _col) = viewport(buf, cursor, avail, *scroll);
     *scroll = s;
     let end = (s + avail).min(buf.len());
-    let shown: String = buf[s..end].iter().collect();
+    let shown = composer_glyphs(&buf[s..end]);
     let col_width = buf[s..cursor.min(buf.len())]
         .iter()
         .copied()
@@ -6093,71 +6254,443 @@ fn edit_in_editor(current: &str) -> Option<String> {
     content.map(|c| c.trim_end_matches(['\n', '\r']).to_string())
 }
 
-// ── Tab completion ───────────────────────────────────────────────────────────
-// Slash commands the REPL handles directly. Kept in sync with the match in lib.rs.
-const SLASH_COMMANDS_BASE: &[&str] = &[
-    "/help",
-    "/clear",
-    "/new",
-    "/resume",
-    "/init",
-    "/login",
-    "/plan",
-    "/build",
-    "/brainstorm",
-    "/doctor",
-    "/debug",
-    "/mode",
-    "/model",
-    "/permissions",
-    "/sandbox",
-    "/add-dir",
-    "/mcp",
-    "/scroll",
-    "/mouse",
-    "/compact",
-    "/cost",
-    "/effort",
-    "/review",
-    "/commit",
-    "/pr",
-    "/diff",
-    "/context",
-    "/schedule",
-    "/loop",
-    "/workflows",
-    "/tasks",
-    "/btw",
-    "/config",
-    "/memory",
-    "/skills",
-    "/tools",
-    "/trace",
-    "/agents",
-    "/checkpoints",
-    "/undo",
-    "/rewind",
-    "/vim",
-    "/theme",
-    "/voice",
-    "/local",
-    "/rules",
-    "/kb",
-    "/index",
-    "/verify",
-    "/audit",
-    "/grill-me",
-    "/teamwork",
-    "/exit",
-    "/quit",
+// ── built-in commands ────────────────────────────────────────────────────────
+/// A slash command the REPL handles itself: what /help, `--help`, the popup
+/// and Tab completion show for it. A test in lib.rs holds this list to the
+/// REPL's own match, both ways.
+pub struct SlashCommand {
+    pub name: &'static str,
+    /// Other spellings the REPL takes.
+    pub aliases: &'static [&'static str],
+    /// Its arguments, as /help shows them.
+    pub args: &'static str,
+    pub desc: &'static str,
+    /// The words Tab completes after it.
+    pub subs: &'static [&'static str],
+    /// The /help section it is listed under.
+    pub section: &'static str,
+}
+
+const fn cmd(
+    section: &'static str,
+    name: &'static str,
+    aliases: &'static [&'static str],
+    args: &'static str,
+    desc: &'static str,
+    subs: &'static [&'static str],
+) -> SlashCommand {
+    SlashCommand {
+        name,
+        aliases,
+        args,
+        desc,
+        subs,
+        section,
+    }
+}
+
+const MODES: &str = "modes and permissions";
+const WORK: &str = "context & git";
+const TALK: &str = "conversation";
+const AUTO: &str = "automation";
+const PROJECT: &str = "project";
+const SETUP: &str = "setup & screen";
+
+/// Every built-in command, in /help order.
+pub const COMMANDS: &[SlashCommand] = &[
+    cmd(
+        MODES,
+        "/plan",
+        &[],
+        "[task]",
+        "switch to PLAN, or plan this task",
+        &[],
+    ),
+    cmd(
+        MODES,
+        "/build",
+        &[],
+        "[task]",
+        "switch to BUILD, or do this task",
+        &[],
+    ),
+    cmd(
+        MODES,
+        "/brainstorm",
+        &[],
+        "[task]",
+        "switch to BRAINSTORM, or talk this through",
+        &[],
+    ),
+    cmd(
+        MODES,
+        "/mode",
+        &[],
+        "[plan|build|brainstorm]",
+        "show or switch mode",
+        &["plan", "build", "brainstorm"],
+    ),
+    cmd(
+        MODES,
+        "/permissions",
+        &[],
+        "[ask|accept-edits|auto|readonly] · default <mode> · list · remove <entry> · reset",
+        "permission mode and saved approvals",
+        &[
+            "ask",
+            "accept-edits",
+            "auto",
+            "readonly",
+            "default",
+            "list",
+            "remove",
+            "reset",
+        ],
+    ),
+    cmd(
+        MODES,
+        "/sandbox",
+        &[],
+        "[off|auto|require|status]",
+        "OS sandbox for shell commands",
+        &["off", "auto", "require", "status"],
+    ),
+    cmd(
+        MODES,
+        "/model",
+        &[],
+        "[name | <url> <model>]",
+        "hot-swap the AI model mid-session",
+        &[],
+    ),
+    cmd(
+        MODES,
+        "/effort",
+        &[],
+        "[off|low|medium|high]",
+        "reasoning depth",
+        &["off", "low", "medium", "high"],
+    ),
+    cmd(
+        MODES,
+        "/local",
+        &[],
+        "",
+        "probe local servers and list GGUF models",
+        &[],
+    ),
+    cmd(
+        WORK,
+        "/compact",
+        &[],
+        "",
+        "compress context to free token budget",
+        &[],
+    ),
+    cmd(WORK, "/context", &[], "", "show context window usage", &[]),
+    cmd(
+        WORK,
+        "/cost",
+        &[],
+        "",
+        "session tokens and estimated cost",
+        &[],
+    ),
+    cmd(
+        WORK,
+        "/diff",
+        &[],
+        "[turn]",
+        "changed files and their diffs; turn: the last turn's",
+        &["turn"],
+    ),
+    cmd(
+        WORK,
+        "/review",
+        &[],
+        "[--base <ref>|--staged] [focus]",
+        "read-only review of your changes",
+        &["--base", "--staged"],
+    ),
+    cmd(
+        WORK,
+        "/commit",
+        &[],
+        "",
+        "AI-drafted commit message, committed on c",
+        &[],
+    ),
+    cmd(
+        WORK,
+        "/pr",
+        &[],
+        "",
+        "AI-drafted PR title + description",
+        &[],
+    ),
+    cmd(
+        WORK,
+        "/add-dir",
+        &[],
+        "[path]",
+        "also work in another folder (list with no path)",
+        &[],
+    ),
+    cmd(WORK, "/checkpoints", &[], "", "list edit checkpoints", &[]),
+    cmd(
+        WORK,
+        "/undo",
+        &[],
+        "[latest|git|all|<id>]",
+        "revert the last agent turn's edits",
+        &["latest", "git", "all"],
+    ),
+    cmd(
+        WORK,
+        "/rewind",
+        &[],
+        "",
+        "back to an earlier prompt (also Esc Esc)",
+        &[],
+    ),
+    cmd(TALK, "/new", &[], "", "start a fresh session", &[]),
+    cmd(
+        TALK,
+        "/resume",
+        &[],
+        "",
+        "pick a saved session to resume",
+        &[],
+    ),
+    cmd(TALK, "/rename", &[], "<name>", "name this session", &[]),
+    cmd(
+        TALK,
+        "/export",
+        &[],
+        "[file]",
+        "this conversation as Markdown",
+        &[],
+    ),
+    cmd(
+        TALK,
+        "/copy",
+        &[],
+        "",
+        "the last answer to the clipboard",
+        &[],
+    ),
+    cmd(
+        TALK,
+        "/ask",
+        &[],
+        "<question>",
+        "a side question, not added to the conversation",
+        &[],
+    ),
+    cmd(
+        TALK,
+        "/btw",
+        &[],
+        "<note>",
+        "add a note to your next message",
+        &[],
+    ),
+    cmd(
+        TALK,
+        "/clear",
+        &[],
+        "",
+        "clear the screen and start a fresh session",
+        &[],
+    ),
+    cmd(
+        AUTO,
+        "/schedule",
+        &[],
+        "<delay> <task>",
+        "run a task later (e.g. 5m cargo test)",
+        &[],
+    ),
+    cmd(
+        AUTO,
+        "/loop",
+        &[],
+        "<interval> <task>",
+        "run a task repeatedly (e.g. 30m)",
+        &[],
+    ),
+    cmd(
+        AUTO,
+        "/workflows",
+        &["/tasks"],
+        "",
+        "list and manage background workflows",
+        &[],
+    ),
+    cmd(
+        AUTO,
+        "/teamwork",
+        &["/teamwork-preview", "/swarm"],
+        "",
+        "how helper agents share work",
+        &[],
+    ),
+    cmd(
+        AUTO,
+        "/grill-me",
+        &["/align", "/interview"],
+        "",
+        "operational alignment interview",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/memory",
+        &[],
+        "",
+        "view and edit session memory",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/skills",
+        &[],
+        "",
+        "list skills and custom commands",
+        &[],
+    ),
+    cmd(PROJECT, "/tools", &[], "", "browse callable tools", &[]),
+    cmd(
+        PROJECT,
+        "/rules",
+        &[],
+        "",
+        "inspect engineering rules and violations",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/kb",
+        &["/index"],
+        "",
+        "query or index project knowledge base",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/verify",
+        &["/audit"],
+        "",
+        "verify codebase against rules and tests",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/agents",
+        &[],
+        "",
+        "helper agents, then Agents.md",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/mcp",
+        &[],
+        "[name|add|remove|login|logout|reload]",
+        "MCP servers: list, <name>, add, remove, login, logout, reload",
+        &["add", "remove", "login", "logout", "reload"],
+    ),
+    cmd(
+        PROJECT,
+        "/trace",
+        &[],
+        "[<id>]",
+        "receipts: tool calls, hooks, skills, subagents",
+        &[],
+    ),
+    cmd(
+        PROJECT,
+        "/config",
+        &[],
+        "",
+        "configure hooks, memory, commands via AI",
+        &[],
+    ),
+    cmd(
+        SETUP,
+        "/init",
+        &[],
+        "",
+        "run setup, then offer to write AGENTS.md",
+        &[],
+    ),
+    cmd(
+        SETUP,
+        "/login",
+        &[],
+        "",
+        "replace the API key, checked before it is saved",
+        &[],
+    ),
+    cmd(SETUP, "/doctor", &["/debug"], "", "diagnose setup", &[]),
+    cmd(
+        SETUP,
+        "/voice",
+        &[],
+        "[<file>]",
+        "audio transcription & voice input",
+        &[],
+    ),
+    cmd(SETUP, "/vim", &[], "", "toggle Vim modal editing", &[]),
+    cmd(
+        SETUP,
+        "/theme",
+        &[],
+        "[dark|light|ansi|auto]",
+        "colour theme",
+        &["dark", "light", "ansi", "auto"],
+    ),
+    cmd(
+        SETUP,
+        "/mouse",
+        &["/scroll"],
+        "[on|off|status]",
+        "wheel scroll + drag-copy",
+        &["on", "off", "status"],
+    ),
+    cmd(SETUP, "/help", &[], "", "show all commands and keys", &[]),
+    cmd(SETUP, "/exit", &["/quit"], "", "exit the session", &[]),
 ];
+
+/// The built-in command named `name`, by its name or an alias.
+pub fn find_command(name: &str) -> Option<&'static SlashCommand> {
+    COMMANDS
+        .iter()
+        .find(|c| c.name == name || c.aliases.contains(&name))
+}
+
+// Every built-in spelling, names and aliases, in /help order.
+fn builtin_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS
+        .iter()
+        .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().copied()))
+}
 
 /// The built-in commands the popup lists (a test holds the REPL to them).
 #[cfg(test)]
-pub(crate) fn builtin_slash_commands() -> &'static [&'static str] {
-    SLASH_COMMANDS_BASE
+pub(crate) fn builtin_slash_commands() -> Vec<&'static str> {
+    builtin_names().collect()
 }
 
+/// What Tab completion offers for `line` typed into the composer.
+#[cfg(test)]
+pub(crate) fn completions_for(line: &str) -> Vec<String> {
+    let buf: Vec<char> = line.chars().collect();
+    let (start, token) = token_at(&buf, buf.len());
+    completions(&buf, start, &token)
+}
+
+// ── Tab completion ───────────────────────────────────────────────────────────
 // Cached: the autocomplete popup consults this on every keystroke, and the
 // skill/command set doesn't change within a session.
 fn load_slash_commands() -> Vec<String> {
@@ -6178,7 +6711,7 @@ fn load_slash_commands() -> Vec<String> {
 }
 
 fn load_slash_commands_uncached() -> Vec<String> {
-    let mut cmds: Vec<String> = SLASH_COMMANDS_BASE.iter().map(|s| s.to_string()).collect();
+    let mut cmds: Vec<String> = builtin_names().map(str::to_string).collect();
     // Every command file the session loads (the user's, and a trusted
     // checkout's) and every skill.
     for c in crate::config::load_custom_commands() {
@@ -6245,58 +6778,7 @@ const POPUP_MAX_ROWS: usize = 8;
 // User-defined commands and skills get an empty description here; see
 // extra_command_desc for those.
 fn slash_command_desc(cmd: &str) -> &'static str {
-    match cmd {
-        "/help" => "show all commands and keys",
-        "/clear" => "clear the screen",
-        "/new" => "start a fresh session",
-        "/resume" => "pick a saved session to resume",
-        "/init" => "reconfigure provider, model, and key",
-        "/login" => "replace the API key (checked before it is saved)",
-        "/plan" => "switch to PLAN mode",
-        "/build" => "switch to BUILD mode",
-        "/brainstorm" => "switch to BRAINSTORM mode",
-        "/doctor" | "/debug" => "diagnose setup and connectivity",
-        "/mode" => "show or switch mode",
-        "/model" => "hot-swap the AI model",
-        "/permissions" => "tool permission level (ask/auto/readonly)",
-        "/sandbox" => "OS sandbox for shell commands (off/auto/require)",
-        "/add-dir" => "also read and change files in another folder",
-        "/mcp" => "MCP servers: list, <name>, add, remove, login, logout, reload",
-        "/scroll" => "wheel scrolling on/off",
-        "/mouse" => "mouse capture on/off",
-        "/compact" => "compress context to free token budget",
-        "/review" => "AI code review of staged git diff",
-        "/commit" => "AI-drafted conventional commit message",
-        "/pr" => "AI-drafted PR title + description",
-        "/diff" => "show current git diff summary",
-        "/context" => "show context window usage",
-        "/cost" => "session tokens and estimated cost",
-        "/effort" => "reasoning depth (off/low/medium/high)",
-        "/schedule" => "one-shot scheduled workflow",
-        "/loop" => "repeating scheduled workflow",
-        "/workflows" => "list and manage background workflows",
-        "/tasks" => "list and manage background tasks",
-        "/btw" => "inject context into the next agent turn",
-        "/config" => "configure hooks, memory, commands via AI",
-        "/memory" => "view and edit session memory",
-        "/skills" => "list skills and custom commands",
-        "/tools" => "browse callable tools",
-        "/trace" => "inspect hooks, tools, skills, subagents",
-        "/agents" => "manage subagents",
-        "/checkpoints" => "list edit checkpoints",
-        "/undo" | "/rewind" => "revert the last agent turn (or latest/git/all/<id>)",
-        "/vim" => "toggle vim editing mode",
-        "/theme" => "colour theme: dark, light, ansi or auto",
-        "/voice" => "voice input",
-        "/local" => "probe local servers and list GGUF models",
-        "/rules" => "manage project rules",
-        "/kb" | "/index" => "query or index project knowledge base",
-        "/verify" | "/audit" => "verify recent changes",
-        "/grill-me" => "operational alignment interview",
-        "/teamwork" => "multi-agent swarm preview",
-        "/exit" | "/quit" => "exit the session",
-        _ => "",
-    }
+    find_command(cmd).map_or("", |c| c.desc)
 }
 
 // Descriptions for the non-builtin popup entries: a skill's first line (via
@@ -6625,58 +7107,13 @@ fn completions_unfiltered(buf: &[char], start: usize, token: &str) -> Vec<String
     }
     // Sub-argument completion: look at the command that precedes the current token.
     let prefix: String = buf[..start].iter().collect();
-    match prefix.trim() {
-        "/mode" => {
-            return ["plan", "build", "brainstorm"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/permissions" => {
-            return ["ask", "auto", "readonly"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/sandbox" => {
-            return ["off", "auto", "require", "status"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/mcp" => {
-            return ["add", "remove", "reload"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/scroll" | "/mouse" => {
-            return ["on", "off", "status"]
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/theme" => {
-            return THEME_NAMES
-                .iter()
-                .chain(&["auto"])
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        "/effort" => {
-            return crate::config::Effort::LEVELS
-                .iter()
-                .filter(|&&s| s.starts_with(token))
-                .map(|s| s.to_string())
-                .collect();
-        }
-        _ => {}
+    if let Some(cmd) = find_command(prefix.trim()).filter(|c| !c.subs.is_empty()) {
+        return cmd
+            .subs
+            .iter()
+            .filter(|s| s.starts_with(token))
+            .map(|s| s.to_string())
+            .collect();
     }
     if let Some(partial) = token.strip_prefix('@') {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -6688,10 +7125,6 @@ fn completions_unfiltered(buf: &[char], start: usize, token: &str) -> Vec<String
     Vec::new()
 }
 
-fn read_line_raw(prompt: &str) -> Option<RawLine> {
-    read_line_raw_prefill(prompt, vec![], 0, false)
-}
-
 // Ctrl+C on an empty composer: the first press says how to quit, and only a
 // second one inside the window quits — so the press after "stop that turn"
 // never closes the session and loses its approvals and undo marker.
@@ -6700,6 +7133,14 @@ const QUIT_PRESS_WINDOW_MS: u64 = 2_000;
 
 fn ctrl_c_quits(armed_at: Option<u64>, now: u64) -> bool {
     armed_at.is_some_and(|t| now.saturating_sub(t) <= QUIT_PRESS_WINDOW_MS)
+}
+
+// Esc on an empty composer arms /rewind; a second Esc within this window,
+// with no other key between, opens it.
+const ESC_ESC_WINDOW_MS: u64 = 1_000;
+
+fn esc_esc_rewinds(armed_at: Option<u64>, now: u64) -> bool {
+    armed_at.is_some_and(|t| now.saturating_sub(t) <= ESC_ESC_WINDOW_MS)
 }
 
 // Raw mode for one read from a cooked terminal (setup, or /init after the
@@ -6734,6 +7175,7 @@ fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) -> Option<R
     let _ = write!(out, "{prompt}{}", buf.iter().collect::<String>());
     let _ = out.flush();
     let mut quit_armed_at: Option<u64> = None;
+    let mut esc_armed_at: Option<u64> = None;
     let mut hist_idx: Option<usize> = None;
     let erase = |out: &mut io::Stdout, chars: &[char]| {
         let w: usize = chars.iter().copied().map(char_width).sum();
@@ -6743,8 +7185,12 @@ fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) -> Option<R
         let ev = match read() {
             Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => k,
             Ok(Event::Paste(s)) => {
-                let chars = sanitize_paste(&s);
-                let _ = write!(out, "{}", chars.iter().collect::<String>());
+                let chars: Vec<char> = if composer {
+                    clean_paste(&s).chars().collect()
+                } else {
+                    sanitize_paste(&s)
+                };
+                let _ = write!(out, "{}", composer_glyphs(&chars));
                 buf.extend(chars);
                 let _ = out.flush();
                 continue;
@@ -6761,6 +7207,7 @@ fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) -> Option<R
         if !(ctrl && ev.code == KeyCode::Char('c')) {
             quit_armed_at = None;
         }
+        let esc_armed = esc_armed_at.take();
         match ev.code {
             KeyCode::Esc | KeyCode::Char('c') if !composer && (ctrl || ev.code == KeyCode::Esc) => {
                 let _ = write!(out, " {}\r\n", dim("cancelled"));
@@ -6784,6 +7231,14 @@ fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) -> Option<R
                     quit_armed_at = Some(monotonic_ms());
                     let _ = write!(out, "\r\n{}\r\n{prompt}", yellow(QUIT_HINT));
                 }
+            }
+            KeyCode::Esc if buf.is_empty() => {
+                if esc_esc_rewinds(esc_armed, monotonic_ms()) {
+                    let _ = write!(out, "\r\n");
+                    let _ = out.flush();
+                    return Some(RawLine::Rewind);
+                }
+                esc_armed_at = Some(monotonic_ms());
             }
             KeyCode::Esc => {
                 erase(&mut out, &buf);
@@ -6831,8 +7286,8 @@ fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) -> Option<R
                 });
                 if let Some(entry) = entry {
                     erase(&mut out, &buf);
-                    buf = sanitize_paste(&entry);
-                    let _ = write!(out, "{}", buf.iter().collect::<String>());
+                    buf = clean_paste(&entry).chars().collect();
+                    let _ = write!(out, "{}", composer_glyphs(&buf));
                 }
             }
             KeyCode::Char(c) if !ctrl && !ev.modifiers.contains(KeyModifiers::ALT) => {
@@ -6871,6 +7326,8 @@ fn read_line_raw_prefill(
     }
     // A first Ctrl+C on an empty composer only arms quitting (see ctrl_c_quits).
     let mut quit_armed_at: Option<u64> = None;
+    // A first Esc on an empty composer arms /rewind (see esc_esc_rewinds).
+    let mut esc_armed_at: Option<u64> = None;
     redraw(prompt, start, &buf, cursor, &mut scroll);
     let mut hist_idx: Option<usize> = None;
     // ↑ stashes the in-progress draft (and its prefix filter); ↓ past the
@@ -6979,6 +7436,7 @@ fn read_line_raw_prefill(
                 }
                 let chars = match collapse_paste(&s).filter(|_| composer) {
                     Some(token) => token.chars().collect(),
+                    None if composer => clean_paste(&s).chars().collect(),
                     None => sanitize_paste(&s),
                 };
                 buf.splice(cursor..cursor, chars.iter().copied());
@@ -7069,6 +7527,7 @@ fn read_line_raw_prefill(
         if !(ctrl && ev.code == KeyCode::Char('c')) {
             quit_armed_at = None;
         }
+        let esc_armed = esc_armed_at.take();
         // A prompt is cancelled by Esc or Ctrl+C whatever was typed, and by
         // Ctrl+D on an empty line: the caller gets None and the box says so.
         let cancel = !composer
@@ -7202,7 +7661,11 @@ fn read_line_raw_prefill(
                         line(&dim(&format!("  ⎘ clipboard image → {}", img.display())));
                     }
                 } else if let Some(text) = crate::media::clipboard_text() {
-                    let chars = sanitize_paste(&text);
+                    let chars: Vec<char> = if composer {
+                        clean_paste(&text).chars().collect()
+                    } else {
+                        sanitize_paste(&text)
+                    };
                     buf.splice(cursor..cursor, chars.iter().copied());
                     cursor += chars.len();
                 }
@@ -7660,6 +8123,16 @@ fn read_line_raw_prefill(
                     sug_suppressed = true;
                     sug_dismissed_at = buf.clone();
                     continue; // loop top clears the popup rows
+                }
+                // Esc Esc on an empty composer (vim: in NORMAL) opens /rewind.
+                if composer && buf.is_empty() && (!is_vim_mode() || vim_state == VimState::Normal) {
+                    if esc_esc_rewinds(esc_armed, monotonic_ms()) {
+                        release!();
+                        clear_composer();
+                        flush();
+                        return Some(RawLine::Rewind);
+                    }
+                    esc_armed_at = Some(monotonic_ms());
                 }
                 if is_vim_mode() && vim_state != VimState::Normal {
                     vim_state = VimState::Normal;
@@ -8639,12 +9112,25 @@ mod tests {
 
     #[test]
     fn every_builtin_slash_command_has_a_description() {
-        for cmd in SLASH_COMMANDS_BASE {
+        for cmd in builtin_names() {
             assert!(
                 !slash_command_desc(cmd).is_empty(),
                 "missing popup description for {cmd}"
             );
         }
+        // Completion lists that live elsewhere stay in step.
+        let theme: Vec<&str> = THEME_NAMES.iter().copied().chain(["auto"]).collect();
+        assert_eq!(find_command("/theme").unwrap().subs, theme);
+        assert_eq!(
+            find_command("/effort").unwrap().subs,
+            crate::config::Effort::LEVELS
+        );
+        // No spelling is listed twice.
+        let mut all: Vec<&str> = builtin_names().collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n);
     }
 
     #[test]
@@ -8897,7 +9383,8 @@ mod tests {
         typeahead_event(Event::Paste("\x1b[31m more\n".into()), true);
         let (buf, cursor) = take_typeahead();
         INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
-        assert_eq!(buf.iter().collect::<String>(), "good point![31m more ");
+        // The paste keeps its line break; its escape is dropped.
+        assert_eq!(buf.iter().collect::<String>(), "good point![31m more\n");
         assert_eq!(cursor, buf.len());
     }
 
@@ -8921,6 +9408,21 @@ mod tests {
         }
         // Margins reset before leaving the alternate screen, which comes last.
         assert!(restore.ends_with("\x1b[?1049l"));
+    }
+
+    #[test]
+    fn the_composer_keeps_pasted_line_breaks_and_shows_them() {
+        let got: Vec<char> = clean_paste("one\r\ntwo\rthree\tx\x1b[31m")
+            .chars()
+            .collect();
+        assert_eq!(got.iter().collect::<String>(), "one\ntwo\nthree\tx[31m");
+        // One column per character, so the cursor arithmetic holds.
+        let shown = composer_glyphs(&got);
+        assert_eq!(shown, "one↵two↵three x[31m");
+        assert_eq!(
+            str_width(&shown),
+            got.iter().copied().map(char_width).sum::<usize>()
+        );
     }
 
     #[test]

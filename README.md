@@ -115,12 +115,13 @@ once you're ready to let it loose on a real project.
 - **Prompts own the keyboard** — while an approval, a question or a picker is
   open, the input box shows it and keys go only to it. `Esc`, `Ctrl+C`, or
   `Ctrl+D` on an empty line cancels a question. Pickers filter as you type, a
-  digit picks a numbered row, and Enter picks only a row that is shown.
+  digit moves to a numbered row, and only Enter picks, and only a row that is
+  shown.
   `Ctrl+C` on an empty prompt quits only on a second press within 2 s
   (`Ctrl+D` quits at once; with workflows waiting it asks first).
-- **What you type is what is sent** — quotes, tabs and line breaks are kept. A
-  paste over 1,000 characters or 10 lines shows as `[pasted 20,024 chars]`
-  and is sent in full. `@` completes files by name anywhere in the project. A
+- **What you type is what is sent** — quotes, tabs and line breaks are kept;
+  a pasted line break shows as `↵` in the input box. A paste over 1,000
+  characters or 10 lines shows as `[pasted 20,024 chars]` and is sent in full. `@` completes files by name anywhere in the project. A
   message that starts with an absolute path (a dropped screenshot) is sent
   with the image attached.
 - **Themes and line mode** — `dark`, `light` (at least 4.5:1 contrast) and
@@ -270,9 +271,9 @@ built-in table (`cache_read` and `cache_write` default to `input`):
 
 ## Modes
 
-- **PLAN** — decompose the task into steps you approve, edit (Edit Step) or
-  push back on (Revise Plan: say what to change and get a revised plan), then
-  execute.
+- **PLAN** — decompose the task into steps you approve, edit (Edit Step:
+  pick a step and change its text in the input box) or push back on (Revise
+  Plan: say what to change and get a revised plan), then execute.
 - **BUILD** — the agentic ReAct loop: read/edit files, run commands, iterate.
 - **BRAINSTORM** — free-form chat with read-only tools (read, grep, fetch, read-only commands); never writes. A task typed here gets a hint to switch; the mode changes only when you change it (Shift+Tab, `/mode`, or bare `/plan`, `/build`, `/brainstorm`).
 
@@ -336,8 +337,12 @@ permission, provider and model. Nobody can answer an approval for them, so
 outside `auto` a change they try is refused: a refused `/loop` run stops the
 loop with `✗ workflow #N blocked: …`. Use `/permissions auto` in the session
 that schedules a workflow that should edit unattended. Bare `/loop`,
-`/schedule` or `/btw` print their usage; `/help` lists the commands, the
-keys, and the answers to an approval prompt.
+`/schedule` or `/btw` print their usage; `/help` lists every command with
+its arguments, the keys, and the answers to an approval prompt, and the `/`
+popup and Tab complete the same commands and their subcommands
+(`/permissions ` Tab offers the modes and `default`, `list`, `remove`,
+`reset`). `buildwithnexus --help` lists every command, subcommand and option.
+Both link [what leaves your machine](https://buildwithnexus.dev/docs/data).
 
 ## Sessions and undo
 
@@ -369,8 +374,9 @@ the agent edited it, `/undo` asks `<file> changed after the agent edited it —
 overwrite your changes? [y/N]`, and `n` keeps your version while the rest is
 restored. `/undo` also says what it cannot undo: changes made by shell
 commands, commits, and files too large to snapshot (the approval prompt warns
-about those too). `/rewind` goes back to an earlier prompt and restores the
-code, the conversation, or both. `/diff` lists every changed and new file
+about those too). `/rewind` (or Esc Esc on an empty input box) goes back to
+an earlier prompt and restores the code, the conversation, or both; the prompt
+comes back in the input box to edit and send again. `/diff` lists every changed and new file
 with one summary line and shows a chosen file's diff; `/diff turn` shows what
 the last turn changed. `/commit` drafts a message and commits only when you
 answer `c` (`[c]ommit · [e]dit · [n]o`). Each folder keeps its newest 500
@@ -796,9 +802,12 @@ precedence):
    then `.buildwithnexus/AGENTS.md`
 
 Each file is capped at 32 KiB (cut with a visible marker) and 96 KiB in
-total. A dim line at startup lists what was found, and says which files came
-from the repository and that nobody reviewed them unless you trusted the
-folder: `instructions from this repo: AGENTS.md, src/AGENTS.md (not reviewed)`.
+total. A dim line at startup lists what was found. The repository's own files
+are asked about once per folder and content: `instructions from this repo:
+AGENTS.md, src/AGENTS.md — press r to review or Enter to use them` (`r` shows
+them; Esc asks again next launch). After that the line just names them, until
+a file changes. A headless run, or a session with prompts piped in, cannot ask, so until
+then it prints one line (a headless run on stderr): `instructions from this repo: AGENTS.md (not reviewed — …)`.
 `/init` offers to write `AGENTS.md` from the repository's own build and test
 files (or to improve the one there), shown as a diff you approve;
 `buildwithnexus init --agents-md` does the same headless.

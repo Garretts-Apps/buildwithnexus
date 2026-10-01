@@ -135,6 +135,34 @@ pub fn assistant_end() {
     }
 }
 
+// The inline diff of the write or edit just announced, and whether it was
+// shown. It is held until the call's fate is known: an approval prompt, a
+// refusal or an error shows it; a change that lands shows its own diff
+// instead, so the same lines never print twice.
+thread_local! {
+    static HELD_PREVIEW: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Shows the held diff of the announced write or edit, once: before its
+/// approval question, or above the reason it was refused.
+pub fn show_held_preview() {
+    HELD_PREVIEW.with_borrow_mut(|held| {
+        if let Some((body, shown)) = held.as_mut().filter(|(_, shown)| !*shown) {
+            // One tui::line call for the whole body → one repaint.
+            tui::line(body);
+            *shown = true;
+        }
+    });
+}
+
+// Whether the held diff was shown, forgetting it.
+fn take_held_preview() -> bool {
+    HELD_PREVIEW
+        .with_borrow_mut(Option::take)
+        .is_some_and(|(_, shown)| shown)
+}
+
 pub fn tool_call(name: &str, preview: &str, input: &Value) {
     if has_sink() {
         to_sink(json!({"type": "tool_call", "name": name, "input": input, "title": preview}));
@@ -144,6 +172,7 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         emit(json!({"type": "tool_call", "name": name, "input": input}));
         return;
     }
+    take_held_preview();
     // `finish` and `exit_plan` are internal control signals — don't double up with a header line.
     if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
@@ -189,7 +218,8 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
 
     // Inline diff for edits/writes — the user sees exactly what will change
     // before approving it, rendered by the same clean renderer as applied
-    // diffs (gutter, tinted rows, word-level emphasis).
+    // diffs (gutter, tinted rows, word-level emphasis). Held, not printed:
+    // see HELD_PREVIEW.
     let body = match name {
         "edit" | "edit_file" => Some(render_diff_block(
             input["old"]
@@ -207,11 +237,8 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         )),
         _ => None,
     };
-    if let Some(body) = body {
-        if !body.is_empty() {
-            // One tui::line call for the whole body → one repaint.
-            tui::line(&body);
-        }
+    if let Some(body) = body.filter(|b| !b.is_empty()) {
+        HELD_PREVIEW.set(Some((body, false)));
     }
 }
 
@@ -244,6 +271,10 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         );
         return;
     }
+    if is_error {
+        show_held_preview();
+    }
+    take_held_preview();
     if (name == "finish" || name == "exit_plan" || name == "ExitPlanMode") && !is_error {
         return;
     }
@@ -338,6 +369,10 @@ pub fn diff(path: &str, old: &str, new: &str) {
         tui::file_link(path, &tui::bold(&format!("{verb} {path}"))),
         tui::dim(&stat)
     ));
+    // Approved after its preview was shown: the stat line confirms it.
+    if take_held_preview() {
+        return;
+    }
     let body = paint_diff_rows(&rows);
     if !body.is_empty() {
         // Single batched line() call → one repaint for the whole diff body.
@@ -668,10 +703,14 @@ fn lcs_ops<'a>(o: &[&'a str], n: &[&'a str]) -> Vec<(char, &'a str)> {
 
 pub fn tool_denied(reason: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!(
-            "  ✗ {}",
-            tui::sanitize_terminal(reason)
-        ))),
+        Mode::Human => {
+            show_held_preview();
+            take_held_preview();
+            tui::line(&tui::red(&format!(
+                "  ✗ {}",
+                tui::sanitize_terminal(reason)
+            )))
+        }
         Mode::Json => emit(json!({"type": "tool_denied", "reason": reason})),
     }
 }

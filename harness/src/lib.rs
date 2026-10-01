@@ -1294,6 +1294,19 @@ fn headless(
     hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
 
+    // The repository's instruction files: acknowledged once in the terminal
+    // UI; until then a headless run says so in one line on stderr.
+    let repo = config::repo_instructions(&cwd);
+    if let Some(repo) = repo.as_ref().filter(|r| !r.acknowledged(&cwd)) {
+        let note = tui::sanitize_terminal(&repo.notice()).into_owned();
+        eprintln!(
+            "{}",
+            tui::yellow(&format!(
+                "buildwithnexus: {note} (not reviewed — open bwn in this folder once to review them)"
+            ))
+        );
+    }
+
     if !report::is_json() {
         // No hand-drawn box: long provider/model/cwd values would shatter
         // fixed-width borders. Plain aligned rows can't overflow.
@@ -1322,6 +1335,10 @@ fn headless(
         // Skill names and paths come from files in the checkout.
         for note in config::startup_context_notices(&cwd) {
             let note = tui::sanitize_terminal(&note);
+            println!("{}", tui::dim(&format!("  {note}")));
+        }
+        if let Some(repo) = repo.as_ref().filter(|r| r.acknowledged(&cwd)) {
+            let note = tui::sanitize_terminal(&repo.notice()).into_owned();
             println!("{}", tui::dim(&format!("  {note}")));
         }
         println!();
@@ -1718,6 +1735,7 @@ fn repl(
     for n in workdirs::notices(cwd) {
         report::notice(&format!("  {n}"));
     }
+    review_repo_instructions(cwd);
     if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
         report::notice(&format!("  {n}"));
     }
@@ -1838,6 +1856,16 @@ fn repl(
                     mode = mode.next();
                     last_suggested_mode = None;
                     tui::show_mode_change(mode_label(&mode));
+                    continue;
+                }
+                Some(tui::InputEvent::Rewind) => {
+                    handle_rewind(
+                        &mut transcript,
+                        &mut rewind_points,
+                        &sid,
+                        cwd,
+                        &provider.model,
+                    );
                     continue;
                 }
                 Some(tui::InputEvent::Text(t)) => t,
@@ -2570,6 +2598,7 @@ fn repl(
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
+        let typed = t.to_string();
         let vision = Vision::of(&provider);
         let (clean_task, mut image_data) = extract_attachments(t, cwd, vision);
 
@@ -2599,6 +2628,7 @@ fn repl(
             index: transcript.len(),
             started_ms: checkpoint::now_ms(),
             prompt: t.to_string(),
+            typed,
         });
         // Every mode reads and extends the one conversation, saved as the
         // session after each turn.
@@ -6386,13 +6416,73 @@ fn handle_checkpoints(cwd: &std::path::Path) {
     }
 }
 
+// The repository's instruction files steer the model: the first launch
+// with this folder and content asks, with one key, to review or use them;
+// after that they are named in a dim line.
+fn review_repo_instructions(cwd: &std::path::Path) {
+    let Some(repo) = config::repo_instructions(cwd) else {
+        return;
+    };
+    // File names come from the checkout.
+    let notice = tui::sanitize_terminal(&repo.notice()).into_owned();
+    if repo.acknowledged(cwd) {
+        tui::line(&tui::dim(&format!("  {notice}")));
+        return;
+    }
+    // Prompts piped in: the first one is not an answer to this.
+    if !std::io::stdin().is_terminal() {
+        tui::line(&tui::dim(&format!("  {notice} (not reviewed)")));
+        return;
+    }
+    loop {
+        tui::line(&tui::yellow(&format!(
+            "  {notice} — press r to review or Enter to use them"
+        )));
+        match tui::ask_key("  r review · Enter use them › ", &['r']) {
+            Some('r') => show_instruction_files(&repo.files),
+            Some(_) => {
+                repo.acknowledge(cwd);
+                tui::line(&tui::dim(&format!(
+                    "  ✓ using {notice} — asked again when they change"
+                )));
+                return;
+            }
+            None => {
+                tui::line(&tui::dim(&format!(
+                    "  {notice} (not reviewed) — asked again next time"
+                )));
+                return;
+            }
+        }
+    }
+}
+
+fn show_instruction_files(files: &[config::InstructionFile]) {
+    for f in files {
+        tui::line(&tui::bold(&format!(
+            "  ── {} ──",
+            tui::sanitize_terminal(&f.label)
+        )));
+        for l in tui::sanitize_terminal(&f.content).lines() {
+            tui::line(&format!("    {l}"));
+        }
+        if f.truncated {
+            tui::line(&tui::dim(
+                "    … cut here: the model is sent the text above",
+            ));
+        }
+    }
+}
+
 // A prompt of this run that /rewind can go back to: where its messages
 // start in the transcript, when its turn began (checkpoints after it are its
-// changes and later ones), and the text sent.
+// changes and later ones), the text sent, and the text as typed (before
+// attached files were added), which goes back in the input box.
 struct RewindPoint {
     index: usize,
     started_ms: u128,
     prompt: String,
+    typed: String,
 }
 
 // Drops the point's prompt and everything after it from the conversation.
@@ -6524,14 +6614,11 @@ fn handle_rewind(
                     "s"
                 }
             )));
-            let prompt = points[at].prompt.clone();
+            tui::prefill_composer(&points[at].typed);
             points.truncate(at);
             tui::line(&tui::dim(
-                "  your prompt was (type its first words and press ↑ to edit it):",
+                "  your prompt is back in the input box — edit it and press Enter",
             ));
-            for l in tui::sanitize_terminal(&prompt).lines().take(6) {
-                tui::line(&format!("    {l}"));
-            }
         } else {
             tui::line(&tui::yellow(
                 "  that prompt is no longer in the conversation (it was compacted) — files only",
@@ -7121,169 +7208,72 @@ fn quit_question(ids: &[usize]) -> String {
     )
 }
 
+/// The page that says what is sent to a hosted model, what stays on this
+/// machine, and where keys are kept.
+const DATA_DOCS: &str = "https://buildwithnexus.dev/docs/data";
+
 fn print_help() {
-    tui::line(&tui::bold(&tui::accent(
-        "  buildwithnexus — commands and keys",
-    )));
-    tui::line(&tui::dim(
-        "  type a task or a question; /command runs a command; Shift+Tab changes mode",
+    for l in help_lines() {
+        tui::line(&l);
+    }
+}
+
+// The /help text: every built-in command by section, then the keys and the
+// answers to an approval, as an aligned table.
+fn help_lines() -> Vec<String> {
+    // (command or key, its arguments and aliases, what it does)
+    type Row = (String, String, &'static str);
+    let mut sections: Vec<(&str, Vec<Row>)> = Vec::new();
+    for c in tui::COMMANDS {
+        let aliases = c.aliases.join(", ");
+        let args = match (aliases.is_empty(), c.args.is_empty()) {
+            (true, _) => c.args.to_string(),
+            (false, true) => format!("({aliases})"),
+            (false, false) => format!("({aliases}) {}", c.args),
+        };
+        let row = (c.name.to_string(), args, c.desc);
+        match sections.iter_mut().find(|(t, _)| *t == c.section) {
+            Some((_, rows)) => rows.push(row),
+            None => sections.push((c.section, vec![row])),
+        }
+    }
+    let rows = |r: &[(&str, &'static str)]| -> Vec<Row> {
+        r.iter()
+            .map(|(k, d)| (k.to_string(), String::new(), *d))
+            .collect()
+    };
+    sections.push((
+        "keys",
+        rows(&[
+            ("Shift+Tab", "cycle PLAN → BUILD → BRAINSTORM"),
+            ("Enter", "send · end a line with \\ to add another"),
+            (
+                "Esc",
+                "stop the agent mid-turn · cancel a question or picker",
+            ),
+            ("Esc Esc", "on an empty line: rewind to an earlier prompt"),
+            (
+                "Ctrl+C",
+                "stop the agent · clear the draft · twice on an empty line: quit",
+            ),
+            ("Ctrl+D", "quit (asks first if workflows are waiting)"),
+            ("Ctrl+Q / Ctrl+X", "edit / drop the next queued message"),
+            ("↑↓  Ctrl+R", "history · search history"),
+            ("Tab", "complete commands and @paths"),
+            ("1-9 ↑↓ Enter", "in a picker: move to a row, Enter picks it"),
+        ]),
     ));
-    // (command, args/aliases hint, description) grouped by section. Rendered
-    // as an auto-aligned table so alignment can't drift as commands change.
-    type Row = (&'static str, &'static str, &'static str);
-    let sections: &[(&str, &[Row])] = &[
-        (
-            "modes",
-            &[
-                ("Shift+Tab", "", "cycle PLAN → BUILD → BRAINSTORM"),
-                ("/plan", "[task]", "switch to PLAN, or plan this task"),
-                ("/build", "[task]", "switch to BUILD, or do this task"),
-                (
-                    "/brainstorm",
-                    "[task]",
-                    "switch to BRAINSTORM, or talk this through",
-                ),
-                ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
-                (
-                    "/permissions",
-                    "[ask|auto|readonly|reset]",
-                    "tool permission level (reset: forget always-allow)",
-                ),
-                (
-                    "/sandbox",
-                    "[off|auto|require|status]",
-                    "OS sandbox for shell commands",
-                ),
-                (
-                    "/add-dir",
-                    "[path]",
-                    "also work in another folder (list with no path)",
-                ),
-                (
-                    "/model",
-                    "[name | <url> <model>]",
-                    "hot-swap the AI model mid-session",
-                ),
-                ("/effort", "[off|low|medium|high]", "reasoning depth"),
-                ("/local", "", "probe local servers and list GGUF models"),
-            ],
-        ),
-        (
-            "context & git",
-            &[
-                ("/compact", "", "compress context to free token budget"),
-                ("/context", "", "show context window usage"),
-                ("/cost", "", "session tokens and estimated cost"),
-                ("/diff", "", "show current git diff summary"),
-                ("/review", "", "AI code review of staged git diff"),
-                ("/commit", "", "AI-drafted conventional commit message"),
-                ("/pr", "", "AI-drafted PR title + description"),
-                ("/checkpoints", "", "list edit checkpoints"),
-                (
-                    "/undo",
-                    "(/rewind) [latest|git|all|<id>]",
-                    "bare: revert the last agent turn's edits",
-                ),
-            ],
-        ),
-        (
-            "automation",
-            &[
-                (
-                    "/schedule",
-                    "<delay> <task>",
-                    "run a task later (e.g. 5m cargo test)",
-                ),
-                (
-                    "/loop",
-                    "<interval> <task>",
-                    "run a task repeatedly (e.g. 30m)",
-                ),
-                ("/workflows", "(/tasks)", "list background workflows"),
-                ("/btw", "<context>", "inject context into next agent turn"),
-                ("/teamwork", "(/swarm)", "multi-agent swarm preview"),
-                ("/grill-me", "(/align)", "operational alignment interview"),
-            ],
-        ),
-        (
-            "project",
-            &[
-                ("/memory", "", "view and edit session memory"),
-                ("/skills", "", "list skills and custom commands"),
-                ("/tools", "", "browse callable tools"),
-                ("/rules", "", "inspect engineering rules and violations"),
-                ("/kb", "(/index)", "query or index project knowledge base"),
-                (
-                    "/verify",
-                    "(/audit)",
-                    "verify codebase against rules and tests",
-                ),
-                ("/agents", "", "show loaded Agents.md context"),
-                (
-                    "/mcp",
-                    "[name|add|remove|reload]",
-                    "MCP servers and their tools",
-                ),
-                (
-                    "/trace",
-                    "[<id>]",
-                    "receipts: tool calls, hooks, skills, subagents",
-                ),
-            ],
-        ),
-        (
-            "session",
-            &[
-                ("/new", "", "start a fresh session"),
-                ("/resume", "", "pick a saved session to resume"),
-                ("/init", "", "run setup (keys, providers, local models)"),
-                (
-                    "/login",
-                    "",
-                    "replace the API key, checked before it is saved",
-                ),
-                ("/config", "", "configure hooks, memory, commands via AI"),
-                ("/voice", "[<file>]", "audio transcription & voice input"),
-                ("/vim", "", "toggle Vim modal editing"),
-                ("/theme", "[dark|light|ansi|auto]", "colour theme"),
-                ("/mouse", "[on|off]", "wheel scroll + drag-copy (/scroll)"),
-                ("/doctor", "(/debug)", "diagnose setup"),
-                ("/clear", "", "clear the screen"),
-                ("/exit", "(/quit)", "exit"),
-            ],
-        ),
-        (
-            "keys",
-            &[
-                ("Enter", "", "send · end a line with \\ to add another"),
-                (
-                    "Esc",
-                    "",
-                    "stop the agent mid-turn · cancel a question or picker",
-                ),
-                (
-                    "Ctrl+C",
-                    "",
-                    "stop the agent · clear the draft · twice on an empty line: quit",
-                ),
-                ("Ctrl+D", "", "quit (asks first if workflows are waiting)"),
-                ("Ctrl+Q / Ctrl+X", "", "edit / drop the next queued message"),
-                ("↑↓  Ctrl+R", "", "history · search history"),
-                ("Tab", "", "complete commands and @paths"),
-            ],
-        ),
-        (
-            "answering an approval (allow?)",
-            &[
-                ("y", "", "yes, this once"),
-                ("n", "", "no"),
-                ("s", "", "allow it for the rest of this session"),
-                ("a", "", "always allow it in this project"),
-                ("d <reason>", "", "deny and tell the agent why"),
-                ("Esc", "", "deny and stop the turn"),
-            ],
-        ),
-    ];
+    sections.push((
+        "answering an approval (allow?)",
+        rows(&[
+            ("y", "yes, this once"),
+            ("n", "no"),
+            ("s", "allow it for the rest of this session"),
+            ("a", "always allow it in this project"),
+            ("d <reason>", "deny and tell the agent why"),
+            ("Esc", "deny and stop the turn"),
+        ]),
+    ));
 
     let cmd_w = sections
         .iter()
@@ -7291,32 +7281,38 @@ fn print_help() {
         .map(|(cmd, _, _)| cmd.chars().count())
         .max()
         .unwrap_or(0);
-
-    for (title, rows) in sections {
-        tui::line("");
-        tui::line(&tui::dim(&format!("  {title}")));
-        for (cmd, args, desc) in rows.iter() {
+    let mut out = vec![
+        tui::bold(&tui::accent("  buildwithnexus — commands and keys")),
+        tui::dim("  type a task or a question; /command runs a command; Shift+Tab changes mode"),
+    ];
+    for (title, rows) in &sections {
+        out.push(String::new());
+        out.push(tui::dim(&format!("  {title}")));
+        for (cmd, args, desc) in rows {
             let pad = " ".repeat(cmd_w.saturating_sub(cmd.chars().count()));
             let args_part = if args.is_empty() {
                 String::new()
             } else {
                 format!("  {}", tui::dim(args))
             };
-            tui::line(&format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
+            out.push(format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
         }
     }
-    tui::line("");
-    tui::line(&tui::dim("  input"));
-    tui::line(&tui::dim(
+    out.push(String::new());
+    out.push(tui::dim("  input"));
+    for l in [
         "    !<cmd> shell command · @<path> attach file/image/video · @diff @kb: @symbol:",
-    ));
-    tui::line(&tui::dim(
         "    ^V paste image/text · ^G $EDITOR · ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank",
-    ));
-    tui::line(&tui::dim(
         "    PgUp/PgDn scroll · --plain (or TERM=dumb) for line mode without screen control",
-    ));
-    tui::line("");
+    ] {
+        out.push(tui::dim(l));
+    }
+    out.push(String::new());
+    out.push(tui::dim(&format!(
+        "  what leaves your machine, and where keys are kept: {DATA_DOCS}"
+    )));
+    out.push(String::new());
+    out
 }
 
 #[cfg(test)]
@@ -7369,6 +7365,180 @@ mod terminal_ui_tests {
         repl_source().contains(&format!("\"{cmd}\""))
             || bare_mode_command(cmd).is_some()
             || command_usage(&cmd[1..]).is_some()
+    }
+
+    // Whether `word` appears in `text` on its own: not inside a longer
+    // command, option or word.
+    fn mentions(text: &str, word: &str) -> bool {
+        let part = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        text.match_indices(word)
+            .any(|(i, _)| !text[..i].ends_with(part) && !text[i + word.len()..].starts_with(part))
+    }
+
+    // The source of `fn <name>(` up to the end of that function.
+    fn fn_source(name: &str) -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find(&format!("\nfn {name}("))
+            .or_else(|| src.find(&format!("\npub fn {name}(")))
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let body = &src[start..];
+        &body[..body[1..].find("\n}\n").expect("end of fn") + 3]
+    }
+
+    // Every `/command` the REPL matches on: match arms, strip_prefix,
+    // slash_args and `t == "/x"` tests.
+    fn repl_commands() -> Vec<String> {
+        let src = repl_source();
+        let mut out: Vec<String> = Vec::new();
+        for (i, _) in src.match_indices("\"/") {
+            let name: String = std::iter::once('/')
+                .chain(
+                    src[i + 2..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'),
+                )
+                .collect();
+            let next = src[i + 1 + name.len()..].chars().next();
+            if name.len() > 1 && matches!(next, Some('"' | ' ')) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    // The string literals in the patterns of a function's match arms
+    // (`"a" | "b" =>`, `Some("a" | "b") =>`), empty ones left out.
+    fn arm_literals(src: &str) -> Vec<String> {
+        src.lines()
+            .filter_map(|l| l.split_once("=>").map(|(pat, _)| pat))
+            .flat_map(|pat| {
+                pat.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_command_the_repl_takes_is_in_help_the_popup_and_completion() {
+        let cmds = repl_commands();
+        assert!(cmds.len() > 50, "{cmds:?}");
+        let help = tui::strip_ansi(&help_lines().join("\n"));
+        let usage = usage_text();
+        let popup = tui::builtin_slash_commands();
+        for cmd in &cmds {
+            assert!(mentions(&help, cmd), "/help does not list {cmd}");
+            assert!(mentions(&usage, cmd), "--help does not list {cmd}");
+            assert!(
+                popup.contains(&cmd.as_str()),
+                "the / popup does not list {cmd}"
+            );
+            assert!(
+                tui::completions_for(cmd).contains(cmd),
+                "Tab does not complete {cmd}"
+            );
+        }
+        // The page on what is sent where is one step from either help.
+        assert!(help.contains(DATA_DOCS), "{help}");
+        assert!(usage.contains(DATA_DOCS), "{usage}");
+    }
+
+    #[test]
+    fn permission_modes_and_subcommands_are_listed_and_complete() {
+        let help = tui::strip_ansi(&help_lines().join("\n"));
+        let usage = usage_text();
+        let perms = tui::find_command("/permissions").unwrap();
+        // Every word /permissions takes: the modes and the approval commands.
+        let taken: Vec<String> = arm_literals(fn_source("handle_permissions_arg"))
+            .into_iter()
+            .map(|w| w.trim().to_string())
+            .filter(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            .collect();
+        assert!(taken.len() >= 3, "{taken:?}");
+        for word in taken.iter().map(String::as_str).chain([
+            "ask",
+            "accept-edits",
+            "auto",
+            "readonly",
+            "default",
+        ]) {
+            assert!(perms.subs.contains(&word), "/permissions {word} not listed");
+            assert!(mentions(perms.args, word), "/help: /permissions {word}");
+            assert!(
+                tui::completions_for("/permissions ").contains(&word.to_string()),
+                "Tab: /permissions {word}"
+            );
+        }
+        // Every permission mode by its name, and plan's reading, in --help.
+        for p in [
+            Permission::Ask,
+            Permission::AcceptEdits,
+            Permission::Auto,
+            Permission::ReadOnly,
+        ] {
+            let name = agent::permission_name(p);
+            assert!(mentions(&usage, name), "--help: {name}");
+            assert!(mentions(&help, name), "/help: {name}");
+        }
+        assert!(usage.contains("plan reads as"), "{usage}");
+        // Subcommands of other commands complete too.
+        assert_eq!(tui::completions_for("/diff t"), ["turn"]);
+        assert!(tui::completions_for("/review --").contains(&"--staged".to_string()));
+        assert!(tui::completions_for("/mcp ").contains(&"reload".to_string()));
+    }
+
+    #[test]
+    fn every_cli_command_option_and_subcommand_is_in_help() {
+        let usage = usage_text();
+        // The commands run() dispatches, their flag spellings included.
+        let run_src = fn_source("run");
+        let dispatch = &run_src[run_src.find("    match cmd {").expect("dispatch")..];
+        let commands = arm_literals(dispatch);
+        assert!(commands.len() > 25, "{commands:?}");
+        for word in &commands {
+            assert!(mentions(&usage, word), "--help does not list `{word}`");
+        }
+        // Every option parse_cli_options takes, and its "did you mean" list.
+        let parse_src = fn_source("parse_cli_options");
+        let mut flags: Vec<String> = arm_literals(parse_src)
+            .into_iter()
+            .filter(|w| w.starts_with('-'))
+            .collect();
+        for (i, _) in parse_src.match_indices("arg == \"") {
+            let flag = &parse_src[i + 8..];
+            flags.push(flag[..flag.find('"').unwrap()].to_string());
+        }
+        assert!(flags.len() > 12, "{flags:?}");
+        for flag in flags
+            .iter()
+            .map(String::as_str)
+            .chain(CLI_OPTIONS.iter().copied())
+        {
+            assert!(mentions(&usage, flag), "--help does not list {flag}");
+            if flag.starts_with("--") && flag != "--" {
+                assert!(CLI_OPTIONS.contains(&flag), "{flag} is not in CLI_OPTIONS");
+            }
+        }
+        // Subcommands and their options.
+        for word in arm_literals(fn_source("sessions_command")) {
+            assert!(mentions(&usage, &word), "--help: sessions {word}");
+        }
+        for word in [
+            "--print",
+            "--agents-md",
+            "--check",
+            "--base",
+            "--staged",
+            "add",
+            "remove",
+            "reload",
+        ] {
+            assert!(mentions(&usage, word), "--help: {word}");
+        }
     }
 
     #[test]
@@ -7970,39 +8140,54 @@ pub fn classify(task: &str) -> Mode {
 }
 
 fn usage() {
-    println!(
+    print!("{}", usage_text());
+}
+
+// `--help`: every command, subcommand and option, the exit codes, and the
+// session's commands by section (/help explains each).
+fn usage_text() -> String {
+    let mut out = format!(
         "buildwithnexus {VERSION} — agentic AI CLI harness\n\n\
          USAGE:\n\
-         \x20 buildwithnexus                 interactive session (all modes, full TUI)\n\
-         \x20 buildwithnexus run <task>      execute a task (agentic BUILD loop)\n\
-         \x20 ... | buildwithnexus run [task] piped text is the task, or context after it (1 MiB)\n\
-         \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
-         \x20 buildwithnexus brainstorm <q>  chat with tools (grep, fetch, read, etc.)\n\
-         \x20 buildwithnexus continue <task> continue the most recent session\n\
-         \x20 buildwithnexus resume <id> <t> resume a specific session\n\
-         \x20 buildwithnexus sessions        list saved sessions\n\
-         \x20 buildwithnexus init            (re)configure provider / model / key\n\
-         \x20 buildwithnexus init --agents-md  write AGENTS.md from this repository\n\
-         \x20 buildwithnexus login           replace the provider's API key (checked first)\n\
-         \x20 buildwithnexus providers       list built-in providers\n\
-         \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
-         \x20 buildwithnexus update [--check] install the latest release (--check: exit 10 if behind)\n\
+         \x20 buildwithnexus                    interactive session (all modes, full TUI)\n\
+         \x20 buildwithnexus run <task>         execute a task (agentic BUILD loop); also -p, --print\n\
+         \x20 ... | buildwithnexus run [task]   piped text is the task, or context after it (1 MiB)\n\
+         \x20 buildwithnexus plan <task>        decompose, approve, then execute (--yes: no approval)\n\
+         \x20 buildwithnexus brainstorm <q>     chat with tools (grep, fetch, read, etc.)\n\
+         \x20 buildwithnexus continue [task]    this folder's latest session; also -c, --continue\n\
+         \x20 buildwithnexus resume [<id> [task]]  a saved session; also -r, --resume\n\
+         \x20 buildwithnexus sessions           list saved sessions (this folder first)\n\
+         \x20 buildwithnexus sessions rm <id>   delete a session; also delete, remove\n\
+         \x20 buildwithnexus sessions export <id> [file.md]  a session as Markdown\n\
+         \x20 buildwithnexus init               (re)configure provider / model / key; also setup\n\
+         \x20 buildwithnexus init --agents-md   write AGENTS.md from this repository\n\
+         \x20 buildwithnexus login              replace the provider's API key (checked first)\n\
+         \x20 buildwithnexus providers          list built-in providers\n\
+         \x20 buildwithnexus doctor             diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus update [--check]   install the latest release (--check: exit 10 if behind)\n\
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
-         \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers\n\
-         \x20 buildwithnexus acp            Agent Client Protocol server on stdio (Zed, JetBrains, Neovim)\n\
-         \x20 buildwithnexus version | help\n\n\
+         \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
+         \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
+         \x20 buildwithnexus acp                Agent Client Protocol server on stdio (Zed, JetBrains, Neovim)\n\
+         \x20 buildwithnexus version | help     also -v, -V, --version, -h, --help\n\
+         \x20 older spellings still accepted: build, headless, --headless (run); da-init (init)\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
          \x20 --model <name>                override the configured model\n\
          \x20 --base-url <url>              model endpoint, e.g. a gateway (--provider custom\n\
          \x20                               reads CUSTOM_API_KEY from the environment)\n\
-         \x20 --permission-mode <mode>      ask, auto, or readonly\n\
+         \x20 --permission-mode <mode>      ask, accept-edits, auto, or readonly (plan reads as\n\
+         \x20                               readonly); also --permission\n\
          \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
          \x20 --worktree <name>             work in .bwn/worktrees/<name> on branch bwn/<name>\n\
          \x20 --add-dir <path>              also read and change files in <path> (repeatable)\n\
          \x20 --prompt <text>               initial interactive prompt\n\
          \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
+         \x20 --trust-project <digest>      trust exactly this project settings content for this\n\
+         \x20                               run (from `trust --print`; or BWN_TRUST_PROJECT)\n\
+         \x20 --plain                       line mode: no alternate screen or cursor control\n\
+         \x20                               (TERM=dumb does the same)\n\
          \x20 --json                        structured headless output\n\
          \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
          \x20 --legacy-exit-codes           exit 0 when a run stops short without failing\n\
@@ -8012,39 +8197,39 @@ fn usage() {
          \x20 4 hook blocked the task   5 budget limit   6 step limit\n\
          \x20 7 checks fail   8 verification failed   9 review found blocking issues\n\
          \x20 130/143 interrupted (SIGINT/SIGTERM)\n\n\
-         INTERACTIVE:\n\
-         \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
-         \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
-         \x20 /model [name]                    hot-swap the AI model\n\
-         \x20 /effort [off|low|medium|high]    show or set reasoning depth\n\
-         \x20 /permissions [ask|auto|readonly|reset] show or switch tool permission level\n\
-         \x20                                  (reset forgets this project's always-allow answers)\n\
-         \x20 /sandbox [off|auto|require|status] OS sandbox for shell commands\n\
-         \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
-         \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
-         \x20 /compact               compress context to free up token budget\n\
-         \x20 /context               show current context usage\n\
-         \x20 /cost                  session tokens and estimated cost\n\
-         \x20 /diff                  show current git diff summary\n\
-         \x20 /review [--base <ref>|--staged] [focus]  read-only review of your changes\n\
-         \x20 /commit                AI-drafted conventional commit message\n\
-         \x20 /pr                    AI-drafted pull request title + description\n\
-         \x20 /schedule <delay> <t>  one-shot workflow  (e.g. /schedule 5m cargo test)\n\
-         \x20 /loop <interval> <t>   repeating workflow (e.g. /loop 30m cargo test)\n\
-         \x20 /workflows /tasks      list and manage background workflows\n\
-         \x20 /btw <context>         inject context into next agent turn\n\
-         \x20 /config                configure hooks, memory, commands via AI\n\
-         \x20 /memory                view and edit session memory\n\
-         \x20 /skills                browse available skills and custom commands\n\
-         \x20 /tools                 browse callable tools\n\
-         \x20 /mcp [name|add|remove|login|logout|reload]  MCP servers and their tools\n\
-         \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
-         \x20 /agents /checkpoints /undo /doctor\n\
-         \x20 /help /clear /new /resume /init /exit\n\
-         \x20 !<cmd>                 run shell command directly\n\
-         \x20 @<path>                Tab-complete a file path\n\
-         \x20 Tab                    autocomplete /commands and sub-args\n"
+         INTERACTIVE (/help in a session explains each):\n"
     );
+    let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+    for c in tui::COMMANDS {
+        let names = std::iter::once(c.name).chain(c.aliases.iter().copied());
+        match sections.iter_mut().find(|(t, _)| *t == c.section) {
+            Some((_, list)) => list.extend(names),
+            None => sections.push((c.section, names.collect())),
+        }
+    }
+    let title_w = sections.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+    for (title, names) in sections {
+        // Wrapped to 80 columns under the section's name.
+        let mut line = format!("  {title:<title_w$} ");
+        let indent = line.len();
+        for n in names {
+            if line.len() + 1 + n.len() > 80 && line.len() > indent {
+                out.push_str(line.trim_end());
+                out.push('\n');
+                line = " ".repeat(indent);
+            }
+            line.push(' ');
+            line.push_str(n);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "  !<cmd> runs a shell command · @<path> attaches a file · Shift+Tab cycles mode\n\
+         \x20 Esc stops the agent · Esc Esc on an empty line rewinds · Tab completes\n\n\
+         What leaves your machine, and where keys are kept: {DATA_DOCS}\n"
+    ));
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -8906,6 +9091,7 @@ mod tests {
             index,
             started_ms: 0,
             prompt: prompt.into(),
+            typed: prompt.into(),
         };
         // A hook appended context to "second": still found.
         assert!(rewind_transcript(&mut t, &point(3, "second")));

@@ -8834,3 +8834,95 @@ fn acp_helpers_from_one_reply_take_turns_and_every_call_ends() {
     }
     acp.close();
 }
+
+// ── the diff of a change is shown once ──────────────────────────────────────
+
+// The write's lines appear once, under the applied `⏺ write` header, when
+// nothing asks first; a write that is refused still shows what it would
+// have written.
+#[test]
+fn a_write_shows_its_diff_once() {
+    let write = || {
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "first note\nsecond note\n"}),
+        )
+    };
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve_streaming(vec![write(), finish("wrote notes")]);
+    write_config(&home, "ollama", "auto", port);
+    let (code, out) = run_human(&home, &cwd, "create notes");
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out.matches("first note").count(), 1, "{out}");
+    assert_eq!(out.matches("second note").count(), 1, "{out}");
+    let applied = out.find("⏺ write").expect("applied header");
+    assert!(out[applied..].contains("first note"), "{out}");
+
+    // Ask mode without a terminal: blocked, so the preview is the only
+    // place the content shows.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve_streaming(vec![write(), finish("blocked")]);
+    write_config(&home, "ollama", "ask", port);
+    let (_, out) = run_human(&home, &cwd, "create notes");
+    assert!(!cwd.join("notes.txt").exists());
+    assert_eq!(out.matches("first note").count(), 1, "{out}");
+    assert!(!out.contains("⏺ write"), "{out}");
+}
+
+// ── a repository's instruction files ────────────────────────────────────────
+
+// With prompts piped in, the AGENTS.md question never eats the first one:
+// nobody is at a terminal to answer it.
+#[test]
+fn piped_prompts_reach_the_model_past_the_repo_instructions_question() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::write(cwd.join("AGENTS.md"), "# Rules\nuse tabs\n").unwrap();
+    let (port, posts) = serve_recording(vec![finish("answered")]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run_stdin(&home, &cwd, &[], "what does this project do?\n/exit\n");
+    let sent = posts.lock().unwrap().clone();
+    assert!(
+        sent.iter()
+            .any(|p| p.contains("what does this project do?")),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("AGENTS.md (not reviewed)"),
+        "{}",
+        r.stderr
+    );
+}
+
+// Headless runs cannot take the one-key acknowledgement: a repository's
+// unacknowledged AGENTS.md gets one line on stderr, in human and --json
+// output alike, and stdout stays the run's own.
+#[test]
+fn unreviewed_repo_instructions_are_one_stderr_line_headless() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(cwd.join(".git")).unwrap();
+    std::fs::write(cwd.join("AGENTS.md"), "# Rules\nalways use tabs\n").unwrap();
+    let note = "instructions from this repo: AGENTS.md (not reviewed";
+    let port = serve_streaming(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+    let (code, out) = run_human(&home, &cwd, "say hi");
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out.matches(note).count(), 1, "{out}");
+    // …and that one is on stderr.
+    let port = serve_streaming(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_args(&home, &cwd, &["run", "say hi"]);
+    assert_eq!(r.stderr.matches(note).count(), 1, "{}", r.stderr);
+    let port = serve(vec![finish("ok")]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run(&home, &cwd, "say hi");
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stderr.matches(note).count(), 1, "{}", r.stderr);
+    assert_eq!(r.stderr.lines().filter(|l| l.contains(note)).count(), 1);
+}

@@ -2174,6 +2174,8 @@ fn confirm_with(
         "permission_prompt",
         &format!("approval needed: {}", trace::preview(label, 120)),
     );
+    // What a write or edit would change, right above the question.
+    report::show_held_preview();
     // Action on its own line; the key legend stays short so the prompt never
     // wraps mid-legend on a normal-width terminal.
     tui::line(&format!(
@@ -5690,22 +5692,18 @@ pub fn plan_turn(
                     crate::session::save(sid, cwd, &p.model, transcript);
                 }
                 Some(1) => {
+                    // The picker numbers the rows: a digit moves to that
+                    // step, Enter opens it with its text to edit.
                     let step_items: Vec<tui::SelectItem> = steps
                         .iter()
-                        .enumerate()
-                        .map(|(i, s)| tui::SelectItem {
-                            label: format!("{}. {}", i + 1, s),
-                            detail: "Select step to edit".into(),
+                        .map(|s| tui::SelectItem {
+                            label: s.clone(),
+                            detail: "edit this step".into(),
                         })
                         .collect();
                     if let Some(idx) = tui::select_item("Select Step to Edit", &step_items) {
-                        tui::line(&tui::dim(&format!(
-                            "  step {} now: {}",
-                            idx + 1,
-                            tui::sanitize_terminal(&steps[idx])
-                        )));
-                        let prompt = format!("  edit step {} (Enter keeps it): ", idx + 1);
-                        if let Some(new_text) = tui::ask(&prompt) {
+                        let prompt = format!("  edit step {}: ", idx + 1);
+                        if let Some(new_text) = tui::ask_prefilled(&prompt, &steps[idx]) {
                             if !new_text.trim().is_empty() {
                                 steps[idx] = new_text.trim().to_string();
                             }
