@@ -237,6 +237,15 @@ preset's default.
 
 A configured key is only sent over HTTPS or to a loopback address.
 
+Setup, `/login` and `/model` share one key question. It refuses an answer that
+cannot be a key without sending it: one with spaces (pasted line breaks count
+as spaces), a leading `/`, only digits, a provider name, or more than 4096
+characters. A `/command` closes it (in setup it stops setup). To use a key that
+really has spaces, set it in the environment variable or `.env.keys`. For an
+endpoint on plain http on another machine bwn does not ask for a key: it
+explains the https and `ssh -L` options. A keyed OpenAI-compatible gateway
+lists its models once the key works.
+
 **Local servers.** llama.cpp, LM Studio and vLLM report their context window,
 and bwn uses it (`context_tokens` in settings fixes a value); `/context` shows
 the total and what fills it (system prompt, tools, MCP tools, conversation,
@@ -249,6 +258,8 @@ preset with its models, then the GGUF files on disk. A busy server (429 or
 loading for about two minutes. Errors say what happened and what to do, with
 the server's own message underneath (`nothing is answering at <host>`, a
 missing Ollama model with its `ollama pull` command).
+`/context` and `/teamwork` say when a local or custom endpoint did not report
+its window (bwn assumes 8k; `context_tokens` changes it).
 
 **Reasoning.** `reasoning_effort` in settings (`off` by default, or `low` / `medium` /
 `high`; `--effort <level>` per run, `/effort` in-session) maps to each API's
@@ -407,6 +418,7 @@ whose API key is in the environment, and writes nothing.
 | `--yes`, `-y` | `plan` only: approve the plan and execute it |
 | `--legacy-exit-codes` | exit 0 when a run stops short without failing (codes 4 to 8, and 3 or 1 for refused or unrun calls, below) |
 | `--trust-project <digest>` | trust exactly this content of the folder's project settings for this run (also `BWN_TRUST_PROJECT`; `buildwithnexus trust --print` prints the digest) |
+| `--trust-project-allow <keys>` | let that digest also trust `base_url` and/or `permission` from the project settings, e.g. `base_url,permission` (also `BWN_TRUST_PROJECT_ALLOW`) |
 | `--worktree <name>` | work in `.bwn/worktrees/<name>` on branch `bwn/<name>` (created from HEAD, or reused); on exit bwn prints the branch and `git merge bwn/<name>` |
 | `--add-dir <path>` | also read and change files in `<path>`; repeatable (see [More folders](#more-folders)). A missing folder, a file, `/` or a folder holding your home exits 2. |
 | `--plain` | line mode for the terminal UI: no alternate screen or cursor addressing (as with `TERM=dumb`) |
@@ -466,7 +478,10 @@ nobody to answer the prompt. Run `buildwithnexus trust --print` in the
 checkout to see what the project settings run, the commands, skills and
 agents it carries, and their digest, then pass `--trust-project <digest>` (or
 set `BWN_TRUST_PROJECT`): if the files change, the run stops with exit 2 and
-names them.
+names them. Settings that set `base_url` (where your requests and API key go)
+or `permission` are trusted only when those keys are named too, with
+`--trust-project-allow base_url,permission` (or `BWN_TRUST_PROJECT_ALLOW`), as
+the terminal asks about them on their own; `trust --print` prints the line.
 
 **Custom commands headless.** `bwn run '/deploy staging'` runs a custom command
 or skill with its arguments, as in a session. A command from the repository
@@ -753,8 +768,10 @@ command names (`make -C sub`, `cd web && npm test`). Editing one of those
 asks again, and the check is repeated before every run of a project hook: a
 script that changed since you trusted it is asked about
 (`scripts/fmt.sh changed since you trusted it — run it?`), or skipped with a
-warning in a headless run. The prompt asks separately before a project's
-`base_url` (where your requests and key go) or `permission` takes effect.
+warning in a headless run. The prompt is one screen with one question; when
+the project sets `base_url` (where your requests and key go) or `permission`,
+`e` trusts everything except those. A later prompt names the file that
+changed since you trusted the folder.
 For CI, see *Trusting a repository in CI* under [Headless and CI](#headless-and-ci).
 Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
 `PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
@@ -856,9 +873,11 @@ precedence):
 Each file is capped at 32 KiB (cut with a visible marker) and 96 KiB in
 total. A dim line at startup lists what was found. The repository's own files
 are asked about once per folder and content: `instructions from this repo:
-AGENTS.md, src/AGENTS.md — press r to review or Enter to use them` (`r` shows
-them; Esc asks again next launch). After that the line just names them, until
-a file changes. A headless run, or a session with prompts piped in, cannot ask, so until
+AGENTS.md, src/AGENTS.md`, then `use them? y yes · n no · r review [N]`. Only
+`y` uses them (and is remembered); Enter, `n` or Esc keeps them out of the
+prompt for this session and asks again next launch, and `r` shows them. A task
+typed while the question is up is not an answer: it waits in the input box.
+After a `y` the line just names them, until a file changes. A headless run, or a session with prompts piped in, cannot ask, so until
 then it prints one line (a headless run on stderr): `instructions from this repo: AGENTS.md (not reviewed — …)`.
 `/init` offers to write `AGENTS.md` from the repository's own build and test
 files (or to improve the one there), shown as a diff you approve;

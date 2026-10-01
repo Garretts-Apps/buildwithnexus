@@ -20,7 +20,7 @@ no tag yet until CHANGELOG.md has its `## [x.y.z]` section.
 
 | Interface | Breaking | Not breaking |
 |---|---|---|
-| CLI subcommands and flags (`run`, `plan`, `--json`, `--permission-mode`, …) | removing or renaming one; changing what an existing value does | a new subcommand, flag or value |
+| CLI subcommands and flags (`run`, `plan`, `--json`, `--permission-mode`, …) | removing or renaming one; changing what an existing value does | a new subcommand, flag or value; a project's `base_url` or `permission` needing `--trust-project-allow` beside a `--trust-project` digest, and a `--trust-project` digest that now covers `skill_dirs` skills (both written in docs/UPGRADING-0.15.md) |
 | Settings keys in `settings.json` | removing or renaming a key; changing the meaning of a value; a new default that changes what an existing setup does | a new key whose default keeps today's behavior |
 | `--json` events on stdout | removing or renaming an event type or field; changing a field's type or meaning | a new event type; a new field |
 | Session files in `~/.buildwithnexus/sessions/` | a file an earlier version wrote no longer loads | new fields |
@@ -80,7 +80,8 @@ order.
 `turns` counts model requests, `tokens_in` includes cached input, and
 `cost_usd` is estimated from the price table; requests to a model with no
 price are counted in `unpriced_requests`, never guessed. `denied` counts every
-refused call, and `denials` lists the first 20.
+refused call, including one a helper made (the parent is told it was not
+done), and `denials` lists the first 20.
 
 The `outcome` values and exit codes of a headless run:
 

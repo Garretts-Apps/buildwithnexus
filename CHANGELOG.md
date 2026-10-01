@@ -139,6 +139,26 @@ the setting that restores the old behavior is listed in
 - A `.gitignore` pattern built to backtrack can no longer stall the file
   tools or `@` completion: matching takes at most pattern × name steps.
 
+- **Instructions from the repository need a `y`.** The question is
+  `use them? y yes · n no · r review [N]`. Only `y` uses a repository's
+  AGENTS.md/CLAUDE.md; Enter, `n` or Esc keep them out of that session's
+  prompt, and the question returns next launch. A task or `/command` typed
+  while it is up is kept for the input box, and `/init`'s y/N question also
+  gives typed text back.
+- **`--trust-project` no longer carries `base_url` or `permission` along.** A
+  digest whose project settings set either exits 2 unless
+  `--trust-project-allow base_url,permission` (or `BWN_TRUST_PROJECT_ALLOW`)
+  names it; a `permission` of `readonly` only tightens and needs no name.
+  `trust --print` prints the exact line, the digest covers skills from a
+  `skill_dirs` the settings add, and a malformed, prefix-less or mistyped
+  digest gets its own message.
+- **Trusted repository commands run headless, and escapes do not load.** A
+  repository command or skill file that links outside its folder is listed
+  as not loaded, and `/name` for it says so instead of going to the model.
+- **A key is asked for only where it can safely go.** When an endpoint is plain
+  http on another machine, setup and `/model` explain the https or
+  ssh-tunnel options instead of asking for a key.
+
 ### Added
 - **Corporate proxies and TLS inspection.** bwn's own HTTP (providers, web
   tools, MCP over HTTP, update check, local server probes) honors
@@ -497,6 +517,37 @@ the setting that restores the old behavior is listed in
 - Session files may hold tool-result pictures (base64, like attached
   images); older versions load them and ignore the field.
 
+- **One key question for setup, `/login` and `/model`.** It refuses, without
+  sending anything, an answer that cannot be a key: one with spaces (pasted
+  line breaks become spaces, so several pasted lines are refused rather than
+  joined), a leading `/`, only digits, a provider name, or more than 4096
+  characters. A `/command` closes it: in a session the command runs, in setup
+  it stops setup. `/model` asks again after a rejected key.
+- **Setup on a keyed OpenAI-compatible gateway** lists the gateway's models
+  once the key works (header `detected models:`), offers `4 accept edits` and
+  refuses permission answers outside 1-4. Setup left early, including `init`
+  without a terminal, writes nothing. The first session after 0.15 says once
+  which endpoint a 0.14 `CUSTOM_API_KEY` is now kept for.
+- **The trust prompt is one screen with one question** (`y` / `e` all except
+  `base_url` and `permission` / `n`). It includes `skill_dirs` skills,
+  explains `base_url` and `permission`, and names the file that changed since
+  the last trust. `trusted.json` gains `<file>#files` entries that older
+  versions ignore; `bwn acp` keeps its per-decision questions.
+- **`doctor` names each missing tool once,** on its check line with the
+  install command, in place of a separate advice block. The blocked-run line
+  suggests `--permission-mode auto` only when auto would allow the calls.
+- **Text tool calls need the whole reply.** Outside a `tool_code` fence a
+  call runs only when the reply is nothing but that call. A call to a tool
+  that was not offered is refused before the gate with a short list of the
+  offered tools. `finish` ends a BRAINSTORM turn and the first ACP prompt turn.
+- **Read-only helpers are reads for the gate.** A helper started with
+  `read_only: true` is a read; a call a helper is refused counts toward exit 3
+  and is reported to the parent.
+- **Local models.** One helper at a time unless `max_parallel_helpers` is set;
+  `/context` and `/teamwork` say when the window was not reported;
+  `screenshot_url` is refused up front for a text-only model; a picture over
+  5 MB in the prompt is not sent.
+
 ### Fixed
 - `/model` on the same provider keeps its saved `base_url`, so a remote Ollama
   host or a LAN llama.cpp/LM Studio server stays in use; llama.cpp and LM
@@ -557,6 +608,12 @@ the setting that restores the old behavior is listed in
   it is an answer, not a failed call to a missing tool.
 - The transcript shows what a picture read or a screenshot showed, instead
   of `↳ 1 line`.
+
+- A project `permission` of `readonly` no longer needs
+  `--trust-project-allow` with a `--trust-project` digest.
+- A `--trust-project` digest made before 0.15 stops matching in a folder whose
+  settings add `skill_dirs`, because the digest now covers those skills
+  (rerun `trust --print`).
 
 ### Release process
 - Releases are drafts until every binary, checksum and the SBOM are uploaded

@@ -192,7 +192,7 @@ shows whether a given file is signed.
   provider keys in its environment); and `npm install -g buildwithnexus` only when the user
   runs `buildwithnexus update` or sets `auto_update` to `"install"` or
   `"install-any"`. It never installs other software: `buildwithnexus doctor`
-  prints the install command for a missing tool and runs none. Commands the
+  prints the install command for a missing tool, once, and runs none. Commands the
   agent runs do not inherit provider keys (variables ending in `_API_KEY` or
   `_API_TOKEN`, and `HF_TOKEN`) unless the user lists them in
   `shell_env_passthrough`.
@@ -260,6 +260,17 @@ shows whether a given file is signed.
   own account.
 - **Not done:** no services, scheduled tasks, startup entries, registry
   writes, drivers, or elevation.
+
+Folder trust is explicit. A project's `base_url` (where requests and the key
+go) and `permission` take effect from a `--trust-project` digest only when
+`--trust-project-allow` (or `BWN_TRUST_PROJECT_ALLOW`) names them; a
+`permission` of `readonly` only tightens and needs no name. The digest covers
+skills from a `skill_dirs` the project settings add. A repository's AGENTS.md
+and CLAUDE.md enter the prompt only after a `y` for that folder and content.
+The key question refuses answers that cannot be a key (spaces, a leading `/`,
+only digits, a provider name, over 4096 characters) instead of sending them
+to the provider, and bwn does not ask for a key for plain http to another
+machine.
 
 Controls an organization can set: `"auto_update": "off"`,
 `"permission": "ask"`, `"accept-edits"` or `"readonly"`, `permissions.deny`
