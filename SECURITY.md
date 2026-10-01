@@ -185,7 +185,11 @@ shows whether a given file is signed.
   `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
   -File <script>`; the OS URL opener (`open`, `xdg-open`, or `rundll32
   url.dll,FileProtocolHandler`) for `open_browser` and for the sign-in page
-  of `buildwithnexus mcp login`; and `npm install -g buildwithnexus` only when the user
+  of `buildwithnexus mcp login`; `pdftotext` (poppler), when installed, to
+  read a PDF the model opens; a local Chrome, Chromium or Edge in headless
+  mode for `screenshot_url` (only for models that take images, with a
+  throwaway profile in the temp directory, deleted afterwards, and without
+  provider keys in its environment); and `npm install -g buildwithnexus` only when the user
   runs `buildwithnexus update` or sets `auto_update` to `"install"` or
   `"install-any"`. It never installs other software: `buildwithnexus doctor`
   prints the install command for a missing tool and runs none. Commands the
@@ -201,7 +205,11 @@ shows whether a given file is signed.
   name when the user runs `mcp login` (only over HTTPS, or to this machine;
   sign-in tokens are sent to nothing else); the URLs of `http` hooks the user
   configures (a project's only once the folder is trusted; `network.deny`
-  applies); and a daily `registry.npmjs.org` version
+  applies; no redirects are followed); pages on this machine that
+  `screenshot_url` opens in the headless browser (another host only when
+  `network.allow` or an allow rule names it; every other request the page or
+  the browser makes, link-local and cloud-metadata addresses included, goes
+  to a local proxy inside bwn that refuses it); and a daily `registry.npmjs.org` version
   check unless `auto_update` is `"off"` (`BWN_UPDATE_REGISTRY` or
   `npm_config_registry` points it at a mirror). There is no telemetry or
   analytics. All of these go through the proxy named by `HTTPS_PROXY`,
@@ -227,6 +235,29 @@ shows whether a given file is signed.
   added with `--add-dir` or `/add-dir`; and, with
   `--worktree <name>`, a git worktree in `.bwn/worktrees/<name>` (listed in
   the repository's `.git/info/exclude`).
+- **Keys for custom endpoints:** a key for an OpenAI-compatible endpoint is
+  saved for that endpoint only (`CUSTOM_API_KEY@<scheme://host[:port]>`),
+  read the way the HTTP client reads the URL, and is never sent to another
+  address. A single key saved by 0.14 is tied to the custom endpoint in the
+  user's own settings, or else kept unbound and never sent until the user
+  says which endpoint it belongs to. `CUSTOM_API_KEY` from the environment
+  goes only to the custom endpoint the run started on.
+- **MCP sign-ins:** tokens refresh on their own and are sent only in the
+  `Authorization` header to the server URL they were saved for.
+  `buildwithnexus mcp logout` asks the authorization server to revoke the
+  token and deletes the file. A token a server echoes back is replaced with
+  `[redacted]` before the model, the transcript or the terminal sees it.
+- **Editors (`buildwithnexus acp`):** it runs only when an editor starts it,
+  and talks to that editor on stdin and stdout. Permission modes, rules,
+  hooks, folder trust and the sandbox apply as in the terminal; approvals
+  become questions in the editor. The protocol's output pipe is not passed
+  to commands, hooks or MCP servers, so they cannot send the editor requests
+  (such as writing a file) of their own.
+- **GitHub Action (`action.yml`):** it installs bwn from npm, defaults to
+  `--permission-mode readonly`, passes its inputs to its scripts as
+  environment variables, gives the token only to the step that posts the
+  pull request comment, and updates only a comment written by that token's
+  own account.
 - **Not done:** no services, scheduled tasks, startup entries, registry
   writes, drivers, or elevation.
 

@@ -11,7 +11,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 An install IT can approve, and trust you grant explicitly: approvals, rules
 and keys that mean what they say, setup that finishes only with a model that
 answered, one conversation across modes, and headless runs whose exit code
-tells the truth. This minor release changes some defaults; every change and
+tells the truth. It also brings helpers that run side by side, extra working
+folders, MCP servers behind OAuth, editors over the Agent Client Protocol, a
+GitHub Action, Claude Code's hook decisions and events, and pictures, PDFs
+and screenshots the model can read. This minor release changes some defaults; every change and
 the setting that restores the old behavior is listed in
 [docs/UPGRADING-0.15.md](docs/UPGRADING-0.15.md).
 
@@ -45,6 +48,55 @@ the setting that restores the old behavior is listed in
   `ln`, `chmod`, `chown`, `dd`, `truncate`, `kill`, `pkill` and similar
   programs (and their Windows forms) covers that exact command, not every
   later use of the program. The prompt names what `s` and `a` will allow.
+  The same holds for git commands that discard or rewrite (`rm`, `clean`,
+  `checkout`, `restore`, `reset --hard`, force or deleting pushes,
+  `branch -D`, `stash drop`/`clear`, `filter-branch`/`filter-repo`,
+  `reflog expire`, `submodule deinit`, `notes remove`/`prune`,
+  `read-tree --reset`/`-u`, `checkout-index --force`, `gc --prune` and
+  others), and for wrappers that run the command after them (`fakeroot`,
+  `firejail`, `torsocks`, …). A saved `git push` no longer covers
+  `git push --force`.
+- **A question in PLAN or BRAINSTORM is read-only.** A question or greeting
+  answered there is read-only whatever the session permission, including
+  rounds a `Stop` hook asks for and turns started from an editor; under
+  `auto` such a turn could write, edit or delete files.
+- **Custom endpoint keys stay with their endpoint.** A key for an
+  OpenAI-compatible endpoint is saved as `CUSTOM_API_KEY@<origin>`, filed
+  under the host the request actually reaches (so `http://a\@b/v1` no longer
+  carries `b`'s key to `a`). `/model` to a new address asks for that
+  address's own key (Enter for none) and never sends another endpoint's. The
+  single key 0.14 saved moves once to the custom endpoint in your own
+  settings, or else waits unbound, is never sent, and is offered with `y/N`
+  at the next new endpoint. `CUSTOM_API_KEY` in the environment stays with
+  the endpoint a run starts on, and `buildwithnexus login` honours
+  `--base-url`.
+- **Deny and ask rules see through wrappers.** They read the command behind
+  `env`, `sudo`, `nice`, `command`, `time`, `timeout`, `xargs`, `exec`,
+  `eval`, `find -exec`, `fakeroot`, `firejail`, `bwrap`, `torsocks`,
+  `proxychains`, `numactl`, `chronic`, `run0`, `sg`, `ssh-agent`,
+  `systemd-inhibit`, `uv`/`poetry`/`pipenv run`, `bundle exec`,
+  `direnv`/`mise exec`, `nix-shell --run`, `FOO=1` and `/usr/bin/git`; inside
+  `sh -c`, `bash -lc`, `cmd /c`, `pwsh -Command`, `$(…)` and backquotes; past
+  git's own options (including `--attr-source` and `--shallow-file`), inline
+  `-c alias.*` aliases and `git-<command>` programs. A deny rule also refuses
+  a pipeline or compound command, code handed to an interpreter
+  (`perl -e`, `ruby -e`) or a bash `$'…'` word that names its program. On
+  Windows the rules read commands as cmd.exe passes them on.
+- **Every file a call touches is checked.** `apply_patch` is checked for each
+  file its diff names (rules, the sensitive-path prompt, accept-edits and
+  hook guards); `move_path` on the trimmed paths it actually moves, so a
+  leading or trailing space no longer escapes the working folder or the
+  sensitive-path prompt; and the legacy `mcp_call` tool as the
+  `mcp__<server>__<tool>` it calls.
+- **Network rules see the real host.** `network` rules and approvals, for the
+  web tools and `http` hooks, see the host a URL reaches: percent-escapes
+  decoded, a trailing dot dropped and an explicit default port left off.
+- **Repo commands, skills and agents need folder trust.** The repository's
+  `.buildwithnexus/{commands,skills,agents}`, `.claude/{commands,skills,agents}`
+  and `.agents/skills` load only once trusted. The trust prompt and
+  `buildwithnexus trust --print` list each file, and trust is pinned to
+  their content. A repository with only a command file now gets the prompt,
+  and files linked from outside their folder never load.
 - **Provider keys stay out of the agent's commands.** `*_API_KEY`,
   `*_API_TOKEN`, `HF_TOKEN` and the other preset key variables are removed
   from every command the agent runs, sandboxed or not, including dev servers
@@ -62,14 +114,22 @@ the setting that restores the old behavior is listed in
   changed since you trusted it — run it?`), or skipped with a warning in a
   headless run. The trust prompt asks separately about a repository's
   `base_url` and `permission`, and a "no" is remembered for that file version.
-  Repository instruction files are announced as not reviewed.
+  A repository's own AGENTS.md/CLAUDE.md is asked about once per folder and
+  content (`press r to review or Enter to use them`); after that a dim line
+  names it. Headless runs, and sessions with prompts piped in, print one
+  line until it is acknowledged.
 - **Web search asks first.** `web_search` counts as network access to
   `lite.duckduckgo.com` and asks outside `auto`, read-only mode included.
 - **Every command gets the same checks.** The commands given to `check_work`
   and `start_server` go through the sensitive-path, dangerous-command and
   deny-rule checks of `run_command`, even in `auto`.
-- `/commit` and `/diff` ask before running git in a repository whose git
-  config can name programs for git to run (hooks, filters, an external diff).
+- `/commit`, `/diff` and the `@diff` and `@status` attachments ask before
+  running git in a repository whose git config can name programs for git to
+  run (hooks, filters, an external diff); headless runs attach nothing there
+  and print a notice. `http.*` keys (such as the auth header
+  actions/checkout stores) count as inert, so a CI checkout no longer asks;
+  `http.cookieFile` and `http.saveCookies` do not, since git writes that file
+  on its next fetch.
 - **Delegation keeps its limits.** A `task` or `spawn_subagent` call with an
   unknown role fails with the list of roles instead of running as `engineer`
   with every tool, and a helper defined by an agent file never gets `task` or
@@ -120,6 +180,79 @@ the setting that restores the old behavior is listed in
   `"on_error": "deny"` makes a crashing `PreToolUse` guard block the call.
   Unknown events, handler types and `on_error` values are reported at startup
   and by `doctor`, and a failed hook shows the end of its stderr.
+- **Hooks that answer as Claude Code's do.** `PostToolUse` can talk to the
+  model: `{"decision":"block","reason":…}`,
+  `hookSpecificOutput.additionalContext`, or stderr with exit 2 is added to
+  the tool result. `Stop` and `SubagentStop` can keep the agent going: exit 2
+  or a block decision sends the reason as the next message, at most 3
+  rounds, with `stop_hook_active` set; a turn you stopped, or one a
+  `UserPromptSubmit` hook blocked, is never continued. `tool_input` carries
+  Claude Code's field names beside bwn's (`file_path`, absolute,
+  `old_string`, `new_string`, `content`, `prompt`, `subagent_type`, `glob`,
+  `path`, `todos`), and a move, `read_many_files` or `apply_patch` call is
+  shown to `PreToolUse` once per file.
+- **New hook events and an `http` hook type.** `PreCompact` (trigger `auto`
+  or `manual`), `Notification` (`permission_prompt`, `question`, `done`, and
+  `idle_prompt` after `idle_notify_secs`, default 60, 0 for never) and
+  `PermissionRequest` (answer allow, deny or ask for the user; only your own
+  hooks can allow; runs in headless runs too). `"type": "http"` POSTs the
+  payload as JSON to a URL through bwn's HTTP client, within the hook
+  timeout and without following redirects; `network.deny` applies, and the
+  trust prompt shows a project's hook URLs.
+- **Helpers side by side.** Helpers that only read and isolated helpers
+  started in the same reply run at the same time, up to
+  `max_parallel_helpers` (default 3), each shown in its own labelled block
+  when it finishes; Esc or Ctrl+C stops them all. Helpers that write in your
+  folder still run one after another, and so do isolated helpers while
+  folders added with `--add-dir` are in use. Agent files and the task tools
+  take `read_only: true` for a helper that may read and search but never
+  change anything. With `--json`, each event of such a helper carries
+  `helper`.
+- **More working folders.** `--add-dir <path>` (repeatable) and `/add-dir`
+  add folders to work in for the session. File tools may write there,
+  searches and `@` completion cover them, the sandbox binds them writable,
+  helpers and workflows inherit them, and the footer shows `+N dirs`.
+  Sensitive paths still ask, links out of them stay outside, their settings,
+  hooks, commands and agents never load, and their AGENTS.md is named in a
+  notice before the model reads it.
+- **MCP servers that ask for OAuth.** `bwn mcp login <name>` (or
+  `/mcp login <name>`) reads the server's OAuth metadata, registers bwn as a
+  client or uses `oauth.client_id`, signs in through the browser with PKCE
+  and saves the token owner-only in `~/.buildwithnexus/mcp-auth/<name>.json`,
+  bound to that server's URL. Tokens refresh on their own; `bwn mcp logout
+  <name>` revokes and forgets the sign-in. `/mcp`, `bwn mcp list` and
+  `doctor` show whether an http server is signed in; one that wants a login
+  is listed as `needs login`, and headless runs skip it with that message
+  instead of opening a browser. A token a server echoes back is shown as
+  `[redacted]`. `mcp add --url` takes `--client-id` and `--callback-port`
+  for authorization servers without dynamic registration.
+- **Editors over the Agent Client Protocol.** `buildwithnexus acp` runs an
+  ACP (v1) server on stdio, so Zed, JetBrains IDEs and Neovim plugins can
+  drive bwn: streamed replies and reasoning, tool calls with diffs, plans,
+  approvals as editor questions (allow once, always in this project,
+  reject), project trust questions, Build/Plan/Brainstorm modes, cancel,
+  session load, editor file access and editor MCP servers. Helpers from one
+  reply take turns there. Commands, hooks and MCP servers never get the
+  protocol's output pipe.
+- **A GitHub Action.** The repository is an action (`action.yml`): it
+  installs bwn from npm, runs `run` or `review`, maps the exit code to the
+  step result with annotations (review findings on their lines), uploads the
+  `--json` event log, and can post or update a pull request comment (only
+  one its own token's account wrote).
+  [examples/github/bwn-review.yml](examples/github/bwn-review.yml) reviews
+  every pull request.
+- **Pictures, PDFs and screenshots.** `read_file` on a PNG, JPEG, GIF or
+  WebP shows the picture to a model that takes images (Anthropic inside the
+  tool result, OpenAI-compatible servers and Ollama in a user turn after the
+  tool messages); a text-only model is told why it sees none. `read_file`
+  reads a PDF as text through `pdftotext` (poppler) when it is installed, and
+  names what to install when it is not. The new `screenshot_url` tool has a
+  local headless Chrome, Chromium or Edge (`BWN_CHROME`, PATH, the usual
+  install folders, or a Playwright build) screenshot a page served on this
+  machine. Other hosts are refused unless `network.allow` names them, and the
+  host is approved like a fetch. Every request the page or the browser makes
+  to another host, link-local and cloud-metadata addresses included, is
+  blocked, and the page's are listed in the result.
 - **Trust for CI.** `buildwithnexus trust --print` prints a digest of this
   folder's project settings; `--trust-project <digest>` or
   `BWN_TRUST_PROJECT=<digest>` trusts exactly that content for one run.
@@ -152,7 +285,9 @@ the setting that restores the old behavior is listed in
   a blocking finding. Reviews include new files git does not track yet.
 - **Custom commands and skills run headless** (`bwn run '/deploy staging'`),
   take `$ARGUMENTS` and `$1`…`$9`, and load from `~/.claude/commands` and, in
-  a trusted folder, `.buildwithnexus/commands` and `.claude/commands`.
+  a trusted folder, `.buildwithnexus/commands` and `.claude/commands`. The
+  slash-command popup lists them too. A repository command that is not
+  trusted exits 2 headless and says how to trust it.
 - **Custom helper agents.** Agent files (`name`, `description` and `tools`
   frontmatter) in `~/.buildwithnexus/agents`, `~/.claude/agents` and, in a
   trusted folder, `.buildwithnexus/agents` and `.claude/agents` become roles
@@ -279,7 +414,9 @@ the setting that restores the old behavior is listed in
   2 s to quit (Ctrl+D quits at once; quitting with workflows waiting asks).
   Esc, Ctrl+C, or Ctrl+D on an empty line cancels a question, setup and
   `/init` included. Pickers filter as you type (`j`, `k` and `q` are letters),
-  a digit picks a numbered row, and Enter picks only a row that is shown. The
+  a digit typed first moves the highlight to that numbered row, and only
+  Enter picks, only a row that is shown, so text like `1. add tests` typed
+  into Approve Plan no longer runs the plan. The
   input box always shows the open prompt or picker.
 - **One line per tool call.** `• tool_call`, `• tool_result` and the other
   trace lines, and the `recovery: parsed …` notice, appear only in `/trace`
@@ -321,6 +458,44 @@ the setting that restores the old behavior is listed in
 - Bare `/plan`, `/build` and `/brainstorm` switch the mode; bare `/loop`,
   `/schedule` and `/btw` print their usage. `/help` groups every command and
   lists the keys and the answers to an approval prompt.
+- **One command table.** `/help`, the `/` popup and Tab completion list every
+  command and alias (now including `/rename`, `/export`, `/copy`, `/ask`,
+  `/add-dir`, `/mcp login`/`logout` and `/rewind` on its own row);
+  `/permissions` completes `accept-edits`, `default`, `list`, `remove` and
+  `reset`. `--help` lists every command, subcommand and option (`acp`,
+  `mcp login|logout`, `trust --print`, `sessions rm`/`export`,
+  `--trust-project`, `--plain`, `--add-dir`, `accept-edits`) and the
+  session's commands by section. Both link
+  https://buildwithnexus.dev/docs/data.
+- **A diff is shown once.** A write or edit shows its diff under the applied
+  `⏺` line when nothing asks first, or above the approval question (then
+  the applied line shows only `+N -M`). A refused or failed change still
+  shows its preview.
+- **Edit Step and /rewind fill the input box.** Edit Step opens the chosen
+  step's text there to edit; `/rewind` puts the chosen prompt back after a
+  conversation rewind, and Esc Esc on an empty input box opens `/rewind`.
+- **Esc or Ctrl+C while a helper runs ends the whole turn** instead of only
+  the helper.
+- **Hook matchers and permission rules:** `Edit` also covers `multi_edit`,
+  `remove_path` and `move_path`, and `Write` covers `create_dir`. A matcher
+  naming the shell (`Bash`, `run_command`, `bash`) also covers `check_work`
+  and `start_server` calls that carry a command.
+- **`mcp add <name> <command> [args...]`** keeps every word after the server
+  name for the server, so `npx -y pkg --json --model m` is saved as written.
+  Claude Code's `mcp add <name> -- <command>` form is accepted.
+- **`/mcp` and `bwn mcp list`** show whether each http server is signed in
+  (the status column is one character wider), and `mcp <name>` adds an
+  `auth:` line.
+- **`bwn acp`** starts the editor server instead of a session with the
+  prompt "acp"; more words after it exit 2.
+- **A check nobody could approve is not a blocked change.** With
+  `accept-edits` or `ask` and no terminal, a `check_work` call nobody could
+  approve no longer fails the run with "changes blocked for lack of
+  approval": the run succeeds and says the checks were not run. The closing
+  line for real blocks names the blocked calls (`N changes were blocked for
+  lack of approval and not made: …`).
+- Session files may hold tool-result pictures (base64, like attached
+  images); older versions load them and ignore the field.
 
 ### Fixed
 - `/model` on the same provider keeps its saved `base_url`, so a remote Ollama
@@ -337,7 +512,10 @@ the setting that restores the old behavior is listed in
   through a symlink.
 - A proxy URL's error message no longer shows part of a password.
 - Prompts reach the model exactly as typed: quotes, line breaks, tabs and
-  spacing are kept around `@attachments`, in the TUI and headless.
+  spacing are kept around `@attachments`, in the TUI and headless. Pasted
+  line breaks and tabs are kept in the message, and the one-row input box
+  shows a break as `↵`; answers to questions and picker filters still take
+  one line.
 - Parallel runs sharing one home no longer overwrite each other's session
   file.
 - Tool calls that small local models write as text work in more shapes
@@ -367,13 +545,18 @@ the setting that restores the old behavior is listed in
 - In vim NORMAL mode, `/` on an empty line starts a command, so `/vim` can
   turn vim mode off.
 - With the dark theme the background is painted on every transcript row.
-- An automatic `check_work` round that could not be approved for want of a
-  terminal no longer makes the run exit 3; the run says the checks were not
-  run.
 - A headless run writes its session file before the first request.
 - `/undo` right after `/commit` says that commits are not undone.
 - `bwn resume` with no id and no terminal exits 2 instead of opening the
   line-mode UI and exiting 0.
+- `buildwithnexus review` and `/review` keep findings a model gives in plain
+  text without calling a tool. The diff in the task triggered the
+  act-don't-explain nudge, the second reply replaced the findings, and the
+  review reported none and exited 0.
+- A final answer that opens with an example function call and then explains
+  it is an answer, not a failed call to a missing tool.
+- The transcript shows what a picture read or a screenshot showed, instead
+  of `↳ 1 line`.
 
 ### Release process
 - Releases are drafts until every binary, checksum and the SBOM are uploaded

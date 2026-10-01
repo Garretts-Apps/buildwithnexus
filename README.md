@@ -207,11 +207,17 @@ Default endpoints: Ollama `http://localhost:11434`, llama.cpp server
 other OpenAI-compatible server (vLLM, TGI, LiteLLM, a gateway), choose the
 `custom` provider (default `http://localhost:8000/v1`); setup, `/model` and
 `/login` ask for its key if it needs one. A custom endpoint's key is saved
-for that endpoint only (`CUSTOM_API_KEY@<scheme://host:port>` in
-`.env.keys`), so `/model` to a new address asks for that address's own key
-(Enter for none) and never sends another server's. `CUSTOM_API_KEY` in the
-environment is the key of the custom endpoint a run starts on; a `/model`
-to another address does not get it.
+for that endpoint only (`CUSTOM_API_KEY@<scheme://host[:port]>` in
+`.env.keys`, the port left off when it is the scheme's default), filed under
+the host the request actually reaches, so `/model` to a new address asks for
+that address's own key (Enter for none) and never sends another server's.
+`buildwithnexus login --provider custom --base-url <url>` saves the key for
+that address. `CUSTOM_API_KEY` in the environment is the key of the custom
+endpoint a run starts on; a `/model` to another address does not get it. The
+single `CUSTOM_API_KEY` an earlier version saved moves, the first time 0.15
+reads it, to the custom endpoint in your own settings; with none it waits as
+`CUSTOM_API_KEY@unbound`, is never sent, and `/model` and setup offer it
+(`send it to <host>? [y/N]`) at the next new endpoint.
 To change where any provider connects, set `base_url` in
 `~/.buildwithnexus/settings.json`:
 
@@ -424,8 +430,8 @@ git diff | bwn run --permission-mode readonly "review this diff for bugs"
 |---|---|---|
 | 0 | `success` | the task finished |
 | 1 | `failed` | the run failed, no provider could be set up, or the turn ended right after a call that could not run |
-| 2 | | usage error: unknown option or `--provider`, a bad `--permission-mode` or `--effort`, a flag missing its value, no task, `plan` with no terminal and no `--yes`, or a spend cap on a model with no known price |
-| 3 | `approval_blocked` | changes were blocked for lack of approval (`ask` with no terminal), or a hook, a deny rule or read-only mode refused a call (`changes were denied: …`) |
+| 2 | | usage error: unknown option or `--provider`, a bad `--permission-mode` or `--effort`, a flag missing its value, no task, `plan` with no terminal and no `--yes`, a spend cap on a model with no known price, a repository command that is not trusted (`bwn run '/deploy'`), or words after `acp` |
+| 3 | `approval_blocked` | changes were blocked for lack of approval (`ask` or `accept-edits` with no terminal; the closing line names them), or a hook, a deny rule or read-only mode refused a call (`changes were denied: …`). A `check_work` round nobody could approve is not a blocked change: the run says the checks were not run. |
 | 4 | `hook_blocked` | a `UserPromptSubmit` hook blocked the task |
 | 5 | `budget_stop` | `--max-budget-usd` stopped the run before the next request |
 | 6 | `step_limit` | the turn used every step without finishing |
@@ -444,6 +450,8 @@ while the `result` event still names the outcome. `buildwithnexus update
 --check` exits 10 when a newer release exists, and `buildwithnexus doctor`
 exits 1 when a check fails (`--json doctor` prints one `check` event per
 check; `--json sessions` one `session` event per saved session).
+`buildwithnexus mcp login` and `logout` exit 1 when the sign-in or sign-out
+fails and 2 on a usage mistake.
 
 **Reviews in CI.** `buildwithnexus review [--base <ref> | --staged] [focus]`
 reviews uncommitted changes (plus the branch since `<ref>` with `--base`, or
@@ -607,20 +615,31 @@ for `web_search`, and the touched paths for file tools: project-relative
 a whole plain command (no chaining or redirection) and every path; ask and
 deny rules match any part of a compound command and any path. Ask and deny
 rules also see the command behind a wrapper (`env`, `sudo`, `nice`,
-`command`, `time`, `timeout`, `xargs`, `FOO=1`, `/usr/bin/git`), inside
-`sh -c '…'`, `bash -lc "…"`, `cmd /c`, `$(…)` and backquotes, past git's
-own options and through an alias given with `-c alias.<name>=…`, so
+`command`, `time`, `timeout`, `xargs`, `exec`, `eval`, `find -exec`,
+`fakeroot`, `firejail`, `bwrap`, `torsocks`, `proxychains`, `numactl`,
+`chronic`, `run0`, `sg`, `ssh-agent`, `systemd-inhibit`, `uv`/`poetry`/`pipenv
+run`, `bundle exec`, `direnv`/`mise exec`, `nix-shell --run`, `FOO=1`,
+`/usr/bin/git`), inside `sh -c '…'`, `bash -lc "…"`, `cmd /c`,
+`pwsh -Command`, `$(…)` and backquotes, past git's own options (`-C`, `-c`,
+`--git-dir`, `--work-tree`, `--attr-source`, `--shallow-file`), through an
+alias given with `-c alias.<name>=…` and into git's `git-<command>`
+programs, so
 `run_command(git push*)` also refuses `git -C . push` and
 `sudo sh -c 'git push'`. An alias saved in git's config is not seen. A deny rule also refuses a pipeline or compound
 command that names its program anywhere (`make && git status` under
 `run_command(git push*)`), since such a command can build what it runs from
 parts, and so does code handed to an interpreter (`perl -e 'system "git push"'`)
 or a word in bash's `$'…'` quoting; the refusal says to run that command on
-its own. Rules are a guard against mistakes, not a sandbox: a program the
+its own. On Windows the rules read a command as cmd.exe passes it on
+(`g^it push` is `git push`), and a command with `^` or `%` counts as
+compound. Rules are a guard against mistakes, not a sandbox: a program the
 list of wrappers does not know, or a script file, can still run what a rule
 names. `network`
 entries are host patterns (`example.com`, `*.example.com`) for the network
-tools. A refusal names the rule and whether it came from user or project
+tools and `http` hooks. Rules and saved approvals see the host a URL
+reaches: percent-escapes decoded, a trailing dot dropped and a default port
+written out (`:443` on https) left off, so `https://%6Cite.example.:443/` is
+`lite.example`. A refusal names the rule and whether it came from user or project
 settings, and a headless run refused by one exits 3.
 
 Rules add up across `~/.buildwithnexus/settings.json`, `settings.local.json`
@@ -682,6 +701,37 @@ the `images` settings key (`"auto"` default, `"kitty"`, `"sixel"`, `"blocks"`,
 `"off"`) or `BWN_IMAGES=…` for one run. Sixel and block previews take at most
 half the window's width and a third of its height, and re-fit when the
 window is resized. Uploads are freed when you `/clear` or exit.
+
+### Pictures, PDFs and screenshots the agent reads
+
+The model can look at pictures too, when it takes images (see `vision` under
+[Models](#models)). `read_file` on a PNG, JPEG, GIF or WebP (up to 5 MB)
+returns the picture: Anthropic gets it inside the tool result, and
+OpenAI-compatible servers and Ollama get it in a user message right after
+the tool results. A text-only model is told why it sees none, and the
+transcript shows what the picture was (`image shot.png (image/png,
+1280x800, …)`). `read_file` on a PDF returns its text through
+`pdftotext` from poppler when that is installed (`apt install
+poppler-utils`, `brew install poppler`), and otherwise says what to install;
+a line range works as for any file.
+
+`screenshot_url` opens a page served on this machine
+(`http://localhost:3000`, a dev server the agent started) in a local
+headless Chrome, Chromium or Edge and shows the model the picture (`width`
+and `height` optional, default 1280×800). The browser is `BWN_CHROME` when
+set, else one found on PATH, in the usual install folders, or a Playwright
+build. It runs with a throwaway profile and without provider keys in its
+environment. Only loopback addresses are opened unless `network.allow` (or
+an allow rule for `screenshot_url`) names the host, and outside `auto` each
+host is approved like a fetch. Every request the page or the browser makes
+to any other host, link-local and cloud-metadata addresses included, goes to
+a local proxy that refuses it, and the result lists the hosts the page
+tried. The tool is offered only to models that take images.
+
+`"vision": false` in settings.json makes bwn treat the model as text-only:
+`read_file` then returns a notice instead of a picture and `screenshot_url`
+is not offered. Pictures a tool returned are kept in the session file, like
+attached images.
 
 A related setting: `notify` (`"auto"` — desktop notification when a turn of
 8 s or longer ends, or an approval or a question is waiting, while the window
@@ -746,8 +796,10 @@ and `start_server` calls that carry a command. `tool_input` carries Claude
 Code's field names beside bwn's, with the values the tool will use:
 `file_path` (absolute), `old_string`, `new_string`, `content`, `prompt`,
 `subagent_type`, `glob`, `path` and `todos`. A call that touches several
-files (`move_path`, `read_many_files`) is shown to `PreToolUse` once per
-file, and `PostToolUse` sees a move's destination. A `*` or empty matcher does
+files (`move_path`, `read_many_files`, `apply_patch`) is shown to
+`PreToolUse` once per file, and `PostToolUse` sees a move's destination. The
+legacy `mcp_call` tool is matched, ruled and approved as the
+`mcp__<server>__<tool>` it calls. A `*` or empty matcher does
 not run on `finish` and `exit_plan`; name them to guard them. A hook under an
 event bwn does not fire, of an unknown `type`, or without its command is
 reported at startup and by `doctor` instead of being ignored. See
