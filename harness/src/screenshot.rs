@@ -479,15 +479,23 @@ mod tests {
             find_chrome_with(&env, false, false),
             Some(PathBuf::from("/custom/chrome"))
         );
-        // Playwright: the newest headless shell first.
+        // Playwright: the newest headless shell first. A browser installed
+        // in /opt or /snap on this machine comes before Playwright's, so the
+        // order is checked on Playwright's own entries.
         let env = vars(vec![
             ("PATH", empty.clone().into()),
             ("PLAYWRIGHT_BROWSERS_PATH", pw.clone().into()),
         ]);
-        assert_eq!(
-            find_chrome_with(&env, false, false),
-            Some(pw.join("chromium_headless_shell-1194/chrome-linux/headless_shell"))
-        );
+        let shell = pw.join("chromium_headless_shell-1194/chrome-linux/headless_shell");
+        let first_pw = install_paths(&env, false, false)
+            .into_iter()
+            .find(|p| p.starts_with(&pw) && p.is_file());
+        assert_eq!(first_pw, Some(shell.clone()));
+        let found = find_chrome_with(&env, false, false);
+        let system = install_paths(&env, false, false)
+            .into_iter()
+            .find(|p| !p.starts_with(&pw) && p.is_file());
+        assert_eq!(found, system.or(Some(shell)));
         // Windows: the install folders, then Playwright's chrome-win build.
         let env = vars(vec![
             ("PATH", empty.clone().into()),
