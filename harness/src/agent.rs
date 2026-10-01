@@ -3060,7 +3060,6 @@ fn user_msg(text: String, images: Vec<(String, String)>) -> Msg {
     }
 }
 
-
 // `sid` is Some for the top-level session (per-round transcript saves) and
 // None for subagents, whose transcripts live inside the parent's results.
 #[allow(clippy::too_many_arguments)]
@@ -4562,7 +4561,16 @@ fn run_helper(
         outcome,
         |reason| {
             CONTINUING.with(|c| c.set(true));
-            build_inner(p, perm, role, reason, &h.run_cwd, depth + 1, &mut child, None)
+            build_inner(
+                p,
+                perm,
+                role,
+                reason,
+                &h.run_cwd,
+                depth + 1,
+                &mut child,
+                None,
+            )
         },
     );
     set_helper_ctx(depth + 1, None);
