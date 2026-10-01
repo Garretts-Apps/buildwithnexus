@@ -2606,3 +2606,337 @@ fn init_agents_md_goes_through_the_approval_gate() {
     let first: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
     assert!(first.to_string().contains("Makefile"), "{first}");
 }
+
+// ── provider failures ───────────────────────────────────────────────────────
+
+// Answers every POST with one fixed status and body, and counts the POSTs.
+fn serve_status(code: u16, body: &'static str) -> (u16, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&posts);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (method, _) = read_request(&mut stream);
+            let (status, reply) = if method == "POST" {
+                seen.fetch_add(1, Ordering::SeqCst);
+                (code, body)
+            } else {
+                (200, r#"{"object":"list","data":[]}"#)
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (port, posts)
+}
+
+fn write_gateway_config(home: &Path, port: u16) {
+    let cfg = json!({
+        "provider": "custom",
+        "model": "gw-model",
+        "permission": "readonly",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+}
+
+#[test]
+fn a_failing_gateway_is_retried_three_times_then_named() {
+    let (port, posts) = serve_status(500, r#"{"error":{"message":"upstream exploded"}}"#);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_gateway_config(&home, port);
+    let start = std::time::Instant::now();
+    let r = run_env(&home, &cwd, &["run", "say hi"], &[]);
+    assert!(start.elapsed().as_secs() < 20, "took {:?}", start.elapsed());
+    assert_eq!(posts.load(Ordering::SeqCst), 4, "one try and three retries");
+    assert_eq!(r.code, Some(1), "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("upstream exploded"), "{}", r.stderr);
+    assert!(r.stderr.contains("BWN_MAX_RETRIES"), "{}", r.stderr);
+
+    // The count is the user's to change.
+    let (port, posts) = serve_status(500, r#"{"error":{"message":"upstream exploded"}}"#);
+    write_gateway_config(&home, port);
+    run_env(&home, &cwd, &["run", "say hi"], &[("BWN_MAX_RETRIES", "0")]);
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_rejected_key_is_not_retried_and_points_at_login() {
+    let (port, posts) = serve_status(401, r#"{"error":{"message":"invalid api key"}}"#);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_gateway_config(&home, port);
+    let start = std::time::Instant::now();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["run", "say hi"],
+        &[("CUSTOM_API_KEY", "sk-wrong-key-123456789")],
+    );
+    assert!(start.elapsed().as_secs() < 3, "took {:?}", start.elapsed());
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert!(
+        r.stderr
+            .contains("the API key was rejected by the provider — /login to replace it"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("HTTP 401: invalid api key"),
+        "{}",
+        r.stderr
+    );
+}
+
+// ── spend cap ───────────────────────────────────────────────────────────────
+
+// A gateway model bwn has no price for. "127.1" reaches the loopback mock
+// without counting as a local (free) endpoint.
+fn write_unpriced_gateway(home: &Path, port: u16, extra: Value) {
+    let mut cfg = json!({
+        "provider": "custom",
+        "model": "gw-model",
+        "permission": "auto",
+        "base_url": format!("http://127.1:{port}/v1"),
+        "context_tokens": 1_000_000,
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        cfg[k] = v.clone();
+    }
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+}
+
+#[test]
+fn a_spend_cap_on_an_unpriced_model_is_refused_before_any_request() {
+    let (port, posts) = serve_recording(vec![finish("never")]);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_unpriced_gateway(&home, port, json!({}));
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--max-budget-usd", "0.01", "run", "read things"],
+    );
+    assert_eq!(r.code, Some(2), "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "cannot enforce --max-budget-usd: no price is known for gw-model — add it under prices in settings.json"
+        ),
+        "{}",
+        r.stderr
+    );
+    assert!(posts.lock().unwrap().is_empty(), "nothing may be sent");
+}
+
+#[test]
+fn a_price_in_settings_lets_the_spend_cap_stop_the_run() {
+    let (port, posts) = serve_recording(vec![
+        with_usage(
+            tool_call("c1", "read_file", json!({"path": "a.txt"})),
+            1_000_000,
+        ),
+        finish("too late"),
+    ]);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("a.txt"), "hello").unwrap();
+    write_unpriced_gateway(
+        &home,
+        port,
+        json!({"prices": {"gw-model": {"input": 2.5, "output": 10.0}}}),
+    );
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "--max-budget-usd", "0.01", "run", "read things"],
+    );
+    assert_eq!(r.code, Some(5), "stderr: {}\n{:?}", r.stderr, r.events);
+    assert_eq!(r.events.last().unwrap()["outcome"], "budget_stop");
+    assert_eq!(
+        posts.lock().unwrap().len(),
+        1,
+        "stops after the reply that crossed the cap"
+    );
+}
+
+// ── proxies and certificates ────────────────────────────────────────────────
+
+#[test]
+fn an_https_proxy_url_fails_at_once_with_the_fix() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_custom_config(&home, "https://gw.example.test/v1");
+    let started = std::time::Instant::now();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["run", "hi"],
+        &[("HTTPS_PROXY", "https://127.0.0.1:9")],
+    );
+    assert!(!r.success);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "retried: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        r.stderr
+            .contains("HTTPS_PROXY: https:// proxy URLs are not supported — use http://"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_proxy_that_is_down_is_named_not_the_server() {
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_custom_config(&home, "https://gw.example.test/v1");
+    let proxy = format!("http://127.0.0.1:{closed}");
+    let r = run_env(&home, &cwd, &["run", "hi"], &[("HTTPS_PROXY", &proxy)]);
+    assert!(!r.success);
+    assert!(
+        r.stderr.contains(&format!(
+            "the proxy in HTTPS_PROXY ({proxy}) refused the connection"
+        )),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn bundled_roots_with_a_ca_file_say_which_setting_wins() {
+    let (ca_pem, tls) = private_ca();
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let ca = home.join("inspection-ca.pem");
+    std::fs::write(&ca, ca_pem).unwrap();
+    let port = serve_tls(vec![], tls);
+    write_custom_config(&home, &format!("https://localhost:{port}/v1"));
+    let r = run_env(
+        &home,
+        &cwd,
+        &["run", "hi"],
+        &[
+            ("SSL_CERT_FILE", ca.to_str().unwrap()),
+            ("BWN_TLS_ROOTS", "bundled"),
+        ],
+    );
+    assert!(!r.success);
+    assert!(
+        r.stderr
+            .contains("BWN_TLS_ROOTS=bundled ignores SSL_CERT_FILE — unset it"),
+        "{}",
+        r.stderr
+    );
+}
+
+// ── context window ──────────────────────────────────────────────────────────
+
+// LM Studio's surface as bwn probes it: no /props, the loaded context
+// length on /api/v0/models, and every POST body kept (and answered).
+fn serve_lmstudio(model: &'static str, loaded: u64) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let posts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&posts);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            let _ = reader.read_line(&mut first);
+            let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = std::io::Read::read_exact(&mut reader, &mut body);
+            let (status, reply) = if first.starts_with("POST") {
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                (200, finish("answered"))
+            } else if path == "/api/v0/models" {
+                (
+                    200,
+                    json!({"data": [{"id": model, "state": "loaded", "loaded_context_length": loaded}]})
+                        .to_string(),
+                )
+            } else {
+                (404, r#"{"error":"Unexpected endpoint"}"#.to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    (port, posts)
+}
+
+#[test]
+fn a_file_bigger_than_the_loaded_window_is_refused_before_sending() {
+    let (port, posts) = serve_lmstudio("tinycoder-7b-instruct", 4096);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let cfg = json!({
+        "provider": "lmstudio", "model": "tinycoder-7b-instruct", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"),
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    std::fs::write(cwd.join("big.txt"), "the quick brown fox. ".repeat(3_000)).unwrap();
+    let r = run_env(&home, &cwd, &["run", "summarize @big.txt in one line"], &[]);
+    assert_eq!(posts.lock().unwrap().len(), 0, "stderr: {}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "big.txt is about 15.8k tokens and the server holds 4.1k — attach a range such as @big.txt:1-200"
+        ),
+        "{}",
+        r.stderr
+    );
+
+    // A message that fits goes out as usual.
+    let r = run_env(&home, &cwd, &["--json", "run", "say hi"], &[]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(posts.lock().unwrap().len(), 1);
+
+    // Refused in the middle of a conversation, the message is not kept: the
+    // next one carries the conversation without it.
+    let pasted = "the quick brown fox. ".repeat(1_000);
+    let r = run_env(&home, &cwd, &["continue", &pasted], &[]);
+    assert!(
+        r.stderr.contains("and the server holds 4.1k"),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(posts.lock().unwrap().len(), 1);
+    let r = run_env(&home, &cwd, &["--json", "continue", "say bye"], &[]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert!(posts[1].contains("say hi") && posts[1].contains("say bye"));
+    assert!(
+        !posts[1].contains("quick brown fox"),
+        "the refused message was sent"
+    );
+}

@@ -368,6 +368,10 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // The CLI flag wins over the settings key; either arms the pre-request
     // guard in the agent loop.
     usage::set_budget(opts.max_budget_usd.or(settings.max_budget_usd));
+    if let Some(why) = provider::budget_guard(&provider) {
+        eprintln!("buildwithnexus: {why}");
+        std::process::exit(2);
+    }
     let perm = permission_from(opts.permission_mode.as_deref(), &settings.permission);
     // A bad --sandbox flag is a hard error; a bad settings value only warns
     // (and leaves the sandbox off) so a typo can't lock the user out.
@@ -584,6 +588,10 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
             config::CUSTOM_KEY
         ));
     }
+    // A notice, not stderr: /model rebuilds the provider inside the TUI.
+    for w in usage::set_prices(&s.prices) {
+        report::notice(&format!("  ⚠ {w}"));
+    }
     let mut context_tokens = match preset.id {
         "anthropic" => 200_000,
         _ if preset.local => 8_192,
@@ -628,6 +636,21 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
             // compaction thresholds match what the model can actually hold.
             provider.context_tokens = n as usize;
         }
+    } else if s.context_tokens.is_none() && (preset.local || is_loopback_url(&provider.base_url)) {
+        // llama.cpp, LM Studio and vLLM report the window they loaded the
+        // model with; the 8k guess stands only when they say nothing.
+        let served = provider::served_model(&provider.base_url, &provider.model);
+        if let Some(n) = served.window {
+            provider.context_tokens = n;
+            provider::remember_window(&provider);
+        }
+        if let Some(v) = served.vision {
+            provider::remember_vision(&provider, v);
+        }
+    }
+    media::set_vision_override(s.vision);
+    if s.context_tokens.is_some() {
+        provider::remember_window(&provider);
     }
     Ok(provider)
 }
@@ -920,6 +943,9 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    if let Some(problem) = provider::startup_problem(&provider) {
+        report::notice(&format!("  ⚠ {problem}"));
+    }
     // Skill names and paths come from files in the checkout.
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
@@ -2505,40 +2531,60 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
 }
 
 fn find_active_local_base_url(preferred: &str) -> Option<String> {
-    let candidates = [
+    find_active_local_base_url_in(&[
         preferred,
         "http://localhost:8080/v1",
         "http://localhost:1234/v1",
-        "http://localhost:11434/v1",
         "http://localhost:8000/v1",
-    ];
+    ])
+}
+
+/// The first of `candidates` where a llama.cpp, LM Studio or vLLM server
+/// answers. Ollama also answers /v1/models, but cannot load a GGUF file
+/// or an LM Studio model by name, so it is never the answer here.
+fn find_active_local_base_url_in(candidates: &[&str]) -> Option<String> {
     for url in candidates {
         let root = url.trim_end_matches('/').trim_end_matches("/v1");
-        let probe = format!("{root}/v1/models");
-        if let Ok(res) = crate::net::shared()
-            .get(&probe)
-            .timeout(std::time::Duration::from_millis(400))
-            .call()
-        {
-            if res.status() < 500 {
-                if let Some(ct) = res.header("content-type") {
-                    if ct.contains("application/json") {
-                        return Some(url.to_string());
-                    }
-                }
-            }
-        }
-        let root_probe = format!("{root}/health");
-        if crate::net::shared()
-            .get(&root_probe)
-            .timeout(std::time::Duration::from_millis(300))
-            .call()
-            .is_ok()
-        {
+        let get = |path: &str, ms: u64| {
+            crate::net::shared()
+                .get(&format!("{root}{path}"))
+                .timeout(std::time::Duration::from_millis(ms))
+                .call()
+                .ok()
+        };
+        let json = |res: &ureq::Response| {
+            res.status() < 500
+                && res
+                    .header("content-type")
+                    .is_some_and(|ct| ct.contains("application/json"))
+        };
+        let answers =
+            get("/v1/models", 400).is_some_and(|r| json(&r)) || get("/health", 300).is_some();
+        if answers && !is_ollama(root) {
             return Some(url.to_string());
         }
     }
     None
+}
+
+// Ollama's own listing; LM Studio and llama.cpp answer it with a 404.
+fn is_ollama(root: &str) -> bool {
+    crate::net::shared()
+        .get(&format!("{root}/api/tags"))
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .is_some_and(|v| v["models"].is_array())
+}
+
+/// Why a GGUF file cannot be served, when nothing is running that could:
+/// llama-server is needed to load it (or LM Studio, which loads it itself).
+fn gguf_unservable(model_name: &str, have_llama_server: bool) -> Option<&'static str> {
+    let gguf = model_name.to_ascii_lowercase().ends_with(".gguf");
+    (gguf && !have_llama_server).then_some(
+        "llama-server is not installed — install llama.cpp, or load the file in LM Studio",
+    )
 }
 
 fn find_llama_server_binary() -> Option<std::path::PathBuf> {
@@ -2594,6 +2640,10 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
             }
         }
         return Some(active_url);
+    }
+    if let Some(why) = gguf_unservable(model_name, find_llama_server_binary().is_some()) {
+        tui::line(&tui::yellow(&format!("  ✗ {why}")));
+        return None;
     }
     let server_bin = find_llama_server_binary()?;
     let gguf_path = crate::local::find_gguf_path(model_name)?;
@@ -3134,41 +3184,132 @@ fn handle_voice(arg: &str) -> Option<String> {
     }
 }
 
-fn handle_local(_provider: &mut Provider) {
+/// A model server /local asks about.
+#[derive(Debug, PartialEq)]
+struct LocalServer {
+    label: &'static str,
+    /// The preset `/model <preset> <name>` switches to.
+    preset: &'static str,
+    base: String,
+}
+
+/// The servers /local probes: the configured one first (a LAN Ollama, LM
+/// Studio on another port), then each local preset at its default address.
+fn local_servers(settings: &Settings) -> Vec<LocalServer> {
+    let label = |id: &str| match id {
+        "ollama" => "Ollama",
+        "lmstudio" => "LM Studio",
+        "llamacpp" => "llama.cpp",
+        _ => "OpenAI-compatible server",
+    };
+    let mut out: Vec<LocalServer> = Vec::new();
+    let mut add = |preset: &'static str, base: &str| {
+        let root = base.trim_end_matches('/').trim_end_matches("/v1");
+        if !out.iter().any(|s| s.base.trim_end_matches("/v1") == root) {
+            out.push(LocalServer {
+                label: label(preset),
+                preset,
+                base: base.trim_end_matches('/').to_string(),
+            });
+        }
+    };
+    if let (Some(p), Some(base)) = (config::preset(&settings.provider), &settings.base_url) {
+        if p.local || (p.id == "custom" && is_loopback_url(base)) {
+            add(p.id, base);
+        }
+    }
+    for p in config::PRESETS.iter().filter(|p| p.local) {
+        add(p.id, p.base_url);
+    }
+    out
+}
+
+fn handle_local(provider: &mut Provider) {
     tui::line(&tui::accent("  local models"));
-    tui::line(&tui::dim("  scanning local servers and model directories…"));
-    let mut servers = Vec::new();
-    if let Ok(o) = std::process::Command::new("curl")
-        .args(["-s", "http://localhost:11434/api/tags"])
-        .output()
-    {
-        if o.status.success() {
-            servers.push("Ollama (port 11434 - ACTIVE)");
-        }
-    }
-    if let Ok(o) = std::process::Command::new("curl")
-        .args(["-s", "http://localhost:8080/v1/models"])
-        .output()
-    {
-        if o.status.success() {
-            servers.push("llama.cpp / vLLM (port 8080 - ACTIVE)");
-        }
-    }
-    if servers.is_empty() {
-        tui::line(&tui::dim("  No running local model servers detected on port 11434 (Ollama) or 8080 (llama.cpp/vLLM)."));
-    } else {
-        for s in servers {
-            tui::line(&format!("  • {}", tui::green(s)));
+    let settings = config::load_settings().unwrap_or_default();
+    let servers = local_servers(&settings);
+    // Every server at once: a dead address costs its timeout, not the sum.
+    let found: Vec<Option<Vec<String>>> = std::thread::scope(|scope| {
+        let probes: Vec<_> = servers
+            .iter()
+            .map(|s| {
+                scope.spawn(move || match s.preset {
+                    "ollama" => provider::ollama_models_checked(&s.base),
+                    _ => provider::openai_models_checked(&s.base),
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
+    let mut suggestions = Vec::new();
+    for (s, models) in servers.iter().zip(found) {
+        // Names come from whatever answers on that port.
+        let shown_base = tui::sanitize_terminal(&s.base).into_owned();
+        match models {
+            None => tui::line(&tui::dim(&format!(
+                "  · {} at {shown_base} — not running",
+                s.label
+            ))),
+            Some(m) if m.is_empty() => tui::line(&format!(
+                "  • {} at {shown_base} — {}",
+                s.label,
+                tui::yellow(if s.preset == "ollama" {
+                    "running, no models yet (ollama pull <name>)"
+                } else {
+                    "running, no model loaded"
+                })
+            )),
+            Some(m) => {
+                let names: Vec<String> = m
+                    .iter()
+                    .map(|n| {
+                        let n = tui::sanitize_terminal(n).into_owned();
+                        if *n == provider.model {
+                            format!("{n} (current)")
+                        } else {
+                            n
+                        }
+                    })
+                    .collect();
+                tui::line(&format!(
+                    "  • {} at {shown_base} — {}",
+                    tui::green(s.label),
+                    names.join(", ")
+                ));
+                if let Some(first) = m.iter().find(|n| **n != provider.model) {
+                    suggestions.push(format!(
+                        "/model {} {}",
+                        s.preset,
+                        tui::sanitize_terminal(first)
+                    ));
+                }
+            }
         }
     }
     let ggufs = crate::local::scan_gguf();
     if !ggufs.is_empty() {
-        tui::line("  Local GGUF models found:");
-        for m in ggufs {
-            tui::line(&format!("    - {}", tui::bold(&tui::sanitize_terminal(&m))));
+        let llama_server = find_llama_server_binary().is_some();
+        tui::line("  GGUF files on disk:");
+        for m in &ggufs {
+            tui::line(&format!("    - {}", tui::bold(&tui::sanitize_terminal(m))));
+        }
+        match gguf_unservable(&ggufs[0], llama_server) {
+            Some(why) => tui::line(&tui::dim(&format!("    {why}"))),
+            None => suggestions.push(format!("/model {}", tui::sanitize_terminal(&ggufs[0]))),
         }
     }
-    tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
+    match suggestions.first() {
+        Some(_) => tui::line(&tui::dim(&format!(
+            "  switch with: {}",
+            suggestions.join("  ·  ")
+        ))),
+        None => tui::line(&tui::dim(
+            "  nothing to switch to yet — start Ollama, LM Studio or llama-server, or put a .gguf file in ~/.buildwithnexus/models",
+        )),
+    }
 }
 
 fn handle_rules(cwd: &std::path::Path) {
@@ -4001,27 +4142,61 @@ fn handle_diff(cwd: &std::path::Path) {
     }
 }
 
-fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
-    let chars: usize = msgs
-        .iter()
-        .map(|m| match m {
-            provider::Msg::System(s) | provider::Msg::User(s) => s.len(),
-            provider::Msg::UserImages { text, images } => text.len() + images.len() * 1024,
+/// Where the next request's tokens go, estimated at four characters a token
+/// (images by their encoded size, as compaction counts them).
+#[derive(Debug, Default, PartialEq)]
+struct ContextBreakdown {
+    system: usize,
+    tools: usize,
+    mcp_tools: usize,
+    conversation: usize,
+    images: usize,
+}
+
+impl ContextBreakdown {
+    fn total(&self) -> usize {
+        self.system + self.tools + self.mcp_tools + self.conversation + self.images
+    }
+}
+
+fn context_breakdown(msgs: &[provider::Msg], tools: &[tools::ToolDef]) -> ContextBreakdown {
+    let mut b = ContextBreakdown::default();
+    for m in msgs {
+        match m {
+            provider::Msg::System(s) => b.system += s.len() / 4,
+            provider::Msg::User(s) => b.conversation += s.len() / 4,
+            provider::Msg::UserImages { text, images } => {
+                b.conversation += text.len() / 4;
+                b.images += images.iter().map(|(_, d)| d.len() / 3).sum::<usize>() / 4;
+            }
             provider::Msg::Assistant { text, calls } => {
-                text.len()
+                b.conversation += (text.len()
                     + calls
                         .iter()
-                        .map(|c| c.input.to_string().len())
-                        .sum::<usize>()
+                        .map(|c| c.name.len() + c.input.to_string().len())
+                        .sum::<usize>())
+                    / 4;
             }
-            provider::Msg::Tool(results) => results.iter().map(|r| r.content.len()).sum(),
-        })
-        .sum();
-    chars / 4
+            provider::Msg::Tool(results) => {
+                b.conversation += results.iter().map(|r| r.content.len()).sum::<usize>() / 4;
+            }
+        }
+    }
+    for t in tools {
+        let size = (t.name.len() + t.description.len() + t.schema.to_string().len()) / 4;
+        if mcp::is_mcp_tool(t.name) {
+            b.mcp_tools += size;
+        } else {
+            b.tools += size;
+        }
+    }
+    b
 }
 
 fn handle_context(transcript: &[provider::Msg], total: usize) {
-    let estimate = msg_token_estimate(transcript);
+    let tools = tools::defs_for_context(true, total);
+    let b = context_breakdown(transcript, &tools);
+    let estimate = b.total();
     // The server's own count for the last request beats the chars/4 guess,
     // but only while the transcript it measured is still the live one.
     let measured = if transcript.is_empty() {
@@ -4029,17 +4204,42 @@ fn handle_context(transcript: &[provider::Msg], total: usize) {
     } else {
         usage::last_context_tokens()
     };
-    tui::context_meter(measured.unwrap_or(estimate), total);
+    let used = measured.unwrap_or(estimate);
+    tui::context_meter(used, total);
+    let pct = (used * 100).checked_div(total).unwrap_or(0);
+    tui::line(&format!(
+        "  context: {} of {} tokens ({pct}%)",
+        provider::short_tokens(used),
+        provider::short_tokens(total)
+    ));
+    let rows = [
+        ("system prompt", b.system),
+        ("tools", b.tools),
+        ("MCP tools", b.mcp_tools),
+        ("conversation", b.conversation),
+        ("images", b.images),
+    ];
+    for (name, n) in rows {
+        tui::line(&tui::dim(&format!(
+            "    {name:<14} {:>7}",
+            provider::short_tokens(n)
+        )));
+    }
     tui::line(&tui::dim(&match measured {
-        Some(_) => {
-            format!("  measured from the last request's usage (chars/4 estimate: {estimate})")
-        }
-        None => "  estimated (chars/4) — no usage reported yet".to_string(),
+        Some(_) => format!(
+            "  total measured from the last request; rows estimated at 4 characters a token · {} messages",
+            transcript.len()
+        ),
+        None => format!(
+            "  estimated at 4 characters a token — no usage reported yet · {} messages",
+            transcript.len()
+        ),
     }));
-    tui::line(&tui::dim(&format!(
-        "  {} messages in session",
-        transcript.len()
-    )));
+    if pct >= 80 {
+        tui::line(&tui::yellow(
+            "  nearly full — /compact summarizes the conversation to make room",
+        ));
+    }
 }
 
 fn handle_cost(provider: &Provider) {
@@ -6626,5 +6826,133 @@ mod tests {
 
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn local_servers_start_with_the_configured_one() {
+        let s = Settings {
+            provider: "ollama".into(),
+            base_url: Some("http://192.168.50.10:11434".into()),
+            ..Default::default()
+        };
+        let bases: Vec<(&str, String)> = local_servers(&s)
+            .into_iter()
+            .map(|l| (l.preset, l.base))
+            .collect();
+        assert_eq!(
+            bases,
+            vec![
+                ("ollama", "http://192.168.50.10:11434".to_string()),
+                ("ollama", "http://localhost:11434".to_string()),
+                ("llamacpp", "http://localhost:8080/v1".to_string()),
+                ("lmstudio", "http://localhost:1234/v1".to_string()),
+                ("custom", "http://localhost:8000/v1".to_string()),
+            ]
+        );
+        // LM Studio moved to another port: listed once, at that port.
+        let s = Settings {
+            provider: "lmstudio".into(),
+            base_url: Some("http://localhost:1235/v1/".into()),
+            ..Default::default()
+        };
+        let servers = local_servers(&s);
+        assert_eq!(servers[0].base, "http://localhost:1235/v1");
+        assert_eq!(servers[0].label, "LM Studio");
+        assert_eq!(servers.len(), 5);
+        // A hosted provider adds nothing of its own.
+        let s = Settings {
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(local_servers(&s).len(), 4);
+    }
+
+    // Answers GETs: /api/tags only when `ollama`, /v1/models always.
+    fn model_server(ollama: bool) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut first = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let (code, body) = if first.contains("/api/tags") && ollama {
+                    (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#)
+                } else if first.contains("/v1/models") {
+                    (200, r#"{"data":[{"id":"x"}]}"#)
+                } else {
+                    (404, r#"{"error":"Unexpected endpoint"}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn a_gguf_swap_never_lands_on_ollama() {
+        let ollama = format!("{}/v1", model_server(true));
+        let llama = format!("{}/v1", model_server(false));
+        assert_eq!(
+            find_active_local_base_url_in(&[&ollama, &llama]),
+            Some(llama.clone())
+        );
+        assert_eq!(find_active_local_base_url_in(&[&ollama]), None);
+
+        assert_eq!(
+            gguf_unservable("tinycoder-7b-q4_k_m.gguf", false),
+            Some(
+                "llama-server is not installed — install llama.cpp, or load the file in LM Studio"
+            )
+        );
+        assert!(gguf_unservable("sub/Model.GGUF", false).is_some());
+        assert_eq!(gguf_unservable("tinycoder-7b-q4_k_m.gguf", true), None);
+        assert_eq!(gguf_unservable("tinycoder-7b-instruct", false), None);
+    }
+
+    #[test]
+    fn context_breakdown_counts_each_part_of_the_next_request() {
+        let msgs = vec![
+            provider::Msg::System("s".repeat(400)),
+            provider::Msg::User("u".repeat(80)),
+            provider::Msg::UserImages {
+                text: "t".repeat(40),
+                images: vec![("image/png".into(), "A".repeat(1_200))],
+            },
+            provider::Msg::Assistant {
+                text: "a".repeat(40),
+                calls: vec![],
+            },
+            provider::Msg::Tool(vec![provider::ToolResult {
+                id: "1".into(),
+                content: "r".repeat(40),
+                is_error: false,
+            }]),
+        ];
+        let tools = vec![tools::ToolDef {
+            name: "read_file",
+            description: "Read a file.",
+            schema: serde_json::json!({}),
+        }];
+        let b = context_breakdown(&msgs, &tools);
+        assert_eq!(b.system, 100);
+        assert_eq!(b.conversation, 20 + 10 + 10 + 10);
+        assert_eq!(b.images, 100);
+        assert_eq!(b.tools, (9 + 12 + 2) / 4);
+        assert_eq!(b.mcp_tools, 0);
+        assert_eq!(b.total(), 100 + 50 + 100 + 5);
     }
 }

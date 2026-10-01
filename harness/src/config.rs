@@ -309,6 +309,17 @@ pub struct Settings {
     /// the user's files only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub endpoints: BTreeMap<String, String>,
+    /// Prices for models the built-in table does not know, so the spend cap
+    /// can count them: `"<model or prefix>": {"input": 3.0, "output": 15.0}`
+    /// in USD per million tokens (`cache_read`/`cache_write` default to
+    /// `input`). Entries win over the built-in table. See usage::set_prices.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prices: BTreeMap<String, serde_json::Value>,
+    /// Whether the model takes images. Unset (the default) asks the server
+    /// (Ollama's capabilities, LM Studio's model type, llama.cpp's
+    /// modalities) and falls back to the model name; true or false decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 /// `permissions` in settings: rule lists by effect.
@@ -397,6 +408,8 @@ impl Default for Settings {
             network: NetworkRules::default(),
             shell_env_passthrough: Vec::new(),
             endpoints: BTreeMap::new(),
+            prices: BTreeMap::new(),
+            vision: None,
         }
     }
 }

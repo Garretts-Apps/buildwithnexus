@@ -92,13 +92,68 @@ const PRICES: &[(&str, Price)] = &[
 ];
 
 /// List price for a model, matched by the longest known prefix (case-insensitive).
+/// Prices from settings (`prices`) come before the built-in table.
 pub fn price_for(model: &str) -> Option<Price> {
     let m = model.trim().to_ascii_lowercase();
-    PRICES
-        .iter()
+    let user = user_prices();
+    longest_prefix(&m, user.iter().map(|(k, p)| (k.as_str(), *p)))
+        .or_else(|| longest_prefix(&m, PRICES.iter().map(|(k, p)| (*k, *p))))
+}
+
+fn longest_prefix<'a>(m: &str, table: impl Iterator<Item = (&'a str, Price)>) -> Option<Price> {
+    table
         .filter(|(prefix, _)| m.starts_with(prefix))
         .max_by_key(|(prefix, _)| prefix.len())
-        .map(|(_, p)| *p)
+        .map(|(_, p)| p)
+}
+
+// `prices` from settings: model name (or prefix) → USD per million tokens.
+static USER_PRICES: Mutex<Vec<(String, Price)>> = Mutex::new(Vec::new());
+
+fn user_prices() -> std::sync::MutexGuard<'static, Vec<(String, Price)>> {
+    USER_PRICES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take the `prices` settings block, replacing any earlier one. Each entry
+/// is `"<model or prefix>": {"input": 3.0, "output": 15.0}` in USD per
+/// million tokens; `cache_read` and `cache_write` default to `input`.
+/// Returns one warning per entry that could not be used.
+pub fn set_prices(prices: &std::collections::BTreeMap<String, serde_json::Value>) -> Vec<String> {
+    let mut table = Vec::new();
+    let mut warnings = Vec::new();
+    for (model, v) in prices {
+        let rate = |k: &str| v[k].as_f64().filter(|n| n.is_finite() && *n >= 0.0);
+        match (rate("input"), rate("output")) {
+            (Some(input), Some(output)) => table.push((
+                model.trim().to_ascii_lowercase(),
+                price(
+                    input,
+                    output,
+                    rate("cache_read").unwrap_or(input),
+                    rate("cache_write").unwrap_or(input),
+                ),
+            )),
+            _ => warnings.push(format!(
+                "prices.{model} needs \"input\" and \"output\" in USD per million tokens — ignored"
+            )),
+        }
+    }
+    *user_prices() = table;
+    warnings
+}
+
+/// Why `--max-budget-usd` cannot hold for this model, when it cannot: a cap
+/// is set, the endpoint is not local (free), and no price is known, so every
+/// request would count as $0.
+pub fn unenforceable_budget(model: &str, local: bool) -> Option<String> {
+    budget()?;
+    if local || price_for(model).is_some() {
+        return None;
+    }
+    Some(format!(
+        "cannot enforce --max-budget-usd: no price is known for {model} — add it under prices in settings.json, \
+         e.g. \"prices\": {{\"{model}\": {{\"input\": 3.0, \"output\": 15.0}}}} (USD per million tokens)"
+    ))
 }
 
 /// Estimated USD for one request; None when the model has no known price.
@@ -256,7 +311,8 @@ pub fn budget() -> Option<f64> {
 
 /// The stop message when the session's estimated cost has passed the budget,
 /// checked before each model request so the loop never dies mid-stream.
-/// Unpriced requests count as $0 — the message says so when it matters.
+/// Unpriced requests (never sent while a cap is set, see
+/// `unenforceable_budget`) count as $0 — the message says so when it matters.
 pub fn budget_stop() -> Option<String> {
     budget_stop_msg(&snapshot(), budget()?)
 }
@@ -448,7 +504,63 @@ mod tests {
     }
 
     #[test]
+    fn prices_from_settings_price_unknown_models_and_win_over_the_table() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prices: std::collections::BTreeMap<String, serde_json::Value> = [
+            (
+                "GW-Model".to_string(),
+                serde_json::json!({"input": 2.0, "output": 8.0}),
+            ),
+            (
+                "gpt-4.1-nano".to_string(),
+                serde_json::json!({"input": 1.0, "output": 1.0, "cache_read": 0.5}),
+            ),
+            ("broken".to_string(), serde_json::json!({"input": "cheap"})),
+        ]
+        .into_iter()
+        .collect();
+        let warnings = set_prices(&prices);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("prices.broken"), "{warnings:?}");
+        assert_eq!(price_for("gw-model-v2"), Some(price(2.0, 8.0, 2.0, 2.0)));
+        assert_eq!(
+            price_for("gpt-4.1-nano-2025"),
+            Some(price(1.0, 1.0, 0.5, 1.0))
+        );
+        assert!(price_for("broken").is_none());
+        set_prices(&Default::default());
+        assert!(price_for("gw-model").is_none());
+        assert_eq!(price_for("gpt-4.1-nano"), Some(price(0.1, 0.4, 0.025, 0.1)));
+    }
+
+    #[test]
+    fn a_cap_cannot_hold_for_an_unpriced_remote_model() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_budget(None);
+        assert!(unenforceable_budget("gw-model", false).is_none(), "no cap");
+        set_budget(Some(0.01));
+        let why = unenforceable_budget("gw-model", false).unwrap();
+        assert!(
+            why.starts_with("cannot enforce --max-budget-usd: no price is known for gw-model — add it under prices in settings.json"),
+            "{why}"
+        );
+        assert!(
+            unenforceable_budget("gw-model", true).is_none(),
+            "local is free"
+        );
+        assert!(unenforceable_budget("gpt-4o", false).is_none(), "priced");
+        set_budget(None);
+    }
+
+    #[test]
     fn budget_zero_or_negative_means_unset() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_budget(Some(0.0));
         assert_eq!(budget(), None);
         set_budget(Some(-1.0));

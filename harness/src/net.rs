@@ -1,14 +1,17 @@
 // Every HTTP client bwn creates is built here, so all of them behave the same
 // behind a corporate network: they honor HTTPS_PROXY, HTTP_PROXY, ALL_PROXY
-// and NO_PROXY (loopback is never proxied), and they trust the OS
-// certificate store (or SSL_CERT_FILE / SSL_CERT_DIR) on top of the bundled
-// webpki roots, so a TLS-inspecting proxy whose CA IT installed works.
+// and NO_PROXY (loopback and private addresses are never proxied), and they
+// trust the OS certificate store (or SSL_CERT_FILE / SSL_CERT_DIR) on top of
+// the bundled webpki roots, so a TLS-inspecting proxy whose CA IT installed
+// works.
 //
 // ureq 2 sets its proxy per agent, so a Client holds one agent per route
 // (direct, and one per proxy URL) and picks by destination URL.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 type Configure<'a> = &'a dyn Fn(ureq::AgentBuilder) -> ureq::AgentBuilder;
 
@@ -38,7 +41,7 @@ impl Client {
     fn with_env(env: ProxyEnv, configure: Configure) -> Client {
         let base = || configure(ureq::AgentBuilder::new().tls_config(tls_config()));
         let mut proxied: Vec<(String, ureq::Agent)> = Vec::new();
-        for url in [&env.https, &env.http].into_iter().flatten() {
+        for (_, url) in [&env.https, &env.http].into_iter().flatten() {
             if proxied.iter().any(|(u, _)| u == url) {
                 continue;
             }
@@ -65,6 +68,25 @@ impl Client {
             .map_or(&self.direct, |(_, a)| a)
     }
 
+    /// The proxy a request to `url` goes through, for error messages; None
+    /// when it goes direct.
+    pub fn proxy_route(&self, url: &str) -> Option<ProxyRoute> {
+        let (var, value) = self.env.route(url)?;
+        let authority = value
+            .split_once("://")
+            .map_or(value.as_str(), |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or("");
+        Some(ProxyRoute {
+            var,
+            shown: redact_userinfo(value),
+            host_port: authority.rsplit('@').next().unwrap_or("").to_string(),
+            has_credentials: authority.contains('@'),
+            unusable: parse_proxy(value).err(),
+        })
+    }
+
     pub fn get(&self, url: &str) -> ureq::Request {
         self.agent_for(url).get(url)
     }
@@ -80,61 +102,184 @@ pub fn shared() -> &'static Client {
     CLIENT.get_or_init(|| Client::new(|b| b))
 }
 
+/// The proxy a request goes through, as error messages name it.
+#[derive(Debug, Clone)]
+pub struct ProxyRoute {
+    /// The variable it came from: `HTTPS_PROXY`, `http_proxy`, `ALL_PROXY`, …
+    pub var: &'static str,
+    /// Its URL with any password hidden.
+    pub shown: String,
+    /// `host:port` of the proxy itself.
+    pub host_port: String,
+    /// Whether the URL carries a user name (and maybe a password).
+    pub has_credentials: bool,
+    /// Why the URL cannot be used at all, when it cannot.
+    pub unusable: Option<String>,
+}
+
 /// What to tell the user when `e` is a certificate the roots do not trust.
 /// Retrying cannot fix it, so callers fail at once with this.
-pub fn cert_error_hint(e: &ureq::Error) -> Option<&'static str> {
+pub fn cert_error_hint(e: &ureq::Error) -> Option<String> {
     e.to_string()
         .contains("invalid peer certificate")
-        .then_some(
-            "The server's certificate is not trusted. Behind a TLS-inspecting proxy, \
-         install its CA in the OS certificate store or set SSL_CERT_FILE to a PEM file holding it.",
-        )
+        .then(|| cert_hint(|k| std::env::var(k).ok()))
+}
+
+// BWN_TLS_ROOTS=bundled (from an old runbook) silently ignores the CA file
+// the user did set, so that case is named before the general advice.
+fn cert_hint(get: impl Fn(&str) -> Option<String>) -> String {
+    let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let bundled = set("BWN_TLS_ROOTS").is_some_and(|v| v.trim().eq_ignore_ascii_case("bundled"));
+    let ca = ["SSL_CERT_FILE", "SSL_CERT_DIR"]
+        .into_iter()
+        .find_map(|k| set(k).map(|v| (k, v)));
+    match (bundled, ca) {
+        (true, Some((var, path))) => format!(
+            "BWN_TLS_ROOTS=bundled ignores {var} — unset it to trust the certificates in {path}"
+        ),
+        (true, None) => "BWN_TLS_ROOTS=bundled trusts only the built-in roots — unset it to \
+             trust the OS certificate store too"
+            .to_string(),
+        _ => "The server's certificate is not trusted. Behind a TLS-inspecting proxy, \
+             install its CA in the OS certificate store or set SSL_CERT_FILE to a PEM file holding it."
+            .to_string(),
+    }
 }
 
 // ── proxy environment ──────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+type Resolve = Box<dyn Fn(&str) -> Option<Vec<IpAddr>> + Send + Sync>;
+
 struct ProxyEnv {
-    https: Option<String>,
-    http: Option<String>,
+    https: Option<(&'static str, String)>,
+    http: Option<(&'static str, String)>,
     no_proxy: Vec<Rule>,
+    // BWN_PROXY_PRIVATE=1: private addresses go through the proxy too.
+    proxy_private: bool,
+    resolve: Resolve,
+    // Host name → whether it resolved to private, and to loopback,
+    // addresses only.
+    private_names: Mutex<HashMap<String, (bool, bool)>>,
 }
 
 impl ProxyEnv {
     fn from_env() -> ProxyEnv {
-        ProxyEnv::from_lookup(|k| std::env::var(k).ok())
+        ProxyEnv::from_lookup(|k| std::env::var(k).ok()).with_resolver(resolve_briefly)
     }
 
     // Lower case first, as curl reads them; an empty value counts as unset.
+    // Names are not resolved until a resolver is given.
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> ProxyEnv {
-        let first = |keys: [&str; 2]| {
-            keys.iter()
-                .filter_map(|k| get(k))
-                .map(|v| v.trim().to_string())
-                .find(|v| !v.is_empty())
+        let first = |keys: [&'static str; 2]| {
+            keys.into_iter()
+                .filter_map(|k| get(k).map(|v| (k, v.trim().to_string())))
+                .find(|(_, v)| !v.is_empty())
         };
         let all = first(["all_proxy", "ALL_PROXY"]);
         ProxyEnv {
             https: first(["https_proxy", "HTTPS_PROXY"]).or_else(|| all.clone()),
             http: first(["http_proxy", "HTTP_PROXY"]).or(all),
             no_proxy: first(["no_proxy", "NO_PROXY"])
-                .map(|v| parse_no_proxy(&v))
+                .map(|(_, v)| parse_no_proxy(&v))
                 .unwrap_or_default(),
+            proxy_private: get("BWN_PROXY_PRIVATE")
+                .is_some_and(|v| !v.trim().is_empty() && v.trim() != "0"),
+            resolve: Box::new(|_| None),
+            private_names: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn with_resolver(
+        mut self,
+        resolve: impl Fn(&str) -> Option<Vec<IpAddr>> + Send + Sync + 'static,
+    ) -> ProxyEnv {
+        self.resolve = Box::new(resolve);
+        self
     }
 
     /// The proxy URL for `url`, or None to connect direct.
     fn proxy_for(&self, url: &str) -> Option<&str> {
+        self.route(url).map(|(_, v)| v.as_str())
+    }
+
+    /// The variable and proxy URL for `url`, or None to connect direct.
+    fn route(&self, url: &str) -> Option<&(&'static str, String)> {
         let parsed = url::Url::parse(url).ok()?;
         let proxy = match parsed.scheme() {
-            "https" | "wss" => self.https.as_deref(),
-            "http" | "ws" => self.http.as_deref(),
+            "https" | "wss" => self.https.as_ref(),
+            "http" | "ws" => self.http.as_ref(),
             _ => None,
         }?;
         let host = Host::of(&parsed)?;
-        let bypass = host.is_loopback() || self.no_proxy.iter().any(|r| r.matches(&host));
+        let bypass = host.is_loopback()
+            || self.no_proxy.iter().any(|r| r.matches(&host))
+            || self.is_private(&host);
         (!bypass).then_some(proxy)
     }
+
+    // A model server on the local network (10.x, 192.168.x, a VM, a
+    // tailnet host), whether written as an address or a name that resolves
+    // there, is reached directly as it was before bwn read proxy variables:
+    // the proxy usually cannot reach it. A name that resolves to loopback is
+    // this machine whatever BWN_PROXY_PRIVATE says.
+    fn is_private(&self, host: &Host) -> bool {
+        match host {
+            Host::Ip(ip) => !self.proxy_private && is_private_ip(*ip),
+            Host::Name(name) => {
+                let cached = self
+                    .private_names
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(name).copied());
+                let (private, loopback) = cached.unwrap_or_else(|| {
+                    let addrs = (self.resolve)(name).unwrap_or_default();
+                    let all =
+                        |f: fn(IpAddr) -> bool| !addrs.is_empty() && addrs.iter().all(|ip| f(*ip));
+                    let found = (all(is_private_ip), all(|ip| canonical(ip).is_loopback()));
+                    if let Ok(mut m) = self.private_names.lock() {
+                        m.insert(name.clone(), found);
+                    }
+                    found
+                });
+                loopback || (private && !self.proxy_private)
+            }
+        }
+    }
+}
+
+// Loopback, RFC 1918, link-local, carrier-grade NAT (tailnets) and IPv6
+// unique-local addresses: places a proxy on the internet side cannot reach.
+fn is_private_ip(ip: IpAddr) -> bool {
+    match canonical(ip) {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+// The system resolver, given one second: a name that does not resolve that
+// fast (no internal DNS, a resolver that only the proxy can reach) is
+// treated as public and goes through the proxy.
+fn resolve_briefly(name: &str) -> Option<Vec<IpAddr>> {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let addrs = (name.as_str(), 0)
+            .to_socket_addrs()
+            .map(|a| a.map(|s| s.ip()).collect::<Vec<_>>());
+        let _ = tx.send(addrs.ok());
+    });
+    rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
 }
 
 enum Host {
@@ -260,6 +405,15 @@ fn parse_proxy(value: &str) -> Result<ureq::Proxy, String> {
     let rest = match value.split_once("://") {
         None => value,
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        // The tunnel to the server is TLS either way; only the hop to the
+        // proxy would be encrypted, and ureq cannot do that.
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("https") => {
+            return Err(format!(
+                "https:// proxy URLs are not supported — use http:// ({} as http://…); \
+                 traffic to the server stays encrypted inside the tunnel",
+                redact_userinfo(value)
+            ))
+        }
         Some((scheme, _)) => {
             return Err(format!(
                 "proxy {} uses {scheme}://, which bwn does not support; use an http:// proxy URL",
@@ -421,13 +575,107 @@ mod tests {
             assert_eq!(e.proxy_for(url), None, "{url}");
         }
         assert!(e.proxy_for("http://localhost.example.com/").is_some());
+    }
+
+    #[test]
+    fn private_destinations_go_direct_unless_asked() {
+        let resolve = |host: &str| -> Option<Vec<IpAddr>> {
+            let ip = |a: [u8; 4]| IpAddr::from(a);
+            match host {
+                "vm" => Some(vec![ip([127, 0, 0, 1])]),
+                "gpu.lan" => Some(vec![ip([10, 1, 2, 3])]),
+                "api.example" => Some(vec![ip([93, 184, 216, 34])]),
+                "mixed.example" => Some(vec![ip([10, 0, 0, 1]), ip([93, 184, 216, 34])]),
+                _ => None,
+            }
+        };
+        let vars = [
+            ("HTTP_PROXY", "http://proxy:3128"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+        ];
+        let e = ProxyEnv::from_lookup(env(&vars)).with_resolver(resolve);
+        for url in [
+            "http://vm:19100/v1",
+            "http://gpu.lan:11434/api/chat",
+            "http://10.0.0.5:11434/",
+            "http://192.168.50.10:11434",
+            "http://172.16.0.9/",
+            "http://100.100.1.1:11434",
+            "http://[fd00::5]:8080/v1",
+            "http://169.254.10.1/",
+        ] {
+            assert_eq!(e.proxy_for(url), None, "{url} should be direct");
+        }
+        for url in [
+            "https://api.example/v1",
+            "https://mixed.example/",
+            "https://nowhere.example/",
+            "http://8.8.8.8/",
+            "http://172.32.0.1/",
+            "http://100.128.0.1/",
+        ] {
+            assert!(e.proxy_for(url).is_some(), "{url} should use the proxy");
+        }
+        // BWN_PROXY_PRIVATE=1 sends private addresses to the proxy too;
+        // this machine stays direct.
+        let mut vars = vars.to_vec();
+        vars.push(("BWN_PROXY_PRIVATE", "1"));
+        let e = ProxyEnv::from_lookup(env(&vars)).with_resolver(resolve);
         assert!(e.proxy_for("http://10.0.0.5:11434/").is_some());
+        // Twice: the second answer comes from the cache.
+        for _ in 0..2 {
+            assert!(e.proxy_for("http://gpu.lan:11434/").is_some());
+            assert_eq!(e.proxy_for("http://vm:19100/"), None);
+        }
+        assert_eq!(e.proxy_for("http://127.0.0.1:19100/"), None);
+    }
+
+    #[test]
+    fn a_route_names_its_variable_and_hides_the_password() {
+        let client = Client::with_lookup(
+            env(&[
+                ("https_proxy", "http://me:s3cret@proxy.corp:3128"),
+                ("ALL_PROXY", "https://tls-proxy:443"),
+            ]),
+            |b| b,
+        );
+        let r = client.proxy_route("https://api.example.com/v1").unwrap();
+        assert_eq!(r.var, "https_proxy");
+        assert_eq!(r.shown, "http://***@proxy.corp:3128");
+        assert_eq!(r.host_port, "proxy.corp:3128");
+        assert!(r.has_credentials);
+        assert!(r.unusable.is_none());
+        let r = client.proxy_route("http://api.example.com/v1").unwrap();
+        assert_eq!(r.var, "ALL_PROXY");
+        let why = r.unusable.unwrap();
+        assert!(
+            why.starts_with("https:// proxy URLs are not supported — use http://"),
+            "{why}"
+        );
+        assert!(client.proxy_route("http://localhost:11434/").is_none());
+    }
+
+    #[test]
+    fn the_certificate_hint_names_a_bundled_override() {
+        let hint = cert_hint(env(&[
+            ("BWN_TLS_ROOTS", "bundled"),
+            ("SSL_CERT_FILE", "/etc/corp-ca.pem"),
+        ]));
+        assert!(
+            hint.starts_with("BWN_TLS_ROOTS=bundled ignores SSL_CERT_FILE — unset it"),
+            "{hint}"
+        );
+        assert!(hint.contains("/etc/corp-ca.pem"), "{hint}");
+        assert!(cert_hint(env(&[("BWN_TLS_ROOTS", "bundled")])).contains("built-in roots"));
+        assert!(cert_hint(env(&[])).contains("set SSL_CERT_FILE"));
     }
 
     #[test]
     fn no_proxy_forms() {
+        // Private addresses on the proxy too, so only NO_PROXY decides here.
         let e = ProxyEnv::from_lookup(env(&[
             ("HTTPS_PROXY", "http://proxy:3128"),
+            ("BWN_PROXY_PRIVATE", "1"),
             (
                 "NO_PROXY",
                 "corp.example, .internal.test,*.svc.cluster.local ,exact.test:8443 \

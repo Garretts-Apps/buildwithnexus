@@ -828,11 +828,34 @@ fn is_casual_turn(text: &str) -> bool {
 
 fn parse_text_tool_calls(text: &str, defs: &[tools::ToolDef]) -> Option<Vec<provider::ToolCall>> {
     let names = defs.iter().map(|d| d.name).collect::<HashSet<_>>();
-    if let Some(candidate) = extract_json_tool_candidate(text) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+    if let Some((candidate, is_reply)) = extract_json_tool_candidate(text) {
+        // A call followed by a sentence ("… I will read the file first.")
+        // is not JSON as a whole; its leading object is.
+        let value = serde_json::from_str::<serde_json::Value>(candidate)
+            .ok()
+            .or_else(|| balanced_json_object(candidate).and_then(|o| serde_json::from_str(o).ok()));
+        if let Some(value) = value {
             let mut calls = Vec::new();
             collect_text_tool_calls(&value, &names, &mut calls);
+            // A name that was never offered is a call only when the JSON is
+            // the reply itself or sits in call markup: JSON quoted inside an
+            // answer (how function calling works) is an example.
+            calls.retain(|c| is_reply || names.contains(c.name.as_str()));
             if !calls.is_empty() {
+                let known = tools::defs(true);
+                let unknown: Vec<&str> = calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .filter(|n| !names.contains(n) && !known.iter().any(|d| d.name == *n))
+                    .collect();
+                // Answered by the tool runner with the real tool list, so
+                // the turn goes on instead of ending on an unusable reply.
+                if !unknown.is_empty() {
+                    report::info(&format!(
+                        "  ⟳ the model asked for {}, which is not a tool here — telling it which tools exist",
+                        unknown.join(", ")
+                    ));
+                }
                 return Some(calls);
             }
         }
@@ -1134,11 +1157,14 @@ fn tool_code_args_to_input(
     serde_json::Value::Object(map)
 }
 
-fn extract_json_tool_candidate(text: &str) -> Option<&str> {
+// The JSON that may hold a tool call, and whether the reply is that call
+// (it leads the reply, fills a fence that is the whole message, or sits in
+// call markup) rather than JSON embedded in prose.
+fn extract_json_tool_candidate(text: &str) -> Option<(&str, bool)> {
     let trimmed = text.trim();
     // Whole-text JSON (the strict, original case).
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return Some(trimmed);
+        return Some((trimmed, true));
     }
     // A fenced ```json block that is the entire message.
     if let Some(rest) = trimmed.strip_prefix("```") {
@@ -1148,7 +1174,7 @@ fn extract_json_tool_candidate(text: &str) -> Option<&str> {
                 let body = &rest[fence_end + 1..];
                 if let Some(close) = body.rfind("```") {
                     if body[close + 3..].trim().is_empty() {
-                        return Some(body[..close].trim());
+                        return Some((body[..close].trim(), true));
                     }
                 }
             }
@@ -1161,12 +1187,12 @@ fn extract_json_tool_candidate(text: &str) -> Option<&str> {
     for tag in TOOL_CALL_TAGS {
         if let Some(pos) = text.find(tag) {
             if let Some(json) = balanced_json_object(&text[pos + tag.len()..]) {
-                return Some(json);
+                return Some((json, true));
             }
         }
     }
     // A bare object embedded in prose (a leading sentence, then the JSON).
-    balanced_json_object(text)
+    balanced_json_object(text).map(|json| (json, false))
 }
 
 // Return the first balanced `{…}` slice, tracking string state so braces inside
@@ -1231,18 +1257,22 @@ fn collect_text_tool_calls(
         }
         return;
     }
+    // Small models write the arguments as an object or a JSON string, under
+    // `arguments`, Llama 3's `parameters`, or `input`.
+    let args_of = |o: &serde_json::Map<String, serde_json::Value>| {
+        o.get("arguments")
+            .or_else(|| o.get("parameters"))
+            .or_else(|| o.get("input"))
+            .map(text_call_args)
+    };
     if let Some(function) = obj.get("function").and_then(|v| v.as_object()) {
         let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
             return;
         };
-        if !allowed.contains(name) {
+        if !allowed.contains(name) && !looks_like_tool_name(name) {
             return;
         }
-        let input = function
-            .get("arguments")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let input = args_of(function).unwrap_or_else(|| serde_json::json!({}));
         out.push(text_tool_call(name, input));
         return;
     }
@@ -1253,14 +1283,14 @@ fn collect_text_tool_calls(
     else {
         return;
     };
-    if !allowed.contains(name) {
-        return;
-    }
-    let input = obj
-        .get("arguments")
-        .or_else(|| obj.get("input"))
-        .cloned()
-        .unwrap_or_else(|| {
+    let input = match args_of(obj) {
+        // An explicit arguments object marks a call even to a name that was
+        // never offered; the tool runner answers it with the real list. A
+        // tool's definition (a description, a JSON Schema) is not a call.
+        Some(input) if allowed.contains(name) => input,
+        Some(input) if looks_like_tool_name(name) && !is_tool_definition(obj, &input) => input,
+        Some(_) => return,
+        None if allowed.contains(name) => {
             let mut map = serde_json::Map::new();
             for (k, v) in obj {
                 if k != "name" && k != "tool_name" && k != "type" && k != "id" {
@@ -1268,8 +1298,38 @@ fn collect_text_tool_calls(
                 }
             }
             serde_json::Value::Object(map)
-        });
+        }
+        None => return,
+    };
     out.push(text_tool_call(name, input));
+}
+
+fn is_tool_definition(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    args: &serde_json::Value,
+) -> bool {
+    obj.contains_key("description") || (args["type"] == "object" && args["properties"].is_object())
+}
+
+fn text_call_args(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        serde_json::Value::Object(_) => v.clone(),
+        _ => serde_json::json!({}),
+    }
+}
+
+// A name a model would give a tool (`find_paths`, `search.files`), not a
+// person's or product's name that happens to sit under a "name" key.
+fn looks_like_tool_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && (name.contains('_') || name.chars().all(|c| !c.is_ascii_uppercase()))
 }
 
 fn text_tool_call(name: &str, input: serde_json::Value) -> provider::ToolCall {
@@ -2745,6 +2805,14 @@ fn build_turn(
                         model_summary(p, middle)
                     });
                     continue;
+                }
+                // Refused before sending: it stays out of the conversation,
+                // or every later message would carry it to the server.
+                if provider::oversized_message(p, msgs).is_some() {
+                    msgs.pop();
+                    if msgs.iter().all(|m| matches!(m, Msg::System(_))) {
+                        msgs.clear();
+                    }
                 }
                 hooks::notify("OnError", cwd);
                 return Err(e);
@@ -5098,6 +5166,116 @@ mod tests {
         );
         assert_eq!(b.calls.len(), 1);
         assert_eq!(b.calls[0].input["path"], "b.txt");
+    }
+
+    #[test]
+    fn small_model_tool_call_shapes_parse() {
+        let defs = tools::defs_for_context(true, 8192);
+        let parse = |text: &str| {
+            normalize_text_tool_calls(
+                Reply {
+                    text: text.to_string(),
+                    ..Default::default()
+                },
+                &defs,
+                "read the file a.txt",
+            )
+        };
+        for text in [
+            // Llama 3's own format: a `parameters` object.
+            r#"{"name": "read_file", "parameters": {"path": "a.txt"}}"#,
+            // The OpenAI function wrapper with an arguments object.
+            r#"{"type":"function","function": {"name": "read_file", "arguments": {"path": "a.txt"}}}"#,
+            // The same wrapper with arguments as a JSON string.
+            r#"{"type":"function","function": {"name": "read_file", "arguments": "{\"path\": \"a.txt\"}"}}"#,
+            // A call followed by a sentence.
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}\n\nI will read the file first.",
+        ] {
+            let r = parse(text);
+            assert_eq!(r.calls.len(), 1, "{text}");
+            assert_eq!(r.calls[0].name, "read_file", "{text}");
+            assert_eq!(r.calls[0].input, json!({"path": "a.txt"}), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_invented_tool_name_is_answered_not_dropped() {
+        let defs = tools::defs_for_context(true, 8192);
+        let r = normalize_text_tool_calls(
+            Reply {
+                text:
+                    r#"{"name": "locate_paths", "arguments": {"pattern": "a.txt", "kind": "file"}}"#
+                        .to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "read the file a.txt",
+        );
+        assert_eq!(r.calls.len(), 1, "the call goes on, to be answered");
+        assert_eq!(r.calls[0].name, "locate_paths");
+        // What the model is told when the call runs.
+        let out = tools::run(&r.calls[0].name, &r.calls[0].input, Path::new("."));
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("unknown tool: locate_paths"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("read_file"), "{}", out.content);
+        // A real tool left off the small-context surface runs as asked.
+        assert!(!defs.iter().any(|d| d.name == "find_paths"));
+        let r = normalize_text_tool_calls(
+            Reply {
+                text: r#"{"name": "find_paths", "arguments": {"pattern": "a.txt"}}"#.to_string(),
+                ..Default::default()
+            },
+            &defs,
+            "find a.txt",
+        );
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].name, "find_paths");
+
+        // JSON in an answer that is not shaped like a call stays text.
+        for text in [
+            r#"{"name": "Alice", "age": 30}"#,
+            r#"{"name": "two words", "arguments": {}}"#,
+        ] {
+            let r = normalize_text_tool_calls(
+                Reply {
+                    text: text.to_string(),
+                    ..Default::default()
+                },
+                &defs,
+                "show me some json",
+            );
+            assert!(r.calls.is_empty(), "{text}");
+            assert_eq!(r.text, text);
+        }
+    }
+
+    #[test]
+    fn a_tool_quoted_in_an_answer_is_not_called() {
+        let defs = tools::defs_for_context(true, 8192);
+        let schema = r#"{"name": "get_weather", "description": "Current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}"#;
+        for text in [
+            // A definition, as an answer about function calling shows one.
+            format!("Here is the definition:\n\n```json\n{schema}\n```\n\nPass it in `tools`."),
+            schema.to_string(),
+            // An example call explained in prose.
+            r#"A call comes back as {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}} and your code runs it."#.to_string(),
+            "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n```\nThat is what the model sends back.".to_string(),
+        ] {
+            let r = normalize_text_tool_calls(
+                Reply {
+                    text: text.clone(),
+                    ..Default::default()
+                },
+                &defs,
+                "show me an OpenAI tool for get_weather",
+            );
+            assert!(r.calls.is_empty(), "{text}");
+            assert_eq!(r.text, text);
+        }
     }
 
     #[test]
