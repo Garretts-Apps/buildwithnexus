@@ -2944,6 +2944,12 @@ fn swap_model(
                 };
             }
         } else {
+            // ensure_local_gguf_server has already said why a GGUF file
+            // cannot be served; the generic list below would contradict it.
+            if gguf_unservable(&model, find_llama_server_binary().is_some()).is_some() {
+                tui::line(&tui::dim("    keeping the current model."));
+                return;
+            }
             tui::line(&tui::yellow(&format!(
                 "  ✗ no local server running on ports 8080/1234/11434/8000 for '{model}'."
             )));
@@ -3194,7 +3200,8 @@ struct LocalServer {
 }
 
 /// The servers /local probes: the configured one first (a LAN Ollama, LM
-/// Studio on another port), then each local preset at its default address.
+/// Studio on another port), then the addresses /model remembers for local
+/// presets, then each local preset at its default address.
 fn local_servers(settings: &Settings) -> Vec<LocalServer> {
     let label = |id: &str| match id {
         "ollama" => "Ollama",
@@ -3218,6 +3225,13 @@ fn local_servers(settings: &Settings) -> Vec<LocalServer> {
             add(p.id, base);
         }
     }
+    for (id, base) in &settings.endpoints {
+        if let Some(p) = config::preset(id) {
+            if p.local || (p.id == "custom" && is_loopback_url(base)) {
+                add(p.id, base);
+            }
+        }
+    }
     for p in config::PRESETS.iter().filter(|p| p.local) {
         add(p.id, p.base_url);
     }
@@ -3226,7 +3240,11 @@ fn local_servers(settings: &Settings) -> Vec<LocalServer> {
 
 fn handle_local(provider: &mut Provider) {
     tui::line(&tui::accent("  local models"));
-    let settings = config::load_settings().unwrap_or_default();
+    let mut settings = config::load_settings().unwrap_or_default();
+    // Remembered addresses come from the user's own files only, like a swap.
+    settings.endpoints = config::load_user_settings()
+        .map(|u| u.endpoints)
+        .unwrap_or_default();
     let servers = local_servers(&settings);
     // Every server at once: a dead address costs its timeout, not the sum.
     let found: Vec<Option<Vec<String>>> = std::thread::scope(|scope| {
@@ -6866,6 +6884,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(local_servers(&s).len(), 4);
+        // Addresses /model remembers for local presets come next; a hosted
+        // one is not a local server.
+        let s = Settings {
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            endpoints: [
+                (
+                    "ollama".to_string(),
+                    "http://192.168.50.10:11434".to_string(),
+                ),
+                (
+                    "openai".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let servers = local_servers(&s);
+        assert_eq!(servers[0].base, "http://192.168.50.10:11434");
+        assert_eq!(servers[0].preset, "ollama");
+        assert_eq!(servers.len(), 5);
     }
 
     // Answers GETs: /api/tags only when `ollama`, /v1/models always.
