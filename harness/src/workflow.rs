@@ -79,6 +79,98 @@ fn manager() -> &'static Mutex<Manager> {
     })
 }
 
+// ── session context ───────────────────────────────────────────────────────────
+// A background run is a child `run --json` process. Left alone it would read
+// settings.json and could run under a looser permission or another model than
+// the session that scheduled it (a read-only session's workflow editing files
+// in auto). The session's live permission, provider and model travel on its
+// command line instead.
+
+/// What a background run inherits from the session that scheduled it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionContext {
+    pub permission: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+}
+
+static CONTEXT: Mutex<Option<SessionContext>> = Mutex::new(None);
+
+/// Records the provider, model, endpoint and permission the session started
+/// with (after command-line flags).
+pub fn set_launch(provider: &str, model: &str, base_url: &str, permission: &str) {
+    if let Ok(mut c) = CONTEXT.lock() {
+        *c = Some(SessionContext {
+            permission: permission.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
+}
+
+/// Keeps the context in step with the session: /permissions and /model
+/// change these mid-session. A new endpoint means /model switched provider,
+/// and saved it, so the provider is read back from the settings.
+pub fn update_live(permission: &str, model: &str, base_url: &str) {
+    let Ok(mut c) = CONTEXT.lock() else {
+        return;
+    };
+    let ctx = c.get_or_insert_with(SessionContext::default);
+    if ctx.base_url != base_url {
+        if let Some(s) = crate::config::load_settings() {
+            ctx.provider = s.provider;
+        }
+        ctx.base_url = base_url.to_string();
+    }
+    ctx.permission = permission.to_string();
+    ctx.model = model.to_string();
+}
+
+fn context() -> Option<SessionContext> {
+    CONTEXT.lock().ok().and_then(|c| c.clone())
+}
+
+/// The child's command line: the session's permission, provider and model,
+/// the folders added with --add-dir, then the task after `--` so a task
+/// like "--permission auto …" stays text. The child runs in the session's
+/// folder and reads the same settings files, where /model saves the
+/// endpoint it switches to.
+pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String> {
+    let mut args = vec!["run".to_string(), "--json".to_string()];
+    if let Some(c) = ctx {
+        for (flag, value) in [
+            ("--permission-mode", &c.permission),
+            ("--provider", &c.provider),
+            ("--model", &c.model),
+            ("--base-url", &c.base_url),
+        ] {
+            if !value.is_empty() {
+                args.push(format!("{flag}={value}"));
+            }
+        }
+    }
+    args.extend(crate::workdirs::child_args());
+    args.push("--".to_string());
+    args.push(task.to_string());
+    args
+}
+
+/// What scheduling a workflow in this session means, when it is not the
+/// obvious: a background run has no terminal, so it cannot answer an
+/// approval prompt.
+pub fn schedule_warning(id: usize) -> Option<String> {
+    let perm = context()?.permission;
+    let why = match perm.as_str() {
+        "auto" | "" => return None,
+        "readonly" => "this is a read-only session — the background run can read but not change anything".to_string(),
+        "accept-edits" => "background runs cannot ask for approval — commands will be blocked (permission: accept-edits)".to_string(),
+        other => format!("background runs cannot ask for approval — edits will be blocked (permission: {other})"),
+    };
+    Some(format!("  ⚠ workflow #{id}: {why}"))
+}
+
 // ── concurrency limit ─────────────────────────────────────────────────────────
 pub const DEFAULT_MAX_CONCURRENT: usize = 2;
 static MAX_CONCURRENT: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_CONCURRENT);
@@ -284,6 +376,16 @@ pub fn restore() -> usize {
     restored
 }
 
+/// The pending workflows, one line each (what a restore notice is about).
+pub fn pending_tasks() -> Vec<String> {
+    let m = manager().lock().unwrap_or_else(|e| e.into_inner());
+    m.workflows
+        .iter()
+        .filter(|w| matches!(w.status, WorkflowStatus::Pending))
+        .map(|w| format!("{:?} {}", w.kind, w.task))
+        .collect()
+}
+
 // Human-readable label for a workflow kind.
 pub fn kind_label(kind: &WorkflowKind) -> String {
     match kind {
@@ -334,6 +436,15 @@ pub fn enqueue(task: &str, kind: WorkflowKind) -> usize {
         next_fire_ms: None,
     });
     save_pending_locked(&m);
+    drop(m);
+    // Shown at the next prompt, right after the "scheduled" line. (Tests
+    // share the notice queue, so they check schedule_warning directly.)
+    #[cfg(not(test))]
+    if let Some(w) = schedule_warning(id) {
+        if let Ok(mut n) = notices().lock() {
+            n.push(w);
+        }
+    }
     id
 }
 
@@ -365,6 +476,8 @@ pub struct WorkflowSnapshot {
     pub iteration: u32,
     pub elapsed_secs: Option<u64>,
     pub output_lines: usize,
+    /// Why a failed run failed, in one sentence.
+    pub reason: Option<String>,
 }
 
 pub fn snapshots() -> Vec<WorkflowSnapshot> {
@@ -382,6 +495,10 @@ pub fn snapshots() -> Vec<WorkflowSnapshot> {
                 iteration: w.iteration,
                 elapsed_secs,
                 output_lines: w.output.len(),
+                reason: match &w.status {
+                    WorkflowStatus::Failed(why) => Some(why.clone()),
+                    _ => None,
+                },
             }
         })
         .collect()
@@ -457,15 +574,16 @@ fn startable(workflows: &[Workflow], running: usize, limit: usize, now: u64) -> 
 
 // Records a finished subprocess on its workflow: output, status, the next
 // loop iteration, and the on-disk log. Returns the notice to show.
-fn complete(wf: &mut Workflow, lines: Vec<String>, ok: bool, now: u64) -> String {
+fn complete(wf: &mut Workflow, lines: Vec<String>, exit_ok: bool, now: u64) -> String {
+    let failure = failure_reason(&lines, exit_ok);
+    let ok = failure.is_none();
     wf.output.extend(lines);
     wf.finished_ms = Some(now);
     let id = wf.id;
     let label: String = wf.task.chars().take(40).collect();
-    wf.status = if ok {
-        WorkflowStatus::Done
-    } else {
-        WorkflowStatus::Failed("non-zero exit".to_string())
+    wf.status = match &failure {
+        None => WorkflowStatus::Done,
+        Some(why) => WorkflowStatus::Failed(why.clone()),
     };
     // Log the run before a loop reschedule clears the buffer.
     let run_lines = std::mem::take(&mut wf.output);
@@ -482,7 +600,101 @@ fn complete(wf: &mut Workflow, lines: Vec<String>, ok: bool, now: u64) -> String
         }
         format!("  ✓ workflow #{id} done: {label}")
     } else {
-        format!("  ✗ workflow #{id} failed: {label}")
+        let why = failure.unwrap_or_default();
+        if why.starts_with("blocked") {
+            format!("  ✗ workflow #{id} {why} ({label})")
+        } else {
+            format!("  ✗ workflow #{id} failed: {why} ({label})")
+        }
+    }
+}
+
+// Why a finished run did not succeed, in one sentence, from its --json
+// events: a refused change, the run's own outcome, or its error.
+fn failure_reason(lines: &[String], exit_ok: bool) -> Option<String> {
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let field = |ty: &str, key: &str| -> Vec<String> {
+        events
+            .iter()
+            .filter(|e| e["type"] == ty)
+            .filter_map(|e| e[key].as_str().map(str::to_string))
+            .collect()
+    };
+    let denials = field("tool_denied", "reason");
+    if denials.iter().any(|d| d.contains("read-only")) {
+        return Some("blocked: read-only session".into());
+    }
+    if denials
+        .iter()
+        .any(|d| d.contains("no interactive terminal"))
+    {
+        return Some(
+            "blocked: background runs cannot ask for approval — /permissions auto, or run it in the session"
+                .into(),
+        );
+    }
+    if let Some(d) = denials.iter().find(|d| d.starts_with("denied by")) {
+        return Some(format!("blocked: {d}"));
+    }
+    let outcome = field("result", "outcome").pop();
+    if let Some(o) = outcome.as_deref().filter(|o| *o != "success") {
+        return Some(o.replace('_', " "));
+    }
+    if exit_ok {
+        return None;
+    }
+    let error = field("error", "message").pop().or_else(|| {
+        lines
+            .iter()
+            .rev()
+            .filter_map(|l| l.strip_prefix("[stderr] "))
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    });
+    Some(
+        error
+            .map(|e| crate::trace::preview(&e, 160))
+            .unwrap_or_else(|| "the run exited with an error".into()),
+    )
+}
+
+/// One readable line for a captured output line: the run's --json events
+/// become what they mean (a call, a refusal, the summary); stderr and other
+/// text stay as they are; bookkeeping events and advice about terminal
+/// flags are dropped.
+pub fn readable(line: &str) -> Option<String> {
+    let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
+        // The run's own advice to pass --permission-mode does not apply to a
+        // workflow: the refusal line above it says what to do instead.
+        if line.starts_with("[stderr]") && line.contains("--permission-mode") {
+            return None;
+        }
+        return Some(line.to_string());
+    };
+    let s = |k: &str| e[k].as_str().unwrap_or("").trim().to_string();
+    let first = |t: String| t.lines().next().unwrap_or("").to_string();
+    match e["type"].as_str().unwrap_or("") {
+        "assistant" => Some(s("text")).filter(|t| !t.is_empty()),
+        "tool_call" => {
+            let name = s("name");
+            Some(format!("→ {}", crate::tools::preview(&name, &e["input"])))
+        }
+        "tool_result" if e["is_error"] == true => Some(format!("  ✗ {}", first(s("content")))),
+        "tool_result" => Some(format!("  {}", first(s("content")))).filter(|l| l.trim() != ""),
+        "tool_denied" => Some(format!("✗ {}", s("reason"))),
+        "finish" => Some(format!("✓ {}", s("summary"))),
+        "error" => Some(format!("error: {}", s("message"))),
+        "notice" => Some(s("message")).filter(|t| !t.is_empty()),
+        "result" => Some(format!(
+            "result: {} (exit {})",
+            s("outcome").replace('_', " "),
+            e["exit_code"]
+        )),
+        _ => None,
     }
 }
 
@@ -525,12 +737,14 @@ pub fn tick() -> Vec<String> {
         };
         let task = m.workflows[idx].task.clone();
         let id = m.workflows[idx].id;
+        let ctx = context();
         let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let buf2 = buf.clone();
         let child_res = Command::new(&bin)
-            // `--` so a task like "--permission auto …" stays the task text
-            // instead of becoming flags on the child run.
-            .args(["run", "--json", "--", &task])
+            .args(child_args(ctx.as_ref(), &task))
+            // The task is an argument: a headless run reads a pipe on stdin
+            // as more input, and the session's own terminal is not its own.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -631,6 +845,7 @@ pub fn parse_interval_secs(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // One combined test: the manager, the PERSIST flag, and the store file
     // are process-global, so splitting these steps into parallel tests would
@@ -838,6 +1053,16 @@ mod tests {
         assert!(log.contains("iteration 1 [done]") && log.contains("run one"));
         assert!(log.contains("iteration 2 [done]") && log.contains("run two"));
 
+        // A run whose change was refused says so, though it exited 0.
+        let mut ro = wf(900, WorkflowKind::Once, WorkflowStatus::Running, None);
+        let denied = serde_json::json!({"type": "tool_denied",
+            "reason": "read-only mode: mutation skipped"});
+        let note = complete(&mut ro, vec![denied.to_string()], true, now);
+        assert_eq!(
+            note,
+            "  ✗ workflow #900 blocked: read-only session (task 900)"
+        );
+
         // output() falls back to the log when nothing is in memory (restart).
         let lines = output(901);
         assert!(lines.iter().any(|l| l == "hello"));
@@ -848,6 +1073,134 @@ mod tests {
         assert_eq!(highest_logged_id(), 902);
         let _ = std::fs::remove_dir_all(log_dir());
         assert_eq!(highest_logged_id(), 0);
+    }
+
+    #[test]
+    fn background_runs_carry_the_session_permission_and_model() {
+        let ctx = SessionContext {
+            permission: "readonly".into(),
+            provider: "custom".into(),
+            model: "mock-coder".into(),
+            base_url: "http://127.0.0.1:9/v1".into(),
+        };
+        assert_eq!(
+            child_args(Some(&ctx), "--permission auto: create notes.txt"),
+            [
+                "run",
+                "--json",
+                "--permission-mode=readonly",
+                "--provider=custom",
+                "--model=mock-coder",
+                "--base-url=http://127.0.0.1:9/v1",
+                "--",
+                "--permission auto: create notes.txt"
+            ]
+        );
+        // Before a session exists (tests, headless) nothing is added.
+        assert_eq!(child_args(None, "t"), ["run", "--json", "--", "t"]);
+    }
+
+    #[test]
+    fn background_runs_work_in_the_added_folders_too() {
+        let base = std::env::temp_dir().join(format!("bwn-wf-dirs-{}", std::process::id()));
+        let (cwd, other) = (base.join("cwd"), base.join("other"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        crate::workdirs::clear();
+        crate::workdirs::add(&other.display().to_string(), &cwd).unwrap();
+        let other = other.canonicalize().unwrap();
+        assert_eq!(
+            child_args(None, "t"),
+            [
+                "run".to_string(),
+                "--json".into(),
+                format!("--add-dir={}", other.display()),
+                "--".into(),
+                "t".into()
+            ]
+        );
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_failed_run_says_why_in_one_sentence() {
+        let ev = |v: serde_json::Value| v.to_string();
+        let readonly = vec![
+            ev(json!({"type": "tool_denied", "reason": "read-only mode: mutation skipped"})),
+            ev(json!({"type": "result", "outcome": "success", "exit_code": 0})),
+        ];
+        assert_eq!(
+            failure_reason(&readonly, true).as_deref(),
+            Some("blocked: read-only session")
+        );
+        let ask = vec![
+            ev(
+                json!({"type": "tool_denied", "reason": "blocked (no interactive terminal to confirm: edit a)"}),
+            ),
+            ev(json!({"type": "result", "outcome": "approval_blocked", "exit_code": 3})),
+        ];
+        assert!(failure_reason(&ask, false)
+            .unwrap()
+            .starts_with("blocked: background runs cannot ask for approval"));
+        let crashed = vec![
+            ev(json!({"type": "error", "message": "HTTP 401: bad key"})),
+            "[stderr] HTTP 401: bad key".to_string(),
+        ];
+        assert_eq!(
+            failure_reason(&crashed, false).as_deref(),
+            Some("HTTP 401: bad key")
+        );
+        let ok = vec![ev(
+            json!({"type": "result", "outcome": "success", "exit_code": 0}),
+        )];
+        assert_eq!(failure_reason(&ok, true), None);
+    }
+
+    #[test]
+    fn inspect_shows_what_the_events_mean() {
+        let ev = |v: serde_json::Value| v.to_string();
+        assert_eq!(
+            readable(&ev(json!({"type": "tool_call", "name": "write_file",
+                "input": {"path": "notes.txt", "content": "x"}}))),
+            Some(format!(
+                "→ {}",
+                crate::tools::preview("write_file", &json!({"path": "notes.txt", "content": "x"}))
+            ))
+        );
+        assert_eq!(
+            readable(&ev(
+                json!({"type": "tool_denied", "reason": "read-only mode: mutation skipped"})
+            ))
+            .as_deref(),
+            Some("✗ read-only mode: mutation skipped")
+        );
+        assert_eq!(
+            readable(&ev(
+                json!({"type": "result", "outcome": "approval_blocked", "exit_code": 3})
+            ))
+            .as_deref(),
+            Some("result: approval blocked (exit 3)")
+        );
+        assert_eq!(readable(&ev(json!({"type": "usage", "tokens": 3}))), None);
+        assert_eq!(readable("[stderr] boom").as_deref(), Some("[stderr] boom"));
+        // Flags for a terminal run are no help in a background one.
+        assert_eq!(
+            readable("[stderr]   Pass --permission-mode auto to allow them"),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduling_warns_when_the_run_cannot_be_approved() {
+        set_launch("custom", "m", "http://x/v1", "ask");
+        assert!(schedule_warning(4)
+            .unwrap()
+            .contains("background runs cannot ask for approval — edits will be blocked"));
+        update_live("readonly", "m", "http://x/v1");
+        assert!(schedule_warning(4).unwrap().contains("read-only session"));
+        update_live("auto", "m", "http://x/v1");
+        assert_eq!(schedule_warning(4), None);
     }
 
     #[test]

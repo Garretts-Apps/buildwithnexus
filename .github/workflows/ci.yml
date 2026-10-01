@@ -133,6 +133,12 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --locked --no-run
 
+      # The integration tests build the exe too. It must not need the Visual
+      # C++ Redistributable; release.yml checks the release exe the same way.
+      - name: Check the exe needs no Visual C++ runtime
+        if: runner.os == 'Windows'
+        run: node ../scripts/check-pe-imports.js ../target/debug/buildwithnexus.exe
+
   wrapper:
     name: npm wrapper syntax
     runs-on: ubuntu-latest
@@ -154,10 +160,26 @@ jobs:
       - name: Check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
+      # package.json, both crates, Cargo.lock and (for a version with no tag
+      # yet, i.e. a release in the making) CHANGELOG.md must agree, or the
+      # binary is not "ready", the bwn crate resolves the wrong buildwithnexus,
+      # or the release ships without notes. Same tag lookup as release.yml's
+      # gate: a failed lookup fails the check instead of guessing.
+      - name: Check versions agree
+        run: |
+          V=$(node -p "require('./package.json').version")
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1 || rc=$?
+          case $rc in
+            0) node scripts/check-versions.js ;;
+            2) node scripts/check-versions.js --require-changelog ;;
+            *) echo "::error::could not list tags on origin (git ls-remote exit $rc)"; exit 1 ;;
+          esac
+
       # Arguments, plus what the launcher says when the binary cannot start
       # (old glibc, musl, EACCES, removed after install), against stub binaries.
       - name: Test launcher
-        run: node --test scripts/launcher.test.js
+        run: node --test scripts/launcher.test.js scripts/check-pe-imports.test.js
 
   # The launcher is the first thing to fail on a user's machine, so its tests
   # also run on macOS and on Windows Server 2022 (what managed machines run;
@@ -192,6 +214,226 @@ jobs:
 
       - name: Test launcher
         run: node --test scripts/launcher.test.js
+
+  # The GitHub Action (action.yml) as a workflow uses it: the npm package is
+  # packed here and installed by the action like a release, BWN_BIN points
+  # the launcher at the bwn built here, and a local mock stands in for the
+  # model and the GitHub API. Each outcome is checked: a change, a refused
+  # change (exit 3 fails the step), the same refusal allowed, a review with
+  # a blocking finding (exit 9) and a usage error (exit 2).
+  action:
+    name: GitHub Action (npm pack, mock model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Test the action's report script
+        run: node --test scripts/action/report.test.js
+
+      - name: Build bwn
+        run: cargo build --locked -p buildwithnexus
+
+      - name: Pack the npm package
+        id: pack
+        run: |
+          set -euo pipefail
+          tgz="$(npm pack --silent --pack-destination "$RUNNER_TEMP")"
+          echo "tarball=$RUNNER_TEMP/$tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Start the mock model and GitHub API
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mocks"
+          nohup python3 scripts/test-fixtures/action-mocks.py --model-port 18080 --github-port 18081 \
+            --log "$RUNNER_TEMP/mocks" > "$RUNNER_TEMP/mocks/server.log" 2>&1 &
+          for _ in $(seq 1 50); do curl -sf http://127.0.0.1:18080/v1/models >/dev/null && break; sleep 0.2; done
+          curl -sf http://127.0.0.1:18080/v1/models
+
+      - name: Make a project to work in
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proj"
+          cd "$RUNNER_TEMP/proj"
+          git init -q
+          git config user.email ci@example.com
+          git config user.name ci
+          echo seed > README
+          git add README
+          git commit -qm seed
+
+      - name: Run the action (a change, in auto)
+        id: change
+        uses: ./
+        env:
+          BWN_BIN: ${{ github.workspace }}/target/debug/buildwithnexus
+          NEXUS_HOME: ${{ runner.temp }}/nexus-home
+        with:
+          install: ${{ steps.pack.outputs.tarball }}
+          working-directory: ${{ runner.temp }}/proj
+          prompt: create hello.txt
+          permission-mode: auto
+          provider: llamacpp
+          model: mock-coder
+          base-url: http://127.0.0.1:18080/v1
+          comment: "true"
+          pr-number: "7"
+          github-token: token-for-the-mock
+          github-api-url: http://127.0.0.1:18081
+
+      - name: Check the change, its outputs and the comment
+        env:
+          OUTCOME: ${{ steps.change.outputs.outcome }}
+          CODE: ${{ steps.change.outputs.exit-code }}
+          PASSED: ${{ steps.change.outputs.passed }}
+          SUMMARY: ${{ steps.change.outputs.summary }}
+          EVENTS: ${{ steps.change.outputs.events }}
+        run: |
+          set -euo pipefail
+          test "$OUTCOME" = success
+          test "$CODE" = 0
+          test "$PASSED" = true
+          grep -q hello.txt <<< "$SUMMARY"
+          test "$(cat "$RUNNER_TEMP/proj/hello.txt")" = hello
+          grep -q '"type":"result"' "$EVENTS"
+          grep -c '"method": "POST"' "$RUNNER_TEMP/mocks/github.jsonl" | grep -qx 1
+          grep -q 'bwn-action:bwn' "$RUNNER_TEMP/mocks/github.jsonl"
+
+      - name: Run the action (a change, read-only)
+        id: refused
+        continue-on-error: true
+        uses: ./
+        env:
+          BWN_BIN: ${{ github.workspace }}/target/debug/buildwithnexus
+          NEXUS_HOME: ${{ runner.temp }}/nexus-home
+        with:
+          install: ${{ steps.pack.outputs.tarball }}
+          working-directory: ${{ runner.temp }}/proj
+          prompt: create refused.txt
+          provider: llamacpp
+          model: mock-coder
+          base-url: http://127.0.0.1:18080/v1
+          events-file: ${{ runner.temp }}/refused/events.jsonl
+          comment: "true"
+          pr-number: "7"
+          github-token: token-for-the-mock
+          github-api-url: http://127.0.0.1:18081
+
+      - name: Check that a refused change fails the step with exit code 3
+        env:
+          STEP: ${{ steps.refused.outcome }}
+          OUTCOME: ${{ steps.refused.outputs.outcome }}
+          CODE: ${{ steps.refused.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          test "$STEP" = failure
+          test "$OUTCOME" = approval_blocked
+          test "$CODE" = 3
+          grep -q '"outcome":"approval_blocked"' "$RUNNER_TEMP/refused/events.jsonl"
+          test ! -e "$RUNNER_TEMP/proj/refused.txt"
+          # The second run updated the first comment instead of adding one.
+          grep -c '"method": "POST"' "$RUNNER_TEMP/mocks/github.jsonl" | grep -qx 1
+          grep -c '"method": "PATCH"' "$RUNNER_TEMP/mocks/github.jsonl" | grep -qx 1
+
+      - name: Run the action (the same refusal, allowed)
+        id: allowed
+        uses: ./
+        env:
+          BWN_BIN: ${{ github.workspace }}/target/debug/buildwithnexus
+          NEXUS_HOME: ${{ runner.temp }}/nexus-home
+        with:
+          install: ${{ steps.pack.outputs.tarball }}
+          working-directory: ${{ runner.temp }}/proj
+          prompt: create refused.txt
+          provider: llamacpp
+          model: mock-coder
+          base-url: http://127.0.0.1:18080/v1
+          allow-outcomes: approval_blocked
+
+      - name: Check that an allowed outcome passes
+        env:
+          OUTCOME: ${{ steps.allowed.outputs.outcome }}
+          PASSED: ${{ steps.allowed.outputs.passed }}
+        run: |
+          set -euo pipefail
+          test "$OUTCOME" = approval_blocked
+          test "$PASSED" = true
+
+      - name: Run the action (a review with a blocking finding)
+        id: review
+        continue-on-error: true
+        uses: ./
+        env:
+          BWN_BIN: ${{ github.workspace }}/target/debug/buildwithnexus
+          NEXUS_HOME: ${{ runner.temp }}/nexus-home
+        with:
+          command: review
+          install: ${{ steps.pack.outputs.tarball }}
+          working-directory: ${{ runner.temp }}/proj
+          provider: llamacpp
+          model: mock-coder
+          base-url: http://127.0.0.1:18080/v1
+          comment: "true"
+          comment-tag: review
+          pr-number: "7"
+          github-token: token-for-the-mock
+          github-api-url: http://127.0.0.1:18081
+
+      - name: Check that a blocking finding fails the step with exit code 9
+        env:
+          STEP: ${{ steps.review.outcome }}
+          OUTCOME: ${{ steps.review.outputs.outcome }}
+          CODE: ${{ steps.review.outputs.exit-code }}
+          FINDINGS: ${{ steps.review.outputs.findings }}
+        run: |
+          set -euo pipefail
+          test "$STEP" = failure
+          test "$OUTCOME" = review_blocking
+          test "$CODE" = 9
+          test "$FINDINGS" = 2
+          grep -q 'bwn-action:review' "$RUNNER_TEMP/mocks/github.jsonl"
+
+      - name: Run the action (a usage error)
+        id: usage
+        continue-on-error: true
+        uses: ./
+        env:
+          BWN_BIN: ${{ github.workspace }}/target/debug/buildwithnexus
+          NEXUS_HOME: ${{ runner.temp }}/nexus-home
+        with:
+          install: ${{ steps.pack.outputs.tarball }}
+          working-directory: ${{ runner.temp }}/proj
+          prompt: create x.txt
+          permission-mode: yolo
+          provider: llamacpp
+          model: mock-coder
+          base-url: http://127.0.0.1:18080/v1
+          upload-events: "false"
+
+      - name: Check that a usage error fails the step with exit code 2
+        env:
+          STEP: ${{ steps.usage.outcome }}
+          OUTCOME: ${{ steps.usage.outputs.outcome }}
+          CODE: ${{ steps.usage.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+          test "$STEP" = failure
+          test "$OUTCOME" = usage_error
+          test "$CODE" = 2
 
   docs-lint:
     name: Docs command lint

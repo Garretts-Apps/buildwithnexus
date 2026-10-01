@@ -11,6 +11,11 @@ name: release
 # while docs-only merges do nothing. Tag pushes and manual dispatches from
 # main always release. (The tag this workflow creates is made with
 # GITHUB_TOKEN, which never triggers workflows — no recursion.)
+#
+# The release is a draft until the last job: every asset is uploaded and
+# attested first, and only then is it published (and its tag created), so a
+# public release never exists without binaries. v0.14.9 was public for about
+# three minutes with none, and a first run in that window got a 404.
 on:
   push:
     tags: ["v*"]
@@ -83,9 +88,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/ci.yml
 
-  # Creates (or refreshes) the tag + release ONCE, with the CHANGELOG section
-  # as the body and GitHub's auto-generated notes appended. The build matrix
-  # only uploads assets — when this step ran per matrix job with
+  # Creates (or refreshes) the release ONCE, as a draft, with the CHANGELOG
+  # section as the body and GitHub's auto-generated notes appended. The build
+  # matrix only uploads assets — when this step ran per matrix job with
   # append_body: true, every job (and every re-dispatch) appended another
   # copy of the notes. body replacement here makes re-dispatches idempotent.
   release:
@@ -141,10 +146,13 @@ jobs:
           fi
           echo "path=$out" >> "$GITHUB_OUTPUT"
 
-      # target_commitish ties a newly created tag to the commit this run
-      # checked out, not to whatever main points at when the API call lands.
-      # (An existing tag is left where it is.)
-      - name: Create or update release
+      # target_commitish ties the tag, created when the draft is published,
+      # to the commit this run checked out, not to whatever main points at
+      # then. (An existing tag is left where it is.) draft: true on every
+      # softprops call: without it the action publishes a new release as
+      # soon as its own step ends. An existing release keeps its state, so
+      # re-dispatching a shipped version does not hide it.
+      - name: Create or update the draft release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
@@ -152,6 +160,7 @@ jobs:
           body_path: ${{ steps.notes.outputs.path }}
           append_body: false
           generate_release_notes: true
+          draft: true
 
   build:
     needs: [gate, release]
@@ -235,6 +244,16 @@ jobs:
             Write-Error "$env:ASSET has no version resource"
             exit 1
           }
+
+      # .cargo/config.toml links the C runtime statically, so the exe starts
+      # on a Windows without the Visual C++ Redistributable. 0.14.10 and
+      # earlier imported VCRUNTIME140.dll; fail rather than ship that again.
+      - name: Check the exe needs no Visual C++ runtime
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+        run: node scripts/check-pe-imports.js "$ASSET"
 
       # Authenticode signing through SignPath (free for open source projects
       # via the SignPath Foundation). Off until the repository variable
@@ -355,6 +374,7 @@ jobs:
           tag_name: ${{ needs.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: dist/buildwithnexus-*
+          draft: true
 
   # CycloneDX SBOM of every crate compiled into the binary, for teams that
   # review third-party software before allowing it.
@@ -386,6 +406,7 @@ jobs:
           tag_name: ${{ needs.release.outputs.tag }}
           target_commitish: ${{ github.sha }}
           files: buildwithnexus.cdx.json
+          draft: true
 
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
   # Publishing refuses OIDC tokens for workflow_run-triggered jobs, and
@@ -486,3 +507,42 @@ jobs:
           done
           echo "::error::bwn alias crate did not publish after 5 attempts. Re-run this job; buildwithnexus itself is already published."
           exit 1
+
+  # Last: publish the draft once everything is on it. The workflow only
+  # succeeds (and publish.yml, which chains on that, only starts) after this,
+  # so the npm launcher's download never races the assets. Drafts are
+  # invisible to unauthenticated reads, so neither the launcher's download
+  # nor field.yml can see the release before this job.
+  publish-release:
+    needs: [gate, release, assets, sbom, crates]
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # publish the release, which creates the tag
+    steps:
+      - name: Check every asset is on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=0
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
+            for a in "buildwithnexus-$t$ext" "buildwithnexus-$t$ext.sha256"; do
+              grep -qxF "$a" <<<"$have" || { echo "::error::$TAG has no $a"; missing=1; }
+            done
+          done
+          grep -qxF buildwithnexus.cdx.json <<<"$have" || { echo "::error::$TAG has no buildwithnexus.cdx.json"; missing=1; }
+          exit "$missing"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,url

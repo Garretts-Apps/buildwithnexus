@@ -4,6 +4,7 @@
 // module only resolves paths. Node builtins only.
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -67,22 +68,51 @@ function target() {
   }
 }
 
-// Legacy location used by pre-0.12.1 installs (postinstall-downloaded).
-function installedBinary() {
+// ~/.buildwithnexus, or NEXUS_HOME, as the binary resolves it. A relative
+// NEXUS_HOME is ignored here: the launcher runs what it finds in this
+// directory, and a relative path would resolve against the current project.
+function nexusHome() {
+  const h = process.env.NEXUS_HOME;
+  if (h && path.isAbsolute(h)) return h;
+  return path.join(process.env.HOME || process.env.USERPROFILE || os.homedir(), '.buildwithnexus');
+}
+
+function packageVersion() {
+  return require(path.join(ROOT, 'package.json')).version;
+}
+
+// Where releases before 0.15 downloaded the binary: inside this package, so
+// every npm update or reinstall deleted it.
+function legacyBinary() {
   return path.join(ROOT, 'bin', 'buildwithnexus' + ext());
 }
 
-// Written by bootstrap.js after a verified download: { version, sha256 }. If
-// it is here but the binary is not, something removed the binary after it was
-// installed (typically endpoint protection), and downloading it again would
-// only repeat that.
-function installMarker() {
-  return path.join(ROOT, 'bin', '.installed.json');
+// Where the first run downloads the binary for this package version:
+// <home>/bin/<version>/, outside the package so npm leaves it alone, and one
+// directory per version so an upgrade never runs or replaces the old one.
+// BWN_INSTALL_IN_PACKAGE=1 keeps the pre-0.15 location.
+function installDir() {
+  if (process.env.BWN_INSTALL_IN_PACKAGE === '1') return path.join(ROOT, 'bin');
+  return path.join(nexusHome(), 'bin', packageVersion());
 }
 
-function readInstallMarker() {
+function installedBinary() {
+  return path.join(installDir(), 'buildwithnexus' + ext());
+}
+
+// Written by bootstrap.js next to the binary after a verified download:
+// { version, sha256 }. If it is here but the binary is not, something removed
+// the binary after it was installed (typically endpoint protection), and
+// downloading it again would only repeat that.
+function installMarker() {
+  return path.join(installDir(), '.installed.json');
+}
+
+// The marker for `bin`, if `bin` is a downloaded binary (either location).
+function readInstallMarker(bin = installedBinary()) {
+  if (bin !== installedBinary() && bin !== legacyBinary()) return null;
   try {
-    const m = JSON.parse(fs.readFileSync(installMarker(), 'utf8'));
+    const m = JSON.parse(fs.readFileSync(path.join(path.dirname(bin), '.installed.json'), 'utf8'));
     return m && typeof m.version === 'string' ? m : null;
   } catch {
     return null;
@@ -100,13 +130,15 @@ function devBinary() {
   return path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext());
 }
 
-// First existing binary: explicit override, platform package, legacy, dev.
+// First existing binary: explicit override, platform package, downloaded,
+// downloaded by an earlier release, dev.
 function existing() {
-  const candidates = [overrideBinary(), packagedBinary(), installedBinary(), devBinary()].filter(Boolean);
+  const candidates = [overrideBinary(), packagedBinary(), installedBinary(), legacyBinary(), devBinary()]
+    .filter(Boolean);
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
 module.exports = {
-  ROOT, ext, target, platformPackage, packagedBinary, installedBinary, installMarker, readInstallMarker,
-  devBinary, existing, EXIT_EXPLAINED,
+  ROOT, ext, target, platformPackage, packagedBinary, nexusHome, installDir, installedBinary, legacyBinary,
+  installMarker, readInstallMarker, devBinary, existing, EXIT_EXPLAINED,
 };

@@ -1,0 +1,41 @@
+# A buildwithnexus review of every pull request, posted as a comment that
+# later pushes update. Copy to .github/workflows/bwn-review.yml and add the
+# provider's key as a repository secret.
+#
+# Pull requests from forks get no secrets, so the review is skipped there.
+# Do not switch this to pull_request_target: that would run with your
+# secrets on code from the fork.
+name: bwn review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: Garretts-Apps/buildwithnexus@v0.15.0
+        with:
+          command: review
+          review-base: origin/${{ github.base_ref }}
+          provider: anthropic
+          # Read-only whatever this says; the review never edits.
+          permission-mode: readonly
+          max-budget-usd: "1"
+          comment: "true"
+          comment-tag: review
+          # A blocking finding fails the check (exit 9). To only report it:
+          # allow-outcomes: review_blocking
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

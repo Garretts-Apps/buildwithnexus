@@ -8,7 +8,9 @@
 // `complete()` and the streaming `stream()` so there's exactly one place that
 // knows each vendor's JSON shape.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +51,12 @@ pub struct ToolResult {
     pub id: String,
     pub content: String,
     pub is_error: bool,
+    /// Images the tool returned (a file read, a screenshot), as
+    /// `(media_type, base64_data)` pairs like `Msg::UserImages`. Anthropic
+    /// takes them inside the tool_result; the other protocols get them in a
+    /// user turn right after the round's tool messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<(String, String)>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Msg {
@@ -92,14 +100,14 @@ pub struct Reply {
 // fires on a stalled stream. Probes set their own short per-request timeouts.
 // Redirects are off because ureq forwards custom headers such as x-api-key to
 // whatever host a 3xx names; send_raw turns a 3xx into an error instead.
-fn agent() -> &'static ureq::Agent {
-    static A: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+fn agent() -> &'static crate::net::Client {
+    static A: std::sync::OnceLock<crate::net::Client> = std::sync::OnceLock::new();
     A.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(read_timeout_secs()))
-            .redirects(0)
-            .build()
+        crate::net::Client::new(|b| {
+            b.timeout_connect(Duration::from_secs(15))
+                .timeout_read(Duration::from_secs(read_timeout_secs()))
+                .redirects(0)
+        })
     })
 }
 
@@ -177,52 +185,266 @@ fn ollama_root(base_url: &str) -> &str {
 // Installed models reported by a running Ollama (GET /api/tags). Empty on any
 // failure (not running, wrong host, …).
 pub fn ollama_models(base_url: &str) -> Vec<String> {
+    ollama_models_checked(base_url).unwrap_or_default()
+}
+
+/// `ollama_models`, with None when nothing (or not Ollama) answered, so a
+/// server with no models can be told from one that is not running.
+pub fn ollama_models_checked(base_url: &str) -> Option<Vec<String>> {
     let root = ollama_root(base_url);
-    let resp = match agent()
+    let v: Value = agent()
         .get(&format!("{root}/api/tags"))
         .timeout(Duration::from_secs(2))
         .call()
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-    let v: Value = match resp.into_json() {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    v["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+        .ok()?
+        .into_json()
+        .ok()?;
+    Some(
+        v["models"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect(),
+    )
 }
 
 // Models a running OpenAI-compatible server offers (GET {base}/models): LM
 // Studio, llama.cpp, vLLM and friends. Empty on any failure.
 pub fn openai_models(base_url: &str) -> Vec<String> {
-    let resp = match agent()
+    openai_models_checked(base_url).unwrap_or_default()
+}
+
+/// `openai_models`, with None when nothing answered.
+pub fn openai_models_checked(base_url: &str) -> Option<Vec<String>> {
+    openai_models_keyed(base_url, None)
+}
+
+/// `openai_models_checked` for a gateway that lists its models only to a
+/// caller with its key.
+pub fn openai_models_keyed(base_url: &str, key: Option<&str>) -> Option<Vec<String>> {
+    let mut req = agent()
         .get(&format!("{}/models", base_url.trim_end_matches('/')))
-        .timeout(Duration::from_secs(2))
-        .call()
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
+        .timeout(Duration::from_secs(2));
+    if let Some(k) = key {
+        req = req.set("Authorization", &format!("Bearer {k}"));
+    }
+    let v: Value = req.call().ok()?.into_json().ok()?;
+    Some(
+        v["data"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+// ── what a local server reports about its model ───────────────────────────
+
+/// What a local OpenAI-compatible server reports about a model it serves.
+#[derive(Debug, Default, PartialEq)]
+pub struct Served {
+    /// The context window it loaded the model with.
+    pub window: Option<usize>,
+    /// Whether the model takes images, when the server says.
+    pub vision: Option<bool>,
+    /// How many requests the server answers at once (llama.cpp's slots).
+    pub slots: Option<usize>,
+}
+
+/// Ask a local OpenAI-compatible server about `model`: llama.cpp's /props
+/// (per-slot n_ctx, `modalities.vision`), LM Studio's /api/v0/models
+/// (loaded context length, `type` vlm or llm), or vLLM's /models
+/// (max_model_len). Empty when the server says nothing.
+pub fn served_model(base_url: &str, model: &str) -> Served {
+    let root = ollama_root(base_url);
+    let get = |url: String| -> Option<Value> {
+        agent()
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()
     };
-    let v: Value = match resp.into_json() {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let entry = |v: Value| -> Option<Value> {
+        v["data"]
+            .as_array()?
+            .iter()
+            .find(|m| {
+                m["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(model))
+            })
+            .cloned()
     };
-    v["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(str::to_string))
-                .collect()
+    let size = |n: Option<u64>| n.and_then(|n| usize::try_from(n).ok()).filter(|n| *n > 0);
+    if let Some(v) = get(format!("{root}/props")) {
+        let n = v["default_generation_settings"]["n_ctx"]
+            .as_u64()
+            .or_else(|| v["n_ctx"].as_u64());
+        if n.is_some() {
+            return Served {
+                window: size(n),
+                vision: v["modalities"]["vision"].as_bool(),
+                slots: size(v["total_slots"].as_u64()),
+            };
+        }
+    }
+    if let Some(m) = get(format!("{root}/api/v0/models")).and_then(entry) {
+        return Served {
+            window: size(m["loaded_context_length"].as_u64()),
+            vision: match m["type"].as_str() {
+                Some("vlm") => Some(true),
+                Some("llm") => Some(false),
+                _ => None,
+            },
+            slots: None,
+        };
+    }
+    match get(format!("{}/models", base_url.trim_end_matches('/'))).and_then(entry) {
+        Some(m) => Served {
+            window: size(m["max_model_len"].as_u64()),
+            vision: None,
+            slots: None,
+        },
+        None => Served::default(),
+    }
+}
+
+// Image support a server reported, by "origin#model".
+fn reported_visions() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(Default::default)
+}
+
+/// Record what the server said about image support for `p`'s model.
+pub fn remember_vision(p: &Provider, vision: bool) {
+    if let Ok(mut m) = reported_visions().lock() {
+        m.insert(window_key(p), vision);
+    }
+}
+
+/// Whether the server says `p`'s model takes images: Ollama's /api/show
+/// capabilities (asked now if nobody has yet), or what a llama.cpp or LM
+/// Studio server reported at startup. None when it never said.
+pub fn reported_vision(p: &Provider) -> Option<bool> {
+    let known = || reported_visions().lock().ok()?.get(&window_key(p)).copied();
+    if p.protocol == Protocol::OllamaNative && known().is_none() {
+        let _ = ollama_window(p);
+    }
+    known()
+}
+
+// Windows a server reported, or settings set, by "origin#model": only a
+// window known this way may refuse a message before it is sent.
+fn known_windows() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static W: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+fn window_key(p: &Provider) -> String {
+    format!("{}#{}", origin(&p.base_url), p.model)
+}
+
+/// Record that `p.context_tokens` is the real window (reported by the
+/// server or set in settings), not a preset's guess.
+pub fn remember_window(p: &Provider) {
+    if let Ok(mut m) = known_windows().lock() {
+        m.insert(window_key(p), p.context_tokens);
+    }
+}
+
+// Requests a local server reported it answers at once, by "origin#model".
+fn reported_slots() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Record how many requests the server said it answers at once.
+pub fn remember_slots(p: &Provider, n: usize) {
+    if let Ok(mut m) = reported_slots().lock() {
+        m.insert(window_key(p), n);
+    }
+}
+
+/// How many requests `p`'s server said it answers at once, if it did.
+pub fn served_slots(p: &Provider) -> Option<usize> {
+    reported_slots().lock().ok()?.get(&window_key(p)).copied()
+}
+
+/// Whether `p.context_tokens` is the real window, not a preset's guess.
+pub fn window_is_known(p: &Provider) -> bool {
+    known_window(p).is_some()
+}
+
+fn known_window(p: &Provider) -> Option<usize> {
+    if p.protocol == Protocol::OllamaNative {
+        if let Some(Some(n)) = p.ollama_ctx.get() {
+            return Some(*n as usize);
+        }
+    }
+    known_windows().lock().ok()?.get(&window_key(p)).copied()
+}
+
+/// "4.1k" style, as the footer shows token counts.
+pub fn short_tokens(n: usize) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", n as f64 / 1000.0)
+    }
+}
+
+/// Why the last message cannot be sent, when it cannot fit the server's
+/// window on its own: compacting the history cannot make room for it, and
+/// the server's own refusal arrives only after the upload. `request` refuses
+/// such a message; callers drop it from the conversation.
+pub fn oversized_message(p: &Provider, msgs: &[Msg]) -> Option<String> {
+    let window = known_window(p)?;
+    let text = match msgs.last()? {
+        Msg::User(t) => t,
+        Msg::UserImages { text, .. } => text,
+        _ => return None,
+    };
+    let tokens = text.len() / 4;
+    if tokens <= window {
+        return None;
+    }
+    let held = short_tokens(window);
+    Some(match biggest_attachment(text) {
+        Some((path, chars)) if chars / 4 > window / 2 => format!(
+            "{path} is about {} tokens and the server holds {held} — attach a range such as @{path}:1-200",
+            short_tokens(chars / 4)
+        ),
+        _ => format!(
+            "this message is about {} tokens and the server holds {held} — send less, or attach part of a file (@file:1-200)",
+            short_tokens(tokens)
+        ),
+    })
+}
+
+// The largest `[file: <path>]` block in a message (how attachments are
+// written into it), as the path to show and its length in characters.
+fn biggest_attachment(text: &str) -> Option<(String, usize)> {
+    let starts: Vec<usize> = text.match_indices("[file: ").map(|(i, _)| i).collect();
+    let cwd = std::env::current_dir().ok();
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &at)| {
+            let end = starts.get(k + 1).copied().unwrap_or(text.len());
+            let header = &text[at + "[file: ".len()..end];
+            let path = header.split(']').next()?.trim();
+            let shown = cwd
+                .as_deref()
+                .and_then(|c| Path::new(path).strip_prefix(c).ok())
+                .map_or_else(|| path.to_string(), |r| r.display().to_string());
+            Some((shown, end - at))
         })
-        .unwrap_or_default()
+        .max_by_key(|(_, len)| *len)
 }
 
 // ── public entry points ────────────────────────────────────────────────────
@@ -237,6 +459,42 @@ fn is_local_url(url: &str) -> bool {
         || url.contains("127.0.0.1")
         || url.contains("::1")
         || url.contains("0.0.0.0")
+}
+
+/// The model names a server says it serves (Ollama's installed list, or an
+/// OpenAI-compatible /models); empty when it says nothing.
+pub fn served_names(p: &Provider) -> Vec<String> {
+    match p.protocol {
+        Protocol::OllamaNative => ollama_models(&p.base_url),
+        _ => openai_models(&p.base_url),
+    }
+}
+
+/// The names to offer for a model the server does not know: up to eight.
+pub fn served_summary(names: &[String]) -> String {
+    let shown: Vec<String> = names
+        .iter()
+        .take(8)
+        .map(|n| crate::tui::sanitize_terminal(n).into_owned())
+        .collect();
+    match names.len().saturating_sub(shown.len()) {
+        0 => shown.join(", "),
+        more => format!("{}, and {more} more", shown.join(", ")),
+    }
+}
+
+/// A local server that lists what it serves, none of it the model asked
+/// for, yet answered the probe: llama.cpp's server runs whatever it loaded
+/// and ignores the name, so the footer would name a model that is not
+/// answering.
+pub fn unlisted_note(model: &str, names: &[String]) -> Option<String> {
+    if names.is_empty() || names.iter().any(|n| n.eq_ignore_ascii_case(model)) {
+        return None;
+    }
+    Some(format!(
+        "the server lists only {}; it answered the probe, but a server like llama.cpp's answers with whatever it loaded, whatever name is sent",
+        served_summary(names)
+    ))
 }
 
 /// One-token probe through the real completion path — proves the key is
@@ -641,12 +899,29 @@ fn ollama_exchange(
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     let key = format!("{}#{}", req.url(), p.model);
+    let no_think_key = format!("no-think:{key}");
+    if flatten_remembered(&no_think_key) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("think");
+        }
+    }
     if flatten_remembered(&key) {
         flatten_ollama_messages(&mut body);
         return finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking);
     }
     match send_raw(req.clone(), body.clone()) {
         Ok(resp) => finish_ollama(resp, streaming, on_text, on_thinking),
+        // A reasoning effort asked of a model without thinking: drop the
+        // option for this model for the rest of the session and retry, which
+        // still gets the tools fallback below if that is needed too.
+        Err(e) if body.get("think").is_some() && ollama_rejects_thinking(&e) => {
+            remember_flatten(&no_think_key);
+            crate::report::info(&format!(
+                "  ⟳ {} does not support thinking — continuing without it",
+                p.model
+            ));
+            ollama_exchange(p, req, body, streaming, on_text, on_thinking)
+        }
         Err(e) if ollama_rejects_tools(&e) => {
             remember_flatten(&key);
             crate::report::info(&format!(
@@ -658,6 +933,11 @@ fn ollama_exchange(
         }
         Err(e) => Err(e),
     }
+}
+
+// Ollama's 400 for `think` sent to a model without thinking support.
+fn ollama_rejects_thinking(e: &str) -> bool {
+    e.starts_with("HTTP 400") && e.to_lowercase().contains("does not support thinking")
 }
 
 // Ollama's 400 for a model without tool support.
@@ -716,11 +996,30 @@ fn request(
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
-    let reply = request_inner(p, msgs, tools, streaming, on_text, on_thinking)?;
-    let local = p.protocol == Protocol::OllamaNative || is_local_url(&p.base_url);
-    crate::usage::record(&p.model, local, reply.usage);
+    // A spend cap that cannot be counted is not sent past (a /model swap
+    // to an unpriced model mid-session lands here; startup exits earlier).
+    if let Some(why) = budget_guard(p) {
+        return Err(why);
+    }
+    if let Some(why) = oversized_message(p, msgs) {
+        return Err(why);
+    }
+    let reply = request_inner(p, msgs, tools, streaming, on_text, on_thinking)
+        .map_err(|e| explain_failure(p, e))?;
+    crate::usage::record(&p.model, is_free(p), reply.usage);
     remember_thinking(&reply);
     Ok(reply)
+}
+
+// Local servers cost nothing whatever the model is called.
+fn is_free(p: &Provider) -> bool {
+    p.protocol == Protocol::OllamaNative || is_local_url(&p.base_url)
+}
+
+/// Why the session's spend cap cannot hold for this provider's model, if it
+/// cannot (see `usage::unenforceable_budget`).
+pub fn budget_guard(p: &Provider) -> Option<String> {
+    crate::usage::unenforceable_budget(&p.model, is_free(p))
 }
 
 fn request_inner(
@@ -752,11 +1051,11 @@ fn request_inner(
         Protocol::OllamaNative => {
             // The native path exists to set options.num_ctx (unavailable on
             // the OpenAI-compat endpoint, which silently truncates prompts)
-            // and to neutralize the repeat_penalty=1.1 default. A failed
-            // /api/show probe means an older server: fall back to the
-            // {root}/v1 OpenAI-compat endpoint used before, with a one-time
-            // heads-up about the context limitation.
-            match ollama_ctx(p) {
+            // and to neutralize the repeat_penalty=1.1 default. A server
+            // without /api/show is an older one: fall back to the {root}/v1
+            // OpenAI-compat endpoint used before, with a one-time heads-up
+            // about the context limitation.
+            match ollama_window(p)? {
                 Some(num_ctx) => {
                     let (req, mut body) = ollama_request(p, msgs, tools, num_ctx);
                     if streaming {
@@ -881,12 +1180,17 @@ fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
 }
 
 fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
-    let mut attempts = 0;
-    let max_attempts = if is_local_url(req.url()) { 15 } else { 5 };
+    let mut retries = 0;
     let mut delay_ms = 500;
+    // A proxy URL bwn cannot use fails every attempt the same way.
+    let route = agent().proxy_route(req.url());
+    if let Some(r) = &route {
+        if let Some(why) = &r.unusable {
+            return Err(format!("{}: {why}", r.var));
+        }
+    }
 
     loop {
-        attempts += 1;
         let req_clone = req.clone();
         let body_clone = body.clone();
 
@@ -901,14 +1205,11 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
             }
             Ok(resp) => return Ok(resp),
             Err(ureq::Error::Status(code, resp)) => {
-                // The status code alone decides retryability — the body is
-                // never consulted, so an error message that happens to mention
-                // "image" or "not supported" can't turn a transient 429/5xx
-                // into a permanent failure.
-                let is_transient = is_transient_status(code);
                 let server_wait = retry_after_ms(resp.header("retry-after"));
                 let detail = resp.into_string().unwrap_or_default();
-                if is_transient && attempts < max_attempts {
+                let budget = retries_for(code, &detail);
+                if retries < budget {
+                    retries += 1;
                     let wait = server_wait.unwrap_or_else(|| jitter(delay_ms));
                     // Say what's happening — a silent 10s backoff reads as a
                     // frozen UI.
@@ -918,9 +1219,8 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
                         "server busy"
                     };
                     crate::report::info(&format!(
-                        "  ⟳ {why} (HTTP {code}) — retrying in {:.1}s ({attempts}/{})",
+                        "  ⟳ {why} (HTTP {code}) — retrying in {:.1}s ({retries}/{budget})",
                         wait as f64 / 1000.0,
-                        max_attempts - 1
                     ));
                     std::thread::sleep(Duration::from_millis(wait));
                     delay_ms = (delay_ms * 2).min(10_000);
@@ -932,37 +1232,197 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
                 ));
             }
             Err(e) => {
-                // Nothing is listening on a local port: retrying for two
-                // minutes will not start the server, so say what to do.
-                let refused_locally = is_local_url(req.url())
-                    && matches!(&e, ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ConnectionFailed);
-                if refused_locally && attempts >= 2 {
-                    return Err(local_server_down_msg(req.url()));
+                if let Some(hint) = crate::net::cert_error_hint(&e) {
+                    return Err(format!(
+                        "connection failed: {}\n{hint}",
+                        redact(&e.to_string())
+                    ));
                 }
+                let kind = io_kind(&e);
+                // A refused connection means nothing listens on that port,
+                // on this machine or another; one retry covers a server that
+                // is restarting, more will not start it.
+                let refused = kind == Some(std::io::ErrorKind::ConnectionRefused);
+                let budget = if refused { 1 } else { max_retries() };
                 // Only failures before the request went out are safe to
                 // resend. A read timeout or reset after the POST body was
                 // delivered may mean the server is still generating (and
                 // billing) the first attempt.
-                if transport_retryable(&e) && attempts < max_attempts {
+                if transport_retryable(&e) && retries < budget {
+                    retries += 1;
                     let wait = jitter(delay_ms);
                     crate::report::info(&format!(
-                        "  ⟳ connection error — retrying in {:.1}s ({attempts}/{})",
+                        "  ⟳ connection error — retrying in {:.1}s ({retries}/{budget})",
                         wait as f64 / 1000.0,
-                        max_attempts - 1
                     ));
                     std::thread::sleep(Duration::from_millis(wait));
                     delay_ms = (delay_ms * 2).min(10_000);
                     continue;
                 }
-                return Err(format!("connection failed: {}", redact(&e.to_string())));
+                return Err(match &route {
+                    Some(r) => proxy_failure(req.url(), r, &e, kind),
+                    None => transport_failure(req.url(), &e, kind),
+                });
             }
         }
+    }
+}
+
+// A transport failure on a proxied request: name the proxy and the setting,
+// since the server itself was never reached.
+fn proxy_failure(
+    url: &str,
+    r: &crate::net::ProxyRoute,
+    e: &ureq::Error,
+    kind: Option<std::io::ErrorKind>,
+) -> String {
+    let (target, host) = target_of(url);
+    let named = format!("the proxy in {} ({})", r.var, r.shown);
+    let ureq::Error::Transport(t) = e else {
+        return transport_failure(url, e, kind);
+    };
+    match t.kind() {
+        ureq::ErrorKind::ProxyUnauthorized => proxy_credentials_msg(r),
+        ureq::ErrorKind::ProxyConnect => format!(
+            "{named} would not connect to {target} — if {host} is on your network, add it to NO_PROXY"
+        ),
+        ureq::ErrorKind::ConnectionFailed
+            if kind == Some(std::io::ErrorKind::ConnectionRefused) =>
+        {
+            format!(
+                "{named} refused the connection — is it running (VPN connected)? To reach {host} without it, add {host} to NO_PROXY"
+            )
+        }
+        ureq::ErrorKind::ConnectionFailed => format!(
+            "{named} did not answer — is it running and reachable? To reach {host} without it, add {host} to NO_PROXY"
+        ),
+        ureq::ErrorKind::Dns => {
+            format!("{named} could not be found — check the host name in {}", r.var)
+        }
+        _ => format!("{}\n  through {named}", transport_failure(url, e, kind)),
+    }
+}
+
+fn proxy_credentials_msg(r: &crate::net::ProxyRoute) -> String {
+    if r.has_credentials {
+        format!(
+            "the proxy in {} ({}) rejected its user name and password — check them",
+            r.var, r.shown
+        )
+    } else {
+        format!(
+            "the proxy wants credentials — {}=http://user:pass@{}",
+            r.var, r.host_port
+        )
+    }
+}
+
+// "host:port" a request was for, and the host alone.
+fn target_of(url: &str) -> (String, String) {
+    match url::Url::parse(url) {
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("").to_string();
+            let port = u.port_or_known_default().unwrap_or(0);
+            (format!("{host}:{port}"), host)
+        }
+        Err(_) => (origin(url).to_string(), origin(url).to_string()),
     }
 }
 
 fn transport_retryable(e: &ureq::Error) -> bool {
     matches!(e, ureq::Error::Transport(t)
         if matches!(t.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns))
+}
+
+// The io::Error under a transport failure (refused, timed out, …), found by
+// walking the source chain ureq wraps it in.
+fn io_kind(e: &ureq::Error) -> Option<std::io::ErrorKind> {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        src = s.source();
+    }
+    None
+}
+
+// What a transport failure means and what to do about it. Library text
+// ("Network Error: … status line") stays only as the last resort.
+fn transport_failure(url: &str, e: &ureq::Error, kind: Option<std::io::ErrorKind>) -> String {
+    use std::io::ErrorKind;
+    let text = e.to_string();
+    let failed_to_connect =
+        matches!(e, ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ConnectionFailed);
+    match kind {
+        Some(ErrorKind::ConnectionRefused) if failed_to_connect => server_down_msg(url),
+        Some(ErrorKind::TimedOut | ErrorKind::WouldBlock) if failed_to_connect => format!(
+            "nothing answered at {} within 15 s — is the machine on and the server listening on that address?",
+            origin(url)
+        ),
+        Some(ErrorKind::TimedOut | ErrorKind::WouldBlock) => read_timeout_msg(url),
+        _ if text.contains("timed out reading") => read_timeout_msg(url),
+        _ => format!("connection failed: {}", redact(&text)),
+    }
+}
+
+/// A stalled response: the server took the request but sent nothing back
+/// within the read timeout.
+fn read_timeout_msg(url: &str) -> String {
+    let secs = read_timeout_secs();
+    format!(
+        "no answer from {} within {secs} s — a slow machine or a long prompt can need more time: \
+         set BWN_READ_TIMEOUT_SECS (now {secs}) higher, e.g. BWN_READ_TIMEOUT_SECS={}",
+        origin(url),
+        (secs * 3).max(900)
+    )
+}
+
+// scheme://host:port of a URL; the request path means nothing to the user.
+fn origin(url: &str) -> &str {
+    match url.find("://") {
+        Some(i) => url[i + 3..].find('/').map_or(url, |j| &url[..i + 3 + j]),
+        None => url,
+    }
+}
+
+/// Retries for a transient failure: BWN_MAX_RETRIES, else 3.
+fn max_retries() -> u32 {
+    retries_env().unwrap_or(DEFAULT_RETRIES)
+}
+
+fn retries_env() -> Option<u32> {
+    std::env::var("BWN_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|n| n.min(MAX_RETRIES_CAP))
+}
+
+const DEFAULT_RETRIES: u32 = 3;
+const MAX_RETRIES_CAP: u32 = 20;
+// A local server answers 503 while it loads a model, which can take minutes
+// on a slow disk: about two minutes of backoff before giving up.
+const LOADING_RETRIES: u32 = 14;
+
+/// How many times a failed status is worth retrying. Only the status decides
+/// whether a failure is transient; the body can only make it definitive
+/// (out of memory never fixes itself) or patient (a model still loading).
+fn retries_for(code: u16, body: &str) -> u32 {
+    if !is_transient_status(code) || out_of_memory(body) {
+        return 0;
+    }
+    if code == 503 && body.to_ascii_lowercase().contains("loading") {
+        return retries_env().unwrap_or(LOADING_RETRIES);
+    }
+    max_retries()
+}
+
+fn out_of_memory(body: &str) -> bool {
+    let l = body.to_ascii_lowercase();
+    l.contains("requires more system memory")
+        || l.contains("out of memory")
+        || l.contains("insufficient memory")
+        || l.contains("failed to allocate")
 }
 
 // ±20% so clients that failed together don't all retry in the same instant.
@@ -975,17 +1435,302 @@ fn jitter(ms: u64) -> u64 {
     ms * pct / 100
 }
 
-fn local_server_down_msg(url: &str) -> String {
-    // scheme://host:port only; the request path means nothing to the user.
-    let base = match url.find("://") {
-        Some(i) => url[i + 3..].find('/').map_or(url, |j| &url[..i + 3 + j]),
-        None => url,
+// A refused connection. Model servers (anything not https on a public name)
+// get the start-the-server advice; a hosted API gets the network one.
+fn server_down_msg(url: &str) -> String {
+    let base = origin(url);
+    let wrong = if in_session() {
+        "/model <name> or `buildwithnexus init` sets a new one."
+    } else {
+        "--base-url <url> (or base_url in settings.json) sets another; `buildwithnexus init` sets it up again."
     };
+    if url.starts_with("https://") && !is_local_url(url) {
+        return format!(
+            "nothing is answering at {base} — check the address (base_url) and your network or VPN"
+        );
+    }
     format!(
         "nothing is answering at {base} — is the model server running?\n  \
          Ollama: `ollama serve` · LM Studio / llama.cpp: start its server\n  \
-         Wrong address? /model <name> or `buildwithnexus init` sets a new one."
+         Wrong address? {wrong}"
     )
+}
+
+// ── failure wording ────────────────────────────────────────────────────────
+
+static IN_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The interactive UI is running: failure hints may name its slash commands.
+/// Elsewhere (`bwn run`, `review`, the Action) they name flags, settings and
+/// environment variables, which a script can use.
+pub fn set_in_session() {
+    IN_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn in_session() -> bool {
+    IN_SESSION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Who was asked, for the wording of a failure.
+struct FailureContext<'a> {
+    model: &'a str,
+    base: &'a str,
+    has_key: bool,
+    ollama: bool,
+    /// Hints name slash commands (the terminal UI) rather than flags.
+    in_session: bool,
+}
+
+/// A failed request in the person's terms: what happened and what to do on
+/// the first line, the status and the server's own message on the second.
+/// Errors that are not an HTTP status pass through unchanged.
+fn explain_failure(p: &Provider, e: String) -> String {
+    let ctx = FailureContext {
+        model: &p.model,
+        base: origin(&p.base_url),
+        has_key: p.api_key.is_some(),
+        ollama: p.protocol == Protocol::OllamaNative,
+        in_session: in_session(),
+    };
+    let Some((code, body)) = e
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.split_once(": "))
+        .and_then(|(code, body)| Some((code.parse::<u16>().ok()?, body)))
+    else {
+        if e.starts_with("stream read failed") && e.contains("timed out") {
+            return read_timeout_msg(&p.base_url);
+        }
+        return e;
+    };
+    if (300..400).contains(&code) {
+        return e;
+    }
+    match agent().proxy_route(&p.base_url) {
+        Some(r) => match proxy_status(code, body, &r, &p.base_url) {
+            Some(own) => own,
+            None => format!(
+                "{}\n  HTTP {code}: {}\n  sent through the proxy in {} ({})",
+                status_advice(code, body, &ctx),
+                server_message(body),
+                r.var,
+                r.shown
+            ),
+        },
+        None => format!(
+            "{}\n  HTTP {code}: {}",
+            status_advice(code, body, &ctx),
+            server_message(body)
+        ),
+    }
+}
+
+// A status the proxy answered itself: 407, or a bare refusal with no body
+// (an API server explains its errors; a proxy's 403 usually does not).
+fn proxy_status(code: u16, body: &str, r: &crate::net::ProxyRoute, url: &str) -> Option<String> {
+    if code == 407 {
+        return Some(proxy_credentials_msg(r));
+    }
+    if !body.trim().is_empty() {
+        return None;
+    }
+    let (target, host) = target_of(url);
+    Some(format!(
+        "HTTP {code} from proxy {} for {target} — if {host} is on your network, add {host} to NO_PROXY ({} is set)",
+        r.shown, r.var
+    ))
+}
+
+/// The first line of a failed status: what it means for this request.
+fn status_advice(code: u16, body: &str, ctx: &FailureContext) -> String {
+    let lower = body.to_ascii_lowercase();
+    let retried = |n: u32| match n {
+        0 => String::new(),
+        1 => " after 1 retry".to_string(),
+        n => format!(" after {n} retries"),
+    };
+    // What replaces a key or picks a model: a slash command in a session,
+    // otherwise what a script can use.
+    let (replace, add, pick) = if ctx.in_session {
+        (
+            "/login to replace it",
+            "/login to add one",
+            "/model to pick an installed one",
+        )
+    } else {
+        (
+            "`buildwithnexus login` replaces it, or set the provider's API key variable (CUSTOM_API_KEY for --base-url)",
+            "`buildwithnexus login` adds one, or set CUSTOM_API_KEY",
+            "--model <name> to use an installed one",
+        )
+    };
+    match code {
+        401 if ctx.has_key => format!("the API key was rejected by the provider — {replace}"),
+        401 => format!("the server at {} wants an API key — {add}", ctx.base),
+        403 => format!(
+            "the provider refused access to {} — check what the key is allowed to use, or {replace}",
+            ctx.model
+        ),
+        404 if model_missing(&lower) && ctx.ollama => format!(
+            "model {} is not installed on {} — ollama pull {}, or {pick}",
+            ctx.model, ctx.base, ctx.model
+        ),
+        404 if model_missing(&lower) => format!(
+            "the server does not know model {} — {}, or check the name",
+            ctx.model,
+            if ctx.in_session { "/model lists what it serves" } else { "--model <name> picks one it serves" }
+        ),
+        404 => format!(
+            "the server has nothing at this address — check base_url ({}); OpenAI-compatible servers usually end in /v1",
+            ctx.base
+        ),
+        400 | 413 if context_overflow(&lower) => overflow_advice(body),
+        413 => "the request is too large for the server — attach less, or /compact".to_string(),
+        429 => format!(
+            "rate-limited by the provider{} — wait a minute and try again (BWN_MAX_RETRIES sets the retries)",
+            retried(retries_for(code, body))
+        ),
+        _ if out_of_memory(body) => memory_advice(body, ctx.model, ctx.in_session),
+        503 if lower.contains("loading") => format!(
+            "the server is still loading {}{} — wait for it to finish, then send again",
+            ctx.model,
+            retried(retries_for(code, body))
+        ),
+        _ if is_transient_status(code) => format!(
+            "the server failed{} — BWN_MAX_RETRIES changes how often bwn retries",
+            retried(retries_for(code, body))
+        ),
+        _ => "the server refused the request".to_string(),
+    }
+}
+
+fn model_missing(lower: &str) -> bool {
+    lower.contains("model")
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("not installed")
+            || lower.contains("no such model"))
+}
+
+fn context_overflow(lower: &str) -> bool {
+    lower.contains("exceed_context_size")
+        || lower.contains("context size")
+        || lower.contains("context length")
+        || lower.contains("context window")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+}
+
+// "the prompt needs N tokens and the server holds M", from whichever numbers
+// the server put in its message: llama.cpp's n_prompt_tokens/n_ctx fields,
+// LM Studio's "first N tokens … context length of only M", OpenAI's
+// "maximum context length is M … resulted in N", Anthropic's "N tokens > M".
+fn overflow_advice(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let err = if v["error"].is_object() {
+        &v["error"]
+    } else {
+        &v
+    };
+    let field = |k: &str| err[k].as_u64().or_else(|| v[k].as_u64());
+    let text = server_message(body);
+    let nums = numbers_in(&text);
+    let lower = text.to_ascii_lowercase();
+    let (needed, held, fix) = if let (Some(n), Some(c)) = (field("n_prompt_tokens"), field("n_ctx"))
+    {
+        (
+            Some(n),
+            Some(c),
+            "restart llama-server with a larger -c, or set context_tokens",
+        )
+    } else if lower.contains("trying to keep the first") {
+        (
+            nums.first().copied(),
+            nums.get(1).copied(),
+            "load the model in LM Studio with a larger context length, or set context_tokens",
+        )
+    } else if lower.contains("maximum context length") {
+        (
+            nums.get(1).copied(),
+            nums.first().copied(),
+            "/compact, or start a new session",
+        )
+    } else if lower.contains("prompt is too long") {
+        (
+            nums.first().copied(),
+            nums.get(1).copied(),
+            "/compact, or start a new session",
+        )
+    } else {
+        (None, None, "/compact, or set context_tokens")
+    };
+    match (needed, held) {
+        (Some(n), Some(c)) => format!(
+            "the prompt needs {} tokens and the server holds {} — {fix}",
+            group_digits(n),
+            group_digits(c)
+        ),
+        _ => format!("the prompt is larger than the model's context window — {fix}"),
+    }
+}
+
+// "model requires more system memory (5.6 GiB) than is available (3.1 GiB)"
+// is Ollama's; anything else that says out of memory gets the general line.
+fn memory_advice(body: &str, model: &str, in_session: bool) -> String {
+    let smaller = if in_session {
+        "/model"
+    } else {
+        "--model <name>"
+    };
+    let text = server_message(body);
+    let sizes: Vec<&str> = text
+        .split('(')
+        .skip(1)
+        .filter_map(|s| s.split(')').next())
+        .filter(|s| s.ends_with("iB") || s.ends_with("GB") || s.ends_with("MB"))
+        .collect();
+    match sizes.as_slice() {
+        [need, free, ..] => format!(
+            "the model needs {need} but {free} is free — pick a smaller model with {smaller}"
+        ),
+        _ => format!(
+            "the server ran out of memory running {model} — pick a smaller model with {smaller}, or close other programs"
+        ),
+    }
+}
+
+fn numbers_in(text: &str) -> Vec<u64> {
+    text.split(|c: char| !c.is_ascii_digit() && c != ',')
+        .filter_map(|w| w.replace(',', "").parse::<u64>().ok())
+        .collect()
+}
+
+fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The server's own words from an error body: `error.message`, a string
+/// `error`, or `message`; the raw text when it is not JSON.
+fn server_message(body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let msg = v["error"]["message"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .or_else(|| v["message"].as_str())
+        .map_or_else(|| body.trim().to_string(), str::to_string);
+    let msg = if msg.is_empty() {
+        "(no message)".to_string()
+    } else {
+        msg
+    };
+    redact(&msg).chars().take(300).collect()
 }
 
 // Retryable status codes: rate limits (429), Anthropic's overloaded (529), and
@@ -1004,7 +1749,7 @@ fn retry_after_ms(header: Option<&str>) -> Option<u64> {
 
 // Defense-in-depth: blank out anything that looks like an API key/token before
 // surfacing an upstream error body to the user or logs.
-fn redact(s: &str) -> String {
+pub(crate) fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
         .map(|tok| {
             let core =
@@ -1130,7 +1875,7 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Opti
                     .map(|r| {
                         json!({
                             "type": "tool_result", "tool_use_id": r.id,
-                            "content": r.content, "is_error": r.is_error
+                            "content": anthropic_tool_content(r), "is_error": r.is_error
                         })
                     })
                     .collect();
@@ -1163,6 +1908,50 @@ fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Opti
             .collect::<Vec<_>>());
     }
     body
+}
+
+// A tool_result's content: the text alone, or text and image blocks when
+// the tool returned images (an empty text block is refused by the API).
+fn anthropic_tool_content(r: &ToolResult) -> Value {
+    if r.images.is_empty() {
+        return json!(r.content);
+    }
+    let mut parts = Vec::new();
+    if !r.content.is_empty() {
+        parts.push(json!({"type": "text", "text": r.content}));
+    }
+    parts.extend(r.images.iter().map(|(mt, data)| {
+        json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mt, "data": data}
+        })
+    }));
+    json!(parts)
+}
+
+// Tool messages on the OpenAI and Ollama protocols carry text only, so the
+// images a round of tools returned follow it in one user turn. Each set is
+// named by the call it came from; `None` when no result had an image.
+fn tool_images_intro(results: &[ToolResult], names: &HashMap<&str, &str>) -> Option<String> {
+    let lines: Vec<String> = results
+        .iter()
+        .filter(|r| !r.images.is_empty())
+        .map(|r| tool_images_label(r, names))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn tool_images_label(r: &ToolResult, names: &HashMap<&str, &str>) -> String {
+    let n = r.images.len();
+    let what = if n == 1 {
+        "1 image".to_string()
+    } else {
+        format!("{n} images")
+    };
+    match names.get(r.id.as_str()) {
+        Some(name) => format!("[{what} returned by the {name} call {}]", r.id),
+        None => format!("[{what} returned by tool call {}]", r.id),
+    }
 }
 
 fn anthropic_request(
@@ -1511,20 +2300,13 @@ fn openai_body(
     if !system.is_empty() {
         messages.push(json!({"role": "system", "content": system}));
     }
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
             Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images
-                    .iter()
-                    .map(|(mt, data)| {
-                        json!({
-                            "type": "image_url",
-                            "image_url": {"url": format!("data:{mt};base64,{data}")}
-                        })
-                    })
-                    .collect();
+                let mut parts: Vec<Value> = images.iter().map(openai_image_part).collect();
                 parts.push(json!({"type": "text", "text": text}));
                 messages.push(json!({"role": "user", "content": parts}));
             }
@@ -1538,6 +2320,9 @@ fn openai_body(
                             "function": {"name": c.name, "arguments": c.input.to_string()}
                         }))
                         .collect::<Vec<_>>());
+                    for c in calls {
+                        call_names.insert(&c.id, &c.name);
+                    }
                 }
                 messages.push(msg);
             }
@@ -1545,6 +2330,18 @@ fn openai_body(
                 for r in results {
                     messages
                         .push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
+                }
+                // After every tool message of the round: a user turn between
+                // them would orphan the calls that follow it.
+                if tool_images_intro(results, &call_names).is_some() {
+                    let mut parts: Vec<Value> = Vec::new();
+                    for r in results.iter().filter(|r| !r.images.is_empty()) {
+                        parts.push(
+                            json!({"type": "text", "text": tool_images_label(r, &call_names)}),
+                        );
+                        parts.extend(r.images.iter().map(openai_image_part));
+                    }
+                    messages.push(json!({"role": "user", "content": parts}));
                 }
             }
         }
@@ -1564,6 +2361,13 @@ fn openai_body(
         })).collect::<Vec<_>>());
     }
     body
+}
+
+fn openai_image_part((mt, data): &(String, String)) -> Value {
+    json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{mt};base64,{data}")}
+    })
 }
 
 fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
@@ -1946,21 +2750,119 @@ fn ollama_pick_ctx(model_max: Option<u64>, modelfile_ctx: Option<u64>) -> u32 {
     u32::try_from(picked).unwrap_or(u32::MAX)
 }
 
-// Cached /api/show probe — queried once per Provider (the OnceLock). Returns
-// the chosen num_ctx, or None when the probe failed (server down, or an
-// Ollama old enough to lack /api/show); callers then use the OpenAI-compat
-// fallback. lib.rs pre-seeds the cache when settings override the context.
+// What /api/show says about the configured model.
+enum Show {
+    /// The num_ctx to request.
+    Known(u32),
+    /// The server answered: it has no model by that name.
+    Missing,
+    /// No /api/show at all: an Ollama old enough to need /v1.
+    Unsupported,
+    /// Nothing listens at the address.
+    Refused,
+    /// No usable answer this time (busy, slow): ask again next request.
+    NoAnswer,
+}
+
+fn probe_show(p: &Provider) -> Show {
+    let root = ollama_root(&p.base_url);
+    let res = agent()
+        .post(&format!("{root}/api/show"))
+        .timeout(Duration::from_secs(3))
+        .send_json(json!({"model": p.model}));
+    match res {
+        Ok(resp) => match resp.into_json::<Value>() {
+            Ok(v) => {
+                // Ollama 0.6+ lists what the model can do ("completion",
+                // "tools", "vision", …); older servers send no list.
+                if let Some(caps) = v["capabilities"].as_array() {
+                    remember_vision(p, caps.iter().any(|c| c == "vision"));
+                }
+                Show::Known(ollama_pick_ctx(show_context_length(&v), show_num_ctx(&v)))
+            }
+            Err(_) => Show::NoAnswer,
+        },
+        // Ollama's own 404 names the model; a router's "404 page not
+        // found" means the endpoint itself is missing.
+        Err(ureq::Error::Status(404, resp)) => {
+            if model_missing(&resp.into_string().unwrap_or_default().to_ascii_lowercase()) {
+                Show::Missing
+            } else {
+                Show::Unsupported
+            }
+        }
+        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::ConnectionRefused) => Show::Refused,
+        Err(_) => Show::NoAnswer,
+    }
+}
+
+// The num_ctx for /api/chat: Some(n) for the native path, None for an old
+// server that only has /v1, Err when there is nothing to send to (the model
+// is not installed, or nothing listens). Only a definitive answer is kept
+// for the session (the OnceLock, which lib.rs pre-seeds when settings set
+// context_tokens): a server that is down or busy is asked again on the next
+// request, so one started after bwn gets the native path and its window.
+fn ollama_window(p: &Provider) -> Result<Option<u32>, String> {
+    if let Some(known) = p.ollama_ctx.get() {
+        return Ok(*known);
+    }
+    match probe_show(p) {
+        Show::Known(n) => {
+            let _ = p.ollama_ctx.set(Some(n));
+            Ok(Some(n))
+        }
+        Show::Unsupported => {
+            let _ = p.ollama_ctx.set(None);
+            Ok(None)
+        }
+        Show::Missing => Err(missing_model_msg(p)),
+        Show::Refused => Err(server_down_msg(&p.base_url)),
+        Show::NoAnswer => Ok(Some(OLLAMA_CTX_FLOOR)),
+    }
+}
+
+/// The window the server reported for this model, probing it if nobody has
+/// yet; None when it is not known (yet).
 pub fn ollama_ctx(p: &Provider) -> Option<u32> {
-    *p.ollama_ctx.get_or_init(|| {
-        let v: Value = agent()
-            .post(&format!("{}/api/show", ollama_root(&p.base_url)))
-            .timeout(Duration::from_secs(3))
-            .send_json(json!({"model": p.model}))
-            .ok()?
-            .into_json()
-            .ok()?;
-        Some(ollama_pick_ctx(show_context_length(&v), show_num_ctx(&v)))
-    })
+    let _ = ollama_window(p);
+    p.ollama_ctx.get().copied().flatten()
+}
+
+/// A problem worth a line under the startup banner: the configured Ollama
+/// model is not installed, or nothing answers at the address yet.
+pub fn startup_problem(p: &Provider) -> Option<String> {
+    if p.protocol != Protocol::OllamaNative {
+        return None;
+    }
+    ollama_window(p).err()
+}
+
+fn missing_model_msg(p: &Provider) -> String {
+    let base = origin(&p.base_url);
+    // Names come from whatever answers on the Ollama port.
+    let installed: Vec<String> = ollama_models(&p.base_url)
+        .iter()
+        .map(|m| crate::tui::sanitize_terminal(m).into_owned())
+        .collect();
+    match installed.first() {
+        Some(first) => {
+            let shown = installed
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "model {m} is not installed on {base} — installed: {shown} · ollama pull {m}, or {use_}{first}",
+                m = p.model,
+                use_ = if in_session() { "/model " } else { "--model " }
+            )
+        }
+        None => format!(
+            "model {m} is not installed on {base}, and Ollama has no models yet — ollama pull {m}",
+            m = p.model
+        ),
+    }
 }
 
 // One-line heads-up, once per process, when falling back to /v1: without
@@ -2002,7 +2904,7 @@ fn ollama_body(
     // Ollama tool-call messages carry no ids on the wire, so tool results are
     // threaded by name instead: map call ids to names while walking the
     // transcript, then stamp tool_name on each result.
-    let mut call_names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
@@ -2035,6 +2937,15 @@ fn ollama_body(
                         msg["tool_name"] = json!(name);
                     }
                     messages.push(msg);
+                }
+                // Images go on a user turn, the role every vision template
+                // renders them for.
+                if let Some(intro) = tool_images_intro(results, &call_names) {
+                    let imgs: Vec<&str> = results
+                        .iter()
+                        .flat_map(|r| r.images.iter().map(|(_, data)| data.as_str()))
+                        .collect();
+                    messages.push(json!({"role": "user", "content": intro, "images": imgs}));
                 }
             }
         }
@@ -2254,15 +3165,327 @@ fn ollama_stream(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_name_the_server_does_not_list_is_noted_and_the_list_is_short() {
+        let names = vec!["tinycoder-7b-q4_k_m.gguf".to_string()];
+        assert!(unlisted_note("TinyCoder-7B-Q4_K_M.gguf", &names).is_none());
+        assert!(unlisted_note("anything", &[]).is_none());
+        let m = unlisted_note("tinycoder:9b", &names).unwrap();
+        assert!(
+            m.starts_with("the server lists only tinycoder-7b-q4_k_m.gguf;"),
+            "{m}"
+        );
+        let many: Vec<String> = (0..11).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            served_summary(&many),
+            "m0, m1, m2, m3, m4, m5, m6, m7, and 3 more"
+        );
+    }
+
     use super::*;
     use std::io::Cursor;
 
     #[test]
-    fn local_server_down_msg_names_host_not_path() {
-        let m = local_server_down_msg("http://127.0.0.1:11434/v1/chat/completions");
+    fn server_down_msg_names_host_not_path() {
+        let m = server_down_msg("http://127.0.0.1:11434/v1/chat/completions");
         assert!(m.contains("http://127.0.0.1:11434 "));
         assert!(!m.contains("/v1/"));
         assert!(m.contains("ollama serve"));
+        // A model server on the local network gets the same advice.
+        let m = server_down_msg("http://192.168.50.10:11434/api/chat");
+        assert!(m.contains("nothing is answering at http://192.168.50.10:11434 "));
+        assert!(m.contains("ollama serve"));
+        // A hosted API gets the network advice instead.
+        let m = server_down_msg("https://api.example.com/v1/chat/completions");
+        assert!(m.contains("https://api.example.com"), "{m}");
+        assert!(!m.contains("ollama serve"), "{m}");
+    }
+
+    fn ctx<'a>(model: &'a str, has_key: bool, ollama: bool) -> FailureContext<'a> {
+        FailureContext {
+            model,
+            base: "http://192.168.50.10:11434",
+            has_key,
+            ollama,
+            in_session: true,
+        }
+    }
+
+    fn explained(code: u16, body: &str, c: &FailureContext) -> String {
+        format!(
+            "{}\n  HTTP {code}: {}",
+            status_advice(code, body, c),
+            server_message(body)
+        )
+    }
+
+    #[test]
+    fn a_script_is_told_flags_and_variables_not_slash_commands() {
+        let mut c = ctx("gpt-4o", true, false);
+        c.in_session = false;
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with("the API key was rejected by the provider — `buildwithnexus login`")
+                && m.contains("CUSTOM_API_KEY")
+                && !m.contains("/login"),
+            "{m}"
+        );
+        c.has_key = false;
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.contains("wants an API key") && !m.contains("/login"),
+            "{m}"
+        );
+        let m = explained(404, r#"{"error":"model not found"}"#, &c);
+        assert!(m.contains("--model <name>") && !m.contains("/model"), "{m}");
+        let m = explained(
+            500,
+            r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            &ctx("m", false, true),
+        );
+        assert!(
+            m.contains("smaller model with /model"),
+            "session wording stays: {m}"
+        );
+        let mut o = ctx("m", false, true);
+        o.in_session = false;
+        let m = explained(
+            500,
+            r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            &o,
+        );
+        assert!(
+            m.contains("smaller model with --model <name>") && !m.contains("with /model"),
+            "{m}"
+        );
+        // Not in a session (the default here): the unreachable-server hint names --base-url.
+        let m = server_down_msg("http://127.0.0.1:1/v1");
+        assert!(
+            m.contains("--base-url <url>") && !m.contains("/model"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn statuses_map_to_what_happened_and_what_to_do() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("BWN_MAX_RETRIES");
+        let hosted = ctx("gpt-4o", true, false);
+        let m = explained(401, r#"{"error":{"message":"invalid api key"}}"#, &hosted);
+        assert!(
+            m.starts_with("the API key was rejected by the provider — /login to replace it"),
+            "{m}"
+        );
+        assert!(m.ends_with("HTTP 401: invalid api key"), "{m}");
+        assert!(explained(401, "{}", &ctx("m", false, false)).contains("wants an API key"));
+
+        let ollama = ctx("tinycoder:7b", false, true);
+        let m = explained(
+            404,
+            r#"{"error":"model \"tinycoder:7b\" not found, try pulling it first"}"#,
+            &ollama,
+        );
+        assert!(
+            m.contains("model tinycoder:7b is not installed on http://192.168.50.10:11434"),
+            "{m}"
+        );
+        assert!(m.contains("ollama pull tinycoder:7b"), "{m}");
+        let m = explained(
+            404,
+            r#"{"error":{"message":"The model `gpt-9` does not exist"}}"#,
+            &hosted,
+        );
+        assert!(m.contains("does not know model gpt-4o"), "{m}");
+        assert!(explained(404, "404 page not found", &hosted).contains("check base_url"));
+
+        let m = explained(
+            400,
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":2150,"n_ctx":2048}}"#,
+            &ctx("tiny.gguf", false, false),
+        );
+        assert!(
+            m.starts_with("the prompt needs 2,150 tokens and the server holds 2,048 — restart llama-server with a larger -c, or set context_tokens"),
+            "{m}"
+        );
+        let m = explained(
+            400,
+            r#"{"error":"Trying to keep the first 56390 tokens when context the overflows. However, the model is loaded with context length of only 4096 tokens, which is not enough."}"#,
+            &ctx("tiny", false, false),
+        );
+        assert!(
+            m.starts_with("the prompt needs 56,390 tokens and the server holds 4,096"),
+            "{m}"
+        );
+        // The server's own words stay, so the agent's overflow recovery
+        // still recognises the failure.
+        assert!(m.contains("context length"), "{m}");
+        let m = explained(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130500 tokens."}}"#,
+            &hosted,
+        );
+        assert!(
+            m.starts_with("the prompt needs 130,500 tokens and the server holds 128,000"),
+            "{m}"
+        );
+
+        let m = explained(
+            500,
+            r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            &ollama,
+        );
+        assert!(
+            m.starts_with(
+                "the model needs 5.6 GiB but 3.1 GiB is free — pick a smaller model with /model"
+            ),
+            "{m}"
+        );
+        let m = explained(500, r#"{"error":{"message":"upstream exploded"}}"#, &hosted);
+        assert!(
+            m.starts_with("the server failed after 3 retries — BWN_MAX_RETRIES"),
+            "{m}"
+        );
+        assert!(m.ends_with("HTTP 500: upstream exploded"), "{m}");
+        let m = explained(503, r#"{"error":{"message":"Loading model"}}"#, &ollama);
+        assert!(
+            m.starts_with("the server is still loading tinycoder:7b after 14 retries"),
+            "{m}"
+        );
+        assert!(explained(429, "{}", &hosted)
+            .starts_with("rate-limited by the provider after 3 retries"));
+    }
+
+    #[test]
+    fn definitive_failures_are_not_retried() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("BWN_MAX_RETRIES");
+        for (code, body) in [
+            (400, "{}"),
+            (401, "{}"),
+            (404, r#"{"error":"model not found"}"#),
+            (
+                500,
+                r#"{"error":"model requires more system memory (5.6 GiB) than is available (3.1 GiB)"}"#,
+            ),
+            (500, r#"{"error":"CUDA error: out of memory"}"#),
+        ] {
+            assert_eq!(retries_for(code, body), 0, "{code} {body}");
+        }
+        assert_eq!(retries_for(500, r#"{"error":"boom"}"#), 3);
+        assert_eq!(retries_for(429, "{}"), 3);
+        assert_eq!(retries_for(503, r#"{"error":"Loading model"}"#), 14);
+        std::env::set_var("BWN_MAX_RETRIES", "0");
+        assert_eq!(retries_for(500, r#"{"error":"boom"}"#), 0);
+        assert_eq!(retries_for(503, "Loading model"), 0);
+        std::env::set_var("BWN_MAX_RETRIES", "999");
+        assert_eq!(retries_for(500, "{}"), MAX_RETRIES_CAP);
+        std::env::remove_var("BWN_MAX_RETRIES");
+    }
+
+    // A one-shot proxy that answers its first request with `reply`.
+    fn proxy_answering(reply: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn through(proxy: &str, url: &str) -> String {
+        let client = crate::net::Client::with_lookup(
+            |k: &str| (k == "HTTPS_PROXY").then(|| proxy.to_string()),
+            |b| b,
+        );
+        let e = client.get(url).call().unwrap_err();
+        let route = client.proxy_route(url).unwrap();
+        proxy_failure(url, &route, &e, io_kind(&e))
+    }
+
+    #[test]
+    fn proxy_failures_name_the_proxy_and_the_setting() {
+        let url = "https://gw.example.test/v1/chat/completions";
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let m = through(&format!("http://127.0.0.1:{closed}"), url);
+        assert!(
+            m.starts_with(&format!(
+                "the proxy in HTTPS_PROXY (http://127.0.0.1:{closed}) refused the connection"
+            )),
+            "{m}"
+        );
+        assert!(m.contains("add gw.example.test to NO_PROXY"), "{m}");
+
+        let port = proxy_answering(
+            "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+        );
+        let m = through(&format!("http://127.0.0.1:{port}"), url);
+        assert_eq!(
+            m,
+            format!("the proxy wants credentials — HTTPS_PROXY=http://user:pass@127.0.0.1:{port}")
+        );
+
+        let port = proxy_answering("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let m = through(&format!("http://127.0.0.1:{port}"), url);
+        assert!(
+            m.contains("would not connect to gw.example.test:443"),
+            "{m}"
+        );
+        assert!(m.contains("NO_PROXY"), "{m}");
+    }
+
+    #[test]
+    fn a_bare_refusal_from_a_proxy_is_named_as_the_proxy() {
+        let r = crate::net::ProxyRoute {
+            var: "HTTP_PROXY",
+            shown: "http://127.0.0.1:19109".into(),
+            host_port: "127.0.0.1:19109".into(),
+            has_credentials: false,
+            unusable: None,
+        };
+        let m = proxy_status(403, "", &r, "http://vm:19100/v1").unwrap();
+        assert!(
+            m.starts_with("HTTP 403 from proxy http://127.0.0.1:19109 for vm:19100 — if vm is on your network, add vm to NO_PROXY"),
+            "{m}"
+        );
+        assert!(proxy_status(403, r#"{"error":"no"}"#, &r, "http://vm:19100/v1").is_none());
+        assert!(proxy_status(407, "", &r, "http://vm:19100/v1")
+            .unwrap()
+            .contains("HTTP_PROXY=http://user:pass@127.0.0.1:19109"));
+    }
+
+    #[test]
+    fn a_stalled_response_names_the_read_timeout_setting() {
+        let p = Provider {
+            protocol: Protocol::OllamaNative,
+            base_url: "http://localhost:11434".into(),
+            api_key: None,
+            model: "tinycoder:3b".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        };
+        let m = explain_failure(
+            &p,
+            "stream read failed: Network Error: timed out reading response".into(),
+        );
+        assert!(m.contains("BWN_READ_TIMEOUT_SECS"), "{m}");
+        assert!(m.contains("http://localhost:11434"), "{m}");
+        // Anything that is not a status or a timeout passes through.
+        assert_eq!(explain_failure(&p, "interrupted".into()), "interrupted");
     }
 
     type Captured = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
@@ -2544,12 +3767,136 @@ mod tests {
             id: "t1".into(),
             content: "ok".into(),
             is_error: false,
+            images: Vec::new(),
         }])];
         let b = anthropic_body("m", &msgs, &[], None);
         let block = &b["messages"][0]["content"][0];
         assert_eq!(block["type"], "tool_result");
         assert_eq!(block["tool_use_id"], "t1");
         assert_eq!(block["is_error"], false);
+        // Text only: the content stays a plain string.
+        assert_eq!(block["content"], "ok");
+    }
+
+    // A round where one tool returned an image and one did not, after the
+    // assistant turn that made both calls.
+    fn image_round() -> Vec<Msg> {
+        vec![
+            Msg::Assistant {
+                text: String::new(),
+                calls: vec![
+                    tc("c1", "read_file", json!({"path": "a.png"})),
+                    tc("c2", "read_file", json!({"path": "b.txt"})),
+                ],
+            },
+            Msg::Tool(vec![
+                ToolResult {
+                    id: "c1".into(),
+                    content: "image a.png".into(),
+                    is_error: false,
+                    images: vec![("image/png".into(), "QUJD".into())],
+                },
+                ToolResult {
+                    id: "c2".into(),
+                    content: "hello".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                },
+            ]),
+        ]
+    }
+
+    #[test]
+    fn anthropic_body_puts_tool_images_inside_the_tool_result() {
+        let b = anthropic_body("m", &image_round(), &[], None);
+        let results = &b["messages"][1]["content"];
+        assert_eq!(
+            results[0]["content"],
+            json!([
+                {"type": "text", "text": "image a.png"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+            ])
+        );
+        assert_eq!(results[1]["content"], "hello");
+        // No empty text block when the tool said nothing.
+        let mut bare = image_round();
+        if let Msg::Tool(rs) = &mut bare[1] {
+            rs[0].content.clear();
+        }
+        let b = anthropic_body("m", &bare, &[], None);
+        assert_eq!(
+            b["messages"][1]["content"][0]["content"][0]["type"],
+            "image"
+        );
+    }
+
+    #[test]
+    fn openai_body_follows_the_tool_messages_with_their_images() {
+        let b = openai_body("m", &image_round(), &[], None, None);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(m[1]["role"], "tool");
+        assert_eq!(m[1]["content"], "image a.png");
+        assert_eq!(m[2]["role"], "tool");
+        assert_eq!(m[3]["role"], "user");
+        assert_eq!(
+            m[3]["content"],
+            json!([
+                {"type": "text", "text": "[1 image returned by the read_file call c1]"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+            ])
+        );
+        // A round without images adds nothing.
+        let b = openai_body("m", &image_round()[..1], &[], None, None);
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ollama_body_follows_the_tool_messages_with_their_images() {
+        let b = ollama_body("m", &image_round(), &[], None, None, 8_192);
+        let m = b["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4, "{m:?}");
+        assert_eq!(m[1]["role"], "tool");
+        assert!(m[1].get("images").is_none());
+        assert_eq!(m[3]["role"], "user");
+        assert_eq!(
+            m[3]["content"],
+            "[1 image returned by the read_file call c1]"
+        );
+        assert_eq!(m[3]["images"], json!(["QUJD"]));
+    }
+
+    #[test]
+    fn flattened_requests_keep_tool_images_on_the_user_turn() {
+        let mut msgs = vec![Msg::User("look at a.png".into())];
+        msgs.extend(image_round());
+        let mut b = openai_body("m", &msgs, &[], None, None);
+        flatten_openai_messages(&mut b, true);
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0]["image_url"]["url"], "data:image/png;base64,QUJD",
+            "{last}"
+        );
+        let mut b = ollama_body("m", &msgs, &[], None, None, 8_192);
+        flatten_ollama_messages(&mut b);
+        let last = b["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["images"], json!(["QUJD"]), "{last}");
+    }
+
+    #[test]
+    fn tool_images_survive_a_session_round_trip_and_old_files_still_load() {
+        let r: ToolResult =
+            serde_json::from_str(r#"{"id":"a","content":"x","is_error":false}"#).unwrap();
+        assert!(r.images.is_empty());
+        let Msg::Tool(rs) = &image_round()[1] else {
+            unreachable!()
+        };
+        let text = serde_json::to_string(&rs[..]).unwrap();
+        assert_eq!(text.matches("images").count(), 1, "{text}");
+        let back: Vec<ToolResult> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back[0].images, rs[0].images);
     }
 
     #[test]
@@ -2785,17 +4132,54 @@ mod tests {
     }
 
     #[test]
+    fn ollama_retries_without_thinking_when_the_model_has_none_and_remembers() {
+        let ok =
+            r#"{"message":{"role":"assistant","content":"y"},"done":true,"done_reason":"stop"}"#;
+        let reject =
+            r#"{"error":"registry.ollama.ai/library/llama3.2:latest does not support thinking"}"#;
+        let (base, handle, bodies) = mock_server_capture(vec![(400, reject), (200, ok), (200, ok)]);
+        let p = Provider {
+            protocol: Protocol::OllamaNative,
+            base_url: base,
+            api_key: None,
+            model: "llama3.2:latest".into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::High,
+            ollama_ctx: std::sync::OnceLock::from(Some(8_192)),
+        };
+        let msgs = [Msg::User("hi".into())];
+        assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
+        assert_eq!(complete(&p, &msgs, &[]).unwrap().text, "y");
+        handle.join().unwrap();
+        let sent: Vec<Value> = bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 3, "400 → retry, then one remembered call");
+        assert_eq!(sent[0]["think"], true);
+        for retry in &sent[1..] {
+            assert!(retry.get("think").is_none(), "{retry}");
+        }
+    }
+
+    #[test]
     fn openai_body_tool_results_each_become_a_message() {
         let msgs = vec![Msg::Tool(vec![
             ToolResult {
                 id: "a".into(),
                 content: "1".into(),
                 is_error: false,
+                images: Vec::new(),
             },
             ToolResult {
                 id: "b".into(),
                 content: "2".into(),
                 is_error: true,
+                images: Vec::new(),
             },
         ])];
         let b = openai_body("m", &msgs, &[], None, None);
@@ -3054,7 +4438,7 @@ mod tests {
     // ── transport: timeouts, retries, redirects ────────────────────────────
     #[test]
     fn shared_agent_has_no_overall_deadline_and_follows_no_redirects() {
-        let dbg = format!("{:?}", agent());
+        let dbg = format!("{:?}", agent().agent_for("https://api.example.com"));
         assert!(dbg.contains("timeout: None"), "{dbg}");
         assert!(dbg.contains("timeout_read: Some("), "{dbg}");
         assert!(dbg.contains("timeout_connect: Some(15s)"), "{dbg}");
@@ -3088,7 +4472,7 @@ mod tests {
             .post(&format!("{base}/v1/chat/completions"))
             .timeout(Duration::from_millis(300));
         let err = send_raw(req, json!({"model": "m"})).unwrap_err();
-        assert!(err.contains("connection failed"), "got: {err}");
+        assert!(err.contains("BWN_READ_TIMEOUT_SECS"), "got: {err}");
         assert_eq!(handle.join().unwrap(), 1, "the POST must be sent once");
     }
 
@@ -3483,11 +4867,13 @@ mod tests {
                     id: "c1".into(),
                     content: "ok".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
                 ToolResult {
                     id: "unknown".into(),
                     content: "?".into(),
                     is_error: true,
+                    images: Vec::new(),
                 },
             ]),
         ];
@@ -3681,6 +5067,150 @@ mod tests {
         assert_eq!(ollama_pick_ctx(None, Some(4_096)), 4_096);
         // …but never exceeds a known model max.
         assert_eq!(ollama_pick_ctx(Some(8_192), Some(65_536)), 8_192);
+    }
+
+    fn ollama_at(base: String, model: &str) -> Provider {
+        Provider {
+            protocol: Protocol::OllamaNative,
+            base_url: base,
+            api_key: None,
+            model: model.into(),
+            context_tokens: 8_192,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn served_windows_come_from_what_each_server_reports() {
+        let served = |base: &str, model: &str| served_model(&format!("{base}/v1"), model);
+        // llama.cpp: /props, per-slot n_ctx and its modalities.
+        // total_slots: how many requests it answers at once.
+        let props = r#"{"default_generation_settings":{"n_ctx":2048},"modalities":{"vision":false},"total_slots":2}"#;
+        let (base, handle) = mock_server(vec![(200, props)]);
+        assert_eq!(
+            served(&base, "tiny.gguf"),
+            Served {
+                window: Some(2_048),
+                vision: Some(false),
+                slots: Some(2),
+            }
+        );
+        handle.join().unwrap();
+        // LM Studio: no /props; this model's loaded length and type.
+        let lms = r#"{"data":[{"id":"other","loaded_context_length":32768},{"id":"tinycoder-7b-instruct","type":"vlm","state":"loaded","max_context_length":32768,"loaded_context_length":4096}]}"#;
+        let (base, handle) = mock_server(vec![(404, "{}"), (200, lms)]);
+        assert_eq!(
+            served(&base, "tinycoder-7b-instruct"),
+            Served {
+                window: Some(4_096),
+                vision: Some(true),
+                slots: None,
+            }
+        );
+        handle.join().unwrap();
+        // vLLM: max_model_len on /v1/models.
+        let vllm = r#"{"data":[{"id":"qwen","max_model_len":16384}]}"#;
+        let (base, handle) = mock_server(vec![(404, "{}"), (404, "{}"), (200, vllm)]);
+        assert_eq!(served(&base, "qwen").window, Some(16_384));
+        handle.join().unwrap();
+        // Nothing said: the caller keeps its guess.
+        let (base, handle) = mock_server(vec![(404, "{}"), (404, "{}"), (200, r#"{"data":[]}"#)]);
+        assert_eq!(served(&base, "qwen"), Served::default());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_message_bigger_than_a_known_window_is_refused_before_sending() {
+        let mut p = ollama_at("http://127.0.0.1:1".into(), "tiny");
+        p.protocol = Protocol::OpenAi;
+        p.context_tokens = 4_096;
+        let cwd = std::env::current_dir().unwrap();
+        let text = format!(
+            "summarize it\n\n[attached files]\n[file: {}]\n{}",
+            cwd.join("big.txt").display(),
+            "x".repeat(36_000)
+        );
+        let msgs = [Msg::System("s".into()), Msg::User(text)];
+        // A guessed window never refuses anything.
+        assert!(oversized_message(&p, &msgs).is_none());
+        remember_window(&p);
+        let why = oversized_message(&p, &msgs).unwrap();
+        assert_eq!(
+            why,
+            "big.txt is about 9.0k tokens and the server holds 4.1k — attach a range such as @big.txt:1-200"
+        );
+        // Without an attachment, the message itself is named.
+        let msgs = [Msg::User("y".repeat(20_000))];
+        assert!(oversized_message(&p, &msgs)
+            .unwrap()
+            .starts_with("this message is about 5.0k tokens and the server holds 4.1k"));
+        // Small messages, and tool results, pass.
+        assert!(oversized_message(&p, &[Msg::User("hi".into())]).is_none());
+        assert!(oversized_message(&p, &[Msg::Tool(vec![])]).is_none());
+        // complete() refuses it without a connection (port 1 would fail).
+        let e = complete(&p, &[Msg::User("z".repeat(20_000))], &[]).unwrap_err();
+        assert!(e.starts_with("this message is about"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_show_probe_is_tried_again_on_the_next_request() {
+        let show = r#"{"model_info":{"llama.context_length":16384},"capabilities":["completion","tools"]}"#;
+        let (base, handle) = mock_server(vec![(500, r#"{"error":"busy"}"#), (200, show)]);
+        let p = ollama_at(base, "tinycoder:3b");
+        // Not answered yet: the native path with the floor, nothing cached.
+        assert_eq!(ollama_window(&p), Ok(Some(OLLAMA_CTX_FLOOR)));
+        assert!(p.ollama_ctx.get().is_none(), "a failure is not remembered");
+        // Answered now: the model's own window, remembered.
+        assert_eq!(ollama_window(&p), Ok(Some(16_384)));
+        assert_eq!(p.ollama_ctx.get(), Some(&Some(16_384)));
+        assert_eq!(ollama_ctx(&p), Some(16_384));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_missing_ollama_model_is_named_with_what_is_installed() {
+        let missing = r#"{"error":"model 'tinycoder:7b' not found"}"#;
+        let tags = r#"{"models":[{"name":"tinycoder:3b"},{"name":"plainchat:2b"}]}"#;
+        let (base, handle) = mock_server(vec![(404, missing), (200, tags)]);
+        let p = ollama_at(base.clone(), "tinycoder:7b");
+        let e = ollama_window(&p).unwrap_err();
+        handle.join().unwrap();
+        assert!(
+            e.starts_with(&format!("model tinycoder:7b is not installed on {base}")),
+            "{e}"
+        );
+        assert!(e.contains("installed: tinycoder:3b, plainchat:2b"), "{e}");
+        assert!(
+            e.contains("ollama pull tinycoder:7b, or --model tinycoder:3b"),
+            "{e}"
+        );
+        assert!(!e.contains("/api/show"), "{e}");
+        assert!(p.ollama_ctx.get().is_none(), "asked again after a pull");
+
+        // A server with no /api/show at all is an old Ollama: /v1, remembered.
+        let (base, handle) = mock_server(vec![(404, "404 page not found")]);
+        let p = ollama_at(base, "tinycoder:3b");
+        assert_eq!(ollama_window(&p), Ok(None));
+        assert_eq!(p.ollama_ctx.get(), Some(&None));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn nobody_listening_is_said_once_without_falling_back() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let p = ollama_at(format!("http://127.0.0.1:{port}"), "tinycoder:3b");
+        let e = ollama_window(&p).unwrap_err();
+        assert!(
+            e.starts_with("nothing is answering at http://127.0.0.1:"),
+            "{e}"
+        );
+        assert!(p.ollama_ctx.get().is_none());
     }
 
     // ── usage parsing ────────────────────────────────────────────────────────
@@ -3966,6 +5496,7 @@ mod tests {
                 id: call_id.clone(),
                 content: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);

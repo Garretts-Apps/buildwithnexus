@@ -37,7 +37,55 @@ pub(crate) fn ffmpeg_input(path: &Path) -> [std::ffi::OsString; 3] {
     ["-protocol_whitelist".into(), "file".into(), url]
 }
 
+// `vision` from settings: Some(v) decides, None asks the server.
+static VISION_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Take the `vision` setting (see Settings::vision).
+pub fn set_vision_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    VISION_OVERRIDE.store(code, Ordering::Relaxed);
+}
+
+fn vision_override() -> Option<bool> {
+    match VISION_OVERRIDE.load(Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether the active model takes images: the `vision` setting, else what
+/// the server reports about the model, else a guess from its name.
 pub fn model_supports_vision(p: &Provider) -> bool {
+    if let Some(v) = vision_override() {
+        return v;
+    }
+    if let Some(v) = crate::provider::reported_vision(p) {
+        return v;
+    }
+    model_name_supports_vision(p)
+}
+
+/// The notice for an image that is not attached, naming who said so.
+pub fn vision_refusal(p: &Provider) -> String {
+    let why = if vision_override() == Some(false) {
+        "\"vision\": false in settings.json".to_string()
+    } else if crate::provider::reported_vision(p) == Some(false) {
+        match p.protocol {
+            Protocol::OllamaNative => "Ollama reports no vision".to_string(),
+            _ => "the server reports a text-only model".to_string(),
+        }
+    } else {
+        "nothing says it does — set \"vision\": true in settings.json if it does".to_string()
+    };
+    format!("this model does not accept images ({why}) — image not attached")
+}
+
+fn model_name_supports_vision(p: &Provider) -> bool {
     let m = p.model.to_lowercase();
     match p.protocol {
         // Every current Anthropic chat model (Claude 3 onward) accepts images.
@@ -322,6 +370,34 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     let (w, h) = (be(16), be(20));
     (w > 0 && h > 0).then_some((w, h))
+}
+
+/// The media type of a picture every vision API takes (PNG, JPEG, GIF,
+/// WebP), from its leading bytes; None for anything else.
+pub fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Pixel size of a PNG or GIF from its header; None for other formats.
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if let Some(d) = png_dimensions(bytes) {
+        return Some(d);
+    }
+    if image_media_type(bytes) == Some("image/gif") && bytes.len() >= 10 {
+        let le = |i: usize| u32::from(u16::from_le_bytes([bytes[i], bytes[i + 1]]));
+        return Some((le(6), le(8))).filter(|&(w, h)| w > 0 && h > 0);
+    }
+    None
 }
 
 /// PNG bytes and pixel size for `path`, no wider than `max_w` pixels. A PNG
@@ -625,8 +701,88 @@ mod tests {
         }
     }
 
+    // An Ollama that answers one /api/show with `capabilities`.
+    fn ollama_showing(capabilities: &'static str) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                // The whole request, body included: closing with part of it
+                // unread resets the connection, and the probe sees no answer.
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = format!(
+                    r#"{{"model_info":{{"llama.context_length":8192}},"capabilities":{capabilities}}}"#
+                );
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn vision_is_what_the_server_reports_unless_settings_say() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_vision_override(None);
+        // No vision hint in the name, but Ollama lists the capability.
+        let mut p = provider_with(Protocol::OllamaNative, "tinycoder:3b");
+        p.base_url = ollama_showing(r#"["completion","tools","vision"]"#);
+        assert!(model_supports_vision(&p));
+        // A vision-sounding name the server says cannot see.
+        let mut p = provider_with(Protocol::OllamaNative, "llava:7b");
+        p.base_url = ollama_showing(r#"["completion"]"#);
+        assert!(!model_supports_vision(&p));
+        assert_eq!(
+            vision_refusal(&p),
+            "this model does not accept images (Ollama reports no vision) — image not attached"
+        );
+        // The setting decides either way.
+        set_vision_override(Some(true));
+        assert!(model_supports_vision(&p));
+        set_vision_override(Some(false));
+        assert!(!model_supports_vision(&provider_with(
+            Protocol::Anthropic,
+            "claude-x"
+        )));
+        assert!(vision_refusal(&p).contains("\"vision\": false in settings.json"));
+        set_vision_override(None);
+    }
+
     #[test]
     fn vision_detection_by_protocol_and_name() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Anthropic: always vision.
         assert!(model_supports_vision(&provider_with(
             Protocol::Anthropic,

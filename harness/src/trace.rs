@@ -76,28 +76,39 @@ pub fn record(kind: &str, title: impl Into<String>, detail: Value) -> u64 {
     id
 }
 
+// Kinds that are bookkeeping, or that the transcript already shows in its
+// own words (the ⚡/✦/◈ call line, the approval, the ✗ denial, the [hook]
+// and ↳ subagent lines): recorded for /trace and the trace file, never
+// printed a second time under their internal names.
+const QUIET_KINDS: &[&str] = &[
+    "agents",
+    "memory",
+    "skills",
+    "rules",
+    "knowledge",
+    "hooks",
+    "skill",
+    "tool_call",
+    "tool_result",
+    "tool_denied",
+    "tool_input_repaired",
+    "hook",
+    "hook_result",
+    "subagent_spawn",
+    "subagent_done",
+];
+
+/// Record an event, and print it as one dim line unless it is bookkeeping
+/// or already shown another way (see QUIET_KINDS).
 pub fn record_visible(kind: &str, title: impl Into<String>, detail: Value) -> u64 {
     let title = title.into();
     let id = record(kind, title.clone(), detail);
-    if !report::is_json() && id > 0 {
-        let silent_kinds = [
-            "agents",
-            "memory",
-            "skills",
-            "rules",
-            "knowledge",
-            "hooks",
-            "skill",
-        ];
-        if !silent_kinds.contains(&kind) {
-            tui::line(&format!(
-                "  {} {} {}",
-                tui::dim("•"),
-                tui::accent(kind),
-                // Titles embed tool args, paths and hook names.
-                tui::dim(&tui::sanitize_terminal(&title))
-            ));
-        }
+    if !report::is_json() && id > 0 && !QUIET_KINDS.contains(&kind) {
+        // Titles embed tool args, paths and hook names.
+        tui::line(&tui::dim(&format!(
+            "  · {}",
+            tui::sanitize_terminal(&title)
+        )));
     }
     id
 }

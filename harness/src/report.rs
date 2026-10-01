@@ -2,6 +2,7 @@
 // one structured event per line so the harness can be driven by an orchestrator.
 // Process-global mode set once at startup — the call sites just say what happened.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
@@ -26,8 +27,59 @@ pub fn is_json() -> bool {
     mode() == Mode::Json
 }
 
+/// Version of the `--json` event schema, sent on every event as
+/// `schema_version`. It changes only for a change that can break a reader
+/// (docs/VERSIONING.md); new event types and new fields keep it.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+fn event_line(mut v: Value) -> String {
+    if let Value::Object(m) = &mut v {
+        m.insert("schema_version".into(), JSON_SCHEMA_VERSION.into());
+    }
+    v.to_string()
+}
+
+/// Where JSON events go in place of stdout: `bwn acp` turns them into
+/// protocol messages. Set once, before the first event.
+pub type Sink = Box<dyn Fn(Value) + Send + Sync>;
+
+static SINK: OnceLock<Sink> = OnceLock::new();
+
+pub fn set_sink(sink: Sink) {
+    let _ = SINK.set(sink);
+}
+
+/// Whether events go to a sink (`bwn acp`) rather than stdout. The sink also
+/// gets what `--json` leaves out: streamed text, reasoning, diff bodies and
+/// the todo list.
+pub fn has_sink() -> bool {
+    SINK.get().is_some()
+}
+
 fn emit(v: Value) {
-    println!("{v}");
+    match SINK.get() {
+        Some(sink) => sink(v),
+        None => {
+            let line = event_line(v);
+            // A helper running beside others keeps its events for its block.
+            if !tui::capture_event(&line) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+// Events only a sink gets (`bwn acp`): never part of the --json output.
+fn to_sink(v: Value) {
+    if let Some(sink) = SINK.get() {
+        sink(v);
+    }
+}
+
+/// A whole event built by the caller (`--json sessions`), with the schema
+/// version added like every other.
+pub fn event(v: Value) {
+    emit(v);
 }
 
 pub fn assistant(text: &str) {
@@ -50,12 +102,31 @@ fn stream_renderer() -> &'static Mutex<tui::StreamRenderer> {
 }
 
 pub fn assistant_delta(chunk: &str) {
-    if mode() == Mode::Human && !chunk.is_empty() {
+    if chunk.is_empty() {
+        return;
+    }
+    if has_sink() {
+        to_sink(json!({"type": "assistant_delta", "text": chunk}));
+    } else if mode() == Mode::Human {
         if let Ok(mut r) = stream_renderer().lock() {
             r.push(chunk);
         }
     }
 }
+
+/// Streamed reasoning, for a sink only (the TUI draws its own).
+pub fn thinking_delta(chunk: &str) {
+    if !chunk.is_empty() {
+        to_sink(json!({"type": "thinking_delta", "text": chunk}));
+    }
+}
+
+/// The todo list after a todo_write, for a sink only (the TUI draws a
+/// checklist).
+pub fn todos(items: &Value) {
+    to_sink(json!({"type": "todos", "items": items}));
+}
+
 pub fn assistant_end() {
     if mode() == Mode::Human {
         if let Ok(mut r) = stream_renderer().lock() {
@@ -65,11 +136,61 @@ pub fn assistant_end() {
     }
 }
 
+// The inline diff of the write or edit just announced, and whether it was
+// shown. It is held until the call's fate is known: an approval prompt, a
+// refusal or an error shows it; a change that lands shows its own diff
+// instead, so the same lines never print twice.
+thread_local! {
+    static HELD_PREVIEW: std::cell::RefCell<Option<(String, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// The header line just printed for a call (its sanitized preview), kept
+// until something else prints under it, so the approval question does not
+// say the same thing again right below it.
+thread_local! {
+    static LAST_HEADER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the line directly above is the header of the call named `label`;
+/// forgets it either way.
+pub fn header_is_just_above(label: &str) -> bool {
+    LAST_HEADER
+        .take()
+        .is_some_and(|h| h == *tui::sanitize_terminal(label))
+}
+
+/// Shows the held diff of the announced write or edit, once: before its
+/// approval question, or above the reason it was refused.
+pub fn show_held_preview() {
+    HELD_PREVIEW.with_borrow_mut(|held| {
+        if let Some((body, shown)) = held.as_mut().filter(|(_, shown)| !*shown) {
+            // One tui::line call for the whole body → one repaint.
+            tui::line(body);
+            *shown = true;
+            LAST_HEADER.take();
+        }
+    });
+}
+
+// Whether the held diff was shown, forgetting it.
+fn take_held_preview() -> bool {
+    HELD_PREVIEW
+        .with_borrow_mut(Option::take)
+        .is_some_and(|(_, shown)| shown)
+}
+
 pub fn tool_call(name: &str, preview: &str, input: &Value) {
+    if has_sink() {
+        to_sink(json!({"type": "tool_call", "name": name, "input": input, "title": preview}));
+        return;
+    }
     if mode() == Mode::Json {
         emit(json!({"type": "tool_call", "name": name, "input": input}));
         return;
     }
+    take_held_preview();
     // `finish` and `exit_plan` are internal control signals — don't double up with a header line.
     if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
@@ -112,10 +233,12 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         _ => ("•", tui::dim(preview)),
     };
     tui::line(&format!("  {} {}", tui::accent(icon), head));
+    LAST_HEADER.set(Some(preview.to_string()));
 
     // Inline diff for edits/writes — the user sees exactly what will change
     // before approving it, rendered by the same clean renderer as applied
-    // diffs (gutter, tinted rows, word-level emphasis).
+    // diffs (gutter, tinted rows, word-level emphasis). Held, not printed:
+    // see HELD_PREVIEW.
     let body = match name {
         "edit" | "edit_file" => Some(render_diff_block(
             input["old"]
@@ -133,11 +256,8 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         )),
         _ => None,
     };
-    if let Some(body) = body {
-        if !body.is_empty() {
-            // One tui::line call for the whole body → one repaint.
-            tui::line(&body);
-        }
+    if let Some(body) = body.filter(|b| !b.is_empty()) {
+        HELD_PREVIEW.set(Some((body, false)));
     }
 }
 
@@ -170,6 +290,10 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         );
         return;
     }
+    if is_error {
+        show_held_preview();
+    }
+    take_held_preview();
     if (name == "finish" || name == "exit_plan" || name == "ExitPlanMode") && !is_error {
         return;
     }
@@ -193,6 +317,18 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
             if !rows.is_empty() {
                 tui::line(&rows.join("\n"));
             }
+        }
+        // A picture read or a screenshot: what the model was shown, and
+        // whether it could see it.
+        "read" | "read_file" | "screenshot_url"
+            if name == "screenshot_url"
+                || (content.starts_with("image ") && content.lines().count() <= 2) =>
+        {
+            let rows: Vec<String> = clip_head(content, 3)
+                .into_iter()
+                .map(|l| tui::dim(&format!("    ↳ {l}")))
+                .collect();
+            tui::line(&rows.join("\n"));
         }
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "list_python_tools" => {
@@ -224,6 +360,10 @@ const LCS_MAX_CELLS: usize = 250_000;
 /// In JSON mode emits `{"type":"diff","path":…,"added":N,"removed":M}`
 /// instead. Call from the edit/write tool paths right after the change lands.
 pub fn diff(path: &str, old: &str, new: &str) {
+    if has_sink() {
+        to_sink(json!({"type": "diff", "path": path, "old_text": old, "new_text": new}));
+        return;
+    }
     if mode() == Mode::Json {
         let (_, added, removed) = diff_rows(old, new);
         emit(json!({"type": "diff", "path": path, "added": added, "removed": removed}));
@@ -248,6 +388,10 @@ pub fn diff(path: &str, old: &str, new: &str) {
         tui::file_link(path, &tui::bold(&format!("{verb} {path}"))),
         tui::dim(&stat)
     ));
+    // Approved after its preview was shown: the stat line confirms it.
+    if take_held_preview() {
+        return;
+    }
     let body = paint_diff_rows(&rows);
     if !body.is_empty() {
         // Single batched line() call → one repaint for the whole diff body.
@@ -578,11 +722,48 @@ fn lcs_ops<'a>(o: &[&'a str], n: &[&'a str]) -> Vec<(char, &'a str)> {
 
 pub fn tool_denied(reason: &str) {
     match mode() {
-        Mode::Human => tui::line(&tui::red(&format!(
-            "  ✗ {}",
-            tui::sanitize_terminal(reason)
-        ))),
+        Mode::Human => {
+            show_held_preview();
+            take_held_preview();
+            tui::line(&tui::red(&format!(
+                "  ✗ {}",
+                tui::sanitize_terminal(reason)
+            )))
+        }
         Mode::Json => emit(json!({"type": "tool_denied", "reason": reason})),
+    }
+}
+
+// Where an isolated helper's work went: a line on screen, and a
+// `subagent_result` event naming the branch to merge.
+pub fn subagent_result(task: &str, branch: Option<&str>, commits: usize, screen: &str) {
+    match mode() {
+        Mode::Human => tui::line(&tui::yellow(&format!(
+            "  ↳ {}",
+            tui::sanitize_terminal(screen)
+        ))),
+        Mode::Json => emit(json!({
+            "type": "subagent_result",
+            "task": task,
+            "branch": branch,
+            "commits": commits,
+            "merge": branch.map(|b| format!("git merge {b}")),
+            "message": screen,
+        })),
+    }
+}
+
+// One issue a review found (JSON mode; human mode already shows the
+// review's own text).
+pub fn finding(severity: &str, path: Option<&str>, line: Option<u64>, message: &str) {
+    if mode() == Mode::Json {
+        emit(json!({
+            "type": "finding",
+            "severity": severity,
+            "path": path,
+            "line": line,
+            "message": message,
+        }));
     }
 }
 
@@ -614,6 +795,135 @@ pub fn verify(status: &str, report: &Value) {
     }
 }
 
+/// A tool call the gate or a hook refused during a BUILD turn: the headless
+/// outcome and the result event are built from these.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Denial {
+    pub tool: String,
+    /// The call as the transcript shows it (`write notes.txt`).
+    pub summary: String,
+    pub reason: String,
+    pub mutating: bool,
+}
+
+static DENIALS: Mutex<Vec<Denial>> = Mutex::new(Vec::new());
+// The result event lists at most this many; `denied` still counts all.
+const MAX_LISTED_DENIALS: usize = 20;
+
+/// Records a refusal next to its `tool_denied` trace event.
+pub fn note_denial(tool: &str, summary: &str, reason: &str, mutating: bool) {
+    if let Ok(mut d) = DENIALS.lock() {
+        d.push(Denial {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+            reason: reason.to_string(),
+            mutating,
+        });
+    }
+}
+
+pub fn denials() -> Vec<Denial> {
+    DENIALS.lock().map(|d| d.clone()).unwrap_or_default()
+}
+
+/// Forgets the refusals so far: `bwn acp` runs many turns in one process.
+pub fn clear_denials() {
+    if let Ok(mut d) = DENIALS.lock() {
+        d.clear();
+    }
+}
+
+// How many refusals there were when the current turn started.
+static TURN_DENIALS_FROM: AtomicUsize = AtomicUsize::new(0);
+
+/// Starts counting this turn's refusals (`refused_this_turn`).
+pub fn mark_turn_denials() {
+    let n = DENIALS.lock().map(|d| d.len()).unwrap_or(0);
+    TURN_DENIALS_FROM.store(n, Ordering::Relaxed);
+}
+
+/// Under the turn's answer in the terminal: the calls refused during it, so
+/// a summary that claims the work cannot pass for the whole story.
+pub fn refused_this_turn() {
+    if mode() != Mode::Human {
+        return;
+    }
+    let from = TURN_DENIALS_FROM.load(Ordering::Relaxed);
+    let d: Vec<Denial> = denials().into_iter().skip(from).collect();
+    if let Some(line) = denials_line(&d) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} — not done this turn",
+            tui::sanitize_terminal(&line)
+        )));
+    }
+}
+
+/// One line for the end of a headless run: `changes were denied: write
+/// notes.txt (policy: …)`.
+pub fn denials_line(d: &[Denial]) -> Option<String> {
+    let first = d.first()?;
+    let what = if d.iter().any(|x| x.mutating) {
+        "changes were denied"
+    } else {
+        "tool calls were denied"
+    };
+    let more = match d.len() {
+        1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    Some(format!(
+        "{what}: {} ({}){more}",
+        first.summary, first.reason
+    ))
+}
+
+// The last event of a headless --json run: how it ended, the exit code the
+// process is about to return, the session it saved to, what it used and
+// every refused call.
+pub fn result(outcome: &str, exit_code: i32) {
+    if mode() == Mode::Json {
+        emit(result_event(
+            outcome,
+            exit_code,
+            crate::session::current(),
+            &crate::usage::snapshot(),
+            &denials(),
+        ));
+    }
+}
+
+fn result_event(
+    outcome: &str,
+    exit_code: i32,
+    session_id: Option<String>,
+    usage: &crate::usage::Snapshot,
+    denials: &[Denial],
+) -> Value {
+    let listed: Vec<Value> = denials
+        .iter()
+        .take(MAX_LISTED_DENIALS)
+        .map(|d| json!({"tool": d.tool, "summary": d.summary, "reason": d.reason}))
+        .collect();
+    let mut ev = json!({
+        "type": "result",
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "session_id": session_id,
+        "turns": usage.requests,
+        "tokens_in": usage.totals.prompt_tokens(),
+        "tokens_out": usage.totals.output,
+        // Estimated from the price table; requests to a model with no price
+        // are counted in unpriced_requests, never guessed.
+        "cost_usd": (usage.cost_usd * 1e6).round() / 1e6,
+        "denied": denials.len(),
+        "denials": listed,
+    });
+    if usage.unpriced_requests > 0 {
+        ev["unpriced_requests"] = usage.unpriced_requests.into();
+    }
+    ev
+}
+
 pub fn error(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::red(&format!("  ✗ {}", tui::sanitize_terminal(msg)))),
@@ -634,6 +944,8 @@ pub fn notice(msg: &str) {
 pub fn info(msg: &str) {
     match mode() {
         Mode::Human => tui::line(&tui::dim(&tui::sanitize_terminal(msg))),
+        // A sink can tell chrome from warnings; --json keeps one type.
+        Mode::Json if has_sink() => to_sink(json!({"type": "info", "message": msg})),
         Mode::Json => emit(json!({"type": "notice", "message": msg})),
     }
 }
@@ -641,6 +953,57 @@ pub fn info(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_json_event_carries_the_schema_version() {
+        for ev in [
+            json!({"type": "assistant", "text": "hi"}),
+            json!({"type": "finish", "summary": "done"}),
+        ] {
+            let line: Value = serde_json::from_str(&event_line(ev.clone())).unwrap();
+            assert_eq!(line["schema_version"], JSON_SCHEMA_VERSION);
+            assert_eq!(line["type"], ev["type"]);
+        }
+        assert_eq!(JSON_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn result_event_carries_session_usage_and_denials() {
+        let mut usage = crate::usage::Snapshot {
+            requests: 3,
+            cost_usd: 0.012_345_678,
+            ..Default::default()
+        };
+        usage.totals.input = 900;
+        usage.totals.cache_read = 100;
+        usage.totals.output = 42;
+        let d = Denial {
+            tool: "write_file".into(),
+            summary: "write notes.txt".into(),
+            reason: "policy: no writes in CI".into(),
+            mutating: true,
+        };
+        let ev = result_event(
+            "approval_blocked",
+            3,
+            Some("0001".into()),
+            &usage,
+            std::slice::from_ref(&d),
+        );
+        assert_eq!(ev["session_id"], "0001");
+        assert_eq!(ev["turns"], 3);
+        assert_eq!(ev["tokens_in"], 1000);
+        assert_eq!(ev["tokens_out"], 42);
+        assert_eq!(ev["cost_usd"], 0.012346);
+        assert_eq!(ev["denied"], 1);
+        assert_eq!(ev["denials"][0]["summary"], "write notes.txt");
+        assert!(ev.get("unpriced_requests").is_none());
+        assert_eq!(
+            denials_line(&[d.clone(), d]).unwrap(),
+            "changes were denied: write notes.txt (policy: no writes in CI) and 1 more"
+        );
+        assert_eq!(denials_line(&[]), None);
+    }
 
     #[test]
     fn diff_preview_neutralizes_model_escapes() {

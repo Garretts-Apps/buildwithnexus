@@ -11,7 +11,7 @@
 //! the network when `sandbox_network` is false. Not confined: reads, the
 //! agent's own file tools (already fenced to cwd), hooks, MCP servers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
@@ -203,20 +203,32 @@ fn detect() -> Result<Backend, String> {
 /// empty directory behind as the mount point. It is not removed afterwards:
 /// a background server may still be using it, and git ignores an empty
 /// `.git` directory.
+///
+/// Folders added with --add-dir are bound read-write the same way, each with
+/// its own `.git` and `.buildwithnexus` kept read-only.
 pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
-    bwrap_argv(cmd, cwd, network, true)
+    bwrap_argv(cmd, cwd, &crate::workdirs::list(), network, true)
 }
 
 // The availability probe runs at `/` and must not mount anything there.
 fn bwrap_probe_args() -> Vec<String> {
-    bwrap_argv("true", Path::new("/"), true, false)
+    bwrap_argv("true", Path::new("/"), &[], true, false)
 }
 
-fn bwrap_argv(cmd: &str, cwd: &Path, network: bool, protect: bool) -> Vec<String> {
-    let protected: Vec<(String, bool)> = PROTECTED_IN_WORKSPACE
+fn bwrap_argv(
+    cmd: &str,
+    cwd: &Path,
+    extra: &[PathBuf],
+    network: bool,
+    protect: bool,
+) -> Vec<String> {
+    let roots: Vec<&Path> = std::iter::once(cwd)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    let protected: Vec<(String, bool)> = roots
         .iter()
+        .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
         .filter(|_| protect)
-        .map(|d| cwd.join(d))
         .map(|p| {
             let exists = p.symlink_metadata().is_ok();
             (p.to_string_lossy().into_owned(), exists)
@@ -251,6 +263,10 @@ fn bwrap_argv(cmd: &str, cwd: &Path, network: bool, protect: bool) -> Vec<String
         ]
         .map(str::to_string),
     );
+    for dir in extra {
+        let dir = dir.to_string_lossy().into_owned();
+        a.extend(["--bind".to_string(), dir.clone(), dir]);
+    }
     for (p, exists) in &protected {
         if *exists {
             a.extend(["--ro-bind".to_string(), p.clone(), p.clone()]);
@@ -273,15 +289,148 @@ const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
 /// Environment a sandboxed child never inherits: session buses and agent
 /// sockets reach outside the sandbox, and provider keys are the agent's.
 pub fn scrubbed_env<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    scrubbed_env_keeping(names, &[])
+}
+
+fn scrubbed_env_keeping<I: IntoIterator<Item = String>>(
+    names: I,
+    passthrough: &[String],
+) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| {
-            matches!(
-                n.as_str(),
-                "DBUS_SESSION_BUS_ADDRESS" | "SSH_AUTH_SOCK" | "HF_TOKEN"
-            ) || n.ends_with("_API_KEY")
+            matches!(n.as_str(), "DBUS_SESSION_BUS_ADDRESS" | "SSH_AUTH_SOCK")
+                || (is_credential(n) && !passthrough.iter().any(|p| p == n))
         })
         .collect()
+}
+
+// A provider credential: `*_API_KEY`, `*_API_TOKEN`, or a provider preset's
+// key variable (`HF_TOKEN`). Windows names are case-insensitive.
+fn is_credential(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_API_KEY")
+        || upper.ends_with("_API_TOKEN")
+        || crate::config::PRESETS
+            .iter()
+            .any(|p| !p.env_key.is_empty() && p.env_key == upper)
+}
+
+/// The provider credentials in `names` that a command the agent runs must
+/// not inherit, sandboxed or not, minus those the user lets through with
+/// `shell_env_passthrough`. Hooks are the user's own and keep everything.
+pub fn credential_env<I: IntoIterator<Item = String>>(
+    names: I,
+    passthrough: &[String],
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|n| is_credential(n) && !passthrough.iter().any(|p| p == n))
+        .collect()
+}
+
+fn passthrough() -> Vec<String> {
+    crate::config::load_settings()
+        .map(|s| s.shell_env_passthrough)
+        .unwrap_or_default()
+}
+
+fn env_names() -> impl Iterator<Item = String> {
+    std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())
+}
+
+/// Marks every descriptor above 2 that bwn inherited close-on-exec, so no
+/// command, hook, MCP server or tmux session it starts gets them. A CI
+/// runner hands its control pipe down to the job's processes, and a command
+/// that wrote to it would end the job. Runs first in `run`.
+#[cfg(unix)]
+pub fn cloexec_inherited_fds() {
+    let fds: Vec<i32> = ["/proc/self/fd", "/dev/fd"]
+        .iter()
+        .find_map(|d| std::fs::read_dir(d).ok())
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| (3..1024).collect());
+    for fd in fds.into_iter().filter(|fd| *fd > 2) {
+        // SAFETY: fcntl on a descriptor number; an unused one fails with
+        // EBADF and is skipped.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// Moves the provider keys bwn was started with to the heap and blanks the
+/// originals, which `/proc/<pid>/environ` (Linux) and `ps eww` (macOS) read:
+/// a command or tool that reads bwn's own environment finds `****`, while
+/// `std::env::var` still returns the key. Runs first in `run`, before any
+/// thread starts.
+#[cfg(unix)]
+pub fn hide_startup_credentials() {
+    extern "C" {
+        static mut environ: *const *mut libc::c_char;
+    }
+    let saved: Vec<(String, std::ffi::OsString)> = credential_env(env_names(), &[])
+        .into_iter()
+        .filter_map(|n| std::env::var_os(&n).map(|v| (n, v)))
+        .collect();
+    if saved.is_empty() {
+        return;
+    }
+    // SAFETY: single-threaded at this point; each entry is a NUL-terminated
+    // `NAME=value` string the process owns, overwritten within its length.
+    unsafe {
+        let mut p = environ;
+        while !p.is_null() && !(*p).is_null() {
+            let entry = *p;
+            let bytes = std::ffi::CStr::from_ptr(entry).to_bytes();
+            if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
+                if saved.iter().any(|(n, _)| n.as_bytes() == &bytes[..eq]) {
+                    for i in eq + 1..bytes.len() {
+                        *entry.add(i) = b'*' as libc::c_char;
+                    }
+                }
+            }
+            p = p.add(1);
+        }
+    }
+    // Unset first: BSD setenv may copy a value back over the old one in
+    // place; a fresh setenv always allocates.
+    for (n, v) in saved {
+        std::env::remove_var(&n);
+        std::env::set_var(n, v);
+    }
+}
+
+/// Removes provider keys from a command the agent is about to run without
+/// the sandbox, so an approved `env` or `printenv` cannot hand the key to the
+/// model.
+pub fn scrub_credentials(c: &mut Command) {
+    for k in credential_env(env_names(), &passthrough()) {
+        c.env_remove(k);
+    }
+}
+
+/// The provider credentials a command started in a tmux session must unset
+/// itself: a tmux server that is already running (bwn started inside tmux)
+/// gives a new session the environment it was started with, not this one,
+/// so the names in `server_env` count too. Only valid shell names.
+pub fn credentials_to_unset<I: IntoIterator<Item = String>>(server_env: I) -> Vec<String> {
+    let mut names = credential_env(env_names().chain(server_env), &passthrough());
+    names.retain(|n| {
+        !n.is_empty()
+            && !n.starts_with(|c: char| c.is_ascii_digit())
+            && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn sbpl_quote(p: &Path) -> String {
@@ -301,24 +450,32 @@ fn sbpl_quote(p: &Path) -> String {
 /// Seatbelt profile: allow everything, deny writes, re-allow them under the
 /// workspace and the temp dirs. Callers pass realpath'd paths so `/var/…`
 /// and `/private/var/…` agree.
-pub fn seatbelt_profile(cwd: &Path, tmpdir: Option<&Path>, network: bool) -> String {
+/// Folders added with --add-dir (`extra`) are writable like the workspace.
+pub fn seatbelt_profile(
+    cwd: &Path,
+    extra: &[PathBuf],
+    tmpdir: Option<&Path>,
+    network: bool,
+) -> String {
     let mut p =
         String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
-    for dir in [
-        Some(cwd),
-        Some(Path::new("/private/tmp")),
-        Some(Path::new("/tmp")),
-        tmpdir,
-    ]
-    .into_iter()
-    .flatten()
+    let roots: Vec<&Path> = std::iter::once(cwd)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    for dir in roots
+        .iter()
+        .copied()
+        .chain([Path::new("/private/tmp"), Path::new("/tmp")])
+        .chain(tmpdir)
     {
         p.push_str(&format!("\n  (subpath {})", sbpl_quote(dir)));
     }
     p.push_str(")\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (regex #\"^/dev/tty\"))\n");
     p.push_str("(deny file-write*");
-    for d in PROTECTED_IN_WORKSPACE {
-        p.push_str(&format!("\n  (subpath {})", sbpl_quote(&cwd.join(d))));
+    for root in &roots {
+        for d in PROTECTED_IN_WORKSPACE {
+            p.push_str(&format!("\n  (subpath {})", sbpl_quote(&root.join(d))));
+        }
     }
     p.push_str(")\n(deny appleevent-send)\n");
     if !network {
@@ -340,13 +497,17 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
                 .map(std::path::PathBuf::from)
                 .and_then(|t| t.canonicalize().ok());
             let mut c = Command::new("sandbox-exec");
-            c.args(["-p", &seatbelt_profile(&cwd, tmp.as_deref(), network())]);
+            let extra = crate::workdirs::list();
+            c.args([
+                "-p",
+                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), network()),
+            ]);
             c.args(["sh", "-c", cmd]);
             c
         }
     };
     c.current_dir(&cwd);
-    for k in scrubbed_env(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok())) {
+    for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
     }
     c
@@ -509,6 +670,35 @@ mod tests {
     }
 
     #[test]
+    fn added_folders_are_bound_writable_with_their_git_read_only() {
+        let extra = [PathBuf::from("/work/lib"), PathBuf::from("/srv/data")];
+        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, false, true);
+        let s = a.join(" ");
+        assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 3, "{s}");
+        let at = |needle: &str| {
+            s.find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing: {s}"))
+        };
+        for d in ["/work/lib", "/srv/data"] {
+            let bind = at(&format!("--bind {d} {d}"));
+            // Their own .git and .buildwithnexus stay read-only, after the bind.
+            assert!(bind < at(&format!("--tmpfs {d}/.git --remount-ro {d}/.git")));
+            assert!(bind < at(&format!("--remount-ro {d}/.buildwithnexus")));
+        }
+        assert!(at("--chdir /work/proj") > at("/srv/data/.buildwithnexus"));
+        let p = seatbelt_profile(Path::new("/w"), &extra, None, false);
+        let (allow, deny) = p.split_once("(deny file-write*\n").unwrap();
+        assert!(
+            allow.contains("(subpath \"/work/lib\")") && allow.contains("(subpath \"/srv/data\")")
+        );
+        assert!(deny.contains("(subpath \"/work/lib/.git\")"), "{p}");
+        assert!(
+            deny.contains("(subpath \"/srv/data/.buildwithnexus\")"),
+            "{p}"
+        );
+    }
+
+    #[test]
     fn bwrap_argv_keeps_git_and_settings_read_only() {
         let ws = std::env::temp_dir().join(format!("bwn-sandbox-ro-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
@@ -566,9 +756,48 @@ mod tests {
     }
 
     #[test]
+    fn agent_commands_lose_provider_keys_unless_passed_through() {
+        let names = [
+            "PATH",
+            "ANTHROPIC_API_KEY",
+            "custom_api_key",
+            "HF_TOKEN",
+            "GROQ_API_KEY",
+            "SOME_API_TOKEN",
+            "GITHUB_TOKEN",
+            "SSH_AUTH_SOCK",
+        ]
+        .map(String::from);
+        assert_eq!(
+            credential_env(names.clone(), &[]),
+            [
+                "ANTHROPIC_API_KEY",
+                "custom_api_key",
+                "HF_TOKEN",
+                "GROQ_API_KEY",
+                "SOME_API_TOKEN"
+            ]
+        );
+        // A build that needs one names it in shell_env_passthrough.
+        let keep = ["GROQ_API_KEY".to_string()];
+        assert!(!credential_env(names.clone(), &keep).contains(&"GROQ_API_KEY".to_string()));
+        assert!(!scrubbed_env_keeping(names, &keep).contains(&"GROQ_API_KEY".to_string()));
+        // What a running tmux server holds is unset too; a name that is not
+        // a shell name never reaches the command line.
+        let unset = credentials_to_unset(
+            ["TMUXONLY_API_KEY", "PATH", "BAD;NAME_API_KEY", "1X_API_KEY"].map(String::from),
+        );
+        assert!(unset.contains(&"TMUXONLY_API_KEY".to_string()), "{unset:?}");
+        assert!(unset
+            .iter()
+            .all(|n| n != "PATH" && !n.contains(';') && !n.starts_with('1')));
+    }
+
+    #[test]
     fn seatbelt_profile_denies_writes_except_workspace_and_tmp() {
         let p = seatbelt_profile(
             Path::new("/private/var/w/my \"proj\""),
+            &[],
             Some(Path::new("/private/var/folders/xy/T")),
             true,
         );
@@ -584,7 +813,7 @@ mod tests {
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
         assert!(!p.contains("network"));
-        let no_net = seatbelt_profile(Path::new("/w"), None, false);
+        let no_net = seatbelt_profile(Path::new("/w"), &[], None, false);
         assert!(no_net.ends_with("(deny network*)\n"));
         assert!(!no_net.contains("folders"));
     }
@@ -656,6 +885,28 @@ mod tests {
             "{} leaked out of the sandbox",
             outside.display()
         );
+
+        // A folder added with --add-dir is writable; its .git is not.
+        let added = std::env::temp_dir().join(format!("bwn-sandbox-added-{id}"));
+        let _ = std::fs::remove_dir_all(&added);
+        std::fs::create_dir_all(added.join(".git")).unwrap();
+        let added = added.canonicalize().unwrap();
+        crate::workdirs::clear();
+        assert!(matches!(
+            crate::workdirs::add(&added.display().to_string(), &ws),
+            Ok(crate::workdirs::Added::New(_))
+        ));
+        let wrote = run(&format!("echo ok > '{}/a.txt'", added.display()));
+        assert!(wrote.status.success(), "{wrote:?}");
+        assert_eq!(
+            std::fs::read_to_string(added.join("a.txt")).unwrap(),
+            "ok\n"
+        );
+        let hook = run(&format!("echo x > '{}/.git/config'", added.display()));
+        assert!(!hook.status.success(), "{hook:?}");
+        assert!(!added.join(".git/config").exists());
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(&added);
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -23,6 +23,9 @@ pub struct Outcome {
     pub content: String,
     pub is_error: bool,
     pub finished: bool, // the `finish` tool ends the loop
+    /// Images for the model, `(media_type, base64)`. The agent drops them,
+    /// and says why, for a model that does not take images.
+    pub images: Vec<(String, String)>,
 }
 
 fn ok(s: impl Into<String>) -> Outcome {
@@ -30,6 +33,7 @@ fn ok(s: impl Into<String>) -> Outcome {
         content: s.into(),
         is_error: false,
         finished: false,
+        images: Vec::new(),
     }
 }
 fn err(s: impl Into<String>) -> Outcome {
@@ -37,6 +41,7 @@ fn err(s: impl Into<String>) -> Outcome {
         content: s.into(),
         is_error: true,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -201,7 +206,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "python_tool", description: "Run a Python tool script with JSON input on stdin. Use for specialized local tools that are easier to maintain outside Rust.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"input":{"type":"object"}},"required":["path"]}) },
-        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. Works anywhere on the filesystem and expands `~`.",
+        ToolDef { name: "read_file", description: "Read a UTF-8 text file and return its contents. Optional start_line/end_line return a bounded line range. A PNG, JPEG, GIF or WebP picture comes back as an image you can look at; a PDF as its text. Works anywhere on the filesystem and expands `~`.",
             schema: json!({"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"]}) },
         ToolDef { name: "read_many_files", description: "Read several UTF-8 text files at once. Use for comparing related files without repeated round trips.",
             schema: json!({"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":20},"max_bytes_per_file":{"type":"integer","minimum":1000,"maximum":100000}},"required":["paths"]}) },
@@ -261,6 +266,8 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"expect_status":{"type":"integer","minimum":100,"maximum":599},"expect_text":{"type":"string"}},"required":["url"]}) },
         ToolDef { name: "open_browser", description: "Open a URL or local file in the user's default browser. Use after publishing an HTML artifact or starting a web server.",
             schema: json!({"type":"object","properties":{"url":{"type":"string"},"path":{"type":"string"}}}) },
+        ToolDef { name: "screenshot_url", description: "Take a screenshot of a web page served on this machine (http://localhost:3000, a dev server you started) with a local headless Chrome, Chromium or Edge, and look at it. Use it to check how a page you built renders. Loopback addresses only, unless settings allow the host; requests the page makes to other hosts are blocked.",
+            schema: json!({"type":"object","properties":{"url":{"type":"string","description":"http:// or https:// URL on localhost / 127.0.0.1"},"width":{"type":"integer","minimum":320,"maximum":2560,"description":"viewport width in pixels (default 1280)"},"height":{"type":"integer","minimum":240,"maximum":2560,"description":"viewport height in pixels (default 800)"}},"required":["url"]}) },
         ToolDef { name: "list_skills", description: "List available skills with their source and short description. Use before load_skill when choosing task-specific instructions.",
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task. Folder skills report their directory so referenced scripts/references can be read with read_file.",
@@ -279,30 +286,55 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}) },
     ];
     if include_subagent {
+        // The built-in roles, then every agent file (see config::load_agent_defs).
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let agents = crate::config::load_agent_defs(&cwd);
+        let mut roles: Vec<String> = crate::config::BUILTIN_ROLES
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        roles.extend(agents.iter().map(|a| a.name.clone()));
+        let listed: String = agents
+            .iter()
+            .map(|a| format!(" `{}`: {}.", a.name, a.description.trim_end_matches('.')))
+            .collect();
+        let roles_note = if listed.is_empty() {
+            String::new()
+        } else {
+            format!(" Roles besides engineer and researcher:{listed}")
+        };
         v.push(ToolDef {
             name: "task",
-            description:
-                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.",
+            description: crate::mcp::intern(&format!(
+                "Common coding-agent alias: delegate a self-contained sub-task to a fresh agent.{PARALLEL_NOTE}{roles_note}"
+            )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
                 "description":{"type":"string"},
-                "role":{"type":"string","enum":["engineer","researcher"]},
-                "isolate":{"type":"boolean"}
+                "role":{"type":"string","enum":roles},
+                "isolate":{"type":"boolean"},
+                "read_only":{"type":"boolean"}
             }}),
         });
         v.push(ToolDef {
             name: "spawn_subagent",
-            description: "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.",
+            description: crate::mcp::intern(&format!(
+                "Delegate a self-contained sub-task to a fresh agent with its own context window. Set isolate=true to run it in an isolated git worktree. Returns the subagent's summary.{PARALLEL_NOTE}{roles_note}"
+            )),
             schema: json!({"type":"object","properties":{
                 "task":{"type":"string"},
-                "role":{"type":"string","enum":["engineer","researcher"]},
-                "isolate":{"type":"boolean"}
+                "role":{"type":"string","enum":roles},
+                "isolate":{"type":"boolean"},
+                "read_only":{"type":"boolean"}
             },"required":["task"]}),
         });
     }
     v.extend(mcp_defs());
     v
 }
+
+// How delegation calls in one reply run, for the task tools' descriptions.
+const PARALLEL_NOTE: &str = " Set read_only=true for a helper that only reads and reports (it cannot change anything). Read-only and isolate=true helpers called in the same reply run at the same time; other helpers run one after another.";
 
 // Tools discovered on connected MCP servers, advertised as
 // `mcp__<server>__<tool>` with the server's own description and input
@@ -318,15 +350,21 @@ fn mcp_defs() -> Vec<ToolDef> {
         .collect()
 }
 
-// Models reporting at most this many context tokens get the compact tool set.
-// Small open-weight models degrade sharply with large tool catalogs, so
-// everything in local-model range (≤32k) gets the trimmed surface; remote
-// frontier providers report much larger contexts and keep the full set.
-const COMPACT_TOOLS_MAX_CONTEXT: usize = 32_768;
+// Models reporting fewer context tokens than this get the compact tool set.
+// Small open-weight models degrade sharply with large tool catalogs, so 8k
+// and 16k windows get the trimmed surface; a 32k window (what bwn asks
+// Ollama for) and the larger windows of remote providers keep the full set.
+const FULL_TOOLS_MIN_CONTEXT: usize = 32_768;
+
+/// Whether a model with this window gets the compact tool set: no helpers,
+/// todo list or screenshots.
+pub fn compact_surface(context_tokens: usize) -> bool {
+    context_tokens < FULL_TOOLS_MIN_CONTEXT
+}
 
 pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<ToolDef> {
     let all = defs(include_subagent);
-    if context_tokens > COMPACT_TOOLS_MAX_CONTEXT {
+    if !compact_surface(context_tokens) {
         return all;
     }
     all.into_iter().filter(|d| compact_tool(d.name)).collect()
@@ -395,6 +433,7 @@ pub fn defs_readonly() -> Vec<ToolDef> {
                         | "list_servers"
                         | "read_server_log"
                         | "wait_for_url"
+                        | "screenshot_url"
                         | "list_skills"
                         | "load_skill"
                         | "kb_query"
@@ -442,6 +481,30 @@ pub fn is_mutating(name: &str) -> bool {
     )
 }
 
+/// The tool an alias stands for (`bash` for run_command), else the name.
+pub fn canonical_name(name: &str) -> &str {
+    match name {
+        "bash" => "run_command",
+        "read" => "read_file",
+        "write" => "write_file",
+        "edit" => "edit_file",
+        "patch" => "apply_patch",
+        "glob" => "find_paths",
+        "grep" => "grep_files",
+        "list" => "list_dir",
+        "webfetch" => "fetch_url",
+        "websearch" => "web_search",
+        "todowrite" => "todo_write",
+        "todoread" => "todo_read",
+        "skill" => "load_skill",
+        "AskUserQuestion" => "question",
+        "ExitPlanMode" => "exit_plan",
+        "publish_artifact" => "Artifact",
+        "task" => "spawn_subagent",
+        other => other,
+    }
+}
+
 pub fn is_mutating_call(name: &str, input: &Value) -> bool {
     if matches!(
         name,
@@ -449,6 +512,11 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
     ) {
         let cmd = input["command"].as_str().unwrap_or("view");
         cmd != "view"
+    } else if matches!(name, "task" | "spawn_subagent") {
+        // A helper started with read_only: true is read-only itself (its
+        // tools and its gate, see agent::helper_reads_only), so starting
+        // one is a read.
+        input["read_only"].as_bool() != Some(true)
     } else {
         is_mutating(name)
     }
@@ -779,7 +847,14 @@ fn git_key_is_inert(key: &str) -> bool {
             )
         }
         ("submodule", Some(_)) => matches!(var, "url" | "active" | "branch"),
+        // Network settings, such as the auth header actions/checkout
+        // stores: none of them names a program. A cookie file git saves to
+        // is a file it writes on the next fetch.
+        ("http", _) => !matches!(var, "cookiefile" | "savecookies"),
         ("diff", None) => var != "external",
+        // Signing runs the user's own gpg.program, which repo config could
+        // only name under `gpg.*` (not inert).
+        ("commit", None) => matches!(var, "gpgsign" | "verbose" | "status" | "cleanup"),
         (
             "user" | "pull" | "push" | "fetch" | "init" | "log" | "color" | "advice" | "status"
             | "rerere" | "gc" | "index" | "feature" | "extensions" | "column" | "lfs",
@@ -918,6 +993,25 @@ const RUNS_ARBITRARY_CODE: &[&str] = &[
     "systemd-run",
     "caffeinate",
     "start",
+    "fakeroot",
+    "fakechroot",
+    "faketime",
+    "firejail",
+    "bwrap",
+    "proot",
+    "proxychains",
+    "torsocks",
+    "tsocks",
+    "numactl",
+    "chronic",
+    "ifne",
+    "sg",
+    "ssh-agent",
+    "dbus-run-session",
+    "systemd-inhibit",
+    "catchsegv",
+    "cgexec",
+    "chpst",
     "eval",
     "exec",
 ];
@@ -933,12 +1027,22 @@ fn runs_arbitrary_code(bin: &str) -> bool {
     RUNS_ARBITRARY_CODE.contains(&family)
 }
 
+// Single-verb programs whose arguments decide what they destroy, move or
+// stop: `s` on `rm -rf tests` must not approve `rm -rf tools`, so their
+// approvals are stored per exact command, like interpreters.
+const KEYS_ON_ARGUMENTS: &[&str] = &[
+    "rm", "rmdir", "unlink", "shred", "srm", "mv", "cp", "ln", "install", "rsync", "chmod",
+    "chown", "chgrp", "chattr", "setfacl", "dd", "truncate", "kill", "pkill", "killall", "del",
+    "erase", "rd", "move", "copy", "robocopy", "xcopy", "icacls", "takeown",
+];
+
 /// The key an "allow this session" / "always allow" answer is stored under:
 /// the binary, plus its subcommand for multi-verb tools (`git status`), or
-/// the whole command for shells and interpreters.
+/// the whole command for shells, interpreters and programs whose arguments
+/// name what they change (`rm -rf tests`).
 pub fn approval_key(cmd: &str) -> String {
     let (bin, args) = command_words(cmd);
-    if runs_arbitrary_code(&bin) {
+    if runs_arbitrary_code(&bin) || KEYS_ON_ARGUMENTS.contains(&bin.as_str()) {
         return cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     // Keep the path in the key for a path-qualified program, so an approval
@@ -949,12 +1053,521 @@ pub fn approval_key(cmd: &str) -> String {
     } else {
         bin.clone()
     };
+    if bin == "git" {
+        return match git_subcommand(&args) {
+            Some((sub, rest)) if git_is_destructive(sub, rest) => {
+                cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+            }
+            Some((sub, _)) => format!("{ident} {sub}"),
+            None => ident,
+        };
+    }
     if MULTI_VERB.contains(&bin.as_str()) {
         if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
             return format!("{ident} {sub}");
         }
     }
     ident
+}
+
+// Git's own options that take the next word as their value (`git -C dir`).
+const GIT_OPTIONS_WITH_VALUE: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+    "--list-cmds",
+    "--attr-source",
+    "--shallow-file",
+];
+
+/// The subcommand of a git command line and the words after it, past git's
+/// own options: `git -C sub -c k=v push -f` → (`push`, [`-f`]).
+pub(crate) fn git_subcommand<'a, 'b>(args: &'b [&'a str]) -> Option<(&'a str, &'b [&'a str])> {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if !a.starts_with('-') {
+            return Some((a, &args[i + 1..]));
+        }
+        i += if GIT_OPTIONS_WITH_VALUE.contains(a) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
+// Git subcommands, or the forms of them, whose arguments name what they
+// discard or rewrite: `s` on `git push --force origin main` or
+// `git rm -r src` must not approve the next force push or removal, so
+// their approvals are stored per exact command, like rm's.
+fn git_is_destructive(sub: &str, rest: &[&str]) -> bool {
+    // A long option, alone or with `=value`.
+    let long = |names: &[&str]| {
+        rest.iter().any(|a| {
+            names
+                .iter()
+                .any(|n| *a == *n || a.strip_prefix(n).is_some_and(|v| v.starts_with('=')))
+        })
+    };
+    // A letter in a cluster of short options (`-uf`).
+    let short = |letters: &str| {
+        rest.iter().any(|a| {
+            a.len() > 1
+                && a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|c| letters.contains(c))
+        })
+    };
+    let action = rest.iter().find(|a| !a.starts_with('-')).copied();
+    match sub {
+        "rm" | "clean" | "checkout" | "restore" | "filter-branch" | "filter-repo" | "prune"
+        | "update-ref" => true,
+        "reset" => long(&["--hard", "--merge", "--keep"]),
+        "push" => {
+            long(&[
+                "--force",
+                "--force-with-lease",
+                "--force-if-includes",
+                "--delete",
+                "--mirror",
+                "--prune",
+            ]) || short("fd")
+                || rest
+                    .iter()
+                    .any(|a| a.starts_with('+') || (a.starts_with(':') && a.len() > 1))
+        }
+        "branch" => long(&["--delete", "--force", "--move", "--copy"]) || short("dDfmMcC"),
+        "switch" => long(&["--discard-changes", "--force", "--force-create"]) || short("fC"),
+        "tag" => long(&["--delete", "--force"]) || short("df"),
+        "stash" => matches!(action, Some("drop" | "clear")),
+        "reflog" => matches!(action, Some("expire" | "delete")),
+        "worktree" => matches!(action, Some("remove" | "prune")),
+        "submodule" => matches!(action, Some("deinit")),
+        "notes" => matches!(action, Some("remove" | "prune")),
+        "read-tree" => long(&["--reset"]) || short("u"),
+        "checkout-index" => long(&["--force"]) || short("f"),
+        "gc" => long(&["--prune"]),
+        _ => false,
+    }
+}
+
+/// `p` relative to the project root, with `/` separators, when it lies
+/// inside the project: what a permission rule's path pattern is matched
+/// against (`migrations/**`).
+pub fn project_relative(p: &Path, cwd: &Path) -> Option<String> {
+    let rel = canonicalize_lenient(p)
+        .strip_prefix(canonicalize_lenient(cwd))
+        .ok()?
+        .to_path_buf();
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// The commands an allow rule is checked against: each part of a compound
+/// command (split at `;`, `&&`, `||`, `|`, `&` and line breaks), whitespace
+/// collapsed and the program reduced to its name. The whole command comes
+/// first, and an allow rule only ever matches that. Deny and ask rules use
+/// `guard_subjects`.
+pub fn rule_subjects(cmd: &str) -> Vec<String> {
+    let flat = |c: &str| -> Option<String> {
+        let mut words = c.split_whitespace();
+        let first = normalized_bin(words.next()?);
+        Some(
+            std::iter::once(first.as_str())
+                .chain(words)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    };
+    let mut out: Vec<String> = flat(cmd).into_iter().collect();
+    for part in cmd.split(['\n', '\r', ';', '|', '&']) {
+        if let Some(p) = flat(part) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+// Programs that run a command given by their later words (`sudo git push`,
+// `xargs git push`, `sh -c 'git push'`, `cmd /c git push`), and the shell
+// words that start one. Their own options cannot all be known, so a deny
+// or ask rule takes every later word as a possible start of the command.
+const RUNS_A_COMMAND: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "ksh",
+    "mksh",
+    "ash",
+    "csh",
+    "tcsh",
+    "nu",
+    "busybox",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "wsl",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "eval",
+    "xargs",
+    "parallel",
+    "nohup",
+    "nice",
+    "ionice",
+    "chrt",
+    "taskset",
+    "stdbuf",
+    "setsid",
+    "unbuffer",
+    "script",
+    "flock",
+    "timeout",
+    "time",
+    "watch",
+    "watchexec",
+    "entr",
+    "hyperfine",
+    "strace",
+    "ltrace",
+    "valgrind",
+    "gdb",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "pkexec",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "systemd-run",
+    "caffeinate",
+    "start",
+    "find",
+    "fakeroot",
+    "fakechroot",
+    "faketime",
+    "firejail",
+    "bwrap",
+    "proot",
+    "proxychains",
+    "proxychains4",
+    "torsocks",
+    "tsocks",
+    "numactl",
+    "chronic",
+    "ifne",
+    "run0",
+    "sg",
+    "ssh-agent",
+    "dbus-run-session",
+    "systemd-inhibit",
+    "catchsegv",
+    "cgexec",
+    "chpst",
+    "uv",
+    "poetry",
+    "pipenv",
+    "pdm",
+    "hatch",
+    "bundle",
+    "direnv",
+    "mise",
+    "asdf",
+    "nix-shell",
+    "{",
+    "}",
+    "!",
+    "if",
+    "then",
+    "else",
+    "elif",
+    "do",
+    "while",
+    "until",
+];
+
+// How deep `guard_subjects` follows a command inside a command
+// (`sh -c "sudo sh -c 'git push'"`).
+const MAX_NESTED_COMMANDS: usize = 4;
+
+// Bounds on `guard_subjects` for one part of a command: the words after a
+// wrapper that may start its command (options never do, and a wrapper takes
+// at most a few operands of its own), how many starts are followed, and how
+// many words of each are matched.
+const STARTS_AFTER_WRAPPER: usize = 16;
+const MAX_STARTS: usize = 256;
+const MAX_SUBJECT_WORDS: usize = 1024;
+
+// A shell variable assignment before a command (`FOO=1 git push`).
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+// The words of a command as the program receives them where that can be
+// known, else split at whitespace with the quotes dropped.
+fn loose_words(cmd: &str) -> Vec<String> {
+    match shell_words(cmd) {
+        Some(words) => words.into_iter().map(|w| w.text).collect(),
+        None => cmd
+            .split_whitespace()
+            .map(|w| w.replace(['\'', '"'], ""))
+            .collect(),
+    }
+}
+
+/// The commands a deny or ask rule is checked against: every
+/// `rule_subjects` entry, and each command as it runs once the wrappers in
+/// front of it are taken off (`env`, `sudo -u x`, `nice -n 5`, `xargs`,
+/// `timeout 30`, `FOO=1`, a path such as `/usr/bin/git`), with the command
+/// inside `sh -c '…'`, `bash -lc "…"`, `cmd /c`, `$(…)` and backquotes, and
+/// git's own options (`-C dir`, `-c k=v`, `--git-dir`) taken out before its
+/// subcommand. `git -C . push` and `sudo sh -c 'git push'` both give
+/// `git push`.
+pub fn guard_subjects(cmd: &str) -> std::rc::Rc<[String]> {
+    thread_local! {
+        // Every deny and ask rule checks the same command in turn.
+        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<[String]>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = LAST.with_borrow(|l| {
+        l.as_ref()
+            .filter(|(c, _)| c == cmd)
+            .map(|(_, s)| std::rc::Rc::clone(s))
+    }) {
+        return hit;
+    }
+    let out: std::rc::Rc<[String]> = guard_subjects_for(cmd, cfg!(windows)).into();
+    LAST.set(Some((cmd.to_string(), std::rc::Rc::clone(&out))));
+    out
+}
+
+fn guard_subjects_for(cmd: &str, windows: bool) -> Vec<String> {
+    let mut out = rule_subjects(cmd);
+    let mut seen: std::collections::HashSet<String> = out.iter().cloned().collect();
+    add_guard_subjects(cmd, 0, &mut out, &mut seen);
+    // cmd.exe, which runs commands on Windows, drops `^` and expands
+    // `%VAR%` before the program sees them: `g^it push` runs `git push`.
+    if windows && cmd_exe_rewrites(cmd) {
+        let plain = cmd_exe_plain(cmd);
+        for s in rule_subjects(&plain) {
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+        add_guard_subjects(&plain, 0, &mut out, &mut seen);
+    }
+    out
+}
+
+// A command as cmd.exe hands it on, as far as its text tells: `^` escapes
+// dropped and each `%VAR%` taken as empty.
+fn cmd_exe_plain(cmd: &str) -> String {
+    let text = cmd.replace('^', "");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        match rest[i + 1..].find('%') {
+            Some(j) => rest = &rest[i + j + 2..],
+            None => {
+                out.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn add_guard_subjects(
+    cmd: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if depth > MAX_NESTED_COMMANDS {
+        return;
+    }
+    let push = |s: String, out: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+        if !s.is_empty() && seen.insert(s.clone()) {
+            out.push(s);
+        }
+    };
+    // The whole command keeps quoted separators inside their word
+    // (`bash -c 'a && b'`); its parts catch the rest.
+    let parts = std::iter::once(cmd).chain(cmd.split(['\n', '\r', ';', '|', '&', '(', ')', '`']));
+    for part in parts {
+        let words = loose_words(part);
+        // Every word a command may start at: the first, the one after an
+        // assignment, and the words after a program that runs a command.
+        let mut starts = vec![0usize];
+        let mut visited = vec![false; words.len()];
+        let mut unpacked = vec![false; words.len()];
+        let mut followed = 0;
+        while let Some(i) = starts.pop() {
+            if i >= words.len() || visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            let word = &words[i];
+            if is_assignment(word) {
+                starts.push(i + 1);
+                continue;
+            }
+            followed += 1;
+            if followed > MAX_STARTS {
+                break;
+            }
+            let bin = normalized_bin(word);
+            if RUNS_A_COMMAND.contains(&bin.as_str()) {
+                starts.extend(
+                    (i + 1..words.len())
+                        .filter(|&j| !words[j].starts_with('-'))
+                        .take(STARTS_AFTER_WRAPPER),
+                );
+                // A command handed over as one word: `sh -c 'git push'`,
+                // `env -S 'git push'`, `watch 'git push'`.
+                for j in i + 1..words.len() {
+                    let w = &words[j];
+                    if !unpacked[j]
+                        && (w.contains(char::is_whitespace) || w.contains([';', '|', '&']))
+                    {
+                        unpacked[j] = true;
+                        add_guard_subjects(w, depth + 1, out, seen);
+                    }
+                }
+            }
+            let end = words.len().min(i + 1 + MAX_SUBJECT_WORDS);
+            let rest: Vec<&str> = words[i + 1..end].iter().map(String::as_str).collect();
+            push(
+                std::iter::once(bin.as_str())
+                    .chain(rest.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                out,
+                seen,
+            );
+            // `git-push`, as git's own programs are named.
+            let bin = match bin.strip_prefix("git-") {
+                Some(sub) if !sub.is_empty() => {
+                    let dashed = std::iter::once(sub)
+                        .chain(rest.iter().copied())
+                        .collect::<Vec<_>>();
+                    push(format!("git {}", dashed.join(" ")), out, seen);
+                    continue;
+                }
+                _ => bin,
+            };
+            if bin == "git" {
+                if let Some((sub, args)) = git_subcommand(&rest) {
+                    push(
+                        ["git", sub]
+                            .into_iter()
+                            .chain(args.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        out,
+                        seen,
+                    );
+                    // An alias given on the command line
+                    // (`git -c alias.p=push p`): what it stands for.
+                    if let Some(value) = git_inline_alias(&rest, sub) {
+                        let expanded = match value.strip_prefix('!') {
+                            Some(shell) => shell.to_string(),
+                            None => format!("git {value}"),
+                        };
+                        let line = std::iter::once(expanded.as_str())
+                            .chain(args.iter().copied())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        add_guard_subjects(&line, depth + 1, out, seen);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The value of `-c alias.<sub>=…` among git's own options, if given.
+fn git_inline_alias<'a>(args: &[&'a str], sub: &str) -> Option<&'a str> {
+    let key = format!("alias.{sub}=");
+    args.windows(2)
+        .take_while(|w| w[0] != sub)
+        .filter(|w| w[0] == "-c")
+        .find_map(|w| {
+            w[1].get(..key.len())
+                .filter(|k| k.eq_ignore_ascii_case(&key))
+                .map(|_| &w[1][key.len()..])
+        })
+}
+
+/// Whether `cmd` is more than one simple command (a pipeline, a list, a
+/// subshell or a substitution), or hands code to an interpreter or spells a
+/// word in bash's `$'…'` quoting, and any word of it names a program
+/// matching `program` (a `*`/`?` pattern for a program name). Such a command
+/// can build what it runs from parts no rule sees (`git $(echo push)`,
+/// `ruby -e 'system "git push"'`), so a deny rule for that program refuses
+/// it.
+pub fn compound_mentions(cmd: &str, program: &str) -> bool {
+    compound_mentions_for(cmd, program, cfg!(windows))
+}
+
+// An interpreter given code as a word (`perl -e 'system "git push"'`):
+// what that code runs is not read here. Shells are left out, as
+// guard_subjects reads the command they are handed.
+fn hands_code_to_interpreter(cmd: &str) -> bool {
+    let words = loose_words(cmd);
+    words.iter().enumerate().any(|(i, w)| {
+        let bin = normalized_bin(w);
+        runs_arbitrary_code(&bin)
+            && !RUNS_A_COMMAND.contains(&bin.as_str())
+            && words[i + 1..]
+                .iter()
+                .any(|w| w.contains(char::is_whitespace))
+    })
+}
+
+// On Windows a command cmd.exe rewrites (`^`, `%VAR%`) counts as compound
+// too, and its words are read with the `^` escapes dropped.
+fn compound_mentions_for(cmd: &str, program: &str, windows: bool) -> bool {
+    let rewritten = windows && cmd_exe_rewrites(cmd);
+    let compound = rewritten
+        || cmd.contains(['\n', '\r', ';', '|', '&', '(', ')', '`'])
+        || cmd.contains("$'")
+        || cmd.contains("$\"")
+        || hands_code_to_interpreter(cmd);
+    let program = normalized_bin(program);
+    let text = if rewritten {
+        cmd.replace('^', "")
+    } else {
+        cmd.to_string()
+    };
+    compound
+        && !program.is_empty()
+        && text
+            .split(|c: char| c.is_whitespace() || ";|&()`'\"<>={}$!%".contains(c))
+            .filter(|w| !w.is_empty())
+            .any(|w| crate::hooks::glob_match(&program, &normalized_bin(w)))
 }
 
 /// A saved approval naming a shell or interpreter on its own (`python3`), as
@@ -1059,14 +1672,41 @@ pub fn approval_label(name: &str, input: &Value) -> String {
     }
 }
 
-/// The host a network tool will contact (`fetch_url`, `headless_browser`,
-/// `wait_for_url`, and `open_browser` with a URL). Fetches can carry data out
-/// (`https://evil/?k=<secret>`) and reach local services, so outside `auto`
+/// A call that only creates or changes files: what `accept-edits` lets run
+/// without a prompt inside the project. Deleting (`remove_path`) and every
+/// command still ask.
+pub fn is_file_edit(name: &str, input: &Value) -> bool {
+    match name {
+        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" | "patch" | "apply_patch"
+        | "create_dir" | "move_path" => true,
+        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
+            is_mutating_call(name, input)
+        }
+        _ => false,
+    }
+}
+
+// Where web_search sends its query.
+const WEB_SEARCH_HOST: &str = "lite.duckduckgo.com";
+
+/// The host a network tool will contact (`fetch_url`, `web_search`,
+/// `headless_browser`, `wait_for_url`, `screenshot_url`, and `open_browser`
+/// with a URL).
+/// Fetches and search queries can carry data out (`https://evil/?k=<secret>`,
+/// "my api key is …") and fetches reach local services, so outside `auto`
 /// they are approved per host. `?` when the URL has no parsable host.
 pub fn network_host(name: &str, input: &Value) -> Option<String> {
+    if matches!(name, "websearch" | "web_search") {
+        return Some(WEB_SEARCH_HOST.to_string());
+    }
     if !matches!(
         name,
-        "webfetch" | "fetch_url" | "headless_browser" | "wait_for_url" | "open_browser"
+        "webfetch"
+            | "fetch_url"
+            | "headless_browser"
+            | "wait_for_url"
+            | "screenshot_url"
+            | "open_browser"
     ) {
         return None;
     }
@@ -1074,12 +1714,30 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
         .as_str()
         .map(str::trim)
         .filter(|u| !u.is_empty())?;
+    // screenshot_url opens http(s) pages only and refuses anything else
+    // itself, with that reason; there is no host to approve.
+    if name == "screenshot_url"
+        && !url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+    {
+        return None;
+    }
     Some(url_authority(url).unwrap_or_else(|| "?".to_string()))
 }
 
 // `scheme://[user@]host[:port]/…` → `host[:port]`, lowercased. The port
-// stays: approving a dev server on :3000 must not approve :2375.
+// stays: approving a dev server on :3000 must not approve :2375. The host
+// is the one the request reaches: percent-escapes decoded and a trailing
+// dot dropped, as the HTTP client and DNS treat them, so a rule naming the
+// host cannot be stepped around by spelling it differently.
 fn url_authority(url: &str) -> Option<String> {
+    if let Ok(u) = url::Url::parse(url) {
+        if let Some(host) = u.host_str().filter(|h| !h.is_empty()) {
+            return Some(crate::net::canonical_authority(&match u.port() {
+                Some(p) => format!("{host}:{p}"),
+                None => host.to_string(),
+            }));
+        }
+    }
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#', '\\']).next()?;
     let host = authority.rsplit('@').next()?.to_ascii_lowercase();
@@ -1119,6 +1777,7 @@ fn raw_preview(name: &str, input: &Value) -> String {
         "stop_server" => format!("stop server: {}", input["name"].as_str().unwrap_or("?")),
         "read_server_log" => format!("server log: {}", input["name"].as_str().unwrap_or("?")),
         "wait_for_url" => format!("wait for URL: {}", input["url"].as_str().unwrap_or("?")),
+        "screenshot_url" => format!("screenshot {}", input["url"].as_str().unwrap_or("?")),
         "open_browser" => format!(
             "open browser: {}",
             input["url"]
@@ -1168,6 +1827,11 @@ fn raw_preview(name: &str, input: &Value) -> String {
                 input["title"].as_str().unwrap_or("untitled")
             )
         }
+        "todo_write" | "todowrite" => match input["items"].as_array().map(Vec::len) {
+            Some(1) => "todo list: 1 item".to_string(),
+            Some(n) => format!("todo list: {n} items"),
+            None => "todo list".to_string(),
+        },
         _ => name.to_string(),
     }
 }
@@ -1192,6 +1856,39 @@ fn task_arg(input: &Value) -> Option<&str> {
     input["task"]
         .as_str()
         .or_else(|| input["description"].as_str())
+}
+
+/// Text files read and written through an editor (`bwn acp` with a client
+/// that offers fs/read_text_file and fs/write_text_file): reads see unsaved
+/// buffers and the editor records each write. `None` means the editor does
+/// not handle that direction, so the disk is used.
+pub trait EditorFiles: Send + Sync {
+    fn read(&self, path: &Path) -> Option<Result<String, String>>;
+    fn write(&self, path: &Path, contents: &str) -> Option<Result<(), String>>;
+}
+
+static EDITOR_FILES: OnceLock<Box<dyn EditorFiles>> = OnceLock::new();
+
+pub fn set_editor_files(files: Box<dyn EditorFiles>) {
+    let _ = EDITOR_FILES.set(files);
+}
+
+// A text file as the editor has it, else from disk. An editor that cannot
+// read it (outside its project, say) leaves the disk to answer: the gate has
+// already allowed the read.
+fn read_text(path: &Path) -> std::io::Result<String> {
+    match EDITOR_FILES.get().and_then(|e| e.read(path)) {
+        Some(Ok(text)) => Ok(text),
+        _ => fs::read_to_string(path),
+    }
+}
+
+// Writes through the editor when it takes writes; its refusal stands.
+fn write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    match EDITOR_FILES.get().and_then(|e| e.write(path, contents)) {
+        Some(r) => r.map_err(std::io::Error::other),
+        None => write_atomic(path, contents),
+    }
 }
 
 // Write file contents atomically: same-directory temp + rename, so a crash
@@ -1220,7 +1917,7 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> 
     }
 }
 
-fn resolve(cwd: &Path, p: &str) -> PathBuf {
+pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     // `~` expansion: $HOME, or %USERPROFILE% on Windows (where `~\x` is
     // also accepted).
     let user_home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
@@ -1275,7 +1972,7 @@ pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
         | "str_replace_editor"
         | "text_editor_20241022"
         | "text_editor_20250124" => Some(resolve(cwd, path_arg(input).unwrap_or(""))),
-        "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or(""))),
+        "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or("").trim())),
         "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
             Some(resolve(cwd, root_arg(input)))
         }
@@ -1298,13 +1995,181 @@ pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
                     .collect()
             })
             .unwrap_or_default(),
+        // The paths move_path itself uses, trimmed as it trims them.
         "move_path" => ["from", "to"]
             .iter()
             .filter_map(|k| input[*k].as_str())
-            .map(|p| resolve(cwd, p))
+            .map(|p| resolve(cwd, p.trim()))
             .collect(),
+        // `git apply` reads the patch's paths from the top of the work tree
+        // (from the folder itself outside one).
+        "patch" | "apply_patch" => {
+            let base = git_top(cwd);
+            patch_files(input["patch"].as_str().unwrap_or(""))
+                .into_iter()
+                .map(|p| resolve(&base, &p))
+                .collect()
+        }
         _ => touched_path(name, input, cwd).into_iter().collect(),
     }
+}
+
+// The work tree `cwd` is in (the nearest folder up holding `.git`), else
+// `cwd` itself.
+fn git_top(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|d| d.join(".git").exists())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// The files a unified diff names, as `git apply` reads them: both sides of
+/// each `---`/`+++` header and of `diff --git`, with the leading component
+/// (`a/`, `b/`) removed, plus rename and copy lines; `/dev/null` is left
+/// out. Hunk bodies are skipped by their line counts, so a removed line
+/// that reads `--- x` is never taken for a header.
+pub fn patch_files(patch: &str) -> Vec<String> {
+    // git's C-style quoting of unusual names: "a/x\ty".
+    fn unquote(s: &str) -> String {
+        let Some(inner) = s
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .filter(|_| s.len() >= 2)
+        else {
+            return s.to_string();
+        };
+        let b = inner.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'\\' || i + 1 >= b.len() {
+                out.push(b[i]);
+                i += 1;
+                continue;
+            }
+            let c = b[i + 1];
+            i += 2;
+            match c {
+                b'0'..=b'7' => {
+                    let mut v = u32::from(c - b'0');
+                    for _ in 0..2 {
+                        if i < b.len() && (b'0'..=b'7').contains(&b[i]) {
+                            v = v * 8 + u32::from(b[i] - b'0');
+                            i += 1;
+                        }
+                    }
+                    out.push(v as u8);
+                }
+                b'a' => out.push(7),
+                b'b' => out.push(8),
+                b't' => out.push(b'\t'),
+                b'n' => out.push(b'\n'),
+                b'v' => out.push(11),
+                b'f' => out.push(12),
+                b'r' => out.push(b'\r'),
+                other => out.push(other),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    // A quoted name at the start of `s` (closing quote not escaped) and
+    // what follows it.
+    fn quoted(s: &str) -> Option<(String, &str)> {
+        let b = s.as_bytes();
+        if b.first() != Some(&b'"') {
+            return None;
+        }
+        let mut i = 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Some((unquote(&s[..=i]), &s[i + 1..])),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+    // A header name: quoted, or up to a tab (a timestamp may follow).
+    fn header_name(rest: &str) -> String {
+        let rest = rest.trim_end_matches('\r');
+        match quoted(rest) {
+            Some((name, _)) => name,
+            None => rest.split('\t').next().unwrap_or("").trim_end().to_string(),
+        }
+    }
+    // git apply's default -p1: drop everything up to the first `/`.
+    fn strip_one(name: &str) -> Option<String> {
+        if name.is_empty() || name == "/dev/null" {
+            return None;
+        }
+        Some(name.split_once('/').map_or(name, |(_, r)| r).to_string())
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: Option<String>| {
+        if let Some(p) = p.filter(|p| !p.is_empty()) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    };
+    let (mut old_left, mut new_left) = (0usize, 0usize);
+    for line in patch.lines() {
+        if old_left > 0 || new_left > 0 {
+            match line.as_bytes().first() {
+                Some(b'-') => old_left = old_left.saturating_sub(1),
+                Some(b'+') => new_left = new_left.saturating_sub(1),
+                Some(b'\\') => {}
+                _ => {
+                    old_left = old_left.saturating_sub(1);
+                    new_left = new_left.saturating_sub(1);
+                }
+            }
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("@@ -") {
+            // @@ -l[,n] +l[,n] @@
+            let count = |r: &str| -> usize {
+                let r = r.split_whitespace().next().unwrap_or("");
+                r.split_once(',')
+                    .map_or(Some(1), |(_, n)| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            old_left = count(h);
+            new_left = h.split_once(" +").map_or(0, |(_, r)| count(r));
+        } else if let Some(r) = line
+            .strip_prefix("--- ")
+            .or_else(|| line.strip_prefix("+++ "))
+        {
+            push(strip_one(&header_name(r)));
+        } else if let Some(r) = ["rename from ", "rename to ", "copy from ", "copy to "]
+            .iter()
+            .find_map(|p| line.strip_prefix(p))
+        {
+            push(Some(header_name(r)));
+        } else if let Some(r) = line.strip_prefix("diff --git ") {
+            let r = r.trim_end_matches('\r');
+            if let Some((first, rest)) = quoted(r) {
+                push(strip_one(&first));
+                push(strip_one(&header_name(rest.trim_start())));
+            } else {
+                // `a/<name> b/<name>`: the split where both halves agree,
+                // else the only one there is.
+                let splits: Vec<usize> = r.match_indices(" b/").map(|(i, _)| i).collect();
+                let agreed = splits
+                    .iter()
+                    .find(|&&i| r.get(..i).and_then(strip_one) == strip_one(&r[i + 1..]));
+                if let Some(&i) = agreed.or(if splits.len() == 1 {
+                    splits.first()
+                } else {
+                    None
+                }) {
+                    push(strip_one(&r[..i]));
+                    push(strip_one(r[i + 1..].trim_end()));
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn command_arg_for<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
@@ -1338,6 +2203,17 @@ pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathB
             path_arg(input).map(|p| resolve(cwd, p))
         }
         _ => None,
+    }
+}
+
+// Where a search without a folder of its own looks: the working folder and
+// every added one. A named folder is searched alone.
+fn search_roots(input: &Value, cwd: &Path) -> Vec<PathBuf> {
+    match root_arg(input) {
+        "." => std::iter::once(cwd.to_path_buf())
+            .chain(crate::workdirs::list())
+            .collect(),
+        r => vec![resolve(cwd, r)],
     }
 }
 
@@ -1414,6 +2290,35 @@ fn command_available(command: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// The variable names in the global environment of a tmux server that is
+// already running (none when there is no server).
+fn tmux_server_env() -> Vec<String> {
+    let Ok(out) = Command::new("tmux")
+        .args(["show-environment", "-g"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.to_string()))
+        .collect()
+}
+
+// `script` run with `names` unset, whatever shell tmux starts it with.
+fn without_env(names: &[String], script: &str) -> String {
+    if names.is_empty() {
+        return script.to_string();
+    }
+    let unset: Vec<String> = names.iter().map(|n| format!("-u {n}")).collect();
+    format!("env {} sh -c {}", unset.join(" "), shell_quote(script))
 }
 
 fn tmux_running(session: &str) -> bool {
@@ -1566,7 +2471,16 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
             command,
             shell_quote(&log_path.to_string_lossy())
         );
-        match Command::new("tmux")
+        // A tmux server that is already running hands the session its own
+        // environment, keys included, so the command unsets them itself.
+        let shell = without_env(
+            &crate::sandbox::credentials_to_unset(tmux_server_env()),
+            &shell,
+        );
+        let mut tmux = Command::new("tmux");
+        // A tmux server started here inherits this environment.
+        crate::sandbox::scrub_credentials(&mut tmux);
+        match tmux
             .args(["new-session", "-d", "-s", &session])
             .arg(shell)
             .output()
@@ -1617,10 +2531,12 @@ fn start_server(input: &Value, cwd: &Path) -> Outcome {
         } else if cfg!(windows) {
             let mut c = Command::new("cmd");
             c.args(["/C", command]).current_dir(&run_cwd);
+            crate::sandbox::scrub_credentials(&mut c);
             c
         } else {
             let mut c = Command::new("sh");
             c.args(["-lc", command]).current_dir(&run_cwd);
+            crate::sandbox::scrub_credentials(&mut c);
             c
         };
         match cmd
@@ -1768,11 +2684,7 @@ fn wait_for_url(input: &Value) -> Outcome {
     let deadline = started + Duration::from_secs(timeout);
 
     loop {
-        let last_error = match web_agent()
-            .get(url)
-            .set("User-Agent", "buildwithnexus/1.0")
-            .call()
-        {
+        let last_error = match web_get(url, Some("buildwithnexus/1.0")) {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.into_string().unwrap_or_default();
@@ -1800,7 +2712,11 @@ fn wait_for_url(input: &Value) -> Outcome {
                         .unwrap_or_default()
                 )
             }
-            Err(ureq::Error::Status(status, resp)) => {
+            Err(WebError::Blocked(why)) => return err(why),
+            Err(WebError::Http(e)) if matches!(*e, ureq::Error::Status(..)) => {
+                let ureq::Error::Status(status, resp) = *e else {
+                    unreachable!()
+                };
                 let body = resp.into_string().unwrap_or_default();
                 let status_ok = expect_status
                     .map(|expected| status == expected)
@@ -1838,6 +2754,22 @@ const BROWSER_FILE_EXTS: &[&str] = &[
     "html", "htm", "xhtml", "svg", "pdf", "png", "jpg", "jpeg", "gif", "webp", "txt", "md", "json",
 ];
 
+/// Hands `target` (a URL or a file the checks above allowed) to the OS
+/// opener and waits for the opener, not the browser, to exit.
+pub fn spawn_opener(target: &str) -> std::io::Result<std::process::ExitStatus> {
+    if cfg!(target_os = "macos") {
+        Command::new("open").arg(target).status()
+    } else if cfg!(windows) {
+        // Not `cmd /C start`: cmd re-parses the target, so `&` in a URL
+        // would run a second command.
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", target])
+            .status()
+    } else {
+        Command::new("xdg-open").arg(target).status()
+    }
+}
+
 fn open_browser(input: &Value, cwd: &Path) -> Outcome {
     let target = if let Some(url) = input["url"].as_str().filter(|s| !s.trim().is_empty()) {
         let url = url.trim();
@@ -1862,18 +2794,7 @@ fn open_browser(input: &Value, cwd: &Path) -> Outcome {
     } else {
         return err("url or path is required");
     };
-    let status = if cfg!(target_os = "macos") {
-        Command::new("open").arg(&target).status()
-    } else if cfg!(windows) {
-        // Not `cmd /C start`: cmd re-parses the target, so `&` in a URL
-        // would run a second command.
-        Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &target])
-            .status()
-    } else {
-        Command::new("xdg-open").arg(&target).status()
-    };
-    match status {
+    match spawn_opener(&target) {
         Ok(s) if s.success() => ok(format!("opened in browser: {target}")),
         Ok(s) => err(format!("browser opener exited with status {s}: {target}")),
         Err(e) => err(format!("cannot open browser for {target}: {e}")),
@@ -2137,6 +3058,13 @@ pub fn escapes_cwd(p: &Path, cwd: &Path) -> bool {
     !canonicalize_lenient(p).starts_with(&base)
 }
 
+/// True if the path resolves outside the working directory and every folder
+/// added with --add-dir. Links are followed, so one inside an added folder
+/// that leads elsewhere is outside.
+pub fn escapes_roots(p: &Path, cwd: &Path) -> bool {
+    escapes_cwd(p, cwd) && crate::workdirs::list().iter().all(|r| escapes_cwd(p, r))
+}
+
 // The resolved out-of-cwd path for a mutating file-tool call, if any. The
 // permission gate can route this through the same confirmation flow used for
 // sensitive paths; `run` also refuses such writes outright so a target outside
@@ -2157,16 +3085,17 @@ pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<Path
         | "str_replace_editor"
         | "text_editor_20241022"
         | "text_editor_20250124" => touched_path(name, input, cwd)?,
+        // Trimmed, as move_path trims them before it moves anything.
         "move_path" => {
-            let from = resolve(cwd, input["from"].as_str().unwrap_or(""));
-            if escapes_cwd(&from, cwd) {
+            let from = resolve(cwd, input["from"].as_str().unwrap_or("").trim());
+            if escapes_roots(&from, cwd) {
                 return Some(from);
             }
-            resolve(cwd, input["to"].as_str().unwrap_or(""))
+            resolve(cwd, input["to"].as_str().unwrap_or("").trim())
         }
         _ => return None,
     };
-    if escapes_cwd(&candidate, cwd) {
+    if escapes_roots(&candidate, cwd) {
         Some(candidate)
     } else {
         None
@@ -2198,56 +3127,144 @@ const SENSITIVE_FILES: &[&str] = &[
     ".env",
 ];
 
-fn is_sensitive_dir_name(name: &str) -> bool {
-    SENSITIVE_DIRS.contains(&name)
+fn is_sensitive_dir_name(name: &str, windows: bool) -> bool {
+    SENSITIVE_DIRS.iter().any(|d| name_is(name, d, windows))
 }
 
-fn is_sensitive_file_name(name: &str) -> bool {
-    SENSITIVE_FILES.contains(&name)
+fn is_sensitive_file_name(name: &str, windows: bool) -> bool {
+    SENSITIVE_FILES.iter().any(|f| name_is(name, f, windows))
         || name.starts_with(".env.")
         || ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
             .iter()
-            .any(|k| name.starts_with(k))
+            .any(|k| name.starts_with(k) || (windows && is_short_name_of(name, k)))
         || [".pem", ".p12", ".pfx"].iter().any(|e| name.ends_with(e))
 }
 
-fn sensitive_components(p: &Path) -> bool {
-    let names: Vec<String> = p
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
-        .collect();
-    names.iter().any(|n| is_sensitive_dir_name(n))
-        || names.windows(2).any(|w| {
-            SENSITIVE_SUBPATHS
-                .iter()
-                .any(|s| w[0] == s[0] && w[1] == s[1])
-        })
-        || names.last().is_some_and(|n| is_sensitive_file_name(n))
+// `name` is `long`, or on Windows its 8.3 short name (`SSH~1` for `.ssh`,
+// `GIT-CR~1` for `.git-credentials`), which opens the same file.
+fn name_is(name: &str, long: &str, windows: bool) -> bool {
+    name == long || (windows && is_short_name_of(name, long))
+}
+
+// A short name keeps up to six characters of the long name's base (leading
+// dots and embedded dots dropped), then `~N` and up to three of its extension.
+fn is_short_name_of(name: &str, long: &str) -> bool {
+    let Some((stem, tail)) = name.split_once('~') else {
+        return false;
+    };
+    let digits = tail.split('.').next().unwrap_or("");
+    if stem.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let long = long.trim_start_matches('.');
+    let base = long.rsplit_once('.').map_or(long, |(b, _)| b);
+    let base: String = base.chars().filter(|c| !matches!(c, '.' | ' ')).collect();
+    base.starts_with(stem)
+}
+
+// A path's lowercased component names. With `windows` the path is read as
+// Windows reads it, whatever the host: `\` and `/` both separate, a drive,
+// UNC or device prefix (`C:`, `\\?\`, `\\.\`, `\??\`) is dropped,
+// trailing dots and spaces are ignored (`.ssh.` opens `.ssh`) and a stream
+// suffix names its file (`.env::$DATA`).
+fn path_names(p: &Path, windows: bool) -> Vec<String> {
+    if !windows {
+        return p
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+                _ => None,
+            })
+            .collect();
+    }
+    let s = p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let mut rest = s.as_str();
+    for prefix in ["//?/unc/", "//?/", "//./", "/??/"] {
+        if let Some(r) = rest.strip_prefix(prefix) {
+            rest = r;
+            break;
+        }
+    }
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        rest = &rest[2..];
+    }
+    let mut names: Vec<String> = Vec::new();
+    for comp in rest.split('/') {
+        let comp = comp.split(':').next().unwrap_or("");
+        match comp {
+            "" | "." => {}
+            ".." => {
+                names.pop();
+            }
+            _ => {
+                let comp = comp.trim_end_matches(['.', ' ']);
+                if !comp.is_empty() {
+                    names.push(comp.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn sensitive_names(names: &[String], windows: bool, in_project: bool) -> bool {
+    names.iter().any(|n| {
+        // A project's own `.buildwithnexus` (instructions, skills) is
+        // ordinary repo content.
+        !(in_project && n == ".buildwithnexus") && is_sensitive_dir_name(n, windows)
+    }) || names.windows(2).any(|w| {
+        SENSITIVE_SUBPATHS
+            .iter()
+            .any(|s| name_is(&w[0], s[0], windows) && name_is(&w[1], s[1], windows))
+    }) || names
+        .last()
+        .is_some_and(|n| is_sensitive_file_name(n, windows))
+        || (!windows && !in_project && is_proc_environ(names))
+}
+
+// `/proc/<pid>/environ` (or `/proc/<pid>/task/<tid>/environ`, or a glob of
+// either): another process's environment holds the keys bwn scrubs from the
+// commands it runs, the parent shell's included.
+fn is_proc_environ(names: &[String]) -> bool {
+    names.len() >= 3
+        && names[0] == "proc"
+        && names
+            .last()
+            .is_some_and(|n| n == "environ" || component_glob_match(n, "environ"))
+}
+
+// `/proc`, `/proc/<pid>`, `/proc/self` (or a glob of a pid): a folder that
+// holds environ files.
+fn is_proc_tree(names: &[String]) -> bool {
+    match names {
+        [p] => p == "proc",
+        [p, pid] => {
+            p == "proc"
+                && (pid == "self"
+                    || pid == "thread-self"
+                    || pid.contains(['*', '?', '['])
+                    || pid.bytes().all(|b| b.is_ascii_digit())
+                    || pid.starts_with('$'))
+        }
+        [p, _, task] => p == "proc" && task == "task",
+        _ => false,
+    }
+}
+
+// `environ`, or a glob of it that spells part of the name (`env*`): a bare
+// `*` is any file.
+fn is_environ_name(n: &str) -> bool {
+    n == "environ"
+        || (n.contains(['*', '?', '[']) && n.contains("env") && component_glob_match(n, "environ"))
 }
 
 /// Sensitivity of a path inside a project tree, relative to its root: the
 /// same credential names as `is_sensitive`, except that the project's own
 /// `.buildwithnexus` (instructions, skills) is ordinary repo content.
 pub fn is_sensitive_in_project(rel: &Path) -> bool {
-    let names: Vec<String> = rel
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
-            _ => None,
-        })
-        .collect();
-    names
-        .iter()
-        .any(|n| n != ".buildwithnexus" && is_sensitive_dir_name(n))
-        || names.windows(2).any(|w| {
-            SENSITIVE_SUBPATHS
-                .iter()
-                .any(|s| w[0] == s[0] && w[1] == s[1])
-        })
-        || names.last().is_some_and(|n| is_sensitive_file_name(n))
+    let windows = cfg!(windows);
+    sensitive_names(&path_names(rel, windows), windows, true)
 }
 
 // Paths that should never be read/written without explicit confirmation, even in
@@ -2255,7 +3272,14 @@ pub fn is_sensitive_in_project(rel: &Path) -> bool {
 // Checked on the lexical path and on the symlink-resolved one, so a link in
 // the workspace pointing at ~/.ssh is caught too.
 pub fn is_sensitive(p: &Path) -> bool {
-    sensitive_components(&normalize(p)) || sensitive_components(&canonicalize_lenient(p))
+    is_sensitive_for(p, cfg!(windows))
+}
+
+/// `is_sensitive` with the platform passed in, so tests can run the Windows
+/// path rules anywhere.
+fn is_sensitive_for(p: &Path, windows: bool) -> bool {
+    let check = |q: &Path| sensitive_names(&path_names(q, windows), windows, false);
+    check(&normalize(p)) || check(&canonicalize_lenient(p))
 }
 
 // Shell glob match for one path component (`*`, `?`, `[...]` as any one
@@ -2293,14 +3317,60 @@ fn glob_component_is_sensitive(comp: &str) -> bool {
 /// The first path-like argument of a shell command that names a sensitive
 /// path (`cat ~/.aws/credentials`, `--file=$HOME/.netrc`). Quotes and
 /// backslashes are stripped and `~`/`$HOME` expanded first; glob components
-/// are matched against the sensitive names.
+/// are matched against the sensitive names. A word is also read as a Windows
+/// path, with `\` separating, on Windows or when it has a backslash
+/// (`C:\Users\me\.ssh\id_rsa` passed to cmd or PowerShell from anywhere).
 pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
+    command_sensitive_path_for(cmd, cwd, cfg!(windows))
+}
+
+thread_local! {
+    // The script command being run (`with_script_command`): its own path is
+    // not a sensitive path to touch, though it sits in `.buildwithnexus`.
+    static SCRIPT_COMMAND: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (the gate and run of a custom script command) with `script`
+/// exempt from the sensitive-path check: the file was trusted to load as a
+/// command, so running it is not a touch of `.buildwithnexus`. Its arguments
+/// are still checked.
+pub fn with_script_command<T>(script: &Path, f: impl FnOnce() -> T) -> T {
+    SCRIPT_COMMAND.with(|s| *s.borrow_mut() = Some(script.to_path_buf()));
+    let r = f();
+    SCRIPT_COMMAND.with(|s| *s.borrow_mut() = None);
+    r
+}
+
+fn is_script_command(p: &Path) -> bool {
+    SCRIPT_COMMAND.with(|s| s.borrow().as_deref() == Some(p))
+}
+
+fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| h.to_string_lossy().into_owned());
     for raw in cmd.split(|c: char| {
         c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`')
     }) {
+        let unquoted: String = raw.chars().filter(|c| !matches!(c, '\'' | '"')).collect();
+        let win = unquoted.rsplit('=').next().unwrap_or("");
+        // PowerShell's `-Path:value`.
+        let win = match win.strip_prefix('-') {
+            Some(p) => p.split_once(':').map_or("", |(_, v)| v),
+            None => win,
+        };
+        if (windows || win.contains('\\')) && !win.is_empty() && !is_script_command(Path::new(win))
+        {
+            let names = path_names(Path::new(win), true);
+            if sensitive_names(&names, true, false)
+                || names
+                    .iter()
+                    .any(|n| n.contains(['*', '?', '[']) && glob_component_is_sensitive(n))
+            {
+                return Some(PathBuf::from(win));
+            }
+        }
         let tok: String = raw
             .chars()
             .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -2315,7 +3385,25 @@ pub fn command_sensitive_path(cmd: &str, cwd: &Path) -> Option<PathBuf> {
             None => tok,
         };
         let p = resolve(cwd, &tok);
-        if is_sensitive(&p) {
+        if is_script_command(&p) {
+            continue;
+        }
+        // Any `…/environ` word: a loop variable (`$p/environ`) or a `cd
+        // /proc/1` first hides the `/proc` the path check needs.
+        if !windows
+            && tok
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| is_environ_name(&n.to_lowercase()))
+        {
+            return Some(p);
+        }
+        // `/proc` or one process's folder: a recursive search (`rg -a KEY
+        // /proc`) reads every environ under it.
+        if !windows && is_proc_tree(&path_names(&normalize(&p), false)) {
+            return Some(p);
+        }
+        if is_sensitive_for(&p, windows) {
             return Some(p);
         }
         if tok.contains(['*', '?', '[']) {
@@ -2347,7 +3435,7 @@ pub fn find_on_path(bin: &str) -> Option<PathBuf> {
 /// `find_on_path` with its inputs passed in, so tests can run the Windows
 /// rules anywhere. On Windows a bare name also matches each PATHEXT suffix
 /// (`git` finds `git.exe`), as cmd.exe does.
-fn find_in_path(
+pub(crate) fn find_in_path(
     bin: &str,
     path: &std::ffi::OsStr,
     pathext: Option<&std::ffi::OsStr>,
@@ -2796,12 +3884,131 @@ pub fn catastrophic(cmd: &str) -> bool {
             if arg.starts_with('-') {
                 continue;
             }
-            if matches!(*arg, "~" | "~/" | "*" | "." | "..") || arg.starts_with('/') {
+            if matches!(*arg, "~" | "~/" | "~\\" | "*" | "." | "..")
+                || arg.starts_with(['/', '\\'])
+                || is_drive_path(arg)
+            {
                 return true;
             }
         }
     }
+    windows_destructive(&lower)
+}
+
+// Windows commands that destroy data or weaken the system whatever their
+// target: cmd's recursive or unconfirmed deletes, PowerShell's recursive
+// forced Remove-Item under any alias, disk, boot and registry tools,
+// ownership or ACL changes on system paths, execution-policy changes, and
+// encoded PowerShell, whose script no check here can read. Matched on every
+// word, so a call wrapped in `cmd /c` or `powershell -Command` counts too.
+fn windows_destructive(lower: &str) -> bool {
+    let toks: Vec<&str> = lower
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '{' | '}' | '"' | '\'' | '`' | ','
+                )
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, tok) in toks.iter().enumerate() {
+        // cmd reads `rd/s/q` as `rd /s /q`.
+        let (name, glued) = match tok.split_once('/') {
+            Some((n, g)) if matches!(n, "rd" | "rmdir" | "del" | "erase" | "cipher") => {
+                (n.to_string(), g)
+            }
+            _ => (normalized_bin(tok), ""),
+        };
+        let rest = &toks[i + 1..];
+        let switch = |want: &dyn Fn(&str) -> bool| {
+            glued.split('/').any(&want)
+                || rest
+                    .iter()
+                    .filter_map(|t| t.strip_prefix('/'))
+                    .any(|t| t.split('/').any(&want))
+        };
+        // PowerShell parameters take any unambiguous prefix and `:value`.
+        let param = |full: &str, min: usize| {
+            rest.iter().any(|t| {
+                let p = t.strip_prefix('-').unwrap_or("");
+                let p = p.split(':').next().unwrap_or(p);
+                p.len() >= min && full.starts_with(p)
+            })
+        };
+        let remove_item = matches!(name.as_str(), "remove-item" | "ri");
+        let hit = match name.as_str() {
+            "rd" | "rmdir" if switch(&|s| s == "s") => true,
+            "del" | "erase" if switch(&|s| s == "s" || s == "q") => true,
+            "cipher" => switch(&|s| s.starts_with('w')),
+            "format" => rest.iter().any(|t| is_drive_root(t)),
+            "diskpart" | "bcdedit" | "set-executionpolicy" | "format-volume" | "clear-disk" => true,
+            "reg" => rest.first() == Some(&"delete"),
+            "takeown" | "icacls" => rest.iter().any(|t| is_windows_system_path(t)),
+            "powershell" | "pwsh" => rest.iter().any(|t| {
+                let p = t.strip_prefix(['-', '/']).unwrap_or("");
+                let p = p.split(':').next().unwrap_or(p);
+                p == "ec" || (!p.is_empty() && "encodedcommand".starts_with(p))
+            }),
+            _ => false,
+        };
+        // Remove-Item and its aliases. `-fo` is not a Unix rm flag, so next
+        // to it `-r` is PowerShell's -Recurse.
+        let hit = hit
+            || (remove_item || matches!(name.as_str(), "rm" | "rd" | "rmdir" | "del" | "erase"))
+                && param("recurse", 1)
+                && param("force", 2);
+        if hit {
+            return true;
+        }
+    }
     false
+}
+
+// An absolute Windows path: `c:\...` or `c:/...`.
+fn is_drive_path(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+// `c:`, `c:\` or `c:/`.
+fn is_drive_root(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && t[2..].chars().all(|c| matches!(c, '\\' | '/'))
+}
+
+// A drive root or the Windows, Program Files or Users tree, lowercased.
+fn is_windows_system_path(t: &str) -> bool {
+    if [
+        "%systemroot%",
+        "%windir%",
+        "%programfiles",
+        "$env:systemroot",
+        "$env:windir",
+    ]
+    .iter()
+    .any(|v| t.contains(v))
+        || t.starts_with("$env:programfiles")
+    {
+        return true;
+    }
+    let t = t.replace('\\', "/");
+    let t = t
+        .strip_prefix("//?/")
+        .or_else(|| t.strip_prefix("//./"))
+        .unwrap_or(&t);
+    let b = t.as_bytes();
+    if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+        return false;
+    }
+    let r = t[2..].trim_matches('/');
+    r.is_empty()
+        || r == "*"
+        || r == "users"
+        || ["windows", "program"].iter().any(|d| r.starts_with(d))
 }
 
 fn truncate(s: String, max: usize) -> String {
@@ -2922,10 +4129,234 @@ fn skip_dir(path: &Path) -> bool {
             | ".cache"
             | "vendor"
             | "__pycache__"
-    ) || is_sensitive_dir_name(&name.to_lowercase())
+            | ".venv"
+            | ".tox"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".ruff_cache"
+    ) || is_sensitive_dir_name(&name.to_lowercase(), cfg!(windows))
+        // A Python virtualenv under any name (`venv`, `env`, `.py311`).
+        || path.join("pyvenv.cfg").is_file()
+}
+
+// ── .gitignore subset for the file walkers ──────────────────────────────────
+// Blank lines and `#` comments, `!` negation, a trailing `/` for folders
+// only, a `/` anywhere but the end anchoring the pattern to its file's
+// folder, and `*`, `?`, `[…]` and `**` globs. Nested .gitignore files apply
+// below their folder, and the last matching rule wins. Sensitive paths are
+// hidden by their own check, which no `!` pattern undoes.
+
+#[derive(Clone)]
+struct IgnoreRule {
+    base: PathBuf,
+    parts: Vec<String>,
+    anchored: bool,
+    dir_only: bool,
+    negate: bool,
+}
+
+#[derive(Clone, Default)]
+struct Ignores {
+    rules: Vec<IgnoreRule>,
+}
+
+impl Ignores {
+    // The .gitignore files from the repository top (the nearest folder up
+    // from `root` holding .git) down to `root`; only root's own outside git.
+    fn for_root(root: &Path) -> Ignores {
+        let mut chain = Vec::new();
+        let mut dir = Some(root);
+        let mut in_git = false;
+        while let Some(d) = dir {
+            chain.push(d.to_path_buf());
+            if d.join(".git").exists() {
+                in_git = true;
+                break;
+            }
+            dir = d.parent();
+        }
+        if !in_git {
+            chain.truncate(1);
+        }
+        let mut ig = Ignores::default();
+        for d in chain.iter().rev() {
+            if let Some(next) = ig.with_dir(d) {
+                ig = next;
+            }
+        }
+        ig
+    }
+
+    // The rules for walking into `dir`: these plus its own .gitignore, or
+    // None when it has none (the caller keeps using these).
+    fn with_dir(&self, dir: &Path) -> Option<Ignores> {
+        let text = fs::read_to_string(dir.join(".gitignore")).ok()?;
+        let mut next = self.clone();
+        next.rules.extend(parse_gitignore(&text, dir));
+        Some(next)
+    }
+
+    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for rule in &self.rules {
+            if rule.matches(path, is_dir) {
+                ignored = !rule.negate;
+            }
+        }
+        ignored
+    }
+}
+
+fn parse_gitignore(text: &str, base: &Path) -> Vec<IgnoreRule> {
+    let mut rules = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (negate, pat) = match line.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, line.strip_prefix('\\').unwrap_or(line)),
+        };
+        let dir_only = pat.ends_with('/');
+        let pat = pat.trim_end_matches('/');
+        let anchored = pat.contains('/');
+        let parts: Vec<String> = pat
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        rules.push(IgnoreRule {
+            base: base.to_path_buf(),
+            parts,
+            anchored,
+            dir_only,
+            negate,
+        });
+    }
+    rules
+}
+
+impl IgnoreRule {
+    fn matches(&self, path: &Path, is_dir: bool) -> bool {
+        if self.dir_only && !is_dir {
+            return false;
+        }
+        let Ok(rel) = path.strip_prefix(&self.base) else {
+            return false;
+        };
+        let names: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if self.anchored {
+            ignore_parts_match(&self.parts, &names)
+        } else {
+            names.last().is_some_and(|n| ignore_glob(&self.parts[0], n))
+        }
+    }
+}
+
+// `**` matches any run of folders, including none. Like ignore_glob, one
+// pass that backtracks only to the last `**`.
+fn ignore_parts_match(pat: &[String], names: &[String]) -> bool {
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < names.len() {
+        match pat.get(pi) {
+            Some(p) if p == "**" => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(p) if ignore_glob(p, &names[ni]) => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    pi = sp + 1;
+                    ni = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pat[pi..].iter().all(|p| p == "**")
+}
+
+// One name against one gitignore glob: `*` any run, `?` one char, `[…]`
+// a set (with `!` or `^` negating and `a-z` ranges). Unlike the shell, git
+// lets `*` match a leading dot. The pattern comes from the checkout, so it
+// is matched in one pass that backtracks only to the last `*`: at most
+// pattern × name steps, however the pattern is built.
+fn ignore_glob(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if p.get(pi) == Some(&'*') {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some(next) = glob_char(&p, pi, n[ni]) {
+            pi = next;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+// Where the pattern goes on after `p[pi]` matches the one character `c`.
+fn glob_char(p: &[char], pi: usize, c: char) -> Option<usize> {
+    match *p.get(pi)? {
+        '?' => Some(pi + 1),
+        '[' => {
+            // No closing bracket: the `[` is a plain character.
+            let Some(close) = p[pi + 1..]
+                .iter()
+                .position(|&x| x == ']')
+                .map(|i| pi + 1 + i)
+            else {
+                return (c == '[').then_some(pi + 1);
+            };
+            let mut set = &p[pi + 1..close];
+            let neg = matches!(set.first(), Some('!') | Some('^'));
+            if neg {
+                set = &set[1..];
+            }
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= c && c <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == c;
+                    i += 1;
+                }
+            }
+            (hit != neg).then_some(close + 1)
+        }
+        lit => (lit == c).then_some(pi + 1),
+    }
 }
 
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
+    collect_files_in(root, &Ignores::for_root(root), out, seen);
+}
+
+fn collect_files_in(root: &Path, ignores: &Ignores, out: &mut Vec<PathBuf>, seen: &mut usize) {
     if *seen >= MAX_SEARCH_FILES {
         return;
     }
@@ -2938,10 +4369,13 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
         }
         let path = entry.path();
         if path.is_dir() {
-            if !skip_dir(&path) {
-                collect_files(&path, out, seen);
+            if !skip_dir(&path) && !ignores.ignored(&path, true) {
+                match ignores.with_dir(&path) {
+                    Some(inner) => collect_files_in(&path, &inner, out, seen),
+                    None => collect_files_in(&path, ignores, out, seen),
+                }
             }
-        } else if path.is_file() && !is_sensitive(&path) {
+        } else if path.is_file() && !is_sensitive(&path) && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
@@ -2949,6 +4383,17 @@ fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
 }
 
 fn collect_paths(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize, dirs: bool, files: bool) {
+    collect_paths_in(root, &Ignores::for_root(root), out, seen, dirs, files);
+}
+
+fn collect_paths_in(
+    root: &Path,
+    ignores: &Ignores,
+    out: &mut Vec<PathBuf>,
+    seen: &mut usize,
+    dirs: bool,
+    files: bool,
+) {
     if *seen >= MAX_SEARCH_FILES {
         return;
     }
@@ -2961,17 +4406,259 @@ fn collect_paths(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize, dirs: bo
         }
         let path = entry.path();
         if path.is_dir() {
-            if dirs && !skip_dir(&path) {
+            if skip_dir(&path) || ignores.ignored(&path, true) {
+                continue;
+            }
+            if dirs {
                 *seen += 1;
                 out.push(path.clone());
             }
-            if !skip_dir(&path) {
-                collect_paths(&path, out, seen, dirs, files);
+            match ignores.with_dir(&path) {
+                Some(inner) => collect_paths_in(&path, &inner, out, seen, dirs, files),
+                None => collect_paths_in(&path, ignores, out, seen, dirs, files),
             }
-        } else if files && path.is_file() {
+        } else if files && path.is_file() && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
+    }
+}
+
+/// The entries of `dir` (name, is_folder) that a project walk rooted at
+/// `root` would see: the skip list, .gitignore rules from the repository top
+/// down and sensitive files hide the rest, and so does a `dir` that sits
+/// inside a hidden folder. For `@` path completion.
+pub fn visible_entries(root: &Path, dir: &Path) -> Vec<(String, bool)> {
+    let (root, rel) = match dir.strip_prefix(root) {
+        Ok(rel) => (root, rel.to_path_buf()),
+        Err(_) => (dir, PathBuf::new()),
+    };
+    let mut ignores = Ignores::for_root(root);
+    let mut at = root.to_path_buf();
+    for part in rel.components() {
+        let std::path::Component::Normal(name) = part else {
+            // `..` or the like: no walk covers it, so nothing is hidden by one.
+            return list_entries(dir, &Ignores::default());
+        };
+        at.push(name);
+        if skip_dir(&at) || ignores.ignored(&at, true) {
+            return Vec::new();
+        }
+        if let Some(inner) = ignores.with_dir(&at) {
+            ignores = inner;
+        }
+    }
+    list_entries(dir, &ignores)
+}
+
+fn list_entries(dir: &Path, ignores: &Ignores) -> Vec<(String, bool)> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let is_dir = path.is_dir();
+            let hidden = if is_dir {
+                skip_dir(&path) || ignores.ignored(&path, true)
+            } else {
+                is_sensitive(&path) || ignores.ignored(&path, false)
+            };
+            (!hidden).then(|| (e.file_name().to_string_lossy().into_owned(), is_dir))
+        })
+        .collect()
+}
+
+/// Every file a project walk sees (skip list, .gitignore, sensitive files
+/// hidden), relative to `cwd` with `/` separators.
+pub fn project_files(cwd: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut seen = 0;
+    collect_files(cwd, &mut files, &mut seen);
+    files.iter().map(|p| display_path(p, cwd)).collect()
+}
+
+/// The paths among `files` whose name starts with or contains `query`
+/// (case-insensitive): starts-with matches first, then shorter paths. For
+/// `@` completion by name.
+pub fn rank_by_name(files: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(bool, &String)> = files
+        .iter()
+        .filter_map(|p| {
+            let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
+            let starts = name.starts_with(&q);
+            (starts || name.contains(&q)).then_some((!starts, p))
+        })
+        .collect();
+    hits.sort_by(|a, b| (a.0, a.1.len(), a.1).cmp(&(b.0, b.1.len(), b.1)));
+    hits.into_iter()
+        .take(limit)
+        .map(|(_, p)| p.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod walker_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-walk-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let put = |rel: &str, text: &str| {
+            let p = d.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, text).unwrap();
+        };
+        fs::create_dir_all(d.join(".git")).unwrap();
+        put(
+            ".gitignore",
+            "*.log\n/out/\nbuild-*/\n!keep.log\n!.env\nsecret?.txt\n",
+        );
+        put("src/app.py", "needle\n");
+        put("src/debug.log", "needle\n");
+        put("src/keep.log", "needle\n");
+        put("out/gen.py", "needle\n");
+        put("src/out/real.py", "needle\n");
+        put("build-x/a.py", "needle\n");
+        put("secret1.txt", "needle\n");
+        put(".env", "needle\n");
+        put(".venv/lib/site.py", "needle\n");
+        put("env2/pyvenv.cfg", "home = /usr\n");
+        put("env2/lib/x.py", "needle\n");
+        put("pkg/.gitignore", "fixtures/\n*.tmp\n");
+        put("pkg/fixtures/f.py", "needle\n");
+        put("pkg/a.tmp", "needle\n");
+        put("pkg/mod.py", "needle\n");
+        d
+    }
+
+    fn found(d: &Path) -> Vec<String> {
+        let r = run("grep_files", &json!({"pattern": "needle"}), d);
+        let mut v: Vec<String> = r
+            .content
+            .lines()
+            .map(|l| l.split(':').next().unwrap_or("").to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn walks_skip_gitignored_paths_and_virtualenvs() {
+        let d = fixture("ignore");
+        // Ignored: *.log (but !keep.log), /out/ only at the top, build-*/,
+        // secret?.txt, a nested .gitignore's own rules, and virtualenvs.
+        assert_eq!(
+            found(&d),
+            [
+                "pkg/mod.py",
+                "src/app.py",
+                "src/keep.log",
+                "src/out/real.py"
+            ]
+        );
+        let r = run("find_files", &json!({"pattern": "*.py"}), &d);
+        assert!(
+            !r.content.contains(".venv") && !r.content.contains("env2/"),
+            "{}",
+            r.content
+        );
+        assert!(!r.content.contains("fixtures"), "{}", r.content);
+        let r = run("find_paths", &json!({"pattern": "*"}), &d);
+        assert!(
+            !r.content.contains("build-x") && !r.content.contains("debug.log"),
+            "{}",
+            r.content
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_negation_never_shows_a_sensitive_file() {
+        let d = fixture("negate");
+        // `!.env` in .gitignore does not bring .env back.
+        assert!(!found(&d).iter().any(|p| p.contains(".env")));
+        let r = run("find_files", &json!({"pattern": "*env*"}), &d);
+        assert!(!r.content.lines().any(|l| l == ".env"), "{}", r.content);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn files_are_found_by_name_anywhere_in_the_tree() {
+        let d = fixture("named");
+        let files = project_files(&d);
+        assert_eq!(rank_by_name(&files, "mod", 10), ["pkg/mod.py"]);
+        assert_eq!(rank_by_name(&files, "APP", 10), ["src/app.py"]);
+        // Ignored and sensitive files are not offered.
+        assert!(rank_by_name(&files, "debug", 10).is_empty());
+        assert!(rank_by_name(&files, ".env", 10).is_empty());
+        assert!(rank_by_name(&files, "", 10).is_empty());
+        // Names that start with the query come before names that contain it.
+        let list = ["a/xfile_1.py".to_string(), "b/file_1.py".to_string()];
+        assert_eq!(
+            rank_by_name(&list, "file_1", 10),
+            ["b/file_1.py", "a/xfile_1.py"]
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn gitignore_globs_follow_git() {
+        assert!(ignore_glob("*.log", "a.log"));
+        assert!(ignore_glob("*.log", ".hidden.log"));
+        assert!(ignore_glob("secret?.txt", "secret1.txt"));
+        assert!(!ignore_glob("secret?.txt", "secret12.txt"));
+        assert!(ignore_glob("[a-c]x", "bx") && !ignore_glob("[!a-c]x", "bx"));
+        let parts = |s: &str| s.split('/').map(str::to_string).collect::<Vec<_>>();
+        assert!(ignore_parts_match(&parts("**/gen"), &parts("a/b/gen")));
+        assert!(ignore_parts_match(&parts("**/gen"), &parts("gen")));
+        assert!(ignore_parts_match(
+            &parts("docs/**/*.md"),
+            &parts("docs/a/b.md")
+        ));
+        assert!(!ignore_parts_match(
+            &parts("docs/*.md"),
+            &parts("docs/a/b.md")
+        ));
+        assert!(ignore_parts_match(&parts("gen/**"), &parts("gen/x/y")));
+        assert!(ignore_glob("a*b*c", "a-b-b-c") && !ignore_glob("a*b*c", "a-b-b-d"));
+        assert!(ignore_glob("[x", "[x") && !ignore_glob("[x", "x"));
+    }
+
+    // A checkout's .gitignore is the repository's to write: a pattern built
+    // to backtrack must not stall grep_files (or @ completion) on a long name.
+    #[test]
+    fn a_hostile_gitignore_pattern_cannot_stall_a_walk() {
+        let d = std::env::temp_dir().join(format!("bwn-walk-redos-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(d.join(".git")).unwrap();
+        let deep: PathBuf = std::iter::repeat_n("a", 30).collect();
+        fs::create_dir_all(d.join(&deep)).unwrap();
+        fs::write(d.join(&deep).join("a".repeat(60)), "needle\n").unwrap();
+        fs::write(d.join("app.py"), "needle\n").unwrap();
+        let star_pattern = format!("{}b", "*a".repeat(16));
+        let deep_pattern = format!("{}b", "**/a/".repeat(10));
+        fs::write(
+            d.join(".gitignore"),
+            format!("{star_pattern}\n{deep_pattern}\n"),
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = d.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run("grep_files", &json!({"pattern": "needle"}), &root).content);
+        });
+        let found = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("grep_files was still matching .gitignore patterns after 5 s");
+        let _ = fs::remove_dir_all(&d);
+        assert!(found.contains("app.py"), "{found}");
+        assert!(found.contains(&"a".repeat(60)), "{found}");
     }
 }
 
@@ -3025,6 +4712,21 @@ fn collect_tree(
     out: &mut Vec<String>,
     max_entries: usize,
 ) {
+    let ignores = Ignores::for_root(root);
+    collect_tree_in(root, &ignores, cwd, depth, max_depth, out, max_entries);
+}
+
+// Gitignored entries are left out of the tree; skipped folders (build
+// output, dependencies) are listed but not opened.
+fn collect_tree_in(
+    root: &Path,
+    ignores: &Ignores,
+    cwd: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<String>,
+    max_entries: usize,
+) {
     if out.len() >= max_entries || depth > max_depth {
         return;
     }
@@ -3038,10 +4740,16 @@ fn collect_tree(
             break;
         }
         let path = entry.path();
-        let suffix = if path.is_dir() { "/" } else { "" };
+        let is_dir = path.is_dir();
+        if ignores.ignored(&path, is_dir) {
+            continue;
+        }
+        let suffix = if is_dir { "/" } else { "" };
         out.push(format!("{}{}", display_path(&path, cwd), suffix));
-        if path.is_dir() && !skip_dir(&path) {
-            collect_tree(&path, cwd, depth + 1, max_depth, out, max_entries);
+        if is_dir && !skip_dir(&path) {
+            let inner = ignores.with_dir(&path);
+            let next = inner.as_ref().unwrap_or(ignores);
+            collect_tree_in(&path, next, cwd, depth + 1, max_depth, out, max_entries);
         }
     }
 }
@@ -3095,6 +4803,7 @@ fn python_tool_command(
     }
     let mut command = Command::new(python_interpreter());
     command.arg(script).current_dir(cwd);
+    crate::sandbox::scrub_credentials(&mut command);
     Ok(command)
 }
 
@@ -3570,6 +5279,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
             content: truncate_head_tail(s, MAX_OUT),
             is_error: true,
             finished: false,
+            images: Vec::new(),
         };
     }
     let code = cap.code.unwrap_or(-1);
@@ -3578,6 +5288,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         content: truncate_head_tail(s, MAX_OUT),
         is_error: code != 0,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -3609,6 +5320,8 @@ fn shell_command(cmd: &str, cwd: &Path) -> Result<Command, String> {
         c
     };
     command.current_dir(cwd);
+    // Provider keys stay with the agent: an approved `env` must not show them.
+    crate::sandbox::scrub_credentials(&mut command);
     Ok(command)
 }
 
@@ -3827,6 +5540,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
         content: truncate_head_tail(format!("{header}\n\n{}", sections.join("\n\n")), MAX_OUT),
         is_error: any_fail,
         finished: false,
+        images: Vec::new(),
     }
 }
 
@@ -4055,8 +5769,9 @@ fn apply_lenient(body: &str, hit: &LenientHit, new: &str) -> String {
     format!("{}{}{}", &body[..hit.start], replacement, &body[hit.end..])
 }
 
-// Small edit distance for "did you mean" suggestions on unknown tool names.
-fn levenshtein(a: &str, b: &str) -> usize {
+// Small edit distance for "did you mean" suggestions on unknown tool names
+// (and unknown command-line options).
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -4073,6 +5788,253 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 // `isError: true` from the server is a tool error, like any local failure.
+// ── pictures and PDFs ────────────────────────────────────────────────────────
+
+// The picture formats every vision API takes, by extension.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+// The largest picture sent to a model: the Anthropic API's per-image limit.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+const PDF_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why a picture of `len` bytes is not sent to a model, if it is too big:
+/// the same limit for read_file and a picture attached in the prompt. The
+/// caller ends the sentence ("… and read that.").
+pub(crate) fn image_too_big(shown: &str, len: u64) -> Option<String> {
+    (len > MAX_IMAGE_BYTES).then(|| {
+        format!(
+            "{shown} is {}; pictures over 5 MB are not sent to the model. Make a smaller copy \
+             (for example `ffmpeg -i {shown} -vf scale=1280:-1 small.png`)",
+            human_bytes(len)
+        )
+    })
+}
+
+// read_file on a picture or a PDF. None for anything else, a file that is
+// not there (the usual error follows), and a file whose bytes are not what
+// its extension says (it is read as text).
+fn read_media(p: &Path, input: &Value, cwd: &Path) -> Option<Outcome> {
+    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    if ext == "pdf" {
+        return read_pdf(p, input);
+    }
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let meta = fs::metadata(p).ok().filter(|m| m.is_file())?;
+    let shown = display_path(p, cwd);
+    if let Some(why) = image_too_big(&shown, meta.len()) {
+        return Some(err(format!("{why} and read that.")));
+    }
+    let bytes = fs::read(p).ok()?;
+    // The bytes decide the media type: APIs refuse one that does not match.
+    let mime = crate::media::image_media_type(&bytes)?;
+    let dims = crate::media::image_dimensions(&bytes)
+        .map(|(w, h)| format!(", {w}x{h}"))
+        .unwrap_or_default();
+    let mut out = ok(format!(
+        "image {shown} ({mime}{dims}, {})",
+        human_bytes(meta.len())
+    ));
+    out.images
+        .push((mime.to_string(), crate::media::b64_encode(&bytes)));
+    Some(out)
+}
+
+// A PDF's text, through pdftotext (poppler) when it is installed.
+fn read_pdf(p: &Path, input: &Value) -> Option<Outcome> {
+    let mut head = [0u8; 5];
+    let mut f = fs::File::open(p).ok()?;
+    if std::io::Read::read_exact(&mut f, &mut head).is_err() || &head != b"%PDF-" {
+        return None;
+    }
+    let Some(bin) = find_on_path("pdftotext") else {
+        return Some(err(format!(
+            "cannot read {} as text: it is a PDF, and pdftotext is not installed. Install poppler \
+             (`apt install poppler-utils`, `brew install poppler`, or `choco install poppler` on \
+             Windows), or ask the user for the text. Do not retry read_file on it.",
+            p.display()
+        )));
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(["-layout", "-enc", "UTF-8", "-q"]).arg(p).arg("-");
+    crate::sandbox::scrub_credentials(&mut cmd);
+    Some(match run_with_timeout(cmd, None, PDF_TIMEOUT) {
+        Ok(cap) if cap.timed_out => err(format!(
+            "pdftotext did not finish reading {} within {}s",
+            p.display(),
+            PDF_TIMEOUT.as_secs()
+        )),
+        Ok(cap) if cap.code == Some(0) && cap.stdout.trim().is_empty() => ok(format!(
+            "{} has no text layer (a scanned PDF?): pdftotext found nothing to read",
+            p.display()
+        )),
+        Ok(cap) if cap.code == Some(0) => ok(truncate_read(
+            apply_line_range(&cap.stdout, line_range(input)),
+            MAX_READ,
+        )),
+        Ok(cap) => err(format!(
+            "pdftotext could not read {}: {}",
+            p.display(),
+            cap.stderr.trim()
+        )),
+        Err(e) => err(format!("pdftotext could not start: {e}")),
+    })
+}
+
+// ── screenshots ──────────────────────────────────────────────────────────────
+// See screenshot.rs for how the browser is found and kept off the network.
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
+    use crate::screenshot;
+    let url = input["url"].as_str().unwrap_or("").trim();
+    let parsed =
+        match url::Url::parse(url) {
+            Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => u,
+            _ => return err(
+                "screenshot_url takes an http:// or https:// URL, such as http://localhost:3000",
+            ),
+        };
+    let url = parsed.as_str();
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(['[', ']'])
+        .to_string();
+    // The gate refuses these too; the tool never relies on it alone.
+    let direct = if screenshot::is_loopback_host(&host) {
+        None
+    } else if crate::agent::network_allows(&host, cwd) {
+        Some(host.as_str())
+    } else {
+        return err(screenshot::off_loopback_refusal(&host));
+    };
+    if let Some(why) = blocked_url(url) {
+        return err(why);
+    }
+    let Some(browser) = screenshot::find_chrome() else {
+        return err(
+            "no Chrome, Chromium or Edge found for screenshot_url: install one, or set BWN_CHROME \
+             to the browser's path (a Playwright Chromium is found on its own). Do not retry \
+             until one is installed.",
+        );
+    };
+    // Nothing listening is a server to start, not a picture of Chrome's
+    // error page. One request, no redirects followed.
+    let status = match web_client().get(url).call() {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => {
+            return err(format!(
+                "nothing answered at {url} ({e}). Start the server first (start_server), wait for \
+                 it (wait_for_url), then take the screenshot."
+            ))
+        }
+    };
+    let size = |k: &str, default: u32, min: u64| {
+        input[k]
+            .as_u64()
+            .map_or(default, |v| v.clamp(min, 2560) as u32)
+    };
+    let (w, h) = (
+        size("width", screenshot::DEFAULT_SIZE.0, 320),
+        size("height", screenshot::DEFAULT_SIZE.1, 240),
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "bwn-screenshot-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    if let Err(e) = fs::create_dir(&dir) {
+        return err(format!("cannot make a folder for the screenshot: {e}"));
+    }
+    let png_path = dir.join("shot.png");
+    let hole = match screenshot::Blackhole::start() {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return err(format!("cannot start the screenshot's network guard: {e}"));
+        }
+    };
+    let mut cmd = Command::new(&browser);
+    cmd.args(screenshot::chrome_args(
+        url,
+        (w, h),
+        &dir.join("profile"),
+        &png_path,
+        hole.port,
+        direct,
+        running_as_root(),
+    ));
+    crate::sandbox::scrub_credentials(&mut cmd);
+    let ran = run_with_timeout(cmd, None, SCREENSHOT_TIMEOUT);
+    let png = fs::read(&png_path).ok();
+    let blocked = hole.hosts();
+    drop(hole);
+    let _ = fs::remove_dir_all(&dir);
+    let png = match (png, ran) {
+        (Some(png), _) if crate::media::image_media_type(&png) == Some("image/png") => png,
+        (_, Ok(cap)) if cap.timed_out => {
+            return err(format!(
+                "{} did not finish the screenshot within {}s",
+                browser.display(),
+                SCREENSHOT_TIMEOUT.as_secs()
+            ))
+        }
+        (_, Ok(cap)) => {
+            let tail: Vec<&str> = cap.stderr.lines().rev().take(5).collect();
+            return err(format!(
+                "{} wrote no screenshot (exit {}): {}",
+                browser.display(),
+                cap.code.unwrap_or(-1),
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            ));
+        }
+        (_, Err(e)) => return err(format!("cannot start {}: {e}", browser.display())),
+    };
+    if png.len() as u64 > MAX_IMAGE_BYTES {
+        return err(format!(
+            "the screenshot is {}, over the 5 MB a model takes: try a smaller width and height",
+            human_bytes(png.len() as u64)
+        ));
+    }
+    let mut text = format!(
+        "screenshot of {url} ({w}x{h}, HTTP {status}) taken with {}",
+        screenshot::browser_name(&browser)
+    );
+    if !blocked.is_empty() {
+        text.push_str(&format!(
+            "\nrequests to other hosts were blocked, so what they serve is missing: {}",
+            blocked.join(", ")
+        ));
+    }
+    let mut out = ok(text);
+    out.images
+        .push(("image/png".into(), crate::media::b64_encode(&png)));
+    out
+}
+
+// Chrome will not start its sandbox as root (containers, CI).
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    match n {
+        0..1024 => format!("{n} bytes"),
+        1024..1_048_576 => format!("{} KB", n / 1024),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
+}
+
 fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
     match r {
         Ok((text, false)) => ok(truncate(text, MAX_OUT)),
@@ -4087,11 +6049,12 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     // refuses regardless so an unwired gate cannot leak a stray write.
     if let Some(p) = out_of_cwd_mutation(name, input, cwd) {
         return err(format!(
-            "refusing to write outside the working directory: {} resolves beyond {}. Out-of-cwd writes require explicit user approval — ask the user first (question tool), and once approved perform the change with run_command, or have the user restart the session in the target directory.",
+            "refusing to write outside the working directory: {} resolves beyond {}. Out-of-cwd writes require explicit user approval — ask the user first (question tool), and once approved perform the change with run_command, or have the user add the folder with /add-dir (--add-dir at launch) or restart the session in the target directory.",
             p.display(),
             cwd.display()
         ));
     }
+    let _fetch_policy = network_host(name, input).map(|_| FetchPolicy::set(cwd));
     match name {
         "read" | "read_file" => {
             let p_str = path_arg(input).unwrap_or("").trim();
@@ -4099,7 +6062,10 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err("path argument is required and cannot be empty");
             }
             let p = resolve(cwd, p_str);
-            match fs::read_to_string(&p) {
+            if let Some(out) = read_media(&p, input, cwd) {
+                return out;
+            }
+            match read_text(&p) {
                 Ok(c) => ok(truncate_read(
                     apply_line_range(&c, line_range(input)),
                     MAX_READ,
@@ -4221,7 +6187,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "glob" | "find_paths" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -4232,7 +6197,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut paths = Vec::new();
             let mut seen = 0;
-            collect_paths(&root, &mut paths, &mut seen, include_dirs, include_files);
+            for root in search_roots(input, cwd) {
+                collect_paths(&root, &mut paths, &mut seen, include_dirs, include_files);
+            }
             paths.sort();
             let matches: Vec<String> = paths
                 .into_iter()
@@ -4257,7 +6224,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "find_files" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -4265,7 +6231,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut files = Vec::new();
             let mut seen = 0;
-            collect_files(&root, &mut files, &mut seen);
+            for root in search_roots(input, cwd) {
+                collect_files(&root, &mut files, &mut seen);
+            }
             files.sort();
             let matches: Vec<String> = files
                 .into_iter()
@@ -4290,7 +6258,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
         }
         "grep" | "grep_files" => {
-            let root = resolve(cwd, root_arg(input));
             let pattern = input["pattern"].as_str().unwrap_or("");
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -4308,7 +6275,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let limit = search_limit(input);
             let mut files = Vec::new();
             let mut seen = 0;
-            collect_files(&root, &mut files, &mut seen);
+            for root in search_roots(input, cwd) {
+                collect_files(&root, &mut files, &mut seen);
+            }
             files.sort();
             let mut matches = Vec::new();
             let mut total = 0usize;
@@ -4382,8 +6351,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 let _ = fs::create_dir_all(dir);
             }
             checkpoint::record(cwd, &p, "write_file");
-            let prior = fs::read_to_string(&p).unwrap_or_default();
-            match write_atomic(&p, content) {
+            let prior = read_text(&p).unwrap_or_default();
+            match write_text(&p, content) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, content);
                     ok(format!("wrote {} ({} bytes)", p.display(), content.len()))
@@ -4405,7 +6374,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .as_str()
                 .or_else(|| input["newString"].as_str())
                 .unwrap_or("");
-            let body = match fs::read_to_string(&p) {
+            let body = match read_text(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
@@ -4420,7 +6389,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
                     checkpoint::record(cwd, &p, "edit_file");
                     let updated = apply_lenient(&body, &hit, new);
-                    return match write_atomic(&p, &updated) {
+                    return match write_text(&p, &updated) {
                         Ok(_) => {
                             crate::report::diff(&p.display().to_string(), &body, &updated);
                             ok(format!("edited {} ({LENIENT_MATCH_NOTE})", p.display()))
@@ -4444,7 +6413,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             checkpoint::record(cwd, &p, "edit_file");
             let updated = body.replacen(old, new, 1);
-            match write_atomic(&p, &updated) {
+            match write_text(&p, &updated) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &body, &updated);
                     ok(format!("edited {}", p.display()))
@@ -4464,7 +6433,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if edits.is_empty() {
                 return err("edits array cannot be empty");
             }
-            let mut body = match fs::read_to_string(&p) {
+            let mut body = match read_text(&p) {
                 Ok(b) => b,
                 Err(e) => return err(format!("cannot read {}: {e}", p.display())),
             };
@@ -4508,7 +6477,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             } else {
                 String::new()
             };
-            match write_atomic(&p, &body) {
+            match write_text(&p, &body) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &prior, &body);
                     ok(format!(
@@ -4631,6 +6600,15 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             match todo_store().lock() {
                 Ok(mut todos) => {
                     *todos = next;
+                    // The person sees the list as a checklist that ticks
+                    // items off as later calls mark them completed.
+                    if !crate::report::is_json() {
+                        crate::tui::line(&crate::tui::todo_checklist(&todos));
+                    }
+                    crate::report::todos(&json!(todos
+                        .iter()
+                        .map(|(task, status)| json!({"task": task, "status": status}))
+                        .collect::<Vec<_>>()));
                     ok(format!("stored {} todo item(s)", todos.len()))
                 }
                 Err(_) => err("todo store unavailable"),
@@ -4675,7 +6653,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(why) = blocked_url(url) {
                 return err(why);
             }
-            match http_get_with_retry(web_agent().get(url)) {
+            match http_get_with_retry(url, None) {
                 Ok(resp) => match resp.into_string() {
                     Ok(body) => ok(truncate(body, MAX_OUT)),
                     Err(e) => err(format!("failed to read response body: {e}")),
@@ -4691,9 +6669,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let encoded = url_encode(query);
             let search_url = format!("https://lite.duckduckgo.com/lite/?q={encoded}");
             match http_get_with_retry(
-                web_agent()
-                    .get(&search_url)
-                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
+                &search_url,
+                Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
             ) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
@@ -4724,11 +6701,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return err(why);
             }
             let extract_links = input["extract_links"].as_bool().unwrap_or(false);
-            match http_get_with_retry(
-                web_agent()
-                    .get(url)
-                    .set("User-Agent", "Mozilla/5.0 (compatible; buildwithnexus/1.0)"),
-            ) {
+            match http_get_with_retry(url, Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)")) {
                 Ok(resp) => match resp.into_string() {
                     Ok(html) => {
                         // Extract <title>
@@ -4838,6 +6811,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         "stop_server" => stop_server(input),
         "read_server_log" => read_server_log(input),
         "wait_for_url" => wait_for_url(input),
+        "screenshot_url" => screenshot_url(input, cwd),
         "open_browser" => open_browser(input, cwd),
         "list_python_tools" => {
             let rows = list_python_tools(cwd);
@@ -5367,6 +7341,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
             is_error: false,
             finished: true,
+            images: Vec::new(),
         },
         "exit_plan" | "ExitPlanMode" => {
             if let Some(steps) = input["steps"].as_array() {
@@ -5437,6 +7412,16 @@ const METADATA_HOSTS: &[&str] = &[
 ];
 
 fn url_host(url: &str) -> Option<String> {
+    // The host the request reaches, as the URL parser reads it: `2852039166`,
+    // `0xa9.254.169.254`, `%31%36%39.254.169.254` and a backslash before an
+    // `@` all name an address that a hand-cut authority would miss.
+    if let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().filter(|h| !h.is_empty()).map(String::from))
+    {
+        let host = crate::net::canonical_authority(&host);
+        return Some(host.trim_matches(['[', ']']).to_string());
+    }
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = rest.split(['/', '?', '#']).next()?;
     let hostport = authority.rsplit('@').next()?;
@@ -5473,41 +7458,131 @@ impl ureq::Resolver for GuardedResolver {
     }
 }
 
-// The agent every fetch tool uses; redirects re-resolve through the guard.
-fn web_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().resolver(GuardedResolver).build())
+// The client every fetch tool uses. Redirects are followed by web_get, not
+// ureq, so each hop is checked again and takes its own route: through a
+// proxy only the proxy resolves names, and GuardedResolver never sees them.
+fn web_client() -> &'static crate::net::Client {
+    static CLIENT: OnceLock<crate::net::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| crate::net::Client::new(|b| b.resolver(GuardedResolver).redirects(0)))
 }
 
-fn http_get_with_retry(req: ureq::Request) -> Result<ureq::Response, Box<ureq::Error>> {
+enum WebError {
+    Blocked(String),
+    Http(Box<ureq::Error>),
+}
+
+impl std::fmt::Display for WebError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebError::Blocked(why) => f.write_str(why),
+            WebError::Http(e) => e.fmt(f),
+        }
+    }
+}
+
+const MAX_REDIRECTS: usize = 5;
+
+thread_local! {
+    // The folder whose network.deny rules the running fetch tool answers to,
+    // so a redirect cannot lead it somewhere a rule refuses.
+    static FETCH_CWD: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct FetchPolicy;
+
+impl FetchPolicy {
+    fn set(cwd: &Path) -> FetchPolicy {
+        FETCH_CWD.with_borrow_mut(|c| *c = Some(cwd.to_path_buf()));
+        FetchPolicy
+    }
+}
+
+impl Drop for FetchPolicy {
+    fn drop(&mut self) {
+        FETCH_CWD.with_borrow_mut(|c| *c = None);
+    }
+}
+
+// network.deny for a redirect's target: the call itself was checked before
+// it ran, but where the server sends it on was not.
+fn redirect_denied(to: &url::Url) -> Option<String> {
+    let cwd = FETCH_CWD.with_borrow(|c| c.clone())?;
+    let host = url_authority(to.as_str())?;
+    let why = crate::agent::network_denied(&cwd, &host)?;
+    Some(format!("refusing to follow the redirect to {to}: {why}"))
+}
+
+fn web_get(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
+    web_get_with(web_client(), url, user_agent)
+}
+
+fn web_get_with(
+    client: &crate::net::Client,
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<ureq::Response, WebError> {
+    let mut url = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        if let Some(why) = blocked_url(&url) {
+            return Err(WebError::Blocked(why));
+        }
+        let mut req = client.get(&url);
+        if let Some(ua) = user_agent {
+            req = req.set("User-Agent", ua);
+        }
+        let resp = req.call().map_err(|e| WebError::Http(Box::new(e)))?;
+        let next = matches!(resp.status(), 301 | 302 | 303 | 307 | 308)
+            .then(|| resp.header("location"))
+            .flatten()
+            .and_then(|to| url::Url::parse(&url).ok()?.join(to).ok());
+        match next {
+            Some(next) => {
+                if let Some(why) = redirect_denied(&next) {
+                    return Err(WebError::Blocked(why));
+                }
+                url = next.to_string();
+            }
+            None => return Ok(resp),
+        }
+    }
+    Err(WebError::Blocked(format!(
+        "stopped after {MAX_REDIRECTS} redirects at {url}"
+    )))
+}
+
+fn http_get_with_retry(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
     let mut attempts = 0;
     let max_attempts = 4;
     let mut delay_ms = 500;
 
     loop {
         attempts += 1;
-        let req_clone = req.clone();
-        match req_clone.call() {
+        match web_get(url, user_agent) {
             Ok(resp) => return Ok(resp),
-            Err(ureq::Error::Status(code, _resp))
-                if (code == 429 || (500..=504).contains(&code)) && attempts < max_attempts =>
+            Err(WebError::Http(e))
+                if matches!(*e, ureq::Error::Status(code, _)
+                    if code == 429 || (500..=504).contains(&code))
+                    && attempts < max_attempts =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;
                 continue;
             }
-            Err(ureq::Error::Transport(_)) if attempts < max_attempts => {
+            Err(WebError::Http(e))
+                if matches!(*e, ureq::Error::Transport(_)) && attempts < max_attempts =>
+            {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;
                 continue;
             }
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(e),
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -5720,6 +7795,22 @@ mod tests {
 
     // ── is_sensitive ────────────────────────────────────────────────────────
     #[test]
+    fn a_trusted_script_command_is_not_a_sensitive_path_but_its_arguments_are() {
+        let cwd = Path::new("/w/proj");
+        let script = cwd.join(".buildwithnexus/commands/fmt.sh");
+        let cmd = format!("'{}' src", script.display());
+        assert!(command_sensitive_path(&cmd, cwd).is_some());
+        assert_eq!(
+            with_script_command(&script, || command_sensitive_path(&cmd, cwd)),
+            None
+        );
+        let leak = format!("'{}' ~/.ssh/id_rsa", script.display());
+        assert!(with_script_command(&script, || command_sensitive_path(&leak, cwd)).is_some());
+        // Only while it runs.
+        assert!(command_sensitive_path(&cmd, cwd).is_some());
+    }
+
+    #[test]
     fn sensitive_paths() {
         for p in [
             "/home/u/.ssh/id_rsa",
@@ -5743,6 +7834,42 @@ mod tests {
             "/proj/environment.txt",
         ] {
             assert!(!is_sensitive(Path::new(p)), "{p} should not be sensitive");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_process_environment_is_sensitive() {
+        for p in [
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "/proc/self/task/7/environ",
+            "/proc/*/environ",
+            "/proc/self/../self/environ",
+        ] {
+            assert!(is_sensitive(Path::new(p)), "{p}");
+        }
+        assert!(!is_sensitive(Path::new("/proc/self/status")));
+        for cmd in ["cat /proc/cpuinfo", "cat /proc/self/status", "free -m"] {
+            assert!(
+                command_sensitive_path(cmd, Path::new("/tmp")).is_none(),
+                "{cmd}"
+            );
+        }
+        assert!(!is_sensitive_in_project(Path::new("proc/x/environ")));
+        let cwd = Path::new("/tmp");
+        for cmd in [
+            "grep -a -h -o CUSTOM_API_KEY=. /proc/*/environ",
+            "cat /proc/$PPID/environ",
+            "tr '\\0' '\\n' < /proc/self/environ",
+            "head -c 4096 /proc/1/env*",
+            "for p in /proc/[0-9]*; do tr '\\0' '\\n' < $p/environ; done",
+            "cd /proc/self && cat environ",
+            "grep -a KEY /proc/self/*",
+            "rg -a CUSTOM_API_KEY /proc --max-depth 2",
+            "grep -ra KEY /proc/$PPID",
+        ] {
+            assert!(command_sensitive_path(cmd, cwd).is_some(), "{cmd}");
         }
     }
 
@@ -5870,9 +7997,10 @@ mod tests {
 
     #[test]
     fn defs_for_small_context_keeps_core_tools_and_drops_bulk() {
-        // 32k is the top of the compact range: all realistic local models get
-        // the trimmed surface; larger remote contexts keep the full set.
-        let compact = defs_for_context(false, 32_768)
+        // Just under 32k is the top of the compact range; a 32k window keeps
+        // the full set.
+        assert!(!compact_surface(32_768));
+        let compact = defs_for_context(false, 32_767)
             .into_iter()
             .map(|d| d.name)
             .collect::<Vec<_>>();
@@ -6990,6 +9118,55 @@ print("hello " + data.get("name", "world"))
         assert!(o.content.contains("bytes omitted"));
     }
 
+    #[test]
+    fn read_file_returns_pictures_as_images_by_their_bytes() {
+        let dir = std::env::temp_dir().join(format!("bwn-read-media-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let gif = b"GIF89a\x02\x00\x03\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        fs::write(dir.join("a.gif"), gif).unwrap();
+        // A JPEG saved as .png goes out as the JPEG it is.
+        fs::write(dir.join("photo.png"), [0xff, 0xd8, 0xff, 0xe0, 0, 0x10]).unwrap();
+        // Text that only has a picture's name is read as text.
+        fs::write(dir.join("notes.png"), "not a picture").unwrap();
+
+        let out = run("read_file", &json!({"path": "a.gif"}), &dir);
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "image a.gif (image/gif, 2x3, 43 bytes)");
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].0, "image/gif");
+        assert_eq!(
+            crate::media::b64_decode(&out.images[0].1).unwrap(),
+            gif.to_vec()
+        );
+        let out = run("read_file", &json!({"path": "photo.png"}), &dir);
+        assert_eq!(out.images[0].0, "image/jpeg");
+        let out = run("read_file", &json!({"path": "notes.png"}), &dir);
+        assert!(out.images.is_empty());
+        assert_eq!(out.content, "not a picture");
+        // A missing picture gets the usual not-found recovery.
+        let out = run("read_file", &json!({"path": "gone.png"}), &dir);
+        assert!(
+            out.is_error && out.content.contains("recovery:"),
+            "{}",
+            out.content
+        );
+        // Over the limit: refused with a way to make it fit.
+        let big = dir.join("big.png");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        let out = run("read_file", &json!({"path": "big.png"}), &dir);
+        assert!(out.is_error && out.images.is_empty());
+        assert!(out.content.contains("over 5 MB"), "{}", out.content);
+        // A .pdf that is not a PDF is read as text.
+        fs::write(dir.join("fake.pdf"), "plain").unwrap();
+        assert_eq!(
+            run("read_file", &json!({"path": "fake.pdf"}), &dir).content,
+            "plain"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_with_timeout_kills_hanging_command_and_keeps_partial_output() {
@@ -7059,6 +9236,13 @@ print("hello " + data.get("name", "world"))
             "python3.12 -c print(1)",
             "nodejs -e 1",
             "sed '1e id' README.md",
+            // Wrappers run whatever command follows them.
+            "fakeroot ls",
+            "firejail --quiet make",
+            "torsocks curl example.com",
+            "proxychains4 -q git fetch",
+            "chronic make",
+            "systemd-inhibit make",
         ] {
             assert_eq!(approval_key(cmd), cmd);
         }
@@ -7191,6 +9375,21 @@ print("hello " + data.get("name", "world"))
         assert!(skips_prompt_safely("ls", &dir));
         git(&["config", "--unset", "core.fsmonitor"]);
         git(&["config", "include.path", "../evil.cfg"]);
+        assert!(!skips_prompt_safely("git diff", &dir));
+        git(&["config", "--unset", "include.path"]);
+        // What actions/checkout stores is network configuration.
+        git(&[
+            "config",
+            "http.https://github.com/.extraheader",
+            "AUTHORIZATION: basic eDp5",
+        ]);
+        git(&["config", "http.sslVerify", "true"]);
+        assert!(skips_prompt_safely("git diff", &dir));
+        git(&["config", "http.saveCookies", "true"]);
+        assert!(!skips_prompt_safely("git diff", &dir));
+        git(&["config", "--unset", "http.saveCookies"]);
+        // A credential helper is a program.
+        git(&["config", "credential.helper", "!touch pwned"]);
         assert!(!skips_prompt_safely("git diff", &dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7343,6 +9542,166 @@ print("hello " + data.get("name", "world"))
         assert_eq!(approval_key("cat README.md"), "cat");
     }
 
+    #[test]
+    fn approval_key_keeps_the_arguments_of_destructive_programs() {
+        // `s` on one of these covers exactly that command, never the program.
+        for cmd in [
+            "rm -rf tests",
+            "mv a.txt b.txt",
+            "cp -r src /tmp/x",
+            "chmod 777 app.py",
+            "chown root app.py",
+            "dd if=/dev/zero of=disk.img",
+            "kill -9 1234",
+            "/bin/rm -rf tests",
+            "RM.exe tests",
+        ] {
+            let key = approval_key(cmd);
+            assert!(key.split_whitespace().count() > 1, "{cmd} → {key}");
+        }
+        assert_eq!(approval_key("rm  -rf   tests"), "rm -rf tests");
+        assert_ne!(approval_key("rm -rf tests"), approval_key("rm -rf tools"));
+        // Multi-verb tools still key on the subcommand.
+        assert_eq!(approval_key("git status -s"), "git status");
+        assert_eq!(approval_key("npm test -- --watch"), "npm test");
+    }
+
+    // Destructive git commands, each with another call of the same kind.
+    pub(crate) const DESTRUCTIVE_GIT: &[(&str, &str)] = &[
+        ("git rm -r src", "git rm -r docs"),
+        ("git rm --cached secrets.env", "git rm README.md"),
+        ("git clean -fdx", "git clean -fd docs"),
+        ("git reset --hard HEAD~1", "git reset --hard origin/main"),
+        ("git reset --merge ORIG_HEAD", "git reset --keep HEAD~2"),
+        (
+            "git push --force origin main",
+            "git push --force origin release",
+        ),
+        ("git push -f origin main", "git push -f origin release"),
+        ("git push -uf origin main", "git push -f origin release"),
+        (
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main:abc origin main",
+        ),
+        ("git push origin +main", "git push origin +release"),
+        (
+            "git push origin --delete feature",
+            "git push origin :release",
+        ),
+        ("git checkout -- src/app.rs", "git checkout -- src/lib.rs"),
+        ("git checkout HEAD~3 src/app.rs", "git checkout ."),
+        (
+            "git restore src/app.rs",
+            "git restore --staged --worktree .",
+        ),
+        ("git branch -D feature", "git branch -D main"),
+        ("git branch --delete --force feature", "git branch -d main"),
+        ("git stash drop", "git stash drop stash@{3}"),
+        ("git stash clear", "git stash drop"),
+        (
+            "git filter-branch --tree-filter 'rm -f x' HEAD",
+            "git filter-branch --index-filter 'git rm --cached y' HEAD",
+        ),
+        (
+            "git filter-repo --path secrets --invert-paths",
+            "git filter-repo --path docs --invert-paths",
+        ),
+        (
+            "git reflog expire --expire=now --all",
+            "git reflog expire --expire=now refs/heads/main",
+        ),
+        ("git gc --prune=now", "git gc --prune=all"),
+        ("git gc --aggressive --prune", "git gc --prune=now"),
+        (
+            "git submodule deinit -f libs/a",
+            "git submodule deinit --all",
+        ),
+        ("git notes remove HEAD", "git notes prune"),
+        (
+            "git read-tree --reset -u HEAD",
+            "git read-tree -u -m HEAD~1",
+        ),
+        (
+            "git checkout-index -a -f",
+            "git checkout-index --force src/a.rs",
+        ),
+    ];
+
+    #[test]
+    fn approval_key_keeps_the_arguments_of_destructive_git_commands() {
+        for (cmd, other) in DESTRUCTIVE_GIT {
+            let key = approval_key(cmd);
+            assert_eq!(key, *cmd, "{cmd}");
+            assert_ne!(key, approval_key(other), "{cmd} vs {other}");
+        }
+        assert_eq!(
+            approval_key("git  push   --force origin main"),
+            "git push --force origin main"
+        );
+        // Git's own options come before the subcommand they modify.
+        assert_eq!(
+            approval_key("git -C sub push --force origin main"),
+            "git -C sub push --force origin main"
+        );
+        assert_eq!(approval_key("git -C sub status"), "git status");
+        assert_eq!(approval_key("git -c core.quotepath=off log"), "git log");
+        // Options git reads a separate value for never become the subcommand.
+        assert_eq!(
+            approval_key("git --attr-source HEAD push --force"),
+            "git --attr-source HEAD push --force"
+        );
+        assert_eq!(
+            approval_key("git --shallow-file x rm -r a"),
+            "git --shallow-file x rm -r a"
+        );
+        assert_eq!(approval_key("git --attr-source HEAD status"), "git status");
+        // Everyday forms of the same subcommands still key on the subcommand.
+        for (cmd, key) in [
+            ("git push origin main", "git push"),
+            ("git push -u origin feature", "git push"),
+            ("git reset HEAD src/app.rs", "git reset"),
+            ("git reset --soft HEAD~1", "git reset"),
+            ("git branch -a", "git branch"),
+            ("git branch feature", "git branch"),
+            ("git stash", "git stash"),
+            ("git stash list", "git stash"),
+            ("git reflog show", "git reflog"),
+            ("git gc", "git gc"),
+            ("git gc --no-prune", "git gc"),
+            ("git submodule update --init", "git submodule"),
+            ("git notes add -m x", "git notes"),
+        ] {
+            assert_eq!(approval_key(cmd), key, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn cmd_exe_escapes_do_not_hide_a_command_from_deny_and_ask_rules() {
+        let pushes = |subjects: &[String]| {
+            subjects
+                .iter()
+                .any(|s| crate::hooks::glob_match("git push*", s))
+        };
+        for cmd in [
+            "g^it push",
+            "git p^ush origin main",
+            "%NOPE%git push",
+            "gi%X:~0,0%t push",
+            "cmd /c g^it push",
+        ] {
+            assert!(pushes(&guard_subjects_for(cmd, true)), "{cmd}");
+            // Elsewhere `^` and `%` are ordinary characters of the word.
+            assert!(!pushes(&guard_subjects_for(cmd, false)), "{cmd}");
+        }
+        // A command cmd.exe rewrites counts as compound for a deny rule.
+        assert!(compound_mentions_for("%X%git status", "git", true));
+        assert!(compound_mentions_for("g^it status", "git", true));
+        assert!(!compound_mentions_for("g^it status", "git", false));
+        assert!(!compound_mentions_for("git status", "git", true));
+        assert!(compound_mentions_for("make && git status", "git", false));
+        assert!(!compound_mentions_for("make && cargo test", "git", false));
+    }
+
     // Every read-only-classifier bypass we have ever fixed, in one place.
     // A command here must never classify as read-only: is_readonly_command is
     // the gate ReadOnly mode trusts, and each case would otherwise have run a
@@ -7426,10 +9785,71 @@ print("hello " + data.get("name", "world"))
             ".\\cat.exe x",
             "C:\\evil\\ls.exe",
         ];
-        for c in corpus {
+        // Windows commands that destroy data or weaken the system: never
+        // read-only, and dangerous, so they prompt even in auto mode and
+        // past a saved approval.
+        let windows_destructive = [
+            "rd /s /q C:\\proj",
+            "RD /S build",
+            "rmdir /s /q build",
+            "cmd /c rd/s/q build",
+            "del /s /q *",
+            "del /q C:\\proj\\*.rs",
+            "erase /s *.txt",
+            "format D: /q",
+            "format.com C:",
+            "Remove-Item -Recurse -Force C:\\proj",
+            "remove-item build -r -fo",
+            "ri -Recurse:$true -Force build",
+            "rm -Recurse -Force build",
+            "del -recurse -force build",
+            "rmdir -Rec -Fo build",
+            "powershell -Command \"Remove-Item -Recurse -Force build\"",
+            "cipher /w:C:\\",
+            "diskpart /s script.txt",
+            "reg delete HKCU\\Software\\X /f",
+            "reg.exe delete HKLM\\SYSTEM\\X",
+            "bcdedit /set {default} recoveryenabled No",
+            "takeown /f C:\\Windows\\System32 /r",
+            "icacls C:\\ /grant Everyone:F",
+            "icacls \"C:\\Program Files\\X\" /reset",
+            "icacls %SystemRoot%\\System32 /grant x:F",
+            "Set-ExecutionPolicy Unrestricted -Scope CurrentUser",
+            "powershell -EncodedCommand ZQBjAGgAbwA=",
+            "pwsh -enc ZQBjAGgAbwA=",
+            "powershell.exe -e ZQBjAGgAbwA=",
+            "powershell /ec ZQBjAGgAbwA=",
+        ];
+        for c in corpus.iter().chain(&windows_destructive) {
             assert!(
                 !is_readonly_command(c),
                 "bypass classified read-only: {c:?}"
+            );
+        }
+        for c in windows_destructive {
+            assert!(
+                catastrophic(c),
+                "Windows destructive command skips the prompt: {c:?}"
+            );
+        }
+        for c in [
+            "rm -rf ./build",
+            "rm -r -f build",
+            "rd build",
+            "del notes.txt",
+            "Remove-Item build",
+            "rm -Force stale.log",
+            "reg query HKCU\\Software\\X",
+            "icacls C:\\proj\\out.txt",
+            "takeown /f C:\\proj\\out.txt",
+            "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+            "cargo fmt --all",
+            "git log --format=%H",
+            "cipher /e secret",
+        ] {
+            assert!(
+                !catastrophic(c),
+                "ordinary command counted destructive: {c:?}"
             );
         }
         // A bare-name approval must not cover a path-qualified invocation.
@@ -7550,6 +9970,37 @@ print("hello " + data.get("name", "world"))
     }
 
     #[test]
+    fn a_patch_names_every_file_it_touches() {
+        let edit = "diff --git a/src/x.rs b/src/x.rs\nindex 1..2 100644\n--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n";
+        assert_eq!(patch_files(edit), ["src/x.rs"]);
+        // A hunk line that reads like a header is content, not a file.
+        let tricky = "--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1 @@\n--- a/.env\n-+++ b/.env\n";
+        assert_eq!(patch_files(tricky), ["q.sql"]);
+        let created =
+            "--- /dev/null\n+++ b/.git/hooks/pre-commit\t2024-01-01 00:00\n@@ -0,0 +1 @@\n+echo\n";
+        assert_eq!(patch_files(created), [".git/hooks/pre-commit"]);
+        let renamed = "diff --git a/old name.txt b/new.txt\nsimilarity index 100%\nrename from old name.txt\nrename to new.txt\n";
+        assert_eq!(patch_files(renamed), ["old name.txt", "new.txt"]);
+        // An empty new file has no ---/+++ lines; diff --git names it.
+        let empty = "diff --git a/e b/e\nnew file mode 100644\nindex 0000000..e69de29\n";
+        assert_eq!(patch_files(empty), ["e"]);
+        let q = "diff --git \"a/t\\tab\" \"b/t\\tab\"\n--- \"a/t\\tab\"\n+++ \"b/t\\tab\"\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(patch_files(q), ["t\tab"]);
+        let two =
+            "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-1\n+2\n--- a/two\n+++ b/two\n@@ -3,0 +4 @@\n+x\n";
+        assert_eq!(patch_files(two), ["one", "two"]);
+        // git apply reads the names from the top of the work tree.
+        let d = tempdir();
+        fs::create_dir_all(d.join(".git")).unwrap();
+        fs::create_dir_all(d.join("sub")).unwrap();
+        let input = json!({"patch": "--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-a\n+b\n"});
+        let paths = touched_paths("apply_patch", &input, &d.join("sub"));
+        assert_eq!(paths, [d.join(".env")]);
+        assert!(paths.iter().any(|p| is_sensitive(p)));
+        assert_eq!(touched_paths("patch", &input, &d), [d.join(".env")]);
+    }
+
+    #[test]
     fn touched_paths_covers_every_read_many_files_path() {
         let cwd = Path::new("/w");
         let input = json!({"paths": ["a.txt", "/home/u/.ssh/id_rsa"]});
@@ -7587,6 +10038,89 @@ print("hello " + data.get("name", "world"))
     }
 
     #[test]
+    fn windows_forms_of_sensitive_paths_are_sensitive() {
+        for p in [
+            "C:\\Users\\me\\.ssh\\id_rsa",
+            "c:/users/me/.SSH/config",
+            "C:\\Users\\me\\.aws\\credentials",
+            "\\\\?\\C:\\Users\\me\\.ssh\\id_rsa",
+            "\\\\.\\C:\\Users\\me\\.gnupg",
+            "\\??\\C:\\Users\\me\\.kube\\config",
+            "\\\\?\\UNC\\host\\share\\me\\.netrc",
+            "\\\\host\\share\\proj\\.env",
+            "C:\\Users\\me\\.ssh.\\id_ed25519",
+            "C:\\proj\\.env. ",
+            "C:\\proj\\.env::$DATA",
+            "C:\\Users\\me\\SSH~1\\config",
+            "C:\\Users\\me\\GIT-CR~1",
+            "C:\\Users\\me\\.docker\\CONFIG~1.JSO",
+            "C:\\Users\\me\\keys\\ID_ED2~1",
+            "C:\\proj\\src\\..\\.env.local",
+        ] {
+            assert!(
+                is_sensitive_for(Path::new(p), true),
+                "{p} should be sensitive"
+            );
+        }
+        for p in [
+            "C:\\Users\\me\\proj\\src\\main.rs",
+            "C:\\Users\\me\\.ssh\\..\\notes.txt",
+            "C:\\Users\\me\\PROGRA~1\\x",
+            "C:\\Users\\me\\.docker\\other.json",
+        ] {
+            assert!(
+                !is_sensitive_for(Path::new(p), true),
+                "{p} should not be sensitive"
+            );
+        }
+    }
+
+    #[test]
+    fn command_sensitive_path_reads_windows_paths() {
+        let cwd = Path::new("/w");
+        // Any host: a backslash path is handed to cmd or PowerShell as is.
+        for c in [
+            "rg . C:\\Users\\me\\.ssh\\id_rsa",
+            "type \"C:\\Users\\me\\.aws\\credentials\"",
+            "powershell.exe -c 'Get-Content $env:USERPROFILE\\.ssh\\id_rsa'",
+            "cmd.exe /c type \\\\?\\C:\\Users\\me\\.netrc",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, false).is_some(),
+                "{c} should be flagged"
+            );
+        }
+        // On Windows, forward slashes, relative paths and short names too.
+        for c in [
+            "rg . C:/Users/me/.ssh/id_rsa",
+            "type .ssh/id_rsa",
+            "Get-Content C:/Users/me/SSH~1/id_rsa",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, true).is_some(),
+                "{c} should be flagged on Windows"
+            );
+        }
+        // PowerShell wildcards and `-Param:value` on any host.
+        for c in [
+            "Get-Content C:\\Users\\me\\.ss?\\config",
+            "type C:\\Users\\me\\.a*\\credentials",
+            "Get-Content -Path:C:\\Users\\me\\.ssh\\id_rsa",
+        ] {
+            assert!(
+                command_sensitive_path_for(c, cwd, false).is_some(),
+                "{c} should be flagged"
+            );
+        }
+        assert!(
+            command_sensitive_path_for("gc -Path:C:/Users/me/.ssh/id_rsa", cwd, true).is_some()
+        );
+        for c in ["rg -n token src", "type C:\\proj\\README.md"] {
+            assert!(command_sensitive_path_for(c, cwd, true).is_none(), "{c}");
+        }
+    }
+
+    #[test]
     fn walkers_skip_sensitive_dirs_and_files() {
         let d = tempdir();
         fs::create_dir_all(d.join(".ssh")).unwrap();
@@ -7605,6 +10139,106 @@ print("hello " + data.get("name", "world"))
         let _ = fs::remove_dir_all(&d);
     }
 
+    // Through a proxy the resolver guard never sees the target's name, so
+    // each redirect hop is checked before it is requested.
+    #[test]
+    fn a_redirect_through_the_proxy_to_metadata_is_refused() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                log.lock().unwrap().push(first.trim().to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let proxy = format!("http://127.0.0.1:{port}");
+        let client = crate::net::Client::with_lookup(
+            |k| (k == "HTTP_PROXY").then(|| proxy.clone()),
+            |b| b.resolver(GuardedResolver).redirects(0),
+        );
+        let Err(e) = web_get_with(&client, "http://docs.example/", None) else {
+            panic!("the redirect must not be followed");
+        };
+        assert!(e.to_string().contains("refusing"), "{e}");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["GET http://docs.example/ HTTP/1.1"],
+            "only the first hop reaches the proxy"
+        );
+    }
+
+    // network.deny is checked for the call before it runs; a redirect to a
+    // host it names, in whatever spelling, is refused too.
+    #[test]
+    fn a_redirect_to_a_denied_host_is_not_followed() {
+        use std::io::{Read, Write};
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let serve = |reply: String| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = hits.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf);
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(reply.as_bytes());
+                }
+            });
+            (port, hits)
+        };
+        let (target, target_hits) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret".into());
+        let (front, _) = serve(format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://2130706433:{target}/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let home = tempdir();
+        let d = tempdir();
+        std::env::set_var("NEXUS_HOME", &home);
+        let url = json!({"url": format!("http://127.0.0.1:{front}/")});
+        // Without a rule the redirect is followed.
+        let r = run("fetch_url", &url, &d);
+        assert!(!r.is_error && r.content == "secret", "{}", r.content);
+        fs::write(
+            home.join("settings.json"),
+            json!({"network": {"deny": [format!("127.0.0.1:{target}")]}}).to_string(),
+        )
+        .unwrap();
+        let before = target_hits.load(std::sync::atomic::Ordering::SeqCst);
+        let r = run("fetch_url", &url, &d);
+        std::env::remove_var("NEXUS_HOME");
+        assert!(
+            r.is_error && r.content.contains("network.deny"),
+            "{}",
+            r.content
+        );
+        assert_eq!(
+            target_hits.load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn fetch_tools_refuse_link_local_and_metadata_hosts() {
         for u in [
@@ -7616,6 +10250,13 @@ print("hello " + data.get("name", "world"))
             "http://metadata.google.internal/computeMetadata/v1/",
             "http://user@METADATA.google.internal./",
             "http://100.100.100.200/",
+            "http://2852039166/latest/meta-data/",
+            "http://0xa9.254.169.254/",
+            "http://0251.0376.0251.0376/",
+            "http://%31%36%39.254.169.254/",
+            "http://169.254.169.254\\@docs.example/",
+            "http://[::ffff:a9fe:a9fe]/",
+            "http://[::169.254.169.254]/",
         ] {
             assert!(blocked_url(u).is_some(), "{u} should be blocked");
         }
@@ -7794,6 +10435,26 @@ print("hello " + data.get("name", "world"))
     }
 
     #[test]
+    fn catastrophic_windows_drive_targets_and_powershell_forms() {
+        for c in [
+            "rm -rf C:\\",
+            "rm -rf C:/",
+            "rm -rf c:\\Users\\me",
+            "rm -r -f D:/data",
+            "rm -rf ~\\",
+            "rm -r -fo build",
+            "rm -r -Force C:\\proj",
+            "Format-Volume -DriveLetter D",
+            "Clear-Disk -Number 1 -RemoveData",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+        for c in ["rm -rf .\\build", "rm -r -f build", "rm -rf cache:x"] {
+            assert!(!catastrophic(c), "{c} should be allowed");
+        }
+    }
+
+    #[test]
     fn catastrophic_still_allows_scoped_rm() {
         for c in ["rm -rf ./build", "rm -rf build", "rm -r tmp"] {
             assert!(!catastrophic(c), "{c} should be allowed");
@@ -7823,6 +10484,16 @@ print("hello " + data.get("name", "world"))
             cwd
         )
         .is_some());
+        // move_path trims its ends: a leading space is no way out.
+        for input in [
+            json!({"from": "a.txt", "to": " ../b.txt"}),
+            json!({"from": " /etc/hosts", "to": "b.txt"}),
+        ] {
+            assert!(
+                out_of_cwd_mutation("move_path", &input, cwd).is_some(),
+                "{input}"
+            );
+        }
         assert!(out_of_cwd_mutation(
             "str_replace_editor",
             &json!({"command": "view", "path": "/etc/hosts"}),

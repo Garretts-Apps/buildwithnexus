@@ -48,17 +48,29 @@ pub fn cell_pixels() -> (u32, u32) {
 /// answers it, so its reply marks the end of the responses.
 #[cfg(unix)]
 pub fn probe() {
-    use std::io::Write;
     if SUPPORT.load(Ordering::Relaxed) != 0 {
         return;
     }
     SUPPORT.store(1, Ordering::Relaxed);
-    let mut out = std::io::stdout();
-    if out.write_all(b"\x1b[16t\x1b[14t\x1b[c").is_err() || out.flush().is_err() {
-        return;
-    }
+    let buf = query(
+        b"\x1b[16t\x1b[14t\x1b[c",
+        std::time::Duration::from_millis(400),
+    );
+    record_probe(&buf);
+}
+
+/// Write a terminal query that ends with DA1 (`ESC [ c`) and collect the
+/// replies until the DA1 answer arrives or `timeout` passes. The caller has
+/// the terminal in raw mode and nothing else reading stdin.
+#[cfg(unix)]
+pub fn query(q: &[u8], timeout: std::time::Duration) -> Vec<u8> {
+    use std::io::Write;
     let mut buf = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    let mut out = std::io::stdout();
+    if out.write_all(q).is_err() || out.flush().is_err() {
+        return buf;
+    }
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -85,7 +97,20 @@ pub fn probe() {
             break;
         }
     }
-    record_probe(&buf);
+    buf
+}
+
+/// Windows: the same query, read as console key events (see `win::query`).
+#[cfg(windows)]
+pub fn query(q: &[u8], timeout: std::time::Duration) -> Vec<u8> {
+    let buf = win::query(q, timeout);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    buf
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn query(_q: &[u8], _timeout: std::time::Duration) -> Vec<u8> {
+    Vec::new()
 }
 
 // Store what the terminal said: Sixel support and the cell size, from the

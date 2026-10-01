@@ -43,6 +43,7 @@ fn long_conversation(turns: usize) -> Vec<Msg> {
             id: format!("call_{i}"),
             content: format!("// contents of module {i}\n").repeat(20),
             is_error: false,
+            images: Vec::new(),
         }]));
     }
     msgs

@@ -104,7 +104,11 @@ path, its SHA-256 and a pointer to [For IT and Security
 Teams](#for-it-and-security-teams). A later run that cannot start the binary
 gets the same explanation.
 
-Each verified download is recorded in `bin/.installed.json` (version and
+The binary is downloaded to `~/.buildwithnexus/bin/<version>/` (under
+`NEXUS_HOME` if that is an absolute path), outside the npm package, so an npm
+update or reinstall does not delete it; `BWN_INSTALL_IN_PACKAGE=1` keeps the
+pre-0.15 location, the package's own `bin/`. Each verified download is
+recorded in `.installed.json` next to it (version and
 SHA-256) as soon as its checksum matches, before it is moved into place, so a
 file that security software quarantines on write counts too. If that record
 is there but the binary is not, the launcher does not download it again on its
@@ -179,25 +183,102 @@ shows whether a given file is signed.
   `icacls` to restrict its settings and key files to the current user, and `tasklist`/`taskkill` for dev servers it started; the user's own
   hook scripts, with
   `.ps1` hooks run as `powershell.exe -NoProfile -ExecutionPolicy Bypass
-  -File <script>`; and `npm install -g buildwithnexus` only when the user
-  sets `auto_update` to `"install"`.
+  -File <script>`; the OS URL opener (`open`, `xdg-open`, or `rundll32
+  url.dll,FileProtocolHandler`) for `open_browser` and for the sign-in page
+  of `buildwithnexus mcp login`; `pdftotext` (poppler), when installed, to
+  read a PDF the model opens; a local Chrome, Chromium or Edge in headless
+  mode for `screenshot_url` (only for models that take images, with a
+  throwaway profile in the temp directory, deleted afterwards, and without
+  provider keys in its environment); and `npm install -g buildwithnexus` only when the user
+  runs `buildwithnexus update` or sets `auto_update` to `"install"` or
+  `"install-any"`. It never installs other software: `buildwithnexus doctor`
+  prints the install command for a missing tool, once, and runs none. Commands the
+  agent runs do not inherit provider keys (variables ending in `_API_KEY` or
+  `_API_TOKEN`, and `HF_TOKEN`) unless the user lists them in
+  `shell_env_passthrough`.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
-  `localhost:11434`); `lite.duckduckgo.com`, and the pages the agent fetches
-  when the model uses the web tools (each new host needs the user's approval
-  outside `auto` mode); MCP servers the user configures; and a
-  daily `registry.npmjs.org` version check unless `auto_update` is `"off"`.
-  There is no telemetry or analytics.
-- **Files:** its settings, sessions and checkpoints under
-  `~/.buildwithnexus` (or `NEXUS_HOME`); pasted images as `bwn-paste-*.png`
-  in the temp directory; and the files the user asks it to edit in the
-  working directory.
+  `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
+  the agent fetches when the model uses the web tools (each new host,
+  including the search host, needs the user's approval outside `auto` mode);
+  MCP servers the user configures, and the OAuth authorization servers they
+  name when the user runs `mcp login` (only over HTTPS, or to this machine;
+  sign-in tokens are sent to nothing else); the URLs of `http` hooks the user
+  configures (a project's only once the folder is trusted; `network.deny`
+  applies; no redirects are followed); pages on this machine that
+  `screenshot_url` opens in the headless browser (another host only when
+  `network.allow` or an allow rule names it; every other request the page or
+  the browser makes, link-local and cloud-metadata addresses included, goes
+  to a local proxy inside bwn that refuses it); and a daily `registry.npmjs.org` version
+  check unless `auto_update` is `"off"` (`BWN_UPDATE_REGISTRY` or
+  `npm_config_registry` points it at a mirror). There is no telemetry or
+  analytics. All of these go through the proxy named by `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` unless `NO_PROXY` matches the host; loopback
+  addresses never do, and neither do model servers on private, link-local,
+  CGNAT or IPv6 unique-local addresses unless `BWN_PROXY_PRIVATE=1`. Certificates are checked
+  against the bundled webpki roots plus the OS certificate store, or plus
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` when set, so a TLS-inspecting proxy with an
+  installed root works. Through a proxy, the proxy resolves host names, so
+  the web tools' check that a name does not resolve to a link-local or
+  metadata address is the proxy's to make; bwn still refuses those
+  addresses and the metadata host names given literally, at every redirect
+  hop.
+- **Files:** its settings, keys (`.env.keys`), MCP sign-ins
+  (`mcp-auth/<server>.json`, owner-only like the key file, each bound to its
+  server's URL), sessions, checkpoints,
+  traces, conversation exports (`exports/`), which upgrade notices were shown
+  (`notices.json`) and whether each saved key passed its last check
+  (`key-checks.json`, a hash, never the key) under `~/.buildwithnexus` (or
+  `NEXUS_HOME`), and there, in `bin/<version>/`, the binary the npm launcher
+  downloaded; pasted images as `bwn-paste-*.png` in the temp directory; the
+  files the user asks it to edit in the working directory and in folders
+  added with `--add-dir` or `/add-dir`; and, with
+  `--worktree <name>`, a git worktree in `.bwn/worktrees/<name>` (listed in
+  the repository's `.git/info/exclude`).
+- **Keys for custom endpoints:** a key for an OpenAI-compatible endpoint is
+  saved for that endpoint only (`CUSTOM_API_KEY@<scheme://host[:port]>`),
+  read the way the HTTP client reads the URL, and is never sent to another
+  address. A single key saved by 0.14 is tied to the custom endpoint in the
+  user's own settings, or else kept unbound and never sent until the user
+  says which endpoint it belongs to. `CUSTOM_API_KEY` from the environment
+  goes only to the custom endpoint the run started on.
+- **MCP sign-ins:** tokens refresh on their own and are sent only in the
+  `Authorization` header to the server URL they were saved for.
+  `buildwithnexus mcp logout` asks the authorization server to revoke the
+  token and deletes the file. A token a server echoes back is replaced with
+  `[redacted]` before the model, the transcript or the terminal sees it.
+- **Editors (`buildwithnexus acp`):** it runs only when an editor starts it,
+  and talks to that editor on stdin and stdout. Permission modes, rules,
+  hooks, folder trust and the sandbox apply as in the terminal; approvals
+  become questions in the editor. The protocol's output pipe is not passed
+  to commands, hooks or MCP servers, so they cannot send the editor requests
+  (such as writing a file) of their own.
+- **GitHub Action (`action.yml`):** it installs bwn from npm, defaults to
+  `--permission-mode readonly`, passes its inputs to its scripts as
+  environment variables, gives the token only to the step that posts the
+  pull request comment, and updates only a comment written by that token's
+  own account.
 - **Not done:** no services, scheduled tasks, startup entries, registry
   writes, drivers, or elevation.
 
+Folder trust is explicit. A project's `base_url` (where requests and the key
+go) and `permission` take effect from a `--trust-project` digest only when
+`--trust-project-allow` (or `BWN_TRUST_PROJECT_ALLOW`) names them; a
+`permission` of `readonly` only tightens and needs no name. The digest covers
+skills from a `skill_dirs` the project settings add. A repository's AGENTS.md
+and CLAUDE.md enter the prompt only after a `y` for that folder and content.
+The key question refuses answers that cannot be a key (spaces, a leading `/`,
+only digits, a provider name, over 4096 characters) instead of sending them
+to the provider, and bwn does not ask for a key for plain http to another
+machine.
+
 Controls an organization can set: `"auto_update": "off"`,
-`"permission": "ask"` or `"readonly"`, `BWN_SKIP_INSTALL=1` (no first-run
-download), and `BWN_BIN` (run a binary IT placed and verified itself).
+`"permission": "ask"`, `"accept-edits"` or `"readonly"`, `permissions.deny`
+rules (for example `run_command(git push*)`) and `network.deny` hosts, which
+refuse in every mode and which a project's settings cannot remove,
+`BWN_SKIP_INSTALL=1` (no first-run download), `BWN_BIN` (run a binary IT
+placed and verified itself), and `BWN_TLS_ROOTS=bundled` (trust only the
+roots built into the binary, not the OS store or `SSL_CERT_FILE`).
 
 ### Why endpoint protection may block it
 
@@ -274,10 +355,11 @@ Update behavior is controlled by the `auto_update` setting in
 |-------------|-----------------------------------------------------------------|
 | `"off"`     | No registry check, no notices.                                  |
 | `"notify"`  | **Default.** Daily check; a one-line notice on the next launch when a newer version exists. Never installs. |
-| `"install"` | Daily check plus silent background `npm install -g`; notice on the next launch. |
+| `"install"` | Daily check plus silent background `npm install -g` of patch releases within the running minor version; notice on the next launch. A new minor or major version is announced with its install command, never installed on its own. |
+| `"install-any"` | As `"install"`, but installs any newer version (what `"install"` did before 0.15). |
 
-`BWN_NO_AUTO_UPDATE=1` is honored for back-compat and caps `"install"` to
-`"notify"`. The check runs inside the CLI (not the npm wrapper), never blocks
+`BWN_NO_AUTO_UPDATE=1` is honored for back-compat and caps `"install"` and
+`"install-any"` to `"notify"`. The check runs inside the CLI (not the npm wrapper), never blocks
 startup, and installs performed by other means (cargo, source builds) are
 never auto-updated.
 
@@ -306,13 +388,20 @@ never auto-updated.
   `main`, and a newly created tag points at the commit the workflow built.
 - Inside the harness itself: mutating file tools are gated by the permission
   model, sensitive paths and catastrophic commands require confirmation even in
-  `auto`, API keys are refused over non-HTTPS endpoints, and key-like tokens are
-  redacted from surfaced errors.
+  `auto` (also when they are the command of `check_work` or `start_server`),
+  API keys are refused over non-HTTPS endpoints, typed hidden and saved only
+  after the provider accepts them, key-like tokens are redacted from surfaced
+  errors, provider keys are removed from the environment of the commands
+  the agent runs and blanked in bwn's own environment block (which
+  `/proc/<pid>/environ` shows), any process's `/proc/<pid>/environ` is a
+  sensitive path, descriptors bwn inherited (a CI runner's pipe) reach no
+  command it starts, a tool call quoted inside an answer never runs, and an
+  isolated helper's worktree runs no repository hooks.
 
 ## Permission Gates and the Optional Sandbox
 
-`ask` / `auto` / `readonly` modes, protected paths, and checkpoints are
-guardrails against mistakes. They are **not OS-level isolation**. An approved
+`ask` / `accept-edits` / `auto` / `readonly` modes, allow, ask and deny
+rules, protected paths, and checkpoints are guardrails against mistakes. They are **not OS-level isolation**. An approved
 command runs with your user's permissions, and checkpoints can rewind file
 edits in the working tree but not network calls, pushed commits, published
 packages, or other external effects.
@@ -329,10 +418,11 @@ Backends: `bwrap` (bubblewrap) on Linux and `sandbox-exec` (Seatbelt) on
 macOS. Windows and WSL have no backend, so `auto` runs unconfined there and
 `require` refuses to run commands.
 
-Inside the sandbox, the command can write only to the working directory and
-the temp directories; the rest of the filesystem, including
-`~/.buildwithnexus`, is read-only, and so are the workspace's `.git` and
-`.buildwithnexus` (on Linux an empty read-only placeholder stands in when
+Inside the sandbox, the command can write only to the working directory,
+the folders added with `--add-dir` and the temp directories; the rest of the
+filesystem, including `~/.buildwithnexus`, is read-only, and so are the
+`.git` and `.buildwithnexus` of the workspace and of each added folder (on
+Linux an empty read-only placeholder stands in when
 they don't exist yet, so a command cannot create a `.git/config` that runs
 later outside the sandbox). On Linux, `/tmp` is a fresh private
 directory that is discarded when the command exits. On macOS, `/tmp` and
@@ -342,7 +432,8 @@ you set `"sandbox_network": false`.
 The sandbox does not confine: reads (the whole filesystem stays readable,
 including files such as `~/.ssh` and `.env` unless their permissions stop
 your user), network access by default, the agent's own file tools (which are
-fenced to the working directory by the permission gate instead), hooks, MCP
+fenced to the working directory and the added folders by the permission gate
+instead), hooks, MCP
 servers, and `start_server`. It never approves anything; it only limits what
 an already-approved command can touch. For untrusted work, use a container
 or VM.

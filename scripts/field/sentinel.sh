@@ -226,7 +226,7 @@ main_head() {
 }
 
 # skips_ci: main's head commit asks GitHub not to run push workflows.
-# publish.yml's manual version bump commits "chore(release): vX [skip ci]".
+# publish.yml's manual version bump (removed in 0.15) committed "chore(release): vX [skip ci]".
 skips_ci() { grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]' "$WORK/head-msg"; }
 
 # npm_doc: dist-tags and publish times from the registry, fetched once.
@@ -309,7 +309,7 @@ check_release_gap() {
 main is at $link, committed $(iso "$epoch") ($age min ago), with package.json version **$ver**.
 $npm_is, and release.yml has no run for this commit.
 
-GitHub dropped a push event like this once before (U22: 2bb2a27, v0.14.6). The sentinel dispatches release.yml on $BRANCH once per commit. publish.yml does not chain from a run dispatched with the workflow token, so when that release succeeds the sentinel dispatches publish.yml too (version_bump none). This issue stays open until npm has v$ver.
+GitHub dropped a push event like this once before (U22: 2bb2a27, v0.14.6). The sentinel dispatches release.yml on $BRANCH once per commit. publish.yml does not chain from a run dispatched with the workflow token, so when that release succeeds the sentinel dispatches publish.yml too. This issue stays open until npm has v$ver.
 EOF
     return
   fi
@@ -341,7 +341,7 @@ EOF
     if ((bot)); then
       request_dispatch release-gap publish.yml "$sha"
       fail release-gap "v$ver is not on npm yet: release.yml succeeded, publish.yml has not run" <<EOF
-The sentinel dispatched release.yml for main $link (v$ver), and [that run]($(jq -r .html_url <<<"$ok")) succeeded $mins min ago. GitHub starts no workflow_run workflows from a run dispatched with the workflow token, so publish.yml cannot chain from it: the sentinel dispatches publish.yml on $BRANCH (version_bump none) once for this commit.
+The sentinel dispatched release.yml for main $link (v$ver), and [that run]($(jq -r .html_url <<<"$ok")) succeeded $mins min ago. GitHub starts no workflow_run workflows from a run dispatched with the workflow token, so publish.yml cannot chain from it: the sentinel dispatches publish.yml on $BRANCH once for this commit.
 $npm_is.
 EOF
       return
@@ -353,7 +353,7 @@ EOF
     request_dispatch release-gap/unpublished publish.yml "$sha"
     fail release-gap/unpublished "v$ver was released but publish.yml never started" <<EOF
 release.yml [succeeded]($(jq -r .html_url <<<"$ok")) for main $link (v$ver) $mins min ago, and publish.yml has no run since. publish.yml starts through a workflow_run event, which GitHub dropped (as it once dropped a push event, U22).
-The sentinel dispatches publish.yml on $BRANCH (version_bump none) once for this commit. $npm_is.
+The sentinel dispatches publish.yml on $BRANCH once for this commit. $npm_is.
 EOF
     return
   fi
@@ -775,9 +775,9 @@ ensure_label() {
 # dispatch_workflow WORKFLOW: run it on $BRANCH, as `gh workflow run WORKFLOW --ref $BRANCH`.
 dispatch_workflow() {
   local body
+  # No inputs: publish.yml publishes the version already on the branch (it
+  # has no version_bump input since 0.15, and GitHub rejects unknown inputs).
   body=$(jq -nc --arg r "$BRANCH" '{ref: $r}')
-  # Publish what is already on main; a bump from here could not be tagged.
-  if [[ $1 == publish.yml ]]; then body=$(jq -c '. + {inputs: {version_bump: "none"}}' <<<"$body"); fi
   act "dispatch $1 on $BRANCH" POST "repos/$REPO/actions/workflows/$1/dispatches" "$body"
 }
 

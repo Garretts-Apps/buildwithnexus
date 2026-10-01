@@ -10,27 +10,20 @@ name: Publish to npm
 # the raw `v*` tag. release.yml builds and attaches the per-platform binaries on
 # the tag; only once that whole workflow succeeds do we publish to npm — so a
 # user never installs a version whose binaries aren't up yet (the first-run
-# fast path). workflow_dispatch stays for manual/emergency publishes.
+# fast path).
+#
+# Before npm sees it, the exact tarball that will be published is installed
+# in clean Linux containers (the `field` job); any FAIL stops the publish.
 on:
   workflow_run:
     workflows: ["release"]
     types: [completed]
+  # Re-runs the publish of the version already on the dispatched branch, whose
+  # release binaries exist (the sentinel uses this when GitHub drops the
+  # workflow_run event). There is deliberately no version bump input: a bump
+  # here could not push a tag that starts release.yml, so it published a
+  # version with no binaries. Bump through a PR to main instead.
   workflow_dispatch:
-    inputs:
-      version_bump:
-        # Default 'none': publish the version already on main, whose release
-        # binaries exist. A bump here can't push a tag (OIDC-only, no PAT), so
-        # release.yml never builds binaries for the bumped version — leaving
-        # the first-run download with a 404. Bump via a PR to main instead.
-        description: "Version bump — keep 'none' to publish the current version (recommended)"
-        required: true
-        default: "none"
-        type: choice
-        options:
-          - none
-          - patch
-          - minor
-          - major
 
 permissions: {}
 
@@ -39,7 +32,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Verifies the release binaries, records their hashes in checksums.json and
+  # packs the tarball the other two jobs test and publish, byte for byte.
+  pack:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Gate: a successful `release` run — from a v* tag push, an automatic
@@ -54,72 +49,41 @@ jobs:
             github.event.workflow_run.head_branch == 'main' ||
             github.event.workflow_run.event == 'workflow_dispatch')) }}
     permissions:
-      # write only for the manual version-bump path, which pushes a commit and
-      # tag; every other path just reads. (Permissions can't be conditional.)
-      contents: write
-      id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
+      contents: read
       attestations: read  # verify the release binaries' build provenance
+    outputs:
+      already: ${{ steps.published.outputs.already }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           # On the release-triggered path, publish exactly the tagged commit the
           # binaries were built from; on manual dispatch, the current branch.
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
-          # Auth is OIDC Trusted Publisher (no npm token, no PAT). Checkout only
-          # needs read access to this public repo, so the default GITHUB_TOKEN is
-          # enough — do NOT require a secret here, or an unset secret makes
-          # checkout fail with "could not read Username" before publish runs.
-          # The token stays on disk only when the bump step has to push.
-          persist-credentials: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none' }}
+          persist-credentials: false
           submodules: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-          # Note: registry-url *intentionally omitted* — when a Trusted Publisher
-          # is configured for this package on npmjs.com, npm publish auto-detects
-          # the OIDC context from GitHub Actions and uses it for auth. Setting
-          # registry-url + .npmrc with NODE_AUTH_TOKEN fights that flow.
 
-      # Node 22 ships npm 10.x, which has no OIDC Trusted Publishing support, so
-      # `npm publish` falls back to token auth, finds none, and fails ENEEDAUTH.
-      # OIDC trusted publishing requires npm >= 11.5.1 — install it explicitly,
-      # pinned so a new npm release can't change the publish path unreviewed.
-      - name: Upgrade npm for OIDC trusted publishing
-        env:
-          NPM_VERSION: "12.1.0"
+      # Idempotency: npm versions are immutable, so republishing one that already
+      # exists hard-fails. The release→publish chain can legitimately re-run for a
+      # version that's already live (e.g. a manual publish happened first), so
+      # skip the publish instead of failing the run. Every docs-only merge to
+      # main lands here too, so this also skips the field run.
+      - name: Check if this version is already on npm
+        id: published
         run: |
-          npm install -g "npm@${NPM_VERSION}"
-          npm --version
-
-      - name: Bump version + tag
-        # Only the manual path bumps; the release-triggered path publishes the
-        # already-tagged version as-is.
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_bump != 'none' }}
-        env:
-          BUMP: ${{ github.event.inputs.version_bump }}
-        run: |
-          set -euo pipefail
-          case "$BUMP" in
-            patch|minor|major) ;;
-            *) echo "::error::unexpected version_bump '$BUMP'"; exit 1 ;;
-          esac
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # No package-lock.json in the wrapper — only package.json changes.
-          NEW_VERSION=$(npm version "$BUMP" --no-git-tag-version)
-          echo "New version: $NEW_VERSION"
-          git add package.json
-          git commit -m "chore(release): $NEW_VERSION [skip ci]"
-          git tag "$NEW_VERSION"
-          # A version on npm with no matching commit and tag on main can't be
-          # reproduced or released with binaries, so a failed push stops here.
-          if ! git push origin HEAD:main --follow-tags; then
-            echo "::error::Could not push the bump commit and tag to main. Nothing was published."
-            exit 1
+          V=$(node -p "require('./package.json').version")
+          if npm view "buildwithnexus@$V" version >/dev/null 2>&1; then
+            echo "buildwithnexus@$V is already on npm — skipping publish."
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
       # Release assets can be replaced after publishing, so their .sha256
@@ -159,25 +123,129 @@ jobs:
       - name: Syntax-check wrapper scripts
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
-      # Confirm the published file set resolves (bin/, scripts, harness sources)
-      # without actually publishing.
-      - name: Verify package contents
-        run: npm pack --dry-run
-
-      # Idempotency: npm versions are immutable, so republishing one that already
-      # exists hard-fails. The release→publish chain can legitimately re-run for a
-      # version that's already live (e.g. a manual publish happened first), so
-      # skip the publish instead of failing the run.
-      - name: Check if this version is already on npm
-        id: published
+      # The tarball npm will get: checksums.json from the step above included.
+      - name: Pack
+        id: pack
         run: |
-          V=$(node -p "require('./package.json').version")
-          if npm view "buildwithnexus@$V" version >/dev/null 2>&1; then
-            echo "buildwithnexus@$V is already on npm — skipping publish."
-            echo "already=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "already=false" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          mkdir -p dist
+          tgz=$(npm pack --pack-destination dist --json | node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename)')
+          sum=$(sha256sum "dist/$tgz" | cut -d' ' -f1)
+          echo "$sum  $tgz"
+          echo "tarball=$tgz" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the tarball to the field and publish jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package
+          path: dist/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # The packed tarball, installed in clean containers the way users install
+  # it, before it can reach npm. Its launcher downloads the release asset,
+  # which exists by now (release.yml has finished). One cell per path: a
+  # supported glibc as the bare asset and through npm (with the EACCES
+  # check), npm on a glibc below the floor, and npm on musl; the two
+  # unsupported ones must explain themselves. About three minutes; the full
+  # matrix runs in field.yml after the publish. No write or OIDC permission
+  # here: this job runs third-party images.
+  field:
+    needs: pack
+    if: needs.pack.outputs.already == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: dist
+
+      # Writes the cell table to the log; exits 1 on any FAIL row.
+      - name: Install the tarball in clean containers
+        env:
+          TARBALL: dist/${{ needs.pack.outputs.tarball }}
+        run: >-
+          bash scripts/field/linux-install.sh --tarball "$TARBALL"
+          --release-yml .github/workflows/release.yml
+          --cells ubuntu:22.04,node:22-bookworm,node:20-bullseye,node:22-alpine
+          --json field-prepublish.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: field-prepublish
+          path: field-prepublish.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  publish:
+    needs: [pack, field]
+    # A field run that did not pass stops it; a skipped one (the version is
+    # already on npm) does not, so a re-dispatch can still publish crates.
+    if: >-
+      ${{ !cancelled() && needs.pack.result == 'success' &&
+          (needs.field.result == 'success' ||
+           (needs.field.result == 'skipped' && needs.pack.outputs.already == 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # REQUIRED for OIDC-based npm Trusted Publisher
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          # Auth is OIDC Trusted Publisher (no npm token, no PAT). Checkout only
+          # needs read access to this public repo, so the default GITHUB_TOKEN is
+          # enough — do NOT require a secret here, or an unset secret makes
+          # checkout fail with "could not read Username" before publish runs.
+          persist-credentials: false
+          submodules: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          # Note: registry-url *intentionally omitted* — when a Trusted Publisher
+          # is configured for this package on npmjs.com, npm publish auto-detects
+          # the OIDC context from GitHub Actions and uses it for auth. Setting
+          # registry-url + .npmrc with NODE_AUTH_TOKEN fights that flow.
+
+      # Node 22 ships npm 10.x, which has no OIDC Trusted Publishing support, so
+      # `npm publish` falls back to token auth, finds none, and fails ENEEDAUTH.
+      # OIDC trusted publishing requires npm >= 11.5.1 — install it explicitly,
+      # pinned so a new npm release can't change the publish path unreviewed.
+      - name: Upgrade npm for OIDC trusted publishing
+        env:
+          NPM_VERSION: "12.1.0"
+        run: |
+          npm install -g "npm@${NPM_VERSION}"
+          npm --version
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: dist
+
+      # The tarball the field job installed, not a re-pack.
+      - name: Check the tarball is the one that was tested
+        env:
+          TARBALL: dist/${{ needs.pack.outputs.tarball }}
+          SHA256: ${{ needs.pack.outputs.sha256 }}
+        run: echo "${SHA256}  ${TARBALL}" | sha256sum -c -
 
       # === AUTH ===
       # The publish step uses npm's OIDC Trusted Publisher flow. It expects:
@@ -195,8 +263,10 @@ jobs:
       #   https://www.npmjs.com/package/buildwithnexus/access → Trusted Publishers
       - name: Publish to npm (OIDC Trusted Publisher + provenance)
         id: npm-publish
-        if: steps.published.outputs.already == 'false'
-        run: npm publish --access public --provenance
+        if: needs.pack.outputs.already == 'false'
+        env:
+          TARBALL: dist/${{ needs.pack.outputs.tarball }}
+        run: npm publish "$TARBALL" --access public --provenance
 
       # crates.io: `cargo install buildwithnexus` (both binaries) and
       # `cargo install bwn` (alias crate). OIDC only — the auth action
@@ -269,7 +339,7 @@ jobs:
       - name: Summary
         if: always()
         env:
-          ALREADY: ${{ steps.published.outputs.already }}
+          ALREADY: ${{ needs.pack.outputs.already }}
           NPM_PUBLISH: ${{ steps.npm-publish.outcome }}
           CRATES: ${{ steps.crates.outcome }}
         run: |

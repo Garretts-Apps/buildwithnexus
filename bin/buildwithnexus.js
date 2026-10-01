@@ -96,7 +96,7 @@ if (result.error || result.status !== 0) {
   // Did the binary start at all? If not (blocked, removed, wrong libc), say
   // why instead of a bare "spawnSync ... EPERM" or loader error.
   const { explainRunFailure } = require('../scripts/diagnose.js');
-  const marker = bin === installedBinary() ? readInstallMarker() : null;
+  const marker = readInstallMarker(bin);
   const found = explainRunFailure(bin, result, {
     verified: Boolean(marker),
     sha256: marker && marker.sha256,

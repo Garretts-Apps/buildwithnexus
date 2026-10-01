@@ -1,6 +1,6 @@
-//! A hilariously fast, agentic AI coding CLI — one static binary, written in
-//! Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter, Groq,
-//! Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
+//! A hilariously fast, agentic AI coding CLI — one self-contained binary,
+//! written in Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter,
+//! Groq, Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
 //! OpenAI-compatible `/v1` endpoint.
 //!
 //! This crate is the whole application: the binaries (`buildwithnexus` and
@@ -28,6 +28,7 @@
 //! | [`provider`] | wire protocols (Anthropic, OpenAI-compat, Ollama native), streaming, retries |
 //! | [`tools`] | the tool surface: file IO, search, shell, web — with permission gating |
 //! | [`mcp`] | Model Context Protocol client: stdio / HTTP servers, discovery, `mcp__*` dispatch |
+//! | [`mcp_auth`] | OAuth for HTTP MCP servers: discovery, PKCE login, saved tokens, refresh |
 //! | [`tui`] | the alternate-screen terminal UI: incremental wrap cache, diffs, autocomplete |
 //! | [`checkpoint`] | pre-edit snapshots and turn-grouped undo |
 //! | [`session`] | save/resume of conversations |
@@ -42,6 +43,7 @@
 //! <https://buildwithnexus.dev>; source at
 //! <https://github.com/Garretts-Apps/buildwithnexus>.
 
+mod acp;
 pub mod agent;
 pub mod checkpoint;
 pub mod config;
@@ -51,12 +53,15 @@ pub mod hooks;
 pub mod knowledge;
 pub mod local;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod media;
+pub mod net;
 pub mod onboarding;
 pub mod provider;
 pub mod report;
 pub mod rules;
 pub mod sandbox;
+pub mod screenshot;
 pub mod session;
 pub mod sixel;
 pub mod tools;
@@ -65,6 +70,7 @@ pub mod tui;
 pub mod update;
 pub mod usage;
 pub mod verifier;
+pub mod workdirs;
 pub mod workflow;
 
 use std::io::IsTerminal;
@@ -94,16 +100,85 @@ struct CliOptions {
     args_literal: bool,
     /// `--yes` / `-y`: auto-approve a plan and execute it (headless `plan`).
     yes: bool,
+    /// `--legacy-exit-codes` (or BWN_LEGACY_EXIT_CODES=1): exit 0 when a
+    /// headless run stops short without failing, as before 0.15.
+    legacy_exit_codes: bool,
+    /// `--trust-project <digest>` (or BWN_TRUST_PROJECT): trust exactly this
+    /// project settings content for this run (`buildwithnexus trust --print`).
+    trust_project: Option<String>,
+    /// `--trust-project-allow <keys>` (or BWN_TRUST_PROJECT_ALLOW): the keys
+    /// asked about on their own (base_url, permission) that the digest may
+    /// trust too.
+    trust_project_allow: Option<String>,
+    /// `--base-url <url>`: the model endpoint, over the settings value.
+    base_url: Option<String>,
+    /// Words before `--` that look like options but are none of ours, in
+    /// order. Commands with options of their own (`mcp add --url`) read
+    /// them; every other command refuses them as a usage error.
+    unknown_flags: Vec<String>,
+    /// `--worktree <name>`: run the session in .bwn/worktrees/<name> on
+    /// branch bwn/<name>.
+    worktree: Option<String>,
+    /// `--add-dir <path>`, repeatable: more folders to work in.
+    add_dirs: Vec<String>,
+}
+
+/// Every option `parse_cli_options` knows, for "did you mean" hints.
+const CLI_OPTIONS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--base-url",
+    "--permission-mode",
+    "--permission",
+    "--sandbox",
+    "--prompt",
+    "--effort",
+    "--max-budget-usd",
+    "--json",
+    "--yes",
+    "--legacy-exit-codes",
+    "--plain",
+    "--trust-project",
+    "--trust-project-allow",
+    "--worktree",
+    "--add-dir",
+    "--help",
+    "--version",
+];
+
+// `-x` or `--word`; a lone `-` and negative numbers (`-1`) are plain words.
+fn looks_like_option(arg: &str) -> bool {
+    arg.len() > 1 && arg.starts_with('-') && !arg[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// `unknown option --modle (did you mean --model?)`.
+fn unknown_option_msg(flag: &str) -> String {
+    unknown_option_among(flag, CLI_OPTIONS)
+}
+
+fn unknown_option_among(flag: &str, known: &[&str]) -> String {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let near = known
+        .iter()
+        .map(|o| (tools::levenshtein(name, o), *o))
+        .filter(|(d, _)| *d <= 2)
+        .min();
+    match near {
+        Some((_, o)) => format!("unknown option {name} (did you mean {o}?); see --help"),
+        None => format!("unknown option {name}; see --help"),
+    }
 }
 
 fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), String> {
     let mut opts = CliOptions::default();
     let mut rest = Vec::new();
     let mut budget_raw: Option<String> = None;
+    let mut literal_from: Option<usize> = None;
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         if arg == "--" {
             opts.args_literal = true;
+            literal_from = Some(rest.len());
             rest.extend(it);
             break;
         }
@@ -115,9 +190,28 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             opts.yes = true;
             continue;
         }
+        if arg == "--legacy-exit-codes" {
+            opts.legacy_exit_codes = true;
+            continue;
+        }
+        // Line mode: no alternate screen or cursor addressing (TERM=dumb
+        // does the same), for screen readers and plain consoles.
+        if arg == "--plain" {
+            tui::set_line_mode(true);
+            continue;
+        }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if flag == "--add-dir" {
+            let dir = inline
+                .map(str::to_string)
+                .or_else(|| it.next().filter(|v| !v.starts_with('-')))
+                .filter(|v| !v.trim().is_empty())
+                .ok_or("--add-dir requires a folder; see `buildwithnexus --help`")?;
+            opts.add_dirs.push(dir);
+            continue;
+        }
         let slot = match flag {
             "--provider" => &mut opts.provider,
             "--model" => &mut opts.model,
@@ -126,8 +220,20 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--prompt" => &mut opts.prompt,
             "--effort" => &mut opts.effort,
             "--max-budget-usd" => &mut budget_raw,
+            "--trust-project" => &mut opts.trust_project,
+            "--trust-project-allow" => &mut opts.trust_project_allow,
+            "--base-url" => &mut opts.base_url,
+            "--worktree" => &mut opts.worktree,
             _ => {
+                let named = !looks_like_option(&arg);
                 rest.push(arg);
+                // `mcp add <name> npx -y pkg --model m`: the server's own
+                // command line, word for word, never bwn's options.
+                if named && rest.len() > 2 && rest[..2] == ["mcp", "add"] {
+                    literal_from = Some(rest.len());
+                    rest.extend(it);
+                    break;
+                }
                 continue;
             }
         };
@@ -139,6 +245,19 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| format!("{flag} requires a value; see `buildwithnexus --help`"))?,
         );
+    }
+    // The first word may be a flag-spelled command (`-p`, `--version`).
+    let options_end = literal_from.unwrap_or(rest.len());
+    opts.unknown_flags = rest[..options_end]
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| looks_like_option(a) && !(*i == 0 && !is_unknown_option(a)))
+        .map(|(_, a)| a.clone())
+        .collect();
+    if let Some(level) = &opts.effort {
+        config::Effort::parse(level).ok_or_else(|| {
+            format!("--effort must be one of off, low, medium, high (got '{level}')")
+        })?;
     }
     if let Some(raw) = budget_raw {
         let usd = raw
@@ -155,7 +274,93 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
     Ok((opts, rest))
 }
 
+#[cfg(test)]
+mod cli_option_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<(CliOptions, Vec<String>), String> {
+        parse_cli_options(args.iter().map(|a| a.to_string()).collect())
+    }
+
+    #[test]
+    fn options_nobody_knows_are_collected_before_the_separator_only() {
+        let (opts, rest) = parse(&["run", "--modle", "big", "fix it"]).unwrap();
+        assert_eq!(opts.unknown_flags, ["--modle"]);
+        assert_eq!(rest, ["run", "--modle", "big", "fix it"]);
+        let (opts, _) = parse(&["run", "--", "--modle", "big"]).unwrap();
+        assert!(opts.unknown_flags.is_empty());
+        // Flag-spelled commands first, negative numbers and a lone dash pass.
+        let (opts, _) = parse(&["-p", "subtract", "-1", "-", "x"]).unwrap();
+        assert!(opts.unknown_flags.is_empty());
+        let (opts, _) = parse(&["run", "-p", "x"]).unwrap();
+        assert_eq!(opts.unknown_flags, ["-p"]);
+    }
+
+    #[test]
+    fn unknown_options_suggest_the_nearest_real_one() {
+        assert_eq!(
+            unknown_option_msg("--modle"),
+            "unknown option --modle (did you mean --model?); see --help"
+        );
+        assert_eq!(
+            unknown_option_msg("--base_url=http://x"),
+            "unknown option --base_url (did you mean --base-url?); see --help"
+        );
+        assert_eq!(
+            unknown_option_msg("--frobnicate"),
+            "unknown option --frobnicate; see --help"
+        );
+    }
+
+    #[test]
+    fn an_mcp_servers_command_line_is_kept_word_for_word() {
+        let (opts, rest) = parse(&[
+            "--json", "mcp", "add", "--force", "fs", "npx", "-y", "pkg", "--json", "--model", "m",
+            "--", "x",
+        ])
+        .unwrap();
+        assert!(opts.json, "options before the name are still bwn's");
+        assert!(!opts.yes && opts.model.is_none());
+        assert_eq!(
+            rest,
+            [
+                "mcp", "add", "--force", "fs", "npx", "-y", "pkg", "--json", "--model", "m", "--",
+                "x"
+            ]
+        );
+        assert!(opts.unknown_flags.iter().all(|f| f == "--force"));
+        // Other commands still take -y and --model wherever they are.
+        let (opts, rest) = parse(&["mcp", "list", "-y"]).unwrap();
+        assert!(opts.yes);
+        assert_eq!(rest, ["mcp", "list"]);
+    }
+
+    #[test]
+    fn add_dir_repeats_in_either_spelling_and_needs_a_folder() {
+        let (opts, rest) = parse(&["--add-dir", "../a", "run", "--add-dir=/b", "x"]).unwrap();
+        assert_eq!(opts.add_dirs, ["../a", "/b"]);
+        assert_eq!(rest, ["run", "x"]);
+        assert!(opts.unknown_flags.is_empty());
+        let err = parse(&["--add-dir", "--json", "run", "x"]).unwrap_err();
+        assert!(err.contains("--add-dir requires a folder"), "{err}");
+    }
+
+    #[test]
+    fn base_url_is_an_option_and_effort_is_checked_while_parsing() {
+        let (opts, rest) = parse(&["--base-url", "https://gw.example/v1", "run", "x"]).unwrap();
+        assert_eq!(opts.base_url.as_deref(), Some("https://gw.example/v1"));
+        assert_eq!(rest, ["run", "x"]);
+        let err = parse(&["--effort", "hihg", "run", "x"]).unwrap_err();
+        assert!(err.contains("off, low, medium, high"), "{err}");
+    }
+}
+
 pub fn run() {
+    #[cfg(unix)]
+    {
+        sandbox::cloexec_inherited_fds();
+        sandbox::hide_startup_credentials();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = match parse_cli_options(args) {
         Ok(parsed) => parsed,
@@ -167,16 +372,68 @@ pub fn run() {
     if opts.json {
         report::set(report::Mode::Json);
     }
+    hooks::set_trust_digest(opts.trust_project.clone(), opts.trust_project_allow.clone());
+    if let Some(p) = opts
+        .provider
+        .as_deref()
+        .filter(|p| config::preset(p).is_none())
+    {
+        eprintln!("buildwithnexus: {}", unknown_provider_msg(p));
+        std::process::exit(2);
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = || args[1..].join(" ");
+    // A mistyped option must not become part of a task (or an interactive
+    // prompt): `run --modle big '<task>'` sends nothing and says so.
+    // Commands with options of their own check them themselves.
+    let own_options = matches!(cmd, "mcp" | "trust" | "update" | "review");
+    // `init --agents-md` is init's one option; any other is still a mistake.
+    let command_flags: &[&str] = match cmd {
+        "init" | "da-init" | "setup" => &["--agents-md"],
+        _ => &[],
+    };
+    let unknown = opts
+        .unknown_flags
+        .iter()
+        .find(|f| !command_flags.contains(&f.as_str()));
+    if let (false, Some(flag)) = (own_options, unknown) {
+        if matches!(flag.as_str(), "-h" | "--help") {
+            usage();
+            return;
+        }
+        eprintln!("buildwithnexus: {}", unknown_option_msg(flag));
+        std::process::exit(2);
+    }
+    // A relative --add-dir names a folder from where bwn was started, even
+    // when --worktree moves the session.
+    let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let add_dirs: Vec<PathBuf> = opts
+        .add_dirs
+        .iter()
+        .map(|d| tools::resolve(&launch_dir, d.trim()))
+        .collect();
+    if let Some(name) = &opts.worktree {
+        if let Err((code, e)) = enter_session_worktree(name) {
+            eprintln!("buildwithnexus: --worktree: {e}");
+            std::process::exit(code);
+        }
+    }
+    // Checked here, before any request; their notices come with the
+    // session's other startup lines.
+    if !add_dirs.is_empty() {
+        let cwd = std::env::current_dir().unwrap_or(launch_dir);
+        for dir in &add_dirs {
+            if let Err(e) = workdirs::add(&dir.to_string_lossy(), &cwd) {
+                eprintln!("buildwithnexus: --add-dir: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     match cmd {
         "" => interactive(opts.prompt.clone(), opts),
-        "init" | "da-init" | "setup" => {
-            onboarding::run();
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            offer_starter_agents_md(&cwd);
-        }
+        "init" | "da-init" | "setup" => init_cli(&opts, &args[1..]),
+        "login" => login_cli(&opts),
         "providers" => {
             for p in config::PRESETS {
                 let tag = if p.local { "local" } else { "remote" };
@@ -184,8 +441,32 @@ pub fn run() {
             }
         }
         "run" | "build" | "headless" | "--headless" | "-p" | "--print" => {
+            let input = HeadlessInput::require(&rest());
             headless(&opts, |p, perm, cwd| {
-                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                if let Some(name) = untrusted_repo_command(&input.argv, &cwd) {
+                    eprintln!(
+                        "buildwithnexus: /{} comes from this repo and is off until the folder is trusted: --trust-project <digest> (`buildwithnexus trust --print` shows it)",
+                        tui::sanitize_terminal(&name)
+                    );
+                    std::process::exit(2);
+                }
+                if let Some(msg) = unloaded_repo_command(&input.argv, &cwd) {
+                    eprintln!("buildwithnexus: {msg}");
+                    std::process::exit(2);
+                }
+                if let Some(msg) = unknown_slash_command(&input.argv) {
+                    eprintln!("buildwithnexus: {msg}");
+                    std::process::exit(2);
+                }
+                if let Some((cmd, args)) = find_slash_command(&input.argv) {
+                    if let Some(script) = &cmd.script {
+                        let out = run_script_command(script, &args, perm, &cwd);
+                        let text = out.as_ref().unwrap_or_else(|e| e);
+                        report::tool_result("run_command", text, out.is_err());
+                        return out.map(|_| ());
+                    }
+                }
+                let (task, images) = input.task(p, &cwd);
                 agent::run_build(p, perm, "engineer", &task, &cwd, images)
             })
         }
@@ -199,65 +480,45 @@ pub fn run() {
                 );
                 std::process::exit(2);
             }
+            let input = HeadlessInput::require(&rest());
             headless(&opts, |p, perm, cwd| {
-                let (task, images) = headless_attachments(p, &rest(), &cwd);
+                let (task, images) = input.task(p, &cwd);
                 agent::run_plan(p, perm, &task, &cwd, opts.yes, images)
             })
         }
-        "brainstorm" => headless(&opts, |p, perm, cwd| {
-            let (task, images) = headless_attachments(p, &rest(), &cwd);
-            agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
-        }),
-        "sessions" => {
-            let all = session::list();
-            if all.is_empty() {
-                // Empty output reads as "broken"; say why the list is empty.
-                println!("no saved sessions yet — BUILD sessions are saved as they run.");
-                return;
-            }
-            for s in &all {
-                // Titles come from task text and cwd from the checkout's
-                // folder name, so neither reaches the terminal raw.
-                let title: String = tui::sanitize_terminal(&s.title).chars().take(48).collect();
-                println!(
-                    "  {}  {:<48}  {}",
-                    s.id,
-                    title,
-                    tui::sanitize_terminal(&s.cwd)
-                );
-            }
-            println!();
-            println!(
-                "{}",
-                tui::dim("resume one:  buildwithnexus resume <id> <task>  ·  the latest:  buildwithnexus continue <task>")
-            );
-        }
-        "continue" | "-c" | "--continue" => {
-            headless(&opts, |p, perm, cwd| match session::latest() {
-                Some(s) => {
-                    agent::run_build_resumed(p, perm, "engineer", &rest(), &cwd, s.msgs, &s.id)
-                }
-                None => Err("no sessions to continue".into()),
+        "brainstorm" => {
+            let input = HeadlessInput::require(&rest());
+            headless(&opts, |p, perm, cwd| {
+                let (task, images) = input.task(p, &cwd);
+                agent::run_brainstorm(p, perm, &cwd, &task, images).map(|_| ())
             })
         }
-        "resume" | "-r" | "--resume" => {
-            let id = args.get(1).cloned().unwrap_or_default();
-            let task = if args.len() > 2 {
-                args[2..].join(" ")
-            } else {
-                String::new()
-            };
-            headless(&opts, |p, perm, cwd| match session::load(&id) {
-                Some(s) => {
-                    agent::run_build_resumed(p, perm, "engineer", &task, &cwd, s.msgs, &s.id)
-                }
-                None => Err(format!("no session '{id}'")),
-            })
-        }
+        "sessions" => sessions_command(&args[1..]),
+        "continue" | "-c" | "--continue" => continue_command(opts.clone(), rest()),
+        "resume" | "-r" | "--resume" => resume_command(opts.clone(), &args[1..]),
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
-        "doctor" => run_doctor(),
-        "mcp" => match mcp::manage(&args[1..], false) {
+        "doctor" => run_doctor(&opts),
+        "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
+        "review" => {
+            let req = match ReviewRequest::parse(&args[1..]) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("buildwithnexus review: {e}");
+                    std::process::exit(2);
+                }
+            };
+            headless(&opts, |p, _perm, cwd| headless_review(p, &req, &cwd))
+        }
+        "update" => std::process::exit(update::cli(&args[1..])),
+        "acp" => {
+            if let Some(extra) = args.get(1) {
+                eprintln!("buildwithnexus acp: unexpected argument '{extra}'; the editor talks to it on stdin");
+                std::process::exit(2);
+            }
+            std::process::exit(acp::serve(&opts))
+        }
+        "mcp" => match mcp::manage(&args[1..], false, &mut |l| println!("  {l}")) {
             Ok(lines) => {
                 for l in lines {
                     println!("  {l}");
@@ -265,7 +526,9 @@ pub fn run() {
             }
             Err(e) => {
                 eprintln!("buildwithnexus mcp: {e}");
-                std::process::exit(2);
+                // A refusal to overwrite or a failed login is not a usage
+                // mistake.
+                std::process::exit(mcp::exit_code(&e));
             }
         },
         // A stray flag must not become an interactive prompt: `bwn --modle x`
@@ -283,6 +546,144 @@ pub fn run() {
             std::process::exit(2);
         }
     }
+    print_session_worktree_hint();
+}
+
+// `--json sessions`: one `session` event per saved session, newest first,
+// and nothing else on stdout (an empty list prints nothing).
+fn print_sessions_json(all: &[session::Session]) {
+    for s in all {
+        report::event(serde_json::json!({
+            "type": "session",
+            "id": s.id,
+            "title": s.title,
+            "cwd": s.cwd,
+            "model": s.model,
+            "created_ms": s.created_ms as u64,
+            "updated_ms": s.updated_ms as u64,
+            "messages": s.msgs.len(),
+        }));
+    }
+}
+
+// The worktree a `--worktree` session runs in: (path, branch, repo root).
+static SESSION_WORKTREE: std::sync::OnceLock<(PathBuf, String, PathBuf)> =
+    std::sync::OnceLock::new();
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git could not start ({e})"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .last()
+            .unwrap_or("git failed")
+            .trim()
+            .to_string())
+    }
+}
+
+// A name git accepts in a branch and a folder: letters, digits, `.`, `_`, `-`.
+fn worktree_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `--worktree <name>`: create (or reuse) <repo>/.bwn/worktrees/<name> on
+/// branch bwn/<name> from HEAD and move the session into it. `.bwn/` goes
+/// into the repository's info/exclude so the main checkout never shows it.
+fn enter_session_worktree(name: &str) -> Result<(), (i32, String)> {
+    if !worktree_name_ok(name) {
+        return Err((
+            2,
+            format!("'{name}' is not a usable name — use letters, digits, '.', '_' or '-'"),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|e| (1, e.to_string()))?;
+    let root = git_in(&cwd, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .map_err(|_| (1, "not inside a git repository".to_string()))?;
+    git_in(&root, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|_| (1, "the repository has no commits yet".to_string()))?;
+    let path = root.join(".bwn").join("worktrees").join(name);
+    let branch = format!("bwn/{name}");
+    if !path.join(".git").exists() {
+        let has_branch = git_in(
+            &root,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        )
+        .is_ok();
+        let path_s = path.to_string_lossy().into_owned();
+        let args: Vec<&str> = if has_branch {
+            vec!["worktree", "add", &path_s, &branch]
+        } else {
+            vec!["worktree", "add", "-b", &branch, &path_s, "HEAD"]
+        };
+        git_in(&root, &args).map_err(|e| (1, format!("git worktree add failed: {e}")))?;
+    }
+    if let Ok(common) = git_in(&root, &["rev-parse", "--git-common-dir"]) {
+        let exclude = root.join(common).join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !text.lines().any(|l| l.trim() == "/.bwn/") {
+            let _ = std::fs::create_dir_all(exclude.parent().unwrap_or(&root));
+            let sep = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let _ = std::fs::write(&exclude, format!("{text}{sep}/.bwn/\n"));
+        }
+    }
+    std::env::set_current_dir(&path).map_err(|e| (1, e.to_string()))?;
+    eprintln!(
+        "{}",
+        tui::dim(&format!(
+            "buildwithnexus: working in .bwn/worktrees/{name} on branch {branch}"
+        ))
+    );
+    let _ = SESSION_WORKTREE.set((path, branch, root));
+    Ok(())
+}
+
+/// On the way out of a `--worktree` session: where the work is and how to
+/// bring it in.
+fn print_session_worktree_hint() {
+    let Some((path, branch, root)) = SESSION_WORKTREE.get() else {
+        return;
+    };
+    let shown = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let dirty = git_in(path, &["status", "--porcelain"])
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let pending = if dirty > 0 {
+        format!(
+            " ({dirty} uncommitted change{} there — commit them first)",
+            if dirty == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "{}",
+        tui::yellow(&tui::sanitize_terminal(&format!(
+            "buildwithnexus: this session's work is on branch {branch} in {shown}{pending} — git merge {branch}"
+        )))
+    );
 }
 
 // Options and flag-spelled subcommands the top-level match accepts. Anything
@@ -310,23 +711,36 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
     let mut settings = match load.settings {
-        Some(s) => s,
+        Some(s) if !s.provider.is_empty() => s,
         // Settings files exist but none were usable: refuse to fall through
         // to onboarding, which would overwrite them. Broken config is a fix,
         // not a first run.
         None if load.any_present => return Err(broken_settings_msg()),
-        // No settings yet. Without a terminal there is nobody to answer the
-        // setup questions, so take the provider from --provider or from the
-        // first API key in the environment, and fail with the fix otherwise.
-        None if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
-            unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some())
-                .ok_or_else(no_setup_headless_msg)?
+        // No provider yet (or only a project file that names none). Without
+        // a terminal there is nobody to answer the setup questions, so take
+        // the provider from --provider or from the first API key in the
+        // environment, and fail with the fix otherwise.
+        loaded if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
+            let picked =
+                unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some())
+                    .ok_or_else(no_setup_headless_msg)?;
+            Settings {
+                provider: picked.provider,
+                ..loaded.unwrap_or_default()
+            }
         }
-        None => onboarding::run().ok_or("setup cancelled")?,
+        _ => onboarding::run().ok_or("setup not finished")?,
     };
-    if let Some(p) = &opts.provider {
+    if let Some(p) = opts.provider.as_ref().filter(|p| **p != settings.provider) {
+        // The saved address belongs to the saved provider: --provider runs
+        // at the address last used with it, or at its preset default.
+        settings.base_url = remembered_endpoint(p);
         settings.provider = p.clone();
     }
+    if let Some(u) = &opts.base_url {
+        settings.base_url = Some(u.clone());
+    }
+    set_active_preset(&settings.provider);
     let mut provider = build_provider(&settings)?;
     if let Some(model) = &opts.model {
         provider.model = model.clone();
@@ -339,10 +753,11 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // The CLI flag wins over the settings key; either arms the pre-request
     // guard in the agent loop.
     usage::set_budget(opts.max_budget_usd.or(settings.max_budget_usd));
-    let perm_name = opts
-        .permission_mode
-        .as_deref()
-        .unwrap_or(&settings.permission);
+    if let Some(why) = provider::budget_guard(&provider) {
+        eprintln!("buildwithnexus: {why}");
+        std::process::exit(2);
+    }
+    let perm = permission_from(opts.permission_mode.as_deref(), &settings.permission);
     // A bad --sandbox flag is a hard error; a bad settings value only warns
     // (and leaves the sandbox off) so a typo can't lock the user out.
     let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
@@ -352,7 +767,43 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         }
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
     }
-    Ok((provider, agent::permission(perm_name)))
+    let local = config::preset(&settings.provider).is_some_and(|p| p.local)
+        || is_loopback_url(&provider.base_url);
+    agent::set_max_parallel_helpers(settings.max_parallel_helpers.unwrap_or_else(|| {
+        agent::default_parallel_helpers(local, provider::served_slots(&provider))
+    }));
+    if let Some(note) = agent::max_parallel_helpers_note(settings.max_parallel_helpers) {
+        eprintln!("{}", tui::yellow(&format!("buildwithnexus: {note}")));
+    }
+    workflow::set_launch(
+        &settings.provider,
+        &provider.model,
+        &provider.base_url,
+        agent::permission_name(perm),
+    );
+    Ok((provider, perm))
+}
+
+// `--permission-mode` wins over the setting. A misspelt flag is a usage
+// error (exit 2) before anything is sent; a misspelt setting warns and
+// falls back to ask, so a typo can neither lock the user out nor loosen
+// the gate.
+fn permission_from(flag: Option<&str>, setting: &str) -> Permission {
+    match flag {
+        Some(name) => agent::parse_permission(name).unwrap_or_else(|e| {
+            eprintln!("{}", tui::red(&format!("buildwithnexus: {e}")));
+            std::process::exit(2);
+        }),
+        None => agent::parse_permission(setting).unwrap_or_else(|e| {
+            eprintln!(
+                "{}",
+                tui::yellow(&format!(
+                    "buildwithnexus: warning: settings: {e} — using ask"
+                ))
+            );
+            Permission::Ask
+        }),
+    }
 }
 
 /// Every ignored settings file gets one loud stderr line — a typo in a config
@@ -412,7 +863,7 @@ const STARTUP_TIPS: &[&str] = &[
     "tip: Ctrl+V pastes a screenshot straight into the prompt — the model sees what you see",
     "tip: @ completes file paths, @kb: searches the knowledge base",
     "tip: double-click a word, triple-click a line. copied, confirmed, footer says so",
-    "tip: /checkpoint before you get brave",
+    "tip: /undo puts back the last turn's edits. go on, be brave",
     "tip: /model swaps models mid-session — it validates before it commits",
     "tip: ↑ filters history by what you've typed, and never eats your draft",
     "tip: /vim exists. you already knew, somehow",
@@ -435,7 +886,7 @@ fn startup_tip() -> &'static str {
     STARTUP_TIPS[nanos % STARTUP_TIPS.len()]
 }
 
-fn is_loopback_url(u: &str) -> bool {
+pub(crate) fn is_loopback_url(u: &str) -> bool {
     let rest = u
         .strip_prefix("http://")
         .or_else(|| u.strip_prefix("https://"))
@@ -456,13 +907,38 @@ fn is_loopback_url(u: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
 }
 
+/// Names an unknown provider id, the closest real one, and the full list.
+pub(crate) fn unknown_provider_msg(id: &str) -> String {
+    if id.trim().is_empty() {
+        return "no provider is set up yet; run `buildwithnexus init`, or pass --provider".into();
+    }
+    let ids: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
+    let typed = id.trim().to_ascii_lowercase();
+    let near = ids
+        .iter()
+        .map(|p| (tools::levenshtein(&typed, p), *p))
+        .min()
+        .filter(|(d, p)| *d <= 2.max(p.len() / 4) || p.starts_with(&typed));
+    let shown = tui::sanitize_terminal(id);
+    match near {
+        Some((_, p)) => format!(
+            "unknown provider {shown} — did you mean {p}? Providers: {}",
+            ids.join(", ")
+        ),
+        None => format!("unknown provider {shown} — Providers: {}", ids.join(", ")),
+    }
+}
+
 pub fn build_provider(s: &Settings) -> Result<Provider, String> {
-    let preset = config::preset(&s.provider).ok_or_else(|| {
-        format!(
-            "unknown provider '{}'; run `buildwithnexus init`",
-            s.provider
-        )
-    })?;
+    build_provider_with_key(s, None)
+}
+
+/// `build_provider` with a key that is not saved yet: it is used in place of
+/// the stored one and passes the same checks, so a key can be proven with a
+/// probe before it is written to disk. For the custom endpoint an empty key
+/// means none, not the saved one.
+pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result<Provider, String> {
+    let preset = config::preset(&s.provider).ok_or_else(|| unknown_provider_msg(&s.provider))?;
     let base_url = match &s.base_url {
         Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
             return Err(format!(
@@ -480,11 +956,23 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     };
     let api_key = if preset.id == "custom" {
         // Optional — most self-hosted OpenAI-compatible servers are keyless.
-        config::load_key(config::CUSTOM_KEY)
+        // Each endpoint has its own saved key.
+        let api_key = match key {
+            Some(k) => Some(k.to_string()).filter(|k| !k.is_empty()),
+            None => config::load_custom_key(&base_url),
+        };
+        if api_key.is_none() && key.is_none() && config::unbound_custom_key().is_some() {
+            report::notice(&format!(
+                "  a CUSTOM_API_KEY saved by an earlier version is not tied to an endpoint, so it is not sent to {} — /model offers it for an endpoint, and `buildwithnexus login` saves one for this one",
+                config::endpoint_origin(&base_url)
+            ));
+        }
+        api_key
     } else if preset.env_key.is_empty() {
         None
     } else {
-        config::load_key(preset.env_key)
+        key.map(str::to_string)
+            .or_else(|| config::load_key(preset.env_key))
     };
     if !preset.env_key.is_empty() && api_key.is_none() {
         return Err(format!(
@@ -504,6 +992,10 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
             config::CUSTOM_KEY
         ));
     }
+    // A notice, not stderr: /model rebuilds the provider inside the TUI.
+    for w in usage::set_prices(&s.prices) {
+        report::notice(&format!("  ⚠ {w}"));
+    }
     let mut context_tokens = match preset.id {
         "anthropic" => 200_000,
         _ if preset.local => 8_192,
@@ -517,11 +1009,15 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
     // surface (`…/v1`) keeps the OpenAI protocol — configs saved before the
     // native Ollama path existed (and users deliberately targeting a /v1
     // proxy) must not switch wire formats. Native is for root URLs only.
+    // The exception is a `…/v1` address that Ollama itself answers: its
+    // OpenAI-compat endpoint cannot take num_ctx, so the prompt is silently
+    // cut to the server's default window. That one is sent natively.
     let mut protocol = preset.protocol;
     if protocol == config::Protocol::OllamaNative
         && s.base_url
             .as_deref()
             .is_some_and(|u| u.trim_end_matches('/').ends_with("/v1"))
+        && provider::ollama_models_checked(&base_url).is_none()
     {
         protocol = config::Protocol::OpenAi;
     }
@@ -548,8 +1044,279 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
             // compaction thresholds match what the model can actually hold.
             provider.context_tokens = n as usize;
         }
+    } else if s.context_tokens.is_none() && (preset.local || is_loopback_url(&provider.base_url)) {
+        // llama.cpp, LM Studio and vLLM report the window they loaded the
+        // model with; the 8k guess stands only when they say nothing.
+        let served = provider::served_model(&provider.base_url, &provider.model);
+        if let Some(n) = served.window {
+            provider.context_tokens = n;
+            provider::remember_window(&provider);
+        }
+        if let Some(v) = served.vision {
+            provider::remember_vision(&provider, v);
+        }
+        if let Some(n) = served.slots {
+            provider::remember_slots(&provider, n);
+        }
+    }
+    media::set_vision_override(s.vision);
+    if s.context_tokens.is_some() {
+        provider::remember_window(&provider);
     }
     Ok(provider)
+}
+
+/// Most piped input a headless run sends, as the task or as a `[stdin]`
+/// block after it; the rest is read and dropped so the writer never sees a
+/// broken pipe.
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
+/// With a task on the command line, stdin is read only if something arrives
+/// this soon: a pipe a parent process leaves open must not hang the run.
+const STDIN_FIRST_BYTE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What a headless run was asked to do: the task from argv, and what was
+/// piped on stdin.
+struct HeadlessInput {
+    argv: String,
+    stdin: Option<String>,
+    // Said once the run has started (truncation, an ignored silent pipe).
+    notice: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Piped {
+    Text { text: String, cut: bool },
+    // A task was given and nothing arrived in time; the pipe was not read.
+    Silent,
+    Nothing,
+}
+
+impl HeadlessInput {
+    /// Reads stdin when it is not a terminal, and exits 2 when neither argv
+    /// nor stdin holds a task, before any setup or request.
+    fn require(argv: &str) -> Self {
+        let have_task = !argv.trim().is_empty();
+        let piped = if std::io::stdin().is_terminal() {
+            Piped::Nothing
+        } else {
+            let wait = have_task.then_some(STDIN_FIRST_BYTE_WAIT);
+            collect_piped(&spawn_stdin_reader(), wait, MAX_STDIN_BYTES)
+        };
+        let input = Self::from_parts(argv, piped);
+        if !have_task && input.stdin.is_none() {
+            eprintln!(
+                "buildwithnexus: no task given — pass it as an argument \
+                 (buildwithnexus run 'fix the typo') or on stdin (echo 'fix the typo' | buildwithnexus run)"
+            );
+            std::process::exit(2);
+        }
+        input
+    }
+
+    fn from_parts(argv: &str, piped: Piped) -> Self {
+        let mib = MAX_STDIN_BYTES / (1024 * 1024);
+        let (stdin, notice) = match piped {
+            Piped::Text { text, .. } if text.trim().is_empty() => (None, None),
+            Piped::Text { text, cut } => (
+                Some(if cut {
+                    format!("{text}\n[stdin cut at {mib} MiB]")
+                } else {
+                    text
+                }),
+                cut.then(|| {
+                    format!("  stdin was longer than {mib} MiB — only the first {mib} MiB was sent")
+                }),
+            ),
+            Piped::Silent => (
+                None,
+                Some(format!(
+                    "  nothing arrived on stdin within {}s, so it was not read — \
+                     for slow input, write it to a file and redirect it (< file)",
+                    STDIN_FIRST_BYTE_WAIT.as_secs()
+                )),
+            ),
+            Piped::Nothing => (None, None),
+        };
+        Self {
+            argv: argv.to_string(),
+            stdin,
+            notice,
+        }
+    }
+
+    /// The task for the model. Argv words go through @path attachments as
+    /// typed tasks do; piped text is data (logs, diffs) and is sent as is.
+    fn task(&self, p: &Provider, cwd: &std::path::Path) -> (String, Vec<(String, String)>) {
+        if let Some(n) = &self.notice {
+            report::notice(n);
+        }
+        let stdin = self.stdin.as_deref();
+        if self.argv.trim().is_empty() {
+            return (stdin.unwrap_or_default().to_string(), Vec::new());
+        }
+        // `/deploy staging` runs the deploy command or skill, as in a session.
+        if let Some((cmd, args)) = find_slash_command(&self.argv) {
+            // A command that takes an argument and got none is filled from
+            // the piped text; with neither, it is run empty and says so.
+            if args.is_empty() && config::command_takes_arguments(&cmd) {
+                match stdin.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(piped) => return (config::command_prompt(&cmd, piped), Vec::new()),
+                    None => report::notice(&format!(
+                        "  /{} takes an argument and none was given — it runs with the gap empty",
+                        tui::sanitize_terminal(&cmd.name)
+                    )),
+                }
+            }
+            let prompt = config::command_prompt(&cmd, &args);
+            return match stdin {
+                Some(s) => (format!("{prompt}\n\n[stdin]\n{s}"), Vec::new()),
+                None => (prompt, Vec::new()),
+            };
+        }
+        let (task, images) = headless_attachments(p, &self.argv, cwd);
+        match stdin {
+            Some(s) => (format!("{task}\n\n[stdin]\n{s}"), images),
+            None => (task, images),
+        }
+    }
+}
+
+// Reads stdin on its own thread, a chunk per message; the channel closes at
+// end of input. Once the receiver is gone the rest is read and dropped.
+fn spawn_stdin_reader() -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let _ = tx.send(buf[..n].to_vec());
+                }
+            }
+        }
+    });
+    rx
+}
+
+// Up to `cap` bytes from the reader. `first_wait` bounds the wait for the
+// first chunk; without it the wait is unbounded, with a hint on stderr.
+fn collect_piped(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    first_wait: Option<std::time::Duration>,
+    cap: usize,
+) -> Piped {
+    use std::sync::mpsc::RecvTimeoutError;
+    let first = match first_wait {
+        Some(wait) => match rx.recv_timeout(wait) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Timeout) => return Piped::Silent,
+            Err(RecvTimeoutError::Disconnected) => return Piped::Nothing,
+        },
+        None => match rx.recv_timeout(STDIN_FIRST_BYTE_WAIT) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Disconnected) => return Piped::Nothing,
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("buildwithnexus: no task argument — waiting for the task on stdin…");
+                match rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return Piped::Nothing,
+                }
+            }
+        },
+    };
+    let mut buf = first;
+    let mut cut = false;
+    while buf.len() <= cap {
+        match rx.recv() {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    if buf.len() > cap {
+        buf.truncate(cap);
+        cut = true;
+        // Drop a character split by the cut rather than send U+FFFD.
+        while std::str::from_utf8(&buf).is_err_and(|e| e.error_len().is_none()) {
+            buf.pop();
+        }
+    }
+    Piped::Text {
+        text: String::from_utf8_lossy(&buf).into_owned(),
+        cut,
+    }
+}
+
+#[cfg(test)]
+mod headless_input_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    #[test]
+    fn piped_input_is_read_to_the_end_and_cut_at_the_cap() {
+        let (tx, rx) = channel();
+        tx.send(b"abc".to_vec()).unwrap();
+        tx.send(b"def".to_vec()).unwrap();
+        drop(tx);
+        let got = collect_piped(&rx, Some(Duration::from_secs(1)), 100);
+        assert_eq!(
+            got,
+            Piped::Text {
+                text: "abcdef".into(),
+                cut: false
+            }
+        );
+
+        let (tx, rx) = channel();
+        tx.send("é".repeat(10).into_bytes()).unwrap();
+        // 7 bytes would split the fourth two-byte character: it is dropped.
+        let Piped::Text { text, cut } = collect_piped(&rx, None, 7) else {
+            panic!("no text");
+        };
+        assert!(cut);
+        assert_eq!(text, "ééé");
+    }
+
+    #[test]
+    fn a_silent_pipe_is_skipped_only_when_a_task_was_given() {
+        let (tx, rx) = channel::<Vec<u8>>();
+        assert_eq!(
+            collect_piped(&rx, Some(Duration::from_millis(20)), 100),
+            Piped::Silent
+        );
+        drop(tx);
+        assert_eq!(collect_piped(&rx, None, 100), Piped::Nothing);
+    }
+
+    #[test]
+    fn piped_text_follows_the_task_as_a_block_or_is_the_task() {
+        let input = HeadlessInput::from_parts(
+            "why?",
+            Piped::Text {
+                text: "log line".into(),
+                cut: true,
+            },
+        );
+        assert_eq!(
+            input.stdin.as_deref(),
+            Some("log line\n[stdin cut at 1 MiB]")
+        );
+        assert!(input.notice.unwrap().contains("1 MiB"));
+        let blank = HeadlessInput::from_parts(
+            "",
+            Piped::Text {
+                text: " \n".into(),
+                cut: false,
+            },
+        );
+        assert!(blank.stdin.is_none() && blank.notice.is_none());
+        let silent = HeadlessInput::from_parts("why?", Piped::Silent);
+        assert!(silent.stdin.is_none());
+        assert!(silent.notice.unwrap().contains("not read"));
+    }
 }
 
 fn headless(
@@ -565,10 +1332,24 @@ fn headless(
             std::process::exit(1);
         }
     };
+    exit_on_interrupt();
     provider::prewarm(&provider);
     hooks::init(&cwd, false);
     hooks::set_permission_mode(agent::permission_name(perm));
     hooks::notify("SessionStart", &cwd);
+
+    // The repository's instruction files: acknowledged once in the terminal
+    // UI; until then a headless run says so in one line on stderr.
+    let repo = config::repo_instructions(&cwd);
+    if let Some(repo) = repo.as_ref().filter(|r| !r.acknowledged(&cwd)) {
+        let note = tui::sanitize_terminal(&repo.notice()).into_owned();
+        eprintln!(
+            "{}",
+            tui::yellow(&format!(
+                "buildwithnexus: {note} (not reviewed — open bwn in this folder once to review them)"
+            ))
+        );
+    }
 
     if !report::is_json() {
         // No hand-drawn box: long provider/model/cwd values would shatter
@@ -582,7 +1363,11 @@ fn headless(
             "{}",
             tui::dim(&format!(
                 "  model  {} · {}",
-                provider.protocol, provider.model
+                onboarding::provider_label(
+                    &active_preset().unwrap_or_default(),
+                    &provider.base_url
+                ),
+                tui::sanitize_terminal(&provider.model)
             ))
         );
         // The folder name comes from whoever made the checkout.
@@ -596,29 +1381,59 @@ fn headless(
             let note = tui::sanitize_terminal(&note);
             println!("{}", tui::dim(&format!("  {note}")));
         }
+        if let Some(repo) = repo.as_ref().filter(|r| r.acknowledged(&cwd)) {
+            let note = tui::sanitize_terminal(&repo.notice()).into_owned();
+            println!("{}", tui::dim(&format!("  {note}")));
+        }
         println!();
         // Off the critical path: five `which` probes cost real startup latency,
         // and with interactive=false this only prints when something is missing.
-        std::thread::spawn(|| check_and_offer_install_dependencies(false));
+        std::thread::spawn(check_and_offer_install_dependencies);
     }
-
-    if let Some(n) = agent::ignored_approvals_notice(&cwd) {
+    // Added folders, and the instruction files they bring, are named
+    // before the model reads them (a `notice` event in --json mode).
+    for n in workdirs::notices(&cwd) {
         report::notice(&format!("  {n}"));
     }
-    // MCP tools must be on the surface before the first request; discovery
-    // is bounded by each server's timeout, and every outcome is a notice.
-    mcp::ensure_ready();
+
+    if let Some(n) = agent::ignored_approvals_notice_once(&cwd) {
+        report::notice(&format!("  {n}"));
+    }
+    // MCP tools must be on the surface before the first request. A server
+    // that is not ready within a few seconds (or its own timeout_secs) is
+    // skipped for this run, with a notice, rather than stalling it.
+    let skipped = mcp::ensure_ready_headless();
     report_mcp_notices();
+    for n in skipped {
+        report::notice(&format!("  {n}"));
+    }
 
     // Nobody can answer an approval prompt here, so `ask` blocks every edit
     // and command. Say so before the run, not after it looks successful.
     let unattended = report::is_json() || !std::io::stdin().is_terminal();
-    if unattended && agent::permission_name(perm) == "ask" {
+    // A PermissionRequest or PreToolUse hook may answer for the terminal.
+    let hook_answers = hooks::has_event("PermissionRequest") || hooks::has_event("PreToolUse");
+    if unattended && perm == Permission::Ask && hook_answers {
+        eprintln!(
+            "{}",
+            tui::yellow(
+                "buildwithnexus: no terminal to approve changes: edits and commands your \
+                 PermissionRequest or PreToolUse hooks do not allow will be blocked."
+            )
+        );
+    } else if unattended && perm == Permission::Ask {
         eprintln!(
             "{}",
             tui::yellow(
                 "buildwithnexus: no terminal to approve changes, so edits and commands will be blocked.\n  \
                  Pass --permission-mode auto to allow them, or --permission-mode readonly to only read."
+            )
+        );
+    } else if unattended && perm == Permission::AcceptEdits {
+        eprintln!(
+            "{}",
+            tui::yellow(
+                "buildwithnexus: accept-edits with no terminal: file edits run, commands and network access will be blocked."
             )
         );
     }
@@ -627,29 +1442,192 @@ fn headless(
     let mut r = f(&provider, perm, cwd.clone());
     let elapsed = start_time.elapsed();
     hooks::notify("SessionEnd", &cwd);
-    let blocked = agent::blocked_without_terminal();
+    let blocked_calls = agent::blocked_without_terminal();
+    let blocked = blocked_calls.len();
     if r.is_ok() && blocked > 0 {
-        r = Err(format!(
-            "{blocked} change{} blocked for lack of approval; nothing was applied for {}. \
-             Re-run with --permission-mode auto to allow changes.",
-            if blocked == 1 { " was" } else { "s were" },
-            if blocked == 1 { "it" } else { "them" }
+        r = Err(blocked_line(
+            &blocked_calls,
+            agent::blocked_needing_a_person().len(),
         ));
+    }
+    // Refusals by a hook, a rule or read-only mode: the run did not do what
+    // it was asked, though nothing failed.
+    let denied = (blocked == 0)
+        .then(|| report::denials_line(&report::denials()))
+        .flatten();
+
+    let outcome = match &r {
+        Err(_) if blocked > 0 => agent::Outcome::ApprovalBlocked,
+        Err(_) => agent::Outcome::Failed,
+        Ok(()) if denied.is_some() => agent::Outcome::ApprovalBlocked,
+        Ok(()) => agent::stopped_short_outcome().unwrap_or(agent::Outcome::Success),
+    };
+    let legacy = opts.legacy_exit_codes
+        || std::env::var("BWN_LEGACY_EXIT_CODES").is_ok_and(|v| !v.is_empty() && v != "0");
+    let mut code = headless_exit_code(outcome, r.is_ok(), legacy);
+    let mut outcome_name = outcome.as_str();
+    let blocking = REVIEW_BLOCKING.load(std::sync::atomic::Ordering::Relaxed);
+    if outcome == agent::Outcome::Success && blocking > 0 {
+        code = EXIT_REVIEW_BLOCKING;
+        outcome_name = "review_blocking";
     }
 
     if !report::is_json() {
         println!();
-        if r.is_ok() {
+        if code == EXIT_REVIEW_BLOCKING {
+            println!(
+                "{}",
+                tui::yellow(&format!(
+                    "⚠ review found {blocking} blocking issue{} after {elapsed:.2?}",
+                    if blocking == 1 { "" } else { "s" }
+                ))
+            );
+        } else if outcome == agent::Outcome::Success {
             println!("{}", tui::green(&format!("✓ done in {elapsed:.2?}")));
+        } else if let (Ok(()), Some(line)) = (&r, &denied) {
+            println!(
+                "{}",
+                tui::yellow(&format!(
+                    "⚠ {} after {elapsed:.2?}",
+                    tui::sanitize_terminal(line)
+                ))
+            );
+        } else if r.is_ok() {
+            println!(
+                "{}",
+                tui::yellow(&format!("⚠ {} after {elapsed:.2?}", outcome.label()))
+            );
         } else {
             println!("{}", tui::red(&format!("✗ failed after {elapsed:.2?}")));
         }
     }
+    report::result(outcome_name, code);
 
     if let Err(e) = r {
         eprintln!("{}", tui::red(&tui::sanitize_terminal(&e)));
-        std::process::exit(if blocked > 0 { 3 } else { 1 });
+    } else if let (true, Some(line)) = (report::is_json(), &denied) {
+        eprintln!("{}", tui::yellow(&tui::sanitize_terminal(line)));
     }
+    if code != 0 {
+        print_session_worktree_hint();
+        std::process::exit(code);
+    }
+}
+
+// The closing line of a run whose changes nobody could approve: what was
+// blocked, by its approval label, and nothing about the rest of the run.
+// `need_person` of them are calls auto mode asks about too (sensitive
+// paths, dangerous commands, ask rules), so auto is not offered for those.
+fn blocked_line(calls: &[String], need_person: usize) -> String {
+    let n = calls.len();
+    let shown: Vec<&str> = calls.iter().take(3).map(String::as_str).collect();
+    let more = match n.saturating_sub(shown.len()) {
+        0 => String::new(),
+        k => format!(" and {k} more"),
+    };
+    let it = if n == 1 { "it" } else { "them" };
+    let advice = if need_person == 0 {
+        format!("Re-run with --permission-mode auto to allow {it}.")
+    } else if need_person >= n {
+        format!(
+            "{} always {} a person to approve, even with --permission-mode auto: run bwn in a terminal to approve {it}.",
+            if n == 1 { "This one" } else { "These" },
+            if n == 1 { "needs" } else { "need" }
+        )
+    } else {
+        format!(
+            "{need_person} of them always need a person to approve, even with --permission-mode auto (run bwn in a terminal for those); auto allows the rest."
+        )
+    };
+    format!(
+        "{n} change{} blocked for lack of approval and not made: {}{more}. {advice}",
+        if n == 1 { " was" } else { "s were" },
+        shown.join("; "),
+    )
+}
+
+// A turn that ended without an error but short of success gets its own exit
+// code, unless legacy exit codes ask for the pre-0.15 zero.
+fn headless_exit_code(outcome: agent::Outcome, turn_ok: bool, legacy: bool) -> i32 {
+    if legacy && turn_ok {
+        0
+    } else {
+        outcome.exit_code()
+    }
+}
+
+// SIGINT or SIGTERM during a headless run: end with 128 + the signal, a
+// final result event (outcome "interrupted") and a line naming the saved
+// session. The handler only records the signal; a watcher thread does the
+// rest outside signal context.
+static INTERRUPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn exit_on_interrupt() {
+    if !install_interrupt_handlers() {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        let sig = INTERRUPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+        if sig != 0 {
+            let code = 128 + sig;
+            report::result("interrupted", code);
+            let resume = crate::session::current()
+                .map(|id| {
+                    format!(
+                        " — session {id} saved; resume with `buildwithnexus resume {id} <task>`"
+                    )
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "{}",
+                tui::yellow(&format!("buildwithnexus: interrupted{resume}"))
+            );
+            print_session_worktree_hint();
+            std::process::exit(code);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    });
+}
+
+#[cfg(unix)]
+fn install_interrupt_handlers() -> bool {
+    extern "C" fn on_signal(sig: libc::c_int) {
+        INTERRUPT_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+    }
+    let h: extern "C" fn(libc::c_int) = on_signal;
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, h as usize);
+        libc::signal(libc::SIGTERM, h as usize);
+    }
+    true
+}
+
+// Ctrl+C and Ctrl+Break in a console: handled (TRUE), so the watcher thread
+// can report and exit with 130. Closing the window keeps the default.
+#[cfg(windows)]
+fn install_interrupt_handlers() -> bool {
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+    unsafe extern "system" fn on_ctrl(kind: u32) -> i32 {
+        // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1.
+        if kind <= 1 {
+            INTERRUPT_SIGNAL.store(2, std::sync::atomic::Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+    // SAFETY: registers a handler that only stores to an atomic.
+    unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) != 0 }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_interrupt_handlers() -> bool {
+    false
 }
 
 // Connected / failed / disconnected lines from background discovery.
@@ -663,21 +1641,94 @@ fn report_mcp_notices() {
     }
 }
 
+// Setup was left before a model answered: nothing was saved, so the next
+// launch starts setup again.
+fn setup_not_finished() -> ! {
+    let why = if std::io::stdin().is_terminal() {
+        ""
+    } else {
+        " (there is no terminal to answer its questions in)"
+    };
+    eprintln!(
+        "{}",
+        tui::yellow(&format!(
+            "setup not finished{why} — nothing was saved. `buildwithnexus` (or `buildwithnexus init`) starts it again."
+        ))
+    );
+    std::process::exit(1);
+}
+
+// `buildwithnexus init`: setup in a terminal; `init --agents-md` writes
+// AGENTS.md from the repository as an ordinary headless run.
+fn init_cli(opts: &CliOptions, args: &[String]) {
+    if args.iter().any(|a| a == "--agents-md") {
+        return headless(opts, |p, perm, cwd| {
+            let task = agents_md_task(&cwd);
+            agent::run_build(p, perm, "engineer", &task, &cwd, Vec::new())
+        });
+    }
+    if onboarding::run().is_none() {
+        setup_not_finished();
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !has_instruction_file(&cwd) {
+        tui::line(&tui::dim(
+            "  No AGENTS.md here: /init in a session, or `buildwithnexus init --agents-md`, writes one from this repository.",
+        ));
+    }
+}
+
+// `buildwithnexus login`: a new key for the configured provider (or
+// --provider), checked before it is saved.
+fn login_cli(opts: &CliOptions) {
+    let settings = config::load_settings().filter(|s| !s.provider.is_empty());
+    let Some(mut settings) =
+        settings.or_else(|| opts.provider.as_ref().map(|_| Settings::default()))
+    else {
+        eprintln!("{}", tui::red(&unknown_provider_msg("")));
+        std::process::exit(1);
+    };
+    if let Some(p) = opts.provider.as_ref().filter(|p| **p != settings.provider) {
+        settings.provider = p.clone();
+        settings.model = String::new();
+        settings.base_url = None;
+    }
+    if let Some(m) = &opts.model {
+        settings.model = m.clone();
+    }
+    if let Some(u) = &opts.base_url {
+        settings.base_url = Some(u.clone());
+    }
+    if onboarding::login(&settings).is_none() {
+        std::process::exit(1);
+    }
+}
+
 fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
-    // Always scaffold on interactive launch so existing users also get the
-    // directory skeleton and starter Agents.md if they're missing.
-    config::scaffold_home();
+    // MCP login hints say /mcp login here, not `bwn mcp login`.
+    mcp_auth::set_in_session();
+    provider::set_in_session();
     let load = config::load_settings_diag();
     warn_settings_issues(&load);
-    if load.settings.is_none() {
-        if load.any_present {
-            eprintln!("{}", tui::red(&broken_settings_msg()));
-            std::process::exit(1);
-        }
-        if onboarding::run().is_none() {
-            return;
-        }
+    // Settings that name no provider (a team repo's hooks-only file, or
+    // nothing at all) mean setup has not run yet; only files that exist and
+    // cannot be read stop startup, so they are never set up over.
+    if load.settings.is_none() && load.any_present {
+        eprintln!("{}", tui::red(&broken_settings_msg()));
+        std::process::exit(1);
     }
+    if !load
+        .settings
+        .as_ref()
+        .is_some_and(|s| !s.provider.is_empty())
+        && onboarding::run().is_none()
+    {
+        setup_not_finished();
+    }
+    // Every launch past setup scaffolds, so existing users also get the
+    // directory skeleton and starter Agents.md if they're missing; setup
+    // left early writes nothing.
+    config::scaffold_home();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let raw = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Before the provider is built: base_url, permission and sandbox may
@@ -718,13 +1769,23 @@ fn repl(
 ) -> Result<(), String> {
     let settings = config::load_settings().unwrap_or_default();
     tui::configure_ui(&settings.images, &settings.notify);
+    let idle = settings.idle_notify_secs.unwrap_or(60);
+    if idle > 0 {
+        let dir = cwd.to_path_buf();
+        tui::on_idle(std::time::Duration::from_secs(idle), move || {
+            hooks::notification("idle_prompt", "waiting for your input", &dir)
+        });
+    }
     tui::set_permission_mode(permission_label(&perm));
     tui::set_model_label(&provider.model);
 
     // Show the full-screen header banner.
     let mode_name = "BRAINSTORM"; // default starting mode
     tui::show_banner(
-        &settings.provider,
+        &onboarding::provider_label(
+            &active_preset().unwrap_or(settings.provider.clone()),
+            &provider.base_url,
+        ),
         &provider.model,
         mode_name,
         &cwd.display().to_string(),
@@ -733,20 +1794,39 @@ fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    if let Some(problem) = provider::startup_problem(&provider) {
+        report::notice(&format!("  ⚠ {problem}"));
+    }
     // Skill names and paths come from files in the checkout.
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
         tui::line(&tui::dim(&format!("  {note}")));
     }
-    if let Some(n) = agent::ignored_approvals_notice(cwd) {
+    if let Some(n) = config::untrusted_extensions_notice(cwd) {
+        report::notice(&format!("  {}", tui::sanitize_terminal(&n)));
+    }
+    for n in workdirs::notices(cwd) {
         report::notice(&format!("  {n}"));
+    }
+    review_repo_instructions(cwd);
+    if let Some(n) = config::custom_key_move_notice() {
+        report::notice(&format!("  {n}"));
+    }
+    if let Some(n) = agent::ignored_approvals_notice_once(cwd) {
+        report::notice(&format!("  {n}"));
+    }
+    for issue in hooks::take_startup_issues() {
+        tui::line(&tui::yellow(&format!("  [hook] ⚠ {issue}")));
     }
     let restored = workflow::restore();
     workflow::set_max_concurrent(settings.max_concurrent_workflows);
     // Background scheduler: due workflows start while the user is idle at the
     // prompt; their completion notices are shown at the next prompt.
     workflow::start_scheduler();
-    if restored > 0 {
+    // Once per set of restored workflows, not at every launch they wait.
+    if restored > 0
+        && !config::notice_seen("restored-workflows", &workflow::pending_tasks().join("\n"))
+    {
         tui::line(&tui::green(&format!(
             "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
             if restored == 1 { "" } else { "s" }
@@ -757,12 +1837,18 @@ fn repl(
     }
     // Off the critical path: five `which` probes cost real startup latency,
     // and with interactive=false this only prints when something is missing.
-    std::thread::spawn(|| check_and_offer_install_dependencies(false));
+    std::thread::spawn(check_and_offer_install_dependencies);
     update::spawn_check(&settings.auto_update);
 
-    let mut transcript: Vec<provider::Msg> = Vec::new();
-    // The REPL owns the id SessionStart already announced.
-    let mut sid = session::current_or_new();
+    // The REPL owns the id SessionStart already announced: a fresh one, or
+    // the session `bwn continue` / `bwn resume <id>` asked to open.
+    let (mut transcript, mut sid) = match session::take_resume_on_start() {
+        Some(s) => {
+            show_resumed(&s, cwd);
+            (s.msgs, s.id)
+        }
+        None => (Vec::new(), session::current_or_new()),
+    };
     session::set_current(&sid);
     trace::set_session(&sid);
     let mut mode = Mode::Brainstorm;
@@ -770,16 +1856,28 @@ fn repl(
     // /btw: extra context injected into the next task without interrupting.
     let mut btw_ctx: Option<String> = None;
     let mut pending_prompt = initial_prompt;
+    // The workflow count the queue line last showed.
+    let mut shown_active = 0usize;
+    // Where each prompt of this run started, for /rewind.
+    let mut rewind_points: Vec<RewindPoint> = Vec::new();
 
     loop {
         // Tick background workflows and surface any completion notifications
         // (both those queued by the scheduler thread and this tick's own).
         // Color by outcome — a "✗ workflow failed" line must not render green.
+        // Background runs take this session's permission and model.
+        workflow::update_live(
+            agent::permission_name(perm),
+            &provider.model,
+            &provider.base_url,
+        );
         let mut notes = workflow::take_notices();
         notes.extend(workflow::tick());
         for note in notes {
             if note.contains('✗') {
                 tui::line(&tui::red(&note));
+            } else if note.contains('⚠') {
+                tui::line(&tui::yellow(&note));
             } else {
                 tui::line(&tui::green(&note));
             }
@@ -799,15 +1897,17 @@ fn repl(
             }
         }
 
-        // Show workflow activity badge if any are pending/running.
+        // Workflow activity badge, when the number pending/running changes
+        // (not again after every command).
         let active = workflow::active_count();
-        if active > 0 {
+        if active > 0 && active != shown_active {
             tui::line(&tui::dim(&format!(
                 "  ⟳ {} workflow{} in queue — /workflows to manage",
                 active,
                 if active == 1 { "" } else { "s" }
             )));
         }
+        shown_active = active;
 
         let mut task = if let Some(prompted) = pending_prompt.take() {
             tui::line("");
@@ -826,11 +1926,22 @@ fn repl(
                 tui::accent("›")
             );
             match tui::ask_task(&prompt) {
-                None => return Ok(()),
+                None if confirm_quit() => return Ok(()),
+                None => continue,
                 Some(tui::InputEvent::CycleMode) => {
                     mode = mode.next();
                     last_suggested_mode = None;
                     tui::show_mode_change(mode_label(&mode));
+                    continue;
+                }
+                Some(tui::InputEvent::Rewind) => {
+                    handle_rewind(
+                        &mut transcript,
+                        &mut rewind_points,
+                        &sid,
+                        cwd,
+                        &provider.model,
+                    );
                     continue;
                 }
                 Some(tui::InputEvent::Text(t)) => t,
@@ -962,16 +2073,14 @@ fn repl(
             if arg.is_empty() {
                 handle_permissions(&mut perm, cwd);
             } else {
-                match arg {
-                    "ask" | "1" => apply_permission(&mut perm, "ask"),
-                    "auto" | "2" => apply_permission(&mut perm, "auto"),
-                    "readonly" | "3" => apply_permission(&mut perm, "readonly"),
-                    "reset" => handle_permissions_reset(cwd),
-                    other => tui::line(&tui::red(&format!(
-                        "  unknown permission '{other}' — try: ask, auto, readonly, reset"
-                    ))),
-                }
+                handle_permissions_arg(&mut perm, cwd, arg);
             }
+            continue;
+        }
+
+        // /add-dir <path>: another folder to work in for this session.
+        if let Some(arg) = t.strip_prefix("/add-dir ") {
+            handle_add_dir(arg, cwd);
             continue;
         }
 
@@ -996,9 +2105,19 @@ fn repl(
         if let Some(model_arg) = t.strip_prefix("/model ") {
             let new_model = model_arg.trim();
             if let Some((url, m)) = parse_model_endpoint(new_model) {
-                // `/model http://host:port/v1 <model>`: a custom endpoint,
+                // `/model http://host:port/v1 <model>`: that endpoint,
                 // persisted the same way the picker's custom entry does it.
-                swap_model(&mut provider, "custom", &m, Some(url));
+                swap_model(&mut provider, endpoint_preset(&url), &m, Some(url));
+            } else if let Some(word) = unknown_provider_word(new_model) {
+                tui::line(&tui::red(&format!(
+                    "  unknown provider '{}' — try: {}, or /model <name> for this endpoint",
+                    tui::sanitize_terminal(word),
+                    config::PRESETS
+                        .iter()
+                        .map(|p| p.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             } else if !new_model.is_empty() {
                 let settings = config::load_settings().unwrap_or_default();
                 let (prov, m) = parse_model_pick(new_model, &settings.provider);
@@ -1010,8 +2129,7 @@ fn repl(
         }
 
         // /schedule <delay> <task>  e.g. `/schedule 5m git pull && cargo test`
-        if let Some(rest) = t.strip_prefix("/schedule ") {
-            let rest = rest.trim();
+        if let Some(rest) = slash_args(t, "/schedule") {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let delay_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
@@ -1038,8 +2156,7 @@ fn repl(
         }
 
         // /loop <interval> <task>  e.g. `/loop 10m cargo test`
-        if let Some(rest) = t.strip_prefix("/loop ") {
-            let rest = rest.trim();
+        if let Some(rest) = slash_args(t, "/loop") {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let interval_str = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
@@ -1065,35 +2182,67 @@ fn repl(
             continue;
         }
 
-        // /btw <context> — inject context into the next agent turn without stopping current work.
+        // /btw <context> — added to the next message sent, without a turn
+        // of its own. /ask is the side question that answers now.
         if let Some(ctx) = t.strip_prefix("/btw ") {
             let ctx = ctx.trim();
             if ctx.is_empty() {
                 tui::line(&tui::red(
-                    "  usage: /btw <context>  e.g. /btw also update the tests",
+                    "  usage: /btw <note>  — adds the note to your next message (e.g. /btw also update the tests); /ask <question> asks aside now",
                 ));
             } else {
                 btw_ctx = Some(ctx.to_string());
                 tui::line(&tui::dim(&format!(
-                    "  ⚑ context queued for next turn: {ctx}"
+                    "  ⚑ noted for your next message: {} — /ask <question> asks aside now",
+                    tui::sanitize_terminal(ctx)
                 )));
             }
             continue;
         }
 
+        // Bare /plan, /build and /brainstorm switch the mode, as the command
+        // list says; with a task they run it in that mode (below).
+        if let Some(next) = bare_mode_command(t) {
+            mode = next;
+            last_suggested_mode = None;
+            tui::show_mode_change(mode_label(&mode));
+            continue;
+        }
+        if let Some(arg) = slash_args(t, "/theme") {
+            handle_theme(arg);
+            continue;
+        }
+        // `/plan <task>` and `/brainstorm <task>` are turns of the one
+        // conversation, like `/build <task>`: kept, saved and counted.
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            if let Err(e) = agent::run_plan(&provider, perm, &task, cwd, false, images) {
-                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            match agent::plan_turn(
+                &provider,
+                perm,
+                &task,
+                cwd,
+                false,
+                images,
+                &mut transcript,
+                &sid,
+            ) {
+                // "Execute Plan" switches to BUILD, as its label says; the
+                // other answers leave the mode alone.
+                Ok(agent::PlanEnd::Executed) if !matches!(mode, Mode::Build) => {
+                    mode = Mode::Build;
+                    tui::show_mode_change(mode_label(&mode));
+                }
+                Ok(_) => {}
+                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
             }
             tui::bell();
             continue;
         }
         if let Some(task) = t.strip_prefix("/build ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
             if let Err(e) = agent::run_build_session_with_images(
                 &provider,
@@ -1112,19 +2261,30 @@ fn repl(
         }
         if let Some(task) = t.strip_prefix("/brainstorm ") {
             tui::line("");
-            let vision = media::model_supports_vision(&provider);
+            let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, &task, images).map(|_| ()) {
-                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            match agent::brainstorm_turn(&provider, cwd, &task, images, &mut transcript, &sid) {
+                // The person answered y to the model's suggestion to switch.
+                Ok(Some(hint)) => {
+                    mode = match hint {
+                        agent::ModeHint::Build => Mode::Build,
+                        agent::ModeHint::Plan => Mode::Plan,
+                    };
+                    tui::show_mode_change(mode_label(&mode));
+                }
+                Ok(None) => {}
+                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
             }
             tui::bell();
             continue;
         }
 
         match t {
-            "/exit" | "/quit" | "exit" | "quit" => return Ok(()),
+            "/exit" | "/quit" | "exit" | "quit" if confirm_quit() => return Ok(()),
+            "/exit" | "/quit" | "exit" | "quit" => continue,
             "/clear" => {
                 transcript.clear();
+                rewind_points.clear();
                 usage::forget_last();
                 sid = session::new_id();
                 session::set_current(&sid);
@@ -1135,6 +2295,7 @@ fn repl(
             }
             "/new" => {
                 transcript.clear();
+                rewind_points.clear();
                 usage::forget_last();
                 sid = session::new_id();
                 session::set_current(&sid);
@@ -1143,7 +2304,8 @@ fn repl(
                 continue;
             }
             "/resume" => {
-                handle_resume(&mut transcript, &mut sid);
+                rewind_points.clear();
+                handle_resume(&mut transcript, &mut sid, cwd);
                 usage::forget_last();
                 session::set_current(&sid);
                 trace::set_session(&sid);
@@ -1158,10 +2320,11 @@ fn repl(
                 continue;
             }
             "/init" => {
-                tui::leave_alt();
-                onboarding::run();
-                offer_starter_agents_md(cwd);
-                tui::enter_alt(raw);
+                handle_init(&mut provider, perm, cwd, raw, &mut transcript, &sid);
+                continue;
+            }
+            "/login" => {
+                handle_login(&mut provider);
                 continue;
             }
             "/model" => {
@@ -1172,45 +2335,18 @@ fn repl(
                 handle_compact(&provider, &mut transcript);
                 continue;
             }
-            "/review" => {
-                tui::line(&tui::accent("  /review — AI code review"));
-                tui::line(&tui::dim("  Reviews staged changes (or the last diff). Press Enter to review, or type a focus area."));
-                let focus = tui::ask("  focus (optional): ").unwrap_or_default();
-                let task = if focus.trim().is_empty() {
-                    "Review the current git diff (git diff HEAD and git diff --staged). Summarize what changed, identify bugs, style issues, and potential improvements. Be concise.".to_string()
-                } else {
-                    format!("Review the current git diff focusing on: {}. Run `git diff HEAD` and `git diff --staged` to see the changes.", focus.trim())
-                };
-                tui::line("");
-                if let Err(e) = agent::run_build_session(
+            _ if t == "/review" || t.starts_with("/review ") => {
+                handle_review(
                     &provider,
-                    perm,
-                    "researcher",
-                    &task,
+                    t["/review".len()..].trim(),
                     cwd,
                     &mut transcript,
                     &sid,
-                ) {
-                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-                }
-                tui::bell();
+                );
                 continue;
             }
             "/commit" => {
-                let task = "Generate a conventional git commit message for the staged changes. Run `git diff --staged` to see what's staged. Then run `git commit -m \"<message>\"` with the generated message. If nothing is staged, remind the user to `git add` files first.";
-                tui::line("");
-                if let Err(e) = agent::run_build_session(
-                    &provider,
-                    perm,
-                    "engineer",
-                    task,
-                    cwd,
-                    &mut transcript,
-                    &sid,
-                ) {
-                    tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-                }
-                tui::bell();
+                handle_commit(&provider, cwd);
                 continue;
             }
             "/pr" => {
@@ -1239,15 +2375,15 @@ fn repl(
                 continue;
             }
             "/doctor" | "/debug" => {
-                handle_doctor_tui();
+                handle_doctor_tui(&provider);
                 continue;
             }
             "/diff" => {
-                handle_diff(cwd);
+                handle_diff(cwd, "");
                 continue;
             }
             "/context" => {
-                handle_context(&transcript, provider.context_tokens);
+                handle_context(&transcript, &provider);
                 continue;
             }
             "/cost" => {
@@ -1266,8 +2402,18 @@ fn repl(
                 handle_checkpoints(cwd);
                 continue;
             }
-            "/undo" | "/rewind" => {
+            "/undo" => {
                 handle_undo(cwd, "");
+                continue;
+            }
+            "/rewind" => {
+                handle_rewind(
+                    &mut transcript,
+                    &mut rewind_points,
+                    &sid,
+                    cwd,
+                    &provider.model,
+                );
                 continue;
             }
             "/grill-me" | "/align" | "/interview" => {
@@ -1275,7 +2421,7 @@ fn repl(
                 continue;
             }
             "/teamwork" | "/teamwork-preview" | "/swarm" => {
-                handle_teamwork();
+                handle_teamwork(&provider);
                 continue;
             }
             "/mode" => {
@@ -1324,6 +2470,10 @@ fn repl(
             }
             "/sandbox" => {
                 handle_sandbox("status");
+                continue;
+            }
+            "/add-dir" => {
+                handle_add_dir("", cwd);
                 continue;
             }
             "/mouse" => {
@@ -1405,6 +2555,35 @@ fn repl(
             }
         }
 
+        if let Some(arg) = t.strip_prefix("/diff ") {
+            handle_diff(cwd, arg);
+            continue;
+        }
+
+        if t == "/export" || t.starts_with("/export ") {
+            handle_export(
+                &transcript,
+                &sid,
+                cwd,
+                &provider.model,
+                &t["/export".len()..],
+            );
+            continue;
+        }
+        if t == "/copy" {
+            handle_copy(&transcript);
+            continue;
+        }
+        if t == "/ask" || t.starts_with("/ask ") {
+            handle_ask(&provider, cwd, &transcript, &t["/ask".len()..]);
+            continue;
+        }
+
+        if t == "/rename" || t.starts_with("/rename ") {
+            handle_rename(&sid, &t["/rename".len()..]);
+            continue;
+        }
+
         if let Some(arg) = t
             .strip_prefix("/undo ")
             .or_else(|| t.strip_prefix("/rewind "))
@@ -1427,45 +2606,21 @@ fn repl(
             let cmd_name = words.next().unwrap_or("");
             let cmd_args = words.next().unwrap_or("").trim();
             if let Some(custom) = find_custom_command(cmd_name) {
-                if let Some(script) = custom.script {
-                    // Shell-quote the script path to guard against spaces (UX-007).
-                    let escaped = script.to_string_lossy().replace('\'', "'\"'\"'");
-                    let shell_cmd = if cmd_args.is_empty() {
-                        format!("'{escaped}'")
-                    } else {
-                        format!("'{escaped}' {cmd_args}")
-                    };
-                    let tool_input = serde_json::json!({"command": shell_cmd});
-                    // UX-002: script-based custom commands must pass through the
-                    // permission gate and PreToolUse hooks just like any run_command.
-                    if let hooks::PreDecision::Deny(r) =
-                        hooks::pre_tool_use("run_command", &tool_input, cwd)
-                    {
-                        tui::line(&tui::red(&format!(
-                            "  blocked by hook: {}",
-                            tui::sanitize_terminal(&r)
-                        )));
-                        tui::bell();
-                        continue;
-                    }
-                    if let Some(reason) = agent::gate(perm, "run_command", &tool_input, cwd) {
-                        tui::line(&tui::red(&format!("  {reason}")));
-                        tui::bell();
-                        continue;
-                    }
-                    let out = tools::run("run_command", &tool_input, cwd);
-                    for l in tui::sanitize_terminal(&out.content).lines() {
-                        tui::line(&format!("  {l}"));
+                if let Some(script) = &custom.script {
+                    match run_script_command(script, cmd_args, perm, cwd) {
+                        Ok(out) => {
+                            for l in tui::sanitize_terminal(&out).lines() {
+                                tui::line(&format!("  {l}"));
+                            }
+                        }
+                        Err(e) => {
+                            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))))
+                        }
                     }
                 } else {
-                    // Inject the skill content as context and run in BUILD mode.
-                    let user_input = if cmd_args.is_empty() {
-                        t.to_string()
-                    } else {
-                        format!("{t} {cmd_args}")
-                    };
-                    let task_with_context =
-                        format!("{user_input}\n\n[Skill: {cmd_name}]\n{}", custom.content);
+                    // A command's body (or a skill as context) with the
+                    // arguments filled in once, run in BUILD mode.
+                    let task_with_context = config::command_prompt(&custom, cmd_args);
                     tui::line("");
                     if let Err(e) = agent::run_build_session(
                         &provider,
@@ -1482,14 +2637,27 @@ fn repl(
                 tui::bell();
                 continue;
             }
-            // UX-001: unknown slash command — show error instead of falling through to AI.
-            if !cmd_name.is_empty() {
-                tui::line(&tui::red(&format!(
-                    "  unknown command /{cmd_name} — /help for all commands"
-                )));
-                continue;
-            } else {
-                tui::line(&tui::red("  type /help for available commands"));
+            // UX-001: unknown slash command — show error instead of falling
+            // through to AI. A message that starts with an absolute path (a
+            // dropped screenshot) is a message, and goes on to the agent.
+            if !starts_with_path(t) {
+                if let Some(usage) = command_usage(cmd_name) {
+                    // A listed command that needs an argument, typed bare.
+                    tui::line(&tui::yellow(&format!("  usage: {usage}")));
+                } else if let Some(msg) = unloaded_repo_command(t, cwd) {
+                    tui::line(&tui::yellow(&format!("  {msg}")));
+                } else if config::is_untrusted_repo_command(cwd, cmd_name) {
+                    tui::line(&tui::yellow(&format!(
+                        "  /{} comes from this repo and is off until you trust this folder: start bwn here again and answer y",
+                        tui::sanitize_terminal(cmd_name)
+                    )));
+                } else if !cmd_name.is_empty() {
+                    tui::line(&tui::red(&format!(
+                        "  unknown command /{cmd_name} — /help for all commands"
+                    )));
+                } else {
+                    tui::line(&tui::red("  type /help for available commands"));
+                }
                 continue;
             }
         }
@@ -1502,30 +2670,24 @@ fn repl(
             continue;
         }
         if let Some(new_perm) = detect_permission_switch(t) {
-            apply_permission(&mut perm, new_perm);
+            apply_permission(&mut perm, new_perm, PermScope::Session);
             continue;
         }
 
-        // Mode routing: auto-switch out of BRAINSTORM when the task clearly
-        // demands real work (chat mode can't fulfill "build X"); elsewhere only
-        // hint, and stay quiet for greetings and ordinary questions.
+        // Mode routing: the mode changes only when the person changes it
+        // (Shift+Tab, /mode, "switch to build mode"). A task typed in another
+        // mode gets a one-time hint and is answered where it was typed; a
+        // long paste of notes must never move the session on its own.
         if should_answer_conversationally(t, &mode) {
             last_suggested_mode = None;
-        } else if let Some(new_mode) = auto_switch_mode(t, &mode) {
-            mode = new_mode;
-            last_suggested_mode = None;
-            tui::line(&tui::dim(&format!(
-                "  auto-switched to {} for this task — /mode to switch back",
-                mode_label(&mode)
-            )));
-            tui::show_mode_change(mode_label(&mode));
         } else {
             suggest_mode_if_mismatch(t, &mode, &mut last_suggested_mode);
         }
 
         // Extract @path tokens. Images become multimodal attachments; text files
         // are appended into the prompt with optional @file:start-end ranges.
-        let vision = media::model_supports_vision(&provider);
+        let typed = t.to_string();
+        let vision = Vision::of(&provider);
         let (clean_task, mut image_data) = extract_attachments(t, cwd, vision);
 
         // Merge any /btw context queued since the last turn.
@@ -1550,21 +2712,48 @@ fn repl(
         }
 
         tui::line("");
+        rewind_points.push(RewindPoint {
+            index: transcript.len(),
+            started_ms: checkpoint::now_ms(),
+            prompt: t.to_string(),
+            typed,
+        });
+        // Every mode reads and extends the one conversation, saved as the
+        // session after each turn.
         let r = if conversational {
-            agent::run_chat_turn(&provider, perm, cwd, t, std::mem::take(&mut image_data))
+            let within = match mode {
+                Mode::Build => agent::ChatIn::Build,
+                Mode::Plan => agent::ChatIn::Plan,
+                Mode::Brainstorm => agent::ChatIn::Brainstorm,
+            };
+            agent::run_chat_turn(
+                &provider,
+                perm,
+                within,
+                cwd,
+                t,
+                std::mem::take(&mut image_data),
+                &mut transcript,
+                &sid,
+            )
         } else {
             match &mode {
-                Mode::Plan => match agent::run_plan(
+                Mode::Plan => match agent::plan_turn(
                     &provider,
                     perm,
                     t,
                     cwd,
                     false,
                     std::mem::take(&mut image_data),
+                    &mut transcript,
+                    &sid,
                 ) {
-                    Ok(()) => {
-                        mode = Mode::Build;
-                        tui::show_mode_change("BUILD");
+                    Ok(end) => {
+                        let next = mode_after_plan(end);
+                        if !matches!(next, Mode::Plan) {
+                            mode = next;
+                            tui::show_mode_change(mode_label(&mode));
+                        }
                         Ok(())
                     }
                     Err(e) => Err(e),
@@ -1579,12 +2768,14 @@ fn repl(
                     &sid,
                     std::mem::take(&mut image_data),
                 ),
-                Mode::Brainstorm => match agent::run_brainstorm(
+                // The person answered y to the model's suggestion to switch.
+                Mode::Brainstorm => match agent::brainstorm_turn(
                     &provider,
-                    perm,
                     cwd,
                     t,
                     std::mem::take(&mut image_data),
+                    &mut transcript,
+                    &sid,
                 ) {
                     Err(e) => Err(e),
                     Ok(None) => Ok(()),
@@ -1598,22 +2789,27 @@ fn repl(
                         tui::show_mode_change("PLAN");
                         Ok(())
                     }
-                    Ok(Some(agent::ModeHint::CycleMode)) => {
-                        mode = mode.next();
-                        tui::show_mode_change(mode_label(&mode));
-                        Ok(())
-                    }
-                    Ok(Some(agent::ModeHint::Handoff(line))) => {
-                        pending_prompt = Some(line);
-                        Ok(())
-                    }
                 },
             }
         };
         if let Err(e) = r {
             tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
         }
+        follow_reported_window(&mut provider, &transcript);
         tui::bell();
+    }
+}
+
+// An Ollama started after bwn reports its window on the first request that
+// reaches it, and the requests use it from then on; the footer total and
+// /context follow instead of keeping the startup guess.
+fn follow_reported_window(provider: &mut Provider, transcript: &[provider::Msg]) {
+    if let Some(Some(n)) = provider.ollama_ctx.get() {
+        let n = *n as usize;
+        if n != provider.context_tokens {
+            provider.context_tokens = n;
+            tui::context_meter(context_in_use(transcript, n), n);
+        }
     }
 }
 
@@ -1625,36 +2821,42 @@ fn mode_label(mode: &Mode) -> &'static str {
     }
 }
 
-// Auto-switch when the task phrasing clearly demands a different mode.
-// Conservative matrix: only ever escalates out of BRAINSTORM — a chat mode
-// can't fulfill a build/plan request. A deliberate PLAN gate is never bypassed
-// silently; build-shaped tasks there still get the tip below.
-fn auto_switch_mode(task: &str, current: &Mode) -> Option<Mode> {
-    let target = classify(task);
-    match (&target, current) {
-        // Never auto-switch directly from BRAINSTORM to BUILD — always step through PLAN first.
-        (Mode::Build, Mode::Brainstorm) => Some(Mode::Plan),
-        (Mode::Plan, Mode::Brainstorm) => Some(Mode::Plan),
+// The mode after a PLAN turn: BUILD only when the person chose to execute
+// the plan; Cancel, Esc and a plain answer stay in PLAN.
+fn mode_after_plan(end: agent::PlanEnd) -> Mode {
+    match end {
+        agent::PlanEnd::Executed => Mode::Build,
+        agent::PlanEnd::Cancelled | agent::PlanEnd::Answered => Mode::Plan,
+    }
+}
+
+// A hint when the task phrasing suggests another mode. Only a hint: the
+// mode itself changes only when the person changes it.
+fn mode_hint(task: &str, current: &Mode) -> Option<(&'static str, String)> {
+    match (classify(task), current) {
+        (Mode::Build | Mode::Plan, Mode::Brainstorm) => Some((
+            "PLAN",
+            "  tip: this looks like a task — Shift+Tab for PLAN".to_string(),
+        )),
+        (Mode::Build, Mode::Plan) => Some((
+            "BUILD",
+            "  tip: this looks like a BUILD task — Shift+Tab or /mode to switch".to_string(),
+        )),
         _ => None,
     }
 }
 
-// Suggest switching modes when the task phrasing strongly implies a different mode.
-// Suppresses the tip if it was already shown for this mode combo in the current session.
+// Shows the hint once per mode combination until the mode or the kind of
+// task changes.
 fn suggest_mode_if_mismatch(task: &str, current: &Mode, last_suggested: &mut Option<&'static str>) {
-    let suggested = classify(task);
-    let mismatch = matches!((&suggested, current), (Mode::Build, Mode::Plan));
-    if mismatch {
-        let sug_label = mode_label(&suggested);
-        if *last_suggested != Some(sug_label) {
-            tui::line(&tui::dim(&format!(
-                "  tip: this looks like a {} task — Shift+Tab or /mode to switch",
-                sug_label
-            )));
-            *last_suggested = Some(sug_label);
+    match mode_hint(task, current) {
+        Some((target, hint)) => {
+            if *last_suggested != Some(target) {
+                tui::line(&tui::dim(&hint));
+                *last_suggested = Some(target);
+            }
         }
-    } else {
-        *last_suggested = None;
+        None => *last_suggested = None,
     }
 }
 
@@ -1738,55 +2940,332 @@ fn looks_like_action_request(task: &str) -> bool {
     })
 }
 
-fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String) {
-    let mut sessions = session::list();
-    if sessions.is_empty() {
+// Where a session ran, as a list shows it: "this folder", or the last two
+// parts of its path.
+fn session_folder(s: &session::Session, cwd: &std::path::Path) -> String {
+    if s.is_in(cwd) {
+        return "this folder".to_string();
+    }
+    let parts: Vec<&str> = s.cwd.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    match parts.len() {
+        0 => s.cwd.clone(),
+        1 => parts[0].to_string(),
+        n => format!("…/{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+// One picker row for a saved session: its title, then age, message count
+// and folder.
+fn session_item(s: &session::Session, cwd: &std::path::Path) -> tui::SelectItem {
+    // Titles come from task text and cwd from the checkout's folder name.
+    let label: String = tui::sanitize_terminal(s.label()).chars().take(56).collect();
+    tui::SelectItem {
+        label,
+        detail: format!(
+            "{} · {} msgs · {}",
+            session::ago(s.updated_ms),
+            s.msgs.len(),
+            tui::sanitize_terminal(&session_folder(s, cwd))
+        ),
+    }
+}
+
+// /resume: the shared picker over sessions from this folder first; arrows
+// move, text filters, Enter opens the highlighted session, Esc closes.
+fn handle_resume(transcript: &mut Vec<provider::Msg>, sid: &mut String, cwd: &std::path::Path) {
+    let all = session::list_here_first(cwd);
+    if all.is_empty() {
         tui::line(&tui::dim("  no saved sessions yet"));
         return;
     }
-    tui::line(&tui::dim("  recent sessions:"));
-    for (i, s) in sessions.iter().take(15).enumerate() {
-        tui::line(&format!(
-            "  {}  {}",
-            tui::bold(&(i + 1).to_string()),
-            tui::sanitize_terminal(&s.title)
-        ));
+    let items: Vec<tui::SelectItem> = all.iter().map(|s| session_item(s, cwd)).collect();
+    let Some(i) = tui::select_item("Resume a session (this folder first)", &items) else {
+        return;
+    };
+    let Some(picked) = session::load(&all[i].id) else {
+        tui::line(&tui::yellow("  that session file can no longer be read"));
+        return;
+    };
+    show_resumed(&picked, cwd);
+    *transcript = picked.msgs;
+    *sid = picked.id;
+}
+
+// The confirmation and history replay for a session opened by /resume,
+// `bwn continue` or `bwn resume <id>`.
+fn show_resumed(s: &session::Session, cwd: &std::path::Path) {
+    tui::line(&tui::green(&format!(
+        "  ✓ resumed: {}",
+        tui::sanitize_terminal(s.label())
+    )));
+    if !s.is_in(cwd) {
+        tui::line(&tui::yellow(&format!(
+            "  this session ran in {} — its files are not in this folder",
+            tui::sanitize_terminal(&s.cwd)
+        )));
     }
-    let pick = tui::ask(&tui::dim("  resume # (Enter to cancel): "))
-        .as_deref()
-        .map(str::trim)
-        .and_then(|x| x.parse::<usize>().ok());
-    if let Some(n) = pick {
-        if n >= 1 && n <= sessions.len().min(15) {
-            let s = sessions.swap_remove(n - 1);
-            let title = s.title.clone();
-            *transcript = s.msgs;
-            *sid = s.id;
-            tui::line(&tui::green(&format!(
-                "  ✓ resumed: {}",
-                tui::sanitize_terminal(&title)
-            )));
-            tui::line(&tui::dim("  ── restored history ──"));
-            for msg in transcript.iter() {
-                match msg {
-                    // Saved sessions are files on disk: replay them through
-                    // the same sanitizer as live model and tool output.
-                    provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
-                        tui::line(&format!(
-                            "{} {}",
-                            tui::accent("›"),
-                            tui::sanitize_terminal(text)
-                        ));
-                    }
-                    provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
-                        tui::line(&tui::render_md(text));
-                    }
-                    _ => {}
-                }
+    tui::line(&tui::dim("  ── restored history ──"));
+    for msg in &s.msgs {
+        match msg {
+            // Saved sessions are files on disk: replay them through
+            // the same sanitizer as live model and tool output.
+            provider::Msg::User(text) | provider::Msg::UserImages { text, .. } => {
+                tui::line(&format!(
+                    "{} {}",
+                    tui::accent("›"),
+                    tui::sanitize_terminal(text)
+                ));
             }
-            tui::line(&tui::dim("  ────────────────────"));
+            provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => {
+                tui::line(&tui::render_md(text));
+            }
+            _ => {}
         }
     }
+    tui::line(&tui::dim("  ────────────────────"));
+}
+
+// /export [path]: the conversation as Markdown. The session is saved first
+// so the file matches what /resume would open.
+fn handle_export(
+    transcript: &[provider::Msg],
+    sid: &str,
+    cwd: &std::path::Path,
+    model: &str,
+    arg: &str,
+) {
+    if transcript.is_empty() {
+        tui::line(&tui::dim("  nothing to export yet"));
+        return;
+    }
+    session::save(sid, cwd, model, transcript);
+    let Some(s) = session::load(sid) else {
+        tui::line(&tui::red("  could not read the saved session back"));
+        return;
+    };
+    let arg = arg.trim();
+    let path = (!arg.is_empty()).then(|| cwd.join(arg));
+    match session::export(&s, path.as_deref()) {
+        Ok(p) => tui::line(&tui::green(&format!(
+            "  ✓ exported to {}",
+            tui::sanitize_terminal(&p.display().to_string())
+        ))),
+        Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
+    }
+}
+
+// The last answer with any text, for /copy.
+fn last_answer(transcript: &[provider::Msg]) -> Option<&str> {
+    transcript.iter().rev().find_map(|m| match m {
+        provider::Msg::Assistant { text, .. } if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    })
+}
+
+// The OSC 52 sequence that puts `text` on the terminal's clipboard.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", media::b64_encode(text.as_bytes()))
+}
+
+// /copy: the last answer to the clipboard through the terminal (OSC 52),
+// which also works over SSH; terminals that do not support it ignore it.
+fn handle_copy(transcript: &[provider::Msg]) {
+    let Some(answer) = last_answer(transcript) else {
+        tui::line(&tui::dim("  no answer to copy yet"));
+        return;
+    };
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(osc52(answer).as_bytes());
+    let _ = out.flush();
+    let n = answer.chars().count();
+    tui::flash_footer(&format!("copied the last answer ({n} chars)"));
+    tui::line(&tui::dim(&format!(
+        "  ⧉ copied the last answer ({n} chars) — if nothing pasted, your terminal does not allow clipboard writes (OSC 52)"
+    )));
+}
+
+// /ask <question>: a side question answered with the conversation as
+// context; it is not added to the conversation or the session.
+fn handle_ask(provider: &Provider, cwd: &std::path::Path, transcript: &[provider::Msg], q: &str) {
+    let q = q.trim();
+    if q.is_empty() {
+        tui::line(&tui::red(
+            "  usage: /ask <question>  — answered aside; it is not added to the conversation",
+        ));
+        return;
+    }
+    tui::line("");
+    if let Err(e) = agent::ask_aside(provider, cwd, q, transcript) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::line(&tui::dim("  (asked aside — not added to the conversation)"));
+}
+
+fn handle_rename(sid: &str, name: &str) {
+    if name.trim().is_empty() {
+        tui::line(&tui::red("  usage: /rename <name>"));
+        return;
+    }
+    match session::rename(sid, name) {
+        Ok(()) => tui::line(&tui::green(&format!(
+            "  ✓ session named '{}'",
+            tui::sanitize_terminal(name.trim())
+        ))),
+        Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+    }
+}
+
+// `bwn sessions [rm <id>]`.
+fn sessions_command(args: &[String]) {
+    match args.first().map(String::as_str) {
+        None => {}
+        Some("rm" | "remove" | "delete") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("usage: buildwithnexus sessions rm <id>");
+                std::process::exit(2);
+            };
+            match session::remove(id) {
+                Ok(s) => println!(
+                    "deleted session {id}: {}",
+                    tui::sanitize_terminal(s.label())
+                ),
+                Err(e) => {
+                    eprintln!("buildwithnexus: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("export") => {
+            let Some(id) = args.get(1) else {
+                eprintln!("usage: buildwithnexus sessions export <id> [file.md]");
+                std::process::exit(2);
+            };
+            let Some(s) = session::load(id) else {
+                eprintln!(
+                    "no session '{}' — bwn sessions lists them",
+                    tui::sanitize_terminal(id)
+                );
+                std::process::exit(1);
+            };
+            match session::export(&s, args.get(2).map(std::path::Path::new)) {
+                Ok(p) => println!("{}", p.display()),
+                Err(e) => {
+                    eprintln!("buildwithnexus: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some(other) => {
+            eprintln!(
+                "buildwithnexus sessions: unknown subcommand '{other}' — try: rm <id>, export <id>"
+            );
+            std::process::exit(2);
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let all = session::list_here_first(&cwd);
+    if report::is_json() {
+        return print_sessions_json(&all);
+    }
+    if all.is_empty() {
+        // Empty output reads as "broken"; say why the list is empty.
+        println!("no saved sessions yet — every conversation is saved as it runs.");
+        return;
+    }
+    for s in &all {
+        // Titles come from task text and cwd from the checkout's
+        // folder name, so neither reaches the terminal raw.
+        let title: String = tui::sanitize_terminal(s.label()).chars().take(48).collect();
+        println!(
+            "  {}  {:<9} {:>4} msgs  {:<48}  {}",
+            s.id,
+            session::ago(s.updated_ms),
+            s.msgs.len(),
+            title,
+            tui::sanitize_terminal(&s.cwd)
+        );
+    }
+    println!();
+    println!(
+        "{}",
+        tui::dim("open one:  buildwithnexus resume <id>  ·  this folder's latest:  buildwithnexus continue  ·  add a task to run it headless  ·  sessions export <id> | rm <id>")
+    );
+}
+
+// Opens `s` in the terminal UI, or runs `task` on it headless.
+fn open_session(opts: CliOptions, s: session::Session, task: String, verb: &str) {
+    if !task.trim().is_empty() {
+        let (msgs, id) = (s.msgs, s.id);
+        headless(&opts, move |p, perm, cwd| {
+            agent::run_build_resumed(p, perm, "engineer", &task, &cwd, msgs, &id)
+        });
+        return;
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!(
+            "buildwithnexus: `{verb}` with no task opens the session in the terminal UI, and there is no terminal here.\n  \
+             Add a task to run it headless: buildwithnexus {verb} <task>"
+        );
+        std::process::exit(2);
+    }
+    session::resume_on_start(s);
+    interactive(opts.prompt.clone(), opts);
+}
+
+// `bwn continue [task]`: this folder's latest session, or the latest
+// anywhere with a note saying which.
+fn continue_command(opts: CliOptions, task: String) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let s = match session::latest_for(&cwd) {
+        Some(s) => s,
+        None => match session::latest() {
+            Some(s) => {
+                eprintln!(
+                    "{}",
+                    tui::yellow(&format!(
+                        "no session in this folder — continuing '{}' from {}",
+                        tui::sanitize_terminal(s.label()),
+                        tui::sanitize_terminal(&session_folder(&s, &cwd))
+                    ))
+                );
+                s
+            }
+            None => {
+                eprintln!(
+                    "buildwithnexus: no saved sessions to continue — bwn sessions lists them"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
+    open_session(opts, s, task, "continue");
+}
+
+// `bwn resume <id> [task]`; with no id, the /resume picker.
+fn resume_command(opts: CliOptions, args: &[String]) {
+    let Some(id) = args.first() else {
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            eprintln!(
+                "buildwithnexus: `resume` with no id opens the session picker in the terminal UI, and there is no terminal here.\n  \
+                 Pass an id and a task to run one headless (bwn sessions lists them): buildwithnexus resume <id> <task>"
+            );
+            std::process::exit(2);
+        }
+        let prompt = opts.prompt.clone().or_else(|| Some("/resume".to_string()));
+        interactive(prompt, opts);
+        return;
+    };
+    let Some(s) = session::load(id) else {
+        eprintln!(
+            "no session '{}' — bwn sessions lists them",
+            tui::sanitize_terminal(id)
+        );
+        std::process::exit(1);
+    };
+    open_session(opts, s, args[1..].join(" "), "resume");
 }
 
 fn handle_config(provider: &Provider, perm: Permission, cwd: &std::path::Path) {
@@ -1944,7 +3423,8 @@ fn handle_tools() {
 fn handle_mcp(arg: &str) {
     let args = shlex::split(arg.trim()).unwrap_or_default();
     // Server names, server_info and errors are server- or config-supplied.
-    match mcp::manage(&args, true) {
+    let mut say = |l: &str| tui::line(&format!("  {l}"));
+    match mcp::manage(&args, true, &mut say) {
         Ok(lines) => {
             for l in lines {
                 tui::line(&format!("  {}", tui::sanitize_terminal(&l)));
@@ -1957,28 +3437,157 @@ fn handle_mcp(arg: &str) {
     }
 }
 
-/// `/init` step: offer a starter AGENTS.md when the cwd has no instruction file.
-fn offer_starter_agents_md(cwd: &std::path::Path) {
-    if cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists() {
+fn has_instruction_file(cwd: &std::path::Path) -> bool {
+    cwd.join("AGENTS.md").exists() || cwd.join("CLAUDE.md").exists()
+}
+
+/// What /init (and `init --agents-md`) asks the model to do: read this
+/// repository's own build, test and CI files and write down only what they
+/// say, or improve the AGENTS.md that is already there.
+fn agents_md_task(cwd: &std::path::Path) -> String {
+    let goal = if cwd.join("AGENTS.md").exists() {
+        "Improve the AGENTS.md at the repository root: keep everything in it that is still true, \
+         correct what the repository contradicts, and add what is missing. Change it with \
+         edit_file (or write_file with the whole improved text)."
+    } else {
+        "Write AGENTS.md at the repository root with write_file."
+    };
+    format!(
+        "{goal} AGENTS.md is the file coding agents read before working in this repository.\n\n\
+         First look at what the repository really uses: list the root, then read the README and \
+         the build and test files that exist (Makefile, package.json scripts, Cargo.toml, \
+         pyproject.toml, setup.cfg, go.mod, build.gradle, pom.xml, CMakeLists.txt, justfile, \
+         Taskfile.yml, and CI workflows such as .github/workflows/*.yml).\n\n\
+         Then write these sections, using only commands and facts you found in those files:\n\
+         - Build & test: the exact commands to build, run the tests, run one test, lint and format.\n\
+         - Layout: the main directories and what lives in each.\n\
+         - Conventions: style, naming and commit rules the code or config shows.\n\
+         - Do not: generated or vendored files that must not be edited by hand, and commands \
+           that must not be run.\n\n\
+         Keep it under 60 lines. Leave out anything you could not confirm instead of guessing. \
+         Do not run commands, and do not change any file other than AGENTS.md."
+    )
+}
+
+/// `/init` step: offer to write AGENTS.md from this repository, or improve
+/// the one there. The write always goes through the approval gate (even
+/// under auto), so the proposed file is shown as a diff before it lands.
+fn offer_agents_md(
+    provider: &Provider,
+    perm: Permission,
+    cwd: &std::path::Path,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    let exists = cwd.join("AGENTS.md").exists();
+    if !exists && cwd.join("CLAUDE.md").exists() {
         return;
     }
     tui::line("");
-    tui::line(&tui::dim(&format!(
-        "  No AGENTS.md in {} — it tells the agent your build/test commands, conventions, and do-nots.",
-        tui::sanitize_terminal(&cwd.display().to_string())
-    )));
-    let answer =
-        tui::ask("  create a starter AGENTS.md here? [Y/n] ").unwrap_or_else(|| "n".into());
-    if matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes") {
-        match config::create_starter_agents_md(cwd) {
-            Ok(p) => tui::line(&tui::green(&format!(
-                "  ✓ created {} — fill in the placeholders",
-                tui::sanitize_terminal(&p.display().to_string())
-            ))),
-            Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
-        }
+    let question = if exists {
+        "  improve AGENTS.md from this repository? [y/N] "
     } else {
+        tui::line(&tui::dim(
+            "  AGENTS.md tells the agent your build and test commands, conventions and do-nots.",
+        ));
+        "  generate AGENTS.md from this repository? [Y/n] "
+    };
+    let Some(answer) = tui::ask(question) else {
+        return;
+    };
+    let yes = match answer.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "" => !exists,
+        "n" | "no" => false,
+        // A message typed while the question was up is not an answer.
+        _ => {
+            tui::prefill_composer(&answer);
+            tui::line(&tui::dim(
+                "  skipped — that was not y or n; your text is back in the input box",
+            ));
+            return;
+        }
+    };
+    if !yes {
         tui::line(&tui::dim("  skipped"));
+        return;
+    }
+    if matches!(perm, Permission::ReadOnly) {
+        tui::line(&tui::yellow(
+            "  permission is read-only, so nothing can be written — /permissions ask, then /init again",
+        ));
+        return;
+    }
+    tui::line("");
+    if let Err(e) = agent::run_build_session(
+        provider,
+        Permission::Ask,
+        "engineer",
+        &agents_md_task(cwd),
+        cwd,
+        transcript,
+        sid,
+    ) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::bell();
+}
+
+// `/init`: setup again; the session then runs on what setup saved, and is
+// left as it was when setup is cancelled.
+fn handle_init(
+    provider: &mut Provider,
+    perm: Permission,
+    cwd: &std::path::Path,
+    raw: bool,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    tui::leave_alt();
+    let saved = onboarding::run();
+    tui::enter_alt(raw);
+    let Some(saved) = saved else {
+        tui::line(&tui::dim("  /init cancelled — settings unchanged"));
+        return;
+    };
+    // Project settings may still layer over what was saved; run on the merge.
+    let s = config::load_settings()
+        .filter(|s| !s.provider.is_empty())
+        .unwrap_or(saved);
+    match build_provider(&s) {
+        Ok(mut p) => {
+            p.effort = provider.effort;
+            usage::forget_last();
+            *provider = p;
+            provider::prewarm(provider);
+            set_active_preset(&s.provider);
+            tui::set_model_label(&provider.model);
+            tui::line(&tui::green(&format!(
+                "  now using {} · {}",
+                s.provider,
+                tui::sanitize_terminal(&provider.base_url)
+            )));
+        }
+        Err(e) => tui::line(&tui::red(&format!(
+            "  ✗ {} — keeping {}",
+            tui::sanitize_terminal(&e),
+            provider.model
+        ))),
+    }
+    offer_agents_md(provider, perm, cwd, transcript, sid);
+}
+
+// `/login`: a new key for the provider the session is using.
+fn handle_login(provider: &mut Provider) {
+    let mut s = config::load_settings().unwrap_or_default();
+    s.provider = active_preset().unwrap_or(s.provider);
+    s.model = provider.model.clone();
+    s.base_url = Some(provider.base_url.clone())
+        .filter(|u| config::preset(&s.provider).is_none_or(|p| p.base_url != u));
+    if let Some(mut p) = onboarding::login(&s) {
+        p.effort = provider.effort;
+        usage::forget_last();
+        *provider = p;
     }
 }
 
@@ -1988,23 +3597,115 @@ fn find_custom_command(name: &str) -> Option<config::CustomCommand> {
         .find(|c| c.name == name)
 }
 
+// `/name …` naming one of the checkout's commands or skills that is off
+// because the folder is not trusted.
+fn untrusted_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    (find_custom_command(name).is_none() && config::is_untrusted_repo_command(cwd, name))
+        .then(|| name.to_string())
+}
+
+// `/name` naming a command or skill file of the checkout that does not
+// load: what to tell the person instead of sending the line on.
+fn unloaded_repo_command(text: &str, cwd: &std::path::Path) -> Option<String> {
+    let name = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    if find_custom_command(name).is_some() {
+        return None;
+    }
+    let path = config::unloaded_repo_command(cwd, name)?;
+    Some(format!(
+        "/{} ({}) is {}",
+        tui::sanitize_terminal(name),
+        tui::sanitize_terminal(&path),
+        config::NOT_LOADED
+    ))
+}
+
+/// A `/word` task that names no command or skill, as the session says it:
+/// a path (`/etc/hosts is wrong`) is a task, anything else is a mistyped
+/// command and no request is made for it.
+fn unknown_slash_command(text: &str) -> Option<String> {
+    let t = text.trim();
+    let name = t.strip_prefix('/')?.split_whitespace().next()?;
+    if starts_with_path(t) || find_custom_command(name).is_some() {
+        return None;
+    }
+    let commands = config::load_custom_commands();
+    let known: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+    let name = tui::sanitize_terminal(name);
+    Some(match hooks::did_you_mean(&name, &known) {
+        Some(near) => format!("unknown command /{name} (did you mean /{near}?)"),
+        None => format!(
+            "unknown command /{name} — a headless run takes your own commands and skills, not the session's built-in ones"
+        ),
+    })
+}
+
+/// `/name args` naming a command or skill: that command and its arguments.
+/// A task that merely starts with a path (`/usr/bin/foo fails`) is not one.
+fn find_slash_command(text: &str) -> Option<(config::CustomCommand, String)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let mut words = rest.splitn(2, char::is_whitespace);
+    let name = words.next().filter(|n| !n.is_empty() && !n.contains('/'))?;
+    let args = words.next().unwrap_or("").trim().to_string();
+    find_custom_command(name).map(|c| (c, args))
+}
+
+// A script command runs like any run_command: PreToolUse hooks, then the
+// permission gate. Its output on success, the refusal or output otherwise.
+fn run_script_command(
+    script: &std::path::Path,
+    args: &str,
+    perm: Permission,
+    cwd: &std::path::Path,
+) -> Result<String, String> {
+    // Shell-quote the script path to guard against spaces (UX-007).
+    let escaped = script.to_string_lossy().replace('\'', "'\"'\"'");
+    let shell_cmd = if args.is_empty() {
+        format!("'{escaped}'")
+    } else {
+        format!("'{escaped}' {args}")
+    };
+    let tool_input = serde_json::json!({"command": shell_cmd});
+    let out = tools::with_script_command(script, || {
+        match agent::hook_gate(perm, "run_command", &tool_input, cwd) {
+            Some(reason) => Err(reason),
+            None => Ok(tools::run("run_command", &tool_input, cwd)),
+        }
+    })?;
+    if out.is_error {
+        Err(out.content)
+    } else {
+        Ok(out.content)
+    }
+}
+
 fn handle_model(provider: &mut Provider) {
     let settings = config::load_settings().unwrap_or_default();
     let mut options: Vec<(String, String, String)> = Vec::new();
 
     let ollama_base = if settings.provider == "ollama" {
-        settings
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:11434".into())
+        settings.base_url.clone()
     } else {
-        "http://localhost:11434".into()
-    };
+        remembered_endpoint("ollama")
+    }
+    .unwrap_or_else(|| "http://localhost:11434".into());
     let ollama_installed = provider::ollama_models(&ollama_base);
-    if !ollama_installed.is_empty() {
-        for m in ollama_installed.iter().take(12) {
-            options.push(("ollama".into(), m.clone(), "installed Ollama model".into()));
-        }
+    for m in ollama_installed.iter().take(onboarding::MODEL_LIST_MAX) {
+        options.push(("ollama".into(), m.clone(), "installed Ollama model".into()));
+    }
+    // The rest stay reachable by name: this row (no model) asks for one.
+    let more = ollama_installed
+        .len()
+        .checked_sub(onboarding::MODEL_LIST_MAX)
+        .filter(|n| *n > 0)
+        .map(onboarding::more_line);
+    if more.is_some() {
+        options.push((
+            "ollama".into(),
+            String::new(),
+            "installed Ollama models".into(),
+        ));
     }
 
     let no_server = find_llama_server_binary().is_none();
@@ -2018,22 +3719,19 @@ fn handle_model(provider: &mut Provider) {
     }
 
     for p in config::PRESETS.iter().filter(|p| !p.local) {
-        let status = if config::load_key(p.env_key).is_some() {
-            "ready".into()
-        } else {
+        let status = if config::load_key(p.env_key).is_none() {
             format!("needs {}", p.env_key)
+        } else if config::key_rejected(p.env_key) {
+            "key rejected — /login".into()
+        } else {
+            "ready".into()
         };
         options.push((
             p.id.to_string(),
             p.default_model.to_string(),
             format!("{} ({})", p.label, status),
         ));
-        let extras: &[&str] = match p.id {
-            "anthropic" => &["claude-opus-4-8", "claude-haiku-4-5"],
-            "openai" => &["gpt-4o-mini"],
-            _ => &[],
-        };
-        for m in extras {
+        for m in p.more_models {
             options.push((
                 p.id.to_string(),
                 m.to_string(),
@@ -2051,10 +3749,10 @@ fn handle_model(provider: &mut Provider) {
     let select_items: Vec<tui::SelectItem> = options
         .iter()
         .map(|(prov, model, desc)| {
-            let label = if model.is_empty() {
-                format!("[{prov}] custom endpoint")
-            } else {
-                format!("{prov} / {model}")
+            let label = match (prov.as_str(), model.is_empty()) {
+                ("custom", true) => format!("[{prov}] custom endpoint"),
+                (_, true) => format!("{prov} / {}", more.as_deref().unwrap_or_default()),
+                _ => format!("{prov} / {model}"),
             };
             tui::SelectItem {
                 label,
@@ -2065,22 +3763,32 @@ fn handle_model(provider: &mut Provider) {
 
     let title = format!(
         "Select AI Model (Current: {} on {})",
-        provider.model, settings.provider
+        provider.model,
+        active_preset().unwrap_or(settings.provider)
     );
 
     if let Some(idx) = tui::select_item(&title, &select_items) {
         let (target_provider, model, _) = options[idx].clone();
         if target_provider == "custom" && model.is_empty() {
-            let pick =
+            let Some(pick) =
                 tui::ask("  Enter endpoint URL & model (e.g. http://localhost:8080/v1 model): ")
-                    .unwrap_or_default();
+            else {
+                return swap_cancelled();
+            };
             let pick = pick.trim();
             if !pick.is_empty() {
                 let (url, m) = pick
                     .split_once(char::is_whitespace)
                     .map(|(u, m)| (u.trim().to_string(), m.trim().to_string()))
                     .unwrap_or((pick.to_string(), String::new()));
-                swap_model(provider, "custom", &m, Some(url));
+                swap_model(provider, endpoint_preset(&url), &m, Some(url));
+            }
+        } else if model.is_empty() {
+            let Some(m) = tui::ask("  model name: ") else {
+                return swap_cancelled();
+            };
+            if !m.trim().is_empty() {
+                swap_model(provider, &target_provider, m.trim(), None);
             }
         } else {
             swap_model(provider, &target_provider, &model, None);
@@ -2089,8 +3797,8 @@ fn handle_model(provider: &mut Provider) {
 }
 
 /// `/model <http(s)://url> [model]` → (base_url, model). A URL first token
-/// always means the custom OpenAI-compatible preset; it must never fall into
-/// the org/model → OpenRouter inference below.
+/// always names an endpoint; it must never fall into the org/model →
+/// OpenRouter inference below. `endpoint_preset` says which preset serves it.
 fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
     let pick = pick.trim();
     let (first, rest) = pick.split_once(char::is_whitespace).unwrap_or((pick, ""));
@@ -2099,6 +3807,40 @@ fn parse_model_endpoint(pick: &str) -> Option<(String, String)> {
         return None;
     }
     Some((first.to_string(), rest.trim().to_string()))
+}
+
+/// An Ollama host root is the Ollama preset, so its own API (and its model
+/// list) is used; any other URL, `…/v1` included, is the custom
+/// OpenAI-compatible preset. Ollama's port says so; a host root on another
+/// port is asked.
+fn endpoint_preset(url: &str) -> &'static str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let root = rest.trim_end_matches('/').split_once('/').is_none();
+    if root && (is_ollama_address(url) || !provider::ollama_models(url).is_empty()) {
+        "ollama"
+    } else {
+        "custom"
+    }
+}
+
+fn is_ollama_address(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority)
+        .ends_with(":11434")
+}
+
+/// The address last used with `preset`, from the user's own settings only:
+/// a cloned repository never chooses where a swap sends the key.
+fn remembered_endpoint(preset: &str) -> Option<String> {
+    config::load_user_settings().and_then(|u| u.endpoints.get(preset).cloned())
+}
+
+fn swap_cancelled() {
+    tui::line(&tui::dim("  /model cancelled — nothing saved"));
 }
 
 /// Maps a typed model name to the provider that serves it. Anything
@@ -2135,61 +3877,97 @@ fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
     (current_provider.to_string(), pick.to_string())
 }
 
+/// The first word of a `/model <word> <model>` pick whose first word names
+/// no provider. A model name has no spaces, so two words are a provider and
+/// a model, and swapping to the pair as one name only ends in a 404.
+fn unknown_provider_word(pick: &str) -> Option<&str> {
+    let (first, rest) = pick.split_once(char::is_whitespace)?;
+    (!rest.trim().is_empty() && config::preset(first).is_none()).then_some(first)
+}
+
 fn find_active_local_base_url(preferred: &str) -> Option<String> {
-    let candidates = [
+    find_active_local_base_url_in(&[
         preferred,
         "http://localhost:8080/v1",
         "http://localhost:1234/v1",
-        "http://localhost:11434/v1",
         "http://localhost:8000/v1",
-    ];
+    ])
+}
+
+/// The first of `candidates` where a llama.cpp, LM Studio or vLLM server
+/// answers. Ollama also answers /v1/models, but cannot load a GGUF file
+/// or an LM Studio model by name, so it is never the answer here.
+fn find_active_local_base_url_in(candidates: &[&str]) -> Option<String> {
     for url in candidates {
         let root = url.trim_end_matches('/').trim_end_matches("/v1");
-        let probe = format!("{root}/v1/models");
-        if let Ok(res) = ureq::get(&probe)
-            .timeout(std::time::Duration::from_millis(400))
-            .call()
-        {
-            if res.status() < 500 {
-                if let Some(ct) = res.header("content-type") {
-                    if ct.contains("application/json") {
-                        return Some(url.to_string());
-                    }
-                }
-            }
-        }
-        let root_probe = format!("{root}/health");
-        if ureq::get(&root_probe)
-            .timeout(std::time::Duration::from_millis(300))
-            .call()
-            .is_ok()
-        {
+        let get = |path: &str, ms: u64| {
+            crate::net::shared()
+                .get(&format!("{root}{path}"))
+                .timeout(std::time::Duration::from_millis(ms))
+                .call()
+                .ok()
+        };
+        let json = |res: &ureq::Response| {
+            res.status() < 500
+                && res
+                    .header("content-type")
+                    .is_some_and(|ct| ct.contains("application/json"))
+        };
+        let answers =
+            get("/v1/models", 400).is_some_and(|r| json(&r)) || get("/health", 300).is_some();
+        if answers && !is_ollama(root) {
             return Some(url.to_string());
         }
     }
     None
 }
 
+// Ollama's own listing; LM Studio and llama.cpp answer it with a 404.
+fn is_ollama(root: &str) -> bool {
+    crate::net::shared()
+        .get(&format!("{root}/api/tags"))
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .is_some_and(|v| v["models"].is_array())
+}
+
+/// Why a GGUF file cannot be served, when nothing is running that could:
+/// llama-server is needed to load it (or LM Studio, which loads it itself).
+fn gguf_unservable(model_name: &str, have_llama_server: bool) -> Option<&'static str> {
+    let gguf = model_name.to_ascii_lowercase().ends_with(".gguf");
+    (gguf && !have_llama_server).then_some(
+        "llama-server is not installed — install llama.cpp, or load the file in LM Studio",
+    )
+}
+
 fn find_llama_server_binary() -> Option<std::path::PathBuf> {
-    for path in [
-        "/opt/homebrew/bin/llama-server",
-        "/usr/local/bin/llama-server",
-        "/usr/bin/llama-server",
-    ] {
-        let p = std::path::PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("llama-server");
-            if candidate.exists() {
-                return Some(candidate);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let pathext = std::env::var_os("PATHEXT");
+    find_llama_server_in(&path, pathext.as_deref(), cfg!(windows))
+}
+
+/// `find_llama_server_binary` with its inputs passed in, so tests can run
+/// the Windows rules anywhere: there the binary is `llama-server.exe`.
+fn find_llama_server_in(
+    path: &std::ffi::OsStr,
+    pathext: Option<&std::ffi::OsStr>,
+    windows: bool,
+) -> Option<std::path::PathBuf> {
+    if !windows {
+        for known in [
+            "/opt/homebrew/bin/llama-server",
+            "/usr/local/bin/llama-server",
+            "/usr/bin/llama-server",
+        ] {
+            let p = std::path::PathBuf::from(known);
+            if p.exists() {
+                return Some(p);
             }
         }
     }
-    None
+    tools::find_in_path("llama-server", path, pathext, windows)
 }
 
 static LLAMA_SERVER_PROCESS: std::sync::Mutex<Option<std::process::Child>> =
@@ -2208,7 +3986,7 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
     if let Some(active_url) = find_active_local_base_url(preferred_url) {
         if active_url.contains("8080") {
             let probe = format!("{}/models", active_url.trim_end_matches('/'));
-            if let Ok(res) = ureq::get(&probe).call() {
+            if let Ok(res) = crate::net::shared().get(&probe).call() {
                 if let Ok(json) = res.into_string() {
                     if !json.contains(model_name) {
                         tui::line(&tui::yellow(&format!("  ⚠ local server at {active_url} is loaded with a different model. Switch it manually if needed.")));
@@ -2217,6 +3995,10 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
             }
         }
         return Some(active_url);
+    }
+    if let Some(why) = gguf_unservable(model_name, find_llama_server_binary().is_some()) {
+        tui::line(&tui::yellow(&format!("  ✗ {why}")));
+        return None;
     }
     let server_bin = find_llama_server_binary()?;
     let gguf_path = crate::local::find_gguf_path(model_name)?;
@@ -2250,7 +4032,8 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
         std::thread::sleep(std::time::Duration::from_millis(500));
         print!(".");
         let _ = std::io::stdout().flush();
-        if ureq::get("http://localhost:8080/v1/models")
+        if crate::net::shared()
+            .get("http://localhost:8080/v1/models")
             .timeout(std::time::Duration::from_millis(300))
             .call()
             .is_ok()
@@ -2269,10 +4052,126 @@ fn ensure_local_gguf_server(preferred_url: &str, model_name: &str) -> Option<Str
     None
 }
 
+// The preset the live provider was built from: the settings and flags at
+// startup, then each /model, /init and /login. Banners and "now using"
+// lines read it, so they name what is really answering.
+static ACTIVE_PRESET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn set_active_preset(id: &str) {
+    if let Ok(mut a) = ACTIVE_PRESET.lock() {
+        *a = id.to_string();
+    }
+}
+
+fn active_preset() -> Option<String> {
+    ACTIVE_PRESET
+        .lock()
+        .ok()
+        .map(|a| a.clone())
+        .filter(|a| !a.is_empty())
+}
+
+/// Where a `/model` swap points: the base URL it probes and runs against,
+/// and what it writes to the saved `base_url`.
+#[derive(Debug, PartialEq)]
+struct SwapTarget {
+    base_url: String,
+    /// None leaves the saved value alone; Some(None) clears it.
+    save: Option<Option<String>>,
+}
+
+/// A saved `base_url` belongs to the provider it was set for: a swap within
+/// that provider keeps it (a remote Ollama host, an LM Studio box on the
+/// LAN), a swap to another provider goes back to the address last used with
+/// it (`remembered`, from `endpoints`) or else to its preset default, and an
+/// explicit URL always wins.
+fn plan_swap(
+    current_provider: &str,
+    saved_base_url: Option<&str>,
+    remembered: Option<&str>,
+    target: &config::Preset,
+    override_url: Option<&str>,
+) -> SwapTarget {
+    if let Some(url) = override_url {
+        return SwapTarget {
+            base_url: url.to_string(),
+            save: Some(Some(url.to_string())),
+        };
+    }
+    match (saved_base_url, remembered) {
+        (Some(url), _) if current_provider == target.id => SwapTarget {
+            base_url: url.to_string(),
+            save: None,
+        },
+        _ if current_provider == target.id => SwapTarget {
+            base_url: target.base_url.to_string(),
+            save: None,
+        },
+        (_, Some(url)) => SwapTarget {
+            base_url: url.to_string(),
+            save: Some(Some(url.to_string())),
+        },
+        _ => SwapTarget {
+            base_url: target.base_url.to_string(),
+            save: Some(None),
+        },
+    }
+}
+
+/// The `endpoints` map after a swap from `from` to `to`, kept for the next
+/// swap back: the address the user's own settings give `from`, and for `to`
+/// the one this swap saves (`saved`), or else the user's own. A base_url a
+/// trusted project layers in serves that project only, so it is never
+/// remembered for the others.
+fn remember_endpoints(
+    user: &Settings,
+    from: &str,
+    to: &str,
+    saved: Option<Option<&str>>,
+) -> std::collections::BTreeMap<String, String> {
+    let own = |id: &str| {
+        (user.provider == id)
+            .then_some(user.base_url.as_deref())
+            .flatten()
+    };
+    let mut endpoints = user.endpoints.clone();
+    if let Some(u) = own(from).filter(|_| from != to) {
+        endpoints.insert(from.to_string(), u.to_string());
+    }
+    if let Some(u) = saved.unwrap_or_else(|| own(to)) {
+        endpoints.insert(to.to_string(), u.to_string());
+    }
+    endpoints
+}
+
+// The last swap's probe was answered by a server that does not list the
+// model: its success line must not say "validated".
+static SWAP_UNCONFIRMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The swap's success line names the model actually saved, which differs
+/// from the one asked for when a local server only answers as "local-model".
+fn swap_success_line(requested: &str, active: &str, provider_label: &str) -> String {
+    if SWAP_UNCONFIRMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // The server answered, but does not list the name: it may be
+        // running another model under it (unlisted_note said so).
+        format!(
+            "  ✓ active model hot-swapped → {active} on {provider_label} (answered; the server does not list it)"
+        )
+    } else if requested == active || requested.is_empty() {
+        format!("  ✓ active model hot-swapped → {active} on {provider_label} (validated)")
+    } else {
+        format!(
+            "  ✓ active model hot-swapped → {active} on {provider_label} (validated; the server \
+             does not serve '{requested}' by that name, so it runs as '{active}')"
+        )
+    }
+}
+
 /// Applies a model swap only after the target provider is actually usable:
 /// walks the user through a missing API key (or a custom endpoint's URL),
 /// checks that a local server is reachable and has the model, and keeps the
-/// current model on any failure.
+/// current model on any failure. A key typed here is saved only once the
+/// probe accepts it; Esc or Ctrl+C at any question cancels with nothing saved.
 fn swap_model(
     provider: &mut Provider,
     target_provider: &str,
@@ -2280,95 +4179,93 @@ fn swap_model(
     base_url_override: Option<String>,
 ) {
     let Some(preset) = config::preset(target_provider) else {
-        let ids: Vec<&str> = config::PRESETS.iter().map(|p| p.id).collect();
         tui::line(&tui::red(&format!(
-            "  ✗ unknown provider '{target_provider}' — valid: {}",
-            ids.join(", ")
+            "  ✗ {}",
+            unknown_provider_msg(target_provider)
         )));
         return;
     };
     let mut s = config::load_settings().unwrap_or_default();
-    let switching = s.provider != preset.id;
+    let (from, from_url) = (s.provider.clone(), s.base_url.clone());
+    let remembered = remembered_endpoint(preset.id);
     let mut model = model.to_string();
     let mut custom_url = base_url_override;
+    // For the custom endpoint, Some("") is "no key", not the saved one.
+    let mut new_key: Option<String> = None;
 
-    // Custom OpenAI-compatible endpoint: gather URL, optional key, and model.
+    // Custom OpenAI-compatible endpoint: the address and key are asked only
+    // for an endpoint not used before; `/model <name>` on a configured one
+    // just switches the model.
     if preset.id == "custom" {
-        if custom_url.is_none() {
-            let default_url = if !switching {
-                s.base_url.clone().unwrap_or_else(|| preset.base_url.into())
-            } else {
-                preset.base_url.to_string()
-            };
-            let url = tui::ask(&format!(
+        let current = (from == "custom").then_some(from_url.as_deref()).flatten();
+        let known = current.or(remembered.as_deref());
+        if custom_url.is_none() && known.is_none() {
+            let default_url = preset.base_url;
+            let Some(url) = tui::ask(&format!(
                 "  Endpoint base URL (OpenAI-compatible, usually ends in /v1) [{default_url}]: "
-            ))
-            .unwrap_or_default();
+            )) else {
+                return swap_cancelled();
+            };
             let url = url.trim();
             custom_url = Some(if url.is_empty() {
-                default_url
+                default_url.to_string()
             } else {
                 url.to_string()
             });
         }
-        if config::load_key(config::CUSTOM_KEY).is_none() {
-            let key =
-                tui::ask("  API key (press Enter if the server needs none): ").unwrap_or_default();
-            if !key.trim().is_empty() {
-                config::save_key(config::CUSTOM_KEY, key.trim());
-                tui::line(&tui::green(&format!("  ✓ {} saved", config::CUSTOM_KEY)));
-            }
+        // Keys are kept per endpoint: a new address gets its own key (or
+        // none), never the key of the one before.
+        let new_address = custom_url.as_deref().filter(|u| Some(*u) != current);
+        if let Some(url) = new_address.filter(|u| config::saved_custom_key(u).is_none()) {
+            new_key = Some(match onboarding::ask_custom_key(url) {
+                onboarding::KeyAnswer::Key(k) => k,
+                onboarding::KeyAnswer::Empty => String::new(),
+                onboarding::KeyAnswer::Cancel => return swap_cancelled(),
+            });
         }
         if model.is_empty() {
-            let m = tui::ask("  Model name (as the server expects it): ").unwrap_or_default();
+            let Some(m) = tui::ask("  Model name (as the server expects it): ") else {
+                return swap_cancelled();
+            };
             model = m.trim().to_string();
             if model.is_empty() {
-                tui::line(&tui::dim(&format!(
-                    "  swap cancelled — keeping {}.",
-                    provider.model
-                )));
-                return;
+                return swap_cancelled();
             }
         }
     }
 
-    // Missing API key: configure it right here instead of failing on the
-    // next request with a raw HTTP error.
+    // Missing API key: take it right here instead of failing on the next
+    // request with a raw HTTP error. It is saved once the probe accepts it.
     if !preset.env_key.is_empty() && config::load_key(preset.env_key).is_none() {
         tui::line(&tui::yellow(&format!(
             "  {} isn't configured yet — {} is not set.",
             preset.label, preset.env_key
         )));
         tui::line(&tui::dim(
-            "  Paste an API key to set it up now, or press Enter to cancel the swap.",
+            "  Paste an API key to set it up now (it is checked before it is saved), or Esc to cancel.",
         ));
-        let key = tui::ask(&format!("  {}: ", preset.env_key)).unwrap_or_default();
-        let key = key.trim();
-        if key.is_empty() {
-            tui::line(&tui::dim(&format!(
-                "  swap cancelled — keeping {}. Configure later with `export {}=…` or `buildwithnexus init`.",
-                provider.model, preset.env_key
-            )));
-            return;
+        match onboarding::read_key(&format!("  {}: ", preset.env_key)) {
+            onboarding::KeyAnswer::Key(k) => new_key = Some(k),
+            _ => return swap_cancelled(),
         }
-        config::save_key(preset.env_key, key);
-        tui::line(&tui::green(&format!("  ✓ {} saved", preset.env_key)));
     }
 
     // Ollama: confirm the server is up and actually has the model before
     // committing — the alternative is an opaque failure mid-conversation.
+    let mut target = plan_swap(
+        &from,
+        from_url.as_deref(),
+        remembered.as_deref(),
+        preset,
+        custom_url.as_deref(),
+    );
     if preset.id == "ollama" {
-        let base = if !switching {
-            s.base_url
-                .clone()
-                .unwrap_or_else(|| preset.base_url.to_string())
-        } else {
-            preset.base_url.to_string()
-        };
+        let base = target.base_url.clone();
+        let shown_base = tui::sanitize_terminal(&base);
         let installed = provider::ollama_models(&base);
         if installed.is_empty() {
             tui::line(&tui::yellow(&format!(
-                "  ✗ can't reach Ollama at {base} (or it has no models)."
+                "  ✗ can't reach Ollama at {shown_base} (or it has no models)."
             )));
             tui::line(&tui::dim("    1. install: https://ollama.com"));
             tui::line(&tui::dim("    2. start it:  ollama serve"));
@@ -2385,7 +4282,7 @@ fn swap_model(
             .any(|m| *m == model || m.split(':').next() == Some(model.as_str()));
         if !have {
             tui::line(&tui::yellow(&format!(
-                "  ✗ Ollama is running but '{model}' isn't installed."
+                "  ✗ Ollama at {shown_base} is running but '{model}' isn't installed."
             )));
             let shown: Vec<&str> = installed.iter().take(8).map(String::as_str).collect();
             // Model names come from whatever answers on the Ollama port.
@@ -2402,10 +4299,21 @@ fn swap_model(
     }
 
     if preset.id == "llamacpp" || preset.id == "lmstudio" {
-        let preferred = custom_url.as_deref().unwrap_or(preset.base_url);
-        if let Some(active_url) = ensure_local_gguf_server(preferred, &model) {
-            custom_url = Some(active_url);
+        if let Some(active_url) = ensure_local_gguf_server(&target.base_url, &model) {
+            // Another port answered: that server is the one to remember.
+            if active_url != target.base_url {
+                target = SwapTarget {
+                    save: Some(Some(active_url.clone())),
+                    base_url: active_url,
+                };
+            }
         } else {
+            // ensure_local_gguf_server has already said why a GGUF file
+            // cannot be served; the generic list below would contradict it.
+            if gguf_unservable(&model, find_llama_server_binary().is_some()).is_some() {
+                tui::line(&tui::dim("    keeping the current model."));
+                return;
+            }
             tui::line(&tui::yellow(&format!(
                 "  ✗ no local server running on ports 8080/1234/11434/8000 for '{model}'."
             )));
@@ -2427,93 +4335,208 @@ fn swap_model(
         }
     }
 
-    // A custom base_url belongs to the provider it was set for. `None`
-    // leaves the saved value alone.
-    let base_url_change = if preset.id != "custom" && custom_url.is_none() {
-        Some(None)
-    } else {
-        custom_url.map(Some)
-    };
+    let base_url_change = target.save.clone();
     if let Some(u) = &base_url_change {
         s.base_url = u.clone();
     }
     s.provider = preset.id.to_string();
     s.model = model.to_string();
-    match build_provider(&s) {
-        Ok(p) => {
-            // No success message without proof: a one-token probe through the
-            // real request path catches bad keys, unknown model names, and
-            // unreachable servers now instead of on the next prompt. Ollama
-            // was already validated live above (server + installed model),
-            // and a probe there could cold-load a large model.
-            if preset.id != "ollama" {
-                tui::line(&tui::dim(&format!(
-                    "  validating {model} — one-token probe…"
+    let Some(mut p) = probe_swap(&mut s, preset, &mut new_key, &provider.model) else {
+        return;
+    };
+    let key_name = onboarding::key_slot(preset, &p.base_url);
+    if let Some(k) = new_key.as_deref().filter(|k| !k.is_empty()) {
+        if preset.id == "custom" {
+            config::save_custom_key(&p.base_url, k);
+            tui::line(&tui::green(&format!(
+                "  ✓ key saved for {}",
+                tui::sanitize_terminal(&config::endpoint_origin(&p.base_url))
+            )));
+        } else {
+            config::save_key(&key_name, k);
+            tui::line(&tui::green(&format!("  ✓ {key_name} saved")));
+        }
+    }
+    if let Some(k) = p.api_key.as_deref() {
+        config::record_key_check(&key_name, k, true);
+    }
+    // The probe's one-token usage mustn't pose as the live prompt
+    // size, and a `--effort` given on the command line outlives the swap.
+    usage::forget_last();
+    p.effort = provider.effort;
+    *provider = p;
+    let user = config::load_user_settings().unwrap_or_default();
+    let endpoints = remember_endpoints(
+        &user,
+        &from,
+        preset.id,
+        base_url_change.as_ref().map(|u| u.as_deref()),
+    );
+    let mut changes = vec![
+        ("provider", Some(s.provider.as_str().into())),
+        ("model", Some(s.model.as_str().into())),
+    ];
+    if let Some(u) = base_url_change {
+        changes.push(("base_url", u.map(Into::into)));
+    }
+    if endpoints != user.endpoints {
+        changes.push(("endpoints", serde_json::to_value(&endpoints).ok()));
+    }
+    save_user_settings(&changes);
+    provider::prewarm(provider);
+    set_active_preset(preset.id);
+    tui::set_model_label(&s.model);
+    tui::line(&tui::green(&swap_success_line(
+        &model,
+        &s.model,
+        &onboarding::provider_label(preset.id, &provider.base_url),
+    )));
+}
+
+// The proof half of a swap: builds the provider (a key typed during the swap
+// stands in for the saved one) and has it answer a one-token probe, which
+// catches bad keys, unknown model names and unreachable servers now instead
+// of on the next prompt. Ollama was already checked live by the caller, and
+// a probe there could cold-load a large model. A custom endpoint with no
+// saved key that answers 401 is asked for one here. None once it has said
+// why the current model stays.
+fn probe_swap(
+    s: &mut Settings,
+    preset: &config::Preset,
+    new_key: &mut Option<String>,
+    current_model: &str,
+) -> Option<Provider> {
+    let keeping = || {
+        tui::line(&tui::dim(&format!(
+            "    keeping the current model ({current_model})."
+        )))
+    };
+    // `/model nonsense-provider some-model` is one name with a space in it.
+    if s.model.split_whitespace().nth(1).is_some() {
+        tui::line(&tui::red(&format!(
+            "  ✗ '{}' is not a provider or a model name — /model <name>, or /model <provider> <name> with one of {}",
+            tui::sanitize_terminal(&s.model),
+            config::PRESETS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
+        )));
+        keeping();
+        return None;
+    }
+    loop {
+        let mut p = match build_provider_with_key(s, new_key.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                tui::line(&tui::red(&format!(
+                    "  ✗ swap failed: {} — keeping the current model; nothing saved.",
+                    tui::sanitize_terminal(&e)
                 )));
-                match provider::validate(&p) {
-                    Ok(Some(new_model)) => {
-                        s.model = new_model.clone();
-                        tui::set_model_label(&new_model);
-                        provider.model = new_model;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tui::line(&tui::red(&format!(
-                            "  ✗ validation failed: {}",
-                            tui::sanitize_terminal(&e)
-                        )));
-                        let hint = if e.contains("401") || e.contains("403") {
-                            format!(
-                            "the API key was rejected — re-run /model to enter a new one, or update {}",
-                            if preset.id == "custom" { config::CUSTOM_KEY } else { preset.env_key }
-                        )
-                        } else if e.contains("404") || e.to_lowercase().contains("model") {
-                            format!("'{model}' doesn't look like a model this provider serves — check the name")
-                        } else if e.contains("Connection refused")
-                            || e.contains("connect error")
-                            || e.contains("connection failed")
-                        {
-                            format!(
-                                "nothing is answering at {} — start the server, then /model again",
-                                p.base_url
-                            )
-                        } else {
-                            "fix the issue above, then /model again".to_string()
-                        };
-                        tui::line(&tui::dim(&format!("    {hint}")));
-                        tui::line(&tui::dim(&format!(
-                            "    keeping the current model ({}).",
-                            provider.model
-                        )));
-                        return;
+                return None;
+            }
+        };
+        if preset.id == "ollama" {
+            return Some(p);
+        }
+        tui::line(&tui::dim(&format!(
+            "  validating {} — one-token probe…",
+            s.model
+        )));
+        let e = match provider::validate(&p) {
+            // The server answered only as its fallback name: run and save
+            // that, not the name it rejected.
+            Ok(Some(new_model)) => {
+                s.model = new_model.clone();
+                p.model = new_model;
+                return Some(p);
+            }
+            Ok(None) => {
+                let note = provider::unlisted_note(&p.model, &provider::served_names(&p));
+                if let Some(note) = &note {
+                    tui::line(&tui::yellow(&format!("  ⚠ {note}")));
+                }
+                SWAP_UNCONFIRMED.store(note.is_some(), std::sync::atomic::Ordering::Relaxed);
+                return Some(p);
+            }
+            Err(e) => e,
+        };
+        let fail = onboarding::Fail::from_error(&e);
+        if let onboarding::Fail::KeyRejected(code) = fail {
+            // A key typed here and refused is asked for again, as setup and
+            // /login do: the next paste must not land in the message box.
+            let typed = new_key.as_deref().is_some_and(|k| !k.is_empty());
+            let wants = preset.id == "custom" && p.api_key.is_none();
+            if typed || wants {
+                if let Some(why) = onboarding::plain_http_key_refusal(&p.base_url)
+                    .filter(|_| preset.id == "custom")
+                {
+                    tui::line(&tui::yellow(&format!(
+                        "  the endpoint wants an API key (HTTP {code}) — {why}"
+                    )));
+                    keeping();
+                    return None;
+                }
+                tui::line(&if typed {
+                    tui::red(&format!(
+                        "  ✗ rejected (HTTP {code}) — not saved. Paste it again, or Esc to cancel"
+                    ))
+                } else {
+                    tui::yellow(&format!(
+                        "  the endpoint wants an API key (HTTP {code}) — paste it, or Esc to cancel"
+                    ))
+                });
+                let prompt = if preset.id == "custom" {
+                    "  API key for this endpoint: ".to_string()
+                } else {
+                    format!("  {}: ", preset.env_key)
+                };
+                match onboarding::read_key(&prompt) {
+                    onboarding::KeyAnswer::Key(k) => *new_key = Some(k),
+                    _ => {
+                        swap_cancelled();
+                        return None;
                     }
                 }
+                continue;
             }
-            // The probe's one-token usage mustn't pose as the live prompt
-            // size, and a `--effort` given on the command line outlives the swap.
-            usage::forget_last();
-            let mut p = p;
-            p.effort = provider.effort;
-            *provider = p;
-            let mut changes = vec![
-                ("provider", Some(s.provider.as_str().into())),
-                ("model", Some(s.model.as_str().into())),
-            ];
-            if let Some(u) = base_url_change {
-                changes.push(("base_url", u.map(Into::into)));
-            }
-            save_user_settings(&changes);
-            provider::prewarm(provider);
-            tui::line(&tui::green(&format!(
-                "  ✓ active model hot-swapped → {} on {} (validated)",
-                model, preset.label
-            )));
         }
-        Err(e) => {
+        // One line for a model the server does not know: it names what the
+        // server serves, not the raw status and a second hint.
+        if fail == onboarding::Fail::ModelMissing {
+            let names = provider::served_names(&p);
             tui::line(&tui::red(&format!(
-                "  ✗ swap failed: {e} — keeping the current model."
+                "  ✗ the server does not know model {}{}",
+                tui::sanitize_terminal(&s.model),
+                if names.is_empty() {
+                    " — check the name".to_string()
+                } else {
+                    format!(" — it serves: {}", provider::served_summary(&names))
+                }
             )));
+            keeping();
+            return None;
         }
+        tui::line(&tui::red(&format!(
+            "  ✗ validation failed: {}",
+            tui::sanitize_terminal(&e)
+        )));
+        let hint = match fail {
+            onboarding::Fail::KeyRejected(_) => {
+                if let Some(k) = &p.api_key {
+                    config::record_key_check(&onboarding::key_slot(preset, &p.base_url), k, false);
+                }
+                "the API key was rejected — /login to replace it".to_string()
+            }
+            onboarding::Fail::ModelMissing => format!(
+                "'{}' doesn't look like a model this provider serves — check the name",
+                s.model
+            ),
+            onboarding::Fail::Unreachable => format!(
+                "nothing is answering at {} — start the server, then /model again",
+                tui::sanitize_terminal(&p.base_url)
+            ),
+            onboarding::Fail::Other(_) => "fix the issue above, then /model again".to_string(),
+        };
+        tui::line(&tui::dim(&format!("    {hint}")));
+        keeping();
+        return None;
     }
 }
 
@@ -2588,41 +4611,144 @@ fn handle_voice(arg: &str) -> Option<String> {
     }
 }
 
-fn handle_local(_provider: &mut Provider) {
+/// A model server /local asks about.
+#[derive(Debug, PartialEq)]
+struct LocalServer {
+    label: &'static str,
+    /// The preset `/model <preset> <name>` switches to.
+    preset: &'static str,
+    base: String,
+}
+
+/// The servers /local probes: the configured one first (a LAN Ollama, LM
+/// Studio on another port), then the addresses /model remembers for local
+/// presets, then each local preset at its default address.
+fn local_servers(settings: &Settings) -> Vec<LocalServer> {
+    let label = |id: &str| match id {
+        "ollama" => "Ollama",
+        "lmstudio" => "LM Studio",
+        "llamacpp" => "llama.cpp",
+        _ => "OpenAI-compatible server",
+    };
+    let mut out: Vec<LocalServer> = Vec::new();
+    let mut add = |preset: &'static str, base: &str| {
+        let root = base.trim_end_matches('/').trim_end_matches("/v1");
+        if !out.iter().any(|s| s.base.trim_end_matches("/v1") == root) {
+            out.push(LocalServer {
+                label: label(preset),
+                preset,
+                base: base.trim_end_matches('/').to_string(),
+            });
+        }
+    };
+    if let (Some(p), Some(base)) = (config::preset(&settings.provider), &settings.base_url) {
+        if p.local || (p.id == "custom" && is_loopback_url(base)) {
+            add(p.id, base);
+        }
+    }
+    for (id, base) in &settings.endpoints {
+        if let Some(p) = config::preset(id) {
+            if p.local || (p.id == "custom" && is_loopback_url(base)) {
+                add(p.id, base);
+            }
+        }
+    }
+    for p in config::PRESETS.iter().filter(|p| p.local) {
+        add(p.id, p.base_url);
+    }
+    out
+}
+
+fn handle_local(provider: &mut Provider) {
     tui::line(&tui::accent("  local models"));
-    tui::line(&tui::dim("  scanning local servers and model directories…"));
-    let mut servers = Vec::new();
-    if let Ok(o) = std::process::Command::new("curl")
-        .args(["-s", "http://localhost:11434/api/tags"])
-        .output()
-    {
-        if o.status.success() {
-            servers.push("Ollama (port 11434 - ACTIVE)");
-        }
-    }
-    if let Ok(o) = std::process::Command::new("curl")
-        .args(["-s", "http://localhost:8080/v1/models"])
-        .output()
-    {
-        if o.status.success() {
-            servers.push("llama.cpp / vLLM (port 8080 - ACTIVE)");
-        }
-    }
-    if servers.is_empty() {
-        tui::line(&tui::dim("  No running local model servers detected on port 11434 (Ollama) or 8080 (llama.cpp/vLLM)."));
-    } else {
-        for s in servers {
-            tui::line(&format!("  • {}", tui::green(s)));
+    let mut settings = config::load_settings().unwrap_or_default();
+    // Remembered addresses come from the user's own files only, like a swap.
+    settings.endpoints = config::load_user_settings()
+        .map(|u| u.endpoints)
+        .unwrap_or_default();
+    let servers = local_servers(&settings);
+    // Every server at once: a dead address costs its timeout, not the sum.
+    let found: Vec<Option<Vec<String>>> = std::thread::scope(|scope| {
+        let probes: Vec<_> = servers
+            .iter()
+            .map(|s| {
+                scope.spawn(move || match s.preset {
+                    "ollama" => provider::ollama_models_checked(&s.base),
+                    _ => provider::openai_models_checked(&s.base),
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
+    let mut suggestions = Vec::new();
+    for (s, models) in servers.iter().zip(found) {
+        // Names come from whatever answers on that port.
+        let shown_base = tui::sanitize_terminal(&s.base).into_owned();
+        match models {
+            None => tui::line(&tui::dim(&format!(
+                "  · {} at {shown_base} — not running",
+                s.label
+            ))),
+            Some(m) if m.is_empty() => tui::line(&format!(
+                "  • {} at {shown_base} — {}",
+                s.label,
+                tui::yellow(if s.preset == "ollama" {
+                    "running, no models yet (ollama pull <name>)"
+                } else {
+                    "running, no model loaded"
+                })
+            )),
+            Some(m) => {
+                let names: Vec<String> = m
+                    .iter()
+                    .map(|n| {
+                        let n = tui::sanitize_terminal(n).into_owned();
+                        if *n == provider.model {
+                            format!("{n} (current)")
+                        } else {
+                            n
+                        }
+                    })
+                    .collect();
+                tui::line(&format!(
+                    "  • {} at {shown_base} — {}",
+                    tui::green(s.label),
+                    names.join(", ")
+                ));
+                if let Some(first) = m.iter().find(|n| **n != provider.model) {
+                    suggestions.push(format!(
+                        "/model {} {}",
+                        s.preset,
+                        tui::sanitize_terminal(first)
+                    ));
+                }
+            }
         }
     }
     let ggufs = crate::local::scan_gguf();
     if !ggufs.is_empty() {
-        tui::line("  Local GGUF models found:");
-        for m in ggufs {
-            tui::line(&format!("    - {}", tui::bold(&tui::sanitize_terminal(&m))));
+        let llama_server = find_llama_server_binary().is_some();
+        tui::line("  GGUF files on disk:");
+        for m in &ggufs {
+            tui::line(&format!("    - {}", tui::bold(&tui::sanitize_terminal(m))));
+        }
+        match gguf_unservable(&ggufs[0], llama_server) {
+            Some(why) => tui::line(&tui::dim(&format!("    {why}"))),
+            None => suggestions.push(format!("/model {}", tui::sanitize_terminal(&ggufs[0]))),
         }
     }
-    tui::line(&tui::dim("  Tip: Use `/model ollama/llama3` or `/model local/qwen2.5-coder` to switch inference to local models."));
+    match suggestions.first() {
+        Some(_) => tui::line(&tui::dim(&format!(
+            "  switch with: {}",
+            suggestions.join("  ·  ")
+        ))),
+        None => tui::line(&tui::dim(
+            "  nothing to switch to yet — start Ollama, LM Studio or llama-server, or put a .gguf file in ~/.buildwithnexus/models",
+        )),
+    }
 }
 
 fn handle_rules(cwd: &std::path::Path) {
@@ -2641,9 +4767,11 @@ fn handle_rules(cwd: &std::path::Path) {
 // description carrying OSC 52 used to write to the user's clipboard.
 fn rules_listing(cwd: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut engine = crate::rules::RuleEngine::load_defaults();
+    let user_dir = config::home().join("rules");
+    let (mut engine, user_failures) = crate::rules::RuleEngine::load_with_overrides(&user_dir);
     let rules_dir = cwd.join(".buildwithnexus").join("rules");
-    let (loaded, failures) = load_workspace_rule_files(&rules_dir);
+    let (loaded, mut failures) = load_workspace_rule_files(&rules_dir);
+    failures.extend(user_failures);
     for r in loaded {
         engine.add_rule(r);
     }
@@ -2666,9 +4794,14 @@ fn rules_listing(cwd: &std::path::Path) -> Vec<String> {
             crate::rules::Severity::Low | crate::rules::Severity::Info => tui::dim("INFO/LOW"),
         };
         out.push(format!(
-            "  [{sev_badge}] {} — {}",
+            "  [{sev_badge}] {} — {}{}",
             tui::bold(&tui::sanitize_terminal(&r.id)),
-            tui::sanitize_terminal(&r.description)
+            tui::sanitize_terminal(&r.description),
+            if r.enabled {
+                String::new()
+            } else {
+                tui::dim(" (off)")
+            }
         ));
     }
     out
@@ -2887,6 +5020,355 @@ fn handle_kb_index(cwd: &std::path::Path) {
     }
 }
 
+// ── review ───────────────────────────────────────────────────────────────────
+
+/// `bwn review` exits with this when a finding is blocking.
+const EXIT_REVIEW_BLOCKING: i32 = 9;
+// Blocking findings of the headless review in this process.
+static REVIEW_BLOCKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// The diff a review sends is cut here; the model can read files for more.
+const MAX_REVIEW_DIFF_BYTES: usize = 200 * 1024;
+
+/// What to review: `--base <ref>` (the branch since it forked, plus
+/// uncommitted changes), `--staged`, or by default everything not yet
+/// committed; any other words are the focus.
+#[derive(Debug, Default, PartialEq)]
+struct ReviewRequest {
+    base: Option<String>,
+    staged: bool,
+    focus: String,
+}
+
+impl ReviewRequest {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut req = ReviewRequest::default();
+        let mut focus = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let (flag, inline) = a
+                .split_once('=')
+                .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
+            match flag {
+                "--base" => {
+                    let v = inline
+                        .map(str::to_string)
+                        .or_else(|| it.next().cloned())
+                        .filter(|v| !v.trim().is_empty() && !v.starts_with('-'))
+                        .ok_or("--base needs a git ref (e.g. --base origin/main)")?;
+                    req.base = Some(v);
+                }
+                "--staged" => req.staged = true,
+                f if looks_like_option(f) => {
+                    return Err(unknown_option_among(f, &["--base", "--staged"]))
+                }
+                _ => focus.push(a.clone()),
+            }
+        }
+        if req.staged && req.base.is_some() {
+            return Err("give --base or --staged, not both".into());
+        }
+        req.focus = focus.join(" ");
+        Ok(req)
+    }
+
+    // What the review covers, in words and as git diff arguments.
+    fn diffs(&self) -> Vec<(String, Vec<String>)> {
+        match (&self.base, self.staged) {
+            (Some(b), _) => vec![
+                (format!("changes since {b}"), vec![format!("{b}...HEAD")]),
+                ("uncommitted changes".into(), vec!["HEAD".into()]),
+            ],
+            (None, true) => vec![("staged changes".into(), vec!["--staged".into()])],
+            (None, false) => vec![("uncommitted changes".into(), vec!["HEAD".into()])],
+        }
+    }
+}
+
+// The diff text for `req`, each part headed; empty when nothing changed.
+fn review_diff(req: &ReviewRequest, cwd: &std::path::Path) -> Result<String, String> {
+    if let Some(base) = &req.base {
+        check_review_base(base, cwd)?;
+    }
+    let mut out = String::new();
+    for (what, args) in req.diffs() {
+        let mut cmd = vec!["--no-pager", "diff", "--no-color", "--no-ext-diff"];
+        cmd.extend(args.iter().map(String::as_str));
+        let text = git_in(cwd, &cmd).map_err(|e| format!("git diff failed: {e}"))?;
+        if !text.trim().is_empty() {
+            out.push_str(&format!("### {what}\n```diff\n{text}\n```\n"));
+        }
+    }
+    // A file git does not track yet is not yet committed either.
+    if !req.staged {
+        out.push_str(&untracked_diff(cwd));
+    }
+    if out.len() > MAX_REVIEW_DIFF_BYTES {
+        let mut cut = MAX_REVIEW_DIFF_BYTES;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n…(diff cut at 200 KiB — read the files for the rest)\n");
+    }
+    Ok(out)
+}
+
+// `base...HEAD` needs the base and a commit both sides share. A CI
+// checkout (actions/checkout's default fetch-depth 1) has neither, and
+// git's own error is a usage line naming nothing.
+fn check_review_base(base: &str, cwd: &std::path::Path) -> Result<(), String> {
+    const CI: &str = "in GitHub Actions, give actions/checkout `fetch-depth: 0`";
+    if git_in(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    )
+    .is_err()
+    {
+        let remotes = git_in(cwd, &["remote"]).unwrap_or_default();
+        let fetch = match base.split_once('/') {
+            Some((remote, branch)) if remotes.lines().any(|r| r == remote) => {
+                format!("git fetch {remote} {branch}")
+            }
+            Some(("origin", branch)) => format!("git fetch origin {branch}"),
+            _ => format!("git fetch origin {base}"),
+        };
+        return Err(format!(
+            "`{base}` is not in this checkout — fetch it (`{fetch}`), or {CI}"
+        ));
+    }
+    if git_in(cwd, &["merge-base", base, "HEAD"]).is_err() {
+        return Err(format!(
+            "HEAD has no history in common with `{base}` here — in a shallow clone, `git fetch --unshallow`; {CI}"
+        ));
+    }
+    Ok(())
+}
+
+// Files git neither tracks nor ignores, each as a new-file diff. Key and
+// credential files are named but not sent, as the file tools hide them;
+// links and binary files are named only.
+fn untracked_diff(cwd: &std::path::Path) -> String {
+    use std::io::Read;
+    let Ok(list) = git_in(cwd, &["ls-files", "--others", "--exclude-standard", "-z"]) else {
+        return String::new();
+    };
+    let mut body = String::new();
+    let mut left_out = Vec::new();
+    for rel in list.split('\0').filter(|p| !p.is_empty()) {
+        if body.len() > MAX_REVIEW_DIFF_BYTES {
+            break;
+        }
+        let path = cwd.join(rel);
+        if tools::is_sensitive(&path) {
+            left_out.push(rel);
+            continue;
+        }
+        let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+        let mut bytes = Vec::new();
+        let read = regular
+            && std::fs::File::open(&path)
+                .and_then(|f| f.take(MAX_REVIEW_DIFF_BYTES as u64).read_to_end(&mut bytes))
+                .is_ok();
+        body.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
+        match std::str::from_utf8(&bytes) {
+            Ok(text) if read && !bytes.contains(&0) => {
+                for l in text.lines() {
+                    body.push('+');
+                    body.push_str(l);
+                    body.push('\n');
+                }
+            }
+            _ => body.push_str("(not text: a link, a folder or a binary file)\n"),
+        }
+    }
+    let mut out = String::new();
+    if !body.is_empty() {
+        out.push_str(&format!(
+            "### new files, not yet tracked\n```diff\n{body}```\n"
+        ));
+    }
+    if !left_out.is_empty() {
+        out.push_str(&format!(
+            "(new files left out because they may hold keys or credentials: {})\n",
+            left_out.join(", ")
+        ));
+    }
+    out
+}
+
+fn review_task(req: &ReviewRequest, diff: &str) -> String {
+    let focus = if req.focus.is_empty() {
+        String::new()
+    } else {
+        format!("Focus on: {}.\n", req.focus)
+    };
+    format!(
+        "Review this change as a careful senior reviewer. Read the files around it when \
+         the diff alone is not enough. You cannot edit anything.\n{focus}\n\
+         End with the findings, one per line, exactly in this form:\n\
+         - [blocking] path/to/file.rs:42 — what is wrong and why it matters\n\
+         Severities: blocking (a bug, security hole or data loss that must be fixed \
+         before merging), major, minor, nit. Leave out the location when there is none. \
+         If there is nothing to report, say: No findings.\n\n{diff}"
+    )
+}
+
+#[derive(Debug, PartialEq)]
+struct Finding {
+    severity: String,
+    path: Option<String>,
+    line: Option<u64>,
+    message: String,
+}
+
+// `- [blocking] src/a.rs:42 — message` lines of a review answer.
+fn parse_findings(text: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let l = raw.trim().trim_start_matches(['-', '*', '•']).trim_start();
+        let Some(rest) = l.strip_prefix('[') else {
+            continue;
+        };
+        let Some((sev, body)) = rest.split_once(']') else {
+            continue;
+        };
+        let severity = sev.trim().to_ascii_lowercase();
+        if !matches!(severity.as_str(), "blocking" | "major" | "minor" | "nit") {
+            continue;
+        }
+        let body = body.trim();
+        let (loc, message) = match body.split_once(" — ").or_else(|| body.split_once(" - ")) {
+            Some((loc, msg)) if !loc.contains(' ') => (Some(loc.trim_matches('`')), msg.trim()),
+            _ => (None, body),
+        };
+        let (path, line) = match loc.and_then(|l| l.rsplit_once(':')) {
+            Some((p, n)) if n.parse::<u64>().is_ok() => (Some(p.to_string()), n.parse().ok()),
+            _ => (loc.map(str::to_string), None),
+        };
+        out.push(Finding {
+            severity,
+            path,
+            line,
+            message: message.to_string(),
+        });
+    }
+    out
+}
+
+// `bwn review`: one read-only review turn over the diff; a `finding`
+// event per issue, and exit 9 when one is blocking.
+fn headless_review(p: &Provider, req: &ReviewRequest, cwd: &std::path::Path) -> Result<(), String> {
+    let diff = review_diff(req, cwd)?;
+    if diff.trim().is_empty() {
+        report::notice("  nothing to review: no changes");
+        return Ok(());
+    }
+    let mut transcript = Vec::new();
+    let sid = session::claim_or_new();
+    let text = agent::run_review(p, &review_task(req, &diff), cwd, &mut transcript, &sid)?;
+    let findings = parse_findings(&text);
+    for f in &findings {
+        report::finding(&f.severity, f.path.as_deref(), f.line, &f.message);
+    }
+    let blocking = findings.iter().filter(|f| f.severity == "blocking").count();
+    REVIEW_BLOCKING.store(blocking, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+// `/review [--base <ref>|--staged] [focus]`: the same read-only review in
+// the session's conversation.
+fn handle_review(
+    provider: &Provider,
+    args: &str,
+    cwd: &std::path::Path,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) {
+    let words = shlex::split(args).unwrap_or_default();
+    let req = match ReviewRequest::parse(&words) {
+        Ok(r) => r,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            tui::line(&tui::dim(
+                "  usage: /review [--base <ref> | --staged] [focus]",
+            ));
+            return;
+        }
+    };
+    let diff = match review_diff(&req, cwd) {
+        Ok(d) if d.trim().is_empty() => {
+            tui::line(&tui::dim("  nothing to review: no changes"));
+            return;
+        }
+        Ok(d) => d,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            return;
+        }
+    };
+    let what: Vec<String> = req.diffs().into_iter().map(|(w, _)| w).collect();
+    tui::line(&tui::accent(&format!(
+        "  /review — {} (read-only)",
+        what.join(" and ")
+    )));
+    tui::line("");
+    if let Err(e) = agent::run_review(provider, &review_task(&req, &diff), cwd, transcript, sid) {
+        tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+    }
+    tui::bell();
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn review_targets_parse() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            ReviewRequest::parse(&a(&["--base", "origin/main", "auth", "paths"])).unwrap(),
+            ReviewRequest {
+                base: Some("origin/main".into()),
+                staged: false,
+                focus: "auth paths".into()
+            }
+        );
+        assert!(ReviewRequest::parse(&a(&["--base=main"]))
+            .unwrap()
+            .base
+            .is_some());
+        assert!(ReviewRequest::parse(&a(&["--base"])).is_err());
+        assert!(ReviewRequest::parse(&a(&["--staged", "--base", "x"])).is_err());
+        assert!(ReviewRequest::parse(&a(&["--bsae", "x"]))
+            .unwrap_err()
+            .contains("did you mean --base"));
+    }
+
+    #[test]
+    fn findings_are_read_from_the_answer() {
+        let text = "Looks fine overall.\n\
+                    - [blocking] src/auth.rs:42 — token compared with ==, timing leak\n\
+                    * [nit] README.md — typo in the title\n\
+                    - [minor] no tests for the new flag\n\
+                    - [later] not a severity\n";
+        let f = parse_findings(text);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0].severity, "blocking");
+        assert_eq!(f[0].path.as_deref(), Some("src/auth.rs"));
+        assert_eq!(f[0].line, Some(42));
+        assert_eq!(f[1].path.as_deref(), Some("README.md"));
+        assert_eq!(f[1].line, None);
+        assert_eq!(f[2].path, None);
+        assert_eq!(f[2].message, "no tests for the new flag");
+        assert!(parse_findings("No findings.").is_empty());
+    }
+}
+
 /// Returns false when the permission gate or a PreToolUse hook refused the
 /// project checks (which run the project's own build/test commands).
 fn handle_verify_audit(perm: Permission, cwd: &std::path::Path) -> bool {
@@ -2976,6 +5458,8 @@ fn handle_compact(provider: &Provider, transcript: &mut Vec<provider::Msg>) {
         return;
     }
     let before = transcript.len();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    hooks::pre_compact("manual", "", &cwd);
     let taken = std::mem::take(transcript);
     *transcript = agent::compact_msgs(provider, taken);
     usage::forget_last();
@@ -3020,6 +5504,12 @@ fn handle_workflows() {
             tui::dim(&s.task),
             iter_label
         ));
+        if let Some(why) = &s.reason {
+            tui::line(&tui::dim(&format!(
+                "        {}",
+                tui::sanitize_terminal(why)
+            )));
+        }
     }
     tui::line(&tui::rule());
     tui::line(&tui::dim(
@@ -3039,7 +5529,11 @@ fn handle_workflows() {
         }
     } else if let Some(rest) = action.strip_prefix('i') {
         if let Ok(id) = rest.trim().parse::<usize>() {
-            let lines = workflow::output(id);
+            // The run's --json events, as the lines they stand for.
+            let lines: Vec<String> = workflow::output(id)
+                .iter()
+                .filter_map(|l| workflow::readable(l))
+                .collect();
             if lines.is_empty() {
                 tui::line(&tui::dim(&format!(
                     "  no output captured for workflow #{id}"
@@ -3134,6 +5628,7 @@ fn detect_permission_switch(t: &str) -> Option<&'static str> {
                 .trim();
             match rest {
                 "ask" | "confirm" => return Some("ask"),
+                "accept edits" | "accept-edits" | "acceptedits" => return Some("accept-edits"),
                 "auto" | "yolo" | "approve all" => return Some("auto"),
                 "readonly" | "read only" | "read-only" | "safe" => return Some("readonly"),
                 _ => {}
@@ -3160,20 +5655,80 @@ fn save_user_settings(changes: &[(&str, Option<serde_json::Value>)]) {
     }
 }
 
-// Apply a permission string, update the in-session value, and persist to settings.json.
-fn apply_permission(perm: &mut Permission, ps: &str) {
-    *perm = agent::permission(ps);
-    hooks::set_permission_mode(agent::permission_name(*perm));
-    save_user_settings(&[("permission", Some(ps.into()))]);
+// How far a permission change reaches: a switch typed in the conversation
+// (or `/permissions <mode>`) lasts for this session; only an explicit
+// "save as default" writes the user settings file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PermScope {
+    Session,
+    Default,
+}
+
+// Apply a permission name to the session, and save it as the default only
+// when asked to.
+fn apply_permission(perm: &mut Permission, ps: &str, scope: PermScope) {
+    let new = match agent::parse_permission(ps) {
+        Ok(p) => p,
+        Err(e) => {
+            tui::line(&tui::red(&format!("  {e}")));
+            return;
+        }
+    };
+    *perm = new;
+    let name = agent::permission_name(new);
+    hooks::set_permission_mode(name);
     tui::set_permission_mode(permission_label(perm));
-    tui::line(&tui::green(&format!("  ✓ permission: {ps}")));
+    match scope {
+        PermScope::Session => tui::line(&tui::green(&format!(
+            "  ✓ permission: {name} for this session — /permissions to make it the default"
+        ))),
+        PermScope::Default => {
+            save_user_settings(&[("permission", Some(name.into()))]);
+            tui::line(&tui::green(&format!(
+                "  ✓ permission: {name} — saved as the default for every project"
+            )));
+        }
+    }
 }
 
 fn permission_label(perm: &Permission) -> &'static str {
-    match perm {
-        Permission::Ask => "ask",
-        Permission::Auto => "auto",
-        Permission::ReadOnly => "readonly",
+    agent::permission_name(*perm)
+}
+
+// `/permissions <arg>`: a mode for this session, `default <mode>` to save
+// it, or the saved-approval commands.
+fn handle_permissions_arg(perm: &mut Permission, cwd: &std::path::Path, arg: &str) {
+    // The numbers are the picker's rows, 1-3 as in 0.14.
+    let mode = |a: &str| match a {
+        "1" => Some("ask"),
+        "2" => Some("auto"),
+        "3" => Some("readonly"),
+        "4" => Some("accept-edits"),
+        other => agent::parse_permission(other)
+            .ok()
+            .map(agent::permission_name),
+    };
+    if let Some(rest) = arg.strip_prefix("default") {
+        match mode(rest.trim()) {
+            Some(m) => apply_permission(perm, m, PermScope::Default),
+            None => tui::line(&tui::red(
+                "  usage: /permissions default <ask|accept-edits|auto|readonly>",
+            )),
+        }
+        return;
+    }
+    match arg {
+        "reset" => handle_permissions_reset(cwd),
+        "list" => print_saved_approvals(cwd),
+        other if other.starts_with("remove ") => {
+            handle_permissions_remove(cwd, &other["remove ".len()..])
+        }
+        other => match mode(other) {
+            Some(m) => apply_permission(perm, m, PermScope::Session),
+            None => tui::line(&tui::red(&format!(
+                "  unknown permission '{other}' — try: ask, accept-edits, auto, readonly, default <mode>, list, remove <entry>, reset"
+            ))),
+        },
     }
 }
 
@@ -3193,33 +5748,111 @@ fn handle_permissions_reset(cwd: &std::path::Path) {
     }
 }
 
+// What `s` and `a` answers allow in this project, and how to take them back;
+// then the allow, ask and deny rules in force, each with its file.
+fn print_saved_approvals(cwd: &std::path::Path) {
+    let rules = config::policy_rules(cwd);
+    if !rules.is_empty() {
+        tui::line("  rules (deny > ask > allow > mode):");
+        for r in &rules {
+            let what = if r.network {
+                format!("network.{}", r.effect.as_str())
+            } else {
+                r.effect.as_str().to_string()
+            };
+            tui::line(&format!(
+                "    {what:<13} {}  {}",
+                tui::sanitize_terminal(&r.rule),
+                tui::dim(&format!("— {}", r.source))
+            ));
+        }
+    }
+    let always = config::load_project_allowed(cwd);
+    let session = agent::session_allowed(cwd);
+    if always.is_empty() && session.is_empty() {
+        tui::line(&tui::dim(
+            "  no saved approvals for this project (answer s or a at an approval to add one)",
+        ));
+        return;
+    }
+    for (title, keys) in [
+        ("always allowed in this project", &always),
+        ("allowed for this session", &session),
+    ] {
+        if keys.is_empty() {
+            continue;
+        }
+        tui::line(&format!("  {title}:"));
+        for k in keys {
+            tui::line(&format!("    {}", tui::sanitize_terminal(k)));
+        }
+    }
+    tui::line(&tui::dim(
+        "  /permissions remove <entry> forgets one · /permissions reset forgets them all",
+    ));
+}
+
+// `/permissions remove <entry>`: forget one saved approval, both the
+// project's "always" entry and this session's.
+fn handle_permissions_remove(cwd: &std::path::Path, key: &str) {
+    let key = key.trim().trim_matches('`');
+    let always = config::remove_project_allowed(cwd, key);
+    let session = agent::remove_session_allowed(cwd, key);
+    let shown = tui::sanitize_terminal(key);
+    if always || session {
+        tui::line(&tui::green(&format!("  ✓ removed: {shown}")));
+    } else {
+        tui::line(&tui::yellow(&format!(
+            "  no saved approval '{shown}' — /permissions list shows them"
+        )));
+    }
+}
+
 fn handle_permissions(perm: &mut Permission, cwd: &std::path::Path) {
     if let Some(n) = agent::ignored_approvals_notice(cwd) {
         report::notice(&format!("  {n}"));
     }
+    print_saved_approvals(cwd);
     let current = permission_label(perm);
-    let items = vec![
+    // 0.14's rows keep their places; accept-edits is added last, so a row
+    // picked from memory never lands on a looser mode.
+    let modes = [
+        (
+            "ask",
+            "Confirm before each file write or command (recommended)",
+        ),
+        ("auto", "Auto-approve all safe tool operations (yolo)"),
+        ("readonly", "Never write files or run mutating commands"),
+        (
+            "accept-edits",
+            "Apply file edits in this project without asking; commands and network still ask",
+        ),
+    ];
+    let items: Vec<tui::SelectItem> = modes
+        .iter()
+        .map(|(label, detail)| tui::SelectItem {
+            label: (*label).into(),
+            detail: (*detail).into(),
+        })
+        .collect();
+    let title = format!("Select Tool Permission Mode (Current: {current})");
+    let Some(&(mode, _)) = tui::select_item(&title, &items).and_then(|i| modes.get(i)) else {
+        return;
+    };
+    let scopes = [
         tui::SelectItem {
-            label: "ask".into(),
-            detail: "Confirm before each file write or command (recommended)".into(),
+            label: "this session".into(),
+            detail: "Back to the saved default next time".into(),
         },
         tui::SelectItem {
-            label: "auto".into(),
-            detail: "Auto-approve all safe tool operations (yolo)".into(),
-        },
-        tui::SelectItem {
-            label: "readonly".into(),
-            detail: "Never write files or run mutating commands".into(),
+            label: "save as default".into(),
+            detail: "Every new session, in every project".into(),
         },
     ];
-    let title = format!("Select Tool Permission Mode (Current: {current})");
-    if let Some(idx) = tui::select_item(&title, &items) {
-        match idx {
-            0 => apply_permission(perm, "ask"),
-            1 => apply_permission(perm, "auto"),
-            2 => apply_permission(perm, "readonly"),
-            _ => {}
-        }
+    match tui::select_item(&format!("Use {mode} for"), &scopes) {
+        Some(0) => apply_permission(perm, mode, PermScope::Session),
+        Some(1) => apply_permission(perm, mode, PermScope::Default),
+        _ => {}
     }
 }
 
@@ -3294,39 +5927,579 @@ fn handle_mouse(arg: Option<&str>) {
     }
 }
 
-fn handle_diff(cwd: &std::path::Path) {
-    let out = tools::run(
-        "run_command",
-        &serde_json::json!({"command": "git diff --stat && git diff --shortstat"}),
-        cwd,
+// Git for bwn's own commands (/commit, /diff), never for the model. A
+// repository's config can name programs git runs (fsmonitor, an external
+// diff, textconv, filters), so unless every repository-level key is known
+// to be inert the person is asked first.
+fn git_may_run(cwd: &std::path::Path, ask: &mut dyn FnMut(&str) -> Option<String>) -> bool {
+    if tools::skips_prompt_safely("git status", cwd) {
+        return true;
+    }
+    let a = ask(
+        "  this repository's git config can run programs (hooks, filters, an external diff) — run git here anyway? [y/N]: ",
     );
-    // File names in the stat come from the checkout.
-    for line in tui::sanitize_terminal(&out.content).lines() {
-        tui::line(&tui::dim(&format!("  {line}")));
+    matches!(a.as_deref().map(str::trim), Some("y" | "Y" | "yes" | "YES"))
+}
+
+// `@diff` and `@status` run git as /diff does: in a repository whose config
+// can name programs the person is asked first, and without a terminal to
+// ask, nothing is attached and the notice says why.
+fn git_attachment_may_run(word: &str, cwd: &std::path::Path) -> bool {
+    if tools::skips_prompt_safely("git status", cwd) {
+        return true;
+    }
+    if report::is_json() || !std::io::stdin().is_terminal() {
+        report::notice(&format!(
+            "  {word} not attached: this repository's git config can run programs (hooks, filters, an external diff)"
+        ));
+        return false;
+    }
+    git_may_run(cwd, &mut |q| tui::ask(q))
+}
+
+fn git_text(cwd: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+// `/commit`: the model drafts the message, bwn shows it, and nothing is
+// committed until the person answers c.
+fn handle_commit(provider: &Provider, cwd: &std::path::Path) {
+    commit_flow(
+        cwd,
+        |stat, diff| agent::draft_commit_message(provider, stat, diff),
+        &mut |q| tui::ask(q),
+    );
+}
+
+// Returns the new commit's one-line summary when a commit was made.
+fn commit_flow(
+    cwd: &std::path::Path,
+    draft: impl FnOnce(&str, &str) -> Result<String, String>,
+    ask: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    if !git_may_run(cwd, ask) {
+        tui::line(&tui::dim("  cancelled — nothing committed"));
+        return None;
+    }
+    let stat = match git_text(cwd, &["diff", "--staged", "--stat", "--no-ext-diff"]) {
+        Ok(s) => s,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  /commit needs a git repository: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return None;
+        }
+    };
+    if stat.trim().is_empty() {
+        tui::line(&tui::yellow(
+            "  nothing is staged — `git add <files>` first, then /commit",
+        ));
+        return None;
+    }
+    let diff =
+        git_text(cwd, &["diff", "--staged", "--no-ext-diff", "--no-textconv"]).unwrap_or_default();
+    let mut msg = match draft(&stat, &diff) {
+        Ok(m) => m,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  could not draft a commit message: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return None;
+        }
+    };
+    loop {
+        tui::line(&tui::accent("  proposed commit message:"));
+        // The draft is model text.
+        for l in tui::sanitize_terminal(&msg).lines() {
+            tui::line(&format!("    {l}"));
+        }
+        let answer = ask("  [c]ommit · [e]dit · [n]o: ");
+        match answer.as_deref().map(str::trim) {
+            Some("c" | "C" | "commit") => break,
+            Some("e" | "E" | "edit") => {
+                if let Some(new) = ask("  new message (Enter keeps the proposed one): ") {
+                    if !new.trim().is_empty() {
+                        msg = new.trim().to_string();
+                    }
+                }
+            }
+            _ => {
+                tui::line(&tui::dim("  not committed — the changes stay staged"));
+                return None;
+            }
+        }
+    }
+    match git_commit(cwd, &msg) {
+        Ok(summary) => {
+            checkpoint::note_commit(cwd);
+            tui::line(&tui::green(&format!(
+                "  ✓ committed {}",
+                tui::sanitize_terminal(&summary)
+            )));
+            Some(summary)
+        }
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  git commit failed: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            None
+        }
     }
 }
 
-fn msg_token_estimate(msgs: &[provider::Msg]) -> usize {
-    let chars: usize = msgs
-        .iter()
-        .map(|m| match m {
-            provider::Msg::System(s) | provider::Msg::User(s) => s.len(),
-            provider::Msg::UserImages { text, images } => text.len() + images.len() * 1024,
-            provider::Msg::Assistant { text, calls } => {
-                text.len()
-                    + calls
-                        .iter()
-                        .map(|c| c.input.to_string().len())
-                        .sum::<usize>()
-            }
-            provider::Msg::Tool(results) => results.iter().map(|r| r.content.len()).sum(),
-        })
-        .sum();
-    chars / 4
+fn git_commit(cwd: &std::path::Path, msg: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor=false", "commit", "-q", "-F", "-"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(msg.as_bytes());
+    }
+    let o = child
+        .wait_with_output()
+        .map_err(|e| format!("git commit: {e}"))?;
+    if !o.status.success() {
+        let mut out = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        if out.is_empty() {
+            out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        }
+        return Err(out);
+    }
+    Ok(git_text(cwd, &["log", "-1", "--oneline", "--no-decorate"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default())
 }
 
-fn handle_context(transcript: &[provider::Msg], total: usize) {
-    let estimate = msg_token_estimate(transcript);
+// One changed path in the working tree, as /diff lists it.
+#[derive(Debug, PartialEq)]
+struct ChangedFile {
+    /// Relative to the repository root; a new folder ends with '/'.
+    path: String,
+    /// git's two status letters ("M ", " M", "??", "A ", " D", "R ").
+    status: String,
+    added: usize,
+    removed: usize,
+}
+
+impl ChangedFile {
+    fn kind(&self) -> &'static str {
+        match self.status.as_str() {
+            "??" if self.path.ends_with('/') => "new folder",
+            "??" => "new",
+            s if s.contains('D') => "deleted",
+            s if s.contains('R') => "renamed",
+            s if s.contains('A') => "added",
+            _ => "modified",
+        }
+    }
+}
+
+// `git status --porcelain=v1 -z` entries as (status, path); a rename's
+// source path is skipped.
+fn parse_porcelain(z: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut parts = z.split('\0');
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (xy, path) = (&entry[..2], &entry[3..]);
+        if xy.contains(['R', 'C']) {
+            parts.next();
+        }
+        out.push((xy.to_string(), path.to_string()));
+    }
+    out
+}
+
+// `git diff --numstat -z` (added, removed) by path; binary files count 0.
+fn parse_numstat(z: &str) -> std::collections::HashMap<String, (usize, usize)> {
+    let mut out = std::collections::HashMap::new();
+    for rec in z.split('\0') {
+        let mut f = rec.splitn(3, '\t');
+        let (Some(a), Some(r), Some(path)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        out.insert(
+            path.trim_start_matches('\n').to_string(),
+            (a.parse().unwrap_or(0), r.parse().unwrap_or(0)),
+        );
+    }
+    out
+}
+
+// Lines in a new file, or in every file under a new folder (bounded).
+fn new_lines(path: &std::path::Path) -> usize {
+    let count = |p: &std::path::Path| {
+        std::fs::read(p)
+            .ok()
+            .filter(|b| b.len() <= MAX_DIFF_BYTES)
+            .map(|b| b.iter().filter(|c| **c == b'\n').count())
+            .unwrap_or(0)
+    };
+    if !path.is_dir() {
+        return count(path);
+    }
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    let mut seen = 0;
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            seen += 1;
+            if seen > 2000 {
+                return total;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                total += count(&p);
+            }
+        }
+    }
+    total
+}
+
+const MAX_DIFF_BYTES: usize = 512 * 1024;
+
+fn changed_files(cwd: &std::path::Path) -> Result<(PathBuf, Vec<ChangedFile>), String> {
+    let top = PathBuf::from(git_text(cwd, &["rev-parse", "--show-toplevel"])?.trim());
+    let status = git_text(
+        cwd,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )?;
+    // Against HEAD when there is one: staged and unstaged changes together.
+    let numstat = git_text(
+        cwd,
+        &[
+            "diff",
+            "HEAD",
+            "--numstat",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
+    )
+    .or_else(|_| {
+        git_text(
+            cwd,
+            &["diff", "--cached", "--numstat", "-z", "--no-ext-diff"],
+        )
+    })
+    .unwrap_or_default();
+    let counts = parse_numstat(&numstat);
+    let files = parse_porcelain(&status)
+        .into_iter()
+        .map(|(status, path)| {
+            let (added, removed) = if status == "??" {
+                (new_lines(&top.join(&path)), 0)
+            } else {
+                counts.get(&path).copied().unwrap_or((0, 0))
+            };
+            ChangedFile {
+                path,
+                status,
+                added,
+                removed,
+            }
+        })
+        .collect();
+    Ok((top, files))
+}
+
+fn diff_summary(files: &[ChangedFile]) -> String {
+    let added: usize = files.iter().map(|f| f.added).sum();
+    let removed: usize = files.iter().map(|f| f.removed).sum();
+    format!(
+        "{} file{} changed, {added} insertion{}(+), {removed} deletion{}(-)",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        if added == 1 { "" } else { "s" },
+        if removed == 1 { "" } else { "s" },
+    )
+}
+
+// /diff: every changed and new file with its line counts and one summary;
+// picking a file shows its diff. `/diff turn` shows what the last agent
+// turn changed.
+fn handle_diff(cwd: &std::path::Path, arg: &str) {
+    let mut ask = |q: &str| tui::ask(q);
+    if !git_may_run(cwd, &mut ask) {
+        tui::line(&tui::dim("  cancelled"));
+        return;
+    }
+    if arg.trim() == "turn" {
+        diff_last_turn(cwd);
+        return;
+    }
+    let (top, files) = match changed_files(cwd) {
+        Ok(v) => v,
+        Err(e) => {
+            tui::line(&tui::red(&format!(
+                "  /diff needs a git repository: {}",
+                tui::sanitize_terminal(&e)
+            )));
+            return;
+        }
+    };
+    if files.is_empty() {
+        tui::line(&tui::dim("  no changes — the working tree matches HEAD"));
+        return;
+    }
+    // File names come from the checkout.
+    for f in &files {
+        tui::line(&format!(
+            "  {:<10} {}  {}",
+            tui::dim(f.kind()),
+            tui::sanitize_terminal(&f.path),
+            tui::dim(&format!("+{} -{}", f.added, f.removed))
+        ));
+    }
+    tui::line(&tui::dim(&format!("  {}", diff_summary(&files))));
+    // The picker draws over the rows above the composer; keep the list in view.
+    if tui::is_raw() {
+        for _ in 0..files.len() + 2 {
+            tui::line("");
+        }
+    }
+    let items: Vec<tui::SelectItem> = files
+        .iter()
+        .map(|f| tui::SelectItem {
+            label: f.path.clone(),
+            detail: format!("{} +{} -{}", f.kind(), f.added, f.removed),
+        })
+        .collect();
+    if let Some(i) = tui::select_item("Show the diff of", &items) {
+        show_file_diff(&top, &files[i]);
+    }
+}
+
+fn read_capped(p: &std::path::Path) -> Option<String> {
+    std::fs::metadata(p)
+        .ok()
+        .filter(|m| m.len() as usize <= MAX_DIFF_BYTES)?;
+    std::fs::read_to_string(p).ok()
+}
+
+fn show_file_diff(top: &std::path::Path, f: &ChangedFile) {
+    let path = top.join(&f.path);
+    if f.status == "??" && path.is_dir() {
+        let mut stack = vec![path];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Some(new) = read_capped(&p) {
+                    let shown = p.strip_prefix(top).unwrap_or(&p).display().to_string();
+                    report::diff(&shown, "", &new);
+                }
+            }
+        }
+        return;
+    }
+    let old = if f.status == "??" || f.status.contains('A') {
+        Some(String::new())
+    } else {
+        git_text(top, &["show", &format!("HEAD:{}", f.path)])
+            .ok()
+            .filter(|t| t.len() <= MAX_DIFF_BYTES)
+    };
+    let new = if f.status.contains('D') {
+        Some(String::new())
+    } else {
+        read_capped(&path)
+    };
+    match (old, new) {
+        (Some(old), Some(new)) => report::diff(&f.path, &old, &new),
+        _ => tui::line(&tui::dim(&format!(
+            "  {} is too large or not text to show here — git diff -- {}",
+            tui::sanitize_terminal(&f.path),
+            tui::sanitize_terminal(&f.path)
+        ))),
+    }
+}
+
+// What the last agent turn changed: each checkpointed file against its
+// state before the turn, and the files shell commands changed.
+fn diff_last_turn(cwd: &std::path::Path) {
+    let Some(last) = checkpoint::last_turn(cwd) else {
+        tui::line(&tui::dim("  no agent turn recorded in this folder"));
+        return;
+    };
+    tui::line(&tui::dim(&format!(
+        "  the last turn, '{}' ({}):",
+        tui::sanitize_terminal(&last.turn.task),
+        session::ago(last.turn.started_ms)
+    )));
+    // Oldest checkpoint per file holds its contents before the turn.
+    let mut firsts: Vec<&checkpoint::Checkpoint> = Vec::new();
+    for cp in last.checkpoints.iter().rev() {
+        if !firsts.iter().any(|f| f.path == cp.path) {
+            firsts.push(cp);
+        }
+    }
+    for cp in &firsts {
+        let shown = checkpoint::shown_path(&cp.path, cwd);
+        let before = if cp.existed {
+            Some(cp.content.clone())
+        } else {
+            Some(String::new())
+        };
+        match (
+            before.filter(|_| cp.snapshotted),
+            read_capped(&cp.path).or_else(|| (!cp.path.exists()).then(String::new)),
+        ) {
+            (Some(old), Some(new)) => report::diff(&shown, &old, &new),
+            _ => tui::line(&tui::dim(&format!(
+                "  {} — no snapshot to compare (too large or not text)",
+                tui::sanitize_terminal(&shown)
+            ))),
+        }
+    }
+    if !last.turn.untracked.is_empty() {
+        tui::line(&tui::dim("  changed by shell commands (against HEAD):"));
+        for rel in &last.turn.untracked {
+            tui::line(&tui::dim(&format!("    - {}", tui::sanitize_terminal(rel))));
+        }
+    }
+    if firsts.is_empty() && last.turn.untracked.is_empty() {
+        tui::line(&tui::dim("  it changed no files"));
+    }
+}
+
+/// Where the next request's tokens go, estimated at four characters a token
+/// (images by their encoded size, as compaction counts them).
+#[derive(Debug, Default, PartialEq)]
+struct ContextBreakdown {
+    system: usize,
+    tools: usize,
+    mcp_tools: usize,
+    conversation: usize,
+    images: usize,
+}
+
+impl ContextBreakdown {
+    fn total(&self) -> usize {
+        self.system + self.tools + self.mcp_tools + self.conversation + self.images
+    }
+}
+
+fn context_breakdown(msgs: &[provider::Msg], tools: &[tools::ToolDef]) -> ContextBreakdown {
+    let mut b = ContextBreakdown::default();
+    for m in msgs {
+        match m {
+            provider::Msg::System(s) => b.system += s.len() / 4,
+            provider::Msg::User(s) => b.conversation += s.len() / 4,
+            provider::Msg::UserImages { text, images } => {
+                b.conversation += text.len() / 4;
+                b.images += images.iter().map(|(_, d)| d.len() / 3).sum::<usize>() / 4;
+            }
+            provider::Msg::Assistant { text, calls } => {
+                b.conversation += (text.len()
+                    + calls
+                        .iter()
+                        .map(|c| c.name.len() + c.input.to_string().len())
+                        .sum::<usize>())
+                    / 4;
+            }
+            provider::Msg::Tool(results) => {
+                b.conversation += results.iter().map(|r| r.content.len()).sum::<usize>() / 4;
+                b.images += results
+                    .iter()
+                    .flat_map(|r| &r.images)
+                    .map(|(_, d)| d.len() / 3)
+                    .sum::<usize>()
+                    / 4;
+            }
+        }
+    }
+    for t in tools {
+        let size = (t.name.len() + t.description.len() + t.schema.to_string().len()) / 4;
+        if mcp::is_mcp_tool(t.name) {
+            b.mcp_tools += size;
+        } else {
+            b.tools += size;
+        }
+    }
+    b
+}
+
+// Tokens the next request would carry, as /context counts them.
+fn context_in_use(transcript: &[provider::Msg], total: usize) -> usize {
+    let measured = if transcript.is_empty() {
+        None
+    } else {
+        usage::last_context_tokens()
+    };
+    measured.unwrap_or_else(|| {
+        let tools = tools::defs_for_context(true, total);
+        context_breakdown(transcript, &tools).total()
+    })
+}
+
+// Whether `p`'s window is bwn's guess for an endpoint that did not say: a
+// local server or a custom endpoint, where the guess is 8k. A hosted
+// preset's window is the provider's documented one.
+fn window_guessed(p: &Provider) -> bool {
+    !provider::window_is_known(p)
+        && (is_loopback_url(&p.base_url)
+            || active_preset()
+                .is_some_and(|id| id == "custom" || config::preset(&id).is_some_and(|pr| pr.local)))
+}
+
+// For /context and /teamwork: whether the window is a guess, and what the
+// compact tool set it leads to leaves out. Empty when neither applies.
+fn window_notes(p: &Provider) -> Vec<String> {
+    let window = provider::short_tokens(p.context_tokens);
+    let mut out = Vec::new();
+    if window_guessed(p) {
+        out.push(format!(
+            "this endpoint did not report its context window, so bwn assumes {window} tokens"
+        ));
+    }
+    if tools::compact_surface(p.context_tokens) {
+        out.push(format!(
+            "at {window} tokens the model gets the compact tool set: no helpers, todo list \
+             or screenshots"
+        ));
+    }
+    if !out.is_empty() {
+        out.push(
+            "set \"context_tokens\" in settings.json to the model's real window \
+             (a window of 32,768 tokens or more offers every tool)"
+                .into(),
+        );
+    }
+    out
+}
+
+fn handle_context(transcript: &[provider::Msg], p: &Provider) {
+    let total = p.context_tokens;
+    let tools = tools::defs_for_context(true, total);
+    let b = context_breakdown(transcript, &tools);
+    let estimate = b.total();
     // The server's own count for the last request beats the chars/4 guess,
     // but only while the transcript it measured is still the live one.
     let measured = if transcript.is_empty() {
@@ -3334,17 +6507,45 @@ fn handle_context(transcript: &[provider::Msg], total: usize) {
     } else {
         usage::last_context_tokens()
     };
-    tui::context_meter(measured.unwrap_or(estimate), total);
+    let used = measured.unwrap_or(estimate);
+    tui::context_meter(used, total);
+    let pct = (used * 100).checked_div(total).unwrap_or(0);
+    tui::line(&format!(
+        "  context: {} of {} tokens ({pct}%)",
+        provider::short_tokens(used),
+        provider::short_tokens(total)
+    ));
+    let rows = [
+        ("system prompt", b.system),
+        ("tools", b.tools),
+        ("MCP tools", b.mcp_tools),
+        ("conversation", b.conversation),
+        ("images", b.images),
+    ];
+    for (name, n) in rows {
+        tui::line(&tui::dim(&format!(
+            "    {name:<14} {:>7}",
+            provider::short_tokens(n)
+        )));
+    }
     tui::line(&tui::dim(&match measured {
-        Some(_) => {
-            format!("  measured from the last request's usage (chars/4 estimate: {estimate})")
-        }
-        None => "  estimated (chars/4) — no usage reported yet".to_string(),
+        Some(_) => format!(
+            "  total measured from the last request; rows estimated at 4 characters a token · {} messages",
+            transcript.len()
+        ),
+        None => format!(
+            "  estimated at 4 characters a token — no usage reported yet · {} messages",
+            transcript.len()
+        ),
     }));
-    tui::line(&tui::dim(&format!(
-        "  {} messages in session",
-        transcript.len()
-    )));
+    if pct >= 80 {
+        tui::line(&tui::yellow(
+            "  nearly full — /compact summarizes the conversation to make room",
+        ));
+    }
+    for note in window_notes(p) {
+        tui::line(&tui::yellow(&format!("  {note}")));
+    }
 }
 
 fn handle_cost(provider: &Provider) {
@@ -3379,46 +6580,410 @@ fn handle_effort(provider: &mut Provider, arg: &str) {
     }
 }
 
+const CHECKPOINT_ROWS: usize = 15;
+
+// /checkpoints: newest first, grouped by the task that made them, with age
+// and paths relative to this folder.
 fn handle_checkpoints(cwd: &std::path::Path) {
+    let pruned = checkpoint::prune_once(cwd);
+    if pruned > 0 {
+        tui::line(&tui::dim(&format!(
+            "  pruned {pruned} old checkpoints — this folder keeps the newest {}",
+            checkpoint::KEEP_CHECKPOINTS
+        )));
+    }
     let items = checkpoint::list(cwd);
     if items.is_empty() {
         tui::line(&tui::dim("  no checkpoints for this directory"));
         return;
     }
-    // Paths are wherever the model wrote; checkpoint files are on disk.
-    for cp in items.iter().take(10) {
+    tui::line(&tui::dim(
+        "  checkpoints in this folder, newest first — /undo <id> restores one, /undo the last task",
+    ));
+    let mut group: Option<(Option<&str>, String)> = None;
+    for cp in items.iter().take(CHECKPOINT_ROWS) {
+        let task = cp.task.as_deref();
+        let age = session::ago(cp.created_ms);
+        if group.as_ref() != Some(&(task, age.clone())) {
+            // Task text is the person's prompt; paths are wherever the model wrote.
+            tui::line(&format!(
+                "  {}  {}",
+                tui::bold(&age),
+                tui::sanitize_terminal(task.unwrap_or("(task not recorded)"))
+            ));
+            group = Some((task, age));
+        }
         tui::line(&format!(
-            "  {}  {}  {}",
-            tui::bold(&tui::sanitize_terminal(&cp.id)),
+            "    {}  {:<11} {}",
+            tui::dim(&tui::sanitize_terminal(&cp.id)),
             tui::sanitize_terminal(&cp.action),
-            tui::sanitize_terminal(&cp.path.display().to_string())
+            tui::sanitize_terminal(&checkpoint::shown_path(&cp.path, cwd))
         ));
     }
+    if items.len() > CHECKPOINT_ROWS {
+        tui::line(&tui::dim(&format!(
+            "  … {} older — this folder keeps the newest {}",
+            items.len() - CHECKPOINT_ROWS,
+            checkpoint::KEEP_CHECKPOINTS
+        )));
+    }
+}
+
+// The repository's instruction files steer the model: the first launch
+// with this folder and content asks whether to use them, and they are used
+// only on a yes (No is the default, as for every trust question). After a
+// yes they are named in a dim line. The question takes whole answers, so a
+// task typed meanwhile is never read as one: it is kept for the input box.
+fn review_repo_instructions(cwd: &std::path::Path) {
+    let Some(repo) = config::repo_instructions(cwd) else {
+        return;
+    };
+    // File names come from the checkout.
+    let notice = tui::sanitize_terminal(&repo.notice()).into_owned();
+    if repo.acknowledged(cwd) {
+        tui::line(&tui::dim(&format!("  {notice}")));
+        return;
+    }
+    // Answered no on the trust screen this launch.
+    if config::repo_instructions_declined() {
+        tui::line(&tui::dim(&format!(
+            "  ✗ not using {notice} this session — asked again next time"
+        )));
+        return;
+    }
+    // Prompts piped in: the first one is not an answer to this.
+    if !std::io::stdin().is_terminal() {
+        tui::line(&tui::dim(&format!("  {notice} (not reviewed)")));
+        return;
+    }
+    tui::line(&tui::yellow(&format!(
+        "  {notice} — the model follows these files from the checkout"
+    )));
+    let mut held: Vec<String> = Vec::new();
+    let used = loop {
+        let Some(answer) = tui::ask("  use them? y yes · n no · r review [N]: ") else {
+            break false;
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => break true,
+            "" | "n" | "no" => break false,
+            "r" | "review" => show_instruction_files(&repo.files),
+            _ => {
+                held.push(answer);
+                tui::line(&tui::dim(
+                    "  (answer y or n first — your text is kept for the input box)",
+                ));
+            }
+        }
+    };
+    if used {
+        repo.acknowledge(cwd);
+        tui::line(&tui::dim(&format!(
+            "  ✓ using {notice} — asked again when they change"
+        )));
+    } else {
+        config::decline_repo_instructions();
+        tui::line(&tui::dim(&format!(
+            "  ✗ not using {notice} this session — asked again next time"
+        )));
+    }
+    if !held.is_empty() {
+        tui::prefill_composer(&held.join("\n"));
+    }
+}
+
+pub(crate) fn show_instruction_files(files: &[config::InstructionFile]) {
+    for f in files {
+        tui::line(&tui::bold(&format!(
+            "  ── {} ──",
+            tui::sanitize_terminal(&f.label)
+        )));
+        for l in tui::sanitize_terminal(&f.content).lines() {
+            tui::line(&format!("    {l}"));
+        }
+        if f.truncated {
+            tui::line(&tui::dim(
+                "    … cut here: the model is sent the text above",
+            ));
+        }
+    }
+}
+
+// A prompt of this run that /rewind can go back to: where its messages
+// start in the transcript, when its turn began (checkpoints after it are its
+// changes and later ones), the text sent, and the text as typed (before
+// attached files were added), which goes back in the input box.
+struct RewindPoint {
+    index: usize,
+    started_ms: u128,
+    prompt: String,
+    typed: String,
+}
+
+// Drops the point's prompt and everything after it from the conversation.
+// The prompt is found at or after its recorded index (a turn may put the
+// system prompt first); a hook may have appended context to it. False when
+// it is no longer there (compacted away), leaving the transcript alone.
+fn rewind_transcript(transcript: &mut Vec<provider::Msg>, point: &RewindPoint) -> bool {
+    let start = point.index.min(transcript.len());
+    let found = transcript[start..].iter().position(|m| match m {
+        provider::Msg::User(t) | provider::Msg::UserImages { text: t, .. } => {
+            t.starts_with(&point.prompt)
+        }
+        _ => false,
+    });
+    match found {
+        Some(i) => {
+            transcript.truncate(start + i);
+            // Nothing but a system prompt left: an empty conversation.
+            if transcript
+                .iter()
+                .all(|m| matches!(m, provider::Msg::System(_)))
+            {
+                transcript.clear();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+// /rewind: pick an earlier prompt of this run and go back to just before it
+// — the files its turn and later turns changed, the conversation from it on,
+// or both.
+fn handle_rewind(
+    transcript: &mut Vec<provider::Msg>,
+    points: &mut Vec<RewindPoint>,
+    sid: &str,
+    cwd: &std::path::Path,
+    model: &str,
+) {
+    if points.is_empty() {
+        tui::line(&tui::dim(
+            "  nothing to rewind in this session yet — /undo restores files from earlier turns",
+        ));
+        return;
+    }
+    let items: Vec<tui::SelectItem> = points
+        .iter()
+        .rev()
+        .map(|p| {
+            let first: String = p
+                .prompt
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(70)
+                .collect();
+            let files = checkpoint::list(cwd)
+                .iter()
+                .filter(|c| c.created_ms >= p.started_ms)
+                .count();
+            tui::SelectItem {
+                label: first,
+                detail: format!(
+                    "{} · {files} file change{} since",
+                    session::ago(p.started_ms),
+                    if files == 1 { "" } else { "s" }
+                ),
+            }
+        })
+        .collect();
+    let Some(pick) = tui::select_item("Rewind to before", &items) else {
+        return;
+    };
+    let at = points.len() - 1 - pick;
+    let what = [
+        tui::SelectItem {
+            label: "Code and conversation".into(),
+            detail: "restore the files and drop this prompt and everything after".into(),
+        },
+        tui::SelectItem {
+            label: "Conversation only".into(),
+            detail: "drop this prompt and everything after; files stay".into(),
+        },
+        tui::SelectItem {
+            label: "Code only".into(),
+            detail: "restore the files changed since; the conversation stays".into(),
+        },
+    ];
+    let Some(choice) = tui::select_item("Rewind what", &what) else {
+        return;
+    };
+    let (code, conversation) = (choice != 1, choice != 2);
+    if code {
+        let mut overwrite = |p: &std::path::Path| confirm_overwrite(cwd, p);
+        match checkpoint::undo_all_since(cwd, points[at].started_ms, &mut overwrite) {
+            Ok(undone) => {
+                tui::line(&tui::green(&format!(
+                    "  ✓ restored {} file{}:",
+                    undone.restored.len(),
+                    if undone.restored.len() == 1 { "" } else { "s" }
+                )));
+                show_undone(cwd, &undone);
+            }
+            Err(e) if e.starts_with("no checkpoints") => {
+                tui::line(&tui::dim("  no file changes since then"));
+            }
+            Err(e) => {
+                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+                return;
+            }
+        }
+    }
+    if conversation {
+        let before = transcript.len();
+        if rewind_transcript(transcript, &points[at]) {
+            if transcript.is_empty() {
+                let _ = session::remove(sid);
+            } else {
+                session::save(sid, cwd, model, transcript);
+            }
+            tui::line(&tui::green(&format!(
+                "  ✓ conversation rewound — dropped {} message{}",
+                before - transcript.len(),
+                if before - transcript.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )));
+            tui::prefill_composer(&points[at].typed);
+            points.truncate(at);
+            tui::line(&tui::dim(
+                "  your prompt is back in the input box — edit it and press Enter",
+            ));
+        } else {
+            tui::line(&tui::yellow(
+                "  that prompt is no longer in the conversation (it was compacted) — files only",
+            ));
+        }
+    }
+}
+
+// The question /undo asks before it overwrites a file changed since the
+// agent's edit. No (or Enter, Esc) keeps the file as it is.
+fn confirm_overwrite(cwd: &std::path::Path, path: &std::path::Path) -> bool {
+    let shown = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
+    let q = format!(
+        "  {} changed after the agent edited it — overwrite your changes? [y/N]: ",
+        tui::sanitize_terminal(&shown)
+    );
+    matches!(
+        tui::ask(&q).as_deref().map(str::trim),
+        Some("y" | "Y" | "yes" | "YES")
+    )
+}
+
+fn show_undone(cwd: &std::path::Path, undone: &checkpoint::Undone) {
+    for c in &undone.restored {
+        tui::line(&format!(
+            "    - {} ({})",
+            tui::sanitize_terminal(&checkpoint::shown_path(&c.path, cwd)),
+            tui::sanitize_terminal(&c.action)
+        ));
+    }
+    for p in &undone.kept {
+        let shown = p.strip_prefix(cwd).unwrap_or(p).display().to_string();
+        tui::line(&tui::yellow(&format!(
+            "    - kept your version of {}",
+            tui::sanitize_terminal(&shown)
+        )));
+    }
+}
+
+// Bare /undo: reverts the last agent turn in this folder as a unit — the
+// recovery for a partial multi-file edit, where undoing one file would
+// quietly leave the rest changed — and says what it cannot undo: commits,
+// files changed by shell commands, a turn from an earlier run (asked first).
+fn undo_last_turn(cwd: &std::path::Path, overwrite: &mut dyn FnMut(&std::path::Path) -> bool) {
+    let last = checkpoint::last_turn(cwd);
+    let committed = checkpoint::committed_since_turn(cwd);
+    for note in undo_preamble(last.as_ref(), committed) {
+        tui::line(&tui::yellow(note));
+    }
+    let Some(last) = last else {
+        return;
+    };
+    let shell_note = |lead: &str| {
+        tui::line(&tui::yellow(&format!(
+            "  {lead} changed files with shell commands, which checkpoints do not track — git diff shows them:"
+        )));
+        for p in last.turn.untracked.iter().take(8) {
+            tui::line(&tui::dim(&format!("    - {}", tui::sanitize_terminal(p))));
+        }
+        if last.turn.untracked.len() > 8 {
+            tui::line(&tui::dim(&format!(
+                "    … and {} more",
+                last.turn.untracked.len() - 8
+            )));
+        }
+    };
+    if last.checkpoints.is_empty() {
+        if last.turn.untracked.is_empty() {
+            tui::line(&tui::yellow(
+                "  the last agent turn made no file changes — use /undo latest, /undo <id>, or /undo all",
+            ));
+        } else {
+            shell_note("that turn");
+        }
+        return;
+    }
+    let files: std::collections::HashSet<&std::path::Path> =
+        last.checkpoints.iter().map(|c| c.path.as_path()).collect();
+    if !last.this_session {
+        // A turn from an earlier run: say which before touching anything.
+        let q = format!(
+            "  undo the last task in this folder, '{}' ({}, {} file{})? [y/N]: ",
+            tui::sanitize_terminal(&last.turn.task),
+            session::ago(last.turn.started_ms),
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
+        let go = tui::ask(&q).unwrap_or_default();
+        if !matches!(go.trim(), "y" | "Y" | "yes" | "YES") {
+            tui::line(&tui::dim("  cancelled — nothing restored."));
+            return;
+        }
+    }
+    match checkpoint::undo_last_turn(cwd, overwrite) {
+        Ok(undone) => {
+            let n = undone.restored.len();
+            tui::line(&tui::green(&format!(
+                "  ✓ undid the last agent turn — restored {n} file{}:",
+                if n == 1 { "" } else { "s" }
+            )));
+            show_undone(cwd, &undone);
+            if !last.turn.untracked.is_empty() {
+                shell_note("that turn also");
+            }
+        }
+        Err(e) => tui::line(&tui::yellow(&format!("  {}", tui::sanitize_terminal(&e)))),
+    }
+}
+
+// What bare /undo says before restoring anything: that a commit (by /commit,
+// or HEAD moved since the turn) is not undone, and that there is no turn to
+// undo — a /commit with no agent turn before it still gets the first.
+fn undo_preamble(last: Option<&checkpoint::LastTurn>, committed: bool) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if committed || last.is_some_and(|l| l.head_moved) {
+        notes.push("  commits are not undone by /undo — git reset --soft HEAD~1 keeps the changes");
+    }
+    if last.is_none() {
+        notes.push(
+            "  no agent turn recorded in this folder — /checkpoints lists what can be restored",
+        );
+    }
+    notes
 }
 
 fn handle_undo(cwd: &std::path::Path, arg: &str) {
     let arg = arg.trim();
+    let mut overwrite = |p: &std::path::Path| confirm_overwrite(cwd, p);
     if arg.is_empty() {
-        // Bare /undo reverts the last agent turn as a unit — the recovery for
-        // a partial multi-file edit, where undoing one file would quietly
-        // leave the rest changed.
-        match checkpoint::undo_last_turn(cwd) {
-            Ok(cps) => {
-                tui::line(&tui::green(&format!(
-                    "  ✓ undid the last agent turn — restored {} file{}:",
-                    cps.len(),
-                    if cps.len() == 1 { "" } else { "s" }
-                )));
-                for c in cps {
-                    tui::line(&format!(
-                        "    - {} ({})",
-                        tui::sanitize_terminal(&c.path.display().to_string()),
-                        tui::sanitize_terminal(&c.action)
-                    ));
-                }
-            }
-            Err(e) => tui::line(&tui::yellow(&format!("  {}", tui::sanitize_terminal(&e)))),
-        }
+        undo_last_turn(cwd, &mut overwrite);
     } else if arg == "git" {
         // The one command here that can destroy work bwn didn't do: it
         // discards ALL unstaged changes, including the user's hand edits.
@@ -3475,24 +7040,18 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             tui::line(&tui::dim("  cancelled — nothing restored."));
             return;
         }
-        match checkpoint::undo_all_since(cwd, since) {
-            Ok(cps) => {
+        match checkpoint::undo_all_since(cwd, since, &mut overwrite) {
+            Ok(undone) => {
                 tui::line(&tui::green(&format!(
                     "  ✓ restored {} files across session:",
-                    cps.len()
+                    undone.restored.len()
                 )));
-                for c in cps {
-                    tui::line(&format!(
-                        "    - {} ({})",
-                        tui::sanitize_terminal(&c.path.display().to_string()),
-                        tui::sanitize_terminal(&c.action)
-                    ));
-                }
+                show_undone(cwd, &undone);
             }
             Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else if arg == "latest" {
-        match checkpoint::undo_latest(cwd) {
+        match checkpoint::undo_latest(cwd, &mut overwrite) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored latest {}",
                 tui::sanitize_terminal(&cp.path.display().to_string())
@@ -3500,7 +7059,7 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
             Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
         }
     } else {
-        match checkpoint::undo_by_id(cwd, arg) {
+        match checkpoint::undo_by_id(cwd, arg, &mut overwrite) {
             Ok(cp) => tui::line(&tui::green(&format!(
                 "  ✓ restored checkpoint {} ({})",
                 cp.id,
@@ -3578,31 +7137,131 @@ fn handle_align(cwd: &std::path::Path) {
     ));
 }
 
-fn handle_teamwork() {
-    tui::line(&tui::accent("  teamwork — multi-agent swarm preview"));
+// What delegation really is: the model hands a subtask to a helper with the
+// task tool; helpers are the two built-in roles and any agent files.
+fn handle_teamwork(p: &Provider) {
+    tui::line(&tui::accent(
+        "  teamwork — helpers the model can delegate to",
+    ));
+    // The compact tool set has no task tool: say so first.
+    if tools::compact_surface(p.context_tokens) {
+        for note in window_notes(p) {
+            tui::line(&tui::yellow(&format!("  {note}")));
+        }
+    }
     tui::line(&tui::dim(
-        "  for complex projects, buildwithnexus orchestrates specialized subagent teams:",
+        "  In BUILD the model can hand a self-contained subtask to a helper with the task tool \
+         (spawn_subagent). The helper gets a fresh context, works, and reports back.",
     ));
     tui::line(&format!(
-        "    • {} — Explores documentation, code graphs, and symbol trees",
-        tui::bold("Researcher Subagent")
+        "    • {} — the default: edits files and runs commands under your permission",
+        tui::bold("engineer")
     ));
     tui::line(&format!(
-        "    • {} — Analyzes logs, stack traces, and test regressions",
-        tui::bold("Debugger Subagent")
+        "    • {} — reads and investigates, cites paths",
+        tui::bold("researcher")
     ));
     tui::line(&format!(
-        "    • {} — Edits code files, runs migrations, and applies patches",
-        tui::bold("Code Writer Subagent")
+        "    • {} — `isolate: true` runs the helper in a git worktree on its own branch",
+        tui::bold("isolation")
     ));
     tui::line(&format!(
-        "    • {} — Checks engineering rules, static analysis, and confidence",
-        tui::bold("Verifier Subagent")
+        "    • {} — `read_only: true` (or an agent file's) lets it read and search, never change",
+        tui::bold("read-only")
     ));
-    tui::line(&tui::dim("  Tip: Use `invoke_subagent` in your custom rules/workflows to dispatch tasks to this team."));
+    let together = match agent::max_parallel_helpers() {
+        1 => "one at a time (max_parallel_helpers is 1 — a local server is \
+              given one helper at a time unless it reports more slots or you set it)"
+            .to_string(),
+        n => format!("up to {n} at the same time (max_parallel_helpers)"),
+    };
+    tui::line(&tui::dim(&format!(
+        "  Read-only and isolated helpers from one reply run {together}, and each shows its \
+         work when it finishes; Esc stops them all. Helpers that write in your folder run one \
+         after another."
+    )));
+    tui::line(&tui::dim(&format!(
+        "  Your own helpers: <name>.md files (name, description, tools, read_only in frontmatter; \
+         instructions as the body) in {}/agents or ~/.claude/agents, and in a trusted project's \
+         .buildwithnexus/agents or .claude/agents. /agents lists them.",
+        config::home().display()
+    )));
 }
 
+// `/add-dir <path>` adds a folder to work in; bare `/add-dir` lists them.
+fn handle_add_dir(arg: &str, cwd: &std::path::Path) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        let dirs = workdirs::list();
+        if dirs.is_empty() {
+            tui::line(&tui::dim(
+                "  no added folders — /add-dir <path> lets the agent read and change files in another folder",
+            ));
+        }
+        for d in dirs {
+            let shown = d.display().to_string();
+            tui::line(&format!("  + {}", tui::sanitize_terminal(&shown)));
+        }
+        return;
+    }
+    match workdirs::add(arg, cwd) {
+        Ok(workdirs::Added::New(dir)) => {
+            let shown = dir.display().to_string();
+            tui::line(&tui::green(&format!(
+                "  ✓ added {} — the agent may read and change files there; sandboxed commands may write there",
+                tui::sanitize_terminal(&shown)
+            )));
+            // The instruction files it brings, named before the next
+            // message carries them to the model.
+            for n in workdirs::notices(cwd)
+                .into_iter()
+                .filter(|n| n.starts_with("instructions") && n.contains(&shown))
+            {
+                report::notice(&format!("  {n}"));
+            }
+        }
+        Ok(workdirs::Added::Covered(why)) => {
+            tui::line(&tui::dim(&format!("  {}", tui::sanitize_terminal(&why))))
+        }
+        Err(e) => tui::line(&tui::red(&format!(
+            "  /add-dir: {}",
+            tui::sanitize_terminal(&e)
+        ))),
+    }
+}
+
+// `/agents`: the helpers the model can delegate to, then Agents.md.
 fn handle_agents() {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let defs = config::load_agent_defs(&cwd);
+    if defs.is_empty() {
+        tui::line(&tui::dim(&format!(
+            "  no helper agents yet — add <name>.md to {}/agents or .buildwithnexus/agents (see /teamwork)",
+            config::home().display()
+        )));
+    } else {
+        tui::line(&tui::accent("  helper agents (task tool roles)"));
+        for a in &defs {
+            let mut tools = a
+                .tools
+                .as_ref()
+                .map_or("all tools".to_string(), |t| t.join(", "));
+            if a.read_only {
+                tools.push_str(", read-only");
+            }
+            // Names, descriptions and paths come from files on disk.
+            tui::line(&format!(
+                "    • {} — {}",
+                tui::bold(&tui::sanitize_terminal(&a.name)),
+                tui::sanitize_terminal(&a.description)
+            ));
+            tui::line(&tui::dim(&format!(
+                "      tools: {} · {}",
+                tui::sanitize_terminal(&tools),
+                tui::sanitize_terminal(&a.path.display().to_string())
+            )));
+        }
+    }
     match config::load_agents() {
         Some(agents) => {
             // Agents.md is Markdown — render it instead of dumping #/**/- raw.
@@ -3618,184 +7277,273 @@ fn handle_agents() {
 }
 
 // One line per configured MCP server, after a bounded connection attempt.
-fn doctor_mcp_lines() -> Vec<String> {
+// One MCP check per configured server: a real connect and handshake each,
+// bounded by their timeouts.
+fn mcp_checks() -> Vec<DoctorCheck> {
     mcp::ensure_ready();
     let reports = mcp::report();
     if reports.is_empty() {
-        return vec!["  ·  mcp          no servers configured".into()];
+        return vec![DoctorCheck::note("mcp", "no servers configured")];
     }
     reports
         .into_iter()
         .map(|r| {
             let name = format!("mcp:{}", r.name);
             match r.status {
-                mcp::Status::Connected => format!(
-                    "  ✓ {name:<14} {} · {} tool{}",
-                    r.transport,
-                    r.tools.len(),
-                    if r.tools.len() == 1 { "" } else { "s" }
+                mcp::Status::Connected => DoctorCheck::pass(
+                    name,
+                    format!(
+                        "{} · {} tool{}",
+                        r.transport,
+                        r.tools.len(),
+                        if r.tools.len() == 1 { "" } else { "s" }
+                    ),
                 ),
-                mcp::Status::Disabled => format!("  ·  {name:<13} disabled"),
+                mcp::Status::Disabled => DoctorCheck::note(name, "disabled"),
                 mcp::Status::Connecting => {
-                    format!("  ✗ {name:<14} still connecting after the timeout")
+                    DoctorCheck::fail(name, "still connecting after the timeout")
                 }
                 mcp::Status::Failed(e) | mcp::Status::Invalid(e) => {
-                    format!("  ✗ {name:<14} {}", e.chars().take(160).collect::<String>())
+                    DoctorCheck::fail(name, e.chars().take(160).collect::<String>())
+                }
+                mcp::Status::NeedsAuth(why) => {
+                    let hint = mcp_auth::login_hint(&r.name, &why);
+                    DoctorCheck::fail(
+                        name,
+                        format!(
+                            "needs login: {}",
+                            hint.chars().take(150).collect::<String>()
+                        ),
+                    )
                 }
             }
         })
-        .map(|l| tui::sanitize_terminal(&l).into_owned())
         .collect()
 }
 
-fn handle_doctor_tui() {
+// `/doctor` (and `/debug`): the same checks as `buildwithnexus doctor`,
+// probing the model this session is using.
+fn handle_doctor_tui(live: &Provider) {
     tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));
-    match config::load_settings() {
-        Some(s) => {
-            tui::line(&format!("  provider: {}", s.provider));
-            tui::line(&format!("  model: {}", s.model));
-            tui::line(&format!("  permission: {}", s.permission));
-        }
-        None => tui::line(&tui::yellow("  settings: not configured")),
+    let checks = doctor_checks(&CliOptions::default(), Some(live));
+    for c in &checks {
+        tui::line(&c.line());
     }
-    let (glyph, text) = sandbox::doctor_summary();
-    tui::line(&format!("  {glyph} sandbox: {text}"));
-    tui::line(&format!("  home: {}", config::home().display()));
-    for line in doctor_mcp_lines() {
-        tui::line(&line);
+    if let Some(summary) = doctor_summary_line(&checks) {
+        tui::line(&tui::yellow(&summary));
     }
-    tui::line(&format!(
-        "  rust: {}",
-        std::process::Command::new("rustc")
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "not found".to_string())
-    ));
 }
 
+/// How to call a listed command that needs an argument, for when it is
+/// typed bare.
+fn command_usage(cmd_name: &str) -> Option<&'static str> {
+    match cmd_name {
+        "btw" => Some("/btw <context>  e.g. /btw also update the tests"),
+        _ => None,
+    }
+}
+
+/// The mode a bare `/plan`, `/build` or `/brainstorm` switches to.
+fn bare_mode_command(t: &str) -> Option<Mode> {
+    match t {
+        "/plan" => Some(Mode::Plan),
+        "/build" => Some(Mode::Build),
+        "/brainstorm" => Some(Mode::Brainstorm),
+        _ => None,
+    }
+}
+
+/// Whether input that starts with `/` is really a path: its first word has
+/// another `/` in it (`/home/me/shot.png what is this`) or names something
+/// on disk. Command names never contain a second slash.
+fn starts_with_path(t: &str) -> bool {
+    let first = t.split_whitespace().next().unwrap_or("");
+    first.len() > 1
+        && first.starts_with('/')
+        && (first[1..].contains('/') || std::path::Path::new(first).exists())
+}
+
+/// `/cmd` alone or `/cmd <args>`: the trimmed arguments ("" when bare).
+/// None for any other input, including `/cmdmore`.
+fn slash_args<'a>(t: &'a str, cmd: &str) -> Option<&'a str> {
+    match t.strip_prefix(cmd)? {
+        "" => Some(""),
+        rest if rest.starts_with(char::is_whitespace) => Some(rest.trim()),
+        _ => None,
+    }
+}
+
+/// `/theme [dark|light|ansi|auto]`: switch the colour theme and save it as
+/// the `theme` setting. Bare, it opens a picker.
+fn handle_theme(arg: &str) {
+    let choice = if arg.is_empty() {
+        let names = ["dark", "light", "ansi", "auto"];
+        let details = [
+            "for dark terminal backgrounds",
+            "for light terminal backgrounds",
+            "the terminal's own 16 colours",
+            "follow the terminal's background colour",
+        ];
+        let items: Vec<tui::SelectItem> = names
+            .iter()
+            .zip(details)
+            .map(|(n, d)| tui::SelectItem {
+                label: n.to_string(),
+                detail: d.to_string(),
+            })
+            .collect();
+        let title = format!("Theme (now: {})", tui::theme_name());
+        match tui::select_item(&title, &items) {
+            Some(i) => names[i].to_string(),
+            None => return,
+        }
+    } else {
+        arg.to_ascii_lowercase()
+    };
+    match tui::set_theme(&choice) {
+        Ok(now) => {
+            let saved = config::save_user_settings(&[("theme", Some(choice.clone().into()))]);
+            let shown = if choice == "auto" {
+                format!("auto ({now})")
+            } else {
+                now.to_string()
+            };
+            match saved {
+                Ok(()) => tui::line(&tui::green(&format!(
+                    "  ✓ theme: {shown} — saved; new output uses it"
+                ))),
+                Err(e) => tui::line(&tui::yellow(&format!(
+                    "  theme: {shown} for this session — not saved: {e}"
+                ))),
+            }
+        }
+        Err(e) => tui::line(&tui::red(&format!("  {e}"))),
+    }
+}
+
+/// Before the session closes (Ctrl+D, a second Ctrl+C, /exit): background
+/// workflows run only while bwn is open, so name the ones that would wait
+/// and ask. True means quit. Input that has gone away quits without asking.
+fn confirm_quit() -> bool {
+    let waiting = waiting_workflows(&workflow::snapshots());
+    if waiting.is_empty() || tui::input_closed() {
+        return true;
+    }
+    let answer = tui::ask(&quit_question(&waiting)).map(|a| a.trim().to_lowercase());
+    matches!(answer.as_deref(), Some("y" | "yes"))
+}
+
+// The workflows that would not run once bwn closes.
+fn waiting_workflows(snaps: &[workflow::WorkflowSnapshot]) -> Vec<usize> {
+    snaps
+        .iter()
+        .filter(|w| matches!(w.status_str.as_str(), "pending" | "running"))
+        .map(|w| w.id)
+        .collect()
+}
+
+fn quit_question(ids: &[usize]) -> String {
+    let list: Vec<String> = ids.iter().map(|id| format!("#{id}")).collect();
+    let noun = if ids.len() == 1 {
+        "workflow"
+    } else {
+        "workflows"
+    };
+    format!(
+        "  {noun} {} will not run while bwn is closed — quit anyway? [y/N] ",
+        list.join(", ")
+    )
+}
+
+/// The page that says what is sent to a hosted model, what stays on this
+/// machine, and where keys are kept.
+const DATA_DOCS: &str = "https://buildwithnexus.dev/docs/data";
+
 fn print_help() {
-    tui::line(&tui::dim(
-        "  /plan <task>        Break down implementation into steps",
+    for l in help_lines() {
+        tui::line(&l);
+    }
+}
+
+const HELP_CUSTOM_ROWS: usize = 12;
+
+// The /help text: every built-in command by section, then the keys and the
+// answers to an approval, as an aligned table.
+fn help_lines() -> Vec<String> {
+    // (command or key, its arguments and aliases, what it does)
+    type Row = (String, String, String);
+    let mut sections: Vec<(&str, Vec<Row>)> = Vec::new();
+    for c in tui::COMMANDS {
+        let aliases = c.aliases.join(", ");
+        let args = match (aliases.is_empty(), c.args.is_empty()) {
+            (true, _) => c.args.to_string(),
+            (false, true) => format!("({aliases})"),
+            (false, false) => format!("({aliases}) {}", c.args),
+        };
+        let row = (c.name.to_string(), args, c.desc.to_string());
+        match sections.iter_mut().find(|(t, _)| *t == c.section) {
+            Some((_, rows)) => rows.push(row),
+            None => sections.push((c.section, vec![row])),
+        }
+    }
+    let rows = |r: &[(&str, &'static str)]| -> Vec<Row> {
+        r.iter()
+            .map(|(k, d)| (k.to_string(), String::new(), d.to_string()))
+            .collect()
+    };
+    // Command files and skills the popup also offers; a long list is cut
+    // and /skills has the rest.
+    let mut mine: Vec<Row> = Vec::new();
+    let custom = config::load_custom_commands();
+    for c in custom.iter().take(HELP_CUSTOM_ROWS) {
+        mine.push((
+            format!("/{}", c.name),
+            String::new(),
+            tui::custom_command_desc(c),
+        ));
+    }
+    if custom.len() > HELP_CUSTOM_ROWS {
+        let more = format!(
+            "… {} more — /skills lists them all",
+            custom.len() - HELP_CUSTOM_ROWS
+        );
+        mine.push((String::new(), String::new(), more));
+    }
+    if !mine.is_empty() {
+        sections.push(("your commands and skills", mine));
+    }
+    sections.push((
+        "keys",
+        rows(&[
+            ("Shift+Tab", "cycle PLAN → BUILD → BRAINSTORM"),
+            ("Enter", "send · end a line with \\ to add another"),
+            (
+                "Esc",
+                "stop the agent mid-turn · cancel a question or picker",
+            ),
+            ("Esc Esc", "on an empty line: rewind to an earlier prompt"),
+            (
+                "Ctrl+C",
+                "stop the agent · clear the draft · twice on an empty line: quit",
+            ),
+            ("Ctrl+D", "quit (asks first if workflows are waiting)"),
+            ("Ctrl+Q / Ctrl+X", "edit / drop the next queued message"),
+            ("↑↓  Ctrl+R", "history · search history"),
+            ("Tab", "complete commands and @paths"),
+            ("1-9 ↑↓ Enter", "in a picker: move to a row, Enter picks it"),
+        ]),
     ));
-    tui::line(&tui::dim(
-        "  /build <task>       Agentic execution of a task",
+    sections.push((
+        "answering an approval (allow?)",
+        rows(&[
+            ("y", "yes, this once"),
+            ("n", "no"),
+            ("s", "allow it for the rest of this session"),
+            ("a", "always allow it in this project"),
+            ("d <reason>", "deny and tell the agent why"),
+            ("Esc", "deny and stop the turn"),
+        ]),
     ));
-    tui::line(&tui::dim(
-        "  /brainstorm <task>  Conversational thought partner",
-    ));
-    tui::line(&tui::dim("  /model <name>       Hot-swap the AI model"));
-    tui::line(&tui::dim(
-        "  /permissions        Change what the agent can do unprompted",
-    ));
-    tui::line(&tui::dim(
-        "  /schedule <delay>   Run a task later (e.g. 5m cargo test)",
-    ));
-    tui::line(&tui::dim(
-        "  /loop <interval>    Run a task repeatedly (e.g. 30m)",
-    ));
-    tui::line(&tui::dim(
-        "  /trace <id>         View detailed receipts for a turn",
-    ));
-    tui::line("");
-    tui::line(&tui::bold(&tui::accent("  commands")));
-    // (command, args/aliases hint, description) grouped by section. Rendered
-    // as an auto-aligned table so alignment can't drift as commands change.
-    type Row = (&'static str, &'static str, &'static str);
-    let sections: &[(&str, &[Row])] = &[
-        (
-            "modes",
-            &[
-                ("Shift+Tab", "", "cycle PLAN → BUILD → BRAINSTORM"),
-                ("/mode", "[plan|build|brainstorm]", "show or switch mode"),
-                (
-                    "/permissions",
-                    "[ask|auto|readonly|reset]",
-                    "tool permission level (reset: forget always-allow)",
-                ),
-                (
-                    "/sandbox",
-                    "[off|auto|require|status]",
-                    "OS sandbox for shell commands",
-                ),
-                (
-                    "/model",
-                    "[name | <url> <model>]",
-                    "hot-swap the AI model mid-session",
-                ),
-                ("/effort", "[off|low|medium|high]", "reasoning depth"),
-                ("/local", "", "probe local servers and list GGUF models"),
-            ],
-        ),
-        (
-            "context & git",
-            &[
-                ("/compact", "", "compress context to free token budget"),
-                ("/context", "", "show context window usage"),
-                ("/cost", "", "session tokens and estimated cost"),
-                ("/diff", "", "show current git diff summary"),
-                ("/review", "", "AI code review of staged git diff"),
-                ("/commit", "", "AI-drafted conventional commit message"),
-                ("/pr", "", "AI-drafted PR title + description"),
-                ("/checkpoints", "", "list edit checkpoints"),
-                (
-                    "/undo",
-                    "(/rewind) [latest|git|all|<id>]",
-                    "bare: revert the last agent turn's edits",
-                ),
-            ],
-        ),
-        (
-            "automation",
-            &[
-                ("/schedule", "<delay> <task>", "one-shot scheduled workflow"),
-                ("/loop", "<interval> <task>", "repeating scheduled workflow"),
-                ("/workflows", "(/tasks)", "list background workflows"),
-                ("/btw", "<context>", "inject context into next agent turn"),
-                ("/teamwork", "(/swarm)", "multi-agent swarm preview"),
-                ("/grill-me", "(/align)", "operational alignment interview"),
-            ],
-        ),
-        (
-            "project",
-            &[
-                ("/memory", "", "view and edit session memory"),
-                ("/skills", "", "list skills and custom commands"),
-                ("/tools", "", "browse callable tools"),
-                ("/rules", "", "inspect engineering rules and violations"),
-                ("/kb", "(/index)", "query or index project knowledge base"),
-                (
-                    "/verify",
-                    "(/audit)",
-                    "verify codebase against rules and tests",
-                ),
-                ("/agents", "", "show loaded Agents.md context"),
-                (
-                    "/mcp",
-                    "[name|add|remove|reload]",
-                    "MCP servers and their tools",
-                ),
-                ("/trace", "", "inspect hooks, tools, skills, subagents"),
-            ],
-        ),
-        (
-            "session",
-            &[
-                ("/new", "", "start a fresh session"),
-                ("/resume", "", "pick a saved session to resume"),
-                ("/init", "", "run setup (keys, providers, local models)"),
-                ("/config", "", "configure hooks, memory, commands via AI"),
-                ("/voice", "[<file>]", "audio transcription & voice input"),
-                ("/vim", "", "toggle Vim modal editing"),
-                ("/mouse", "[on|off]", "wheel scroll + drag-copy (/scroll)"),
-                ("/doctor", "(/debug)", "diagnose setup"),
-                ("/clear", "", "clear the screen"),
-                ("/exit", "", "exit"),
-            ],
-        ),
-    ];
 
     let cmd_w = sections
         .iter()
@@ -3803,36 +7551,314 @@ fn print_help() {
         .map(|(cmd, _, _)| cmd.chars().count())
         .max()
         .unwrap_or(0);
-
-    tui::line("");
-    for (title, rows) in sections {
-        tui::line("");
-        tui::line(&tui::dim(&format!("  {title}")));
-        for (cmd, args, desc) in rows.iter() {
+    let mut out = vec![
+        tui::bold(&tui::accent("  buildwithnexus — commands and keys")),
+        tui::dim("  type a task or a question; /command runs a command; Shift+Tab changes mode"),
+    ];
+    for (title, rows) in &sections {
+        out.push(String::new());
+        out.push(tui::dim(&format!("  {title}")));
+        for (cmd, args, desc) in rows {
             let pad = " ".repeat(cmd_w.saturating_sub(cmd.chars().count()));
             let args_part = if args.is_empty() {
                 String::new()
             } else {
                 format!("  {}", tui::dim(args))
             };
-            tui::line(&format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
+            out.push(format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
         }
     }
-    tui::line("");
-    tui::line(&tui::dim("  input"));
-    tui::line(&tui::dim(
+    out.push(String::new());
+    out.push(tui::dim("  input"));
+    for l in [
         "    !<cmd> shell command · @<path> attach file/image/video · @diff @kb: @symbol:",
-    ));
-    tui::line(&tui::dim(
-        "    ^V paste image/text · Tab complete · ↑↓ history · ^R search · ^G $EDITOR",
-    ));
-    tui::line(&tui::dim(
-        "    ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank · PgUp/PgDn scroll",
-    ));
-    tui::line("");
+        "    ^V paste image/text · ^G $EDITOR · ←→ ^A ^E move · ^W ^U ^K kill · ^Y yank",
+        "    PgUp/PgDn scroll · --plain (or TERM=dumb) for line mode without screen control",
+    ] {
+        out.push(tui::dim(l));
+    }
+    out.push(String::new());
+    out.push(tui::dim(&format!(
+        "  what leaves your machine, and where keys are kept: {DATA_DOCS}"
+    )));
+    out.push(String::new());
+    out
+}
+
+#[cfg(test)]
+mod terminal_ui_tests {
+    use super::*;
+
+    #[test]
+    fn quitting_names_the_workflows_that_would_wait() {
+        assert_eq!(
+            quit_question(&[1]),
+            "  workflow #1 will not run while bwn is closed — quit anyway? [y/N] "
+        );
+        assert!(quit_question(&[2, 5]).contains("workflows #2, #5 will not run"));
+        // Built from snapshots, not the live queue: other tests schedule
+        // workflows in this process while this one runs.
+        let snap = |id: usize, status: &str| workflow::WorkflowSnapshot {
+            id,
+            task: "cargo test".into(),
+            kind_str: "once".into(),
+            status_str: status.into(),
+            iteration: 0,
+            elapsed_secs: None,
+            output_lines: 0,
+            reason: None,
+        };
+        assert!(waiting_workflows(&[]).is_empty());
+        assert_eq!(
+            waiting_workflows(&[
+                snap(1, "done"),
+                snap(2, "pending"),
+                snap(3, "running"),
+                snap(4, "cancelled"),
+            ]),
+            [2, 3]
+        );
+    }
+
+    // The REPL's source, from `fn repl(` to the end of that function.
+    fn repl_source() -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src.find("\nfn repl(").expect("fn repl");
+        let body = &src[start..];
+        &body[..body[1..].find("\n}\n").expect("end of repl") + 3]
+    }
+
+    // A listed command typed bare does something: the REPL matches it
+    // alone (an arm, slash_args), it switches the mode, or it needs an
+    // argument and its usage is printed.
+    fn handled(cmd: &str) -> bool {
+        repl_source().contains(&format!("\"{cmd}\""))
+            || bare_mode_command(cmd).is_some()
+            || command_usage(&cmd[1..]).is_some()
+    }
+
+    // Whether `word` appears in `text` on its own: not inside a longer
+    // command, option or word.
+    fn mentions(text: &str, word: &str) -> bool {
+        let part = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+        text.match_indices(word)
+            .any(|(i, _)| !text[..i].ends_with(part) && !text[i + word.len()..].starts_with(part))
+    }
+
+    // The source of `fn <name>(` up to the end of that function.
+    fn fn_source(name: &str) -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find(&format!("\nfn {name}("))
+            .or_else(|| src.find(&format!("\npub fn {name}(")))
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let body = &src[start..];
+        &body[..body[1..].find("\n}\n").expect("end of fn") + 3]
+    }
+
+    // Every `/command` the REPL matches on: match arms, strip_prefix,
+    // slash_args and `t == "/x"` tests.
+    fn repl_commands() -> Vec<String> {
+        let src = repl_source();
+        let mut out: Vec<String> = Vec::new();
+        for (i, _) in src.match_indices("\"/") {
+            let name: String = std::iter::once('/')
+                .chain(
+                    src[i + 2..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'),
+                )
+                .collect();
+            let next = src[i + 1 + name.len()..].chars().next();
+            if name.len() > 1 && matches!(next, Some('"' | ' ')) && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    // The string literals in the patterns of a function's match arms
+    // (`"a" | "b" =>`, `Some("a" | "b") =>`), empty ones left out.
+    fn arm_literals(src: &str) -> Vec<String> {
+        src.lines()
+            .filter_map(|l| l.split_once("=>").map(|(pat, _)| pat))
+            .flat_map(|pat| {
+                pat.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_command_the_repl_takes_is_in_help_the_popup_and_completion() {
+        let cmds = repl_commands();
+        assert!(cmds.len() > 50, "{cmds:?}");
+        let help = tui::strip_ansi(&help_lines().join("\n"));
+        let usage = usage_text();
+        let popup = tui::builtin_slash_commands();
+        for cmd in &cmds {
+            assert!(mentions(&help, cmd), "/help does not list {cmd}");
+            assert!(mentions(&usage, cmd), "--help does not list {cmd}");
+            assert!(
+                popup.contains(&cmd.as_str()),
+                "the / popup does not list {cmd}"
+            );
+            assert!(
+                tui::completions_for(cmd).contains(cmd),
+                "Tab does not complete {cmd}"
+            );
+        }
+        // The page on what is sent where is one step from either help.
+        assert!(help.contains(DATA_DOCS), "{help}");
+        assert!(usage.contains(DATA_DOCS), "{usage}");
+    }
+
+    #[test]
+    fn permission_modes_and_subcommands_are_listed_and_complete() {
+        let help = tui::strip_ansi(&help_lines().join("\n"));
+        let usage = usage_text();
+        let perms = tui::find_command("/permissions").unwrap();
+        // Every word /permissions takes: the modes and the approval commands.
+        let taken: Vec<String> = arm_literals(fn_source("handle_permissions_arg"))
+            .into_iter()
+            .map(|w| w.trim().to_string())
+            .filter(|w| w.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            .collect();
+        assert!(taken.len() >= 3, "{taken:?}");
+        for word in taken.iter().map(String::as_str).chain([
+            "ask",
+            "accept-edits",
+            "auto",
+            "readonly",
+            "default",
+        ]) {
+            assert!(perms.subs.contains(&word), "/permissions {word} not listed");
+            assert!(mentions(perms.args, word), "/help: /permissions {word}");
+            assert!(
+                tui::completions_for("/permissions ").contains(&word.to_string()),
+                "Tab: /permissions {word}"
+            );
+        }
+        // Every permission mode by its name, and plan's reading, in --help.
+        for p in [
+            Permission::Ask,
+            Permission::AcceptEdits,
+            Permission::Auto,
+            Permission::ReadOnly,
+        ] {
+            let name = agent::permission_name(p);
+            assert!(mentions(&usage, name), "--help: {name}");
+            assert!(mentions(&help, name), "/help: {name}");
+        }
+        assert!(usage.contains("plan reads as"), "{usage}");
+        // Subcommands of other commands complete too.
+        assert_eq!(tui::completions_for("/diff t"), ["turn"]);
+        assert!(tui::completions_for("/review --").contains(&"--staged".to_string()));
+        assert!(tui::completions_for("/mcp ").contains(&"reload".to_string()));
+    }
+
+    #[test]
+    fn every_cli_command_option_and_subcommand_is_in_help() {
+        let usage = usage_text();
+        // The commands run() dispatches, their flag spellings included.
+        let run_src = fn_source("run");
+        let dispatch = &run_src[run_src.find("    match cmd {").expect("dispatch")..];
+        let commands = arm_literals(dispatch);
+        assert!(commands.len() > 25, "{commands:?}");
+        for word in &commands {
+            assert!(mentions(&usage, word), "--help does not list `{word}`");
+        }
+        // Every option parse_cli_options takes, and its "did you mean" list.
+        let parse_src = fn_source("parse_cli_options");
+        let mut flags: Vec<String> = arm_literals(parse_src)
+            .into_iter()
+            .filter(|w| w.starts_with('-'))
+            .collect();
+        for (i, _) in parse_src.match_indices("arg == \"") {
+            let flag = &parse_src[i + 8..];
+            flags.push(flag[..flag.find('"').unwrap()].to_string());
+        }
+        assert!(flags.len() > 12, "{flags:?}");
+        for flag in flags
+            .iter()
+            .map(String::as_str)
+            .chain(CLI_OPTIONS.iter().copied())
+        {
+            assert!(mentions(&usage, flag), "--help does not list {flag}");
+            if flag.starts_with("--") && flag != "--" {
+                assert!(CLI_OPTIONS.contains(&flag), "{flag} is not in CLI_OPTIONS");
+            }
+        }
+        // Subcommands and their options.
+        for word in arm_literals(fn_source("sessions_command")) {
+            assert!(mentions(&usage, &word), "--help: sessions {word}");
+        }
+        for word in [
+            "--print",
+            "--agents-md",
+            "--check",
+            "--base",
+            "--staged",
+            "add",
+            "remove",
+            "reload",
+        ] {
+            assert!(mentions(&usage, word), "--help: {word}");
+        }
+    }
+
+    #[test]
+    fn every_listed_command_and_tip_has_a_handler() {
+        for cmd in tui::builtin_slash_commands() {
+            assert!(
+                handled(cmd),
+                "{cmd} is in the command list but no REPL arm handles it"
+            );
+        }
+        for tip in STARTUP_TIPS {
+            for word in tip.split_whitespace().filter(|w| w.starts_with('/')) {
+                let cmd = word.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+                assert!(
+                    handled(cmd) && tui::builtin_slash_commands().contains(&cmd),
+                    "tip names {cmd}, which is not a command: {tip}"
+                );
+            }
+        }
+        // Bare mode commands switch the mode; with a task they run it.
+        assert!(matches!(bare_mode_command("/plan"), Some(Mode::Plan)));
+        assert!(matches!(bare_mode_command("/build"), Some(Mode::Build)));
+        assert!(matches!(
+            bare_mode_command("/brainstorm"),
+            Some(Mode::Brainstorm)
+        ));
+        assert!(bare_mode_command("/plan add tests").is_none());
+        assert_eq!(slash_args("/loop", "/loop"), Some(""));
+        assert_eq!(
+            slash_args("/loop  5m cargo test ", "/loop"),
+            Some("5m cargo test")
+        );
+        assert_eq!(slash_args("/loops", "/loop"), None);
+    }
+
+    #[test]
+    fn a_message_starting_with_an_absolute_path_is_not_a_command() {
+        assert!(starts_with_path(
+            "/home/me/shot.png what is in this screenshot"
+        ));
+        assert!(starts_with_path("/home/me/my\\ shot.png what is this"));
+        assert!(starts_with_path("/tmp"));
+        assert!(!starts_with_path("/help"));
+        assert!(!starts_with_path("/frobnicate now"));
+        assert!(!starts_with_path("/"));
+    }
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
 pub enum Mode {
     Plan,
     Build,
@@ -3861,8 +7887,7 @@ fn headless_attachments(
     task: &str,
     cwd: &std::path::Path,
 ) -> (String, Vec<(String, String)>) {
-    let vision = media::model_supports_vision(p);
-    let (task, images) = extract_attachments(task, cwd, vision);
+    let (task, images) = extract_attachments(task, cwd, Vision::of(p));
     if !images.is_empty() {
         let n = images.len();
         eprintln!("⎘ attached {n} image{}", if n == 1 { "" } else { "s" });
@@ -3870,278 +7895,395 @@ fn headless_attachments(
     (task, images)
 }
 
+/// Whether an image or a video may be attached, and if not, the notice that
+/// says who decided (the `vision` setting, the server, or the model name).
+enum Vision {
+    Yes,
+    No(String),
+}
+
+impl Vision {
+    fn of(p: &Provider) -> Self {
+        if media::model_supports_vision(p) {
+            Vision::Yes
+        } else {
+            Vision::No(media::vision_refusal(p))
+        }
+    }
+}
+
+impl From<bool> for Vision {
+    fn from(yes: bool) -> Self {
+        if yes {
+            Vision::Yes
+        } else {
+            Vision::No("this model does not accept images — image not attached".into())
+        }
+    }
+}
+
 fn extract_attachments(
     task: &str,
     cwd: &std::path::Path,
-    vision: bool,
+    vision: impl Into<Vision>,
 ) -> (String, Vec<(String, String)>) {
-    use std::io::Read;
-    let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
+    let vision = vision.into();
     let mut images: Vec<(String, String)> = Vec::new();
-    let mut clean = String::new();
     let mut text_attachments = Vec::new();
-    let words: Vec<String> = shlex::split(task)
-        .unwrap_or_else(|| task.split_whitespace().map(|s| s.to_string()).collect());
-    for word_str in &words {
+    // Attachment words are replaced where they stand; every other byte of
+    // the prompt (quotes, line breaks, tabs, runs of spaces) reaches the
+    // model exactly as typed.
+    let mut clean = String::with_capacity(task.len());
+    let mut at = 0;
+    for w in prompt_words(task) {
         // Sentence punctuation after a path ("what is in @shot.png?") is not
-        // part of the file name.
-        let word = word_str.trim_end_matches(['?', '!', '.', ',', ';', ':']);
-        let is_at = word.starts_with('@');
-        let clean_word = word.trim_matches(|c| {
-            c == '\'' || c == '"' || c == ',' || c == ';' || c == '(' || c == ')' || c == '`'
-        });
-        let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
-        let is_img = image_exts.contains(&ext.as_str());
-        let is_video = media::VIDEO_EXTS.contains(&ext.as_str());
-        if !is_at && !is_img && !is_video {
-            if !clean.is_empty() {
-                clean.push(' ');
-            }
-            clean.push_str(word_str);
+        // part of the file name; it stays in the prompt after the marker.
+        let word = w.value.trim_end_matches(['?', '!', '.', ',', ';', ':']);
+        let after = &w.value[word.len()..];
+        let Some(marker) = attach_word(word, cwd, &vision, &mut images, &mut text_attachments)
+        else {
             continue;
-        }
-        if let Some(raw_path) = if is_at {
-            word.strip_prefix('@')
+        };
+        // Brackets or quotes around a bare path ("(shot.png)") stay too.
+        let (before, behind) = if word.starts_with('@') {
+            ("", "")
         } else {
-            Some(clean_word)
-        } {
-            if raw_path == "diff" || raw_path == "git:diff" {
-                if let Ok(o) = std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let diff_text = String::from_utf8_lossy(&o.stdout);
-                    if !diff_text.trim().is_empty() {
-                        text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str("[git diff HEAD]");
-                        continue;
-                    }
-                }
-            } else if raw_path == "status" || raw_path == "git:status" {
-                if let Ok(o) = std::process::Command::new("git")
-                    .args(["status", "-s"])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let stat_text = String::from_utf8_lossy(&o.stdout);
-                    if !stat_text.trim().is_empty() {
-                        text_attachments.push(format!("[git status]\n{}", stat_text));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str("[git status]");
-                        continue;
-                    }
-                }
-            } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
-                let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
-                let res = kb.search(kb_query);
-                if !res.is_empty() {
-                    let summary = res
-                        .iter()
-                        .map(|e| {
-                            format!(
-                                "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
-                                e.name,
-                                e.entity_type,
-                                e.description.as_deref().unwrap_or(""),
-                                e.path
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n---\n");
-                    text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
-                    if !clean.is_empty() {
-                        clean.push(' ');
-                    }
-                    clean.push_str(&format!("[kb: {}]", kb_query));
-                    continue;
-                }
-            } else if raw_path == "rules" || raw_path.starts_with("rule:") {
-                let engine = crate::rules::RuleEngine::load_defaults();
-                let rules_summary = engine
-                    .rules
-                    .iter()
-                    .map(|r| {
-                        format!(
-                            "Rule [{}]: {} (Severity: {})",
-                            r.id, r.description, r.severity
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
-                if !clean.is_empty() {
-                    clean.push(' ');
-                }
-                clean.push_str("[active rules]");
-                continue;
-            } else if let Some(url) = raw_path
-                .strip_prefix("url:")
-                .or_else(|| raw_path.strip_prefix("web:"))
-            {
-                // Only real web URLs, and `--` so a value like `-K file` or
-                // `file:///…` can't become curl options or a local read.
-                if !is_web_url(url) {
-                    tui::line(&tui::yellow(&format!(
-                        "  ⚠ @{} not fetched — only http:// and https:// URLs are attached",
-                        tui::sanitize_terminal(raw_path)
-                    )));
-                } else if let Ok(o) = std::process::Command::new("curl")
-                    .args(["-sL", "--max-time", "5", "--", url])
-                    .output()
-                {
-                    let web_text = String::from_utf8_lossy(&o.stdout);
-                    if !web_text.trim().is_empty() {
-                        let snippet: String = web_text.chars().take(8000).collect();
-                        text_attachments.push(format!("[web: {}]\n{}", url, snippet));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!("[web: {}]", url));
-                        continue;
-                    }
-                }
-            } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
-                if let Ok(o) = std::process::Command::new("grep")
-                    .args(["-rnI", "-e", sym_query, "--", "."])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let sym_text = String::from_utf8_lossy(&o.stdout);
-                    if !sym_text.trim().is_empty() {
-                        let snippet: String =
-                            sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
-                        text_attachments
-                            .push(format!("[symbol search: {}]\n{}", sym_query, snippet));
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!("[symbol: {}]", sym_query));
-                        continue;
-                    }
-                }
-            }
-            let (raw_path, range) = split_attachment_range(raw_path);
-            let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
-            let p = if let Some(rest) = raw_path.strip_prefix("~/") {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| cwd.to_path_buf())
-                    .join(rest)
-            } else if raw_path.starts_with('/') {
-                PathBuf::from(raw_path)
-            } else {
-                cwd.join(raw_path)
-            };
-            // Credentials must never ride along in a prompt unnoticed; the
-            // token stays as typed and nothing is read.
-            if p.exists() && tools::is_sensitive(&p) {
-                tui::line(&tui::yellow(&format!(
-                    "  ⚠ {} not attached — it is a sensitive file (keys, credentials, secrets)",
-                    tui::sanitize_terminal(&p.display().to_string())
-                )));
-            } else if image_exts.contains(&ext.as_str()) && p.exists() {
-                if !vision {
-                    tui::line(&tui::yellow(
-                        "  ⚠ current model is not multimodal — image not attached",
-                    ));
-                } else if let Ok(mut f) = std::fs::File::open(&p) {
-                    let mut buf = Vec::new();
-                    if f.read_to_end(&mut buf).is_ok() {
-                        let media_type = match ext.as_str() {
-                            "jpg" | "jpeg" => "image/jpeg",
-                            "gif" => "image/gif",
-                            "webp" => "image/webp",
-                            _ => "image/png",
-                        };
-                        images.push((media_type.to_string(), media::b64_encode(&buf)));
-                        // Show the attachment in the transcript (pixel-perfect
-                        // or half-block, see tui::show_image_file); a pasted
-                        // screenshot already previewed at paste time is not
-                        // drawn twice.
-                        tui::show_image_file(&p, true);
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!(
-                            "[image: {}]",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                        continue;
-                    }
-                }
-            } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
-                if !vision {
-                    tui::line(&tui::yellow(
-                        "  ⚠ current model is not multimodal — video not attached",
-                    ));
-                } else if !media::ffmpeg_available() {
-                    tui::line(&tui::yellow(
-                        "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",
-                    ));
-                } else {
-                    tui::line(&tui::dim(&format!(
-                        "  ⎘ parsing video {} with ffmpeg…",
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    )));
-                    if let Some(v) = media::attach_video(&p) {
-                        let n = v.frames.len();
-                        images.extend(v.frames);
-                        text_attachments.push(v.summary);
-                        // First frame inline.
-                        tui::show_image_file(&p, true);
-                        if !clean.is_empty() {
-                            clean.push(' ');
-                        }
-                        clean.push_str(&format!(
-                            "[video: {} — {n} sampled frames attached in order]",
-                            p.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                        continue;
-                    }
-                    tui::line(&tui::red(&format!(
-                        "  ✗ could not decode video {}",
-                        p.display()
-                    )));
-                }
-            } else if let Some(att) = read_text_attachment(&p, range) {
-                if let Some(total_kib) = att.truncated_from_kib {
-                    tui::line(&tui::yellow(&format!(
-                        "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
-                        p.display(),
-                        MAX_ATTACHED_FILE_BYTES / 1024
-                    )));
-                }
-                text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
-                if !clean.is_empty() {
-                    clean.push(' ');
-                }
-                clean.push_str(&format!("[file: {}]", p.display()));
-                continue;
-            } else if p.is_file() {
-                // Never drop an attachment silently: the token stays in the
-                // prompt as typed, and the user is told why.
-                tui::line(&tui::yellow(&format!(
-                    "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
-                    p.display()
-                )));
-            }
-        }
-        if !clean.is_empty() {
-            clean.push(' ');
-        }
-        clean.push_str(word);
+            let core = word.trim_start_matches(ATTACHMENT_WRAP);
+            let lead = &word[..word.len() - core.len()];
+            let trail = &core[core.trim_end_matches(ATTACHMENT_WRAP).len()..];
+            (lead, trail)
+        };
+        clean.push_str(&task[at..w.start]);
+        clean.push_str(before);
+        clean.push_str(&marker);
+        clean.push_str(behind);
+        clean.push_str(after);
+        at = w.end;
     }
+    clean.push_str(&task[at..]);
     if !text_attachments.is_empty() {
         clean.push_str("\n\n[attached files]\n");
         clean.push_str(&text_attachments.join("\n\n"));
     }
     (clean, images)
+}
+
+const ATTACHMENT_WRAP: &[char] = &['\'', '"', ',', ';', '(', ')', '`'];
+
+// One whitespace-separated word of a prompt: its byte range as typed and
+// its value with surrounding quotes and `\ ` escapes removed, so a quoted or
+// escaped path with spaces ('/tmp/My Shot.png', @"my notes.md",
+// My\ Shot.png) is one word. A quote with no closing match is plain text.
+struct PromptWord {
+    start: usize,
+    end: usize,
+    value: String,
+}
+
+fn prompt_words(text: &str) -> Vec<PromptWord> {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        if c.is_whitespace() {
+            i += c.len_utf8();
+            continue;
+        }
+        let start = i;
+        let mut value = String::new();
+        let mut j = i;
+        if c == '@' {
+            value.push('@');
+            j += 1;
+        }
+        if let Some((close, inner)) = quoted(text, j) {
+            value.push_str(&inner);
+            j = close + 1;
+        }
+        while let Some(ch) = text[j..].chars().next() {
+            if ch.is_whitespace() {
+                break;
+            }
+            if ch == '\\' && text[j + 1..].starts_with(' ') {
+                value.push(' ');
+                j += 2;
+                continue;
+            }
+            value.push(ch);
+            j += ch.len_utf8();
+        }
+        words.push(PromptWord {
+            start,
+            end: j,
+            value,
+        });
+        i = j;
+    }
+    words
+}
+
+// A quoted span starting at `j`: the index of its closing quote and its
+// value. Inside double quotes `\\` and `\"` are escapes, as in the tokens
+// tui::attachment_token writes; single quotes take everything literally.
+fn quoted(text: &str, j: usize) -> Option<(usize, String)> {
+    let q = text[j..]
+        .chars()
+        .next()
+        .filter(|q| *q == '"' || *q == '\'')?;
+    let mut value = String::new();
+    let mut k = j + 1;
+    while let Some(ch) = text[k..].chars().next() {
+        if ch == q {
+            return Some((k, value));
+        }
+        if q == '"' && ch == '\\' {
+            if let Some(next) = text[k + 1..]
+                .chars()
+                .next()
+                .filter(|n| matches!(n, '\\' | '"'))
+            {
+                value.push(next);
+                k += 2;
+                continue;
+            }
+        }
+        value.push(ch);
+        k += ch.len_utf8();
+    }
+    None
+}
+
+// Attaches what one prompt word names, if anything, and returns the marker
+// that replaces it in the prompt. Unreadable or unknown words return None
+// and stay as typed.
+fn attach_word(
+    word: &str,
+    cwd: &std::path::Path,
+    vision: &Vision,
+    images: &mut Vec<(String, String)>,
+    text_attachments: &mut Vec<String>,
+) -> Option<String> {
+    use std::io::Read;
+    let image_exts = ["png", "jpg", "jpeg", "gif", "webp"];
+    let is_at = word.starts_with('@');
+    let clean_word = word.trim_matches(ATTACHMENT_WRAP);
+    let ext = clean_word.rsplit('.').next().unwrap_or("").to_lowercase();
+    let is_img = image_exts.contains(&ext.as_str());
+    let is_video = media::VIDEO_EXTS.contains(&ext.as_str());
+    if !is_at && !is_img && !is_video {
+        return None;
+    }
+    let raw_path = if is_at {
+        word.strip_prefix('@')?
+    } else {
+        clean_word
+    };
+    if raw_path == "diff" || raw_path == "git:diff" {
+        if !git_attachment_may_run(word, cwd) {
+            return None;
+        }
+        if let Ok(diff_text) = git_text(cwd, &["diff", "HEAD", "--no-ext-diff", "--no-textconv"]) {
+            if !diff_text.trim().is_empty() {
+                text_attachments.push(format!("[git diff HEAD]\n{}", diff_text));
+                return Some("[git diff HEAD]".to_string());
+            }
+        }
+    } else if raw_path == "status" || raw_path == "git:status" {
+        if !git_attachment_may_run(word, cwd) {
+            return None;
+        }
+        if let Ok(stat_text) = git_text(cwd, &["status", "-s"]) {
+            if !stat_text.trim().is_empty() {
+                text_attachments.push(format!("[git status]\n{}", stat_text));
+                return Some("[git status]".to_string());
+            }
+        }
+    } else if let Some(kb_query) = raw_path.strip_prefix("kb:") {
+        let kb = crate::knowledge::KnowledgeBase::new(&cwd.to_string_lossy());
+        let res = kb.search(kb_query);
+        if !res.is_empty() {
+            let summary = res
+                .iter()
+                .map(|e| {
+                    format!(
+                        "Entity: {} ({:?})\nDescription: {}\nPath: {:?}",
+                        e.name,
+                        e.entity_type,
+                        e.description.as_deref().unwrap_or(""),
+                        e.path
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n---\n");
+            text_attachments.push(format!("[knowledge base: {}]\n{}", kb_query, summary));
+            return Some(format!("[kb: {}]", kb_query));
+        }
+    } else if raw_path == "rules" || raw_path.starts_with("rule:") {
+        let engine = crate::rules::RuleEngine::load_defaults();
+        let rules_summary = engine
+            .rules
+            .iter()
+            .map(|r| {
+                format!(
+                    "Rule [{}]: {} (Severity: {})",
+                    r.id, r.description, r.severity
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        text_attachments.push(format!("[active engineering rules]\n{}", rules_summary));
+        return Some("[active rules]".to_string());
+    } else if let Some(url) = raw_path
+        .strip_prefix("url:")
+        .or_else(|| raw_path.strip_prefix("web:"))
+    {
+        // Only real web URLs, and `--` so a value like `-K file` or
+        // `file:///…` can't become curl options or a local read.
+        if !is_web_url(url) {
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ @{} not fetched — only http:// and https:// URLs are attached",
+                tui::sanitize_terminal(raw_path)
+            )));
+        } else if let Ok(o) = std::process::Command::new("curl")
+            .args(["-sL", "--max-time", "5", "--", url])
+            .output()
+        {
+            let web_text = String::from_utf8_lossy(&o.stdout);
+            if !web_text.trim().is_empty() {
+                let snippet: String = web_text.chars().take(8000).collect();
+                text_attachments.push(format!("[web: {}]\n{}", url, snippet));
+                return Some(format!("[web: {}]", url));
+            }
+        }
+    } else if let Some(sym_query) = raw_path.strip_prefix("symbol:") {
+        if let Ok(o) = std::process::Command::new("grep")
+            .args(["-rnI", "-e", sym_query, "--", "."])
+            .current_dir(cwd)
+            .output()
+        {
+            let sym_text = String::from_utf8_lossy(&o.stdout);
+            if !sym_text.trim().is_empty() {
+                let snippet: String = sym_text.lines().take(30).collect::<Vec<_>>().join("\n");
+                text_attachments.push(format!("[symbol search: {}]\n{}", sym_query, snippet));
+                return Some(format!("[symbol: {}]", sym_query));
+            }
+        }
+    }
+    let (raw_path, range) = split_attachment_range(raw_path);
+    let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
+    let p = if let Some(rest) = raw_path.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(rest)
+    } else if raw_path.starts_with('/') {
+        PathBuf::from(raw_path)
+    } else {
+        cwd.join(raw_path)
+    };
+    // Credentials must never ride along in a prompt unnoticed; the
+    // token stays as typed and nothing is read.
+    if p.exists() && tools::is_sensitive(&p) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} not attached — it is a sensitive file (keys, credentials, secrets)",
+            tui::sanitize_terminal(&p.display().to_string())
+        )));
+    } else if image_exts.contains(&ext.as_str()) && p.exists() {
+        let too_big = std::fs::metadata(&p)
+            .ok()
+            .and_then(|m| tools::image_too_big(raw_path, m.len()));
+        if let Vision::No(why) = vision {
+            tui::line(&tui::yellow(&format!("  ⚠ {why}")));
+        } else if let Some(why) = too_big {
+            // As read_file refuses it: nothing that size is sent.
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ {} and attach that.",
+                tui::sanitize_terminal(&why)
+            )));
+        } else if let Ok(mut f) = std::fs::File::open(&p) {
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_ok() {
+                let media_type = match ext.as_str() {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    _ => "image/png",
+                };
+                images.push((media_type.to_string(), media::b64_encode(&buf)));
+                // Show the attachment in the transcript (pixel-perfect
+                // or half-block, see tui::show_image_file); a pasted
+                // screenshot already previewed at paste time is not
+                // drawn twice.
+                tui::show_image_file(&p, true);
+                return Some(format!(
+                    "[image: {}]",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+    } else if media::VIDEO_EXTS.contains(&ext.as_str()) && p.exists() {
+        if let Vision::No(why) = vision {
+            let why = why.replace("image not attached", "video not attached");
+            tui::line(&tui::yellow(&format!("  ⚠ {why}")));
+        } else if !media::ffmpeg_available() {
+            tui::line(&tui::yellow(
+                "  ⚠ ffmpeg/ffprobe not found — install ffmpeg to attach videos",
+            ));
+        } else {
+            tui::line(&tui::dim(&format!(
+                "  ⎘ parsing video {} with ffmpeg…",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            )));
+            if let Some(v) = media::attach_video(&p) {
+                let n = v.frames.len();
+                images.extend(v.frames);
+                text_attachments.push(v.summary);
+                // First frame inline.
+                tui::show_image_file(&p, true);
+                return Some(format!(
+                    "[video: {} — {n} sampled frames attached in order]",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            tui::line(&tui::red(&format!(
+                "  ✗ could not decode video {}",
+                p.display()
+            )));
+        }
+    } else if let Some(att) = read_text_attachment(&p, range) {
+        if let Some(total_kib) = att.truncated_from_kib {
+            tui::line(&tui::yellow(&format!(
+                "  ⚠ {} is {total_kib} KiB — only the first {} KiB attached",
+                p.display(),
+                MAX_ATTACHED_FILE_BYTES / 1024
+            )));
+        }
+        text_attachments.push(format!("[file: {}]\n{}", p.display(), att.text));
+        return Some(format!("[file: {}]", p.display()));
+    } else if p.is_file() {
+        // Never drop an attachment silently: the token stays in the
+        // prompt as typed, and the user is told why.
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ could not attach {} (not readable as UTF-8 text) — leaving `{word}` as typed",
+            p.display()
+        )));
+    } else if is_at && !p.exists() && !is_special_mention(raw_path) {
+        tui::line(&tui::yellow(&format!(
+            "  ⚠ {} not found — sent as typed",
+            tui::sanitize_terminal(word)
+        )));
+    }
+    None
+}
+
+// The `@` words that are not file names: they have their own meaning (and
+// their own notice) when they attach nothing.
+fn is_special_mention(raw_path: &str) -> bool {
+    matches!(
+        raw_path,
+        "" | "diff" | "git:diff" | "status" | "git:status" | "rules"
+    ) || ["kb:", "rule:", "url:", "web:", "symbol:"]
+        .iter()
+        .any(|p| raw_path.starts_with(p))
 }
 
 fn is_web_url(url: &str) -> bool {
@@ -4293,180 +8435,408 @@ pub fn classify(task: &str) -> Mode {
 }
 
 fn usage() {
-    println!(
+    print!("{}", usage_text());
+}
+
+// `--help`: every command, subcommand and option, the exit codes, and the
+// session's commands by section (/help explains each).
+fn usage_text() -> String {
+    let mut out = format!(
         "buildwithnexus {VERSION} — agentic AI CLI harness\n\n\
          USAGE:\n\
-         \x20 buildwithnexus                 interactive session (all modes, full TUI)\n\
-         \x20 buildwithnexus run <task>      execute a task (agentic BUILD loop)\n\
-         \x20 buildwithnexus plan <task>     decompose, approve, then execute\n\
-         \x20 buildwithnexus brainstorm <q>  chat with tools (grep, fetch, read, etc.)\n\
-         \x20 buildwithnexus continue <task> continue the most recent session\n\
-         \x20 buildwithnexus resume <id> <t> resume a specific session\n\
-         \x20 buildwithnexus sessions        list saved sessions\n\
-         \x20 buildwithnexus init            (re)configure provider / model / key\n\
-         \x20 buildwithnexus providers       list built-in providers\n\
-         \x20 buildwithnexus doctor          diagnose setup (keys, tools, connectivity)\n\
-         \x20 buildwithnexus mcp [list|<name>|add|remove|reload]  manage MCP servers\n\
-         \x20 buildwithnexus version | help\n\n\
+         \x20 buildwithnexus                    interactive session (all modes, full TUI)\n\
+         \x20 buildwithnexus run <task>         execute a task (agentic BUILD loop); also -p, --print\n\
+         \x20 ... | buildwithnexus run [task]   piped text is the task, or context after it (1 MiB)\n\
+         \x20 buildwithnexus plan <task>        decompose, approve, then execute (--yes: no approval)\n\
+         \x20 buildwithnexus brainstorm <q>     chat with tools (grep, fetch, read, etc.)\n\
+         \x20 buildwithnexus continue [task]    this folder's latest session; also -c, --continue\n\
+         \x20 buildwithnexus resume [<id> [task]]  a saved session; also -r, --resume\n\
+         \x20 buildwithnexus sessions           list saved sessions (this folder first)\n\
+         \x20 buildwithnexus sessions rm <id>   delete a session; also delete, remove\n\
+         \x20 buildwithnexus sessions export <id> [file.md]  a session as Markdown\n\
+         \x20 buildwithnexus init               (re)configure provider / model / key; also setup\n\
+         \x20 buildwithnexus init --agents-md   write AGENTS.md from this repository\n\
+         \x20 buildwithnexus login              replace the provider's API key (checked first)\n\
+         \x20 buildwithnexus providers          list built-in providers\n\
+         \x20 buildwithnexus doctor             diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus update [--check]   install the latest release (--check: exit 10 if behind)\n\
+         \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
+         \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
+         \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
+         \x20 buildwithnexus acp                Agent Client Protocol server on stdio (Zed, JetBrains, Neovim)\n\
+         \x20 buildwithnexus version | help     also -v, -V, --version, -h, --help\n\
+         \x20 older spellings still accepted: build, headless, --headless (run); da-init (init)\n\n\
          OPTIONS:\n\
          \x20 --provider <name>             override the configured provider\n\
          \x20 --model <name>                override the configured model\n\
-         \x20 --permission-mode <mode>      ask, auto, or readonly\n\
+         \x20 --base-url <url>              model endpoint, e.g. a gateway (--provider custom\n\
+         \x20                               reads CUSTOM_API_KEY from the environment)\n\
+         \x20 --permission-mode <mode>      ask, accept-edits, auto, or readonly (plan reads as\n\
+         \x20                               readonly); also --permission\n\
          \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
+         \x20 --worktree <name>             work in .bwn/worktrees/<name> on branch bwn/<name>\n\
+         \x20 --add-dir <path>              also read and change files in <path> (repeatable)\n\
          \x20 --prompt <text>               initial interactive prompt\n\
          \x20 --effort <level>              reasoning depth: off, low, medium, high\n\
          \x20 --max-budget-usd <n>          stop before the next request once spend exceeds n\n\
+         \x20 --trust-project <digest>      trust exactly this project settings content for this\n\
+         \x20                               run (from `trust --print`; or BWN_TRUST_PROJECT)\n\
+         \x20 --trust-project-allow <keys>  let that digest trust base_url and/or permission\n\
+         \x20                               too, e.g. base_url,permission (or\n\
+         \x20                               BWN_TRUST_PROJECT_ALLOW)\n\
+         \x20 --plain                       line mode: no alternate screen or cursor control\n\
+         \x20                               (TERM=dumb does the same)\n\
          \x20 --json                        structured headless output\n\
          \x20 --yes, -y                     auto-approve the plan and execute (plan)\n\
+         \x20 --legacy-exit-codes           exit 0 when a run stops short without failing\n\
          \x20 --                            stop parsing options (run -- <task>)\n\n\
-         INTERACTIVE:\n\
-         \x20 Shift+Tab              cycle mode (PLAN → BUILD → BRAINSTORM → PLAN)\n\
-         \x20 /mode [plan|build|brainstorm]    show or switch mode\n\
-         \x20 /model [name]                    hot-swap the AI model\n\
-         \x20 /effort [off|low|medium|high]    show or set reasoning depth\n\
-         \x20 /permissions [ask|auto|readonly|reset] show or switch tool permission level\n\
-         \x20                                  (reset forgets this project's always-allow answers)\n\
-         \x20 /sandbox [off|auto|require|status] OS sandbox for shell commands\n\
-         \x20 /mouse|/scroll [on|off|status]   wheel scroll + drag-to-copy (on by default)\n\
-         \x20   or say: \"switch to build mode\" / \"use readonly\"\n\
-         \x20 /compact               compress context to free up token budget\n\
-         \x20 /context               show current context usage\n\
-         \x20 /cost                  session tokens and estimated cost\n\
-         \x20 /diff                  show current git diff summary\n\
-         \x20 /review                AI code review of staged git diff\n\
-         \x20 /commit                AI-drafted conventional commit message\n\
-         \x20 /pr                    AI-drafted pull request title + description\n\
-         \x20 /schedule <delay> <t>  one-shot workflow  (e.g. /schedule 5m cargo test)\n\
-         \x20 /loop <interval> <t>   repeating workflow (e.g. /loop 30m cargo test)\n\
-         \x20 /workflows /tasks      list and manage background workflows\n\
-         \x20 /btw <context>         inject context into next agent turn\n\
-         \x20 /config                configure hooks, memory, commands via AI\n\
-         \x20 /memory                view and edit session memory\n\
-         \x20 /skills                browse available skills and custom commands\n\
-         \x20 /tools                 browse callable tools\n\
-         \x20 /mcp [name|add|remove|reload]  MCP servers and their tools\n\
-         \x20 /trace                 inspect hooks, tools, skills, and subagents\n\
-         \x20 /agents /checkpoints /undo /doctor\n\
-         \x20 /help /clear /new /resume /init /exit\n\
-         \x20 !<cmd>                 run shell command directly\n\
-         \x20 @<path>                Tab-complete a file path\n\
-         \x20 Tab                    autocomplete /commands and sub-args\n"
+         EXIT CODES (headless; --json ends with a result event naming the outcome):\n\
+         \x20 0 success   1 failed   2 usage error   3 changes blocked or denied\n\
+         \x20 4 hook blocked the task   5 budget limit   6 step limit\n\
+         \x20 7 checks fail   8 verification failed   9 review found blocking issues\n\
+         \x20 130/143 interrupted (SIGINT/SIGTERM)\n\n\
+         INTERACTIVE (/help in a session explains each):\n"
     );
+    let mut sections: Vec<(&str, Vec<&str>)> = Vec::new();
+    for c in tui::COMMANDS {
+        let names = std::iter::once(c.name).chain(c.aliases.iter().copied());
+        match sections.iter_mut().find(|(t, _)| *t == c.section) {
+            Some((_, list)) => list.extend(names),
+            None => sections.push((c.section, names.collect())),
+        }
+    }
+    let title_w = sections.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+    for (title, names) in sections {
+        // Wrapped to 80 columns under the section's name.
+        let mut line = format!("  {title:<title_w$} ");
+        let indent = line.len();
+        for n in names {
+            if line.len() + 1 + n.len() > 80 && line.len() > indent {
+                out.push_str(line.trim_end());
+                out.push('\n');
+                line = " ".repeat(indent);
+            }
+            line.push(' ');
+            line.push_str(n);
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "  !<cmd> runs a shell command · @<path> attaches a file · Shift+Tab cycles mode\n\
+         \x20 Esc stops the agent · Esc Esc on an empty line rewinds · Tab completes\n\n\
+         What leaves your machine, and where keys are kept: {DATA_DOCS}\n"
+    ));
+    out
 }
 
-fn run_doctor() {
-    println!("buildwithnexus {VERSION} — doctor");
-    println!();
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CheckState {
+    Pass,
+    Warn,
+    Fail,
+    Note,
+}
 
-    // Settings
+/// One line of `doctor`: what was checked, how it went, and the detail
+/// (with the fix when it failed).
+#[derive(Debug)]
+struct DoctorCheck {
+    name: String,
+    state: CheckState,
+    detail: String,
+}
+
+impl DoctorCheck {
+    fn new(name: impl Into<String>, state: CheckState, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            state,
+            detail: detail.into(),
+        }
+    }
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Pass, detail)
+    }
+    fn fail(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Fail, detail)
+    }
+    fn note(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::new(name, CheckState::Note, detail)
+    }
+    // sandbox::doctor_summary and hook lines speak in glyphs.
+    fn from_glyph(name: impl Into<String>, glyph: &str, detail: impl Into<String>) -> Self {
+        let state = match glyph {
+            "✓" => CheckState::Pass,
+            "✗" => CheckState::Fail,
+            "⚠" => CheckState::Warn,
+            _ => CheckState::Note,
+        };
+        Self::new(name, state, detail)
+    }
+
+    fn status(&self) -> &'static str {
+        match self.state {
+            CheckState::Pass => "ok",
+            CheckState::Warn => "warn",
+            CheckState::Fail => "fail",
+            CheckState::Note => "info",
+        }
+    }
+
+    // Names and details carry paths, server names and server errors.
+    fn line(&self) -> String {
+        let glyph = match self.state {
+            CheckState::Pass => "✓",
+            CheckState::Warn => "⚠",
+            CheckState::Fail => "✗",
+            CheckState::Note => "·",
+        };
+        format!(
+            "  {glyph} {:<14} {}",
+            tui::sanitize_terminal(&self.name),
+            tui::sanitize_terminal(&self.detail)
+        )
+    }
+}
+
+// Each configured hook, and a line starting with ⚠ for every problem
+// (unknown events and types, untrusted files).
+fn hook_doctor_lines() -> Vec<String> {
+    hooks::doctor_lines()
+}
+
+// `ollama list` names carry a tag; a configured name without one means
+// `:latest`.
+fn ollama_has_model(installed: &[String], model: &str) -> bool {
+    installed
+        .iter()
+        .any(|m| m == model || (!model.contains(':') && *m == format!("{model}:latest")))
+}
+
+// The live check of the model endpoint. Ollama answers for free on
+// /api/tags, which also says whether the configured model is there; every
+// other server pays one output token. A local setup never reaches a hosted
+// address.
+fn provider_check(p: &Provider, id: &str) -> DoctorCheck {
+    let url = tui::sanitize_terminal(&p.base_url).into_owned();
+    if id == "ollama" && p.protocol == config::Protocol::OllamaNative {
+        let models = provider::ollama_models(&p.base_url);
+        return if models.is_empty() {
+            DoctorCheck::fail(
+                "provider",
+                format!(
+                    "no answer or no models at Ollama {url} — is it running (ollama serve) \
+                     and is the model pulled (ollama pull {})?",
+                    p.model
+                ),
+            )
+        } else if !ollama_has_model(&models, &p.model) {
+            DoctorCheck::fail(
+                "provider",
+                format!(
+                    "{} is not installed at Ollama {url} — ollama pull {}",
+                    p.model, p.model
+                ),
+            )
+        } else {
+            DoctorCheck::pass("provider", format!("Ollama at {url} has {}", p.model))
+        };
+    }
+    match provider::validate(p) {
+        Ok(Some(served)) => DoctorCheck::pass(
+            "provider",
+            format!("{id} at {url} answers as {served} (one-token probe)"),
+        ),
+        Ok(None) => DoctorCheck::pass(
+            "provider",
+            format!("{id} at {url} answers as {} (one-token probe)", p.model),
+        ),
+        // The error can carry the server's response body.
+        Err(e) => DoctorCheck::fail(
+            "provider",
+            format!("{id} at {url}: {}", e.chars().take(200).collect::<String>()),
+        ),
+    }
+}
+
+// What an Ollama setup sends as its context window. Ollama's OpenAI-compatible
+// `/v1` endpoint takes no num_ctx, so a prompt past the server's default
+// window is cut without a word; only the native API carries it.
+fn ollama_window_check(p: &Provider) -> Option<DoctorCheck> {
+    match p.protocol {
+        config::Protocol::OllamaNative => Some(DoctorCheck::note(
+            "context",
+            format!("{} tokens, sent as num_ctx", p.context_tokens),
+        )),
+        config::Protocol::OpenAi
+            if p.base_url.trim_end_matches('/').ends_with("/v1")
+                && provider::ollama_models_checked(&p.base_url).is_some() =>
+        {
+            Some(DoctorCheck::from_glyph(
+                "context",
+                "⚠",
+                "this is Ollama addressed through its /v1 endpoint, which takes no num_ctx: \
+                 prompts are cut at the server's default window and the footer's window is a guess. \
+                 Use provider ollama (`buildwithnexus init`), or set context_tokens",
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Every doctor check, in order. `live` is the session's provider (/doctor);
+/// otherwise the provider is built as a headless run would build it.
+fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck> {
+    let mut out = Vec::new();
+
     let load = config::load_settings_diag();
     for i in &load.issues {
-        println!(
-            "  ✗ settings       {}: {}",
-            tui::sanitize_terminal(&i.source),
-            tui::sanitize_terminal(&i.error)
-        );
+        out.push(DoctorCheck::fail(
+            "settings",
+            format!("{}: {}", i.source, i.error),
+        ));
     }
-    match load.settings.as_ref() {
-        None if load.any_present => {
-            println!("  ✗ settings       present but unusable — fix the file(s) above");
-        }
-        None => println!("  ✗ settings       not found — run `buildwithnexus init`"),
+    let mut settings = match load.settings.clone() {
         Some(s) => {
-            println!(
-                "  ✓ settings       provider={} model={} permission={}",
-                s.provider,
-                if s.model.is_empty() {
-                    "(default)"
-                } else {
-                    &s.model
-                },
-                s.permission
-            );
-            // Live connectivity through the exact path real requests take —
-            // key presence says nothing about whether the provider answers.
-            // Ollama is probed via its free /api/tags; everything else pays
-            // one output token, which is what a diagnostic command is for.
-            match build_provider(s) {
-                Ok(p) => {
-                    if config::preset(&s.provider).is_some_and(|pr| pr.id == "ollama") {
-                        let models = provider::ollama_models(&p.base_url);
-                        if models.is_empty() {
-                            println!(
-                                "  ✗ provider       can't reach Ollama at {} — is it running? (ollama serve)",
-                                p.base_url
-                            );
-                        } else {
-                            println!(
-                                "  ✓ provider       Ollama at {} — {} model{} installed",
-                                p.base_url,
-                                models.len(),
-                                if models.len() == 1 { "" } else { "s" }
-                            );
-                        }
+            out.push(DoctorCheck::pass(
+                "settings",
+                format!(
+                    "provider={} model={} permission={}",
+                    s.provider,
+                    if s.model.is_empty() {
+                        "(default)"
                     } else {
-                        match provider::validate(&p) {
-                            Ok(_) => println!(
-                                "  ✓ provider       {} answers as {} (one-token probe)",
-                                s.provider, p.model
-                            ),
-                            // The error can carry the server's response body.
-                            Err(e) => println!(
-                                "  ✗ provider       {}: {}",
-                                s.provider,
-                                tui::sanitize_terminal(&e)
-                                    .chars()
-                                    .take(160)
-                                    .collect::<String>()
-                            ),
-                        }
-                    }
-                }
-                Err(e) => println!(
-                    "  ✗ provider       {}",
-                    tui::sanitize_terminal(&e.to_string())
+                        &s.model
+                    },
+                    s.permission
                 ),
+            ));
+            Some(s)
+        }
+        None if load.any_present => {
+            out.push(DoctorCheck::fail(
+                "settings",
+                "present but unusable — fix the file(s) above",
+            ));
+            None
+        }
+        // As a headless run would: --provider, or the first key set.
+        None => {
+            match unattended_settings(opts.provider.as_deref(), |k| config::load_key(k).is_some()) {
+                Some(s) => {
+                    out.push(DoctorCheck::note(
+                        "settings",
+                        format!(
+                            "none — runs use {} from flags or the environment",
+                            s.provider
+                        ),
+                    ));
+                    Some(s)
+                }
+                None => {
+                    out.push(DoctorCheck::fail(
+                        "settings",
+                        "not found — run `buildwithnexus init`, or pass --provider",
+                    ));
+                    None
+                }
             }
+        }
+    };
+    if let Some(s) = settings.as_mut() {
+        if let Some(p) = &opts.provider {
+            s.provider = p.clone();
+        }
+        if let Some(u) = &opts.base_url {
+            s.base_url = Some(u.clone());
+        }
+        if let Some(m) = &opts.model {
+            s.model = m.clone();
         }
     }
 
-    // Sandbox: the probe runs the real backend once, so this reports whether
-    // shell commands would actually be confined on this machine.
-    if let Some(s) = &load.settings {
+    // The key of the provider in use, and no other.
+    if let Some((s, preset)) = settings
+        .as_ref()
+        .and_then(|s| config::preset(&s.provider).map(|p| (s, p)))
+    {
+        if preset.id == "custom" {
+            let url = s.base_url.as_deref().unwrap_or(preset.base_url);
+            let origin = config::endpoint_origin(url);
+            out.push(DoctorCheck::note(
+                config::CUSTOM_KEY,
+                if config::load_custom_key(url).is_some() {
+                    format!("set for {origin}")
+                } else {
+                    format!("not set for {origin} (optional for most servers)")
+                },
+            ));
+        } else if !preset.env_key.is_empty() {
+            out.push(match config::load_key(preset.env_key) {
+                Some(_) => DoctorCheck::pass(preset.env_key, "set"),
+                None => DoctorCheck::fail(
+                    preset.env_key,
+                    format!(
+                        "not set (needed for {}) — export it or run `buildwithnexus init`",
+                        preset.label
+                    ),
+                ),
+            });
+        }
+    }
+
+    if let Some(s) = &settings {
+        match live {
+            Some(p) => {
+                out.push(provider_check(p, &s.provider));
+                out.extend(ollama_window_check(p));
+            }
+            None => match build_provider(s) {
+                Ok(p) => {
+                    out.push(provider_check(&p, &s.provider));
+                    out.extend(ollama_window_check(&p));
+                }
+                Err(e) => out.push(DoctorCheck::fail("provider", e)),
+            },
+        }
+    }
+
+    // The probe runs the real backend once, so this reports whether shell
+    // commands would actually be confined on this machine.
+    if let Some(s) = &settings {
         if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
-            println!("  ✗ sandbox        {e}");
+            out.push(DoctorCheck::fail("sandbox", e));
         }
     }
     let (glyph, text) = sandbox::doctor_summary();
-    println!("  {glyph} sandbox        {text}");
-
-    // API key
-    for preset in config::PRESETS
-        .iter()
-        .filter(|p| !p.env_key.is_empty() && !p.local)
+    out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
+    if let Some(note) = settings
+        .as_ref()
+        .and_then(|s| agent::max_parallel_helpers_note(s.max_parallel_helpers))
     {
-        match config::load_key(preset.env_key) {
-            Some(_) => println!("  ✓ {}  set", preset.env_key),
-            None => println!(
-                "  ✗ {}  not set (needed for {})",
-                preset.env_key, preset.label
-            ),
-        }
+        out.push(DoctorCheck::note("helpers", note));
     }
 
-    // Memory
-    match config::load_memory() {
-        None => println!("  ·  memory.md     (empty)"),
-        Some(m) => println!("  ✓ memory.md      {} chars", m.len()),
+    out.push(match config::load_memory() {
+        None => DoctorCheck::note("memory.md", "(empty)"),
+        Some(m) => DoctorCheck::pass("memory.md", format!("{} chars", m.len())),
+    });
+    out.push(DoctorCheck::note(
+        "home",
+        config::home().display().to_string(),
+    ));
+
+    for line in hook_doctor_lines() {
+        out.push(match line.strip_prefix('⚠') {
+            Some(problem) => DoctorCheck::new("hooks", CheckState::Warn, problem.trim()),
+            None => DoctorCheck::pass("hooks", line),
+        });
     }
 
-    // MCP servers: a real connect + handshake each, bounded by their timeouts.
-    for line in doctor_mcp_lines() {
-        println!("{line}");
-    }
+    out.extend(mcp_checks());
 
-    // External tools
-    let tools_to_check = [
+    for (bin, label) in [
         ("git", "version control"),
         ("cargo", "Rust build tool"),
         ("node", "Node.js runtime"),
@@ -4475,160 +8845,179 @@ fn run_doctor() {
         ("gh", "GitHub CLI (optional)"),
         ("docker", "Docker (optional)"),
         ("rg", "ripgrep (fast search, optional)"),
-    ];
-    for (bin, label) in &tools_to_check {
-        let found = crate::tools::find_on_path(bin).is_some();
-        let glyph = if found { "✓" } else { "·" };
-        println!("  {glyph} {bin:<12} {label}");
+    ] {
+        out.push(if crate::tools::find_on_path(bin).is_some() {
+            DoctorCheck::pass(bin, label)
+        } else {
+            match install_command(bin) {
+                Some(how) => {
+                    DoctorCheck::note(bin, format!("{label} — not found; install it with: {how}"))
+                }
+                None => DoctorCheck::note(bin, format!("{label} — not found")),
+            }
+        });
     }
 
     if crate::tools::is_wsl() {
-        println!();
-        println!("  ✓ WSL2 runtime     detected");
         let home = config::home();
-        if crate::tools::is_wsl_windows_mount(&home) {
-            println!(
-                "  ⚠ WSL2 filesystem  NEXUS_HOME is on a Windows mount ({}).",
-                home.display()
-            );
-            println!("                     Set NEXUS_HOME to a Linux path (~/.buildwithnexus) for 10x faster I/O.");
+        out.push(if crate::tools::is_wsl_windows_mount(&home) {
+            DoctorCheck::new(
+                "wsl2",
+                CheckState::Warn,
+                format!(
+                    "NEXUS_HOME is on a Windows mount ({}) — set it to a Linux path for faster I/O",
+                    home.display()
+                ),
+            )
         } else {
-            println!("  ✓ WSL2 filesystem  native Linux filesystem detected (optimal I/O speed)");
-        }
+            DoctorCheck::pass("wsl2", "native Linux filesystem")
+        });
     }
-
-    // Connectivity (quick HEAD to detect outbound network)
-    println!();
-    println!("  checking connectivity...");
-    let reachable = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "--max-time",
-            "5",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "https://api.anthropic.com",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|code| code.trim() != "000")
-        .unwrap_or(false);
-    if reachable {
-        println!("  ✓ api.anthropic.com reachable");
-    } else {
-        println!("  ✗ api.anthropic.com unreachable — check firewall / proxy");
-    }
-
-    println!();
-    check_and_offer_install_dependencies(true);
-    println!();
-    println!("  Run `buildwithnexus init` to fix any missing configuration.");
+    out
 }
 
-pub fn check_and_offer_install_dependencies(interactive: bool) {
-    let tools_to_check = [
-        ("git", "git", "git", "Version control & workspace tracking"),
-        (
-            "rg",
-            "ripgrep",
-            "ripgrep",
-            "High-speed regex/pattern file searching",
-        ),
-        ("node", "node", "nodejs", "Node.js runtime & MCP servers"),
-        ("npm", "node", "npm", "Node package manager"),
-        (
-            "python3",
-            "python",
-            "python3",
-            "Python runtime & data scripting",
-        ),
-    ];
+// "2 checks failed: provider, OPENAI_API_KEY" when anything failed.
+fn doctor_summary_line(checks: &[DoctorCheck]) -> Option<String> {
+    let failed: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.state == CheckState::Fail)
+        .map(|c| c.name.as_str())
+        .collect();
+    (!failed.is_empty()).then(|| {
+        format!(
+            "  {} check{} failed: {}",
+            failed.len(),
+            if failed.len() == 1 { "" } else { "s" },
+            tui::sanitize_terminal(&failed.join(", "))
+        )
+    })
+}
 
-    let mut missing = Vec::new();
-    for (bin, brew_pkg, apt_pkg, desc) in &tools_to_check {
-        let found = crate::tools::find_on_path(bin).is_some();
-        if !found {
-            missing.push((*bin, *brew_pkg, *apt_pkg, *desc));
+// `buildwithnexus doctor`: exits 1 when a check fails, so it can gate a
+// pipeline; `--json doctor` prints one `check` event per line.
+fn run_doctor(opts: &CliOptions) {
+    if !report::is_json() {
+        println!("buildwithnexus {VERSION} — doctor");
+        println!();
+    }
+    let checks = doctor_checks(opts, None);
+    let failed = checks.iter().any(|c| c.state == CheckState::Fail);
+    if report::is_json() {
+        for c in &checks {
+            report::event(serde_json::json!({
+                "type": "check",
+                "name": c.name,
+                "status": c.status(),
+                "detail": c.detail,
+            }));
+        }
+    } else {
+        for c in &checks {
+            println!("{}", c.line());
+        }
+        println!();
+        if let Some(summary) = doctor_summary_line(&checks) {
+            println!("{summary}");
         }
     }
-
-    if missing.is_empty() {
-        if interactive {
-            tui::line(&tui::green(
-                "  ✓ dependencies installed (git, rg, node, npm, python3)",
-            ));
-        }
-        return;
+    if failed {
+        std::process::exit(1);
     }
+}
 
-    tui::line(&tui::yellow(&format!(
-        "  ⚠ Missing {} OOTB development tool(s):",
-        missing.len()
-    )));
-    for (bin, _, _, desc) in &missing {
-        tui::line(&format!("    • {} — {}", tui::bold(bin), desc));
-    }
+/// Tools bwn can use from PATH: (binary, Homebrew package, apt package,
+/// download page, what it is for, needed by bwn itself).
+const DEPENDENCIES: &[(&str, &str, &str, &str, &str, bool)] = &[
+    (
+        "git",
+        "git",
+        "git",
+        "https://git-scm.com/downloads",
+        "/undo, /diff and checkpoints use it",
+        true,
+    ),
+    (
+        "rg",
+        "ripgrep",
+        "ripgrep",
+        "https://github.com/BurntSushi/ripgrep#installation",
+        "faster searches when the agent runs it; bwn's own search does not need it",
+        false,
+    ),
+    (
+        "node",
+        "node",
+        "nodejs",
+        "https://nodejs.org",
+        "MCP servers written for Node",
+        false,
+    ),
+    (
+        "npm",
+        "node",
+        "npm",
+        "https://nodejs.org",
+        "installing Node MCP servers",
+        false,
+    ),
+    (
+        "python3",
+        "python",
+        "python3",
+        "https://www.python.org/downloads",
+        "Python scripts and MCP servers",
+        false,
+    ),
+];
 
-    if !interactive {
-        tui::line(&tui::dim("  Tip: Run `buildwithnexus init` or `buildwithnexus doctor` to auto-install missing dependencies."));
-        return;
-    }
-
-    let brew_available = crate::tools::find_on_path("brew").is_some();
-    let apt_available = crate::tools::find_on_path("apt-get").is_some();
-
-    for (bin, brew_pkg, apt_pkg, desc) in missing {
-        let ask_msg = format!(
-            "  Would you like to install '{}' ({}) now? [Y/n]: ",
-            bin, desc
-        );
-        let ans = match tui::ask(&ask_msg) {
-            Some(a) => a.trim().to_lowercase(),
-            None => break,
-        };
-        if ans == "n" || ans == "no" {
-            tui::line(&tui::dim(&format!("    Skipped installing {bin}.")));
+/// Lists a missing tool bwn itself needs (git) as plain advice at session
+/// start; it never installs anything. `doctor` names every missing tool with
+/// its install command in its own checks. The name is kept for its callers.
+pub fn check_and_offer_install_dependencies() {
+    let brew = crate::tools::find_on_path("brew").is_some();
+    let apt = crate::tools::find_on_path("apt-get").is_some();
+    for &(bin, brew_pkg, apt_pkg, page, why, needed) in DEPENDENCIES {
+        if !needed || crate::tools::find_on_path(bin).is_some() {
             continue;
         }
+        let how = install_hint(brew_pkg, apt_pkg, page, brew, apt, cfg!(windows));
+        tui::line(&tui::yellow(&format!(
+            "  · {bin} not found — {why}; install it with: {how}"
+        )));
+    }
+}
 
-        if brew_available {
-            tui::line(&tui::accent(&format!(
-                "    Running `brew install {brew_pkg}`..."
-            )));
-            let res = std::process::Command::new("brew")
-                .args(["install", brew_pkg])
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
-                }
-                _ => tui::line(&tui::red(&format!(
-                    "    ✗ Failed to install {brew_pkg} via Homebrew."
-                ))),
-            }
-        } else if apt_available {
-            tui::line(&tui::accent(&format!(
-                "    Running `sudo apt-get install -y {apt_pkg}`..."
-            )));
-            let res = std::process::Command::new("sudo")
-                .args(["apt-get", "install", "-y", apt_pkg])
-                .status();
-            match res {
-                Ok(s) if s.success() => {
-                    tui::line(&tui::green(&format!("    ✓ Successfully installed {bin}!")))
-                }
-                _ => tui::line(&tui::red(&format!(
-                    "    ✗ Failed to install {apt_pkg} via apt-get."
-                ))),
-            }
-        } else {
-            tui::line(&tui::yellow(&format!(
-                "    Neither Homebrew nor apt-get found. Please install '{bin}' manually."
-            )));
-        }
+// How to install `bin` here, when it is one of DEPENDENCIES.
+fn install_command(bin: &str) -> Option<String> {
+    let &(_, brew_pkg, apt_pkg, page, _, _) = DEPENDENCIES.iter().find(|d| d.0 == bin)?;
+    Some(install_hint(
+        brew_pkg,
+        apt_pkg,
+        page,
+        crate::tools::find_on_path("brew").is_some(),
+        crate::tools::find_on_path("apt-get").is_some(),
+        cfg!(windows),
+    ))
+}
+
+// The command (or page) that installs a tool here. Printed for the person to
+// run, never run by bwn. `windows` is a parameter so tests cover it anywhere.
+fn install_hint(
+    brew_pkg: &str,
+    apt_pkg: &str,
+    page: &str,
+    brew: bool,
+    apt: bool,
+    windows: bool,
+) -> String {
+    if windows {
+        page.to_string()
+    } else if brew {
+        format!("brew install {brew_pkg}")
+    } else if apt {
+        format!("sudo apt-get install {apt_pkg}")
+    } else {
+        page.to_string()
     }
 }
 
@@ -4715,15 +9104,27 @@ mod tests {
         assert_eq!(p.model, "my-vllm-model");
 
         // With a key configured, plain http to a REMOTE host is refused…
-        config::save_key(config::CUSTOM_KEY, "sk-custom");
         let mut remote = s.clone();
         remote.base_url = Some("http://gateway.example.com/v1".into());
+        config::save_custom_key("http://gateway.example.com/v1", "sk-custom");
         assert!(build_provider(&remote).is_err());
         // …but loopback and https are both fine.
-        assert!(build_provider(&s).unwrap().api_key.is_some());
+        config::save_custom_key("http://localhost:8000/v1", "sk-local");
+        assert_eq!(
+            build_provider(&s).unwrap().api_key.as_deref(),
+            Some("sk-local")
+        );
         let mut tls = s.clone();
         tls.base_url = Some("https://gateway.example.com/v1".into());
-        assert!(build_provider(&tls).is_ok());
+        config::save_custom_key("https://gateway.example.com/v1", "sk-tls");
+        assert_eq!(
+            build_provider(&tls).unwrap().api_key.as_deref(),
+            Some("sk-tls")
+        );
+        // Each endpoint gets its own key, or none.
+        let mut other = s.clone();
+        other.base_url = Some("http://127.0.0.1:9000/v1".into());
+        assert_eq!(build_provider(&other).unwrap().api_key, None);
 
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&h);
@@ -4788,20 +9189,272 @@ mod tests {
     }
 
     #[test]
-    fn auto_switch_escalates_out_of_brainstorm_only() {
-        // Brainstorming mode escalates to Plan mode first before stepping to Build mode.
+    fn a_task_typed_in_brainstorm_gets_a_hint_never_a_mode_change() {
+        // The hint names PLAN; the mode stays where the person put it.
+        let (target, hint) = mode_hint("build me a snake game", &Mode::Brainstorm).unwrap();
+        assert_eq!(target, "PLAN");
+        assert!(hint.contains("this looks like a task — Shift+Tab for PLAN"));
+        // A long paste of notes reads as a plan-sized task: still only a hint.
+        let notes =
+            "we should build a cache layer, add retries and fix the flaky test. ".repeat(30);
+        assert!(notes.len() > 2000);
+        assert_eq!(mode_hint(&notes, &Mode::Brainstorm).unwrap().0, "PLAN");
+        // A build task in PLAN suggests BUILD; matching modes say nothing.
+        assert_eq!(
+            mode_hint("fix the parser bug", &Mode::Plan).unwrap().0,
+            "BUILD"
+        );
+        assert!(mode_hint("fix the parser bug", &Mode::Build).is_none());
+        assert!(mode_hint("what if we used sqlite?", &Mode::Brainstorm).is_none());
+    }
+
+    fn git_fixture(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&d)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(d.join("app.py"), "def main():\n    pass\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "commit.gpgsign=false", "commit", "-qm", "init"]);
+        d
+    }
+
+    fn log_count(d: &std::path::Path) -> usize {
+        git_text(d, &["log", "--oneline"]).unwrap().lines().count()
+    }
+
+    #[test]
+    fn commit_shows_the_draft_and_commits_only_after_c() {
+        let d = git_fixture("commit");
+        // Nothing staged: no draft is requested.
+        let mut drafted = false;
+        let r = commit_flow(
+            &d,
+            |_, _| {
+                drafted = true;
+                Ok("x".into())
+            },
+            &mut |_| Some("c".into()),
+        );
+        assert!(r.is_none() && !drafted);
+
+        std::fs::write(d.join("app.py"), "def greet():\n    pass\n").unwrap();
+        git_text(&d, &["add", "app.py"]).unwrap();
+        let draft = |stat: &str, diff: &str| {
+            assert!(stat.contains("app.py") && diff.contains("+def greet"));
+            Ok("feat: add greet helper".to_string())
+        };
+        let answer = |script: &'static [&'static str]| {
+            let mut i = 0;
+            move |q: &str| {
+                if q.contains("run git here anyway") {
+                    return Some("y".to_string());
+                }
+                i += 1;
+                script.get(i - 1).map(|a| a.to_string())
+            }
+        };
+        // n: the draft is shown, git log is unchanged and the change stays staged.
+        assert!(commit_flow(&d, draft, &mut answer(&["n"])).is_none());
+        assert_eq!(log_count(&d), 1);
+        assert!(!git_text(&d, &["diff", "--staged", "--stat"])
+            .unwrap()
+            .trim()
+            .is_empty());
+        // e, a new message, then c: bwn commits the edited message.
+        let summary = commit_flow(&d, draft, &mut answer(&["e", "feat: greet people", "c"]))
+            .expect("committed");
+        assert!(summary.ends_with("feat: greet people"), "{summary}");
+        assert_eq!(log_count(&d), 2);
+        assert!(crate::checkpoint::committed_since_turn(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_after_a_commit_says_commits_are_not_undone() {
+        // /commit with no agent turn recorded in this folder.
+        assert_eq!(
+            undo_preamble(None, true),
+            [
+                "  commits are not undone by /undo — git reset --soft HEAD~1 keeps the changes",
+                "  no agent turn recorded in this folder — /checkpoints lists what can be restored",
+            ]
+        );
+        assert_eq!(
+            undo_preamble(None, false),
+            ["  no agent turn recorded in this folder — /checkpoints lists what can be restored"]
+        );
+        // A turn, then a commit made outside bwn (HEAD moved).
+        let last = checkpoint::LastTurn {
+            turn: checkpoint::Turn::default(),
+            checkpoints: Vec::new(),
+            this_session: true,
+            head_moved: true,
+        };
+        assert_eq!(undo_preamble(Some(&last), false).len(), 1);
+        let last = checkpoint::LastTurn {
+            head_moved: false,
+            ..last
+        };
+        assert!(undo_preamble(Some(&last), false).is_empty());
+    }
+
+    #[test]
+    fn a_model_pick_with_an_unknown_provider_word_is_named() {
+        assert_eq!(
+            unknown_provider_word("nonsense some-model"),
+            Some("nonsense")
+        );
+        assert_eq!(unknown_provider_word("ollama tinycoder:3b"), None);
+        assert_eq!(unknown_provider_word("tinycoder:3b"), None);
+    }
+
+    #[test]
+    fn resume_rows_name_age_messages_and_folder() {
+        let mk = |title: &str, cwd: &str| session::Session {
+            schema_version: 1,
+            id: title.into(),
+            title: title.into(),
+            cwd: cwd.into(),
+            model: "m".into(),
+            created_ms: 0,
+            updated_ms: 0,
+            msgs: vec![],
+            name: None,
+        };
+        let all = [
+            mk("fix the parser", "/work/api"),
+            mk("add a flag", "/work/cli"),
+        ];
+        let item = session_item(&all[0], std::path::Path::new("/work/api"));
+        assert_eq!(item.label, "fix the parser");
+        assert!(
+            item.detail.ends_with("0 msgs · this folder"),
+            "{}",
+            item.detail
+        );
+        let here = std::path::Path::new("/work/api");
+        assert_eq!(session_folder(&all[0], here), "this folder");
+        assert_eq!(session_folder(&all[1], here), "…/work/cli");
+    }
+
+    #[test]
+    fn diff_lists_changed_and_new_files_with_one_summary() {
+        let d = git_fixture("diff");
+        std::fs::write(d.join("app.py"), "def main():\n    print('hi')\n").unwrap();
+        std::fs::create_dir_all(d.join("pkg")).unwrap();
+        std::fs::write(d.join("pkg/core.py"), "a = 1\nb = 2\n").unwrap();
+        std::fs::create_dir_all(d.join("tests")).unwrap();
+        std::fs::write(d.join("tests/test_core.py"), "x\n").unwrap();
+        git_text(&d, &["add", "tests/test_core.py"]).unwrap();
+        let (_, files) = changed_files(&d).unwrap();
+        let listed: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.kind())).collect();
+        assert_eq!(
+            listed,
+            [
+                ("app.py", "modified"),
+                ("tests/test_core.py", "added"),
+                ("pkg/", "new folder")
+            ]
+        );
+        let app = &files[0];
+        assert_eq!((app.added, app.removed), (1, 1));
+        assert_eq!(files[2].added, 2, "lines in the new folder count");
+        assert_eq!(
+            diff_summary(&files),
+            "3 files changed, 4 insertions(+), 1 deletion(-)"
+        );
+        // Porcelain with a rename keeps the new path only.
+        assert_eq!(
+            parse_porcelain("R  new.py\0old.py\0?? x/\0"),
+            [
+                ("R ".to_string(), "new.py".to_string()),
+                ("??".into(), "x/".into())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_takes_the_last_answer_and_wraps_it_for_the_clipboard() {
+        let t = vec![
+            provider::Msg::User("q".into()),
+            provider::Msg::Assistant {
+                text: "first answer".into(),
+                calls: vec![],
+            },
+            provider::Msg::Assistant {
+                text: "  ".into(),
+                calls: vec![],
+            },
+        ];
+        assert_eq!(last_answer(&t), Some("first answer"));
+        assert_eq!(last_answer(&[]), None);
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn rewind_cuts_the_conversation_just_before_the_prompt() {
+        use provider::Msg;
+        let answer = |t: &str| Msg::Assistant {
+            text: t.into(),
+            calls: vec![],
+        };
+        let mut t = vec![
+            Msg::System("sys".into()),
+            Msg::User("first".into()),
+            answer("a1"),
+            Msg::User("second\n\n[hook context]\nbranch main".into()),
+            answer("a2"),
+            Msg::User("third".into()),
+            answer("a3"),
+        ];
+        let point = |index, prompt: &str| RewindPoint {
+            index,
+            started_ms: 0,
+            prompt: prompt.into(),
+            typed: prompt.into(),
+        };
+        // A hook appended context to "second": still found.
+        assert!(rewind_transcript(&mut t, &point(3, "second")));
+        assert_eq!(t.len(), 3);
+        assert!(matches!(t.last(), Some(Msg::Assistant { text, .. }) if text == "a1"));
+        // The first prompt of a conversation (recorded at index 0, behind the
+        // system prompt the turn added) leaves an empty conversation.
+        assert!(rewind_transcript(&mut t, &point(0, "first")));
+        assert!(t.is_empty());
+        // A prompt that is no longer there changes nothing.
+        let mut t = vec![Msg::System("sys".into()), Msg::User("summary".into())];
+        assert!(!rewind_transcript(&mut t, &point(1, "gone")));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_plan_stays_in_plan() {
         assert!(matches!(
-            auto_switch_mode("build me a snake game", &Mode::Brainstorm),
-            Some(Mode::Plan)
+            mode_after_plan(agent::PlanEnd::Executed),
+            Mode::Build
         ));
         assert!(matches!(
-            auto_switch_mode("plan the migration to sqlite", &Mode::Brainstorm),
-            Some(Mode::Plan)
+            mode_after_plan(agent::PlanEnd::Cancelled),
+            Mode::Plan
         ));
-        // A deliberate PLAN gate is never silently bypassed.
-        assert!(auto_switch_mode("fix the parser bug", &Mode::Plan).is_none());
-        // Matching mode: nothing to do.
-        assert!(auto_switch_mode("fix the parser bug", &Mode::Build).is_none());
+        assert!(matches!(
+            mode_after_plan(agent::PlanEnd::Answered),
+            Mode::Plan
+        ));
     }
 
     #[test]
@@ -4963,6 +9616,54 @@ mod tests {
     }
 
     #[test]
+    fn legacy_exit_codes_flag_zeroes_only_incomplete_runs() {
+        let (opts, rest) = parse_cli_options(
+            ["--legacy-exit-codes", "run", "x"]
+                .map(str::to_string)
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(opts.legacy_exit_codes);
+        assert_eq!(rest, ["run", "x"]);
+        assert!(!parse_cli_options(vec![]).unwrap().0.legacy_exit_codes);
+        use agent::Outcome;
+        assert_eq!(headless_exit_code(Outcome::StepLimit, true, false), 6);
+        assert_eq!(headless_exit_code(Outcome::StepLimit, true, true), 0);
+        // A turn that errored keeps its code either way.
+        assert_eq!(headless_exit_code(Outcome::ApprovalBlocked, false, true), 3);
+        assert_eq!(headless_exit_code(Outcome::Failed, false, true), 1);
+    }
+
+    #[test]
+    fn the_blocked_line_names_what_was_blocked() {
+        let calls: Vec<String> = ["write a.txt", "run: npm test", "remove b", "run: ls", "x"]
+            .map(str::to_string)
+            .to_vec();
+        assert_eq!(
+            blocked_line(&calls[..1], 0),
+            "1 change was blocked for lack of approval and not made: write a.txt. \
+             Re-run with --permission-mode auto to allow it."
+        );
+        assert_eq!(
+            blocked_line(&calls, 0),
+            "5 changes were blocked for lack of approval and not made: write a.txt; \
+             run: npm test; remove b and 2 more. Re-run with --permission-mode auto to allow them."
+        );
+        // Auto would not allow these either: it is not offered.
+        let one = blocked_line(&calls[..1], 1);
+        assert!(!one.contains("Re-run with --permission-mode auto"), "{one}");
+        assert!(
+            one.ends_with("This one always needs a person to approve, even with --permission-mode auto: run bwn in a terminal to approve it."),
+            "{one}"
+        );
+        let mixed = blocked_line(&calls, 2);
+        assert!(
+            mixed.ends_with("2 of them always need a person to approve, even with --permission-mode auto (run bwn in a terminal for those); auto allows the rest."),
+            "{mixed}"
+        );
+    }
+
+    #[test]
     fn parse_cli_options_budget_rejects_missing_or_non_positive_values() {
         let err = parse_cli_options(["--max-budget-usd"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("--max-budget-usd requires a value"), "{err}");
@@ -4972,8 +9673,7 @@ mod tests {
         let err =
             parse_cli_options(["--max-budget-usd", "0"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("positive dollar amount"), "{err}");
-        // Effort values are validated when the provider is built, but the
-        // missing-value rule applies here like every other option.
+        // The missing-value rule applies to --effort like every other option.
         let err =
             parse_cli_options(["--effort", "--json"].map(str::to_string).to_vec()).unwrap_err();
         assert!(err.contains("--effort requires a value"), "{err}");
@@ -5268,6 +9968,21 @@ mod tests {
     }
 
     #[test]
+    fn an_at_word_naming_no_file_says_so() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        tui::capture_start();
+        let (text, _) = extract_attachments("explain @nosuchfile.py and @diff", &dir, false);
+        let shown = tui::capture_take().join("\n");
+        assert_eq!(text, "explain @nosuchfile.py and @diff");
+        assert!(shown.contains("@nosuchfile.py not found"), "{shown}");
+        // @diff with no changes keeps its own meaning and stays quiet.
+        assert!(!shown.contains("@diff not found"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn url_attachment_requires_web_scheme() {
         assert!(is_web_url("https://example.com/x"));
         assert!(is_web_url("HTTP://example.com"));
@@ -5299,6 +10014,65 @@ mod tests {
     }
 
     #[test]
+    fn what_you_type_is_what_the_model_gets() {
+        let dir = std::env::temp_dir().join(format!("bwn-attach-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.py"), "line 1\nline 2\nline 3\n").unwrap();
+        std::fs::write(dir.join("my notes.md"), "spaced\n").unwrap();
+        // Prompts with no attachment are sent byte for byte.
+        for typed in [
+            "why does int(\"abc\") fail with 'abc'?",
+            "line one\nline two",
+            "tabs\tand  two spaces, \"double\" and 'single' quotes",
+            "unbalanced \"quote and it's fine",
+            "a \\ backslash and C:\\path\\x",
+        ] {
+            let (text, images) = extract_attachments(typed, &dir, true);
+            assert_eq!(text, typed);
+            assert!(images.is_empty());
+        }
+        // Attachments are replaced where they stand; the rest stays as typed.
+        let typed = "see @app.py:1-2,\n\tthen \"explain\" it";
+        let (text, _) = extract_attachments(typed, &dir, true);
+        let file = format!("[file: {}]", dir.join("app.py").display());
+        assert!(
+            text.starts_with(&format!(
+                "see {file},\n\tthen \"explain\" it\n\n[attached files]\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("line 1\nline 2") && !text.contains("line 3"),
+            "{text}"
+        );
+        // Quoted and escaped @paths with spaces are one attachment.
+        for typed in [
+            "read @\"my notes.md\" now",
+            "read @'my notes.md' now",
+            "read @my\\ notes.md now",
+        ] {
+            let (text, _) = extract_attachments(typed, &dir, true);
+            let file = format!("[file: {}]", dir.join("my notes.md").display());
+            assert!(
+                text.starts_with(&format!("read {file} now\n\n")),
+                "{typed}: {text}"
+            );
+        }
+        // The composer's own tokens for dropped files round-trip.
+        for name in ["my notes.md", "say \"hi\" notes.md", "back\\slash notes.md"] {
+            std::fs::write(dir.join(name), "dropped\n").unwrap();
+            let token = crate::tui::attachment_token(&dir.join(name));
+            let (text, _) = extract_attachments(&format!("read {token}"), &dir, true);
+            assert!(text.contains("dropped"), "{token}: {text}");
+        }
+        // A missing file stays exactly as typed.
+        let (text, _) = extract_attachments("open @nope.py  please", &dir, true);
+        assert_eq!(text, "open @nope.py  please");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn image_path_before_sentence_punctuation_attaches() {
         let dir = std::env::temp_dir().join(format!("bwn-attach-punct-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5320,6 +10094,17 @@ mod tests {
             let (_, images) = extract_attachments(prompt, &dir, true);
             assert_eq!(images.len(), 1, "{prompt}");
         }
+        std::fs::write(dir.join("My Shot.png"), png).unwrap();
+        let typed = format!(
+            "what's in '{}'?\nand (shot.png)",
+            dir.join("My Shot.png").display()
+        );
+        let (text, images) = extract_attachments(&typed, &dir, true);
+        assert_eq!(images.len(), 2, "{text}");
+        assert_eq!(
+            text,
+            "what's in [image: My Shot.png]?\nand ([image: shot.png])"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5447,6 +10232,616 @@ mod tests {
 
     #[test]
     fn test_check_and_offer_install_dependencies() {
-        super::check_and_offer_install_dependencies(false);
+        super::check_and_offer_install_dependencies();
+    }
+
+    #[test]
+    fn missing_tools_get_an_install_command_that_bwn_never_runs() {
+        let page = "https://github.com/BurntSushi/ripgrep#installation";
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, false, true, false),
+            "sudo apt-get install ripgrep"
+        );
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, true, true, false),
+            "brew install ripgrep"
+        );
+        // No package manager known, and Windows (where winget may be absent):
+        // the download page.
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, false, false, false),
+            page
+        );
+        assert_eq!(
+            install_hint("ripgrep", "ripgrep", page, true, true, true),
+            page
+        );
+        // Only git is needed by bwn itself; the rest are optional.
+        let needed: Vec<&str> = DEPENDENCIES.iter().filter(|d| d.5).map(|d| d.0).collect();
+        assert_eq!(needed, ["git"]);
+    }
+
+    // A loopback HTTP server answering every request with `respond(method,
+    // path, body)` → (status, JSON body). Runs until the test process exits.
+    fn mock_http(respond: fn(&str, &str, &str) -> (u16, String)) -> u16 {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() {
+                    continue;
+                }
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; len];
+                let _ = reader.read_exact(&mut body);
+                let (status, reply) = respond(&method, &path, &String::from_utf8_lossy(&body));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        port
+    }
+
+    // Runs `swap_model` against settings saved under a scratch NEXUS_HOME and
+    // returns the settings it left behind plus the live provider.
+    fn swap_with_saved(
+        saved: config::Settings,
+        target: &str,
+        model: &str,
+    ) -> (config::Settings, Provider) {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "bwn-swap-{}-{}",
+            std::process::id(),
+            saved.provider
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        config::save_settings(&saved);
+        let mut provider = build_provider(&saved).unwrap();
+        swap_model(&mut provider, target, model, None);
+        let after = config::load_settings().unwrap();
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+        (after, provider)
+    }
+
+    #[test]
+    fn same_provider_swap_on_a_remote_ollama_keeps_its_base_url() {
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"m1"},{"name":"m2"}]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        let (after, provider) = swap_with_saved(
+            config::Settings {
+                provider: "ollama".into(),
+                model: "m1".into(),
+                base_url: Some(url.clone()),
+                ..Default::default()
+            },
+            "ollama",
+            "m2",
+        );
+        assert_eq!(after.model, "m2");
+        assert_eq!(after.base_url.as_deref(), Some(url.as_str()));
+        assert_eq!(provider.base_url, url);
+    }
+
+    // An OpenAI-compatible local server that only answers as "local-model".
+    fn local_model_only(method: &str, path: &str, body: &str) -> (u16, String) {
+        match (method, path) {
+            ("GET", "/v1/models") => (200, r#"{"data":[{"id":"local-model"}]}"#.into()),
+            ("POST", "/v1/chat/completions") if body.contains(r#""model":"local-model""#) => {
+                (200, r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())
+            }
+            ("POST", _) => (404, r#"{"error":"model not found"}"#.into()),
+            _ => (200, "{}".into()),
+        }
+    }
+
+    #[test]
+    fn local_server_swaps_use_the_saved_base_url_and_report_the_fallback() {
+        for preset in ["lmstudio", "llamacpp"] {
+            let port = mock_http(local_model_only);
+            let url = format!("http://127.0.0.1:{port}/v1");
+            let (after, provider) = swap_with_saved(
+                config::Settings {
+                    provider: preset.into(),
+                    model: "old".into(),
+                    base_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                preset,
+                "qwen-7b",
+            );
+            assert_eq!(after.base_url.as_deref(), Some(url.as_str()), "{preset}");
+            assert_eq!(after.model, "local-model", "{preset}");
+            assert_eq!(provider.model, "local-model", "{preset}");
+            assert_eq!(provider.base_url, url, "{preset}");
+        }
+    }
+
+    // (from, saved base_url, to, override URL, expected target)
+    type SwapCase = (
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        SwapTarget,
+    );
+
+    #[test]
+    fn plan_swap_over_preset_transitions() {
+        let preset = |id| config::preset(id).unwrap();
+        let keep = |url: &str| SwapTarget {
+            base_url: url.into(),
+            save: None,
+        };
+        let reset = |id| SwapTarget {
+            base_url: preset(id).base_url.into(),
+            save: Some(None),
+        };
+        let remote_ollama = "http://gpu-box:11434";
+        let lan_lmstudio = "http://10.0.0.5:1234/v1";
+        let lan_llama = "http://10.0.0.6:8080/v1";
+        let table: Vec<SwapCase> = vec![
+            (
+                "ollama",
+                Some(remote_ollama),
+                "ollama",
+                None,
+                keep(remote_ollama),
+            ),
+            (
+                "ollama",
+                None,
+                "ollama",
+                None,
+                keep(preset("ollama").base_url),
+            ),
+            (
+                "ollama",
+                Some(remote_ollama),
+                "anthropic",
+                None,
+                reset("anthropic"),
+            ),
+            ("anthropic", None, "ollama", None, reset("ollama")),
+            (
+                "lmstudio",
+                Some(lan_lmstudio),
+                "lmstudio",
+                None,
+                keep(lan_lmstudio),
+            ),
+            (
+                "llamacpp",
+                Some(lan_llama),
+                "llamacpp",
+                None,
+                keep(lan_llama),
+            ),
+            (
+                "llamacpp",
+                Some(lan_llama),
+                "lmstudio",
+                None,
+                reset("lmstudio"),
+            ),
+            (
+                "lmstudio",
+                Some(lan_lmstudio),
+                "ollama",
+                None,
+                reset("ollama"),
+            ),
+            ("openrouter", None, "openai", None, reset("openai")),
+            (
+                "anthropic",
+                None,
+                "custom",
+                Some("http://127.0.0.1:9000/v1"),
+                SwapTarget {
+                    base_url: "http://127.0.0.1:9000/v1".into(),
+                    save: Some(Some("http://127.0.0.1:9000/v1".into())),
+                },
+            ),
+            (
+                "custom",
+                Some("http://127.0.0.1:9000/v1"),
+                "custom",
+                None,
+                keep("http://127.0.0.1:9000/v1"),
+            ),
+        ];
+        for (from, saved, to, url, want) in table {
+            assert_eq!(
+                plan_swap(from, saved, None, preset(to), url),
+                want,
+                "{from} ({saved:?}) → {to} ({url:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_swap_returns_to_the_address_last_used_with_a_provider() {
+        let preset = |id| config::preset(id).unwrap();
+        let lan = "http://192.168.50.10:11434";
+        // LM Studio → Ollama: back to the LAN box, and it is saved again.
+        assert_eq!(
+            plan_swap("lmstudio", None, Some(lan), preset("ollama"), None),
+            SwapTarget {
+                base_url: lan.into(),
+                save: Some(Some(lan.into())),
+            }
+        );
+        // Within a provider the saved address still wins, and a typed URL
+        // wins over both.
+        assert_eq!(
+            plan_swap(
+                "ollama",
+                Some("http://a:11434"),
+                Some(lan),
+                preset("ollama"),
+                None
+            )
+            .base_url,
+            "http://a:11434"
+        );
+        assert_eq!(
+            plan_swap(
+                "lmstudio",
+                None,
+                Some(lan),
+                preset("ollama"),
+                Some("http://b:11434")
+            )
+            .base_url,
+            "http://b:11434"
+        );
+
+        // Leaving a provider remembers its address; arriving records the new one.
+        let own = |provider: &str, url: Option<&str>| config::Settings {
+            provider: provider.into(),
+            base_url: url.map(String::from),
+            ..Default::default()
+        };
+        let map = remember_endpoints(
+            &own("ollama", Some(lan)),
+            "ollama",
+            "lmstudio",
+            Some(Some("http://127.0.0.1:1234/v1")),
+        );
+        assert_eq!(map.get("ollama").map(String::as_str), Some(lan));
+        assert_eq!(
+            map.get("lmstudio").map(String::as_str),
+            Some("http://127.0.0.1:1234/v1")
+        );
+        // A preset default (no saved URL) adds nothing.
+        assert!(
+            remember_endpoints(&own("anthropic", None), "anthropic", "openai", Some(None))
+                .is_empty()
+        );
+        // Only the user's own addresses are remembered: a base_url a trusted
+        // project layers in serves that project, never every project.
+        let mine = own("custom", Some("http://my-gateway:8080/v1"));
+        let map = remember_endpoints(&mine, "custom", "ollama", Some(Some(lan)));
+        assert_eq!(map["custom"], "http://my-gateway:8080/v1");
+        let map = remember_endpoints(&mine, "custom", "custom", None);
+        assert_eq!(map["custom"], "http://my-gateway:8080/v1");
+        let map = remember_endpoints(&own("anthropic", None), "custom", "ollama", Some(Some(lan)));
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["ollama"]);
+    }
+
+    #[test]
+    fn ollama_addresses_pick_the_ollama_preset() {
+        assert!(is_ollama_address("http://192.168.50.10:11434"));
+        assert!(is_ollama_address("http://gpu-box:11434/"));
+        assert!(is_ollama_address("http://localhost:11434/v1"));
+        assert!(is_ollama_address("http://user:pw@host:11434"));
+        assert!(!is_ollama_address("http://127.0.0.1:8081/v1"));
+        assert!(!is_ollama_address("https://gateway.example/11434"));
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434"), "ollama");
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434/"), "ollama");
+        // Ollama's OpenAI-compatible /v1 stays the custom preset, as before.
+        assert_eq!(endpoint_preset("http://192.168.50.10:11434/v1"), "custom");
+        // A path, or nothing answering /api/tags, means an OpenAI-compatible
+        // endpoint.
+        assert_eq!(endpoint_preset("http://127.0.0.1:9/v1"), "custom");
+        assert_eq!(endpoint_preset("http://127.0.0.1:9"), "custom");
+        // An Ollama on another port is recognised by its own API.
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        assert_eq!(
+            endpoint_preset(&format!("http://127.0.0.1:{port}")),
+            "ollama"
+        );
+    }
+
+    #[test]
+    fn swap_back_to_ollama_goes_to_the_remembered_host() {
+        let port = mock_http(|_, path, _| match path {
+            "/api/tags" => (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#.into()),
+            _ => (200, "{}".into()),
+        });
+        let lan = format!("http://127.0.0.1:{port}");
+        let (after, provider) = swap_with_saved(
+            config::Settings {
+                provider: "lmstudio".into(),
+                model: "tinycoder-7b-instruct".into(),
+                endpoints: [("ollama".to_string(), lan.clone())].into(),
+                ..Default::default()
+            },
+            "ollama",
+            "tinycoder:3b",
+        );
+        assert_eq!(after.provider, "ollama");
+        assert_eq!(after.base_url.as_deref(), Some(lan.as_str()));
+        assert_eq!(provider.base_url, lan);
+        assert_eq!(after.endpoints.get("ollama"), Some(&lan));
+    }
+
+    #[test]
+    fn swap_success_line_names_the_model_actually_saved() {
+        let same = swap_success_line("qwen", "qwen", "LM Studio");
+        assert!(same.contains("→ qwen on LM Studio"), "{same}");
+        let fell_back = swap_success_line("qwen", "local-model", "LM Studio");
+        assert!(
+            fell_back.contains("→ local-model on LM Studio"),
+            "{fell_back}"
+        );
+        assert!(fell_back.contains("'qwen'"), "{fell_back}");
+    }
+
+    #[test]
+    fn llama_server_is_found_as_an_exe_on_windows() {
+        let dir = std::env::temp_dir().join(format!("bwn-llama-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // PATHEXT spells .EXE in upper case; Windows disks ignore case, this
+        // one may not.
+        let exe = dir.join("llama-server.EXE");
+        std::fs::write(&exe, "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(find_llama_server_in(&path, None, true), Some(exe.clone()));
+        assert_eq!(
+            find_llama_server_in(&path, Some(std::ffi::OsStr::new(".COM;.EXE")), true),
+            Some(exe)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_typed_permission_switch_lasts_for_the_session_only() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-perm-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let file = home.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"provider":"anthropic","model":"m","permission":"ask"}"#,
+        )
+        .unwrap();
+        let saved = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap()
+        };
+        let cwd = home.clone();
+        let mut perm = Permission::Ask;
+
+        // "use auto" and `/permissions auto` change the session only.
+        let phrase = super::detect_permission_switch("use auto").unwrap();
+        super::apply_permission(&mut perm, phrase, super::PermScope::Session);
+        assert_eq!(perm, Permission::Auto);
+        assert_eq!(saved()["permission"], "ask");
+        super::handle_permissions_arg(&mut perm, &cwd, "accept-edits");
+        assert_eq!(perm, Permission::AcceptEdits);
+        assert_eq!(saved()["permission"], "ask");
+        // Saving the default is its own, explicit choice.
+        super::handle_permissions_arg(&mut perm, &cwd, "default auto");
+        assert_eq!(perm, Permission::Auto);
+        assert_eq!(saved()["permission"], "auto");
+        // A name that isn't a mode changes nothing.
+        super::handle_permissions_arg(&mut perm, &cwd, "yolo2");
+        assert_eq!(perm, Permission::Auto);
+        // The number shortcuts keep their 0.14 meaning (3 never loosens
+        // to auto); accept-edits is the new 4.
+        for (arg, want) in [
+            ("1", Permission::Ask),
+            ("3", Permission::ReadOnly),
+            ("2", Permission::Auto),
+            ("4", Permission::AcceptEdits),
+        ] {
+            super::handle_permissions_arg(&mut perm, &cwd, arg);
+            assert_eq!(perm, want, "/permissions {arg}");
+        }
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn local_servers_start_with_the_configured_one() {
+        let s = Settings {
+            provider: "ollama".into(),
+            base_url: Some("http://192.168.50.10:11434".into()),
+            ..Default::default()
+        };
+        let bases: Vec<(&str, String)> = local_servers(&s)
+            .into_iter()
+            .map(|l| (l.preset, l.base))
+            .collect();
+        assert_eq!(
+            bases,
+            vec![
+                ("ollama", "http://192.168.50.10:11434".to_string()),
+                ("ollama", "http://localhost:11434".to_string()),
+                ("llamacpp", "http://localhost:8080/v1".to_string()),
+                ("lmstudio", "http://localhost:1234/v1".to_string()),
+                ("custom", "http://localhost:8000/v1".to_string()),
+            ]
+        );
+        // LM Studio moved to another port: listed once, at that port.
+        let s = Settings {
+            provider: "lmstudio".into(),
+            base_url: Some("http://localhost:1235/v1/".into()),
+            ..Default::default()
+        };
+        let servers = local_servers(&s);
+        assert_eq!(servers[0].base, "http://localhost:1235/v1");
+        assert_eq!(servers[0].label, "LM Studio");
+        assert_eq!(servers.len(), 5);
+        // A hosted provider adds nothing of its own.
+        let s = Settings {
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            ..Default::default()
+        };
+        assert_eq!(local_servers(&s).len(), 4);
+        // Addresses /model remembers for local presets come next; a hosted
+        // one is not a local server.
+        let s = Settings {
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            endpoints: [
+                (
+                    "ollama".to_string(),
+                    "http://192.168.50.10:11434".to_string(),
+                ),
+                (
+                    "openai".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let servers = local_servers(&s);
+        assert_eq!(servers[0].base, "http://192.168.50.10:11434");
+        assert_eq!(servers[0].preset, "ollama");
+        assert_eq!(servers.len(), 5);
+    }
+
+    // Answers GETs: /api/tags only when `ollama`, /v1/models always.
+    fn model_server(ollama: bool) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in l.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut first = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let (code, body) = if first.contains("/api/tags") && ollama {
+                    (200, r#"{"models":[{"name":"tinycoder:3b"}]}"#)
+                } else if first.contains("/v1/models") {
+                    (200, r#"{"data":[{"id":"x"}]}"#)
+                } else {
+                    (404, r#"{"error":"Unexpected endpoint"}"#)
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn a_gguf_swap_never_lands_on_ollama() {
+        let ollama = format!("{}/v1", model_server(true));
+        let llama = format!("{}/v1", model_server(false));
+        assert_eq!(
+            find_active_local_base_url_in(&[&ollama, &llama]),
+            Some(llama.clone())
+        );
+        assert_eq!(find_active_local_base_url_in(&[&ollama]), None);
+
+        assert_eq!(
+            gguf_unservable("tinycoder-7b-q4_k_m.gguf", false),
+            Some(
+                "llama-server is not installed — install llama.cpp, or load the file in LM Studio"
+            )
+        );
+        assert!(gguf_unservable("sub/Model.GGUF", false).is_some());
+        assert_eq!(gguf_unservable("tinycoder-7b-q4_k_m.gguf", true), None);
+        assert_eq!(gguf_unservable("tinycoder-7b-instruct", false), None);
+    }
+
+    #[test]
+    fn context_breakdown_counts_each_part_of_the_next_request() {
+        let msgs = vec![
+            provider::Msg::System("s".repeat(400)),
+            provider::Msg::User("u".repeat(80)),
+            provider::Msg::UserImages {
+                text: "t".repeat(40),
+                images: vec![("image/png".into(), "A".repeat(1_200))],
+            },
+            provider::Msg::Assistant {
+                text: "a".repeat(40),
+                calls: vec![],
+            },
+            provider::Msg::Tool(vec![provider::ToolResult {
+                id: "1".into(),
+                content: "r".repeat(40),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+        ];
+        let tools = vec![tools::ToolDef {
+            name: "read_file",
+            description: "Read a file.",
+            schema: serde_json::json!({}),
+        }];
+        let b = context_breakdown(&msgs, &tools);
+        assert_eq!(b.system, 100);
+        assert_eq!(b.conversation, 20 + 10 + 10 + 10);
+        assert_eq!(b.images, 100);
+        assert_eq!(b.tools, (9 + 12 + 2) / 4);
+        assert_eq!(b.mcp_tools, 0);
+        assert_eq!(b.total(), 100 + 50 + 100 + 5);
     }
 }
