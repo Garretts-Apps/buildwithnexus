@@ -143,6 +143,7 @@ pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String
             ("--permission-mode", &c.permission),
             ("--provider", &c.provider),
             ("--model", &c.model),
+            ("--base-url", &c.base_url),
         ] {
             if !value.is_empty() {
                 args.push(format!("{flag}={value}"));
@@ -733,6 +734,9 @@ pub fn tick() -> Vec<String> {
         let buf2 = buf.clone();
         let child_res = Command::new(&bin)
             .args(child_args(ctx.as_ref(), &task))
+            // The task is an argument: a headless run reads a pipe on stdin
+            // as more input, and the session's own terminal is not its own.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -1079,6 +1083,7 @@ mod tests {
                 "--permission-mode=readonly",
                 "--provider=custom",
                 "--model=mock-coder",
+                "--base-url=http://127.0.0.1:9/v1",
                 "--",
                 "--permission auto: create notes.txt"
             ]
