@@ -1951,12 +1951,30 @@ fn repl(
             handle_theme(arg);
             continue;
         }
+        // `/plan <task>` and `/brainstorm <task>` are turns of the one
+        // conversation, like `/build <task>`: kept, saved and counted.
         if let Some(task) = t.strip_prefix("/plan ") {
             tui::line("");
             let vision = media::model_supports_vision(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            if let Err(e) = agent::run_plan(&provider, perm, &task, cwd, false, images) {
-                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            match agent::plan_turn(
+                &provider,
+                perm,
+                &task,
+                cwd,
+                false,
+                images,
+                &mut transcript,
+                &sid,
+            ) {
+                // "Execute Plan" switches to BUILD, as its label says; the
+                // other answers leave the mode alone.
+                Ok(agent::PlanEnd::Executed) if !matches!(mode, Mode::Build) => {
+                    mode = Mode::Build;
+                    tui::show_mode_change(mode_label(&mode));
+                }
+                Ok(_) => {}
+                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
             }
             tui::bell();
             continue;
@@ -1984,8 +2002,17 @@ fn repl(
             tui::line("");
             let vision = media::model_supports_vision(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            if let Err(e) = agent::run_brainstorm(&provider, perm, cwd, &task, images).map(|_| ()) {
-                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
+            match agent::brainstorm_turn(&provider, cwd, &task, images, &mut transcript, &sid) {
+                // The person answered y to the model's suggestion to switch.
+                Ok(Some(hint)) => {
+                    mode = match hint {
+                        agent::ModeHint::Build => Mode::Build,
+                        agent::ModeHint::Plan => Mode::Plan,
+                    };
+                    tui::show_mode_change(mode_label(&mode));
+                }
+                Ok(None) => {}
+                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
             }
             tui::bell();
             continue;
