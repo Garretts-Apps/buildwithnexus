@@ -2711,7 +2711,6 @@ fn build_inner(
     build_turn(p, perm, role_id, task, cwd, depth, msgs, sid, Vec::new())
 }
 
-#[allow(clippy::too_many_arguments)]
 /// A message `provider::request` refused before sending (bigger than the
 /// server's window) stays out of the conversation, or every later message
 /// would carry it to the server. A conversation left with only its system
@@ -2725,6 +2724,7 @@ fn drop_refused_message(p: &Provider, msgs: &mut Vec<Msg>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_turn(
     p: &Provider,
     perm: Permission,
