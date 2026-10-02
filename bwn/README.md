@@ -1,7 +1,7 @@
 # bwn
 
 Short-name alias crate for [buildwithnexus](https://crates.io/crates/buildwithnexus),
-the hilariously fast agentic AI coding CLI.
+the agentic AI coding CLI.
 
 ```bash
 cargo install bwn --locked

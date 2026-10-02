@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: Garretts-Apps/buildwithnexus@v0.15.0
+      - uses: Garretts-Apps/buildwithnexus@v0.15.1
         with:
           command: review
           review-base: origin/${{ github.base_ref }}

@@ -3,9 +3,9 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-A hilariously fast, **agentic AI CLI** — written in Rust. Remote models via
+An **agentic AI CLI** with 2 ms startup, written in Rust. Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands, asking before each change. One self-contained binary, six direct
+commands, asking before each change. One self-contained binary, 10 direct
 dependencies, no runtime to babysit — and a terminal UI built to feel
 instant: an incremental wrap cache with atomic frames, live autocomplete,
 GitHub-grade diffs, clickable files and links, and multimodal input straight
@@ -145,10 +145,9 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
-"Hilariously fast" is a measurement, not a mood: 2 ms full-process startup,
-a 4.6 MiB resident TUI, and 3.6 µs to render a streamed chunk into a
-2,000-line transcript. Every number and how to regenerate it:
-[BENCHMARKS.md](BENCHMARKS.md).
+The speed is measured: 2 ms full-process startup, a 4.6 MiB resident TUI,
+and 3.6 µs to render a streamed chunk into a 2,000-line transcript. Every
+number and how to regenerate it: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Package history
 
@@ -507,7 +506,7 @@ pull request, updating the same comment on later pushes.
 every pull request:
 
 ```yaml
-- uses: Garretts-Apps/buildwithnexus@v0.15.0
+- uses: Garretts-Apps/buildwithnexus@v0.15.1
   with:
     command: review              # or run, with prompt: <task>
     review-base: origin/${{ github.base_ref }}

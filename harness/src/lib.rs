@@ -1,4 +1,4 @@
-//! A hilariously fast, agentic AI coding CLI — one self-contained binary,
+//! An agentic AI coding CLI with 2 ms startup — one self-contained binary,
 //! written in Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter,
 //! Groq, Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
 //! OpenAI-compatible `/v1` endpoint.
@@ -361,6 +361,7 @@ pub fn run() {
         sandbox::cloexec_inherited_fds();
         sandbox::hide_startup_credentials();
     }
+    tui::init_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = match parse_cli_options(args) {
         Ok(parsed) => parsed,

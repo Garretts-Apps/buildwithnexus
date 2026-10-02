@@ -28,7 +28,7 @@ pub fn run() -> Option<Settings> {
     tui::clear();
     tui::line(&tui::accent("  buildwithnexus"));
     tui::line(&tui::dim(
-        "  a hilariously fast, agentic AI CLI — remote or local models",
+        "  an agentic AI coding CLI for remote or local models",
     ));
     tui::line("");
     wsl_notice();

@@ -2,7 +2,7 @@
   "version": "1.0.0",
   "project": {
     "name": "buildwithnexus",
-    "description": "A hilariously fast, agentic AI CLI harness written in Rust. Remote models via API key, or local models. Plans, edits files, runs commands with approval gates.",
+    "description": "An agentic AI CLI harness written in Rust. Remote models via API key, or local models. Plans, edits files, runs commands with approval gates.",
     "repository": "https://github.com/Garretts-Apps/buildwithnexus",
     "primary_language": "rust",
     "indexed_at": "2026-07-06T08:00:00Z"

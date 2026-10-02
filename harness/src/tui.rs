@@ -688,8 +688,76 @@ fn no_color() -> bool {
 fn stdout_wants_color() -> bool {
     static WANTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WANTS.get_or_init(|| {
-        cfg!(test) || std::env::var_os("FORCE_COLOR").is_some() || io::stdout().is_terminal()
+        cfg!(test)
+            || std::env::var_os("FORCE_COLOR").is_some()
+            || (io::stdout().is_terminal() && console_vt())
     })
+}
+
+/// Sets up the console before anything is printed. A Windows console shows
+/// colour and cursor codes as text (`←[38;2;…m`) until the program turns on
+/// virtual-terminal processing: Windows Terminal has it on for every
+/// program, the console window that cmd and PowerShell open does not. A
+/// console that refuses it (the "Use legacy console" setting) gets line mode
+/// without colour, so it shows plain text instead of codes.
+pub fn init_console() {
+    if !console_vt() {
+        set_line_mode(true);
+    }
+}
+
+#[cfg(windows)]
+fn console_vt() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(win_console::enable_vt)
+}
+
+#[cfg(not(windows))]
+fn console_vt() -> bool {
+    true
+}
+
+// kernel32 is always linked on Windows; declaring the three calls here
+// avoids a Windows API crate, as signal_restore does.
+#[cfg(windows)]
+mod win_console {
+    type Handle = *mut std::ffi::c_void;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+    }
+
+    /// Turns on virtual-terminal processing for stdout and stderr where they
+    /// are consoles. False only when stdout is a console that refuses it; a
+    /// pipe or a file is not a console and needs nothing. The mode stays on
+    /// after bwn exits, as it does for other programs that set it.
+    pub fn enable_vt() -> bool {
+        let mut ok = true;
+        for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain kernel32 calls on the process's own standard
+            // handles; `mode` is a local the call writes.
+            unsafe {
+                let h = GetStdHandle(which);
+                let mut mode = 0u32;
+                if h.is_null() || h as isize == -1 || GetConsoleMode(h, &mut mode) == 0 {
+                    continue;
+                }
+                if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0
+                    && SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0
+                    && which == STD_OUTPUT_HANDLE
+                {
+                    ok = false;
+                }
+            }
+        }
+        ok
+    }
 }
 
 fn truecolor() -> bool {

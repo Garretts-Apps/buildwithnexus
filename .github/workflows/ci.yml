@@ -139,6 +139,14 @@ jobs:
         if: runner.os == 'Windows'
         run: node ../scripts/check-pe-imports.js ../target/debug/buildwithnexus.exe
 
+      # First-run setup in a classic console window, the one cmd opens: the
+      # colour codes must be drawn, not printed as text (0.15.0 printed
+      # ←[38;2;…m there because nothing turned on VT processing).
+      - name: Check console colours in a cmd window
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ..\scripts\check-console-colors.ps1 -Command (Resolve-Path ..\target\debug\buildwithnexus.exe).Path
+
   wrapper:
     name: npm wrapper syntax
     runs-on: ubuntu-latest
