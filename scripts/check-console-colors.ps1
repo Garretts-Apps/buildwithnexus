@@ -48,7 +48,9 @@ public static class ReadConsole {
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleScreenBufferInfo(IntPtr h, out BufferInfo info);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint mode);
-    [DllImport("kernel32.dll", SetLastError = true)]
+    // CharSet.Unicode: without it the char[] is marshalled as one byte per
+    // character and the W call writes past its end.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] text, uint length, Coord at, out uint read);
 
     // readconsole <pid> <file>: writes the console that process <pid> is
