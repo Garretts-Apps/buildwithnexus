@@ -1,6 +1,6 @@
 # Product identity
 
-One guiding principle: **it's hilariously fast.** Everything else — the
+One guiding principle: **it's fast, and the numbers prove it.** Everything else — the
 voice, the jokes, the design decisions — flows from that. Fast enough to be
 funny about it. The terminal they tell you not to worry about.
 
@@ -19,8 +19,8 @@ Where the jokes live:
 
 - **Startup tips** — one rotating dim line under the banner: half real tips,
   half quips. This is the personality's home turf.
-- **Release notes and site copy** — one wink per surface ("hilariously
-  fast", "deliberately boring launcher"). Understatement over exclamation.
+- **Release notes and site copy** — one wink per surface ("deliberately
+  boring launcher"). Understatement over exclamation.
 - **Never in error paths.** An error message's only job is the next step:
   what happened, the exact command that recovers. Jokes in errors read as
   mockery when someone's stuck. Errors stay serious; that contrast is what

@@ -1,4 +1,4 @@
-//! A hilariously fast, agentic AI coding CLI — one self-contained binary,
+//! An agentic AI coding CLI with 2 ms startup — one self-contained binary,
 //! written in Rust. Works with hosted APIs (Anthropic, OpenAI, OpenRouter,
 //! Groq, Hugging Face), local models (Ollama, llama.cpp, LM Studio), and any
 //! OpenAI-compatible `/v1` endpoint.

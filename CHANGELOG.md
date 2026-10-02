@@ -20,6 +20,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gets plain text in line mode instead of codes. CI opens the setup in a
   conhost window and fails if a code shows up as text.
 
+### Changed
+- **The setup banner and package descriptions drop "hilariously fast".**
+  The banner reads "an agentic AI coding CLI for remote or local models".
+  README, the crate descriptions and buildwithnexus.dev give the measured
+  2 ms startup instead.
+
 ### Release process
 - The npm publish step passes the tarball as `./dist/…`. npm 12 read
   `dist/buildwithnexus-0.15.0.tgz` as GitHub shorthand and refused it
