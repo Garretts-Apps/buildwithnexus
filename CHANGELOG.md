@@ -6,6 +6,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-02
+
+Colours instead of escape codes in the console window that cmd and Windows
+PowerShell open, a setup banner without "hilariously fast", and the npm
+publish fix that 0.15.0 needed.
+
 ### Fixed
 - **Colours show in a cmd or PowerShell console window on Windows.** The
   first-run setup, and anything else printed before the full-screen UI,

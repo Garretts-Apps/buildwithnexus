@@ -1,6 +1,6 @@
 [package]
 name = "buildwithnexus"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 rust-version = "1.94"
 description = "An agentic AI coding CLI with 2 ms startup — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"

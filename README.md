@@ -506,7 +506,7 @@ pull request, updating the same comment on later pushes.
 every pull request:
 
 ```yaml
-- uses: Garretts-Apps/buildwithnexus@v0.15.0
+- uses: Garretts-Apps/buildwithnexus@v0.15.1
   with:
     command: review              # or run, with prompt: <task>
     review-base: origin/${{ github.base_ref }}
