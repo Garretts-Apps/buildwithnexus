@@ -27,60 +27,61 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-Add-Type -TypeDefinition @'
+# Reading another process's console means leaving this one (FreeConsole,
+# then AttachConsole), after which PowerShell's own output is lost. So a small
+# helper exe does the reading and writes what it saw to a file.
+$helperSrc = @'
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace BwnCheck {
-    public static class ConsoleText {
-        [StructLayout(LayoutKind.Sequential)] struct Coord { public short X; public short Y; }
-        [StructLayout(LayoutKind.Sequential)] struct SmallRect { public short Left; public short Top; public short Right; public short Bottom; }
-        [StructLayout(LayoutKind.Sequential)] struct BufferInfo { public Coord Size; public Coord Cursor; public ushort Attributes; public SmallRect Window; public Coord MaxSize; }
+public static class ReadConsole {
+    [StructLayout(LayoutKind.Sequential)] struct Coord { public short X; public short Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SmallRect { public short Left; public short Top; public short Right; public short Bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct BufferInfo { public Coord Size; public Coord Cursor; public ushort Attributes; public SmallRect Window; public Coord MaxSize; }
 
-        [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
-        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
-        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleScreenBufferInfo(IntPtr h, out BufferInfo info);
-        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint mode);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] text, uint length, Coord at, out uint read);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleScreenBufferInfo(IntPtr h, out BufferInfo info);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint mode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] text, uint length, Coord at, out uint read);
 
-        // The console that process `pid` is attached to: its output mode on
-        // the first line ("mode=0x..."), then one line per row up to the
-        // cursor. Null when this process cannot attach to it yet.
-        public static string Read(uint pid) {
-            FreeConsole();
-            if (!AttachConsole(pid)) return null;
-            try {
-                // GENERIC_READ | GENERIC_WRITE, shared, OPEN_EXISTING
-                IntPtr h = CreateFileW("CONOUT$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
-                if (h == new IntPtr(-1)) return null;
-                try {
-                    BufferInfo info;
-                    if (!GetConsoleScreenBufferInfo(h, out info)) return null;
-                    uint mode;
-                    GetConsoleMode(h, out mode);
-                    StringBuilder all = new StringBuilder();
-                    all.Append("mode=0x").Append(mode.ToString("x")).Append('\n');
-                    char[] row = new char[info.Size.X];
-                    for (short y = 0; y <= info.Cursor.Y; y++) {
-                        Coord at;
-                        at.X = 0;
-                        at.Y = y;
-                        uint n;
-                        if (!ReadConsoleOutputCharacterW(h, row, (uint)row.Length, at, out n)) n = 0;
-                        all.Append(new string(row, 0, (int)n).TrimEnd()).Append('\n');
-                    }
-                    return all.ToString();
-                } finally {
-                    CloseHandle(h);
-                }
-            } finally {
-                FreeConsole();
+    // readconsole <pid> <file>: writes the console that process <pid> is
+    // attached to into <file>: its output mode on the first line
+    // ("mode=0x..."), then one line per row up to the cursor. Exit 0 on
+    // success, 2 when it cannot attach or read.
+    public static int Main(string[] args) {
+        uint pid = uint.Parse(args[0]);
+        FreeConsole();
+        if (!AttachConsole(pid)) return 2;
+        // GENERIC_READ | GENERIC_WRITE, shared, OPEN_EXISTING
+        IntPtr h = CreateFileW("CONOUT$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (h == new IntPtr(-1)) return 2;
+        try {
+            BufferInfo info;
+            if (!GetConsoleScreenBufferInfo(h, out info)) return 2;
+            uint mode;
+            GetConsoleMode(h, out mode);
+            StringBuilder all = new StringBuilder();
+            all.Append("mode=0x").Append(mode.ToString("x")).Append('\n');
+            char[] row = new char[info.Size.X];
+            for (short y = 0; y <= info.Cursor.Y; y++) {
+                Coord at;
+                at.X = 0;
+                at.Y = y;
+                uint n;
+                if (!ReadConsoleOutputCharacterW(h, row, (uint)row.Length, at, out n)) n = 0;
+                all.Append(new string(row, 0, (int)n).TrimEnd()).Append('\n');
             }
+            File.WriteAllText(args[1], all.ToString(), new UTF8Encoding(false));
+            return 0;
+        } finally {
+            CloseHandle(h);
         }
     }
 }
@@ -90,8 +91,12 @@ $esc = [string][char]0x1B
 $arrow = [string][char]0x2190
 
 # A fresh first run: no settings, no keys, no colour overrides.
-$home_ = Join-Path ([IO.Path]::GetTempPath()) ('bwn-console-' + [Guid]::NewGuid().ToString('N'))
+$work = Join-Path ([IO.Path]::GetTempPath()) ('bwn-console-' + [Guid]::NewGuid().ToString('N'))
+$home_ = Join-Path $work 'home'
 New-Item -ItemType Directory -Force -Path $home_ | Out-Null
+$helper = Join-Path $work 'readconsole.exe'
+$screen = Join-Path $work 'screen.txt'
+Add-Type -TypeDefinition $helperSrc -OutputAssembly $helper -OutputType ConsoleApplication
 $env:NEXUS_HOME = $home_
 foreach ($name in @(Get-ChildItem Env: | ForEach-Object { $_.Name })) {
     if ($name -match '_API_KEY$|_API_TOKEN$|^(NO_COLOR|FORCE_COLOR|COLORTERM|TERM|WT_SESSION)$') {
@@ -108,9 +113,11 @@ Set-ItemProperty -LiteralPath $consoleKey -Name VirtualTerminalLevel -Value 0 -T
 $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
 $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
 $p = Start-Process -FilePath $conhost -ArgumentList ('"' + $cmd + '" /d /c "' + $Command + '"') -PassThru
+Write-Output ('console-check: conhost pid ' + $p.Id + ' running ' + $Command)
 
 $text = $null
 $attachTo = 0
+$helperExit = 'not run'
 try {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -120,8 +127,9 @@ try {
             if ($child) { $attachTo = [uint32]$child.ProcessId }
             continue
         }
-        $read = [BwnCheck.ConsoleText]::Read($attachTo)
-        if ($read) { $text = $read }
+        $r = Start-Process -FilePath $helper -ArgumentList $attachTo, ('"' + $screen + '"') -WindowStyle Hidden -Wait -PassThru
+        $helperExit = $r.ExitCode
+        if ($r.ExitCode -eq 0) { $text = [IO.File]::ReadAllText($screen) }
         if ($text -and $text.Contains($Ready)) { break }
     }
 } finally {
@@ -131,9 +139,10 @@ try {
     } else {
         Remove-ItemProperty -LiteralPath $consoleKey -Name VirtualTerminalLevel -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $home_ -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Output ('console-check: read the console of pid ' + $attachTo + ', helper exit ' + $helperExit)
 if (-not $text) {
     Write-Output 'console-check: could not read the console window'
     exit 1
