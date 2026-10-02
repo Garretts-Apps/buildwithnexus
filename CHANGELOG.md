@@ -10,12 +10,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Colours show in a cmd or PowerShell console window on Windows.** The
   first-run setup, and anything else printed before the full-screen UI,
   printed its colour codes as text (`←[38;2;187;154;247m  buildwithnexus`)
-  in the console window that cmd and Windows PowerShell open. Windows
-  Terminal was not affected. bwn now turns on virtual-terminal processing
-  for the console before it prints anything. A console that refuses it (the
-  "Use legacy console" setting) gets plain text in line mode instead of
-  codes. CI opens the setup in a conhost window and fails if a code shows
-  up as text.
+  in the console window that cmd and Windows PowerShell open. It happened on
+  every launch of a cargo-installed or release binary, and through npm on
+  every launch after the one that downloaded the binary: that launch's
+  download lines come from Node, which turns virtual-terminal processing on
+  as a side effect. Windows Terminal was not affected. bwn now turns
+  virtual-terminal processing on for the console itself, before it prints
+  anything. A console that refuses it (the "Use legacy console" setting)
+  gets plain text in line mode instead of codes. CI opens the setup in a
+  conhost window and fails if a code shows up as text.
 
 ### Release process
 - The npm publish step passes the tarball as `./dist/…`. npm 12 read
