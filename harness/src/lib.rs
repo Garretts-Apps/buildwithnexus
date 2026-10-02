@@ -361,6 +361,7 @@ pub fn run() {
         sandbox::cloexec_inherited_fds();
         sandbox::hide_startup_credentials();
     }
+    tui::init_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (opts, args) = match parse_cli_options(args) {
         Ok(parsed) => parsed,
