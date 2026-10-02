@@ -11,9 +11,9 @@ virtual-terminal processing.
 buildwithnexus.cmd (set BWN_BIN first to run a local build through it). The
 run gets a NEXUS_HOME with no settings and no API keys, so setup always
 starts, and HKCU\Console\VirtualTerminalLevel is 0 for the window, the
-default on a machine nobody has tuned. The report prints the console's output mode and
-the first lines as the user sees them, with ESC shown as the arrow the
-console draws for it.
+default on a machine nobody has tuned. The report prints the console's
+output mode and the first lines as the user sees them, with ESC (which the
+console draws as an arrow) shown as <ESC>.
 
 Must stay Windows PowerShell 5.1 compatible (C# 5 in Add-Type), like
 scripts\field\run-blocks.ps1.
@@ -94,8 +94,10 @@ public static class ReadConsole {
 }
 '@
 
+# ESC is reported as <ESC>: the console draws it as an arrow, but an arrow
+# written to a redirected stdout can come out as the ESC byte again.
 $esc = [string][char]0x1B
-$arrow = [string][char]0x2190
+$escMark = '<ESC>'
 
 # A fresh first run: no settings, no keys, no colour overrides.
 $work = Join-Path ([IO.Path]::GetTempPath()) ('bwn-console-' + [Guid]::NewGuid().ToString('N'))
@@ -162,13 +164,13 @@ if (-not $text) {
 }
 $lines = $text -split "`n"
 $mode = [Convert]::ToUInt32($lines[0].Substring('mode=0x'.Length), 16)
-$shown = (($lines | Select-Object -Skip 1) -join "`n").Replace($esc, $arrow)
-$raw = [regex]::IsMatch($shown, [regex]::Escape($arrow) + '\[[0-9;]*[A-Za-z]')
+$shown = (($lines | Select-Object -Skip 1) -join "`n").Replace($esc, $escMark).Replace([string][char]0x2190, $escMark)
+$raw = [regex]::IsMatch($shown, [regex]::Escape($escMark) + '\[[0-9;]*[A-Za-z]')
 $ready = $shown.Contains($Ready)
 Write-Output ('vt-processing=' + $(if ($mode -band 4) { 'on' } else { 'off' }))
 Write-Output ('raw-codes=' + $raw)
 Write-Output ('setup-prompt=' + $ready)
-Write-Output ('--- console (ESC shown as ' + $arrow + ') ---')
+Write-Output ('--- console (ESC shown as ' + $escMark + ') ---')
 $shown -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 14 | ForEach-Object { Write-Output $_ }
 if ($raw -or -not $ready) { exit 1 }
 exit 0
