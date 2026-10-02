@@ -9,9 +9,9 @@ virtual-terminal processing.
 
 -Command is what the user types: a buildwithnexus.exe, or the npm shim
 buildwithnexus.cmd (set BWN_BIN first to run a local build through it). The
-run gets a fresh NEXUS_HOME and no API keys, so setup always starts, and
-HKCU\Console\VirtualTerminalLevel is 0 for the window, the default on a
-machine nobody has tuned. The report prints the console's output mode and
+run gets a NEXUS_HOME with no settings and no API keys, so setup always
+starts, and HKCU\Console\VirtualTerminalLevel is 0 for the window, the
+default on a machine nobody has tuned. The report prints the console's output mode and
 the first lines as the user sees them, with ESC shown as the arrow the
 console draws for it.
 
@@ -20,6 +20,11 @@ scripts\field\run-blocks.ps1.
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Command,
+    # A NEXUS_HOME with no settings in it. The npm launcher keeps the binary
+    # it downloads there, so pass the folder a download went to when the run
+    # should find the binary already in place, as on a machine that ran bwn
+    # before. Default: a new empty folder.
+    [string]$NexusHome = '',
     [int]$TimeoutSec = 180,
     [string]$Ready = 'provider number or name'
 )
@@ -94,8 +99,14 @@ $arrow = [string][char]0x2190
 
 # A fresh first run: no settings, no keys, no colour overrides.
 $work = Join-Path ([IO.Path]::GetTempPath()) ('bwn-console-' + [Guid]::NewGuid().ToString('N'))
-$home_ = Join-Path $work 'home'
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+$home_ = $NexusHome
+if (-not $home_) { $home_ = Join-Path $work 'home' }
 New-Item -ItemType Directory -Force -Path $home_ | Out-Null
+if (Test-Path -LiteralPath (Join-Path $home_ 'settings.json')) {
+    Write-Output ('console-check: ' + $home_ + ' has settings.json, so setup would not start')
+    exit 1
+}
 $helper = Join-Path $work 'readconsole.exe'
 $screen = Join-Path $work 'screen.txt'
 Add-Type -TypeDefinition $helperSrc -OutputAssembly $helper -OutputType ConsoleApplication
