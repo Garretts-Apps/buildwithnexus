@@ -669,7 +669,22 @@ fn choose_key(pick: &Preset, stored: Option<&str>, url: &str) -> Result<Option<S
         "  {} needs an API key; it is checked before it is saved (0600 in ~/.buildwithnexus/.env.keys)",
         pick.label
     )));
+    if let Some(page) = key_page(pick.id) {
+        tui::line(&tui::dim(&format!("  Get one at {page}")));
+    }
     ask_key(pick).map(Some)
+}
+
+/// Where a person gets an API key for a hosted provider.
+fn key_page(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "anthropic" => "https://console.anthropic.com/settings/keys",
+        "openai" => "https://platform.openai.com/api-keys",
+        "openrouter" => "https://openrouter.ai/keys",
+        "groq" => "https://console.groq.com/keys",
+        "huggingface" => "https://huggingface.co/settings/tokens",
+        _ => return None,
+    })
 }
 
 // Setup's custom-endpoint key: Some(key), None for no key; Esc stops.
@@ -745,23 +760,23 @@ fn replace_model(pick: &Preset, url: &str, model: &str) -> Result<String, Exit> 
 fn choose_permission() -> Result<String, Exit> {
     tui::line("");
     tui::line("  Tool permissions:");
+    // Safest first: the order is the order of caution, and auto comes last.
+    // (`/permissions <n>` keeps its own numbers: 1-3 as in 0.14.)
     tui::line(&format!(
         "    {}  ask before every file write / command  {}",
         tui::bold("1"),
         tui::dim("(recommended)")
     ));
     tui::line(&format!(
-        "    {}  auto-approve everything                {}",
-        tui::bold("2"),
-        tui::dim("(yolo)")
+        "    {}  accept edits — file edits in this project without asking; commands still ask",
+        tui::bold("2")
     ));
     tui::line(&format!(
         "    {}  read-only — never modify anything",
         tui::bold("3")
     ));
-    // Numbered as in /permissions.
     tui::line(&format!(
-        "    {}  accept edits — file edits in this project without asking; commands still ask",
+        "    {}  auto — runs commands and edits without asking (only a short list of dangerous commands still prompts)",
         tui::bold("4")
     ));
     loop {
@@ -776,9 +791,9 @@ fn choose_permission() -> Result<String, Exit> {
 fn permission_choice(answer: &str) -> Option<&'static str> {
     match answer.trim().to_ascii_lowercase().as_str() {
         "" | "1" | "ask" => Some("ask"),
-        "2" | "auto" => Some("auto"),
+        "2" | "accept-edits" | "accept edits" => Some("accept-edits"),
         "3" | "readonly" | "read-only" => Some("readonly"),
-        "4" | "accept-edits" | "accept edits" => Some("accept-edits"),
+        "4" | "auto" => Some("auto"),
         _ => None,
     }
 }
@@ -1031,12 +1046,32 @@ mod tests {
     }
 
     #[test]
+    fn every_hosted_provider_says_where_to_get_a_key() {
+        assert_eq!(
+            key_page("anthropic"),
+            Some("https://console.anthropic.com/settings/keys")
+        );
+        assert_eq!(
+            key_page("openai"),
+            Some("https://platform.openai.com/api-keys")
+        );
+        for p in config::PRESETS.iter().filter(|p| !p.local) {
+            let page = key_page(p.id).unwrap_or_else(|| panic!("{} has no key page", p.id));
+            assert!(page.starts_with("https://"), "{page}");
+        }
+        for p in config::PRESETS.iter().filter(|p| p.local) {
+            assert_eq!(key_page(p.id), None, "{}", p.id);
+        }
+    }
+
+    #[test]
     fn setup_offers_every_permission_mode_and_refuses_the_rest() {
         assert_eq!(permission_choice(""), Some("ask"));
-        assert_eq!(permission_choice("2"), Some("auto"));
+        assert_eq!(permission_choice("2"), Some("accept-edits"));
         assert_eq!(permission_choice("3"), Some("readonly"));
-        assert_eq!(permission_choice("4"), Some("accept-edits"));
+        assert_eq!(permission_choice("4"), Some("auto"));
         assert_eq!(permission_choice(" Accept-Edits "), Some("accept-edits"));
+        assert_eq!(permission_choice("auto"), Some("auto"));
         assert_eq!(permission_choice("5"), None);
         assert_eq!(permission_choice("yolo"), None);
     }

@@ -4523,7 +4523,13 @@ fn probe_swap(
                 if let Some(k) = &p.api_key {
                     config::record_key_check(&onboarding::key_slot(preset, &p.base_url), k, false);
                 }
-                "the API key was rejected — /login to replace it".to_string()
+                match provider::key_source(&p) {
+                    // The variable overrides the stored key: /login would not help.
+                    Some(provider::KeySource::Env(name)) => format!(
+                        "{name} (from your environment) was rejected — check or unset it; /login only changes the stored key, which this variable overrides"
+                    ),
+                    _ => "the API key was rejected — /login to replace it".to_string(),
+                }
             }
             onboarding::Fail::ModelMissing => format!(
                 "'{}' doesn't look like a model this provider serves — check the name",
@@ -7719,6 +7725,26 @@ mod terminal_ui_tests {
     }
 
     #[test]
+    fn help_says_bwn_is_the_same_command() {
+        let usage = usage_text();
+        let first = usage
+            .lines()
+            .find(|l| l.contains("interactive session"))
+            .unwrap();
+        assert!(first.contains("(also `bwn`)"), "{first}");
+        // The description column stays aligned with the rows around it.
+        let col = |l: &str| {
+            l.find("interactive session")
+                .or_else(|| l.find("execute a task"))
+        };
+        let run = usage
+            .lines()
+            .find(|l| l.contains("execute a task"))
+            .unwrap();
+        assert_eq!(col(first), col(run), "{usage}");
+    }
+
+    #[test]
     fn permission_modes_and_subcommands_are_listed_and_complete() {
         let help = tui::strip_ansi(&help_lines().join("\n"));
         let usage = usage_text();
@@ -8445,7 +8471,7 @@ fn usage_text() -> String {
     let mut out = format!(
         "buildwithnexus {VERSION} — agentic AI CLI harness\n\n\
          USAGE:\n\
-         \x20 buildwithnexus                    interactive session (all modes, full TUI)\n\
+         \x20 buildwithnexus (also `bwn`)       interactive session (all modes, full TUI)\n\
          \x20 buildwithnexus run <task>         execute a task (agentic BUILD loop); also -p, --print\n\
          \x20 ... | buildwithnexus run [task]   piped text is the task, or context after it (1 MiB)\n\
          \x20 buildwithnexus plan <task>        decompose, approve, then execute (--yes: no approval)\n\
