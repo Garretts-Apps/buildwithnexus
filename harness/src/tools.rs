@@ -3884,15 +3884,103 @@ pub fn catastrophic(cmd: &str) -> bool {
             if arg.starts_with('-') {
                 continue;
             }
-            if matches!(*arg, "~" | "~/" | "~\\" | "*" | "." | "..")
-                || arg.starts_with(['/', '\\'])
-                || is_drive_path(arg)
+            // Quotes and `$HOME`/`${HOME}` spellings folded away first, and a
+            // trailing `/*`, `/.*` or `/.` (`~/*`, `"$HOME"/*`, `./*`).
+            let target = normalize_target(arg);
+            if matches!(target.as_str(), "~" | "*" | "." | "..")
+                || target.starts_with(['/', '\\'])
+                || is_drive_path(&arg.replace(['"', '\''], ""))
             {
                 return true;
             }
         }
     }
-    windows_destructive(&lower)
+    find_deletes_root_or_home(&toks) || windows_destructive(&lower)
+}
+
+// A shell word folded to the form the destructive-command checks compare:
+// quotes dropped, `$HOME`, `${HOME}` and the Windows profile variables read as
+// `~`, then trailing path separators and `/*`, `/.*`, `/.` removed (they all
+// name the same folder's contents). A target that was `/`-rooted and is empty
+// afterwards is `/`. Expects lowercase input.
+fn normalize_target(word: &str) -> String {
+    let mut t: String = word.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    for var in [
+        "${home}",
+        "$home",
+        "$env:userprofile",
+        "$userprofile",
+        "%userprofile%",
+    ] {
+        if let Some(rest) = t.strip_prefix(var) {
+            if rest.is_empty() || rest.starts_with(['/', '\\']) {
+                t = format!("~{rest}");
+                break;
+            }
+        }
+    }
+    let rooted = t.starts_with('/');
+    loop {
+        let before = t.len();
+        t = t.trim_end_matches(['/', '\\']).to_string();
+        for tail in ["/*", "/.*", "/."] {
+            if let Some(head) = t.strip_suffix(tail) {
+                t = head.to_string();
+            }
+        }
+        if t.len() == before {
+            break;
+        }
+    }
+    if t.is_empty() && rooted {
+        t.push('/');
+    }
+    t
+}
+
+// `find <home or root> … -delete` and `find <home or root> … -exec rm …`: a
+// recursive delete by another name. Only the folders `rm -rf` is also stopped
+// on count (`/`, `~`, `$HOME`); `find . -name '*.tmp' -delete` and
+// `find ./build -delete` are ordinary work.
+fn find_deletes_root_or_home(toks: &[&str]) -> bool {
+    for (i, tok) in toks.iter().enumerate() {
+        if *tok != "find" && !tok.ends_with("/find") {
+            continue;
+        }
+        // The command ends at a shell separator.
+        let args: Vec<&str> = toks[i + 1..]
+            .iter()
+            .copied()
+            .take_while(|t| !matches!(*t, "|" | "||" | "&&" | "&" | ";"))
+            .collect();
+        // Start points: the words before the first expression (`-name`, `(`, `!`).
+        let starts = args
+            .iter()
+            .copied()
+            .skip_while(|t| matches!(*t, "-h" | "-l" | "-p"))
+            .take_while(|t| !t.starts_with(['-', '(', '!']));
+        let mut whole = false;
+        for start in starts {
+            let t = normalize_target(start);
+            whole |= t == "/" || t == "~";
+        }
+        if !whole {
+            continue;
+        }
+        for (j, a) in args.iter().enumerate() {
+            if *a == "-delete" {
+                return true;
+            }
+            if matches!(*a, "-exec" | "-execdir" | "-ok" | "-okdir") {
+                let prog = args.get(j + 1).map_or("", |p| p.trim_matches(['"', '\'']));
+                let name = prog.rsplit('/').next().unwrap_or(prog);
+                if matches!(name, "rm" | "rmdir" | "unlink" | "shred") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // Windows commands that destroy data or weaken the system whatever their
@@ -10458,6 +10546,115 @@ print("hello " + data.get("name", "world"))
     fn catastrophic_still_allows_scoped_rm() {
         for c in ["rm -rf ./build", "rm -rf build", "rm -r tmp"] {
             assert!(!catastrophic(c), "{c} should be allowed");
+        }
+    }
+
+    #[test]
+    fn catastrophic_home_spelled_as_variable_glob_or_quoted() {
+        for c in [
+            "rm -rf ~/*",
+            "rm -rf ~/.*",
+            "rm -rf ~/.",
+            "rm -rf $HOME",
+            "rm -rf $HOME/",
+            "rm -rf $HOME/*",
+            "rm -rf \"$HOME\"",
+            "rm -rf \"$HOME\"/*",
+            "rm -rf '$HOME'",
+            "rm -rf ${HOME}",
+            "rm -rf \"${HOME}\"",
+            "rm -rf ${HOME}/*",
+            "rm -fr $HOME",
+            "rm -r -f $HOME",
+            "rm --recursive --force $HOME",
+            "rm -rf -- \"$HOME\"",
+            "sudo rm -rf $HOME",
+            "cd /tmp && rm -rf ~/*",
+            "rm -rf /*",
+            "rm -rf ./*",
+            "rm -rf \"/\"",
+            "rm -rf \"~\"",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+    }
+
+    #[test]
+    fn catastrophic_find_delete_of_root_or_home() {
+        for c in [
+            "find ~ -delete",
+            "find / -delete",
+            "find $HOME -delete",
+            "find \"$HOME\" -delete",
+            "find ${HOME} -type f -delete",
+            "find ~/ -name '*.tmp' -delete",
+            "find / -name core -delete",
+            "find ~ -exec rm -rf {} +",
+            "find ~ -type f -exec rm {} \\;",
+            "find $HOME -exec /bin/rm -f {} \\;",
+            "find / -execdir shred {} +",
+            "find -L / -ok rm {} \\;",
+            "find ~ ! -name keep -delete",
+            "cd /tmp && find ~ -mindepth 1 -delete",
+            "echo hi; find / -delete",
+        ] {
+            assert!(catastrophic(c), "{c} should be catastrophic");
+        }
+    }
+
+    #[test]
+    fn catastrophic_leaves_ordinary_cleanup_alone() {
+        for c in [
+            "rm -rf ./target",
+            "rm -rf node_modules",
+            "rm -rf ~/projects/app/build",
+            "rm -rf $HOME/projects/app/build",
+            "rm -rf \"$HOME/.cache/app\"",
+            "rm -rf ${HOME}/.cache/app",
+            "rm -rf ~/.cache",
+            "rm -rf build/*",
+            "rm -rf dist/ out/",
+            "rm -rf $HOMEBREW_CACHE",
+            "rm -f ~/notes.txt",
+            "rm ~/*.log",
+            "find . -name '*.tmp' -delete",
+            "find ./build -delete",
+            "find build -type f -exec rm {} +",
+            "find ~/projects/app -name '*.o' -delete",
+            "find /var/log/app -name '*.gz' -delete",
+            "find $HOME/projects -name node_modules -prune",
+            "find ~ -name '*.rs'",
+            "find / -name '*.conf' -print",
+            "find ~ -type f -exec grep -l TODO {} +",
+            "find ~ -type f -exec ls -l {} +",
+            "find . -type f | xargs rm",
+            "grep -rn delete ~",
+            "ls ~ | head && find . -delete",
+        ] {
+            assert!(!catastrophic(c), "{c} should be allowed");
+        }
+    }
+
+    #[test]
+    fn normalize_target_folds_home_quotes_and_globs() {
+        for (word, want) in [
+            ("~", "~"),
+            ("~/", "~"),
+            ("~/*", "~"),
+            ("~/.*", "~"),
+            ("~/.", "~"),
+            ("$home", "~"),
+            ("${home}/", "~"),
+            ("\"$home\"/*", "~"),
+            ("/", "/"),
+            ("/*", "/"),
+            ("//", "/"),
+            ("./*", "."),
+            ("$homebrew", "$homebrew"),
+            ("~/projects", "~/projects"),
+            ("$home/projects", "~/projects"),
+        ] {
+            assert_eq!(normalize_target(word), want, "{word}");
         }
     }
 
