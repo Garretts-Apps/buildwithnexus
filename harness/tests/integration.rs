@@ -2604,6 +2604,56 @@ fn provider_keys_stay_out_of_the_commands_the_agent_runs() {
 
 #[cfg(unix)]
 #[test]
+fn tokens_secrets_passwords_and_aws_variables_stay_out_of_the_commands_the_agent_runs() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![
+        tool_call("c1", "run_command", json!({"command": "env"})),
+        finish("done"),
+    ]);
+    write_config(&home, "custom", "auto", port);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"shell_env_passthrough": ["GH_TOKEN"]}).to_string(),
+    )
+    .unwrap();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "print the environment"],
+        &[
+            ("GITHUB_TOKEN", "SENTINEL-github"),
+            ("NPM_TOKEN", "SENTINEL-npm"),
+            ("AWS_SECRET_ACCESS_KEY", "SENTINEL-aws-secret"),
+            ("AWS_SESSION_TOKEN", "SENTINEL-aws-session"),
+            ("DB_PASSWORD", "SENTINEL-db"),
+            ("CLIENT_SECRET", "SENTINEL-client"),
+            ("GH_TOKEN", "SENTINEL-passed-through"),
+            ("BWN_TEST_PLAIN_VAR", "SENTINEL-plain"),
+        ],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    let after = posts.get(1).expect("a second request");
+    for gone in [
+        "SENTINEL-github",
+        "SENTINEL-npm",
+        "SENTINEL-aws-secret",
+        "SENTINEL-aws-session",
+        "SENTINEL-db",
+        "SENTINEL-client",
+    ] {
+        assert!(!after.contains(gone), "{gone} reached the command");
+    }
+    assert!(
+        after.contains("SENTINEL-passed-through"),
+        "shell_env_passthrough keeps GH_TOKEN"
+    );
+    assert!(after.contains("SENTINEL-plain"), "ordinary variables stay");
+}
+
+#[cfg(unix)]
+#[test]
 fn ci_trusts_a_repositorys_hooks_only_with_the_matching_digest() {
     let home = tmp("home");
     let cwd = tmp("proj");
@@ -3330,15 +3380,45 @@ fn a_rejected_key_is_not_retried_and_points_at_login() {
     );
     assert!(start.elapsed().as_secs() < 3, "took {:?}", start.elapsed());
     assert_eq!(posts.load(Ordering::SeqCst), 1);
+    // The variable overrides the stored key, so the message names it and does
+    // not offer `login` as the fix.
     assert!(
         r.stderr.contains(
-            "the API key was rejected by the provider — `buildwithnexus login` replaces it"
-        ) && !r.stderr.contains("/login"),
+            "CUSTOM_API_KEY (from your environment) was rejected (HTTP 401). Check or unset it; `buildwithnexus login` only changes the stored key, which this variable overrides."
+        ) && !r.stderr.contains("/login") && !r.stderr.contains("replaces it"),
         "{}",
         r.stderr
     );
     assert!(
         r.stderr.contains("HTTP 401: invalid api key"),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn a_rejected_stored_key_points_at_login_and_names_no_variable() {
+    let (port, posts) = serve_status(401, r#"{"error":{"message":"invalid api key"}}"#);
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    write_gateway_config(&home, port);
+    std::fs::write(
+        home.join(".env.keys"),
+        format!("CUSTOM_API_KEY@http://127.0.0.1:{port}=sk-stored-wrong-key-123456789\n"), // gitleaks:allow (fake key for the test)
+    )
+    .unwrap();
+    // An empty variable is no variable: the stored key is the one sent.
+    let r = run_env(&home, &cwd, &["run", "say hi"], &[("CUSTOM_API_KEY", "")]);
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "{}", r.stderr);
+    assert!(
+        r.stderr.contains(&format!(
+            "The stored API key for http://127.0.0.1:{port} was rejected (HTTP 401). `buildwithnexus login` replaces it."
+        )),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains("from your environment") && !r.stderr.contains("CUSTOM_API_KEY"),
         "{}",
         r.stderr
     );
