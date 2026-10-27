@@ -672,7 +672,7 @@ eacces_step() { # cid libc
   fi
   xrun "$cid" -- chmod a-x "$bin"
   if [ "$RC" -ne 0 ]; then add_row "$EACCES_CELL" npm:eacces "$libc" SKIP "chmod a-x failed: $OUT"; return; fi
-  xrun "$cid" -- sh -lc 'bwn --version'
+  xrun "$cid" -- sh -lc 'bwn version'
   expect_guided_failure "$OUT" "$RC" "$VERSION" eacces
   [ "$RESULT" = FAIL ] && show_output "$EACCES_CELL chmod a-x output (exit $RC)" "$OUT"
   add_row "$EACCES_CELL" npm:eacces "$libc" "$RESULT" "binary chmod a-x; $DETAIL"
@@ -694,7 +694,9 @@ for img in "${NPM_CELLS[@]}"; do
     docker rm -f "$cid" >/dev/null 2>&1
     continue
   fi
-  xrun "$cid" -- sh -lc 'bwn --version'
+  # The launcher answers `bwn --version` itself, with no download, so the
+  # probes use `bwn version`, which needs the native binary.
+  xrun "$cid" -- sh -lc 'bwn version'
   if [ "$EXPECT" = runs ]; then
     expect_bootstrap_hint "$OUT" "$RC"
   else
@@ -704,11 +706,11 @@ for img in "${NPM_CELLS[@]}"; do
   [ "$RESULT" = FAIL ] && show_output "$img non-TTY output (exit $RC)" "$OUT"
   add_row "$img" npm:non-tty "$libc" "$RESULT" "$NOTE$DETAIL"
 
-  xrun "$cid" -e BWN_ALLOW_BOOTSTRAP=1 -- sh -lc 'bwn --version'
+  xrun "$cid" -e BWN_ALLOW_BOOTSTRAP=1 -- sh -lc 'bwn version'
   first_out=$OUT first_rc=$RC
   judge "$first_out" "$first_rc" launcher
   # A second plain run must use the installed binary, not download again.
-  xrun "$cid" -- sh -lc 'bwn --version'
+  xrun "$cid" -- sh -lc 'bwn version'
   if grep -qi 'downloading' <<<"$OUT"; then RESULT=FAIL DETAIL="downloads again on the next run; $DETAIL"; fi
   [ "$RESULT" = FAIL ] && show_output "$img BWN_ALLOW_BOOTSTRAP=1 output (exit $first_rc)" "$first_out"
   boot_result=$RESULT
@@ -735,7 +737,7 @@ for img in "${NPM_CELLS[@]}"; do
   elif ! npm_install "$cid"; then
     add_row "$img" npm:tty "$libc" FAIL "npm i -g $INSTALL_SPEC failed: $(symptom "$OUT")"
   else
-    xrun "$cid" -- sh -lc "script -qec 'bwn --version' /dev/null"
+    xrun "$cid" -- sh -lc "script -qec 'bwn version' /dev/null"
     judge "$OUT" "$RC" launcher
     [ "$RESULT" = FAIL ] && show_output "$img TTY output (exit $RC)" "$OUT"
     add_row "$img" npm:tty "$libc" "$RESULT" "$DETAIL"
@@ -796,7 +798,7 @@ if selected "$NVM_CELL"; then
         else
           add_row "$NVM_CELL" nvm:shell "$libc" PASS "new shell has no \"incompatible with nvm\""
         fi
-        xrun "$cid" "${as_dev[@]}" -- bash -ic "script -qec 'bwn --version' /dev/null"
+        xrun "$cid" "${as_dev[@]}" -- bash -ic "script -qec 'bwn version' /dev/null"
         out=$(grep -vE 'cannot set terminal process group|no job control in this shell' <<<"$OUT")
         judge "$out" "$RC" launcher
         [ "$RESULT" = FAIL ] && show_output "$NVM_CELL TTY output (exit $RC)" "$out"
