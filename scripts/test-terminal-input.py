@@ -785,7 +785,7 @@ class SetupKeyShapeTests(TerminalHarness):
         self.assertIn(b"accept edits", self.output)
         self.answer(b"choice [1]: ", "7")
         self.wait_for(lambda: b"choose 1, 2, 3 or 4" in self.output, "refused")
-        self.answer(b"choice [1]: ", "4")
+        self.answer(b"choice [1]: ", "2")
         self.wait_for(lambda: b"describe a task" in self.output, "the session", timeout=15)
         self.assertFalse(any("hello" in k for k in self.gateway.keys_sent()))
         saved = json.loads((self.home / "settings.json").read_text())

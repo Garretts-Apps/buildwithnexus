@@ -287,7 +287,8 @@ fn bwrap_argv(
 const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
 
 /// Environment a sandboxed child never inherits: session buses and agent
-/// sockets reach outside the sandbox, and provider keys are the agent's.
+/// sockets reach outside the sandbox, and provider keys and other credentials
+/// (see `is_credential`) are not the command's to have.
 pub fn scrubbed_env<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
     scrubbed_env_keeping(names, &[])
 }
@@ -305,12 +306,27 @@ fn scrubbed_env_keeping<I: IntoIterator<Item = String>>(
         .collect()
 }
 
-// A provider credential: `*_API_KEY`, `*_API_TOKEN`, or a provider preset's
-// key variable (`HF_TOKEN`). Windows names are case-insensitive.
+/// Suffixes of the variable names treated as credentials (compared to the
+/// upper-cased name): `*_API_KEY`, `*_API_TOKEN`, `*_TOKEN` (GITHUB_TOKEN,
+/// NPM_TOKEN), `*_SECRET`, `*_SECRETS` and `*_PASSWORD`.
+pub const CREDENTIAL_SUFFIXES: &[&str] = &[
+    "_API_KEY",
+    "_API_TOKEN",
+    "_TOKEN",
+    "_SECRET",
+    "_SECRETS",
+    "_PASSWORD",
+];
+
+/// A credential a command the agent runs does not inherit: a name ending in
+/// one of `CREDENTIAL_SUFFIXES`, any `AWS_*` variable (AWS_SECRET_ACCESS_KEY,
+/// AWS_SESSION_TOKEN, AWS_PROFILE, …), or a provider preset's key variable
+/// (`HF_TOKEN`). Windows names are case-insensitive. A name the user lists in
+/// `shell_env_passthrough` is kept (see `credential_env`).
 fn is_credential(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.ends_with("_API_KEY")
-        || upper.ends_with("_API_TOKEN")
+    CREDENTIAL_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        || upper.starts_with("AWS_")
         || crate::config::PRESETS
             .iter()
             .any(|p| !p.env_key.is_empty() && p.env_key == upper)
@@ -764,7 +780,6 @@ mod tests {
             "HF_TOKEN",
             "GROQ_API_KEY",
             "SOME_API_TOKEN",
-            "GITHUB_TOKEN",
             "SSH_AUTH_SOCK",
         ]
         .map(String::from);
@@ -791,6 +806,70 @@ mod tests {
         assert!(unset
             .iter()
             .all(|n| n != "PATH" && !n.contains(';') && !n.starts_with('1')));
+    }
+
+    #[test]
+    fn agent_commands_lose_tokens_secrets_passwords_and_aws_variables() {
+        let stripped = [
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "NPM_TOKEN",
+            "CI_JOB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_PROFILE",
+            "aws_secret_access_key",
+            "DB_PASSWORD",
+            "POSTGRES_PASSWORD",
+            "CLIENT_SECRET",
+            "APP_SECRETS",
+            "github_token",
+            "SOME_API_KEY",
+            "SOME_API_TOKEN",
+            "HF_TOKEN",
+        ];
+        let kept = [
+            "PATH",
+            "HOME",
+            "SHELL",
+            "USER",
+            "LANG",
+            "TERM",
+            "EDITOR",
+            "SSH_AUTH_SOCK",
+            "TOKENIZERS_PARALLELISM",
+            "PASSWORD_STORE_DIR",
+            "SECRET_SANTA",
+            "AWSOME_TOOL",
+            "XDG_RUNTIME_DIR",
+            "CARGO_HOME",
+            "RUST_LOG",
+        ];
+        let names = || stripped.iter().chain(&kept).map(|s| s.to_string());
+        assert_eq!(credential_env(names(), &[]), stripped);
+        // The sandbox strips the same names, plus the sockets.
+        let sandboxed = scrubbed_env(names());
+        for n in stripped {
+            assert!(sandboxed.contains(&n.to_string()), "{n}");
+        }
+        assert!(sandboxed.contains(&"SSH_AUTH_SOCK".to_string()));
+        for n in kept.iter().filter(|n| **n != "SSH_AUTH_SOCK") {
+            assert!(!sandboxed.contains(&n.to_string()), "{n}");
+        }
+        // shell_env_passthrough keeps what the user lists, and only that.
+        let keep = ["GITHUB_TOKEN".to_string(), "AWS_PROFILE".to_string()];
+        let left = credential_env(names(), &keep);
+        assert!(!left.contains(&"GITHUB_TOKEN".to_string()));
+        assert!(!left.contains(&"AWS_PROFILE".to_string()));
+        assert!(left.contains(&"GH_TOKEN".to_string()));
+        assert!(left.contains(&"AWS_SESSION_TOKEN".to_string()));
+        let left = scrubbed_env_keeping(names(), &keep);
+        assert!(!left.contains(&"GITHUB_TOKEN".to_string()));
+        assert!(left.contains(&"NPM_TOKEN".to_string()));
+        // A tmux session's own `env -u` list follows the same rule.
+        let unset = credentials_to_unset(["TMUX_ONLY_TOKEN".to_string()]);
+        assert!(unset.contains(&"TMUX_ONLY_TOKEN".to_string()), "{unset:?}");
     }
 
     #[test]

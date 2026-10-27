@@ -3,9 +3,10 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-An **agentic AI CLI** with 2 ms startup, written in Rust. Remote models via
+An **agentic AI CLI** written in Rust. The native binary starts in about 2 ms (`--version`, [measured](BENCHMARKS.md)). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands, asking before each change. One self-contained binary, 10 direct
+commands. By default it asks before each change; accept-edits, auto and
+readonly modes let you choose. One self-contained binary, 10 direct
 dependencies, no runtime to babysit — and a terminal UI built to feel
 instant: an incremental wrap cache with atomic frames, live autocomplete,
 GitHub-grade diffs, clickable files and links, and multimodal input straight
@@ -32,6 +33,19 @@ check. The check reads `BWN_UPDATE_REGISTRY`, else npm's
 `npm_config_registry`, else the public registry. The npm launcher keeps the
 downloaded binary in `~/.buildwithnexus/bin/<version>/` (under `NEXUS_HOME`
 if set), outside the npm package, so `npm update` does not delete it.
+
+## Uninstall
+
+```bash
+npm uninstall -g buildwithnexus      # or: cargo uninstall buildwithnexus
+rm -rf ~/.buildwithnexus             # or $NEXUS_HOME, if you set it
+```
+
+That folder holds your settings, saved sessions, checkpoints, the binaries
+the npm launcher downloaded and your saved API keys (`.env.keys`), so remove
+it only if you want all of that gone. A project's own `.buildwithnexus/`
+folder (rules, skills, project settings) is part of that project and is left
+alone. On Windows the folder is `%USERPROFILE%\.buildwithnexus`.
 
 ## Requirements
 
@@ -145,9 +159,11 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
-The speed is measured: 2 ms full-process startup, a 4.6 MiB resident TUI,
-and 3.6 µs to render a streamed chunk into a 2,000-line transcript. Every
-number and how to regenerate it: [BENCHMARKS.md](BENCHMARKS.md).
+The speed is measured: 2 ms for the native binary to run `--version`
+(about 47 ms through the npm launcher, which starts Node first), a 7.7 MiB
+resident TUI, and 4.2 µs to render a streamed chunk into a 2,000-line
+transcript. Every number and how to regenerate it:
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### Package history
 
@@ -184,7 +200,9 @@ Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600). A key is typed hidden (dots, then only
 the masked key) and saved only after the provider accepts it. If a key is
 rejected later, `/login` in a session (or `buildwithnexus login`) replaces it
-in place, checked first; the `/model` picker marks a key whose last check
+in place, checked first. When the rejected key came from an environment
+variable, the error names that variable (it overrides the stored key, so
+`login` would not help: fix or unset the variable); the `/model` picker marks a key whose last check
 failed `key rejected` (recorded as a hash in
 `~/.buildwithnexus/key-checks.json`, never the key).
 
@@ -574,11 +592,13 @@ out or reach services on your network. `web_search` sends its query to
 `"fetch *"` allows every host.
 
 Commands the agent runs (including `check_work` and `start_server`, sandboxed
-or not) do not inherit provider keys: variables ending in `_API_KEY` or
-`_API_TOKEN`, and the presets' key variables such as `HF_TOKEN`, are removed
-from their environment. List any your build needs in
-`"shell_env_passthrough": ["MAPS_API_KEY"]`. Hooks are your own and keep
-their environment.
+or not) do not inherit credentials. These variables are removed from their
+environment: names ending in `_API_KEY`, `_API_TOKEN`, `_TOKEN`, `_SECRET`,
+`_SECRETS` or `_PASSWORD` (so `GITHUB_TOKEN`, `GH_TOKEN` and `NPM_TOKEN` too),
+every `AWS_*` variable (`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, ...), and
+the presets' key variables such as `HF_TOKEN`. List any your build needs in
+`"shell_env_passthrough": ["GITHUB_TOKEN", "AWS_PROFILE"]`. Hooks are your own
+and keep their environment.
 
 ### More folders
 
@@ -1258,24 +1278,32 @@ To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
 
 ## Safety
 
-- Default permission is **ask** — every file write, edit, and command is
-  confirmed. `accept-edits`, `auto` ("yolo") and `readonly` are opt-in, and
-  deny rules hold in every mode.
-- Mutating file tools (write/edit/patch) are confined to the working directory —
-  writes outside it require explicit confirmation. Reads are unconfined, but
-  sensitive paths (the key store, `~/.ssh`, `.env`, `*.pem`) require
-  confirmation even in `auto`. Catastrophic commands (`rm -rf /`, `mkfs`, …) too.
+- Default permission is **ask** — every edit and every command that can
+  change something is confirmed (read-only commands such as `git status` and
+  `grep` skip the prompt). `accept-edits`, `auto` ("yolo") and `readonly` are
+  opt-in, and deny rules hold in every mode.
+- Mutating file tools (write/edit/patch) are confined to the working directory
+  (and folders added with `--add-dir`): writes outside the project folder are
+  refused. Reads are unconfined, but sensitive paths (the key store, `~/.ssh`,
+  `.env`, `*.pem`) require confirmation even in `auto`.
+- A pattern-based check asks before well-known destructive commands
+  (`rm -rf /`, `rm -rf ~`, `mkfs`, ...), even in `auto`. It is a best-effort
+  guardrail, not a guarantee; use `--sandbox require` or a container for
+  untrusted work.
 - API keys are never sent to a non-HTTPS endpoint, and key-like tokens are
   redacted from surfaced errors.
 - In non-interactive / `--json` runs, anything that would prompt is denied
   rather than blocking, and the run exits 3.
-- Commands the agent runs never inherit provider keys (`*_API_KEY`,
-  `*_API_TOKEN`, `HF_TOKEN`); see [Permissions](#permissions).
+- Commands the agent runs do not inherit credentials from your environment
+  (`*_API_KEY`, `*_API_TOKEN`, `*_TOKEN`, `*_SECRET`, `*_SECRETS`,
+  `*_PASSWORD`, `AWS_*`, `HF_TOKEN`); `shell_env_passthrough` opts a variable
+  back in. See [Permissions](#permissions).
 - The file tools (`grep_files`, `find_files`, `find_paths`, `list_tree`) and
   `@` completion skip what `.gitignore` ignores and Python virtualenvs, and
   never list `.env` and other sensitive files, even when a `.gitignore` line
   un-ignores them. `read_file` still reads an ignored file by path.
-- Every write is checkpointed before it happens; bare `/undo` reverts the
+- Every file-tool write is checkpointed before it happens; changes made by
+  shell commands are not checkpointed. Bare `/undo` reverts the
   whole last agent turn and asks before overwriting your own later edits.
   Failure modes, checkpoint mechanics, and what is deliberately **not**
   protected: [RECOVERY.md](RECOVERY.md).

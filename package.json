@@ -1,7 +1,7 @@
 {
   "name": "buildwithnexus",
   "version": "0.15.1",
-  "description": "Fast, local-first AI coding agent for the terminal, written in Rust. Works with hosted APIs (Anthropic, OpenAI) and local models (Ollama).",
+  "description": "Fast AI coding agent for the terminal, written in Rust. Works with hosted APIs (Anthropic, OpenAI) or local models (Ollama).",
   "main": "index.js",
   "bin": {
     "buildwithnexus": "bin/buildwithnexus.js",

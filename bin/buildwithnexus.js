@@ -7,7 +7,7 @@
 const path = require('path');
 const { spawnSync } = require('child_process');
 const {
-  existing, platformPackage, target, installedBinary, readInstallMarker, EXIT_EXPLAINED,
+  existing, hasPrebuilt, target, installedBinary, readInstallMarker, EXIT_EXPLAINED,
 } = require('../scripts/resolve-binary.js');
 
 let args = process.argv.slice(2);
@@ -43,9 +43,15 @@ if (!bin) {
     process.stderr.write(found.text);
     process.exit(1);
   }
-  // The platform optionalDependency is absent (platform packages not yet
-  // published, or installed with --omit=optional). Fall back to a
-  // checksum-verified download from the GitHub release.
+  // `bwn --version` before the native binary is downloaded answers from this
+  // package instead of downloading it, or failing, just to print a number.
+  // Same text the binary prints. (After the check above: a binary that was
+  // installed and then removed is still explained, not hidden by a version.)
+  if (flagIdx === -1 && args.length === 1 && ['--version', '-v', '-V'].includes(args[0])) {
+    process.stdout.write(`buildwithnexus ${require('../package.json').version}\n`);
+    process.exit(0);
+  }
+  // Download the binary from the GitHub release, checksum-verified.
   if (consented) {
     const boot = spawnSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'bootstrap.js')], {
       stdio: 'inherit',
@@ -64,12 +70,12 @@ if (!bin) {
   }
 }
 if (!bin) {
-  const pkg = platformPackage();
+  const prebuilt = hasPrebuilt();
   const t = target();
   let fetchOnce = '';
-  if (pkg && process.env.BWN_SKIP_INSTALL) {
+  if (prebuilt && process.env.BWN_SKIP_INSTALL) {
     fetchOnce = '  BWN_SKIP_INSTALL is set, so the launcher does not download it.\n';
-  } else if (pkg && !consented) {
+  } else if (prebuilt && !consented) {
     fetchOnce = '  Download the checksum-verified release binary once (no terminal here, so the\n' +
       '  launcher will not download it on its own):\n' +
       '    bwn --bootstrap        (or BWN_ALLOW_BOOTSTRAP=1 bwn)\n';
@@ -77,9 +83,8 @@ if (!bin) {
   process.stderr.write(
     'buildwithnexus: native binary not found.\n' +
     fetchOnce +
-    (pkg
-      ? `  If you installed with --omit=optional, reinstalling without it also works once the\n` +
-        `  "${pkg}" package is available.\n`
+    (prebuilt
+      ? ''
       : `  No prebuilt binary exists for this platform (${process.platform} ${process.arch}).\n`) +
     (t
       ? '  Or build from source and point BWN_BIN at the result (an absolute path):\n' +

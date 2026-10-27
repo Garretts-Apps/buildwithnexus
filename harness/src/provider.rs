@@ -1471,11 +1471,51 @@ fn in_session() -> bool {
     IN_SESSION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where the key a request sent came from. A variable in the environment
+/// wins over the stored key, so `login` does not replace it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum KeySource {
+    /// The environment variable that holds it (`ANTHROPIC_API_KEY`).
+    Env(String),
+    /// The key saved by setup or `login`, for this provider or endpoint.
+    Stored(String),
+}
+
+/// Which variable or store `p`'s key came from, found the way `build_provider`
+/// chose it: a key equal to a key variable's value is that variable's (the
+/// provider's own first), else it is the stored one.
+pub(crate) fn key_source(p: &Provider) -> Option<KeySource> {
+    let key = p.api_key.as_deref()?;
+    let base = crate::config::endpoint_origin(&p.base_url);
+    let preset = crate::config::PRESETS
+        .iter()
+        .find(|x| crate::config::endpoint_origin(x.base_url) == base && !x.env_key.is_empty());
+    let own = preset.map(|x| x.env_key);
+    let others = crate::config::PRESETS
+        .iter()
+        .map(|x| x.env_key)
+        .chain([crate::config::CUSTOM_KEY]);
+    let from_env = own
+        .into_iter()
+        .chain(others)
+        .filter(|n| !n.is_empty())
+        .find(|n| std::env::var(n).is_ok_and(|v| v == key));
+    Some(match from_env {
+        Some(name) => KeySource::Env(name.to_string()),
+        None => KeySource::Stored(match preset {
+            Some(x) => x.label.to_string(),
+            None => base,
+        }),
+    })
+}
+
 /// Who was asked, for the wording of a failure.
 struct FailureContext<'a> {
     model: &'a str,
     base: &'a str,
     has_key: bool,
+    /// Where that key came from, when known.
+    key: Option<KeySource>,
     ollama: bool,
     /// Hints name slash commands (the terminal UI) rather than flags.
     in_session: bool,
@@ -1489,6 +1529,7 @@ fn explain_failure(p: &Provider, e: String) -> String {
         model: &p.model,
         base: origin(&p.base_url),
         has_key: p.api_key.is_some(),
+        key: key_source(p),
         ollama: p.protocol == Protocol::OllamaNative,
         in_session: in_session(),
     };
@@ -1563,12 +1604,33 @@ fn status_advice(code: u16, body: &str, ctx: &FailureContext) -> String {
             "--model <name> to use an installed one",
         )
     };
+    let login = if ctx.in_session {
+        "/login"
+    } else {
+        "`buildwithnexus login`"
+    };
     match code {
-        401 if ctx.has_key => format!("the API key was rejected by the provider — {replace}"),
-        401 => format!("the server at {} wants an API key — {add}", ctx.base),
+        401 => match &ctx.key {
+            // The variable overrides the stored key, so `login` would not help.
+            Some(KeySource::Env(name)) if ctx.has_key => format!(
+                "{name} (from your environment) was rejected (HTTP 401). Check or unset it; {login} only changes the stored key, which this variable overrides."
+            ),
+            Some(KeySource::Stored(what)) if ctx.has_key => {
+                format!("The stored API key for {what} was rejected (HTTP 401). {login} replaces it.")
+            }
+            _ if ctx.has_key => format!("the API key was rejected by the provider — {replace}"),
+            _ => format!("the server at {} wants an API key — {add}", ctx.base),
+        },
         403 => format!(
-            "the provider refused access to {} — check what the key is allowed to use, or {replace}",
-            ctx.model
+            "the provider refused access to {} — check what the key is allowed to use, or {}",
+            ctx.model,
+            match &ctx.key {
+                Some(KeySource::Env(name)) =>
+                    format!("change {name} (from your environment; {login} does not replace it)"),
+                Some(KeySource::Stored(_)) if ctx.in_session => replace.to_string(),
+                Some(KeySource::Stored(_)) => format!("{login} replaces it"),
+                None => replace.to_string(),
+            }
         ),
         404 if model_missing(&lower) && ctx.ollama => format!(
             "model {} is not installed on {} — ollama pull {}, or {pick}",
@@ -3206,6 +3268,7 @@ mod tests {
             model,
             base: "http://192.168.50.10:11434",
             has_key,
+            key: None,
             ollama,
             in_session: true,
         }
@@ -3264,6 +3327,152 @@ mod tests {
             m.contains("--base-url <url>") && !m.contains("/model"),
             "{m}"
         );
+    }
+
+    fn provider_for(base_url: &str, key: Option<&str>) -> Provider {
+        Provider {
+            protocol: Protocol::OpenAi,
+            base_url: base_url.into(),
+            api_key: key.map(Into::into),
+            model: "m".into(),
+            context_tokens: 8192,
+            temperature: None,
+            max_tokens: None,
+            effort: crate::config::Effort::Off,
+            ollama_ctx: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn a_rejected_key_names_where_it_came_from() {
+        let mut c = ctx("claude-sonnet-4-6", true, false);
+        c.in_session = false;
+        c.key = Some(KeySource::Env("ANTHROPIC_API_KEY".into()));
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with(
+                "ANTHROPIC_API_KEY (from your environment) was rejected (HTTP 401). Check or unset it; `buildwithnexus login` only changes the stored key, which this variable overrides."
+            ),
+            "{m}"
+        );
+        // A key that came from the environment is not fixed by `login`, and
+        // CUSTOM_API_KEY is only named when it is the variable in use.
+        assert!(
+            !m.contains("replaces it") && !m.contains("CUSTOM_API_KEY"),
+            "{m}"
+        );
+
+        c.key = Some(KeySource::Stored("OpenAI".into()));
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with(
+                "The stored API key for OpenAI was rejected (HTTP 401). `buildwithnexus login` replaces it."
+            ),
+            "{m}"
+        );
+        assert!(
+            !m.contains("CUSTOM_API_KEY") && !m.contains("environment"),
+            "{m}"
+        );
+
+        c.key = Some(KeySource::Env("CUSTOM_API_KEY".into()));
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with("CUSTOM_API_KEY (from your environment) was rejected"),
+            "{m}"
+        );
+
+        // In a session the replacement is a slash command.
+        c.in_session = true;
+        c.key = Some(KeySource::Env("OPENAI_API_KEY".into()));
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.contains("Check or unset it; /login only changes the stored key"),
+            "{m}"
+        );
+        assert!(!m.contains("buildwithnexus login"), "{m}");
+        c.key = Some(KeySource::Stored("Groq".into()));
+        let m = explained(401, "{}", &c);
+        assert!(
+            m.starts_with(
+                "The stored API key for Groq was rejected (HTTP 401). /login replaces it."
+            ),
+            "{m}"
+        );
+
+        // 403 from an environment key does not send the user to `login`.
+        c.in_session = false;
+        c.key = Some(KeySource::Env("OPENAI_API_KEY".into()));
+        let m = explained(403, "{}", &c);
+        assert!(
+            m.contains("change OPENAI_API_KEY (from your environment;"),
+            "{m}"
+        );
+        assert!(!m.contains("CUSTOM_API_KEY"), "{m}");
+
+        // The wording the setup check reads as a rejected key still does.
+        for k in [
+            Some(KeySource::Env("OPENAI_API_KEY".into())),
+            Some(KeySource::Stored("OpenAI".into())),
+        ] {
+            c.key = k;
+            assert_eq!(
+                crate::onboarding::Fail::from_error(&explained(401, "{}", &c)),
+                crate::onboarding::Fail::KeyRejected(401)
+            );
+        }
+    }
+
+    #[test]
+    fn the_key_source_is_the_variable_that_holds_the_key_else_the_store() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CUSTOM_API_KEY"]
+            .map(|n| (n, std::env::var_os(n)))
+            .into();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("CUSTOM_API_KEY");
+
+        assert_eq!(
+            key_source(&provider_for("https://api.openai.com/v1", None)),
+            None
+        );
+        let openai = provider_for("https://api.openai.com/v1", Some("sk-stored"));
+        assert_eq!(
+            key_source(&openai),
+            Some(KeySource::Stored("OpenAI".into()))
+        );
+        std::env::set_var("OPENAI_API_KEY", "sk-stored");
+        assert_eq!(
+            key_source(&openai),
+            Some(KeySource::Env("OPENAI_API_KEY".into()))
+        );
+        std::env::set_var("OPENAI_API_KEY", "sk-other");
+        assert_eq!(
+            key_source(&openai),
+            Some(KeySource::Stored("OpenAI".into()))
+        );
+
+        // A gateway: the key is CUSTOM_API_KEY's, or the one saved for it.
+        let gw = provider_for("http://127.0.0.1:9000/v1", Some("sk-gw"));
+        assert_eq!(
+            key_source(&gw),
+            Some(KeySource::Stored("http://127.0.0.1:9000".into()))
+        );
+        std::env::set_var("CUSTOM_API_KEY", "sk-gw");
+        assert_eq!(
+            key_source(&gw),
+            Some(KeySource::Env("CUSTOM_API_KEY".into()))
+        );
+
+        for (n, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+        }
     }
 
     #[test]

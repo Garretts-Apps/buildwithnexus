@@ -56,17 +56,20 @@ access happens during `npm install`.
 
 The native binary is not in the npm tarball. The launcher
 (`bin/buildwithnexus.js`) looks for it in this order: `BWN_BIN`, then a
-per-platform package (`buildwithnexus-<os>-<cpu>`) if one is installed, then
-a binary downloaded on an earlier run, then a local `cargo build` in a repo
-checkout. No per-platform package carries a binary, so in practice the
-binary comes from the first-run download below.
+binary downloaded on an earlier run, then a local `cargo build` in a repo
+checkout. The current launcher does not look for the binary in any npm
+package, so in practice the binary comes from the first-run download below.
 
-**Unregistered platform package names.** Versions 0.12.1 to 0.14.2 list
-`buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies`, but no such
-package was ever published, so anyone could register those names and have
-their code installed with those versions. Publishing is OIDC-only, and npm's
-OIDC publishing cannot create a new package, so the names stay unregistered.
-Do not install 0.12.1 to 0.14.2; use `buildwithnexus@latest`.
+**Old versions that name unpublished packages.** Versions 0.12.1 to 0.14.2
+list `buildwithnexus-<os>-<cpu>@<version>` in `optionalDependencies`, but no
+such package was ever published, so the names are not registered on npm.
+Publishing from this project is OIDC-only, which stops this project's own
+workflow from creating them by accident; it does not stop anyone else from
+registering those names, and an install of one of those old versions would
+then fetch that person's code. The current launcher and package no longer list
+or look for those names. If you have 0.12.1 to 0.14.2 installed, upgrade to
+the latest version (`npm install -g buildwithnexus@latest`), and do not
+install those versions.
 
 **First-run download.** If no binary is found, the launcher runs
 `scripts/bootstrap.js`, which downloads the release asset for your platform
@@ -119,9 +122,9 @@ A request that gets no data for 30 s fails with the reason. Node's `https`
 module ignores `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY=1` is set, which Node
 22.21+ and 24.5+ support; a failed download says so and prints the command.
 
-The launcher only uses a platform package installed next to the main package,
-never one found in a parent directory's `node_modules`, and ignores a relative
-`BWN_BIN`.
+The launcher ignores a relative `BWN_BIN`, and only runs a binary from `BWN_BIN`,
+`<home>/bin/<version>/` (where the download goes), the package's own `bin/`
+(earlier releases) or a repo checkout's `target/`.
 
 To avoid the download, set `BWN_BIN` to a binary you built or verified
 yourself.
@@ -193,9 +196,11 @@ shows whether a given file is signed.
   runs `buildwithnexus update` or sets `auto_update` to `"install"` or
   `"install-any"`. It never installs other software: `buildwithnexus doctor`
   prints the install command for a missing tool, once, and runs none. Commands the
-  agent runs do not inherit provider keys (variables ending in `_API_KEY` or
-  `_API_TOKEN`, and `HF_TOKEN`) unless the user lists them in
-  `shell_env_passthrough`.
+  agent runs do not inherit credentials from the environment: variables whose
+  names end in `_API_KEY`, `_API_TOKEN`, `_TOKEN`, `_SECRET`, `_SECRETS` or
+  `_PASSWORD`, every `AWS_*` variable, and `HF_TOKEN` and the other provider
+  presets' key variables. The user can list any of them in
+  `shell_env_passthrough` to keep it.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
   `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
@@ -387,12 +392,14 @@ never auto-updated.
 - Releases run one at a time, a manual release can only be started from
   `main`, and a newly created tag points at the commit the workflow built.
 - Inside the harness itself: mutating file tools are gated by the permission
-  model, sensitive paths and catastrophic commands require confirmation even in
-  `auto` (also when they are the command of `check_work` or `start_server`),
+  model, sensitive paths and well-known destructive commands (a best-effort
+  pattern check, not a guarantee) require confirmation even in `auto` (also
+  when they are the command of `check_work` or `start_server`),
   API keys are refused over non-HTTPS endpoints, typed hidden and saved only
   after the provider accepts them, key-like tokens are redacted from surfaced
-  errors, provider keys are removed from the environment of the commands
-  the agent runs and blanked in bwn's own environment block (which
+  errors, provider keys and other credentials (tokens, secrets, passwords,
+  `AWS_*`) are removed from the environment of the commands
+  the agent runs and provider keys are blanked in bwn's own environment block (which
   `/proc/<pid>/environ` shows), any process's `/proc/<pid>/environ` is a
   sensitive path, descriptors bwn inherited (a CI runner's pipe) reach no
   command it starts, a tool call quoted inside an answer never runs, and an

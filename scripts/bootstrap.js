@@ -10,7 +10,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { pipeline } = require('stream');
 const {
-  ROOT, ext, target, installedBinary, installMarker, existing, EXIT_EXPLAINED,
+  ROOT, ext, target, installedBinary, installMarker, existing, pruneOldVersions, EXIT_EXPLAINED,
 } = require('./resolve-binary.js');
 
 const pkg = require(path.join(ROOT, 'package.json'));
@@ -222,20 +222,26 @@ function downloadFailure(e) {
   }
   if (NETWORK_CODES.has(code) || TLS_CODES.has(code)) out.push(...proxyHint(win));
   out.push('  To try again:  bwn --bootstrap');
-  out.push(`  Other ways to install (platform package, source build and BWN_BIN): ${DOCS_URL}`);
+  out.push(`  Other ways to install (source build and BWN_BIN): ${DOCS_URL}`);
   return out.join('\n') + '\n';
+}
+
+// Colour only for a terminal, and not when NO_COLOR asks for none: piped
+// output (CI logs, `| tee`) would otherwise show the codes as text.
+function style(code, text, tty = process.stdout.isTTY, noColor = process.env.NO_COLOR) {
+  return tty && !noColor ? `\x1b[${code}m${text}\x1b[0m` : text;
 }
 
 function walkthrough(ok) {
   log('');
   if (ok) {
-    log('  \x1b[38;5;141mbuildwithnexus\x1b[0m is ready.');
-    log('  Run  \x1b[1mbuildwithnexus\x1b[0m  — the first launch walks you through choosing a model:');
+    log(`  ${style('38;5;141', 'buildwithnexus')} is ready.`);
+    log(`  Run  ${style('1', 'buildwithnexus')}  — the first launch walks you through choosing a model:`);
     log('    • remote  — Anthropic, OpenAI, OpenRouter, Groq, Hugging Face (paste an API key)');
     log('    • local   — Ollama, llama.cpp, LM Studio (no key, runs on your machine)');
-    log('  Then describe a task. It plans, edits files, and runs commands — asking before each change.');
+    log('  Then describe a task. It plans, edits files, and runs commands. By default it asks before each change.');
   } else {
-    log('  \x1b[33mbuildwithnexus: native binary not available yet.\x1b[0m');
+    log(`  ${style('33', 'buildwithnexus: native binary not available yet.')}`);
     log('  Build from source: git clone https://github.com/Garretts-Apps/buildwithnexus');
     log('  then: cargo build --release --manifest-path harness/Cargo.toml');
     log('  and point BWN_BIN at the built binary (an absolute path).');
@@ -270,6 +276,8 @@ obtain()
         problem = { text: `buildwithnexus: could not check the installed binary: ${e.message}\n` };
       }
       if (problem) explained(problem.text);
+      // It runs. Older versions' binaries are no longer needed (~6 MB each).
+      if (process.env.BWN_INSTALL_IN_PACKAGE !== '1') pruneOldVersions(pkg.version);
     }
     const ok = Boolean(r.installed || r.present);
     walkthrough(ok);

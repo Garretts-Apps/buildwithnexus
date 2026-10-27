@@ -1,7 +1,7 @@
 #!/bin/sh
-# Stands in for a working binary: answers --version, and exits with
+# Stands in for a working binary: answers --version (or version), and exits with
 # STUB_STATUS for anything else (a run that started and then failed).
-if [ "$1" = "--version" ]; then
+if [ "$1" = "--version" ] || [ "$1" = "version" ]; then
   echo "buildwithnexus ${STUB_VERSION:-0.0.0}"
   exit 0
 fi
