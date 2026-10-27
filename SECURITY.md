@@ -196,9 +196,11 @@ shows whether a given file is signed.
   runs `buildwithnexus update` or sets `auto_update` to `"install"` or
   `"install-any"`. It never installs other software: `buildwithnexus doctor`
   prints the install command for a missing tool, once, and runs none. Commands the
-  agent runs do not inherit provider keys (variables ending in `_API_KEY` or
-  `_API_TOKEN`, and `HF_TOKEN`) unless the user lists them in
-  `shell_env_passthrough`.
+  agent runs do not inherit credentials from the environment: variables whose
+  names end in `_API_KEY`, `_API_TOKEN`, `_TOKEN`, `_SECRET`, `_SECRETS` or
+  `_PASSWORD`, every `AWS_*` variable, and `HF_TOKEN` and the other provider
+  presets' key variables. The user can list any of them in
+  `shell_env_passthrough` to keep it.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
   `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
@@ -390,12 +392,14 @@ never auto-updated.
 - Releases run one at a time, a manual release can only be started from
   `main`, and a newly created tag points at the commit the workflow built.
 - Inside the harness itself: mutating file tools are gated by the permission
-  model, sensitive paths and catastrophic commands require confirmation even in
-  `auto` (also when they are the command of `check_work` or `start_server`),
+  model, sensitive paths and well-known destructive commands (a best-effort
+  pattern check, not a guarantee) require confirmation even in `auto` (also
+  when they are the command of `check_work` or `start_server`),
   API keys are refused over non-HTTPS endpoints, typed hidden and saved only
   after the provider accepts them, key-like tokens are redacted from surfaced
-  errors, provider keys are removed from the environment of the commands
-  the agent runs and blanked in bwn's own environment block (which
+  errors, provider keys and other credentials (tokens, secrets, passwords,
+  `AWS_*`) are removed from the environment of the commands
+  the agent runs and provider keys are blanked in bwn's own environment block (which
   `/proc/<pid>/environ` shows), any process's `/proc/<pid>/environ` is a
   sensitive path, descriptors bwn inherited (a CI runner's pipe) reach no
   command it starts, a tool call quoted inside an answer never runs, and an

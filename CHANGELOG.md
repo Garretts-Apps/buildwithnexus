@@ -6,6 +6,77 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: more of your environment is kept from the commands the
+  agent runs.** Besides `*_API_KEY`, `*_API_TOKEN` and `HF_TOKEN`, bwn now
+  also removes `*_TOKEN`, `*_SECRET`, `*_SECRETS`, `*_PASSWORD` and every
+  `AWS_*` variable (`GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`, ...) from the
+  environment of `run_command`, `check_work` and `start_server` commands,
+  sandboxed or not. Hooks keep their environment. **If your commands rely on
+  one of these, for example `gh` or `git push` with `GITHUB_TOKEN`, or the
+  `aws` CLI, list it in `shell_env_passthrough` in settings, for example
+  `"shell_env_passthrough": ["GITHUB_TOKEN", "AWS_PROFILE"]`.** The README
+  and SECURITY.md list the full set.
+- Setup's "Tool permissions" question lists the modes safest first: ask,
+  accept edits, read-only, and auto last, described as "runs commands and
+  edits without asking (only a short list of dangerous commands still
+  prompts)". The default stays ask. The choice numbers follow the new order
+  (2 is accept edits, 4 is auto); `/permissions <n>` keeps its numbers.
+- The first-run API key question says where to get a key (Anthropic, OpenAI,
+  OpenRouter, Groq, Hugging Face), and `--help` shows that `bwn` is the same
+  command.
+- The npm package description and README opening no longer say "local-first"
+  or claim every change is asked about: by default bwn asks before each change,
+  and accept-edits, auto and readonly modes let you choose.
+- The npm launcher's first-run text no longer says it asks before every change.
+
+### Fixed
+- **Destructive-command check.** The prompt before well-known destructive
+  commands (even in `auto`) now also catches `rm -rf ~/*`, `rm -rf $HOME`,
+  `rm -rf "$HOME"`, `rm -rf ${HOME}` and `find / -delete`,
+  `find ~ -delete` or `find $HOME -exec rm ...` (`~`, `$HOME`, `${HOME}`,
+  quotes and a trailing `/*`, `/.*` or `/.` are folded together first).
+  `rm -rf ./target`, `rm -rf node_modules`, `rm -rf ~/projects/app/build` and
+  `find . -name '*.tmp' -delete` still run without that prompt. This is a
+  best-effort pattern check, not a guarantee; use `--sandbox require` or a
+  container for untrusted work.
+- **A rejected key says where it came from.** `ANTHROPIC_API_KEY=... bwn run`
+  with a bad key said `buildwithnexus login` replaces it, but the environment
+  variable overrides the stored key, so `login` changed nothing. The error now
+  names the variable (`ANTHROPIC_API_KEY (from your environment) was rejected
+  (HTTP 401). Check or unset it; ...`), or, for a stored key, says `The stored
+  API key for <provider> was rejected (HTTP 401). buildwithnexus login
+  replaces it.` `CUSTOM_API_KEY` is named only when it is the variable in use.
+- **`bwn --version` and `-v` work before the binary is downloaded.** The
+  launcher answers from its own package instead of failing with "native binary
+  not found" (or downloading ~6 MB just to print a number).
+- The npm launcher's first-run text printed raw colour codes when its output was
+  not a terminal; it now uses colour only on a terminal and honours `NO_COLOR`.
+- The npm launcher removes the binaries of other versions it downloaded
+  earlier (`~/.buildwithnexus/bin/<version>/`, about 6 MB each) once the new
+  version's binary has been downloaded and runs. Failures are ignored.
+
+### Security
+- **The launcher no longer looks for per-platform npm packages.** Versions
+  0.12.1 to 0.14.2 list `buildwithnexus-linux-x64`, `-linux-arm64`,
+  `-darwin-x64`, `-darwin-arm64` and `-win32-x64` in `optionalDependencies`, but
+  those packages were never published, so someone else could register the
+  names. The current launcher never resolves or runs a binary from them, and
+  its messages no longer suggest them. If you have 0.12.1 to 0.14.2, upgrade
+  with `npm install -g buildwithnexus@latest`. SECURITY.md said OIDC publishing
+  keeps the names unregistered; that only stops this project, and the text is
+  corrected.
+
+### Documentation
+- README: the opening says what asks by default and what the other modes do;
+  the Safety section says writes outside the project folder by the file tools
+  are refused, that only file-tool writes are checkpointed (not shell
+  commands), that the destructive-command check is best-effort, and which
+  commands skip the prompt; new Uninstall section.
+- BENCHMARKS.md re-measured (binary size, startup of the native binary and
+  through the npm launcher).
+
 ## [0.15.1] - 2026-10-02
 
 Colours instead of escape codes in the console window that cmd and Windows
