@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-An **agentic AI CLI** with 2 ms startup, written in Rust. Remote models via
+An **agentic AI CLI** written in Rust. The native binary starts in about 2 ms (`--version`, [measured](BENCHMARKS.md)). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
 commands. By default it asks before each change; accept-edits, auto and
 readonly modes let you choose. One self-contained binary, 10 direct
