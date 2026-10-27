@@ -72,6 +72,11 @@ restores the old behavior is below.
   version's binary has been downloaded and runs. Failures are ignored.
 
 ### Security
+- **TLS dependencies updated for RUSTSEC-2026-0346 to -0349, -0381 and
+  -0382.** `rustls` 0.23.45 to 0.23.46 (including a Brotli certificate
+  decompression allocation and a ServerHello key-exchange downgrade),
+  `rustls-webpki` 0.103.15 to 0.103.16 and `webpki-roots` 1.0.8 to 1.0.11
+  (distrusted intermediates).
 - **The launcher no longer looks for per-platform npm packages.** Versions
   0.12.1 to 0.14.2 list `buildwithnexus-linux-x64`, `-linux-arm64`,
   `-darwin-x64`, `-darwin-arm64` and `-win32-x64` in `optionalDependencies`, but
