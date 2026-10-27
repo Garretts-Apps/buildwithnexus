@@ -26,10 +26,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The first-run API key question says where to get a key (Anthropic, OpenAI,
   OpenRouter, Groq, Hugging Face), and `--help` shows that `bwn` is the same
   command.
-- The npm package description and README opening no longer say "local-first"
-  or claim every change is asked about: by default bwn asks before each change,
-  and accept-edits, auto and readonly modes let you choose.
-- The npm launcher's first-run text no longer says it asks before every change.
+- The npm package description drops "local-first". The README opening and
+  the launcher's first-run text no longer say bwn always asks before a change:
+  by default it does, and the accept-edits, auto and readonly modes let you
+  choose.
 
 ### Fixed
 - **Destructive-command check.** The prompt before well-known destructive
@@ -74,8 +74,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are refused, that only file-tool writes are checkpointed (not shell
   commands), that the destructive-command check is best-effort, and which
   commands skip the prompt; new Uninstall section.
-- BENCHMARKS.md re-measured (binary size, startup of the native binary and
-  through the npm launcher).
+- BENCHMARKS.md re-measured on 2026-10-27: the binary is 6.07 MB (the table
+  said 3.98 MB), idle TUI memory is 7.7 MiB (4.6 MiB), the startup row says it
+  is the native binary running `--version` (about 2 ms) and gives the time
+  through the npm launcher (about 47 ms, Node starts first), and the
+  microbenchmarks are new. README quotes the same numbers.
 
 ## [0.15.1] - 2026-10-02
 

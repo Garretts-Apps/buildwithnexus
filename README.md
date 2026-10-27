@@ -159,9 +159,11 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
-The speed is measured: 2 ms full-process startup, a 4.6 MiB resident TUI,
-and 3.6 µs to render a streamed chunk into a 2,000-line transcript. Every
-number and how to regenerate it: [BENCHMARKS.md](BENCHMARKS.md).
+The speed is measured: 2 ms for the native binary to run `--version`
+(about 47 ms through the npm launcher, which starts Node first), a 7.7 MiB
+resident TUI, and 4.2 µs to render a streamed chunk into a 2,000-line
+transcript. Every number and how to regenerate it:
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### Package history
 
