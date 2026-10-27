@@ -1,7 +1,7 @@
 'use strict';
-// Locate the native binary. No network, no shell, no install scripts — the
-// binary arrives as a per-platform optionalDependency (like esbuild), and this
-// module only resolves paths. Node builtins only.
+// Locate the native binary. No network, no shell, no install scripts: this
+// module only resolves paths (the binary arrives by the checksum-verified
+// first-run download in bootstrap.js). Node builtins only.
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -12,37 +12,14 @@ function ext() {
   return process.platform === 'win32' ? '.exe' : '';
 }
 
-// Platform package that carries the prebuilt binary for this machine.
-const PLATFORM_PACKAGES = {
-  'linux x64': 'buildwithnexus-linux-x64',
-  'linux arm64': 'buildwithnexus-linux-arm64',
-  'darwin x64': 'buildwithnexus-darwin-x64',
-  'darwin arm64': 'buildwithnexus-darwin-arm64',
-  'win32 x64': 'buildwithnexus-win32-x64',
-};
+// Platforms the GitHub Release has a prebuilt binary for. The launcher never
+// looks for the binary in an npm package: 0.12.1 to 0.14.2 listed per-platform
+// packages that were never published, and nothing should install code from
+// those names. The binary comes from the checksum-verified download.
+const PREBUILT_PLATFORMS = new Set(['linux x64', 'linux arm64', 'darwin x64', 'darwin arm64', 'win32 x64']);
 
-function platformPackage() {
-  return PLATFORM_PACKAGES[`${process.platform} ${process.arch}`] || null;
-}
-
-// Binary installed by the platform optionalDependency, if present. Only a
-// package installed next to this one (or nested inside it) counts: Node's
-// lookup also walks every parent `node_modules` and NODE_PATH, where another
-// user could plant a package (`C:\node_modules\buildwithnexus-win32-x64`).
-function packagedBinary() {
-  const name = platformPackage();
-  if (!name) return null;
-  let found;
-  try {
-    found = require.resolve(`${name}/bin/buildwithnexus${ext()}`, { paths: [ROOT] });
-  } catch {
-    return null;
-  }
-  const allowed = [
-    path.join(path.dirname(ROOT), name) + path.sep,
-    path.join(ROOT, 'node_modules', name) + path.sep,
-  ];
-  return allowed.some((dir) => found.startsWith(dir)) ? found : null;
+function hasPrebuilt() {
+  return PREBUILT_PLATFORMS.has(`${process.platform} ${process.arch}`);
 }
 
 // BWN_BIN, if it is an absolute path. A relative value would resolve against
@@ -123,6 +100,27 @@ function readInstallMarker(bin = installedBinary()) {
 // cannot run, so the launcher does not add a second message.
 const EXIT_EXPLAINED = 3;
 
+// Best-effort cleanup after a successful download: removes the other
+// versions' <home>/bin/<version>/ directories (about 6 MB each). Only a
+// directory directly under <home>/bin whose name looks like a version, and
+// never `keep`. Failures are ignored (a binary still running from an old
+// version cannot be deleted on Windows). Returns the versions it removed.
+function pruneOldVersions(keep = packageVersion()) {
+  const removed = [];
+  try {
+    const binDir = path.join(nexusHome(), 'bin');
+    for (const entry of fs.readdirSync(binDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === keep) continue;
+      if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(entry.name)) continue;
+      try {
+        fs.rmSync(path.join(binDir, entry.name), { recursive: true, force: true });
+        removed.push(entry.name);
+      } catch {}
+    }
+  } catch {}
+  return removed;
+}
+
 // Local development builds in a repo checkout.
 function devBinary() {
   const rootTarget = path.join(ROOT, 'target', 'release', 'buildwithnexus' + ext());
@@ -130,15 +128,15 @@ function devBinary() {
   return path.join(ROOT, 'harness', 'target', 'release', 'buildwithnexus' + ext());
 }
 
-// First existing binary: explicit override, platform package, downloaded,
-// downloaded by an earlier release, dev.
+// First existing binary: explicit override, downloaded, downloaded by an
+// earlier release, dev.
 function existing() {
-  const candidates = [overrideBinary(), packagedBinary(), installedBinary(), legacyBinary(), devBinary()]
+  const candidates = [overrideBinary(), installedBinary(), legacyBinary(), devBinary()]
     .filter(Boolean);
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
 
 module.exports = {
-  ROOT, ext, target, platformPackage, packagedBinary, nexusHome, installDir, installedBinary, legacyBinary,
-  installMarker, readInstallMarker, devBinary, existing, EXIT_EXPLAINED,
+  ROOT, ext, target, hasPrebuilt, nexusHome, installDir, installedBinary, legacyBinary,
+  installMarker, readInstallMarker, pruneOldVersions, devBinary, existing, EXIT_EXPLAINED,
 };

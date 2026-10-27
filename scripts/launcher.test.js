@@ -527,7 +527,7 @@ test('launcher: a verified install that vanished is not downloaded again', (t) =
   writeMarker(pkg, { version: VERSION, sha256: '12'.repeat(32) });
   // BWN_SKIP_INSTALL keeps a regression off the network; the assertions on
   // stdout show whether bootstrap ran at all.
-  const r = launch(pkg, ['--version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
+  const r = launch(pkg, ['version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /removed after it was downloaded and verified/);
   assert.match(r.stderr, new RegExp(`SHA-256: ${'12'.repeat(32)}`));
@@ -549,7 +549,7 @@ test('launcher: --bootstrap still downloads again after a vanished install', (t)
 test('launcher: a marker from another version does not block the download', (t) => {
   const pkg = tempPackage(t);
   writeMarker(pkg, { version: '0.0.1', sha256: '12'.repeat(32) });
-  const r = launch(pkg, ['--version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
+  const r = launch(pkg, ['version'], { BWN_ALLOW_BOOTSTRAP: '1', BWN_SKIP_INSTALL: '1' });
   assert.match(r.stdout, /native binary not available yet/);
 });
 
@@ -561,7 +561,7 @@ test('launcher without a terminal on old glibc or musl explains the platform, no
     ['2.31', /needs glibc 2\.34 or later; this system has 2\.31/],
     ['musl', /musl libc \(Alpine or similar\)/],
   ]) {
-    const r = launch(pkg, ['--version'], { FAKE_GLIBC: fake }, [FAKE_GLIBC]);
+    const r = launch(pkg, ['version'], { FAKE_GLIBC: fake }, [FAKE_GLIBC]);
     assert.equal(r.status, 1, fake);
     assert.match(r.stderr, said);
     // It would download a binary that cannot run here.
@@ -572,7 +572,7 @@ test('launcher without a terminal on old glibc or musl explains the platform, no
 test('launcher without a terminal on a supported system offers --bootstrap', (t) => {
   const pkg = tempPackage(t);
   const linux = process.platform === 'linux';
-  const r = launch(pkg, ['--version'], linux ? { FAKE_GLIBC: '2.39' } : {}, linux ? [FAKE_GLIBC] : []);
+  const r = launch(pkg, ['version'], linux ? { FAKE_GLIBC: '2.39' } : {}, linux ? [FAKE_GLIBC] : []);
   assert.equal(r.status, 1);
   if (!ASSET) return;
   assert.match(r.stderr, /no terminal here[\s\S]*bwn --bootstrap/);
@@ -584,9 +584,12 @@ test('launcher without a terminal on a supported system offers --bootstrap', (t)
 test('first run: a verified download that runs is "ready" and then runs', { skip: needsSh || noRelease }, (t) => {
   const pkg = tempPackage(t);
   const asset = path.join(STUBS, 'prints-version');
-  const r = launchFake(pkg, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
+  const r = launchFake(pkg, ['version'], { asset, env: { STUB_VERSION: VERSION } });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /installed prebuilt binary \(sha256 verified\)[\s\S]*is ready/);
+  // Piped, not a terminal: no colour codes in the text.
+  assert.doesNotMatch(r.stdout, /\x1b/);
+  assert.match(r.stdout, /By default it asks before each change/);
   assert.ok(r.stdout.endsWith(`buildwithnexus ${VERSION}\n`), r.stdout);
   assert.deepEqual(r.requests.map((u) => u.split('/').pop()), [ASSET]);
   assert.equal(JSON.parse(fs.readFileSync(pkg.marker, 'utf8')).sha256, sha256(asset));
@@ -595,13 +598,13 @@ test('first run: a verified download that runs is "ready" and then runs', { skip
 
 // npm deletes and recreates the package folder on every update or reinstall,
 // so a binary kept in it was lost each time (and downloaded again).
-test('upgrade: the binary survives npm replacing the package, and each version keeps its own', {
+test('upgrade: the binary survives npm replacing the package, and an upgrade replaces the old version\'s', {
   skip: needsSh || noRelease,
 }, (t) => {
   const home = tempHome(t);
   const asset = path.join(STUBS, 'prints-version');
   const first = tempPackage(t, { home });
-  const r1 = launchFake(first, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
+  const r1 = launchFake(first, ['version'], { asset, env: { STUB_VERSION: VERSION } });
   assert.equal(r1.status, 0, r1.stderr);
   assert.equal(r1.requests.length, 1);
   assert.ok(fs.existsSync(first.bin));
@@ -609,22 +612,115 @@ test('upgrade: the binary survives npm replacing the package, and each version k
 
   // Same version again in a fresh package folder: no download.
   const again = tempPackage(t, { home });
-  const r2 = launchFake(again, ['--version'], { asset, env: { STUB_VERSION: VERSION } });
+  const r2 = launchFake(again, ['version'], { asset, env: { STUB_VERSION: VERSION } });
   assert.equal(r2.status, 0, r2.stderr);
   assert.deepEqual(r2.requests, []);
   assert.equal(r2.stdout, `buildwithnexus ${VERSION}\n`);
 
-  // A new version downloads its own binary and leaves the old one alone.
+  // A new version downloads its own binary, and the old version's is removed
+  // once the new one runs (they are ~6 MB each and nothing runs them again).
   const next = tempPackage(t, { home, version: '99.0.0' });
-  const r3 = launchFake(next, ['--version'], { asset, env: { STUB_VERSION: '99.0.0' } });
+  const r3 = launchFake(next, ['version'], { asset, env: { STUB_VERSION: '99.0.0' } });
   assert.equal(r3.status, 0, r3.stderr);
   assert.equal(r3.requests.length, 1);
   assert.match(r3.requests[0], /\/download\/v99\.0\.0\//);
   assert.ok(r3.stdout.endsWith('buildwithnexus 99.0.0\n'), r3.stdout);
   assert.notEqual(next.bin, first.bin);
-  assert.ok(fs.existsSync(first.bin));
-  assert.equal(JSON.parse(fs.readFileSync(first.marker, 'utf8')).version, VERSION);
+  assert.ok(!fs.existsSync(path.dirname(first.bin)));
+  assert.ok(fs.existsSync(next.bin));
   assert.equal(JSON.parse(fs.readFileSync(next.marker, 'utf8')).version, '99.0.0');
+});
+
+test('first run: other versions\' bin/<version> directories are removed, nothing else is', {
+  skip: needsSh || noRelease,
+}, (t) => {
+  const home = tempHome(t);
+  const binDir = path.join(home, 'bin');
+  for (const v of ['0.14.0', '0.15.0', '1.0.0-rc.1']) {
+    fs.mkdirSync(path.join(binDir, v), { recursive: true });
+    fs.writeFileSync(path.join(binDir, v, 'buildwithnexus'), 'old');
+  }
+  // Not a version directory, a file named like a version, and files elsewhere
+  // in the home: all stay.
+  fs.mkdirSync(path.join(binDir, 'tools'));
+  fs.writeFileSync(path.join(binDir, 'tools', 'keep'), 'x');
+  fs.writeFileSync(path.join(binDir, '0.13.0'), 'a file');
+  fs.writeFileSync(path.join(home, 'settings.json'), '{}');
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-outside-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(outside, 'keep'), 'x');
+  try { fs.symlinkSync(outside, path.join(binDir, '0.12.0'), 'dir'); } catch {}
+
+  const pkg = tempPackage(t, { home });
+  const r = launchFake(pkg, ['version'], {
+    asset: path.join(STUBS, 'prints-version'), env: { STUB_VERSION: VERSION },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(fs.existsSync(pkg.bin));
+  for (const v of ['0.14.0', '0.15.0', '1.0.0-rc.1']) assert.ok(!fs.existsSync(path.join(binDir, v)), v);
+  assert.ok(fs.existsSync(path.join(binDir, 'tools', 'keep')));
+  assert.equal(fs.readFileSync(path.join(binDir, '0.13.0'), 'utf8'), 'a file');
+  assert.ok(fs.existsSync(path.join(home, 'settings.json')));
+  assert.ok(fs.existsSync(path.join(outside, 'keep')), 'a symlink must not be followed');
+});
+
+test('first run: a failed download removes no other version', { skip: noRelease }, (t) => {
+  const pkg = tempPackage(t);
+  const old = path.join(pkg.home, 'bin', '0.14.0');
+  fs.mkdirSync(old, { recursive: true });
+  const r = launchFake(pkg, ['version'], {
+    asset: path.join(STUBS, 'prints-version'), pin: '0'.repeat(64),
+  });
+  assert.equal(r.status, 1);
+  assert.ok(fs.existsSync(old));
+});
+
+test('pruneOldVersions never removes the version it is told to keep, and ignores a missing bin folder', (t) => {
+  const { pruneOldVersions } = require('./resolve-binary.js');
+  const home = tempHome(t);
+  const saved = process.env.NEXUS_HOME;
+  t.after(() => { if (saved === undefined) delete process.env.NEXUS_HOME; else process.env.NEXUS_HOME = saved; });
+  process.env.NEXUS_HOME = home;
+  assert.deepEqual(pruneOldVersions('1.2.3'), []);
+  for (const v of ['1.2.3', '1.2.2']) fs.mkdirSync(path.join(home, 'bin', v), { recursive: true });
+  assert.deepEqual(pruneOldVersions('1.2.3'), ['1.2.2']);
+  assert.ok(fs.existsSync(path.join(home, 'bin', '1.2.3')));
+});
+
+test('--version / -v before the binary is downloaded answer from package.json, without downloading', (t) => {
+  const pkg = tempPackage(t);
+  for (const flag of ['--version', '-v']) {
+    // BWN_ALLOW_BOOTSTRAP would download for any other command.
+    const r = launchFake(pkg, [flag], { asset: path.join(STUBS, 'prints-version') });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, `buildwithnexus ${VERSION}\n`);
+    assert.equal(r.stderr, '');
+    assert.deepEqual(r.requests, []);
+    assert.ok(!fs.existsSync(pkg.bin));
+  }
+});
+
+test('--version with other arguments is left to the binary', (t) => {
+  const pkg = tempPackage(t);
+  const r = launch(pkg, ['run', '--version']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /native binary not found|no terminal here/);
+});
+
+test('the launcher no longer looks for per-platform npm packages or suggests them', (t) => {
+  const pkg = tempPackage(t);
+  // A package planted where the old lookup would have found it.
+  const name = `buildwithnexus-${process.platform}-${process.arch}`;
+  const planted = path.join(pkg.root, 'node_modules', name, 'bin');
+  fs.mkdirSync(planted, { recursive: true });
+  fs.writeFileSync(path.join(planted, 'buildwithnexus' + (WIN ? '.exe' : '')), '#!/bin/sh\necho planted\n', { mode: 0o755 });
+  const r = launch(pkg, ['run', 'x']);
+  assert.equal(r.status, 1);
+  assert.doesNotMatch(r.stdout, /planted/);
+  assert.doesNotMatch(r.stderr, /omit=optional|buildwithnexus-(linux|darwin|win32)-|package is available/);
+  const resolve = require('./resolve-binary.js');
+  assert.equal(resolve.packagedBinary, undefined);
+  assert.equal(resolve.platformPackage, undefined);
 });
 
 test('without NEXUS_HOME the binary goes under ~/.buildwithnexus/bin/<version>', {
@@ -632,7 +728,7 @@ test('without NEXUS_HOME the binary goes under ~/.buildwithnexus/bin/<version>',
 }, (t) => {
   const pkg = tempPackage(t);
   const user = tempHome(t);
-  const r = launchFake(pkg, ['--version'], {
+  const r = launchFake(pkg, ['version'], {
     asset: path.join(STUBS, 'prints-version'),
     env: { NEXUS_HOME: undefined, HOME: user, USERPROFILE: user, STUB_VERSION: VERSION },
   });
@@ -644,7 +740,7 @@ test('without NEXUS_HOME the binary goes under ~/.buildwithnexus/bin/<version>',
 test('a binary downloaded into the package by an earlier release still runs', { skip: needsSh }, (t) => {
   const pkg = tempPackage(t);
   installStub(pkg, 'prints-version', 0o755, pkg.legacyBin);
-  const r = launch(pkg, ['--version'], { STUB_VERSION: VERSION });
+  const r = launch(pkg, ['version'], { STUB_VERSION: VERSION });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, `buildwithnexus ${VERSION}\n`);
 });
@@ -652,7 +748,7 @@ test('a binary downloaded into the package by an earlier release still runs', { 
 test('BWN_INSTALL_IN_PACKAGE=1 downloads into the package, as before 0.15', { skip: needsSh || noRelease }, (t) => {
   const pkg = tempPackage(t);
   const asset = path.join(STUBS, 'prints-version');
-  const r = launchFake(pkg, ['--version'], { asset, env: { STUB_VERSION: VERSION, BWN_INSTALL_IN_PACKAGE: '1' } });
+  const r = launchFake(pkg, ['version'], { asset, env: { STUB_VERSION: VERSION, BWN_INSTALL_IN_PACKAGE: '1' } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(sha256(pkg.legacyBin), sha256(asset));
   assert.equal(JSON.parse(fs.readFileSync(pkg.legacyMarker, 'utf8')).version, VERSION);
@@ -668,7 +764,7 @@ for (const when of ['on-close', 'before-rename', 'after-rename']) {
     const pkg = tempPackage(t);
     const asset = path.join(STUBS, 'prints-version');
     const hash = sha256(asset);
-    const first = launchFake(pkg, ['--version'], { asset, env: { FAKE_QUARANTINE: when } });
+    const first = launchFake(pkg, ['version'], { asset, env: { FAKE_QUARANTINE: when } });
     assert.equal(first.status, 1, first.stdout + first.stderr);
     assert.match(first.stderr, /removed after it was downloaded and verified/);
     assert.match(first.stderr, /blocked or\s+(quarantined|removed) by/);
@@ -680,7 +776,7 @@ for (const when of ['on-close', 'before-rename', 'after-rename']) {
     assert.deepEqual(JSON.parse(fs.readFileSync(pkg.marker, 'utf8')), { version: VERSION, sha256: hash });
     assert.ok(!fs.existsSync(`${pkg.bin}.download`));
 
-    const again = launchFake(pkg, ['--version'], { asset });
+    const again = launchFake(pkg, ['version'], { asset });
     assert.equal(again.status, 1);
     assert.match(again.stderr, /removed after it was downloaded and verified/);
     assert.match(again.stderr, new RegExp(`SHA-256: ${hash}`));
@@ -691,7 +787,7 @@ for (const when of ['on-close', 'before-rename', 'after-rename']) {
 
 test('first run: a download with the wrong checksum is refused and not recorded', { skip: noRelease }, (t) => {
   const pkg = tempPackage(t);
-  const r = launchFake(pkg, ['--version'], { asset: path.join(STUBS, 'prints-version'), pin: '0'.repeat(64) });
+  const r = launchFake(pkg, ['version'], { asset: path.join(STUBS, 'prints-version'), pin: '0'.repeat(64) });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /could not download the prebuilt binary: checksum mismatch/);
   assert.doesNotMatch(r.stderr, /removed after|no terminal here|proxy/);
@@ -705,7 +801,7 @@ test('first run: a failed download says why and how proxies work, not "no termin
   const [major, minor] = process.versions.node.split('.').map(Number);
   const envProxy = major >= 25 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
   for (const [how, env, said] of [
-    [['--version'], {}, /If this network needs a proxy: Node's https module uses HTTPS_PROXY only with NODE_USE_ENV_PROXY=1/],
+    [['version'], {}, /If this network needs a proxy: Node's https module uses HTTPS_PROXY only with NODE_USE_ENV_PROXY=1/],
     [['--bootstrap', '--version'], { BWN_ALLOW_BOOTSTRAP: undefined, HTTPS_PROXY: 'http://proxy.example:8080' },
       /HTTPS_PROXY is set, but Node's https module ignores it unless NODE_USE_ENV_PROXY=1 is set too/],
   ]) {
@@ -724,7 +820,7 @@ test('first run: a download that gets no answer times out instead of hanging', {
   const pkg = tempPackage(t);
   // The fake cuts the launcher's 30 s timer to 300 ms. The request's own
   // timeout option alone would fire after 60 s here, past the test's limit.
-  const r = launchFake(pkg, ['--version'], { env: { FAKE_HANG: '300' } });
+  const r = launchFake(pkg, ['version'], { env: { FAKE_HANG: '300' } });
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stderr, /no response from github\.com for 30 s \(ETIMEDOUT\)/);
   assert.match(r.stderr, /NODE_USE_ENV_PROXY/);
