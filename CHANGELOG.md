@@ -4,7 +4,21 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] - 2026-10-27
+
+Safer defaults for what the agent's commands can see and run, an install that
+no longer looks up npm package names nobody owns, and docs and benchmarks
+that match the code. This minor release changes one default; the setting that
+restores the old behavior is below.
+
+### Upgrading
+- **Commands the agent runs no longer inherit `*_TOKEN`, `*_SECRET`,
+  `*_SECRETS`, `*_PASSWORD` or any `AWS_*` variable** (see Changed). If your
+  commands need one, such as `gh` or `git push` with `GITHUB_TOKEN`, or the
+  `aws` CLI with `AWS_PROFILE` or `AWS_REGION`, list it in
+  `shell_env_passthrough` in settings.
+- Setup's "Tool permissions" choice numbers follow the new order (see
+  Changed). `/permissions <n>` keeps its numbers.
 
 ### Changed
 - **Behaviour change: more of your environment is kept from the commands the
