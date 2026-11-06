@@ -63,19 +63,6 @@ pub struct TestsStatus {
     pub tests_ok: Option<bool>,
     #[serde(default)]
     pub tests_added: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_delta: Option<f64>,
-}
-
-/// Results from static analysis or linting tools.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct StaticAnalysisResult {
-    pub tool: String,
-    pub issues_found: u32,
-    pub critical_issues: u32,
-    pub warnings: u32,
-    #[serde(default)]
-    pub details: Vec<String>,
 }
 
 /// Record of a tool call made during the session.
@@ -103,8 +90,6 @@ pub struct VerificationContext {
     pub tests_added: Vec<String>,
     #[serde(default)]
     pub dependencies_changed: Vec<(String, String)>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_diff: Option<String>,
     /// Explicit verdict of the project's own checks (check_work): `Some(true)`
     /// passed, `Some(false)` failed, `None` not run / no project detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,8 +109,6 @@ pub struct VerificationReport {
     pub confidence_level: String,
     pub files_changed: Vec<String>,
     pub tests_status: TestsStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub static_analysis_status: Option<StaticAnalysisResult>,
     pub timestamp: String,
 }
 
@@ -142,14 +125,6 @@ impl Verifier {
     pub fn new(workdir: &str) -> Self {
         Self {
             rule_engine: RuleEngine::load_with_overrides(&crate::config::home().join("rules")).0,
-            workdir: PathBuf::from(workdir),
-        }
-    }
-
-    /// Creates a new Verifier with a custom RuleEngine.
-    pub fn with_rules(workdir: &str, rule_engine: RuleEngine) -> Self {
-        Self {
-            rule_engine,
             workdir: PathBuf::from(workdir),
         }
     }
@@ -209,15 +184,10 @@ impl Verifier {
         // 2. Evaluate rules
         let rule_violations = self.rule_engine.evaluate(&eval_ctx);
 
-        // 3. Check tests and static analysis
-        let mut tests_status = self.check_tests(
-            &ctx.changed_files,
-            &ctx.tests_added,
-            eval_ctx.tests_run,
-            &ctx.tool_calls,
-        );
+        // 3. Check tests
+        let mut tests_status =
+            self.check_tests(&ctx.tests_added, eval_ctx.tests_run, &ctx.tool_calls);
         tests_status.tests_ok = ctx.tests_passed;
-        let static_analysis_status = self.run_static_analysis(&ctx.changed_files);
 
         // 4. Determine missing evidence
         let mut missing_evidence = Vec::new();
@@ -249,7 +219,6 @@ impl Verifier {
             confidence_level: "high".to_string(),
             files_changed: ctx.changed_files.clone(),
             tests_status,
-            static_analysis_status,
             timestamp: crate::knowledge::chrono_now_iso(),
         };
 
@@ -301,7 +270,6 @@ impl Verifier {
     /// fact that a shell command ran.
     pub fn check_tests(
         &self,
-        _changed_files: &[String],
         tests_added: &[String],
         tests_run: bool,
         tool_calls: &[ToolCallRecord],
@@ -319,13 +287,7 @@ impl Verifier {
             tests_failed,
             tests_ok: None,
             tests_added: tests_added.to_vec(),
-            coverage_delta: None,
         }
-    }
-
-    /// Runs static analysis or returns simulated/cached results.
-    pub fn run_static_analysis(&self, _files: &[String]) -> Option<StaticAnalysisResult> {
-        None
     }
 
     /// Formats the verification report as human-readable Markdown text.
@@ -377,40 +339,6 @@ impl Verifier {
     /// Returns the verification report as a JSON Value.
     pub fn format_report_json(report: &VerificationReport) -> Value {
         serde_json::to_value(report).unwrap_or(Value::Null)
-    }
-
-    /// Formats a decision support memo incorporating verification results.
-    pub fn format_decision_memo(report: &VerificationReport) -> String {
-        let mut out = String::from("# Decision Memo\n\n");
-        out.push_str(&format!(
-            "**Confidence**: {:.2} ({})\n\n",
-            report.confidence,
-            report.confidence_level.to_uppercase()
-        ));
-        out.push_str("## Evidence Inspected\n");
-        if report.evidence_used.is_empty() {
-            out.push_str("- *No explicit evidence recorded.*\n");
-        } else {
-            for e in &report.evidence_used {
-                out.push_str(&format!("- **{}**: {}\n", e.source, e.description));
-            }
-        }
-        out.push('\n');
-
-        if !report.rule_violations.is_empty() {
-            out.push_str("## Applicable Constraints & Violations\n");
-            for v in &report.rule_violations {
-                out.push_str(&format!(
-                    "- **[{}]** `{}`: {}\n",
-                    v.severity.to_string().to_uppercase(),
-                    v.rule_id,
-                    v.message
-                ));
-            }
-            out.push('\n');
-        }
-
-        out
     }
 }
 
@@ -475,7 +403,7 @@ mod tests {
         // A bash call ran, but its output carries no test summary — counts
         // must stay unknown rather than being invented.
         let calls = vec![bash_call("Compiling harness v0.1.0\nFinished dev")];
-        let status = verifier.check_tests(&[], &[], true, &calls);
+        let status = verifier.check_tests(&[], true, &calls);
         assert!(status.tests_run);
         assert_eq!(status.tests_passed, None);
         assert_eq!(status.tests_failed, None);
@@ -487,7 +415,7 @@ mod tests {
         let calls = vec![bash_call(
             "test result: ok. 12 passed; 1 failed; 0 ignored; 0 measured",
         )];
-        let status = verifier.check_tests(&[], &[], true, &calls);
+        let status = verifier.check_tests(&[], true, &calls);
         assert_eq!(status.tests_passed, Some(12));
         assert_eq!(status.tests_failed, Some(1));
     }

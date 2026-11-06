@@ -272,7 +272,7 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
             schema: json!({"type":"object","properties":{}}) },
         ToolDef { name: "load_skill", description: "Load the full instructions for one named skill. Use only when that skill is relevant to the task. Folder skills report their directory so referenced scripts/references can be read with read_file.",
             schema: json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) },
-        ToolDef { name: "kb_query", description: "Query the project's local structured knowledge base (.buildwithnexus/knowledge/) for entities, relationships, and architectural decisions.",
+        ToolDef { name: "kb_query", description: "Query the project's local structured knowledge base (.buildwithnexus/knowledge/) for entities and architectural decisions.",
             schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}) },
         ToolDef { name: "kb_record", description: "Record an entity, relationship, or architectural decision (with risk, cost, and reversibility primitives) into the local knowledge base.",
             schema: json!({"type":"object","properties":{"name":{"type":"string"},"entity_type":{"type":"string","enum":["Function","Class","Module","Package","Service","Endpoint","DatabaseTable","Migration","ArchitectureDecision"]},"description":{"type":"string"},"path":{"type":"string"}},"required":["name","entity_type"]}) },
@@ -7004,7 +7004,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 path: input["path"].as_str().map(|s| s.to_string()),
                 description: desc,
                 metadata: input["metadata"].clone(),
-                relationships: vec![],
                 last_updated: iso8601_utc_now(),
             };
             let id = entity.id.clone();
@@ -7066,7 +7065,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 evidence_gathered: vec![],
                 tests_added: vec![],
                 dependencies_changed: vec![],
-                git_diff: None,
                 tests_passed: None,
             };
             let report = verifier.verify(&ctx);

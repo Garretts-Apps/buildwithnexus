@@ -1045,7 +1045,7 @@ fn request_inner(
             }
         }
         Protocol::OpenAi => {
-            let (req, body) = openai_request(p, msgs, tools);
+            let (req, body) = openai_request_at(p, &p.base_url, msgs, tools);
             openai_exchange(req, body, streaming, on_text, on_thinking)
         }
         Protocol::OllamaNative => {
@@ -2430,10 +2430,6 @@ fn openai_image_part((mt, data): &(String, String)) -> Value {
         "type": "image_url",
         "image_url": {"url": format!("data:{mt};base64,{data}")}
     })
-}
-
-fn openai_request(p: &Provider, msgs: &[Msg], tools: &[ToolDef]) -> (ureq::Request, Value) {
-    openai_request_at(p, &p.base_url, msgs, tools)
 }
 
 // Same request against an explicit base URL — the Ollama fallback path targets

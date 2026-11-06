@@ -1480,11 +1480,6 @@ pub fn skill_warnings(skills: &[Skill]) -> Vec<String> {
         .collect()
 }
 
-/// `skill_warnings` filtered to ones not yet returned in this process.
-pub fn skill_warnings_once(skills: &[Skill]) -> Vec<String> {
-    first_time(skill_warnings(skills))
-}
-
 fn first_time(warnings: Vec<String>) -> Vec<String> {
     static SEEN: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
     let mut lock = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -4450,8 +4445,8 @@ mod tests {
         let warns = skill_warnings(&skills);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("renamed") && warns[0].contains("SKILL.md"));
-        assert_eq!(skill_warnings_once(&skills).len(), 1);
-        assert!(skill_warnings_once(&skills).is_empty());
+        assert_eq!(first_time(skill_warnings(&skills)).len(), 1);
+        assert!(first_time(skill_warnings(&skills)).is_empty());
 
         let descs = load_skill_descriptions(&proj);
         assert!(descs.contains(&("renamed".to_string(), "(no description)".to_string())));

@@ -5000,7 +5000,6 @@ fn handle_kb_index(cwd: &std::path::Path) {
                                                 "Extracted symbol from {rel_path}"
                                             )),
                                             metadata: serde_json::json!({"auto_indexed": true}),
-                                            relationships: vec![],
                                             last_updated: crate::knowledge::chrono_now_iso(),
                                         });
                                         count += 1;
@@ -5439,7 +5438,6 @@ fn handle_verify_audit(perm: Permission, cwd: &std::path::Path) -> bool {
         evidence_gathered: vec![],
         tests_added: vec![],
         dependencies_changed: vec![],
-        git_diff: None,
         tests_passed,
     };
 
@@ -7131,7 +7129,6 @@ fn handle_align(cwd: &std::path::Path) {
             "confidence_target": conf_label,
             "timestamp": crate::checkpoint::now_ms()
         }),
-        relationships: vec![],
         last_updated: "now".to_string(),
     };
     kb.add_entity(entity);

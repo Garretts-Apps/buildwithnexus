@@ -675,11 +675,7 @@ fn term_is_dumb() -> bool {
 }
 
 /// True when colour output is off (`NO_COLOR`); highlighters skip work.
-pub fn color_disabled() -> bool {
-    no_color()
-}
-
-fn no_color() -> bool {
+pub(crate) fn no_color() -> bool {
     std::env::var_os("NO_COLOR").is_some() || !stdout_wants_color() || term_is_dumb()
 }
 
@@ -5169,11 +5165,6 @@ impl Drop for PauseAgentRunningGuard {
             set_agent_running(true);
         }
     }
-}
-
-pub fn drain_stdin() {
-    // Intentionally no-op: do NOT read and discard stdin events so typed-ahead
-    // keystrokes (like "good point") are preserved 100% reliably.
 }
 
 // What the input box reads while a picker is open.

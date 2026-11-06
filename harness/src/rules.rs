@@ -142,14 +142,9 @@ pub struct RuleEngine {
 }
 
 impl RuleEngine {
-    /// Creates a new empty RuleEngine.
-    pub fn new() -> Self {
-        Self { rules: Vec::new() }
-    }
-
     /// Loads built-in default engineering constraints.
     pub fn load_defaults() -> Self {
-        let mut engine = Self::new();
+        let mut engine = Self::default();
 
         engine.add_rule(Rule {
             id: "bug_fix_requires_regression_test".to_string(),
@@ -476,13 +471,6 @@ impl RuleEngine {
         Ok(())
     }
 
-    /// Returns true if any High or Critical violations exist in the context.
-    pub fn is_blocked(&self, ctx: &EvaluationContext) -> bool {
-        self.evaluate(ctx)
-            .iter()
-            .any(|v| v.severity == Severity::Critical || v.severity == Severity::High)
-    }
-
     /// Formats a list of violations into human-readable text.
     pub fn format_violations(violations: &[RuleViolation]) -> String {
         if violations.is_empty() {
@@ -501,11 +489,6 @@ impl RuleEngine {
             }
         }
         out
-    }
-
-    /// Returns violations formatted as a JSON Value.
-    pub fn format_violations_json(violations: &[RuleViolation]) -> Value {
-        serde_json::to_value(violations).unwrap_or(Value::Null)
     }
 }
 

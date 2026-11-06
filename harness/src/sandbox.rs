@@ -289,10 +289,6 @@ const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
 /// Environment a sandboxed child never inherits: session buses and agent
 /// sockets reach outside the sandbox, and provider keys and other credentials
 /// (see `is_credential`) are not the command's to have.
-pub fn scrubbed_env<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
-    scrubbed_env_keeping(names, &[])
-}
-
 fn scrubbed_env_keeping<I: IntoIterator<Item = String>>(
     names: I,
     passthrough: &[String],
@@ -760,7 +756,7 @@ mod tests {
         ]
         .map(String::from);
         assert_eq!(
-            scrubbed_env(names),
+            scrubbed_env_keeping(names, &[]),
             [
                 "DBUS_SESSION_BUS_ADDRESS",
                 "SSH_AUTH_SOCK",
@@ -849,7 +845,7 @@ mod tests {
         let names = || stripped.iter().chain(&kept).map(|s| s.to_string());
         assert_eq!(credential_env(names(), &[]), stripped);
         // The sandbox strips the same names, plus the sockets.
-        let sandboxed = scrubbed_env(names());
+        let sandboxed = scrubbed_env_keeping(names(), &[]);
         for n in stripped {
             assert!(sandboxed.contains(&n.to_string()), "{n}");
         }

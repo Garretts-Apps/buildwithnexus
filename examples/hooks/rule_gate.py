@@ -24,19 +24,6 @@ import os
 import re
 
 
-def load_rules(workdir):
-    """Load rules from .buildwithnexus/rules/default_rules.json or custom rules file."""
-    rules_path = os.path.join(workdir, ".buildwithnexus", "rules", "default_rules.json")
-    if not os.path.exists(rules_path):
-        return []
-    try:
-        with open(rules_path, "r") as f:
-            data = json.load(f)
-            return data.get("rules", [])
-    except (json.JSONDecodeError, IOError):
-        return []
-
-
 def check_sensitive_patterns(tool_name, tool_input):
     """Check for patterns that indicate sensitive operations."""
     violations = []

@@ -101,13 +101,9 @@ pub fn new_id() -> String {
     format!("{:016}-{:08x}", now_ms(), h.finish() as u32)
 }
 
-fn file(id: &str) -> PathBuf {
-    dir().join(format!("{id}.json"))
-}
-
 /// Where the transcript for `id` is (or will be) saved.
 pub fn path(id: &str) -> PathBuf {
-    file(id)
+    dir().join(format!("{id}.json"))
 }
 
 // The id of the session this process is running — the same value the
@@ -208,7 +204,7 @@ fn write(s: &Session) -> bool {
     // Write-then-rename so a crash mid-save never truncates the previous
     // session file. list() only picks up `.json` files, so the temp file
     // is invisible even if a crash leaves it behind.
-    let path = file(&s.id);
+    let path = path(&s.id);
     let tmp = dir().join(format!("{}.json.tmp", s.id));
     if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
         return true;
@@ -228,7 +224,7 @@ pub fn rename(id: &str, name: &str) -> Result<(), String> {
     if write(&s) {
         Ok(())
     } else {
-        Err(format!("could not write {}", file(id).display()))
+        Err(format!("could not write {}", path(id).display()))
     }
 }
 
@@ -237,7 +233,7 @@ pub fn remove(id: &str) -> Result<Session, String> {
     let Some(s) = load(id) else {
         return Err(format!("no session '{id}' — bwn sessions lists them"));
     };
-    std::fs::remove_file(file(id)).map_err(|e| format!("could not delete {id}: {e}"))?;
+    std::fs::remove_file(path(id)).map_err(|e| format!("could not delete {id}: {e}"))?;
     Ok(s)
 }
 
@@ -261,7 +257,7 @@ fn parse_session(path: &Path, text: &str) -> Option<Session> {
 /// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
 /// Warns on stderr if the file exists but cannot be parsed.
 pub fn load(id: &str) -> Option<Session> {
-    let path = file(id);
+    let path = path(id);
     let text = std::fs::read_to_string(&path).ok()?;
     parse_session(&path, &text)
 }
@@ -690,7 +686,7 @@ mod tests {
                 "m",
                 &[Msg::User("v".into())],
             );
-            let text = std::fs::read_to_string(file("0000000000000005")).unwrap();
+            let text = std::fs::read_to_string(path("0000000000000005")).unwrap();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(v["schema_version"], SCHEMA_VERSION);
             assert_eq!(
@@ -706,7 +702,7 @@ mod tests {
         with_home(|| {
             let _ = std::fs::create_dir_all(dir());
             std::fs::write(
-                file("0000000000000006"),
+                path("0000000000000006"),
                 r#"{"id":"0000000000000006","title":"old task","cwd":"/p","model":"m","created_ms":1,"updated_ms":2,"msgs":[{"User":"old task"}]}"#,
             )
             .unwrap();

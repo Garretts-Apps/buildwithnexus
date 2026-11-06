@@ -934,7 +934,7 @@ pub fn highlight_line(lang: &Lang, line: &str, st: &mut State) -> String {
 /// Highlight a whole fenced block. Returns the lines unchanged when the tag
 /// is unknown or colour is disabled.
 pub fn highlight_block(tag: &str, lines: &[String]) -> Vec<String> {
-    if tui::color_disabled() {
+    if tui::no_color() {
         return lines.to_vec();
     }
     let t = tag.trim().to_ascii_lowercase();
