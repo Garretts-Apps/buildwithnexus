@@ -1718,6 +1718,216 @@ fn drop_refused_message(p: &Provider, msgs: &mut Vec<Msg>) {
     }
 }
 
+/// How a BUILD step that got text and no tool calls goes on.
+enum TextReply {
+    /// The model was nudged; ask it again.
+    Again,
+    /// The turn ends with this.
+    Done(Result<String, String>),
+}
+
+/// A BUILD step's reply had text and no tool calls: an empty reply is
+/// retried once, how-to prose gets a nudge to act, an explicit file or
+/// artifact task is finished on the model's behalf, and anything else ends
+/// the turn with the text.
+#[allow(clippy::too_many_arguments)]
+fn on_text_reply(
+    st: &mut TurnState,
+    reply: Reply,
+    task_for_recovery: &str,
+    msgs: &mut Vec<Msg>,
+    perm: Permission,
+    cwd: &Path,
+    depth: usize,
+    defs: &[tools::ToolDef],
+) -> TextReply {
+    // One empty response is retried before ending the run; a second
+    // empty response ends it.
+    if reply.text.trim().is_empty() {
+        // No assistant turn is recorded here: an empty assistant
+        // message would serialize to an empty content array (API 400).
+        if !st.empty_reply_retried {
+            st.empty_reply_retried = true;
+            report::notice("  ⚠ model returned no output — asking it to continue");
+            msgs.push(Msg::User(
+                    "You returned no output. Continue the task: call a tool or state your final answer."
+                        .to_string(),
+                ));
+            return TextReply::Again;
+        }
+        report::notice("  ⚠ model returned no output");
+        if depth == 0 && (!st.any_tool_ran || st.last_unrun.is_some()) {
+            stopped_short(Outcome::Failed);
+        }
+        return TextReply::Done(Ok(reply.text));
+    }
+    // Imperative task answered with how-to prose instead of tool
+    // calls: tell the model to act, bounded per task. Never fires
+    // once a mutating tool has run (that prose is a real summary),
+    // nor in a review, whose answer is prose by design (the diff in
+    // its task reads as an order to change things).
+    if !REVIEWING.load(Ordering::Relaxed)
+        && should_nudge_to_act(
+            task_for_recovery,
+            &reply.text,
+            st.any_tool_ran,
+            st.mutating_tool_ran,
+            st.act_nudges,
+        )
+    {
+        st.act_nudges += 1;
+        report::notice("  ⟳ model explained instead of acting — nudging it to use tools");
+        msgs.push(Msg::Assistant {
+            text: reply.text.clone(),
+            calls: vec![],
+        });
+        msgs.push(Msg::User(
+            "Do not explain how to do it — actually do it now. Use your tools \
+                 (write_file/edit_file/run_command) to make the changes. Begin immediately \
+                 with your first tool call."
+                .to_string(),
+        ));
+        return TextReply::Again;
+    }
+    if let Some(input) = auto_create_file_input(task_for_recovery) {
+        // Record this harness recovery in the transcript so saved and
+        // resumed sessions aren't missing turns.
+        msgs.push(Msg::Assistant {
+            text: reply.text.clone(),
+            calls: vec![],
+        });
+        if let Some(reason) = hook_gate(perm, "write_file", &input, cwd) {
+            report::tool_denied(&reason);
+            msgs.push(Msg::User(format!(
+                "[harness] write_file recovery blocked: {reason}"
+            )));
+            return TextReply::Done(Err(reason));
+        }
+        report::tool_call("write_file", &tools::preview("write_file", &input), &input);
+        trace_tool_call("write_file", &input, "build", depth);
+        let mut out = tools::run("write_file", &input, cwd);
+        post_tool_hooks("write_file", &input, &mut out, cwd);
+        report::tool_result("write_file", &out.content, out.is_error);
+        trace_tool_result("write_file", &out.content, out.is_error, "build", depth);
+        if out.is_error {
+            msgs.push(Msg::User(format!(
+                "[harness] write_file recovery failed: {}",
+                out.content
+            )));
+            return TextReply::Done(Err(out.content));
+        }
+        msgs.push(Msg::User(format!(
+            "[harness] completed the explicit file creation with write_file: {}",
+            out.content
+        )));
+        return TextReply::Done(Ok(format!(
+                "{}\n\nCompleted the explicit file creation task after the model returned prose without tool calls.",
+                out.content
+            )));
+    }
+    if let Some(input) = auto_static_artifact_input(task_for_recovery, &reply.text) {
+        msgs.push(Msg::Assistant {
+            text: reply.text.clone(),
+            calls: vec![],
+        });
+        if let Some(reason) = hook_gate(perm, "Artifact", &input, cwd) {
+            report::tool_denied(&reason);
+            msgs.push(Msg::User(format!(
+                "[harness] Artifact recovery blocked: {reason}"
+            )));
+            return TextReply::Done(Err(reason));
+        }
+        report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
+        trace_tool_call("Artifact", &input, "build", depth);
+        let mut out = tools::run("Artifact", &input, cwd);
+        post_tool_hooks("Artifact", &input, &mut out, cwd);
+        report::tool_result("Artifact", &out.content, out.is_error);
+        trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
+        if out.is_error {
+            // Tell the model exactly why the artifact was rejected and
+            // let it fix and re-publish; fail honestly once bounded
+            // recovery attempts run out.
+            if st.artifact_error_count < 2 {
+                st.artifact_error_count += 1;
+                msgs.push(Msg::User(format!(
+                    "The HTML artifact you wrote in plain text was rejected: {}. \
+                         Fix that problem and re-publish: call Artifact/publish_artifact with one \
+                         complete self-contained HTML file. Do not answer with markdown code.",
+                    out.content
+                )));
+                return TextReply::Again;
+            }
+            return TextReply::Done(Err(format!(
+                "artifact publishing failed after {} recovery attempts; last rejection: {}",
+                st.artifact_error_count, out.content
+            )));
+        }
+        return TextReply::Done(Ok(out.content));
+    }
+    if static_artifact_requested(task_for_recovery) {
+        msgs.push(Msg::Assistant {
+            text: reply.text.clone(),
+            calls: vec![],
+        });
+        if st.static_artifact_recovery_count < 2 {
+            st.static_artifact_recovery_count += 1;
+            msgs.push(Msg::User(static_artifact_recovery_prompt(
+                task_for_recovery,
+            )));
+            return TextReply::Again;
+        }
+        // No fabricated fallback artifact: report the failure honestly.
+        return TextReply::Done(Err(format!(
+            "the model did not produce a runnable web artifact after \
+                 {} recovery prompts; its last response was:\n{}",
+            st.static_artifact_recovery_count, reply.text
+        )));
+    }
+    msgs.push(Msg::Assistant {
+        text: reply.text.clone(),
+        calls: vec![],
+    });
+    if depth == 0 {
+        if let Some(note) = unrun_call_note(st.last_unrun.as_deref(), &reply.text, defs) {
+            report::notice(&note);
+            stopped_short(Outcome::Failed);
+        }
+        report::refused_this_turn();
+    }
+    TextReply::Done(Ok(reply.text))
+}
+
+/// What one BUILD turn tracks across its steps.
+#[derive(Default)]
+struct TurnState {
+    /// Files read this turn, for read-before-write.
+    read_paths: std::collections::HashSet<PathBuf>,
+    loop_guard: ToolLoopGuard,
+    artifact_error_count: usize,
+    static_artifact_recovery_count: usize,
+    empty_reply_retried: bool,
+    malformed_markup_retried: bool,
+    token_limit_continuations: usize,
+    forced_compact_retry: bool,
+    verifier_fix_rounds: usize,
+    /// Act-don't-explain: nudges spent, whether any call reached dispatch,
+    /// and whether a mutating tool actually ran.
+    act_nudges: usize,
+    any_tool_ran: bool,
+    mutating_tool_ran: bool,
+    /// Executed calls and touched files, for the verifier pass.
+    tool_records: Vec<crate::verifier::ToolCallRecord>,
+    changed_files: Vec<String>,
+    /// check_work: whether the model ran it, its last verdict, and how often
+    /// the harness ran it on the model's behalf.
+    check_work_called: bool,
+    check_work_passed: Option<bool>,
+    auto_check_rounds: usize,
+    /// The first call of the last tool round that never ran (unknown tool,
+    /// invalid or missing arguments): ending on text after one is not success.
+    last_unrun: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_turn(
     p: &Provider,
@@ -1803,32 +2013,7 @@ fn build_turn(
         crate::session::save(sid, cwd, &p.model, msgs);
     }
 
-    // Track which files have been read this session so we can enforce read-before-write.
-    let mut read_paths: std::collections::HashSet<PathBuf> = Default::default();
-    let mut loop_guard = ToolLoopGuard::default();
-    let mut artifact_error_count = 0usize;
-    let mut static_artifact_recovery_count = 0usize;
-    let mut empty_reply_retried = false;
-    let mut malformed_markup_retried = false;
-    let mut token_limit_continuations = 0usize;
-    let mut forced_compact_retry = false;
-    let mut verifier_fix_rounds = 0usize;
-    // Act-don't-explain tracking: whether any call reached dispatch, whether a
-    // mutating tool actually executed, and how many nudges were spent.
-    let mut act_nudges = 0usize;
-    let mut any_tool_ran = false;
-    let mut mutating_tool_ran = false;
-    // Executed calls and touched files, collected for the verifier pass.
-    let mut tool_records: Vec<crate::verifier::ToolCallRecord> = Vec::new();
-    let mut changed_files: Vec<String> = Vec::new();
-    // check_work enforcement: whether the model ran it, the last verdict, and
-    // whether the harness already ran it once on its behalf.
-    let mut check_work_called = false;
-    let mut check_work_passed: Option<bool> = None;
-    let mut auto_check_rounds = 0usize;
-    // The first call in the last tool round that never ran (unknown tool,
-    // invalid or missing arguments): ending on text after one is not success.
-    let mut last_unrun: Option<String> = None;
+    let mut st = TurnState::default();
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -1854,10 +2039,10 @@ fn build_turn(
                 }
                 // A context-overflow rejection is recoverable: force-compact the
                 // transcript and retry once instead of dying.
-                if !forced_compact_retry
+                if !st.forced_compact_retry
                     && (lower.contains("prompt is too long") || lower.contains("context length"))
                 {
-                    forced_compact_retry = true;
+                    st.forced_compact_retry = true;
                     // Compaction keeps the system prompt and the newest
                     // message: with nothing in between to shrink, the same
                     // request would only be sent again.
@@ -1882,9 +2067,9 @@ fn build_turn(
         // it) may be incomplete — ask the model to continue instead of acting
         // on or returning a cut-off result. Bounded to avoid loops.
         if reply_truncated_at_token_limit(&reply)
-            && token_limit_continuations < MAX_TOKEN_LIMIT_CONTINUATIONS
+            && st.token_limit_continuations < MAX_TOKEN_LIMIT_CONTINUATIONS
         {
-            token_limit_continuations += 1;
+            st.token_limit_continuations += 1;
             report::notice(
                 "  ⚠ output truncated at the token limit — asking the model to continue",
             );
@@ -1911,8 +2096,8 @@ fn build_turn(
         // but emitted broken JSON inside the tags. Reprompting once turns a
         // garbage "final answer" into a corrected call; bounded so a model
         // that can't produce valid JSON still terminates.
-        if malformed_tool_markup(&reply) && !malformed_markup_retried {
-            malformed_markup_retried = true;
+        if malformed_tool_markup(&reply) && !st.malformed_markup_retried {
+            st.malformed_markup_retried = true;
             report::notice("  ⚠ tool-call markup didn't parse — asking the model to re-emit it");
             trace::record_visible(
                 "tool_input_repaired",
@@ -1933,160 +2118,19 @@ fn build_turn(
             continue;
         }
         if reply.calls.is_empty() {
-            // One empty response is retried before ending the run; a second
-            // empty response ends it.
-            if reply.text.trim().is_empty() {
-                // No assistant turn is recorded here: an empty assistant
-                // message would serialize to an empty content array (API 400).
-                if !empty_reply_retried {
-                    empty_reply_retried = true;
-                    report::notice("  ⚠ model returned no output — asking it to continue");
-                    msgs.push(Msg::User(
-                        "You returned no output. Continue the task: call a tool or state your final answer."
-                            .to_string(),
-                    ));
-                    continue;
-                }
-                report::notice("  ⚠ model returned no output");
-                if depth == 0 && (!any_tool_ran || last_unrun.is_some()) {
-                    stopped_short(Outcome::Failed);
-                }
-                return Ok(reply.text);
+            match on_text_reply(
+                &mut st,
+                reply,
+                &task_for_recovery,
+                msgs,
+                perm,
+                cwd,
+                depth,
+                &defs,
+            ) {
+                TextReply::Again => continue,
+                TextReply::Done(r) => return r,
             }
-            // Imperative task answered with how-to prose instead of tool
-            // calls: tell the model to act, bounded per task. Never fires
-            // once a mutating tool has run (that prose is a real summary),
-            // nor in a review, whose answer is prose by design (the diff in
-            // its task reads as an order to change things).
-            if !REVIEWING.load(Ordering::Relaxed)
-                && should_nudge_to_act(
-                    &task_for_recovery,
-                    &reply.text,
-                    any_tool_ran,
-                    mutating_tool_ran,
-                    act_nudges,
-                )
-            {
-                act_nudges += 1;
-                report::notice("  ⟳ model explained instead of acting — nudging it to use tools");
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
-                msgs.push(Msg::User(
-                    "Do not explain how to do it — actually do it now. Use your tools \
-                     (write_file/edit_file/run_command) to make the changes. Begin immediately \
-                     with your first tool call."
-                        .to_string(),
-                ));
-                continue;
-            }
-            if let Some(input) = auto_create_file_input(&task_for_recovery) {
-                // Record this harness recovery in the transcript so saved and
-                // resumed sessions aren't missing turns.
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
-                if let Some(reason) = hook_gate(perm, "write_file", &input, cwd) {
-                    report::tool_denied(&reason);
-                    msgs.push(Msg::User(format!(
-                        "[harness] write_file recovery blocked: {reason}"
-                    )));
-                    return Err(reason);
-                }
-                report::tool_call("write_file", &tools::preview("write_file", &input), &input);
-                trace_tool_call("write_file", &input, "build", depth);
-                let mut out = tools::run("write_file", &input, cwd);
-                post_tool_hooks("write_file", &input, &mut out, cwd);
-                report::tool_result("write_file", &out.content, out.is_error);
-                trace_tool_result("write_file", &out.content, out.is_error, "build", depth);
-                if out.is_error {
-                    msgs.push(Msg::User(format!(
-                        "[harness] write_file recovery failed: {}",
-                        out.content
-                    )));
-                    return Err(out.content);
-                }
-                msgs.push(Msg::User(format!(
-                    "[harness] completed the explicit file creation with write_file: {}",
-                    out.content
-                )));
-                return Ok(format!(
-                    "{}\n\nCompleted the explicit file creation task after the model returned prose without tool calls.",
-                    out.content
-                ));
-            }
-            if let Some(input) = auto_static_artifact_input(&task_for_recovery, &reply.text) {
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
-                if let Some(reason) = hook_gate(perm, "Artifact", &input, cwd) {
-                    report::tool_denied(&reason);
-                    msgs.push(Msg::User(format!(
-                        "[harness] Artifact recovery blocked: {reason}"
-                    )));
-                    return Err(reason);
-                }
-                report::tool_call("Artifact", &tools::preview("Artifact", &input), &input);
-                trace_tool_call("Artifact", &input, "build", depth);
-                let mut out = tools::run("Artifact", &input, cwd);
-                post_tool_hooks("Artifact", &input, &mut out, cwd);
-                report::tool_result("Artifact", &out.content, out.is_error);
-                trace_tool_result("Artifact", &out.content, out.is_error, "build", depth);
-                if out.is_error {
-                    // Tell the model exactly why the artifact was rejected and
-                    // let it fix and re-publish; fail honestly once bounded
-                    // recovery attempts run out.
-                    if artifact_error_count < 2 {
-                        artifact_error_count += 1;
-                        msgs.push(Msg::User(format!(
-                            "The HTML artifact you wrote in plain text was rejected: {}. \
-                             Fix that problem and re-publish: call Artifact/publish_artifact with one \
-                             complete self-contained HTML file. Do not answer with markdown code.",
-                            out.content
-                        )));
-                        continue;
-                    }
-                    return Err(format!(
-                        "artifact publishing failed after {artifact_error_count} recovery attempts; last rejection: {}",
-                        out.content
-                    ));
-                }
-                return Ok(out.content);
-            }
-            if static_artifact_requested(&task_for_recovery) {
-                msgs.push(Msg::Assistant {
-                    text: reply.text.clone(),
-                    calls: vec![],
-                });
-                if static_artifact_recovery_count < 2 {
-                    static_artifact_recovery_count += 1;
-                    msgs.push(Msg::User(static_artifact_recovery_prompt(
-                        &task_for_recovery,
-                    )));
-                    continue;
-                }
-                // No fabricated fallback artifact: report the failure honestly.
-                return Err(format!(
-                    "the model did not produce a runnable web artifact after \
-                     {static_artifact_recovery_count} recovery prompts; its last response was:\n{}",
-                    reply.text
-                ));
-            }
-            msgs.push(Msg::Assistant {
-                text: reply.text.clone(),
-                calls: vec![],
-            });
-            if depth == 0 {
-                if let Some(note) = unrun_call_note(last_unrun.as_deref(), &reply.text, &defs) {
-                    report::notice(&note);
-                    stopped_short(Outcome::Failed);
-                }
-                report::refused_this_turn();
-            }
-            return Ok(reply.text);
         }
 
         let mut results = Vec::new();
@@ -2117,7 +2161,7 @@ fn build_turn(
                 round_unrun.get_or_insert_with(|| format!("{} (invalid arguments)", call.name));
                 report::tool_denied(&msg);
                 note_loop_result(
-                    &mut loop_guard,
+                    &mut st.loop_guard,
                     &call.name,
                     &call.input,
                     &msg,
@@ -2143,7 +2187,7 @@ fn build_turn(
             if let Some((shown, told)) = refusal {
                 report::tool_denied(&shown);
                 note_loop_result(
-                    &mut loop_guard,
+                    &mut st.loop_guard,
                     &call.name,
                     &call.input,
                     &told,
@@ -2167,7 +2211,7 @@ fn build_turn(
                 depth,
                 &task_for_recovery,
             );
-            any_tool_ran = true;
+            st.any_tool_ran = true;
             report::tool_call(
                 &call.name,
                 &tools::preview(&call.name, &call_input),
@@ -2180,7 +2224,7 @@ fn build_turn(
                 report::tool_result(&call.name, &answer, is_error);
                 trace_tool_result(&call.name, &answer, is_error, "build", depth);
                 note_loop_result(
-                    &mut loop_guard,
+                    &mut st.loop_guard,
                     &call.name,
                     &call_input,
                     &answer,
@@ -2241,7 +2285,7 @@ fn build_turn(
                 // could approve leave the work as it is, unverified, and the
                 // automatic round would only be refused again.
                 let reason = if checks_unapproved {
-                    check_work_called = true;
+                    st.check_work_called = true;
                     report::notice(&format!("  {CHECKS_NOT_RUN}"));
                     format!(
                         "{reason} — the project's {CHECKS_NOT_RUN}. Do not retry them; \
@@ -2262,7 +2306,7 @@ fn build_turn(
                     reason
                 };
                 note_loop_result(
-                    &mut loop_guard,
+                    &mut st.loop_guard,
                     &call.name,
                     &call_input,
                     &reason,
@@ -2281,19 +2325,19 @@ fn build_turn(
 
             // Record reads so we can enforce read-before-write below.
             if let Some(p) = tools::read_tracking_path(&call.name, &call_input, cwd) {
-                read_paths.insert(p);
+                st.read_paths.insert(p);
             }
 
             // Require the model to read a file before overwriting or patching it.
             if let Some(p) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
-                if p.exists() && !read_paths.contains(&p) {
+                if p.exists() && !st.read_paths.contains(&p) {
                     let msg = format!(
                         "read('{}') required before editing or deleting existing file. Read the file first, then retry.",
                         p.display()
                     );
                     report::tool_denied(&msg);
                     note_loop_result(
-                        &mut loop_guard,
+                        &mut st.loop_guard,
                         &call.name,
                         &call_input,
                         &msg,
@@ -2313,7 +2357,7 @@ fn build_turn(
 
             if matches!(call.name.as_str(), "task" | "spawn_subagent") {
                 // A subagent can mutate the workspace — count it as action.
-                mutating_tool_ran = true;
+                st.mutating_tool_ran = true;
                 if let Some(spec) = side_by_side {
                     waiting.push(WaitingHelper {
                         slot: results.len(),
@@ -2357,7 +2401,7 @@ fn build_turn(
             }
 
             if tools::is_mutating_call(&call.name, &call_input) {
-                mutating_tool_ran = true;
+                st.mutating_tool_ran = true;
             }
             let mut out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
             post_tool_hooks(&call.name, &call_input, &mut out, cwd);
@@ -2373,14 +2417,14 @@ fn build_turn(
             report::tool_result(&call.name, &out.content, out.is_error);
             trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
             if call.name == "check_work" {
-                check_work_called = true;
+                st.check_work_called = true;
                 if !check_work_found_no_project(&out.content) {
-                    check_work_passed = Some(!out.is_error);
+                    st.check_work_passed = Some(!out.is_error);
                 }
             }
             // Feed the verifier real data: every executed call, and the files
             // touched by successful write/edit tools.
-            tool_records.push(crate::verifier::ToolCallRecord {
+            st.tool_records.push(crate::verifier::ToolCallRecord {
                 tool_name: call.name.clone(),
                 args_summary: tools::preview(&call.name, &call_input),
                 result_preview: out.content.chars().take(200).collect(),
@@ -2389,8 +2433,8 @@ fn build_turn(
             if !out.is_error {
                 if let Some(pb) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
                     let path = pb.display().to_string();
-                    if !changed_files.contains(&path) {
-                        changed_files.push(path);
+                    if !st.changed_files.contains(&path) {
+                        st.changed_files.push(path);
                     }
                 }
             }
@@ -2402,8 +2446,8 @@ fn build_turn(
                 // No fabricated fallback artifact: tell the model exactly why
                 // publishing was rejected and ask it to fix and re-publish;
                 // fail honestly after bounded recovery attempts.
-                artifact_error_count += 1;
-                if artifact_error_count <= 2 {
+                st.artifact_error_count += 1;
+                if st.artifact_error_count <= 2 {
                     artifact_recovery = Some(format!(
                         "Your artifact was rejected: {}. Fix that exact problem and call \
                          Artifact/publish_artifact again with one complete self-contained HTML file \
@@ -2412,9 +2456,9 @@ fn build_turn(
                     ));
                 } else {
                     loop_stop = Some(format!(
-                        "artifact publishing failed after {artifact_error_count} attempts; \
+                        "artifact publishing failed after {} attempts; \
                          last rejection: {}",
-                        out.content
+                        st.artifact_error_count, out.content
                     ));
                 }
             }
@@ -2426,7 +2470,7 @@ fn build_turn(
                 summary = Some(out.content.clone());
             } else {
                 note_loop_result(
-                    &mut loop_guard,
+                    &mut st.loop_guard,
                     &call.name,
                     &call_input,
                     &out.content,
@@ -2451,7 +2495,7 @@ fn build_turn(
             calls: reply.calls,
         });
         msgs.push(Msg::Tool(results));
-        last_unrun = round_unrun;
+        st.last_unrun = round_unrun;
         // Persist the transcript after every tool round so a crash or kill
         // doesn't lose the session (save is cheap and swallows I/O errors).
         if let Some(sid) = sid {
@@ -2476,11 +2520,11 @@ fn build_turn(
             if should_auto_check_work(
                 perm,
                 depth,
-                changed_files.len(),
-                check_work_called,
-                auto_check_rounds,
+                st.changed_files.len(),
+                st.check_work_called,
+                st.auto_check_rounds,
             ) {
-                auto_check_rounds += 1;
+                st.auto_check_rounds += 1;
                 let input = serde_json::json!({});
                 report::notice(
                     "  ⟳ finish called without check_work — running the project's checks",
@@ -2513,14 +2557,14 @@ fn build_turn(
                     .map_or("skipped: denied by the permission gate", |o| {
                         o.content.as_str()
                     });
-                tool_records.push(crate::verifier::ToolCallRecord {
+                st.tool_records.push(crate::verifier::ToolCallRecord {
                     tool_name: "check_work".into(),
                     args_summary: tools::preview("check_work", &input),
                     result_preview: preview.chars().take(200).collect(),
                     timestamp: String::new(),
                 });
                 if let Some(out) = out.filter(|o| !check_work_found_no_project(&o.content)) {
-                    check_work_passed = Some(!out.is_error);
+                    st.check_work_passed = Some(!out.is_error);
                     if out.is_error {
                         msgs.push(Msg::User(format!(
                             "[harness] You called finish without running check_work, so it ran \
@@ -2532,7 +2576,7 @@ fn build_turn(
                     }
                 }
             }
-            let s = if auto_check_rounds > 0 && check_work_passed == Some(false) {
+            let s = if st.auto_check_rounds > 0 && st.check_work_passed == Some(false) {
                 report::notice("  ⚠ check_work failed — finishing anyway; see the report above");
                 format!(
                     "{s}\n\n[check_work note] The project's checks still fail after the \
@@ -2545,9 +2589,9 @@ fn build_turn(
                 let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
                 let ctx = crate::verifier::VerificationContext {
                     task_description: task.to_string(),
-                    changed_files: changed_files.clone(),
-                    tool_calls: tool_records.clone(),
-                    tests_passed: check_work_passed,
+                    changed_files: st.changed_files.clone(),
+                    tool_calls: st.tool_records.clone(),
+                    tests_passed: st.check_work_passed,
                     ..Default::default()
                 };
                 let rep = verifier.verify(&ctx);
@@ -2558,11 +2602,11 @@ fn build_turn(
                 match rep.status {
                     crate::verifier::VerificationStatus::Blocked
                     | crate::verifier::VerificationStatus::Failed
-                        if verifier_fix_rounds < MAX_VERIFIER_FIX_ROUNDS =>
+                        if st.verifier_fix_rounds < MAX_VERIFIER_FIX_ROUNDS =>
                     {
                         // Give the model a chance to address the violations
                         // before finishing.
-                        verifier_fix_rounds += 1;
+                        st.verifier_fix_rounds += 1;
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
                         report::notice(&format!(
@@ -2585,14 +2629,14 @@ fn build_turn(
                         let violations =
                             crate::rules::RuleEngine::format_violations(&rep.rule_violations);
                         report::notice(&format!("  ⚠ verification {}", rep.status.label()));
-                        if check_work_passed == Some(false) {
+                        if st.check_work_passed == Some(false) {
                             stopped_short(Outcome::CheckWorkFailed);
                         }
                         stopped_short(Outcome::VerificationFailed);
                         return Ok(format!(
                             "{s}\n\n[verification note] The verifier still reports `{}` after \
-                             {verifier_fix_rounds} fix attempts:\n{violations}",
-                            rep.status
+                             {} fix attempts:\n{violations}",
+                            rep.status, st.verifier_fix_rounds
                         ));
                     }
                     crate::verifier::VerificationStatus::PassedWithWarnings => {
@@ -2607,7 +2651,7 @@ fn build_turn(
                 }
                 // The last check_work verdict stands: finishing over failing
                 // checks is not a success.
-                if check_work_passed == Some(false) {
+                if st.check_work_passed == Some(false) {
                     stopped_short(Outcome::CheckWorkFailed);
                 }
             }

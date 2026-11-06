@@ -1540,6 +1540,45 @@ fn headless_brainstorm_sends_attached_image() {
     );
 }
 
+// A BUILD step with no tool calls: one empty reply is retried with a
+// prompt to go on; prose answering an explicit file-creation task is
+// finished with write_file on the model's behalf.
+#[test]
+fn an_empty_reply_is_retried_once() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![text(""), text("All set.")]);
+    write_config(&home, "llamacpp", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "run", "say hello"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2, "stderr: {}", r.stderr);
+    assert!(posts[1].contains("You returned no output"), "{}", posts[1]);
+}
+
+#[test]
+fn prose_for_an_explicit_file_task_is_finished_with_write_file() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // Prose three times: the two nudges to act come first.
+    let prose = text("You could create it with an editor.");
+    let (port, posts) = serve_recording(vec![prose.clone(), prose.clone(), prose]);
+    write_config(&home, "llamacpp", "auto", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "run", "create notes.txt containing hello world"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(posts.lock().unwrap().len(), 3);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("notes.txt"))
+            .unwrap()
+            .trim(),
+        "hello world"
+    );
+}
+
 // Native Windows sets USERPROFILE and no HOME. `@~/file` must still find the
 // home folder: 0.16.0 resolved it against the working folder and sent the
 // token as typed.
