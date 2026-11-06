@@ -1927,23 +1927,7 @@ fn write_text(path: &Path, contents: &str) -> std::io::Result<()> {
 // replace-by-rename would silently strip an executable bit from a script
 // the agent edits.
 fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(format!(".bwn-tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    fs::write(&tmp, contents)?;
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    crate::config::atomic_write(path, contents.as_ref(), crate::config::Perm::KeepExisting)
 }
 
 pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {

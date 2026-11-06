@@ -3217,29 +3217,78 @@ pub(crate) fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// Atomic write for user data (settings, keys, memory, history): temp file in
-// the same directory, then rename — a crash mid-save can never truncate the
-// file it replaces. With `restricted`, permissions are tightened on the TEMP
-// file, so a secrets file is never visible at its real name with default
-// (world-readable) permissions, even for an instant.
-fn write_atomic(path: &std::path::Path, contents: &str, restricted: bool) -> bool {
-    let mut name = match path.file_name() {
-        Some(n) => n.to_os_string(),
-        None => return false,
-    };
-    name.push(format!(".tmp-{}", std::process::id()));
+/// The permissions `atomic_write` gives the file it writes.
+#[derive(Clone, Copy)]
+pub(crate) enum Perm {
+    /// Whatever a new file gets.
+    Default,
+    /// The replaced file's own permissions, so an edit never strips a
+    /// script's executable bit.
+    KeepExisting,
+    /// Owner-only: 0600, or an ACL for the current user alone on Windows.
+    Private,
+    /// This Unix mode (ignored elsewhere); failing to set it fails the write.
+    Mode(u32),
+}
+
+/// Writes `contents` to `path` through a temp file in the same folder and a
+/// rename, so a crash mid-write never leaves a truncated file. Permissions
+/// are set on the temp file, so a secrets file is never visible at its real
+/// name with default permissions, even for an instant. The temp name is
+/// unique per process and per call, and a failed write removes it.
+pub(crate) fn atomic_write(
+    path: &std::path::Path,
+    contents: &[u8],
+    perm: Perm,
+) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_os_string();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    name.push(format!(".bwn-tmp-{}-{seq}", std::process::id()));
     let tmp = path.with_file_name(name);
-    if fs::write(&tmp, contents).is_err() {
-        return false;
-    }
-    if restricted {
-        restrict(&tmp);
-    }
-    if fs::rename(&tmp, path).is_err() {
+    fs::write(&tmp, contents)?;
+    let set = match perm {
+        Perm::Default => Ok(()),
+        Perm::KeepExisting => {
+            if let Ok(meta) = fs::metadata(path) {
+                let _ = fs::set_permissions(&tmp, meta.permissions());
+            }
+            Ok(())
+        }
+        Perm::Private => {
+            restrict(&tmp);
+            Ok(())
+        }
+        Perm::Mode(mode) => set_mode(&tmp, mode),
+    };
+    set.and_then(|()| fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    true
+    })
+}
+
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+// Atomic write for user data (settings, keys, memory, history); `restricted`
+// makes it owner-only. See `atomic_write`.
+fn write_atomic(path: &std::path::Path, contents: &str, restricted: bool) -> bool {
+    let perm = if restricted {
+        Perm::Private
+    } else {
+        Perm::Default
+    };
+    atomic_write(path, contents.as_bytes(), perm).is_ok()
 }
 
 #[cfg(unix)]
@@ -3321,6 +3370,50 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
+
+    fn atomic_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-atomic-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_when_the_rename_fails() {
+        let d = atomic_dir("fail");
+        // A folder at the target makes the rename fail on every platform.
+        let target = d.join("taken");
+        fs::create_dir(&target).unwrap();
+        assert!(atomic_write(&target, b"x", Perm::Default).is_err());
+        let left: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("taken")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_sets_the_permissions_it_is_asked_for() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = atomic_dir("perm");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let script = d.join("run.sh");
+        fs::write(&script, "old").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        atomic_write(&script, b"new", Perm::KeepExisting).unwrap();
+        assert_eq!(
+            (mode(&script), fs::read_to_string(&script).unwrap()),
+            (0o755, "new".into())
+        );
+        let secret = d.join("keys");
+        atomic_write(&secret, b"k", Perm::Private).unwrap();
+        assert_eq!(mode(&secret), 0o600);
+        let restored = d.join("restored");
+        atomic_write(&restored, b"r", Perm::Mode(0o640)).unwrap();
+        assert_eq!(mode(&restored), 0o640);
+    }
 
     // A word that names a specific model (as opposed to a family prefix or
     // a placeholder like "local-model").

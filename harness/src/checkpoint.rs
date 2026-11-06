@@ -635,38 +635,14 @@ fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    Ok(())
-}
-
 // Same-directory temp + rename; a crash mid-write never leaves a partial file.
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, contents, None)
 }
 
 fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    let mut name = match path.file_name() {
-        Some(n) => n.to_os_string(),
-        None => return Err(std::io::Error::other("path has no file name")),
-    };
-    name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    fs::write(&tmp, contents)?;
-    if let Some(m) = mode {
-        set_mode(&tmp, m).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
-    }
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    let perm = mode.map_or(crate::config::Perm::Default, crate::config::Perm::Mode);
+    crate::config::atomic_write(path, contents, perm)
 }
 
 /// Returns all recorded checkpoints for the given workspace directory, sorted newest first.

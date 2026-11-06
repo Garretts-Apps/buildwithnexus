@@ -201,16 +201,9 @@ fn write(s: &Session) -> bool {
     let Ok(text) = serde_json::to_string(s) else {
         return false;
     };
-    // Write-then-rename so a crash mid-save never truncates the previous
-    // session file. list() only picks up `.json` files, so the temp file
-    // is invisible even if a crash leaves it behind.
-    let path = path(&s.id);
-    let tmp = dir().join(format!("{}.json.tmp", s.id));
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-        return true;
-    }
-    let _ = std::fs::remove_file(&tmp);
-    false
+    // list() only picks up `.json` files, so the temp file is invisible
+    // even if a crash leaves it behind.
+    crate::config::atomic_write(&path(&s.id), text.as_bytes(), crate::config::Perm::Default).is_ok()
 }
 
 /// Names a saved session (/rename). The name replaces the first prompt in
