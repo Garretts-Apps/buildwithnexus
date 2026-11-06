@@ -95,10 +95,7 @@ fn too_wide(dir: &Path) -> Result<(), String> {
         ));
     }
     let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
-    let user_home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|h| !h.is_empty())
-        .map(|h| canon(PathBuf::from(h)));
+    let user_home = crate::config::user_home().map(canon);
     if user_home.as_deref().is_some_and(|h| h.starts_with(dir)) {
         return Err(format!(
             "{shown} is too wide to add: it holds your home folder — add the project folder instead"

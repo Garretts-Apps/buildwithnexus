@@ -1316,11 +1316,8 @@ pub fn pasted_media_path(text: &str) -> Option<std::path::PathBuf> {
         t = t.replace("\\ ", " ");
     }
     if let Some(rest) = t.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            t = std::path::PathBuf::from(home)
-                .join(rest)
-                .display()
-                .to_string();
+        if let Some(home) = crate::config::user_home() {
+            t = home.join(rest).display().to_string();
         }
     }
     let path = std::path::PathBuf::from(&t);

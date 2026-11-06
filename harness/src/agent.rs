@@ -1682,7 +1682,9 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
     // Identity leads every prompt — it is short and always worth the tokens.
     parts.push(persona());
 
-    let home_str = std::env::var("HOME").unwrap_or_default();
+    let home_str = crate::config::user_home()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
     let mut path_info = format!(
         "[Environment Paths]\n\
          Workspace (CWD): {}\n\
@@ -2764,8 +2766,8 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 fn path_matches(pattern: &str, path: &Path, cwd: &Path) -> bool {
     let pattern = pattern.trim().trim_start_matches("./");
     if let Some(rest) = pattern.strip_prefix("~/") {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
+        let home = crate::config::user_home()
+            .map(|h| h.to_string_lossy().into_owned())
             .unwrap_or_default();
         return !home.is_empty()
             && hooks::glob_match(

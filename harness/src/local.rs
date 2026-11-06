@@ -16,8 +16,7 @@ pub fn models_dir() -> PathBuf {
 // llama.cpp / LM Studio locations.
 fn gguf_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![models_dir()];
-    if let Ok(home) = std::env::var("HOME") {
-        let h = PathBuf::from(home);
+    if let Some(h) = crate::config::user_home() {
         dirs.push(h.join(".cache/lm-studio/models"));
         dirs.push(h.join(".lmstudio/models"));
         dirs.push(h.join(".local/share/models"));

@@ -609,10 +609,9 @@ pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("NEXUS_HOME") {
         return PathBuf::from(h);
     }
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join(".buildwithnexus")
+    user_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".buildwithnexus")
 }
 
 pub fn settings_path() -> PathBuf {
@@ -888,11 +887,13 @@ fn dir_names(dir: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn user_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .filter(|h| !h.is_empty())
+/// The user's home folder: `HOME`, else `USERPROFILE` (native Windows sets
+/// only the second). An empty value counts as unset. Every `~` in bwn goes
+/// through here, so one platform rule covers them all.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    set("HOME")
+        .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
 }
 

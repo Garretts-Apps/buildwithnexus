@@ -1920,7 +1920,6 @@ fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> 
 pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     // `~` expansion: $HOME, or %USERPROFILE% on Windows (where `~\x` is
     // also accepted).
-    let user_home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let tilde_rest = p.strip_prefix("~/").or_else(|| {
         if cfg!(windows) {
             p.strip_prefix("~\\")
@@ -1929,13 +1928,13 @@ pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
         }
     });
     if let Some(rest) = tilde_rest {
-        if let Some(home) = user_home() {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = crate::config::user_home() {
+            return home.join(rest);
         }
     }
     if p == "~" {
-        if let Some(home) = user_home() {
-            return PathBuf::from(home);
+        if let Some(home) = crate::config::user_home() {
+            return home;
         }
     }
     let path = Path::new(p);
@@ -3347,9 +3346,7 @@ fn is_script_command(p: &Path) -> bool {
 }
 
 fn command_sensitive_path_for(cmd: &str, cwd: &Path, windows: bool) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| h.to_string_lossy().into_owned());
+    let home = crate::config::user_home().map(|h| h.to_string_lossy().into_owned());
     for raw in cmd.split(|c: char| {
         c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`')
     }) {

@@ -1540,6 +1540,51 @@ fn headless_brainstorm_sends_attached_image() {
     );
 }
 
+// Native Windows sets USERPROFILE and no HOME. `@~/file` must still find the
+// home folder: 0.16.0 resolved it against the working folder and sent the
+// token as typed.
+#[test]
+fn a_tilde_attachment_uses_userprofile_when_home_is_unset() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let user = tmp("user");
+    std::fs::write(user.join("note.txt"), "text from the home folder").unwrap();
+    let (port, posts) = serve_recording(vec![text("ok")]);
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args([
+            "--json",
+            "--provider",
+            "custom",
+            "--base-url",
+            &format!("http://127.0.0.1:{port}/v1"),
+            "--model",
+            "m",
+            "run",
+            "summarize @~/note.txt",
+        ])
+        .env_remove("HOME")
+        .env("USERPROFILE", &user)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not found"), "stderr: {stderr}");
+    let posts = posts.lock().unwrap();
+    assert!(
+        posts
+            .first()
+            .is_some_and(|p| p.contains("text from the home folder")),
+        "stderr: {stderr}"
+    );
+}
+
 // ── corporate networks: a CONNECT proxy and a private CA ────────────────────
 // A throwaway CA, the PEM of its certificate, and a server config for a leaf
 // it signed for model.test and localhost — the shape of a TLS-inspecting

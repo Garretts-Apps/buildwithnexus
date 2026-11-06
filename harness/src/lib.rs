@@ -8194,16 +8194,7 @@ fn attach_word(
     }
     let (raw_path, range) = split_attachment_range(raw_path);
     let ext = raw_path.rsplit('.').next().unwrap_or("").to_lowercase();
-    let p = if let Some(rest) = raw_path.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| cwd.to_path_buf())
-            .join(rest)
-    } else if raw_path.starts_with('/') {
-        PathBuf::from(raw_path)
-    } else {
-        cwd.join(raw_path)
-    };
+    let p = tools::resolve(cwd, raw_path);
     // Credentials must never ride along in a prompt unnoticed; the
     // token stays as typed and nothing is read.
     if p.exists() && tools::is_sensitive(&p) {
