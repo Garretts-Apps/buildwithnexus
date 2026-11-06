@@ -4183,9 +4183,9 @@ fn line_range(input: &Value) -> Option<(usize, usize)> {
     }
 }
 
-fn apply_line_range(text: &str, range: Option<(usize, usize)>) -> String {
+fn apply_line_range(text: String, range: Option<(usize, usize)>) -> String {
     let Some((start, end)) = range else {
-        return text.to_string();
+        return text;
     };
     text.lines()
         .enumerate()
@@ -4337,21 +4337,23 @@ impl IgnoreRule {
         let Ok(rel) = path.strip_prefix(&self.base) else {
             return false;
         };
-        let names: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        if self.anchored {
-            ignore_parts_match(&self.parts, &names)
-        } else {
-            names.last().is_some_and(|n| ignore_glob(&self.parts[0], n))
+        if !self.anchored {
+            // Only the last name matters; this runs per rule per walked entry.
+            return rel
+                .file_name()
+                .is_some_and(|n| ignore_glob(&self.parts[0], &n.to_string_lossy()));
         }
+        let names: Vec<std::borrow::Cow<str>> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        ignore_parts_match(&self.parts, &names)
     }
 }
 
 // `**` matches any run of folders, including none. Like ignore_glob, one
 // pass that backtracks only to the last `**`.
-fn ignore_parts_match(pat: &[String], names: &[String]) -> bool {
+fn ignore_parts_match<S: AsRef<str>>(pat: &[String], names: &[S]) -> bool {
     let (mut pi, mut ni) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while ni < names.len() {
@@ -4360,7 +4362,7 @@ fn ignore_parts_match(pat: &[String], names: &[String]) -> bool {
                 star = Some((pi, ni));
                 pi += 1;
             }
-            Some(p) if ignore_glob(p, &names[ni]) => {
+            Some(p) if ignore_glob(p, names[ni].as_ref()) => {
                 pi += 1;
                 ni += 1;
             }
@@ -4440,6 +4442,16 @@ fn glob_char(p: &[char], pi: usize, c: char) -> Option<usize> {
     }
 }
 
+// (is folder, is file) for a walked entry. The directory listing already
+// knows the type, so only a symlink costs a stat (to follow it, as the walk
+// always has).
+fn entry_kind(entry: &fs::DirEntry, path: &Path) -> (bool, bool) {
+    match entry.file_type() {
+        Ok(t) if !t.is_symlink() => (t.is_dir(), t.is_file()),
+        _ => (path.is_dir(), path.is_file()),
+    }
+}
+
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
     collect_files_in(root, &Ignores::for_root(root), out, seen);
 }
@@ -4456,14 +4468,15 @@ fn collect_files_in(root: &Path, ignores: &Ignores, out: &mut Vec<PathBuf>, seen
             break;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let (is_dir, is_file) = entry_kind(&entry, &path);
+        if is_dir {
             if !skip_dir(&path) && !ignores.ignored(&path, true) {
                 match ignores.with_dir(&path) {
                     Some(inner) => collect_files_in(&path, &inner, out, seen),
                     None => collect_files_in(&path, ignores, out, seen),
                 }
             }
-        } else if path.is_file() && !is_sensitive(&path) && !ignores.ignored(&path, false) {
+        } else if is_file && !is_sensitive(&path) && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
@@ -4493,7 +4506,8 @@ fn collect_paths_in(
             break;
         }
         let path = entry.path();
-        if path.is_dir() {
+        let (is_dir, is_file) = entry_kind(&entry, &path);
+        if is_dir {
             if skip_dir(&path) || ignores.ignored(&path, true) {
                 continue;
             }
@@ -4505,7 +4519,7 @@ fn collect_paths_in(
                 Some(inner) => collect_paths_in(&path, &inner, out, seen, dirs, files),
                 None => collect_paths_in(&path, ignores, out, seen, dirs, files),
             }
-        } else if files && path.is_file() && !ignores.ignored(&path, false) {
+        } else if files && is_file && !ignores.ignored(&path, false) {
             *seen += 1;
             out.push(path);
         }
@@ -5957,7 +5971,7 @@ fn read_pdf(p: &Path, input: &Value) -> Option<Outcome> {
             p.display()
         )),
         Ok(cap) if cap.code == Some(0) => ok(truncate_read(
-            apply_line_range(&cap.stdout, line_range(input)),
+            apply_line_range(cap.stdout, line_range(input)),
             MAX_READ,
         )),
         Ok(cap) => err(format!(
@@ -6154,10 +6168,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 return out;
             }
             match read_text(&p) {
-                Ok(c) => ok(truncate_read(
-                    apply_line_range(&c, line_range(input)),
-                    MAX_READ,
-                )),
+                Ok(c) => ok(truncate_read(apply_line_range(c, line_range(input)), MAX_READ)),
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::InvalidData => err(format!(
                         "cannot read {}: contents are not valid UTF-8 — this looks like a binary file. Do not retry read_file; use run_command with a targeted extractor instead (e.g. `file`, `strings`, `xxd | head`, or a format-specific CLI).",
@@ -7003,12 +7014,12 @@ fn run_grep(input: &Value, cwd: &Path) -> Outcome {
             continue;
         };
         for (idx, line) in text.lines().enumerate() {
-            let haystack = if case_sensitive {
-                line.to_string()
+            let hit = if case_sensitive {
+                line.contains(needle.as_str())
             } else {
-                line.to_lowercase()
+                line.to_lowercase().contains(&needle)
             };
-            if haystack.contains(&needle) {
+            if hit {
                 // Keep counting past the limit so the cap header can
                 // report how much was left out.
                 total += 1;
