@@ -6,11 +6,9 @@
 An **agentic AI CLI** written in Rust. The native binary starts in about 2 ms (`--version`, [measured](BENCHMARKS.md)). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
 commands. By default it asks before each change; accept-edits, auto and
-readonly modes let you choose. One self-contained binary, 10 direct
-dependencies, no runtime to babysit — and a terminal UI built to feel
-instant: an incremental wrap cache with atomic frames, live autocomplete,
-GitHub-grade diffs, clickable files and links, and multimodal input straight
-from your clipboard.
+readonly modes let you choose. It ships as one self-contained binary with
+10 direct dependencies. The terminal UI has live autocomplete, inline diffs,
+clickable files and links, and image paste from the clipboard.
 
 ```bash
 npm install -g buildwithnexus     # fetches the checksum-verified binary on first run
@@ -68,8 +66,6 @@ alone. On Windows the folder is `%USERPROFILE%\.buildwithnexus`.
 
 ## Try it in a sandbox
 
-Want to kick the tires without touching your machine?
-
 **GitHub Codespaces — one click, in the browser.**
 [Open a codespace on this repo](https://codespaces.new/Garretts-Apps/buildwithnexus?quickstart=1)
 — the devcontainer preinstalls the binary, so when the terminal appears just
@@ -85,24 +81,24 @@ docker run -it --rm -e BWN_ALLOW_BOOTSTRAP=1 -e ANTHROPIC_API_KEY \
 ```
 
 Drop `--rm` to keep the sandbox between runs, or add `-v "$PWD":/work -w /work`
-once you're ready to let it loose on a real project.
+to let it work on the current folder.
 
 ## The TUI
 
-- **Instant startup, never a black frame** — chrome paints before anything
+- **Startup** — chrome paints before anything
   else; dependency probes and connection warming run off the critical path.
 - **Fast rendering** — each transcript line is wrapped once, repaints are
   frame-coalesced (~60fps) and wrapped in synchronized-output brackets, so
-  streaming is smooth on kitty/iTerm2/WezTerm/Alacritty with zero tearing.
+  streaming does not tear on kitty/iTerm2/WezTerm/Alacritty.
 - **Live autocomplete** — type `/` for a command popup with descriptions;
   `@` completes files, `kb:` symbols. ↑/↓ navigate, Tab/Enter accept.
-- **Clean diffs** — line-number gutters, background-tinted rows, changed-span
+- **Diffs** — line-number gutters, background-tinted rows, changed-span
   highlighting, hunk elision. Same renderer for previews and applied
   changes.
-- **Clickable everything** — file paths and links are OSC 8 hyperlinks: click
+- **Clickable paths and links** — file paths and links are OSC 8 hyperlinks: click
   a path in an edit header and it opens in your OS default app.
-- **Images you can actually see** — `Ctrl+V` pastes a clipboard screenshot
-  and it appears *right there in the transcript* before you send it: at real
+- **Inline images** — `Ctrl+V` pastes a clipboard screenshot
+  and it appears in the transcript before you send it: at real
   pixel resolution on kitty, Ghostty and WezTerm (kitty graphics protocol,
   Unicode placeholders — works through tmux), over Sixel on Windows
   Terminal 1.22+, foot, mlterm and xterm, as half-block art everywhere else.
@@ -110,18 +106,18 @@ once you're ready to let it loose on a real project.
   `@attachment` with the same preview. `@clip.mp4` runs ffmpeg to sample
   frames + metadata for vision models (text-only models get a clear "not
   multimodal" notice instead of silent drops).
-- **Code that looks like code** — fenced blocks are syntax-highlighted for 20+
+- **Code and tables** — fenced blocks are syntax-highlighted for 20+
   languages by a zero-dependency lexer; markdown tables are drawn aligned,
   with header rules and column alignment; `---`, task lists and
   `~~strikethrough~~` render too.
-- **Know what it's doing** — the banner names the model and the server
+- **Status** — the banner names the model and the server
   answering it (`LM Studio (localhost:1234)`); the footer shows the model, a
   spinner, elapsed time and streamed tokens/s while the agent works. Each
   tool call is one plain line, and the agent's todo list is a checklist that
   ticks off items. When a long turn ends, or an approval or a question is
   waiting, while you're in another window you get a desktop notification
   (OSC 99/777/9) and a taskbar progress state on terminals that have one.
-- **Claude-Code-grade ergonomics** — `Esc` interrupts the agent; messages
+- **Interrupt, queue and history** — `Esc` interrupts the agent; messages
   typed while it works queue and auto-send; ↑ history is prefix-filtered and
   never destroys your draft; double-click selects a word, triple-click a
   line, and every copy confirms itself in the footer via OSC 52 (terminals
@@ -135,7 +131,7 @@ once you're ready to let it loose on a real project.
   (`Ctrl+D` quits at once; with workflows waiting it asks first).
 - **What you type is what is sent** — quotes, tabs and line breaks are kept;
   a pasted line break shows as `↵` in the input box. A paste over 1,000
-  characters or 10 lines shows as `[pasted 20,024 chars]` and is sent in full. `@` completes files by name anywhere in the project. A
+  characters or 10 lines shows as `[pasted 20,024 chars]` and is sent in full. A
   message that starts with an absolute path (a dropped screenshot) is sent
   with the image attached.
 - **Themes and line mode** — `dark`, `light` (at least 4.5:1 contrast) and
@@ -148,9 +144,9 @@ once you're ready to let it loose on a real project.
 ## Why
 
 The original `buildwithnexus` was a TypeScript CLI talking to a Python /
-LangGraph backend over HTTP. This is a ground-up rewrite that keeps the *benefits*
-of that engine — planning, a ReAct tool loop, approval gates, role-specialized
-agents — as plain Rust control flow, with **none** of the framework weight. No
+LangGraph backend over HTTP. This is a ground-up rewrite that keeps what
+that engine did — planning, a ReAct tool loop, approval gates, role-specialized
+agents — as plain Rust control flow, without the framework. No
 Python, no Docker, no tunnel. The orchestration that LangGraph did at runtime is
 just code here, which is where the speed comes from.
 
