@@ -105,52 +105,7 @@ pub(super) fn repl(
     let mut rewind_points: Vec<RewindPoint> = Vec::new();
 
     loop {
-        // Tick background workflows and surface any completion notifications
-        // (both those queued by the scheduler thread and this tick's own).
-        // Color by outcome — a "✗ workflow failed" line must not render green.
-        // Background runs take this session's permission and model.
-        workflow::update_live(
-            agent::permission_name(perm),
-            &provider.model,
-            &provider.base_url,
-        );
-        let mut notes = workflow::take_notices();
-        notes.extend(workflow::tick());
-        for note in notes {
-            if note.contains('✗') {
-                tui::line(&tui::red(&note));
-            } else if note.contains('⚠') {
-                tui::line(&tui::yellow(&note));
-            } else {
-                tui::line(&tui::green(&note));
-            }
-        }
-        // Prune old done/cancelled workflows, keep last 20.
-        workflow::prune(20);
-
-        // MCP servers connect in the background after the first prompt; their
-        // one-line outcomes surface here so they never interleave with a turn.
-        for (msg, ok) in mcp::drain_notices() {
-            // Notices carry server names and error text from the server.
-            let msg = tui::sanitize_terminal(&msg);
-            if ok {
-                tui::line(&tui::dim(&format!("  {msg}")));
-            } else {
-                tui::line(&tui::yellow(&format!("  {msg}")));
-            }
-        }
-
-        // Workflow activity badge, when the number pending/running changes
-        // (not again after every command).
-        let active = workflow::active_count();
-        if active > 0 && active != shown_active {
-            tui::line(&tui::dim(&format!(
-                "  ⟳ {} workflow{} in queue — /workflows to manage",
-                active,
-                crate::report::plural(active)
-            )));
-        }
-        shown_active = active;
+        tick_background(perm, &provider, &mut shown_active);
 
         let mut task = if let Some(prompted) = pending_prompt.take() {
             tui::line("");
@@ -457,67 +412,28 @@ pub(super) fn repl(
         }
         // `/plan <task>` and `/brainstorm <task>` are turns of the one
         // conversation, like `/build <task>`: kept, saved and counted.
-        if let Some(task) = t.strip_prefix("/plan ") {
+        let one_off = [
+            ("/plan ", Mode::Plan),
+            ("/build ", Mode::Build),
+            ("/brainstorm ", Mode::Brainstorm),
+        ]
+        .into_iter()
+        .find_map(|(prefix, m)| t.strip_prefix(prefix).map(|task| (m, task)));
+        if let Some((turn_mode, task)) = one_off {
             tui::line("");
             let vision = Vision::of(&provider);
             let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            match agent::plan_turn(
+            let r = run_mode_turn(
+                turn_mode,
                 &provider,
                 perm,
                 &task,
                 cwd,
-                false,
                 images,
                 &mut transcript,
                 &sid,
-            ) {
-                // "Execute Plan" switches to BUILD, as its label says; the
-                // other answers leave the mode alone.
-                Ok(agent::PlanEnd::Executed) if !matches!(mode, Mode::Build) => {
-                    mode = Mode::Build;
-                    tui::show_mode_change(mode_label(&mode));
-                }
-                Ok(_) => {}
-                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
-            }
-            tui::bell();
-            continue;
-        }
-        if let Some(task) = t.strip_prefix("/build ") {
-            tui::line("");
-            let vision = Vision::of(&provider);
-            let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            if let Err(e) = agent::run_build_session_with_images(
-                &provider,
-                perm,
-                "engineer",
-                &task,
-                cwd,
-                &mut transcript,
-                &sid,
-                images,
-            ) {
-                tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-            }
-            tui::bell();
-            continue;
-        }
-        if let Some(task) = t.strip_prefix("/brainstorm ") {
-            tui::line("");
-            let vision = Vision::of(&provider);
-            let (task, images) = extract_attachments(task.trim(), cwd, vision);
-            match agent::brainstorm_turn(&provider, cwd, &task, images, &mut transcript, &sid) {
-                // The person answered y to the model's suggestion to switch.
-                Ok(Some(hint)) => {
-                    mode = match hint {
-                        agent::ModeHint::Build => Mode::Build,
-                        agent::ModeHint::Plan => Mode::Plan,
-                    };
-                    tui::show_mode_change(mode_label(&mode));
-                }
-                Ok(None) => {}
-                Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
-            }
+            );
+            switch_after_turn(r, &mut mode);
             tui::bell();
             continue;
         }
@@ -526,23 +442,13 @@ pub(super) fn repl(
             "/exit" | "/quit" | "exit" | "quit" if confirm_quit() => return Ok(()),
             "/exit" | "/quit" | "exit" | "quit" => continue,
             "/clear" => {
-                transcript.clear();
-                rewind_points.clear();
-                usage::forget_last();
-                sid = session::new_id();
-                session::set_current(&sid);
-                trace::set_session(&sid);
+                reset_session(&mut transcript, &mut rewind_points, &mut sid);
                 tui::clear();
                 tui::line(&tui::dim("  ✓ context cleared — fresh session"));
                 continue;
             }
             "/new" => {
-                transcript.clear();
-                rewind_points.clear();
-                usage::forget_last();
-                sid = session::new_id();
-                session::set_current(&sid);
-                trace::set_session(&sid);
+                reset_session(&mut transcript, &mut rewind_points, &mut sid);
                 tui::line(&tui::dim("  started a fresh session"));
                 continue;
             }
@@ -979,65 +885,12 @@ pub(super) fn repl(
                 &mut transcript,
                 &sid,
             )
+            .map(|()| None)
         } else {
-            match &mode {
-                Mode::Plan => match agent::plan_turn(
-                    &provider,
-                    perm,
-                    t,
-                    cwd,
-                    false,
-                    std::mem::take(&mut image_data),
-                    &mut transcript,
-                    &sid,
-                ) {
-                    Ok(end) => {
-                        let next = mode_after_plan(end);
-                        if !matches!(next, Mode::Plan) {
-                            mode = next;
-                            tui::show_mode_change(mode_label(&mode));
-                        }
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                },
-                Mode::Build => agent::run_build_session_with_images(
-                    &provider,
-                    perm,
-                    "engineer",
-                    t,
-                    cwd,
-                    &mut transcript,
-                    &sid,
-                    std::mem::take(&mut image_data),
-                ),
-                // The person answered y to the model's suggestion to switch.
-                Mode::Brainstorm => match agent::brainstorm_turn(
-                    &provider,
-                    cwd,
-                    t,
-                    std::mem::take(&mut image_data),
-                    &mut transcript,
-                    &sid,
-                ) {
-                    Err(e) => Err(e),
-                    Ok(None) => Ok(()),
-                    Ok(Some(agent::ModeHint::Build)) => {
-                        mode = Mode::Build;
-                        tui::show_mode_change("BUILD");
-                        Ok(())
-                    }
-                    Ok(Some(agent::ModeHint::Plan)) => {
-                        mode = Mode::Plan;
-                        tui::show_mode_change("PLAN");
-                        Ok(())
-                    }
-                },
-            }
+            let images = std::mem::take(&mut image_data);
+            run_mode_turn(mode, &provider, perm, t, cwd, images, &mut transcript, &sid)
         };
-        if let Err(e) = r {
-            tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e))));
-        }
+        switch_after_turn(r, &mut mode);
         follow_reported_window(&mut provider, &transcript);
         tui::bell();
     }
@@ -1066,6 +919,115 @@ pub(super) fn mode_label(mode: &Mode) -> &'static str {
 
 // The mode after a PLAN turn: BUILD only when the person chose to execute
 // the plan; Cancel, Esc and a plain answer stay in PLAN.
+// Between prompts: background workflows run and report, MCP connection
+// outcomes surface, and the queue line updates when its count changes.
+fn tick_background(perm: Permission, provider: &Provider, shown_active: &mut usize) {
+    // Tick background workflows and surface any completion notifications
+    // (both those queued by the scheduler thread and this tick's own).
+    // Color by outcome — a "✗ workflow failed" line must not render green.
+    // Background runs take this session's permission and model.
+    workflow::update_live(
+        agent::permission_name(perm),
+        &provider.model,
+        &provider.base_url,
+    );
+    let mut notes = workflow::take_notices();
+    notes.extend(workflow::tick());
+    for note in notes {
+        if note.contains('✗') {
+            tui::line(&tui::red(&note));
+        } else if note.contains('⚠') {
+            tui::line(&tui::yellow(&note));
+        } else {
+            tui::line(&tui::green(&note));
+        }
+    }
+    // Prune old done/cancelled workflows, keep last 20.
+    workflow::prune(20);
+
+    // MCP servers connect in the background after the first prompt; their
+    // one-line outcomes surface here so they never interleave with a turn.
+    for (msg, ok) in mcp::drain_notices() {
+        // Notices carry server names and error text from the server.
+        let msg = tui::sanitize_terminal(&msg);
+        if ok {
+            tui::line(&tui::dim(&format!("  {msg}")));
+        } else {
+            tui::line(&tui::yellow(&format!("  {msg}")));
+        }
+    }
+
+    // Workflow activity badge, when the number pending/running changes
+    // (not again after every command).
+    let active = workflow::active_count();
+    if active > 0 && active != *shown_active {
+        tui::line(&tui::dim(&format!(
+            "  ⟳ {} workflow{} in queue — /workflows to manage",
+            active,
+            crate::report::plural(active)
+        )));
+    }
+    *shown_active = active;
+}
+
+/// One turn of `turn_mode` in the session's conversation, whichever mode the
+/// session is in (`/plan <task>` runs a PLAN turn from BUILD). Returns the
+/// mode the session moves to: BUILD after "Execute Plan", or the mode the
+/// person accepted when BRAINSTORM suggested one.
+#[allow(clippy::too_many_arguments)]
+fn run_mode_turn(
+    turn_mode: Mode,
+    provider: &Provider,
+    perm: Permission,
+    task: &str,
+    cwd: &std::path::Path,
+    images: Vec<(String, String)>,
+    transcript: &mut Vec<provider::Msg>,
+    sid: &str,
+) -> Result<Option<Mode>, String> {
+    match turn_mode {
+        Mode::Plan => agent::plan_turn(provider, perm, task, cwd, false, images, transcript, sid)
+            .map(|end| Some(mode_after_plan(end)).filter(|m| *m != Mode::Plan)),
+        Mode::Build => agent::run_build_session_with_images(
+            provider, perm, "engineer", task, cwd, transcript, sid, images,
+        )
+        .map(|()| None),
+        Mode::Brainstorm => agent::brainstorm_turn(provider, cwd, task, images, transcript, sid)
+            .map(|hint| {
+                hint.map(|h| match h {
+                    agent::ModeHint::Build => Mode::Build,
+                    agent::ModeHint::Plan => Mode::Plan,
+                })
+            }),
+    }
+}
+
+// Reports a failed turn, or moves the session to the mode the turn ended in.
+fn switch_after_turn(r: Result<Option<Mode>, String>, mode: &mut Mode) {
+    match r {
+        Ok(Some(next)) if next != *mode => {
+            *mode = next;
+            tui::show_mode_change(mode_label(mode));
+        }
+        Ok(_) => {}
+        Err(e) => tui::line(&tui::red(&format!("  {}", tui::sanitize_terminal(&e)))),
+    }
+}
+
+// /clear and /new: an empty conversation under a new session id.
+fn reset_session(
+    transcript: &mut Vec<provider::Msg>,
+    rewind_points: &mut Vec<RewindPoint>,
+    sid: &mut String,
+) {
+    transcript.clear();
+    rewind_points.clear();
+    usage::forget_last();
+    *sid = session::new_id();
+    session::set_current(sid);
+    trace::set_session(sid);
+}
+
 pub(super) fn mode_after_plan(end: agent::PlanEnd) -> Mode {
     match end {
         agent::PlanEnd::Executed => Mode::Build,

@@ -436,6 +436,40 @@ class ReadOnlyConversationTests(TerminalHarness):
         self.ask("hello", "BRAINSTORM is read-only")
 
 
+class OneOffModeCommandTests(TerminalHarness):
+    """`/build <task>` and `/brainstorm <task>` run one turn of the session's
+    conversation, and /clear starts the next turn with none of it."""
+
+    def prepare(self):
+        self.model = ChatModel(lambda messages: ("text", f"answer {len(self.model.requests)}"))
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def turn(self, text):
+        before = len(self.model.requests)
+        self.send(text + "\r")
+        self.wait_for(lambda: len(self.model.requests) > before
+                      and f"answer {len(self.model.requests)}".encode() in self.output,
+                      f"the answer to {text!r}", timeout=15)
+        return self.model.user_texts()
+
+    def test_one_off_turns_share_the_conversation_until_clear(self):
+        users = self.turn("/build write the release note")
+        self.assertTrue(any("write the release note" in u for u in users), users)
+        users = self.turn("/brainstorm what should come next")
+        self.assertTrue(any("write the release note" in u for u in users), users)
+        self.assertTrue(any("what should come next" in u for u in users), users)
+        self.send("/clear\r")
+        self.wait_for(lambda: b"context cleared" in self.output, "/clear")
+        users = self.turn("/brainstorm a fresh start")
+        self.assertFalse(any("release note" in u for u in users), users)
+        self.assertTrue(any("a fresh start" in u for u in users), users)
+
+
 class GitAttachmentTests(TerminalHarness):
     """@diff in a repository whose git config runs a program asks first."""
 

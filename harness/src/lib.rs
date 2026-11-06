@@ -1772,7 +1772,7 @@ pub(crate) use commands::show_instruction_files;
 use commands::*;
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Plan,
     Build,
