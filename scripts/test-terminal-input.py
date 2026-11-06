@@ -394,6 +394,99 @@ class TerminalInputTests(TerminalHarness):
         self.assertNotIn(b"line one line two", bytes(self.output))
 
 
+class HistoryHarness(TerminalHarness):
+    """A session whose prompt history holds two entries."""
+
+    def prepare(self):
+        (self.home / "history").write_text("deploy staging\nrun the tests\n")
+
+    def history(self):
+        return [l.strip() for l in (self.home / "history").read_text().splitlines()]
+
+    def wait_sent(self, line, times=1):
+        self.wait_for(lambda: self.history().count(line) >= times, f"history entry {line!r}")
+
+
+class ReverseSearchTests(HistoryHarness):
+    """Ctrl+R searches the prompt history: Enter sends the match, Esc keeps
+    it for editing, and Ctrl+G puts the draft back."""
+
+    def test_enter_sends_the_match(self):
+        self.send("\x12deploy")
+        self.wait_for(lambda: b"reverse-i-search" in self.output, "the search line")
+        self.send("\r")
+        self.wait_sent("deploy staging", times=2)
+
+    def test_esc_keeps_the_match_for_editing(self):
+        self.send("\x12run")
+        self.wait_for(lambda: b"reverse-i-search" in self.output, "the search line")
+        self.send("\x1b")
+        self.pump(0.3)
+        self.send(" now\r")
+        self.wait_sent("run the tests now")
+
+    def test_ctrl_g_puts_the_draft_back(self):
+        self.send("my draft")
+        self.send("\x12zzz")
+        self.wait_for(lambda: b"reverse-i-search" in self.output, "the search line")
+        self.send("\x07")
+        self.pump(0.3)
+        self.send("\r")
+        self.wait_sent("my draft")
+
+
+class HistoryArrowTests(HistoryHarness):
+    """↑ recalls entries that start with the draft, ↓ past the newest brings
+    the draft back."""
+
+    def test_up_recalls_by_prefix_and_down_restores_the_draft(self):
+        self.send("dep")
+        self.send("\x1b[A")
+        self.wait_for(lambda: b"deploy staging" in self.output, "the recalled entry")
+        self.send("\x1b[B")
+        self.pump(0.3)
+        self.send("\r")
+        self.wait_sent("dep")
+
+    def test_up_then_enter_sends_the_entry(self):
+        # The older entry: a repeat of the newest one is not saved again.
+        self.send("dep")
+        self.send("\x1b[A")
+        self.pump(0.3)
+        self.send("\r")
+        self.wait_sent("deploy staging", times=2)
+
+
+class VimEditingTests(HistoryHarness):
+    """/vim: NORMAL-mode motions and edits, and a VISUAL-mode delete."""
+
+    def vim_on(self):
+        self.send("/vim\r")
+        self.pump(0.5)
+
+    def test_normal_mode_edits(self):
+        self.vim_on()
+        # i: insert; Esc: NORMAL; 0 x: delete the first character; A: append.
+        self.send("ihello world")
+        self.send("\x1b")
+        self.pump(0.2)
+        self.send("0x")
+        self.send("A!")
+        self.send("\r")
+        self.wait_sent("ello world!")
+
+    def test_visual_delete(self):
+        self.vim_on()
+        # v e d: select to the end of the first word and delete it.
+        self.send("ione two")
+        self.send("\x1b")
+        self.pump(0.2)
+        self.send("0ved")
+        self.send("i")
+        self.send("\r")
+        self.wait_sent("two")
+
+
 class ReadOnlyConversationTests(TerminalHarness):
     """A question answered in PLAN or BRAINSTORM is read-only, whatever the
     session permission: the model's write, edit and rm are all refused."""
@@ -434,6 +527,40 @@ class ReadOnlyConversationTests(TerminalHarness):
 
     def test_a_greeting_in_brainstorm_changes_nothing(self):
         self.ask("hello", "BRAINSTORM is read-only")
+
+
+class OneOffModeCommandTests(TerminalHarness):
+    """`/build <task>` and `/brainstorm <task>` run one turn of the session's
+    conversation, and /clear starts the next turn with none of it."""
+
+    def prepare(self):
+        self.model = ChatModel(lambda messages: ("text", f"answer {len(self.model.requests)}"))
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def turn(self, text):
+        before = len(self.model.requests)
+        self.send(text + "\r")
+        self.wait_for(lambda: len(self.model.requests) > before
+                      and f"answer {len(self.model.requests)}".encode() in self.output,
+                      f"the answer to {text!r}", timeout=15)
+        return self.model.user_texts()
+
+    def test_one_off_turns_share_the_conversation_until_clear(self):
+        users = self.turn("/build write the release note")
+        self.assertTrue(any("write the release note" in u for u in users), users)
+        users = self.turn("/brainstorm what should come next")
+        self.assertTrue(any("write the release note" in u for u in users), users)
+        self.assertTrue(any("what should come next" in u for u in users), users)
+        self.send("/clear\r")
+        self.wait_for(lambda: b"context cleared" in self.output, "/clear")
+        users = self.turn("/brainstorm a fresh start")
+        self.assertFalse(any("release note" in u for u in users), users)
+        self.assertTrue(any("a fresh start" in u for u in users), users)
 
 
 class GitAttachmentTests(TerminalHarness):

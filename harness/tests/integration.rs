@@ -253,6 +253,7 @@ fn hook(command: &str) -> Value {
     json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
 }
 
+#[cfg(unix)]
 fn count_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
@@ -1537,6 +1538,123 @@ fn headless_brainstorm_sends_attached_image() {
         r.stderr.contains("attached 1 image"),
         "stderr: {}",
         r.stderr
+    );
+}
+
+// A BUILD step with no tool calls: one empty reply is retried with a
+// prompt to go on; prose answering an explicit file-creation task is
+// finished with write_file on the model's behalf.
+#[test]
+fn an_empty_reply_is_retried_once() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![text(""), text("All set.")]);
+    write_config(&home, "llamacpp", "auto", port);
+    let r = run_args(&home, &cwd, &["--json", "run", "say hello"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let posts = posts.lock().unwrap();
+    assert_eq!(posts.len(), 2, "stderr: {}", r.stderr);
+    assert!(posts[1].contains("You returned no output"), "{}", posts[1]);
+}
+
+#[test]
+fn prose_for_an_explicit_file_task_is_finished_with_write_file() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    // Prose three times: the two nudges to act come first.
+    let prose = text("You could create it with an editor.");
+    let (port, posts) = serve_recording(vec![prose.clone(), prose.clone(), prose]);
+    write_config(&home, "llamacpp", "auto", port);
+    let r = run_args(
+        &home,
+        &cwd,
+        &["--json", "run", "create notes.txt containing hello world"],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(posts.lock().unwrap().len(), 3);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("notes.txt"))
+            .unwrap()
+            .trim(),
+        "hello world"
+    );
+}
+
+// `bwn run ... | head -1`: a reader that has gone away ends the run quietly,
+// with the exit code a shell gives a process killed by SIGPIPE, not a panic.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_ends_a_headless_run_without_a_panic() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let mut child = Command::new(BIN)
+        .args([
+            "run",
+            "--provider",
+            "custom",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "m",
+            "say hi",
+        ])
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    drop(child.stdout.take()); // nobody reads the output
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(141), "stderr: {stderr}");
+}
+
+// Native Windows sets USERPROFILE and no HOME. `@~/file` must still find the
+// home folder: 0.16.0 resolved it against the working folder and sent the
+// token as typed.
+#[test]
+fn a_tilde_attachment_uses_userprofile_when_home_is_unset() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let user = tmp("user");
+    std::fs::write(user.join("note.txt"), "text from the home folder").unwrap();
+    let (port, posts) = serve_recording(vec![text("ok")]);
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .args([
+            "--json",
+            "--provider",
+            "custom",
+            "--base-url",
+            &format!("http://127.0.0.1:{port}/v1"),
+            "--model",
+            "m",
+            "run",
+            "summarize @~/note.txt",
+        ])
+        .env_remove("HOME")
+        .env("USERPROFILE", &user)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not found"), "stderr: {stderr}");
+    let posts = posts.lock().unwrap();
+    assert!(
+        posts
+            .first()
+            .is_some_and(|p| p.contains("text from the home folder")),
+        "stderr: {stderr}"
     );
 }
 
@@ -4359,6 +4477,7 @@ fn an_answer_that_opens_with_an_example_call_is_a_success() {
 }
 
 // Accepts one chat request and never answers it.
+#[cfg(unix)]
 fn serve_silent() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -9012,6 +9131,56 @@ fn acp_file_tools_read_and_write_through_the_editor_when_it_offers_fs() {
     assert_eq!(std::fs::read_to_string(&notes).unwrap(), "on disk\n");
     // The model saw the buffer, not the disk.
     assert!(posts.lock().unwrap()[1].contains("unsaved buffer"));
+    acp.close();
+}
+
+// str_replace_editor's str_replace edits the same buffer edit_file does; it
+// read and wrote the disk until 0.17.
+#[test]
+fn acp_str_replace_edits_the_editor_buffer_too() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let notes = cwd.join("notes.txt");
+    std::fs::write(&notes, "on disk\n").unwrap();
+    let (port, _posts) = serve_sse(vec![
+        tool_call("c0", "read_file", json!({"path": "notes.txt"})),
+        tool_call(
+            "c1",
+            "str_replace_editor",
+            json!({"command": "str_replace", "path": "notes.txt",
+                   "old_str": "unsaved buffer", "new_str": "edited buffer"}),
+        ),
+        text("Edited the open buffer."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(
+        &mut acp,
+        json!({"fs": {"readTextFile": true, "writeTextFile": true}}),
+    );
+    let sid = acp_new_session(&mut acp, &cwd);
+    let mut writes = Vec::new();
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "edit the unsaved buffer in notes.txt"),
+        &mut |req| match req["method"].as_str().unwrap() {
+            "fs/read_text_file" => json!({"content": "unsaved buffer\n"}),
+            "fs/write_text_file" => {
+                writes.push(req["params"]["content"].as_str().unwrap().to_string());
+                json!({})
+            }
+            other => panic!("unexpected request {other}: {req}"),
+        },
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    assert_eq!(writes, ["edited buffer\n"]);
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "on disk\n");
     acp.close();
 }
 

@@ -138,7 +138,7 @@ const PRUNE_AT: usize = 600;
 
 // The turn now running: its task (stamped on each checkpoint) and the git
 // state it started from, by folder.
-static CURRENT_TASK: Mutex<Option<String>> = Mutex::new(None);
+static CURRENT_TASK: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
 static TURN_SNAPSHOTS: Mutex<Vec<(PathBuf, Option<GitSnap>)>> = Mutex::new(Vec::new());
 // Turns this process began, by folder: a relaunch must ask before undoing.
 static OWN_TURNS: Mutex<Vec<(PathBuf, u128)>> = Mutex::new(Vec::new());
@@ -187,7 +187,8 @@ pub fn begin_turn(cwd: &Path, task: &str) -> usize {
         .take(80)
         .collect();
     if let Ok(mut t) = CURRENT_TASK.lock() {
-        *t = Some(label.clone());
+        t.retain(|(c, _)| c != cwd);
+        t.push((cwd.to_path_buf(), label.clone()));
     }
     let pruned = prune_once(cwd);
     let snap = git_snapshot(cwd);
@@ -213,22 +214,18 @@ pub fn begin_turn(cwd: &Path, task: &str) -> usize {
 /// (see `changed_after_agent`) and which changed files no checkpoint covers.
 pub fn end_turn(cwd: &Path) {
     if let Ok(mut t) = CURRENT_TASK.lock() {
-        *t = None;
+        t.retain(|(c, _)| c != cwd);
     }
     let Some(mut turn) = load_turn(cwd) else {
         return;
     };
-    seal_since(cwd, turn.started_ms);
+    let this_turn = seal_since(cwd, turn.started_ms);
     let before = TURN_SNAPSHOTS.lock().ok().and_then(|mut snaps| {
         let i = snaps.iter().position(|(c, _)| c == cwd)?;
         snaps.swap_remove(i).1
     });
     if let (Some(before), Some(after)) = (before, git_snapshot(cwd)) {
-        let covered: HashSet<PathBuf> = list(cwd)
-            .into_iter()
-            .filter(|cp| cp.created_ms >= turn.started_ms)
-            .map(|cp| normalized(&cp.path))
-            .collect();
+        let covered: HashSet<PathBuf> = this_turn.iter().map(|cp| normalized(&cp.path)).collect();
         // A new folder counts as covered when checkpoints hold files in it.
         turn.untracked = changed_between(&before, &after)
             .into_iter()
@@ -333,6 +330,11 @@ struct GitSnap {
 }
 
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
+    git_run(cwd, args).and_then(|(ok, out)| ok.then_some(out))
+}
+
+// Whether git succeeded, and what it printed either way.
+fn git_run(cwd: &Path, args: &[&str]) -> Option<(bool, String)> {
     let o = std::process::Command::new("git")
         .args(["-c", "core.fsmonitor=false"])
         .args(args)
@@ -341,9 +343,10 @@ fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    o.status
-        .success()
-        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    Some((
+        o.status.success(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+    ))
 }
 
 // git honours the repository's own config, which can name programs to run;
@@ -363,8 +366,15 @@ fn git_snapshot(cwd: &Path) -> Option<GitSnap> {
     if !git_allowed(cwd) {
         return None;
     }
-    let top = PathBuf::from(git_out(cwd, &["rev-parse", "--show-toplevel"])?.trim());
-    let head = git_out(cwd, &["rev-parse", "--verify", "-q", "HEAD"]).map(|h| h.trim().to_string());
+    // One process for both: the top folder, then HEAD. In a repository with
+    // no commit yet git exits 1 but still prints the top folder.
+    let (ok, out) = git_run(
+        cwd,
+        &["rev-parse", "--show-toplevel", "--verify", "-q", "HEAD"],
+    )?;
+    let mut lines = out.lines();
+    let top = PathBuf::from(lines.next().filter(|t| !t.trim().is_empty())?.trim());
+    let head = lines.next().filter(|_| ok).map(|h| h.trim().to_string());
     let status = git_out(
         cwd,
         &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -459,16 +469,15 @@ pub fn undo_note(paths: &[PathBuf]) -> Option<String> {
 /// `since_ms` (see `changed_after_agent`). `end_turn` does this for a task;
 /// a conversational turn, which is not the folder's last task for bare
 /// /undo, calls it directly.
-pub fn seal_since(cwd: &Path, since_ms: u128) {
-    for mut cp in list(cwd)
-        .into_iter()
-        .filter(|cp| cp.created_ms >= since_ms && cp.after.is_none())
-    {
+pub fn seal_since(cwd: &Path, since_ms: u128) -> Vec<Checkpoint> {
+    let mut cps = list_since(cwd, since_ms);
+    for cp in cps.iter_mut().filter(|cp| cp.after.is_none()) {
         cp.after = Some(fingerprint(&cp.path));
         if let Ok(body) = serde_json::to_string_pretty(&cp) {
             let _ = write_atomic(&dir(cwd).join(format!("{}.json", cp.id)), body.as_bytes());
         }
     }
+    cps
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -610,7 +619,10 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         seq,
         mode,
         after: None,
-        task: CURRENT_TASK.lock().ok().and_then(|t| t.clone()),
+        task: CURRENT_TASK
+            .lock()
+            .ok()
+            .and_then(|t| t.iter().find(|(c, _)| c == cwd).map(|(_, l)| l.clone())),
         root: crate::workdirs::containing(path).filter(|_| !inside_tree(path, cwd)),
     };
     let checkpoint_dir = dir(cwd);
@@ -635,47 +647,39 @@ fn file_mode(_path: &Path) -> Option<u32> {
     None
 }
 
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    Ok(())
-}
-
 // Same-directory temp + rename; a crash mid-write never leaves a partial file.
 fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     write_atomic_mode(path, contents, None)
 }
 
 fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    let mut name = match path.file_name() {
-        Some(n) => n.to_os_string(),
-        None => return Err(std::io::Error::other("path has no file name")),
-    };
-    name.push(format!(".tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(name);
-    fs::write(&tmp, contents)?;
-    if let Some(m) = mode {
-        set_mode(&tmp, m).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
-    }
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    let perm = mode.map_or(crate::config::Perm::Default, crate::config::Perm::Mode);
+    crate::config::atomic_write(path, contents, perm)
 }
 
 /// Returns all recorded checkpoints for the given workspace directory, sorted newest first.
 pub fn list(cwd: &Path) -> Vec<Checkpoint> {
+    list_since(cwd, 0)
+}
+
+/// The checkpoints recorded for `cwd` at or after `since_ms`, newest first.
+/// A checkpoint's file name starts with its creation time, so older ones are
+/// skipped without reading them; the store holds every project's
+/// checkpoints, each with a file snapshot of up to 2 MiB.
+fn list_since(cwd: &Path, since_ms: u128) -> Vec<Checkpoint> {
     let Ok(rd) = fs::read_dir(dir(cwd)) else {
         return Vec::new();
     };
+    let recent = |name: &std::ffi::OsStr| {
+        let created = name
+            .to_str()
+            .and_then(|n| n.split('-').next()?.parse::<u128>().ok());
+        // A name that does not parse is read, as before.
+        created.is_none_or(|ms| ms >= since_ms)
+    };
     let mut items: Vec<Checkpoint> = rd
         .filter_map(|e| e.ok())
+        .filter(|e| since_ms == 0 || recent(&e.file_name()))
         .filter_map(|e| fs::read_to_string(e.path()).ok())
         .filter_map(|s| serde_json::from_str::<Checkpoint>(&s).ok())
         .filter(|cp| cp.cwd == cwd)
@@ -830,7 +834,7 @@ fn restore_set(
         return Err(format!(
             "nothing restored — {} checkpoint{} cannot be restored:\n  {}",
             blocked.len(),
-            if blocked.len() == 1 { "" } else { "s" },
+            crate::report::plural(blocked.len()),
             blocked.join("\n  ")
         ));
     }
@@ -855,7 +859,7 @@ fn restore_set(
     let mut msg = format!(
         "{} restore{} failed:",
         failed.len(),
-        if failed.len() == 1 { "" } else { "s" }
+        crate::report::plural(failed.len())
     );
     for e in &failed {
         msg.push_str(&format!("\n  ✗ {e}"));
@@ -1376,6 +1380,25 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn git_snapshot_reads_the_top_folder_with_and_without_a_commit() {
+        let d = scratch("snaptop");
+        git(&d, &["init", "-q"]);
+        let top = |s: &GitSnap| fs::canonicalize(&s.top).unwrap();
+        let unborn = git_snapshot(&d).expect("an unborn repository still snapshots");
+        assert_eq!(top(&unborn), fs::canonicalize(&d).unwrap());
+        assert_eq!(unborn.head, None);
+        git(&d, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let born = git_snapshot(&d).expect("snapshot");
+        assert_eq!(top(&born), fs::canonicalize(&d).unwrap());
+        assert!(
+            born.head.as_deref().is_some_and(|h| h.len() == 40),
+            "{:?}",
+            born.head
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -56,6 +56,17 @@ const HOOK_TIMEOUT_CODE: i32 = 124; // matches timeout(1) convention
 const HOOK_SPAWN_FAILED_CODE: i32 = 126;
 const HOOK_SIGNAL_CODE: i32 = 128; // plus the signal number, like a shell
 
+// The signal that ended a process, where the platform has signals.
+#[cfg(unix)]
+fn exit_signal(st: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(st)
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_st: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 // Why a hook has no exit status of its own. PreToolUse blocks the call on any
 // of these: a guard that never ran, or died midway, must not read as "allow".
 enum HookFailure {
@@ -1786,7 +1797,7 @@ fn apply_run_trust(cwd: &Path) {
     if off <= 3 {
         refuse(format!(
             "that digest differs from this folder's in {off} character{} — check it was copied whole from `buildwithnexus trust --print`",
-            if off == 1 { "" } else { "s" }
+            crate::report::plural(off)
         ));
     }
     let mut covered: Vec<String> = files.iter().map(|f| entry_label(f.name)).collect();
@@ -2559,10 +2570,7 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> HookRun {
             Some(code) => (code, None),
             // Signal-killed: never report exit 0 for a hook that died.
             None => {
-                #[cfg(unix)]
-                let sig = std::os::unix::process::ExitStatusExt::signal(&st);
-                #[cfg(not(unix))]
-                let sig = None;
+                let sig = exit_signal(&st);
                 (
                     HOOK_SIGNAL_CODE + sig.unwrap_or(0),
                     Some(HookFailure::Signal(sig)),
@@ -2948,11 +2956,8 @@ fn cap_hook_context(s: &str) -> String {
     if s.len() <= MAX_HOOK_CONTEXT_BYTES {
         return s.to_string();
     }
-    let mut end = MAX_HOOK_CONTEXT_BYTES;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n[hook output truncated at 16KB]", &s[..end])
+    let shown = crate::config::cut_at_char_boundary(s, MAX_HOOK_CONTEXT_BYTES);
+    format!("{shown}\n[hook output truncated at 16KB]")
 }
 
 /// What `doctor` reports about hooks: each configured hook with the file it

@@ -953,14 +953,6 @@ fn connect(cfg: &ServerConfig) -> Result<Connected, Status> {
     Ok((conn, info, tools))
 }
 
-fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
-}
-
 /// Starts connecting every configured server in the background. Idempotent:
 /// later calls are no-ops until `reload()`.
 pub fn start_background() {
@@ -1015,7 +1007,10 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
                         st.status = Status::Connected;
                     }
                     (
-                        format!("mcp: {name} connected, {n} tool{}", plural(n)),
+                        format!(
+                            "mcp: {name} connected, {n} tool{}",
+                            crate::report::plural(n)
+                        ),
                         true,
                     )
                 }
@@ -1327,15 +1322,6 @@ pub fn report() -> Vec<ServerReport> {
 
 // ── management commands (shared by `/mcp …` and `buildwithnexus mcp …`) ────
 
-fn clip(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(max - 1).collect::<String>())
-    }
-}
-
 /// Status table lines, one per configured server.
 fn status_lines() -> Vec<String> {
     let reports = report();
@@ -1368,15 +1354,17 @@ fn status_lines() -> Vec<String> {
         let detail = match &r.status {
             Status::Connected => format!(
                 "{n} tool{}{}{signed_in}",
-                plural(n),
+                crate::report::plural(n),
                 if r.server_info.is_empty() {
                     String::new()
                 } else {
                     format!(" · {}", r.server_info)
                 }
             ),
-            Status::Failed(e) | Status::Invalid(e) => clip(e, 100),
-            Status::NeedsAuth(why) => clip(&crate::mcp_auth::login_hint(&r.name, why), 100),
+            Status::Failed(e) | Status::Invalid(e) => crate::tools::clamp_preview(e, 100),
+            Status::NeedsAuth(why) => {
+                crate::tools::clamp_preview(&crate::mcp_auth::login_hint(&r.name, why), 100)
+            }
             Status::Disabled => "enabled: false".into(),
             Status::Connecting => "discovery in progress".into(),
         };
@@ -1416,7 +1404,10 @@ fn server_lines(name: &str) -> Result<Vec<String>, String> {
         for t in &r.tools {
             let tag = if t.read_only { " [read-only]" } else { "" };
             lines.push(format!("  {}{tag}", t.mangled));
-            lines.push(format!("      {}", clip(&t.description, 160)));
+            lines.push(format!(
+                "      {}",
+                crate::tools::clamp_preview(&t.description, 160)
+            ));
         }
     }
     Ok(lines)
@@ -1645,7 +1636,7 @@ fn login(name: &str, connect: bool, say: &mut dyn FnMut(&str)) -> Result<Vec<Str
     } else {
         // An http server spawns nothing, so the CLI can prove the token.
         lines.push(match connect_once(&cfg) {
-            Ok(n) => format!("{name} connected, {n} tool{}", plural(n)),
+            Ok(n) => format!("{name} connected, {n} tool{}", crate::report::plural(n)),
             Err(e) => format!("{name} did not connect with the new login: {e}"),
         });
     }

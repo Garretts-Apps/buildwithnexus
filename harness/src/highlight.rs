@@ -934,7 +934,7 @@ pub fn highlight_line(lang: &Lang, line: &str, st: &mut State) -> String {
 /// Highlight a whole fenced block. Returns the lines unchanged when the tag
 /// is unknown or colour is disabled.
 pub fn highlight_block(tag: &str, lines: &[String]) -> Vec<String> {
-    if tui::color_disabled() {
+    if tui::no_color() {
         return lines.to_vec();
     }
     let t = tag.trim().to_ascii_lowercase();
@@ -970,24 +970,6 @@ pub fn highlight_block(tag: &str, lines: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn plain(s: &str) -> String {
-        // Strip SGR to compare content; presence of escapes is asserted separately.
-        let mut out = String::new();
-        let mut it = s.chars().peekable();
-        while let Some(c) = it.next() {
-            if c == '\x1b' {
-                for d in it.by_ref() {
-                    if d.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
     #[test]
     fn content_is_preserved_exactly() {
         std::env::remove_var("NO_COLOR");
@@ -999,7 +981,7 @@ mod tests {
         let lines: Vec<String> = src.iter().map(|s| s.to_string()).collect();
         let out = highlight_block("rust", &lines);
         for (a, b) in out.iter().zip(src.iter()) {
-            assert_eq!(plain(a), *b);
+            assert_eq!(crate::tui::strip_ansi(a), *b);
         }
         assert!(out[0].contains('\x1b'));
     }

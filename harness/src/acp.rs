@@ -950,11 +950,8 @@ fn clip(text: &str) -> String {
     if text.len() <= MAX_SHOWN_RESULT {
         return text.to_string();
     }
-    let mut end = MAX_SHOWN_RESULT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n… ({} more bytes)", &text[..end], text.len() - end)
+    let shown = crate::config::cut_at_char_boundary(text, MAX_SHOWN_RESULT);
+    format!("{shown}\n… ({} more bytes)", text.len() - shown.len())
 }
 
 fn next_call_id() -> String {

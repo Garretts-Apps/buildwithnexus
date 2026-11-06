@@ -53,6 +53,54 @@ impl Session {
     }
 }
 
+/// A saved session without its messages, which are counted but never built:
+/// listings and pickers read only this, so a session full of screenshots
+/// costs a scan, not an allocation per message.
+#[derive(Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+    pub model: String,
+    pub created_ms: u128,
+    pub updated_ms: u128,
+    #[serde(rename = "msgs", deserialize_with = "count_seq")]
+    pub msg_count: usize,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl SessionInfo {
+    /// The name given with /rename, else the first prompt.
+    pub fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.title)
+    }
+
+    /// Whether the session was started in `cwd`.
+    pub fn is_in(&self, cwd: &Path) -> bool {
+        same_dir(Path::new(&self.cwd), cwd)
+    }
+}
+
+// The length of a JSON array, skipping its elements without building them.
+fn count_seq<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    struct Count;
+    impl<'de> serde::de::Visitor<'de> for Count {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<usize, A::Error> {
+            let mut n = 0;
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
+    d.deserialize_seq(Count)
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -101,13 +149,9 @@ pub fn new_id() -> String {
     format!("{:016}-{:08x}", now_ms(), h.finish() as u32)
 }
 
-fn file(id: &str) -> PathBuf {
-    dir().join(format!("{id}.json"))
-}
-
 /// Where the transcript for `id` is (or will be) saved.
 pub fn path(id: &str) -> PathBuf {
-    file(id)
+    dir().join(format!("{id}.json"))
 }
 
 // The id of the session this process is running — the same value the
@@ -186,35 +230,44 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
         return;
     }
     let _ = std::fs::create_dir_all(dir());
-    let before = load(id);
-    let s = Session {
+    // Only the header of the previous save is read back, and the messages
+    // are serialized where they lie: this runs after every tool round.
+    let before = load_info(id);
+    // The same fields, in the same order, as `Session`.
+    #[derive(Serialize)]
+    struct Saved<'a> {
+        schema_version: u32,
+        id: &'a str,
+        title: String,
+        cwd: std::borrow::Cow<'a, str>,
+        model: &'a str,
+        created_ms: u128,
+        updated_ms: u128,
+        msgs: &'a [Msg],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    }
+    let s = Saved {
         schema_version: SCHEMA_VERSION,
-        id: id.to_string(),
+        id,
         title: title_of(msgs),
-        cwd: cwd.to_string_lossy().into_owned(),
-        model: model.to_string(),
+        cwd: cwd.to_string_lossy(),
+        model,
         created_ms: before.as_ref().map(|s| s.created_ms).unwrap_or_else(now_ms),
         updated_ms: now_ms(),
-        msgs: msgs.to_vec(),
+        msgs,
         name: before.and_then(|s| s.name),
     };
-    write(&s);
+    write(id, &s);
 }
 
-fn write(s: &Session) -> bool {
+fn write(id: &str, s: &impl Serialize) -> bool {
     let Ok(text) = serde_json::to_string(s) else {
         return false;
     };
-    // Write-then-rename so a crash mid-save never truncates the previous
-    // session file. list() only picks up `.json` files, so the temp file
-    // is invisible even if a crash leaves it behind.
-    let path = file(&s.id);
-    let tmp = dir().join(format!("{}.json.tmp", s.id));
-    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-        return true;
-    }
-    let _ = std::fs::remove_file(&tmp);
-    false
+    // list() only picks up `.json` files, so the temp file is invisible
+    // even if a crash leaves it behind.
+    crate::config::atomic_write(&path(id), text.as_bytes(), crate::config::Perm::Default).is_ok()
 }
 
 /// Names a saved session (/rename). The name replaces the first prompt in
@@ -225,10 +278,10 @@ pub fn rename(id: &str, name: &str) -> Result<(), String> {
     };
     let name = name.trim();
     s.name = (!name.is_empty()).then(|| name.chars().take(80).collect());
-    if write(&s) {
+    if write(id, &s) {
         Ok(())
     } else {
-        Err(format!("could not write {}", file(id).display()))
+        Err(format!("could not write {}", path(id).display()))
     }
 }
 
@@ -237,13 +290,13 @@ pub fn remove(id: &str) -> Result<Session, String> {
     let Some(s) = load(id) else {
         return Err(format!("no session '{id}' — bwn sessions lists them"));
     };
-    std::fs::remove_file(file(id)).map_err(|e| format!("could not delete {id}: {e}"))?;
+    std::fs::remove_file(path(id)).map_err(|e| format!("could not delete {id}: {e}"))?;
     Ok(s)
 }
 
 // A session file that exists but fails to parse is data the user thinks is
 // saved — surface it instead of silently dropping it from /resume listings.
-fn parse_session(path: &Path, text: &str) -> Option<Session> {
+fn parse_session<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Option<T> {
     match serde_json::from_str(text) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -261,15 +314,21 @@ fn parse_session(path: &Path, text: &str) -> Option<Session> {
 /// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
 /// Warns on stderr if the file exists but cannot be parsed.
 pub fn load(id: &str) -> Option<Session> {
-    let path = file(id);
+    let path = path(id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    parse_session(&path, &text)
+}
+
+fn load_info(id: &str) -> Option<SessionInfo> {
+    let path = path(id);
     let text = std::fs::read_to_string(&path).ok()?;
     parse_session(&path, &text)
 }
 
 /// Lists all persisted sessions, ordered newest-first by last update timestamp.
 /// Corrupt session files are skipped with a warning on stderr.
-pub fn list() -> Vec<Session> {
-    let mut v: Vec<Session> = match std::fs::read_dir(dir()) {
+pub fn list() -> Vec<SessionInfo> {
+    let mut v: Vec<SessionInfo> = match std::fs::read_dir(dir()) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
@@ -287,22 +346,22 @@ pub fn list() -> Vec<Session> {
 
 /// Returns the most recently updated session, or `None` if no sessions exist.
 pub fn latest() -> Option<Session> {
-    list().into_iter().next()
+    list().first().and_then(|s| load(&s.id))
 }
 
 /// The sessions started in `cwd`, newest first.
-pub fn list_for(cwd: &Path) -> Vec<Session> {
+pub fn list_for(cwd: &Path) -> Vec<SessionInfo> {
     list().into_iter().filter(|s| s.is_in(cwd)).collect()
 }
 
 /// The newest session started in `cwd`.
 pub fn latest_for(cwd: &Path) -> Option<Session> {
-    list_for(cwd).into_iter().next()
+    list_for(cwd).first().and_then(|s| load(&s.id))
 }
 
 /// Every session, the ones started in `cwd` first; each group newest first.
-pub fn list_here_first(cwd: &Path) -> Vec<Session> {
-    let (mut here, others): (Vec<Session>, Vec<Session>) =
+pub fn list_here_first(cwd: &Path) -> Vec<SessionInfo> {
+    let (mut here, others): (Vec<SessionInfo>, Vec<SessionInfo>) =
         list().into_iter().partition(|s| s.is_in(cwd));
     here.extend(others);
     here
@@ -357,7 +416,7 @@ pub fn to_markdown(s: &Session) -> String {
                     let n = images.len();
                     out.push_str(&format!(
                         "\n_{n} image{} attached_\n",
-                        if n == 1 { "" } else { "s" }
+                        crate::report::plural(n)
                     ));
                 }
             }
@@ -690,7 +749,7 @@ mod tests {
                 "m",
                 &[Msg::User("v".into())],
             );
-            let text = std::fs::read_to_string(file("0000000000000005")).unwrap();
+            let text = std::fs::read_to_string(path("0000000000000005")).unwrap();
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             assert_eq!(v["schema_version"], SCHEMA_VERSION);
             assert_eq!(
@@ -706,7 +765,7 @@ mod tests {
         with_home(|| {
             let _ = std::fs::create_dir_all(dir());
             std::fs::write(
-                file("0000000000000006"),
+                path("0000000000000006"),
                 r#"{"id":"0000000000000006","title":"old task","cwd":"/p","model":"m","created_ms":1,"updated_ms":2,"msgs":[{"User":"old task"}]}"#,
             )
             .unwrap();

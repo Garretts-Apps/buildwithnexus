@@ -333,10 +333,7 @@ pub fn tool_result(name: &str, content: &str, is_error: bool) {
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "list_python_tools" => {
             let n = content.lines().count();
-            tui::line(&tui::dim(&format!(
-                "    ↳ {n} line{}",
-                if n == 1 { "" } else { "s" }
-            )));
+            tui::line(&tui::dim(&format!("    ↳ {n} line{}", plural(n))));
         }
         // write_file / edit_file / finish: the call header (+ diff) already said it.
         _ => {}
@@ -950,6 +947,15 @@ pub fn info(msg: &str) {
     }
 }
 
+/// "s" unless `n` is one: `format!("{n} file{}", plural(n))`.
+pub(crate) fn plural<N: PartialEq + From<u8>>(n: N) -> &'static str {
+    if n == N::from(1) {
+        ""
+    } else {
+        "s"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,23 +1157,7 @@ mod tests {
     fn paint_diff_rows_shows_gutter_signs_and_padding() {
         let (rows, _, _) = diff_rows("a\nb\nc", "a\nX\nc");
         let painted = paint_diff_rows(&rows);
-        let plain: String = {
-            // cheap ANSI strip for assertions
-            let mut out = String::new();
-            let mut it = painted.chars().peekable();
-            while let Some(c) = it.next() {
-                if c == '\x1b' {
-                    for d in it.by_ref() {
-                        if d.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                } else {
-                    out.push(c);
-                }
-            }
-            out
-        };
+        let plain = crate::tui::strip_ansi(&painted);
         assert!(plain.contains("- b"), "{plain}");
         assert!(plain.contains("+ X"), "{plain}");
         assert!(plain.contains('│'), "{plain}");

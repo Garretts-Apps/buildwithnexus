@@ -609,10 +609,9 @@ pub fn home() -> PathBuf {
     if let Ok(h) = std::env::var("NEXUS_HOME") {
         return PathBuf::from(h);
     }
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(base).join(".buildwithnexus")
+    user_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".buildwithnexus")
 }
 
 pub fn settings_path() -> PathBuf {
@@ -888,11 +887,13 @@ fn dir_names(dir: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-fn user_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .filter(|h| !h.is_empty())
+/// The user's home folder: `HOME`, else `USERPROFILE` (native Windows sets
+/// only the second). An empty value counts as unset. Every `~` in bwn goes
+/// through here, so one platform rule covers them all.
+pub(crate) fn user_home() -> Option<PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    set("HOME")
+        .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
 }
 
@@ -905,7 +906,10 @@ fn tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn cut_at_char_boundary(s: &str, max: usize) -> &str {
+/// The longest prefix of `s` that is at most `max` bytes and ends on a
+/// UTF-8 character boundary. Slicing at a raw byte offset panics inside a
+/// multibyte character, which arbitrary file or command output can hold.
+pub(crate) fn cut_at_char_boundary(s: &str, max: usize) -> &str {
     let mut end = max.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -1478,11 +1482,6 @@ pub fn skill_warnings(skills: &[Skill]) -> Vec<String> {
             })
         })
         .collect()
-}
-
-/// `skill_warnings` filtered to ones not yet returned in this process.
-pub fn skill_warnings_once(skills: &[Skill]) -> Vec<String> {
-    first_time(skill_warnings(skills))
 }
 
 fn first_time(warnings: Vec<String>) -> Vec<String> {
@@ -2679,19 +2678,15 @@ pub struct PolicyRule {
 /// across layers (a project cannot drop a user's deny rule), and an
 /// untrusted project file contributes only its ask and deny entries.
 pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
-    let user = [
-        home().join("config.json"),
-        settings_path(),
-        home().join("settings.local.json"),
-    ];
-    let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> = user
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .filter_map(|t| match serde_json::from_str(&t) {
-            Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
-            _ => None,
-        })
-        .collect();
+    let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> =
+        user_settings_files()
+            .iter()
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .filter_map(|t| match serde_json::from_str(&t) {
+                Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
+                _ => None,
+            })
+            .collect();
     let dot = workdir.join(".buildwithnexus");
     for name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(dot.join(name)) else {
@@ -2735,13 +2730,19 @@ pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
     out
 }
 
-// `workdir: None` loads the user-level files only.
-fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFile>) {
-    let user_paths = [
-        home().join("config.json"), // legacy base
+/// The user-level settings files, lowest precedence first: the legacy
+/// config.json base, settings.json, then settings.local.json.
+fn user_settings_files() -> [PathBuf; 3] {
+    [
+        home().join("config.json"),
         settings_path(),
         home().join("settings.local.json"),
-    ];
+    ]
+}
+
+// `workdir: None` loads the user-level files only.
+fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFile>) {
+    let user_paths = user_settings_files();
 
     let mut merged = serde_json::Map::new();
     let mut any_source = false;
@@ -3218,29 +3219,78 @@ pub(crate) fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-// Atomic write for user data (settings, keys, memory, history): temp file in
-// the same directory, then rename — a crash mid-save can never truncate the
-// file it replaces. With `restricted`, permissions are tightened on the TEMP
-// file, so a secrets file is never visible at its real name with default
-// (world-readable) permissions, even for an instant.
-fn write_atomic(path: &std::path::Path, contents: &str, restricted: bool) -> bool {
-    let mut name = match path.file_name() {
-        Some(n) => n.to_os_string(),
-        None => return false,
-    };
-    name.push(format!(".tmp-{}", std::process::id()));
+/// The permissions `atomic_write` gives the file it writes.
+#[derive(Clone, Copy)]
+pub(crate) enum Perm {
+    /// Whatever a new file gets.
+    Default,
+    /// The replaced file's own permissions, so an edit never strips a
+    /// script's executable bit.
+    KeepExisting,
+    /// Owner-only: 0600, or an ACL for the current user alone on Windows.
+    Private,
+    /// This Unix mode (ignored elsewhere); failing to set it fails the write.
+    Mode(u32),
+}
+
+/// Writes `contents` to `path` through a temp file in the same folder and a
+/// rename, so a crash mid-write never leaves a truncated file. Permissions
+/// are set on the temp file, so a secrets file is never visible at its real
+/// name with default permissions, even for an instant. The temp name is
+/// unique per process and per call, and a failed write removes it.
+pub(crate) fn atomic_write(
+    path: &std::path::Path,
+    contents: &[u8],
+    perm: Perm,
+) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_os_string();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    name.push(format!(".bwn-tmp-{}-{seq}", std::process::id()));
     let tmp = path.with_file_name(name);
-    if fs::write(&tmp, contents).is_err() {
-        return false;
-    }
-    if restricted {
-        restrict(&tmp);
-    }
-    if fs::rename(&tmp, path).is_err() {
+    fs::write(&tmp, contents)?;
+    let set = match perm {
+        Perm::Default => Ok(()),
+        Perm::KeepExisting => {
+            if let Ok(meta) = fs::metadata(path) {
+                let _ = fs::set_permissions(&tmp, meta.permissions());
+            }
+            Ok(())
+        }
+        Perm::Private => {
+            restrict(&tmp);
+            Ok(())
+        }
+        Perm::Mode(mode) => set_mode(&tmp, mode),
+    };
+    set.and_then(|()| fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-        return false;
-    }
-    true
+    })
+}
+
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+// Atomic write for user data (settings, keys, memory, history); `restricted`
+// makes it owner-only. See `atomic_write`.
+fn write_atomic(path: &std::path::Path, contents: &str, restricted: bool) -> bool {
+    let perm = if restricted {
+        Perm::Private
+    } else {
+        Perm::Default
+    };
+    atomic_write(path, contents.as_bytes(), perm).is_ok()
 }
 
 #[cfg(unix)]
@@ -3323,6 +3373,50 @@ mod tests {
     use super::TEST_ENV_LOCK as ENV_LOCK;
     use super::*;
 
+    fn atomic_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwn-atomic-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_when_the_rename_fails() {
+        let d = atomic_dir("fail");
+        // A folder at the target makes the rename fail on every platform.
+        let target = d.join("taken");
+        fs::create_dir(&target).unwrap();
+        assert!(atomic_write(&target, b"x", Perm::Default).is_err());
+        let left: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from("taken")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_sets_the_permissions_it_is_asked_for() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = atomic_dir("perm");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let script = d.join("run.sh");
+        fs::write(&script, "old").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        atomic_write(&script, b"new", Perm::KeepExisting).unwrap();
+        assert_eq!(
+            (mode(&script), fs::read_to_string(&script).unwrap()),
+            (0o755, "new".into())
+        );
+        let secret = d.join("keys");
+        atomic_write(&secret, b"k", Perm::Private).unwrap();
+        assert_eq!(mode(&secret), 0o600);
+        let restored = d.join("restored");
+        atomic_write(&restored, b"r", Perm::Mode(0o640)).unwrap();
+        assert_eq!(mode(&restored), 0o640);
+    }
+
     // A word that names a specific model (as opposed to a family prefix or
     // a placeholder like "local-model").
     fn looks_like_model_id(lit: &str) -> bool {
@@ -3354,15 +3448,35 @@ mod tests {
     fn default_model_ids_live_only_in_the_presets_table() {
         // Files whose model strings are family prefixes for pricing or
         // capability checks, never a model the harness picks.
-        const PREFIX_TABLES: &[&str] = &["usage.rs", "media.rs", "provider.rs"];
+        const PREFIX_TABLES: &[&str] = &["usage.rs", "media.rs", "provider/"];
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Every source file, nested modules included, but not the files that
+        // hold only a module's tests.
+        let mut files = Vec::new();
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "tests.rs")
+                {
+                    files.push(path);
+                }
+            }
+        }
         let mut stray = Vec::new();
-        for entry in fs::read_dir(&src).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if !name.ends_with(".rs") || PREFIX_TABLES.contains(&name.as_str()) {
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if PREFIX_TABLES.iter().any(|t| rel.starts_with(t)) {
                 continue;
             }
+            let name = rel;
             let text = fs::read_to_string(&path).unwrap();
             // Only shipped code: everything above the first test module.
             let shipped = text.split("#[cfg(test)]").next().unwrap();
@@ -4450,8 +4564,8 @@ mod tests {
         let warns = skill_warnings(&skills);
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(warns[0].contains("renamed") && warns[0].contains("SKILL.md"));
-        assert_eq!(skill_warnings_once(&skills).len(), 1);
-        assert!(skill_warnings_once(&skills).is_empty());
+        assert_eq!(first_time(skill_warnings(&skills)).len(), 1);
+        assert!(first_time(skill_warnings(&skills)).is_empty());
 
         let descs = load_skill_descriptions(&proj);
         assert!(descs.contains(&("renamed".to_string(), "(no description)".to_string())));

@@ -332,10 +332,7 @@ fn save_pending_locked(m: &Manager) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(body) = serde_json::to_string_pretty(&pending) {
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let _ = crate::config::atomic_write(&path, body.as_bytes(), crate::config::Perm::Default);
     }
 }
 

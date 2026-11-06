@@ -63,6 +63,13 @@ fn bench_wrap_cache(c: &mut Criterion) {
         let mut t = uibench::transcript(2_000, 100, &line);
         b.iter(|| uibench::append_and_reset(black_box(&mut t), black_box("token "), &line))
     });
+    // A long paragraph streamed with no line break: each chunk re-wraps the
+    // whole open line, so this is the worst case for a single line.
+    let paragraph = line.repeat(13);
+    g.bench_function("incremental/2000lines_2000char_line", |b| {
+        let mut t = uibench::transcript(2_000, 100, &line);
+        b.iter(|| uibench::append_and_reset(black_box(&mut t), black_box("token "), &paragraph))
+    });
     // What every chunk cost before the wrap cache: re-wrap the whole
     // transcript. Width alternates so the cache can't short-circuit.
     g.bench_function("full_rewrap/2000lines", |b| {
