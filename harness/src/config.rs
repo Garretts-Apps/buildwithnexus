@@ -906,7 +906,10 @@ fn tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn cut_at_char_boundary(s: &str, max: usize) -> &str {
+/// The longest prefix of `s` that is at most `max` bytes and ends on a
+/// UTF-8 character boundary. Slicing at a raw byte offset panics inside a
+/// multibyte character, which arbitrary file or command output can hold.
+pub(crate) fn cut_at_char_boundary(s: &str, max: usize) -> &str {
     let mut end = max.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;

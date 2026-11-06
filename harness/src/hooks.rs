@@ -2948,11 +2948,8 @@ fn cap_hook_context(s: &str) -> String {
     if s.len() <= MAX_HOOK_CONTEXT_BYTES {
         return s.to_string();
     }
-    let mut end = MAX_HOOK_CONTEXT_BYTES;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n[hook output truncated at 16KB]", &s[..end])
+    let shown = crate::config::cut_at_char_boundary(s, MAX_HOOK_CONTEXT_BYTES);
+    format!("{shown}\n[hook output truncated at 16KB]")
 }
 
 /// What `doctor` reports about hooks: each configured hook with the file it

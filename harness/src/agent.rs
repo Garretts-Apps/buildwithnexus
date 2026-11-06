@@ -37,19 +37,6 @@ const MAX_VERIFIER_FIX_ROUNDS: usize = 2;
 // model answers with instructions instead of doing the work.
 const MAX_ACT_NUDGES: usize = 2;
 
-/// Truncate `s` to at most `max` bytes without splitting a UTF-8 character —
-/// byte-offset slicing (`&s[..max]`) panics on emoji/CJK at the boundary.
-fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 // ── context compaction ────────────────────────────────────────────────────────
 fn estimate_tokens(msgs: &[Msg]) -> usize {
     let mut chars = 0usize;
@@ -1739,7 +1726,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
             }),
         );
         let text = if compact && text.len() > 2_000 {
-            format!("{}…", truncate_at_char_boundary(&text, 2_000))
+            format!("{}…", crate::config::cut_at_char_boundary(&text, 2_000))
         } else {
             text
         };
@@ -1749,7 +1736,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
     if let Some(mem) = config::load_memory() {
         // Memory is user-important; always include but truncate for small ctx
         let mem_text = if compact && mem.len() > 300 {
-            format!("{}…", truncate_at_char_boundary(&mem, 300))
+            format!("{}…", crate::config::cut_at_char_boundary(&mem, 300))
         } else {
             mem
         };
@@ -1763,7 +1750,7 @@ fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
         );
         // For small contexts, truncate Agents.md to avoid blowing the budget
         let agents_text = if compact && agents.len() > 500 {
-            format!("{}…", truncate_at_char_boundary(&agents, 500))
+            format!("{}…", crate::config::cut_at_char_boundary(&agents, 500))
         } else {
             agents
         };
@@ -7175,7 +7162,7 @@ fn chat_rounds(
 const MAX_COMMIT_DIFF_CHARS: usize = 40_000;
 
 fn commit_draft_msgs(stat: &str, diff: &str) -> Vec<Msg> {
-    let cut = truncate_at_char_boundary(diff, MAX_COMMIT_DIFF_CHARS);
+    let cut = crate::config::cut_at_char_boundary(diff, MAX_COMMIT_DIFF_CHARS);
     let more = if cut.len() < diff.len() {
         "\n[diff truncated]"
     } else {
@@ -9140,11 +9127,11 @@ mod tests {
     #[test]
     fn truncate_at_char_boundary_never_splits_multibyte() {
         let s = "ab🚀cd"; // the emoji occupies bytes 2..6
-        assert_eq!(truncate_at_char_boundary(s, 3), "ab");
-        assert_eq!(truncate_at_char_boundary(s, 6), "ab🚀");
-        assert_eq!(truncate_at_char_boundary(s, 100), s);
+        assert_eq!(crate::config::cut_at_char_boundary(s, 3), "ab");
+        assert_eq!(crate::config::cut_at_char_boundary(s, 6), "ab🚀");
+        assert_eq!(crate::config::cut_at_char_boundary(s, 100), s);
         let cjk = "日本語テキスト"; // 3 bytes per char
-        let t = truncate_at_char_boundary(cjk, 7);
+        let t = crate::config::cut_at_char_boundary(cjk, 7);
         assert_eq!(t, "日本");
         assert!(cjk.starts_with(t));
     }

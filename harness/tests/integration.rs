@@ -9060,6 +9060,56 @@ fn acp_file_tools_read_and_write_through_the_editor_when_it_offers_fs() {
     acp.close();
 }
 
+// str_replace_editor's str_replace edits the same buffer edit_file does; it
+// read and wrote the disk until 0.17.
+#[test]
+fn acp_str_replace_edits_the_editor_buffer_too() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let notes = cwd.join("notes.txt");
+    std::fs::write(&notes, "on disk\n").unwrap();
+    let (port, _posts) = serve_sse(vec![
+        tool_call("c0", "read_file", json!({"path": "notes.txt"})),
+        tool_call(
+            "c1",
+            "str_replace_editor",
+            json!({"command": "str_replace", "path": "notes.txt",
+                   "old_str": "unsaved buffer", "new_str": "edited buffer"}),
+        ),
+        text("Edited the open buffer."),
+    ]);
+    write_config(&home, "llamacpp", "auto", port);
+
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(
+        &mut acp,
+        json!({"fs": {"readTextFile": true, "writeTextFile": true}}),
+    );
+    let sid = acp_new_session(&mut acp, &cwd);
+    let mut writes = Vec::new();
+    let done = acp.call(
+        "session/prompt",
+        prompt(&sid, "edit the unsaved buffer in notes.txt"),
+        &mut |req| match req["method"].as_str().unwrap() {
+            "fs/read_text_file" => json!({"content": "unsaved buffer\n"}),
+            "fs/write_text_file" => {
+                writes.push(req["params"]["content"].as_str().unwrap().to_string());
+                json!({})
+            }
+            other => panic!("unexpected request {other}: {req}"),
+        },
+    );
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; stderr:\n{}",
+        acp.stderr()
+    );
+    assert_eq!(writes, ["edited buffer\n"]);
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "on disk\n");
+    acp.close();
+}
+
 #[test]
 fn acp_session_load_replays_the_conversation_and_continues_it() {
     let home = tmp("home");

@@ -5109,10 +5109,7 @@ fn review_diff(req: &ReviewRequest, cwd: &std::path::Path) -> Result<String, Str
         out.push_str(&untracked_diff(cwd));
     }
     if out.len() > MAX_REVIEW_DIFF_BYTES {
-        let mut cut = MAX_REVIEW_DIFF_BYTES;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        let cut = config::cut_at_char_boundary(&out, MAX_REVIEW_DIFF_BYTES).len();
         out.truncate(cut);
         out.push_str("\n…(diff cut at 200 KiB — read the files for the rest)\n");
     }

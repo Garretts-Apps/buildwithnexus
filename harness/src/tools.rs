@@ -1873,6 +1873,35 @@ pub fn set_editor_files(files: Box<dyn EditorFiles>) {
     let _ = EDITOR_FILES.set(files);
 }
 
+/// What replacing `old` with `new` exactly once in a file's text gave.
+enum Replaced {
+    /// `old` occurred once; the updated text.
+    Exact(String),
+    /// `old` was absent but had one whitespace-tolerant match; the updated text.
+    Lenient(String),
+    NotFound,
+    /// `old` occurred this many times.
+    Ambiguous(usize),
+}
+
+/// The shared core of edit_file and str_replace_editor's str_replace: the
+/// text must match exactly once, or else once ignoring whitespace (tiered
+/// lenient fallback); ambiguous or absent text keeps the diagnostic.
+fn replace_once(body: &str, old: &str, new: &str) -> Replaced {
+    // One pass to locate, a counting pass over the remainder for the
+    // occurrence total, with no separate full replace scan.
+    let Some(first) = body.find(old) else {
+        return match lenient_find(body, old) {
+            LenientMatch::Hit(hit) => Replaced::Lenient(apply_lenient(body, &hit, new)),
+            _ => Replaced::NotFound,
+        };
+    };
+    match body[first + old.len()..].matches(old).count() {
+        0 => Replaced::Exact(body.replacen(old, new, 1)),
+        extra => Replaced::Ambiguous(extra + 1),
+    }
+}
+
 // A text file as the editor has it, else from disk. An editor that cannot
 // read it (outside its project, say) leaves the disk to answer: the gate has
 // already allowed the read.
@@ -4103,11 +4132,7 @@ fn truncate(s: String, max: usize) -> String {
     // Back off to a UTF-8 char boundary — String::truncate / slicing panics if
     // `max` lands inside a multibyte glyph, which arbitrary file/command output
     // can easily produce.
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = s[..end].to_string();
+    let mut out = crate::config::cut_at_char_boundary(&s, max).to_string();
     out.push_str("\n…[truncated]");
     out
 }
@@ -4121,10 +4146,7 @@ fn truncate_head_tail(s: String, max: usize) -> String {
     }
     let head_len = HEAD_KEEP.min(max / 2);
     let tail_len = max - head_len;
-    let mut head_end = head_len;
-    while head_end > 0 && !s.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
+    let head_end = crate::config::cut_at_char_boundary(&s, head_len).len();
     let mut tail_start = s.len() - tail_len;
     while tail_start < s.len() && !s.is_char_boundary(tail_start) {
         tail_start += 1;
@@ -4145,14 +4167,10 @@ fn truncate_read(s: String, max: usize) -> String {
     }
     let total_bytes = s.len();
     let total_lines = s.lines().count();
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let shown_lines = s[..end].lines().count();
+    let shown = crate::config::cut_at_char_boundary(&s, max);
+    let shown_lines = shown.lines().count();
     format!(
-        "{}\n…[truncated: content is {total_bytes} bytes / {total_lines} lines total; showing the first {shown_lines} lines — pass start_line/end_line to read the rest in ranges]",
-        &s[..end]
+        "{shown}\n…[truncated: content is {total_bytes} bytes / {total_lines} lines total; showing the first {shown_lines} lines — pass start_line/end_line to read the rest in ranges]"
     )
 }
 
@@ -4162,11 +4180,10 @@ fn clip_line(line: &str, max: usize) -> String {
     if line.len() <= max {
         return line.to_string();
     }
-    let mut end = max;
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…[line truncated]", &line[..end])
+    format!(
+        "{}…[line truncated]",
+        crate::config::cut_at_char_boundary(line, max)
+    )
 }
 
 fn line_range(input: &Value) -> Option<(usize, usize)> {
@@ -6466,42 +6483,28 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if old.is_empty() {
                 return err("`old` text cannot be empty");
             }
-            // One pass to locate, a counting pass over the remainder for the
-            // occurrence total — still avoids a separate full replace scan.
-            let Some(first) = body.find(old) else {
-                // Tiered lenient fallback: a unique whitespace-tolerant hit is
-                // auto-applied; ambiguous or absent text keeps the diagnostic.
-                if let LenientMatch::Hit(hit) = lenient_find(&body, old) {
-                    checkpoint::record(cwd, &p, "edit_file");
-                    let updated = apply_lenient(&body, &hit, new);
-                    return match write_text(&p, &updated) {
-                        Ok(_) => {
-                            crate::report::diff(&p.display().to_string(), &body, &updated);
-                            ok(format!("edited {} ({LENIENT_MATCH_NOTE})", p.display()))
-                        }
-                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                    };
+            let (updated, note) = match replace_once(&body, old, new) {
+                Replaced::Exact(u) => (u, String::new()),
+                Replaced::Lenient(u) => (u, format!(" ({LENIENT_MATCH_NOTE})")),
+                Replaced::NotFound => {
+                    return err(format!(
+                        "`old` text not found in {}. {}.",
+                        p.display(),
+                        edit_not_found_hint(&body, old)
+                    ))
                 }
-                return err(format!(
-                    "`old` text not found in {}. {}.",
-                    p.display(),
-                    edit_not_found_hint(&body, old)
-                ));
+                Replaced::Ambiguous(n) => {
+                    return err(format!(
+                        "`old` text is not unique — it appears {n} times in {}; add surrounding context so it matches exactly once",
+                        p.display()
+                    ))
+                }
             };
-            let extra = body[first + old.len()..].matches(old).count();
-            if extra > 0 {
-                return err(format!(
-                    "`old` text is not unique — it appears {} times in {}; add surrounding context so it matches exactly once",
-                    extra + 1,
-                    p.display()
-                ));
-            }
             checkpoint::record(cwd, &p, "edit_file");
-            let updated = body.replacen(old, new, 1);
             match write_text(&p, &updated) {
                 Ok(_) => {
                     crate::report::diff(&p.display().to_string(), &body, &updated);
-                    ok(format!("edited {}", p.display()))
+                    ok(format!("edited {}{note}", p.display()))
                 }
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
@@ -7218,50 +7221,34 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     if old_str.is_empty() {
                         return err("old_str cannot be empty");
                     }
-                    let body = match fs::read_to_string(&p) {
+                    let body = match read_text(&p) {
                         Ok(b) => b,
                         Err(e) => return err(format!("cannot read {}: {e}", p.display())),
                     };
-                    let count = body.matches(old_str).count();
-                    if count == 0 {
-                        // Tiered lenient fallback: a unique whitespace-tolerant
-                        // hit is auto-applied; ambiguous or absent text keeps
-                        // the diagnostic.
-                        if let LenientMatch::Hit(hit) = lenient_find(&body, old_str) {
-                            let next = apply_lenient(&body, &hit, new_str);
-                            {
-                                let mut guard =
-                                    UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                                *guard = Some((p.clone(), body));
-                            }
-                            return match write_atomic(&p, &next) {
-                                Ok(_) => ok(format!(
-                                    "successfully edited file {} ({LENIENT_MATCH_NOTE})",
-                                    p.display()
-                                )),
-                                Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                            };
+                    let (next, note) = match replace_once(&body, old_str, new_str) {
+                        Replaced::Exact(u) => (u, String::new()),
+                        Replaced::Lenient(u) => (u, format!(" ({LENIENT_MATCH_NOTE})")),
+                        Replaced::NotFound => {
+                            return err(format!(
+                                "old text not found in {}. {}.\n\nold text sought:\n{}",
+                                p.display(),
+                                edit_not_found_hint(&body, old_str),
+                                old_str
+                            ))
                         }
-                        return err(format!(
-                            "old text not found in {}. {}.\n\nold text sought:\n{}",
-                            p.display(),
-                            edit_not_found_hint(&body, old_str),
-                            old_str
-                        ));
-                    }
-                    if count > 1 {
-                        return err(format!(
-                            "ambiguous replacement: old text matches {count} times in {}",
-                            p.display()
-                        ));
-                    }
-                    let next = body.replace(old_str, new_str);
+                        Replaced::Ambiguous(n) => {
+                            return err(format!(
+                                "ambiguous replacement: old text matches {n} times in {}",
+                                p.display()
+                            ))
+                        }
+                    };
                     {
                         let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
                         *guard = Some((p.clone(), body));
                     }
-                    match write_atomic(&p, &next) {
-                        Ok(_) => ok(format!("successfully edited file {}", p.display())),
+                    match write_text(&p, &next) {
+                        Ok(_) => ok(format!("successfully edited file {}{note}", p.display())),
                         Err(e) => err(format!("cannot write {}: {e}", p.display())),
                     }
                 }
