@@ -320,6 +320,6 @@ All done (ENT-001 to ENT-008). One plan finding was wrong: `RuleEngine::new` is 
 ### Found along the way
 
 - **Fixed:** the running turn's task label was one global, so one folder's turn could stamp another's checkpoints. It also made a checkpoint test fail about one run in five; it now fails 0 in 30.
-- **Not fixed:** a headless run piped into a reader that closes early (`bwn run … | head -1`) panics with exit code 101.
-- **Not fixed:** `.buildwithnexus/knowledge/entities.json` in this repository uses an older shape, an array without `last_updated`, so it has never loaded. The deleted `schema.json` described that shape.
-- **Not fixed:** on Windows, clippy flags `sig.unwrap_or(0)` in `hooks.rs`. It is on `main` too, and CI does not run clippy on Windows.
+- **Fixed:** a headless run piped into a reader that closes early (`bwn run … | head -1`) panicked with exit code 101. It now ends quietly with 141, the code a shell reports for SIGPIPE. SIGPIPE itself stays ignored, since sockets and hook pipes need it.
+- **Fixed:** `.buildwithnexus/knowledge/entities.json` used an older shape, so it had never loaded. It is now in the loader's shape with its content kept, and a test guards that it loads and names real paths. It adds about 3.9 KB to the prompt of sessions run in this repository. ADR-003 (four dependencies) is marked superseded, because the crate has ten.
+- **Fixed:** the Windows clippy lint in `hooks.rs`, and two test helpers only Unix tests use. Windows clippy is clean for all targets, though CI still does not run it.
