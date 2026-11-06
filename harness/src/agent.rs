@@ -38,6 +38,24 @@ const MAX_VERIFIER_FIX_ROUNDS: usize = 2;
 const MAX_ACT_NUDGES: usize = 2;
 
 // ── context compaction ────────────────────────────────────────────────────────
+// The length of `v` serialized as compact JSON, without building the string:
+// this runs on every step, over every tool input in the conversation.
+fn json_len(v: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
+}
+
 fn estimate_tokens(msgs: &[Msg]) -> usize {
     let mut chars = 0usize;
     for m in msgs {
@@ -50,7 +68,7 @@ fn estimate_tokens(msgs: &[Msg]) -> usize {
                 text.len()
                     + calls
                         .iter()
-                        .map(|c| c.name.len() + c.input.to_string().len())
+                        .map(|c| c.name.len() + json_len(&c.input))
                         .sum::<usize>()
             }
             Msg::Tool(rs) => rs
@@ -727,8 +745,8 @@ fn request_reply(
             }
             thinking.borrow_mut().finish();
             renderer.push(c);
+            // Drains typed keys and repaints the composer once.
             tui::poll_typeahead();
-            tui::render_queued_composer();
             streamed = true;
         },
         &mut |t| {

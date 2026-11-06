@@ -1455,10 +1455,11 @@ impl StreamRenderer {
         loop {
             match self.pending.find('\n') {
                 Some(nl) => {
-                    let line_text = self.pending[..nl].to_string();
-                    self.pending = self.pending[nl + 1..].to_string();
-                    // Any echoed raw prefix belongs to this line; the next
-                    // line starts un-echoed.
+                    // Take the line out in place; the rest is not copied.
+                    let mut line_text: String = self.pending.drain(..=nl).collect();
+                    line_text.pop(); // the '\n'
+                                     // Any echoed raw prefix belongs to this line; the next
+                                     // line starts un-echoed.
                     let had_partial = std::mem::take(&mut self.shown) > 0;
                     self.process_line(&line_text, had_partial);
                 }
@@ -7084,26 +7085,46 @@ fn path_candidates(partial: &str, cwd: &std::path::Path) -> Vec<String> {
     out
 }
 
-// The project's file list for `@` completion, walked at most every five
-// seconds: the popup asks on every keystroke.
-fn project_files_cached(cwd: &std::path::Path) -> Vec<String> {
+// The project's file list for `@` completion. The popup asks on every
+// keystroke, so the list is shared rather than copied, and once it is five
+// seconds old it is rebuilt on a background thread while the old list keeps
+// answering: typing never waits on a walk after the first one.
+fn project_files_cached(cwd: &std::path::Path) -> Arc<Vec<String>> {
+    struct Entry {
+        at: u64,
+        dir: std::path::PathBuf,
+        files: Arc<Vec<String>>,
+        refreshing: bool,
+    }
     // One entry per folder: the working folder and each added one.
-    #[allow(clippy::type_complexity)]
-    static CACHE: OnceLock<Mutex<Vec<(u64, std::path::PathBuf, Vec<String>)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
     let now = monotonic_ms();
-    if let Ok(c) = cache.lock() {
-        if let Some((_, _, files)) = c
-            .iter()
-            .find(|(ts, dir, _)| dir == cwd && now.saturating_sub(*ts) < 5_000)
-        {
-            return files.clone();
+    if let Ok(mut c) = CACHE.lock() {
+        if let Some(e) = c.iter_mut().find(|e| e.dir == cwd) {
+            if now.saturating_sub(e.at) >= 5_000 && !e.refreshing {
+                e.refreshing = true;
+                let dir = cwd.to_path_buf();
+                std::thread::spawn(move || {
+                    let files = Arc::new(crate::tools::project_files(&dir));
+                    if let Ok(mut c) = CACHE.lock() {
+                        if let Some(e) = c.iter_mut().find(|e| e.dir == dir) {
+                            (e.at, e.files, e.refreshing) = (monotonic_ms(), files, false);
+                        }
+                    }
+                });
+            }
+            return e.files.clone();
         }
     }
-    let files = crate::tools::project_files(cwd);
-    if let Ok(mut c) = cache.lock() {
-        c.retain(|(_, dir, _)| dir != cwd);
-        c.push((now, cwd.to_path_buf(), files.clone()));
+    let files = Arc::new(crate::tools::project_files(cwd));
+    if let Ok(mut c) = CACHE.lock() {
+        c.retain(|e| e.dir != cwd);
+        c.push(Entry {
+            at: now,
+            dir: cwd.to_path_buf(),
+            files: files.clone(),
+            refreshing: false,
+        });
     }
     files
 }

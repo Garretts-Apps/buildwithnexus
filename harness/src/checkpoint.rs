@@ -330,6 +330,11 @@ struct GitSnap {
 }
 
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
+    git_run(cwd, args).and_then(|(ok, out)| ok.then_some(out))
+}
+
+// Whether git succeeded, and what it printed either way.
+fn git_run(cwd: &Path, args: &[&str]) -> Option<(bool, String)> {
     let o = std::process::Command::new("git")
         .args(["-c", "core.fsmonitor=false"])
         .args(args)
@@ -338,9 +343,10 @@ fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    o.status
-        .success()
-        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+    Some((
+        o.status.success(),
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+    ))
 }
 
 // git honours the repository's own config, which can name programs to run;
@@ -360,8 +366,15 @@ fn git_snapshot(cwd: &Path) -> Option<GitSnap> {
     if !git_allowed(cwd) {
         return None;
     }
-    let top = PathBuf::from(git_out(cwd, &["rev-parse", "--show-toplevel"])?.trim());
-    let head = git_out(cwd, &["rev-parse", "--verify", "-q", "HEAD"]).map(|h| h.trim().to_string());
+    // One process for both: the top folder, then HEAD. In a repository with
+    // no commit yet git exits 1 but still prints the top folder.
+    let (ok, out) = git_run(
+        cwd,
+        &["rev-parse", "--show-toplevel", "--verify", "-q", "HEAD"],
+    )?;
+    let mut lines = out.lines();
+    let top = PathBuf::from(lines.next().filter(|t| !t.trim().is_empty())?.trim());
+    let head = lines.next().filter(|_| ok).map(|h| h.trim().to_string());
     let status = git_out(
         cwd,
         &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
@@ -1367,6 +1380,25 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn git_snapshot_reads_the_top_folder_with_and_without_a_commit() {
+        let d = scratch("snaptop");
+        git(&d, &["init", "-q"]);
+        let top = |s: &GitSnap| fs::canonicalize(&s.top).unwrap();
+        let unborn = git_snapshot(&d).expect("an unborn repository still snapshots");
+        assert_eq!(top(&unborn), fs::canonicalize(&d).unwrap());
+        assert_eq!(unborn.head, None);
+        git(&d, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        let born = git_snapshot(&d).expect("snapshot");
+        assert_eq!(top(&born), fs::canonicalize(&d).unwrap());
+        assert!(
+            born.head.as_deref().is_some_and(|h| h.len() == 40),
+            "{:?}",
+            born.head
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
