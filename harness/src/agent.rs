@@ -1980,11 +1980,6 @@ pub fn clear_session_allowed(cwd: &Path) {
     }
 }
 
-#[allow(dead_code)]
-fn confirm(label: &str) -> Option<String> {
-    confirm_tool(label, "", Path::new("."))
-}
-
 /// How a headless run ended short of success, each with its own exit code.
 /// Exit 0 is kept for real success; 1 (failed) and 2 (usage) predate this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
