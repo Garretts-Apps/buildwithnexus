@@ -4442,88 +4442,110 @@ fn glob_char(p: &[char], pi: usize, c: char) -> Option<usize> {
     }
 }
 
-// (is folder, is file) for a walked entry. The directory listing already
-// knows the type, so only a symlink costs a stat (to follow it, as the walk
-// always has).
-fn entry_kind(entry: &fs::DirEntry, path: &Path) -> (bool, bool) {
-    match entry.file_type() {
-        Ok(t) if !t.is_symlink() => (t.is_dir(), t.is_file()),
-        _ => (path.is_dir(), path.is_file()),
+// What a project walk collects and how far it has got. Folders reached
+// through a symlink are remembered by their real path, so a link back up the
+// tree (or a ring of links) is not walked again under ever longer paths.
+struct Walk<'a> {
+    out: &'a mut Vec<PathBuf>,
+    seen: &'a mut usize,
+    dirs: bool,
+    files: bool,
+    skip_sensitive: bool,
+    linked: HashSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    fn run(&mut self, root: &Path) {
+        if let Ok(real) = fs::canonicalize(root) {
+            self.linked.insert(real);
+        }
+        self.dir(root, &Ignores::for_root(root));
+    }
+
+    fn dir(&mut self, root: &Path, ignores: &Ignores) {
+        if *self.seen >= MAX_SEARCH_FILES {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            if *self.seen >= MAX_SEARCH_FILES {
+                break;
+            }
+            let path = entry.path();
+            // The listing already knows the type; only a symlink costs a stat.
+            let (is_dir, is_file, is_link) = match entry.file_type() {
+                Ok(t) if !t.is_symlink() => (t.is_dir(), t.is_file(), false),
+                _ => (path.is_dir(), path.is_file(), true),
+            };
+            if is_dir {
+                if skip_dir(&path)
+                    || ignores.ignored(&path, true)
+                    || !self.follow(&path, root, is_link)
+                {
+                    continue;
+                }
+                if self.dirs {
+                    *self.seen += 1;
+                    self.out.push(path.clone());
+                }
+                match ignores.with_dir(&path) {
+                    Some(inner) => self.dir(&path, &inner),
+                    None => self.dir(&path, ignores),
+                }
+            } else if self.files
+                && is_file
+                && !(self.skip_sensitive && is_sensitive(&path))
+                && !ignores.ignored(&path, false)
+            {
+                *self.seen += 1;
+                self.out.push(path);
+            }
+        }
+    }
+
+    // A linked folder is walked unless it holds the folder being walked or
+    // was already reached through a link.
+    fn follow(&mut self, path: &Path, parent: &Path, is_link: bool) -> bool {
+        if !is_link {
+            return true;
+        }
+        let Ok(real) = fs::canonicalize(path) else {
+            return false;
+        };
+        if fs::canonicalize(parent).is_ok_and(|p| p.starts_with(&real)) {
+            return false;
+        }
+        self.linked.insert(real)
     }
 }
 
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize) {
-    collect_files_in(root, &Ignores::for_root(root), out, seen);
-}
-
-fn collect_files_in(root: &Path, ignores: &Ignores, out: &mut Vec<PathBuf>, seen: &mut usize) {
-    if *seen >= MAX_SEARCH_FILES {
-        return;
+    let (dirs, files, skip_sensitive) = (false, true, true);
+    let linked = HashSet::new();
+    Walk {
+        out,
+        seen,
+        dirs,
+        files,
+        skip_sensitive,
+        linked,
     }
-    let Ok(rd) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in rd.filter_map(|e| e.ok()) {
-        if *seen >= MAX_SEARCH_FILES {
-            break;
-        }
-        let path = entry.path();
-        let (is_dir, is_file) = entry_kind(&entry, &path);
-        if is_dir {
-            if !skip_dir(&path) && !ignores.ignored(&path, true) {
-                match ignores.with_dir(&path) {
-                    Some(inner) => collect_files_in(&path, &inner, out, seen),
-                    None => collect_files_in(&path, ignores, out, seen),
-                }
-            }
-        } else if is_file && !is_sensitive(&path) && !ignores.ignored(&path, false) {
-            *seen += 1;
-            out.push(path);
-        }
-    }
+    .run(root);
 }
 
 fn collect_paths(root: &Path, out: &mut Vec<PathBuf>, seen: &mut usize, dirs: bool, files: bool) {
-    collect_paths_in(root, &Ignores::for_root(root), out, seen, dirs, files);
-}
-
-fn collect_paths_in(
-    root: &Path,
-    ignores: &Ignores,
-    out: &mut Vec<PathBuf>,
-    seen: &mut usize,
-    dirs: bool,
-    files: bool,
-) {
-    if *seen >= MAX_SEARCH_FILES {
-        return;
+    let linked = HashSet::new();
+    Walk {
+        out,
+        seen,
+        dirs,
+        files,
+        skip_sensitive: false,
+        linked,
     }
-    let Ok(rd) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in rd.filter_map(|e| e.ok()) {
-        if *seen >= MAX_SEARCH_FILES {
-            break;
-        }
-        let path = entry.path();
-        let (is_dir, is_file) = entry_kind(&entry, &path);
-        if is_dir {
-            if skip_dir(&path) || ignores.ignored(&path, true) {
-                continue;
-            }
-            if dirs {
-                *seen += 1;
-                out.push(path.clone());
-            }
-            match ignores.with_dir(&path) {
-                Some(inner) => collect_paths_in(&path, &inner, out, seen, dirs, files),
-                None => collect_paths_in(&path, ignores, out, seen, dirs, files),
-            }
-        } else if files && is_file && !ignores.ignored(&path, false) {
-            *seen += 1;
-            out.push(path);
-        }
-    }
+    .run(root);
 }
 
 /// The entries of `dir` (name, is_folder) that a project walk rooted at
@@ -4606,6 +4628,27 @@ pub fn rank_by_name(files: &[String], query: &str, limit: usize) -> Vec<String> 
 #[cfg(test)]
 mod walker_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn walks_follow_links_out_but_not_round_a_loop() {
+        let d = std::env::temp_dir().join(format!("bwn-walk-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let outside = d.with_extension("outside");
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(d.join("src/a.rs"), "x").unwrap();
+        fs::write(outside.join("b.rs"), "y").unwrap();
+        // A link back up the tree, and one to a folder outside it.
+        std::os::unix::fs::symlink("..", d.join("src/up")).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("ext")).unwrap();
+        let mut files = project_files(&d);
+        files.sort();
+        assert_eq!(files, ["ext/b.rs", "src/a.rs"]);
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&outside);
+    }
     use serde_json::json;
 
     fn fixture(tag: &str) -> PathBuf {

@@ -4874,146 +4874,28 @@ fn handle_kb_index(cwd: &std::path::Path) {
     ));
     let mut count = 0;
     tui::set_agent_running(true);
-    let mut dirs_to_visit = vec![cwd.to_path_buf()];
-    while let Some(dir) = dirs_to_visit.pop() {
+    for rel_path in tools::project_files(cwd) {
         if tui::interrupted() {
             break;
         }
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.')
-                    || name == "target"
-                    || name == "node_modules"
-                    || name == "vendor"
-                    || name == "dist"
-                {
-                    continue;
-                }
-                if path.is_dir() {
-                    dirs_to_visit.push(path);
-                } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
-                        let rel_path = path
-                            .strip_prefix(cwd)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .to_string();
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            for line in content.lines() {
-                                let trimmed = line.trim();
-                                let mut entity_type = None;
-                                let mut sym_name = None;
-                                if ext == "rs" {
-                                    if trimmed.starts_with("fn ")
-                                        || trimmed.starts_with("pub fn ")
-                                        || trimmed.starts_with("async fn ")
-                                        || trimmed.starts_with("pub async fn ")
-                                    {
-                                        entity_type = Some(crate::knowledge::EntityType::Function);
-                                        if let Some(idx) = trimmed.find("fn ") {
-                                            let rest = &trimmed[idx + 3..];
-                                            if let Some(paren) = rest.find('(') {
-                                                sym_name = Some(rest[..paren].trim().to_string());
-                                            }
-                                        }
-                                    } else if trimmed.starts_with("struct ")
-                                        || trimmed.starts_with("pub struct ")
-                                    {
-                                        entity_type = Some(crate::knowledge::EntityType::Class);
-                                        if let Some(idx) = trimmed.find("struct ") {
-                                            let rest = &trimmed[idx + 7..];
-                                            let name_part =
-                                                rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(
-                                                name_part
-                                                    .trim_matches(|c| {
-                                                        c == '{' || c == '(' || c == ';'
-                                                    })
-                                                    .to_string(),
-                                            );
-                                        }
-                                    } else if trimmed.starts_with("enum ")
-                                        || trimmed.starts_with("pub enum ")
-                                    {
-                                        entity_type = Some(crate::knowledge::EntityType::Class);
-                                        if let Some(idx) = trimmed.find("enum ") {
-                                            let rest = &trimmed[idx + 5..];
-                                            let name_part =
-                                                rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(
-                                                name_part
-                                                    .trim_matches(|c| {
-                                                        c == '{' || c == '(' || c == ';'
-                                                    })
-                                                    .to_string(),
-                                            );
-                                        }
-                                    }
-                                } else if ext == "py" {
-                                    if let Some(rest) = trimmed.strip_prefix("def ") {
-                                        entity_type = Some(crate::knowledge::EntityType::Function);
-                                        if let Some(paren) = rest.find('(') {
-                                            sym_name = Some(rest[..paren].trim().to_string());
-                                        }
-                                    } else if let Some(rest) = trimmed.strip_prefix("class ") {
-                                        entity_type = Some(crate::knowledge::EntityType::Class);
-                                        if let Some(paren) = rest.find(['(', ':']) {
-                                            sym_name = Some(rest[..paren].trim().to_string());
-                                        }
-                                    }
-                                } else if matches!(ext, "js" | "ts") {
-                                    if trimmed.starts_with("function ")
-                                        || trimmed.starts_with("export function ")
-                                    {
-                                        entity_type = Some(crate::knowledge::EntityType::Function);
-                                        if let Some(idx) = trimmed.find("function ") {
-                                            let rest = &trimmed[idx + 9..];
-                                            if let Some(paren) = rest.find('(') {
-                                                sym_name = Some(rest[..paren].trim().to_string());
-                                            }
-                                        }
-                                    } else if trimmed.starts_with("class ")
-                                        || trimmed.starts_with("export class ")
-                                    {
-                                        entity_type = Some(crate::knowledge::EntityType::Class);
-                                        if let Some(idx) = trimmed.find("class ") {
-                                            let rest = &trimmed[idx + 6..];
-                                            let name_part =
-                                                rest.split_whitespace().next().unwrap_or("");
-                                            sym_name = Some(
-                                                name_part.trim_matches(|c| c == '{').to_string(),
-                                            );
-                                        }
-                                    }
-                                }
-                                if let (Some(et), Some(sn)) = (entity_type, sym_name) {
-                                    if !sn.is_empty()
-                                        && sn
-                                            .chars()
-                                            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-                                    {
-                                        let id = format!("{sn}@{rel_path}");
-                                        kb.add_entity(crate::knowledge::Entity {
-                                            id,
-                                            entity_type: et,
-                                            name: sn,
-                                            path: Some(rel_path.clone()),
-                                            description: Some(format!(
-                                                "Extracted symbol from {rel_path}"
-                                            )),
-                                            metadata: serde_json::json!({"auto_indexed": true}),
-                                            last_updated: crate::knowledge::chrono_now_iso(),
-                                        });
-                                        count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let ext = rel_path.rsplit_once('.').map_or("", |(_, e)| e);
+        if !matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(cwd.join(&rel_path)) else {
+            continue;
+        };
+        for (entity_type, name) in content.lines().filter_map(|l| extract_symbol(ext, l)) {
+            kb.add_entity(crate::knowledge::Entity {
+                id: format!("{name}@{rel_path}"),
+                entity_type,
+                name,
+                path: Some(rel_path.clone()),
+                description: Some(format!("Extracted symbol from {rel_path}")),
+                metadata: serde_json::json!({"auto_indexed": true}),
+                last_updated: crate::knowledge::chrono_now_iso(),
+            });
+            count += 1;
         }
     }
     tui::set_agent_running(false);
@@ -5028,6 +4910,55 @@ fn handle_kb_index(cwd: &std::path::Path) {
             "  tip: @kb:<name> or @symbol:<name> injects symbol definitions into prompts",
         ));
     }
+}
+
+/// The function or type a source line declares, by the line's own keyword:
+/// `fn`/`struct`/`enum` in Rust, `def`/`class` in Python, `function`/`class`
+/// in JavaScript and TypeScript. A line-based scan, not a parser; names that
+/// are not plain identifiers are dropped.
+fn extract_symbol(ext: &str, line: &str) -> Option<(crate::knowledge::EntityType, String)> {
+    use crate::knowledge::EntityType::{Class, Function};
+    let t = line.trim();
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|p| t.starts_with(p));
+    // The text after `kw`, up to the first of `stops`.
+    let name_before = |kw: &str, stops: &[char]| {
+        let rest = &t[t.find(kw)? + kw.len()..];
+        Some(rest[..rest.find(stops)?].trim().to_string())
+    };
+    // The first word after `kw`, without the punctuation that can follow it.
+    let word_after = |kw: &str, trim: &[char]| {
+        let rest = &t[t.find(kw)? + kw.len()..];
+        Some(
+            rest.split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(trim)
+                .to_string(),
+        )
+    };
+    let (kind, name) = match ext {
+        "rs" if starts(&["fn ", "pub fn ", "async fn ", "pub async fn "]) => {
+            (Function, name_before("fn ", &['('])?)
+        }
+        "rs" if starts(&["struct ", "pub struct "]) => {
+            (Class, word_after("struct ", &['{', '(', ';'])?)
+        }
+        "rs" if starts(&["enum ", "pub enum "]) => (Class, word_after("enum ", &['{', '(', ';'])?),
+        "py" if t.starts_with("def ") => (Function, name_before("def ", &['('])?),
+        "py" if t.starts_with("class ") => (Class, name_before("class ", &['(', ':'])?),
+        "js" | "ts" if starts(&["function ", "export function "]) => {
+            (Function, name_before("function ", &['('])?)
+        }
+        "js" | "ts" if starts(&["class ", "export class "]) => {
+            (Class, word_after("class ", &['{'])?)
+        }
+        _ => return None,
+    };
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+    plain.then_some((kind, name))
 }
 
 // ── review ───────────────────────────────────────────────────────────────────
@@ -10229,6 +10160,23 @@ mod tests {
         assert!(kb.entities.values().any(|e| e.name == "SessionData"));
 
         super::handle_rules(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A symlink back up the tree must not make the indexer walk the project
+    // again and again under ever longer paths.
+    #[cfg(unix)]
+    #[test]
+    fn kb_index_does_not_follow_a_symlink_loop() {
+        let dir = std::env::temp_dir().join(format!("bwn-kb-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::os::unix::fs::symlink("..", dir.join("src/up")).unwrap();
+        super::handle_kb_index(&dir);
+        let kb = crate::knowledge::KnowledgeBase::new(&dir.to_string_lossy());
+        let ids: Vec<&String> = kb.entities.keys().collect();
+        assert_eq!(ids, ["alpha@src/a.rs"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
