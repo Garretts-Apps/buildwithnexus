@@ -1196,6 +1196,320 @@ pub(super) fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) 
     }
 }
 
+/// ↑/↓ through the prompt history. The first ↑ stashes the draft and
+/// recalls only entries that start with it; ↓ past the newest match brings
+/// the draft back instead of clearing the line. Editing a recalled entry
+/// ends the recall.
+#[derive(Default)]
+struct HistoryRecall {
+    idx: Option<usize>,
+    draft: Vec<char>,
+    prefix: String,
+}
+
+impl HistoryRecall {
+    // Whether `buf` still shows the recalled entry; editing it ends recall.
+    fn still_showing(&mut self, h: &[String], buf: &[char]) {
+        if self
+            .idx
+            .is_some_and(|cur| buf != h[cur].chars().collect::<Vec<char>>().as_slice())
+        {
+            self.idx = None;
+        }
+    }
+
+    fn up(&mut self, h: &[String], buf: &mut Vec<char>, cursor: &mut usize) {
+        if h.is_empty() {
+            return;
+        }
+        self.still_showing(h, buf);
+        if self.idx.is_none() {
+            self.draft = buf.clone();
+            self.prefix = buf.iter().collect();
+        }
+        if let Some(idx) = hist_match(h, &self.prefix, self.idx, true) {
+            self.idx = Some(idx);
+            *buf = h[idx].chars().collect();
+            *cursor = buf.len();
+        }
+    }
+
+    fn down(&mut self, h: &[String], buf: &mut Vec<char>, cursor: &mut usize) {
+        self.still_showing(h, buf);
+        let Some(cur) = self.idx else {
+            return;
+        };
+        match hist_match(h, &self.prefix, Some(cur), false) {
+            Some(idx) => {
+                self.idx = Some(idx);
+                *buf = h[idx].chars().collect();
+            }
+            None => {
+                self.idx = None;
+                *buf = self.draft.clone();
+            }
+        }
+        *cursor = buf.len();
+    }
+}
+
+/// A key typed in vim NORMAL mode: motions, edits that fill the kill
+/// buffer (and the clipboard over OSC 52), undo, and the ways into INSERT
+/// and VISUAL.
+fn vim_normal_key(
+    c: char,
+    buf: &mut Vec<char>,
+    cursor: &mut usize,
+    kill: &mut String,
+    vim_state: &mut VimState,
+    undo: &mut Vec<Vec<char>>,
+) {
+    match c {
+        'i' => *vim_state = VimState::Insert,
+        'a' => {
+            if *cursor < buf.len() {
+                *cursor += 1;
+            }
+            *vim_state = VimState::Insert;
+        }
+        'I' => {
+            *cursor = 0;
+            *vim_state = VimState::Insert;
+        }
+        'A' => {
+            *cursor = buf.len();
+            *vim_state = VimState::Insert;
+        }
+        'h' => *cursor = cursor.saturating_sub(1),
+        'l' => {
+            if *cursor < buf.len() {
+                *cursor += 1;
+            }
+        }
+        '0' | '^' => *cursor = 0,
+        '$' => *cursor = buf.len(),
+        'w' => *cursor = next_word(buf, *cursor),
+        'b' => *cursor = prev_word(buf, *cursor),
+        'e' => *cursor = end_word(buf, *cursor),
+        's' => {
+            if *cursor < buf.len() {
+                *kill = buf[*cursor..=*cursor].iter().collect();
+                buf.remove(*cursor);
+            }
+            *vim_state = VimState::Insert;
+        }
+        'o' => {
+            buf.push('\n');
+            *cursor = buf.len();
+            *vim_state = VimState::Insert;
+        }
+        'O' => {
+            buf.insert(0, '\n');
+            *cursor = 0;
+            *vim_state = VimState::Insert;
+        }
+        'x' => {
+            if *cursor < buf.len() {
+                *kill = buf[*cursor..=*cursor].iter().collect();
+                buf.remove(*cursor);
+                if !kill.is_empty() {
+                    osc52_copy(kill);
+                }
+            }
+        }
+        'D' => {
+            *kill = buf[*cursor..].iter().collect();
+            buf.truncate(*cursor);
+            if !kill.is_empty() {
+                osc52_copy(kill);
+            }
+        }
+        'C' => {
+            *kill = buf[*cursor..].iter().collect();
+            buf.truncate(*cursor);
+            if !kill.is_empty() {
+                osc52_copy(kill);
+            }
+            *vim_state = VimState::Insert;
+        }
+        'p' => {
+            for ch in kill.chars() {
+                if *cursor < buf.len() {
+                    buf.insert(*cursor + 1, ch);
+                    *cursor += 1;
+                } else {
+                    buf.push(ch);
+                    *cursor = buf.len();
+                }
+            }
+        }
+        'u' => {
+            if let Some(prev) = undo.pop() {
+                *buf = prev;
+                *cursor = (*cursor).min(buf.len());
+            }
+        }
+        ':' => {
+            buf.clear();
+            buf.push('/');
+            *cursor = 1;
+            *vim_state = VimState::Insert;
+        }
+        // On an empty line `/` starts a command as typed, so
+        // /vim (or any command) works from NORMAL mode.
+        '/' if buf.is_empty() => {
+            buf.push('/');
+            *cursor = 1;
+            *vim_state = VimState::Insert;
+        }
+        'v' => *vim_state = VimState::Visual(*cursor),
+        _ => {}
+    }
+}
+
+/// A key typed in vim VISUAL mode: motions extend the selection, and `d`,
+/// `x` or `y` act on it and return to NORMAL.
+fn vim_visual_key(
+    c: char,
+    buf: &mut Vec<char>,
+    cursor: &mut usize,
+    kill: &mut String,
+    vim_state: &mut VimState,
+) {
+    let VimState::Visual(start_idx) = *vim_state else {
+        unreachable!()
+    };
+    match c {
+        'h' => *cursor = cursor.saturating_sub(1),
+        'l' => {
+            if *cursor < buf.len() {
+                *cursor += 1;
+            }
+        }
+        'w' => *cursor = next_word(buf, *cursor),
+        'b' => *cursor = prev_word(buf, *cursor),
+        'e' => *cursor = end_word(buf, *cursor),
+        '0' | '^' => *cursor = 0,
+        '$' => *cursor = buf.len(),
+        'd' | 'x' => {
+            let min_i = start_idx.min(*cursor);
+            let max_i = start_idx.max(*cursor).min(buf.len().saturating_sub(1));
+            if min_i <= max_i && max_i < buf.len() {
+                *kill = buf[min_i..=max_i].iter().collect();
+                buf.drain(min_i..=max_i);
+                *cursor = min_i.min(buf.len());
+                if !kill.is_empty() {
+                    osc52_copy(kill);
+                }
+            }
+            *vim_state = VimState::Normal;
+        }
+        'y' => {
+            let min_i = start_idx.min(*cursor);
+            let max_i = start_idx.max(*cursor).min(buf.len().saturating_sub(1));
+            if min_i <= max_i && max_i < buf.len() {
+                *kill = buf[min_i..=max_i].iter().collect();
+                if !kill.is_empty() {
+                    osc52_copy(kill);
+                }
+            }
+            *vim_state = VimState::Normal;
+        }
+        _ => {}
+    }
+}
+
+/// Ctrl+R: incremental search back through the prompt history, drawn on
+/// the composer row. Returns the entry to send when Enter picks one;
+/// otherwise `buf` and `cursor` hold the match to edit (Esc, Tab) or the
+/// draft as it was (Ctrl+C, Ctrl+G, or Enter with no match).
+fn reverse_search(buf: &mut Vec<char>, cursor: &mut usize, row: u16) -> Option<String> {
+    let snapshot = (buf.clone(), *cursor);
+    let mut query = String::new();
+    let mut skip = 0usize;
+    loop {
+        let m = {
+            let h = history().lock();
+            h.ok().and_then(|h| history_search(&h, &query, skip))
+        };
+        {
+            let mut out = io::stdout();
+            if ALT_SCREEN.load(Ordering::Relaxed) {
+                queue_composer_box(&mut out);
+                let _ = write!(
+                    out,
+                    "{}{}",
+                    dim(&format!("(reverse-i-search)`{query}`: ")),
+                    m.as_deref().unwrap_or("")
+                );
+                queue_composer_right_border(&mut out);
+            } else {
+                let _ = queue!(out, MoveTo(0, row), Clear(ClearType::UntilNewLine));
+                let _ = write!(
+                    out,
+                    "{}{}",
+                    dim(&format!("(reverse-i-search)`{query}`: ")),
+                    m.as_deref().unwrap_or("")
+                );
+            }
+            let _ = out.flush();
+        }
+        let ev = match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
+            Ok(_) => continue,
+            Err(_) => {
+                *buf = snapshot.0;
+                *cursor = snapshot.1;
+                break;
+            }
+        };
+        let c = ev.modifiers.contains(KeyModifiers::CONTROL);
+        match ev.code {
+            KeyCode::Char('r') if c => {
+                if m.is_some() {
+                    skip += 1;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('g') if c => {
+                *buf = snapshot.0;
+                *cursor = snapshot.1;
+                break;
+            }
+            KeyCode::Char(ch) if !c => {
+                query.push(ch);
+                skip = 0;
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                skip = 0;
+            }
+            KeyCode::Enter => {
+                if m.is_some() {
+                    return m;
+                }
+                *buf = snapshot.0;
+                *cursor = snapshot.1;
+                break;
+            }
+            KeyCode::Esc | KeyCode::Tab => {
+                match m {
+                    Some(e) => {
+                        *buf = e.chars().collect();
+                        *cursor = buf.len();
+                    }
+                    None => {
+                        *buf = snapshot.0;
+                        *cursor = snapshot.1;
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // `composer` is the session's main input (ask_task): it cycles modes, shows
 // the autocomplete popup, and quits on a second Ctrl+C. Anything else is a
 // prompt (ask): Esc and Ctrl+C cancel it and return None.
@@ -1225,11 +1539,7 @@ pub(super) fn read_line_raw_prefill(
     // A first Esc on an empty composer arms /rewind (see esc_esc_rewinds).
     let mut esc_armed_at: Option<u64> = None;
     redraw(prompt, start, &buf, cursor, &mut scroll);
-    let mut hist_idx: Option<usize> = None;
-    // ↑ stashes the in-progress draft (and its prefix filter); ↓ past the
-    // newest matching entry restores the draft instead of clearing the line.
-    let mut hist_draft: Vec<char> = Vec::new();
-    let mut hist_prefix = String::new();
+    let mut recall = HistoryRecall::default();
     let mut kill = String::new();
     let mut vim_state = if is_vim_mode() {
         VimState::Normal
@@ -1590,90 +1900,10 @@ pub(super) fn read_line_raw_prefill(
                 reline!();
             }
             KeyCode::Char('r') if ctrl => {
-                let snapshot = (buf.clone(), cursor);
-                let mut query = String::new();
-                let mut skip = 0usize;
-                loop {
-                    let m = {
-                        let h = history().lock();
-                        h.ok().and_then(|h| history_search(&h, &query, skip))
-                    };
-                    {
-                        let mut out = io::stdout();
-                        if ALT_SCREEN.load(Ordering::Relaxed) {
-                            queue_composer_box(&mut out);
-                            let _ = write!(
-                                out,
-                                "{}{}",
-                                dim(&format!("(reverse-i-search)`{query}`: ")),
-                                m.as_deref().unwrap_or("")
-                            );
-                            queue_composer_right_border(&mut out);
-                        } else {
-                            let _ = queue!(out, MoveTo(0, start.1), Clear(ClearType::UntilNewLine));
-                            let _ = write!(
-                                out,
-                                "{}{}",
-                                dim(&format!("(reverse-i-search)`{query}`: ")),
-                                m.as_deref().unwrap_or("")
-                            );
-                        }
-                        let _ = out.flush();
-                    }
-                    let ev = match read() {
-                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => k,
-                        Ok(_) => continue,
-                        Err(_) => {
-                            buf = snapshot.0;
-                            cursor = snapshot.1;
-                            break;
-                        }
-                    };
-                    let c = ev.modifiers.contains(KeyModifiers::CONTROL);
-                    match ev.code {
-                        KeyCode::Char('r') if c => {
-                            if m.is_some() {
-                                skip += 1;
-                            }
-                        }
-                        KeyCode::Char('c') | KeyCode::Char('g') if c => {
-                            buf = snapshot.0;
-                            cursor = snapshot.1;
-                            break;
-                        }
-                        KeyCode::Char(ch) if !c => {
-                            query.push(ch);
-                            skip = 0;
-                        }
-                        KeyCode::Backspace => {
-                            query.pop();
-                            skip = 0;
-                        }
-                        KeyCode::Enter => {
-                            if let Some(e) = m {
-                                release!();
-                                echo_submitted(prompt, &e);
-                                return Some(RawLine::Submit(e, false));
-                            }
-                            buf = snapshot.0;
-                            cursor = snapshot.1;
-                            break;
-                        }
-                        KeyCode::Esc | KeyCode::Tab => {
-                            match m {
-                                Some(e) => {
-                                    buf = e.chars().collect();
-                                    cursor = buf.len();
-                                }
-                                None => {
-                                    buf = snapshot.0;
-                                    cursor = snapshot.1;
-                                }
-                            }
-                            break;
-                        }
-                        _ => {}
-                    }
+                if let Some(e) = reverse_search(&mut buf, &mut cursor, start.1) {
+                    release!();
+                    echo_submitted(prompt, &e);
+                    return Some(RawLine::Submit(e, false));
                 }
                 reline!();
             }
@@ -1687,149 +1917,16 @@ pub(super) fn read_line_raw_prefill(
             }
             KeyCode::Char(c) if !ctrl && !alt => {
                 if is_vim_mode() && vim_state == VimState::Normal {
-                    match c {
-                        'i' => vim_state = VimState::Insert,
-                        'a' => {
-                            if cursor < buf.len() {
-                                cursor += 1;
-                            }
-                            vim_state = VimState::Insert;
-                        }
-                        'I' => {
-                            cursor = 0;
-                            vim_state = VimState::Insert;
-                        }
-                        'A' => {
-                            cursor = buf.len();
-                            vim_state = VimState::Insert;
-                        }
-                        'h' => cursor = cursor.saturating_sub(1),
-                        'l' => {
-                            if cursor < buf.len() {
-                                cursor += 1;
-                            }
-                        }
-                        '0' | '^' => cursor = 0,
-                        '$' => cursor = buf.len(),
-                        'w' => cursor = next_word(&buf, cursor),
-                        'b' => cursor = prev_word(&buf, cursor),
-                        'e' => cursor = end_word(&buf, cursor),
-                        's' => {
-                            if cursor < buf.len() {
-                                kill = buf[cursor..=cursor].iter().collect();
-                                buf.remove(cursor);
-                            }
-                            vim_state = VimState::Insert;
-                        }
-                        'o' => {
-                            buf.push('\n');
-                            cursor = buf.len();
-                            vim_state = VimState::Insert;
-                        }
-                        'O' => {
-                            buf.insert(0, '\n');
-                            cursor = 0;
-                            vim_state = VimState::Insert;
-                        }
-                        'x' => {
-                            if cursor < buf.len() {
-                                kill = buf[cursor..=cursor].iter().collect();
-                                buf.remove(cursor);
-                                if !kill.is_empty() {
-                                    osc52_copy(&kill);
-                                }
-                            }
-                        }
-                        'D' => {
-                            kill = buf[cursor..].iter().collect();
-                            buf.truncate(cursor);
-                            if !kill.is_empty() {
-                                osc52_copy(&kill);
-                            }
-                        }
-                        'C' => {
-                            kill = buf[cursor..].iter().collect();
-                            buf.truncate(cursor);
-                            if !kill.is_empty() {
-                                osc52_copy(&kill);
-                            }
-                            vim_state = VimState::Insert;
-                        }
-                        'p' => {
-                            for ch in kill.chars() {
-                                if cursor < buf.len() {
-                                    buf.insert(cursor + 1, ch);
-                                    cursor += 1;
-                                } else {
-                                    buf.push(ch);
-                                    cursor = buf.len();
-                                }
-                            }
-                        }
-                        'u' => {
-                            if let Some(prev) = vim_undo_stack.pop() {
-                                buf = prev;
-                                cursor = cursor.min(buf.len());
-                            }
-                        }
-                        ':' => {
-                            buf.clear();
-                            buf.push('/');
-                            cursor = 1;
-                            vim_state = VimState::Insert;
-                        }
-                        // On an empty line `/` starts a command as typed, so
-                        // /vim (or any command) works from NORMAL mode.
-                        '/' if buf.is_empty() => {
-                            buf.push('/');
-                            cursor = 1;
-                            vim_state = VimState::Insert;
-                        }
-                        'v' => vim_state = VimState::Visual(cursor),
-                        _ => {}
-                    }
+                    vim_normal_key(
+                        c,
+                        &mut buf,
+                        &mut cursor,
+                        &mut kill,
+                        &mut vim_state,
+                        &mut vim_undo_stack,
+                    );
                 } else if is_vim_mode() && matches!(vim_state, VimState::Visual(_)) {
-                    let VimState::Visual(start_idx) = vim_state else {
-                        unreachable!()
-                    };
-                    match c {
-                        'h' => cursor = cursor.saturating_sub(1),
-                        'l' => {
-                            if cursor < buf.len() {
-                                cursor += 1;
-                            }
-                        }
-                        'w' => cursor = next_word(&buf, cursor),
-                        'b' => cursor = prev_word(&buf, cursor),
-                        'e' => cursor = end_word(&buf, cursor),
-                        '0' | '^' => cursor = 0,
-                        '$' => cursor = buf.len(),
-                        'd' | 'x' => {
-                            let min_i = start_idx.min(cursor);
-                            let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
-                            if min_i <= max_i && max_i < buf.len() {
-                                kill = buf[min_i..=max_i].iter().collect();
-                                buf.drain(min_i..=max_i);
-                                cursor = min_i.min(buf.len());
-                                if !kill.is_empty() {
-                                    osc52_copy(&kill);
-                                }
-                            }
-                            vim_state = VimState::Normal;
-                        }
-                        'y' => {
-                            let min_i = start_idx.min(cursor);
-                            let max_i = start_idx.max(cursor).min(buf.len().saturating_sub(1));
-                            if min_i <= max_i && max_i < buf.len() {
-                                kill = buf[min_i..=max_i].iter().collect();
-                                if !kill.is_empty() {
-                                    osc52_copy(&kill);
-                                }
-                            }
-                            vim_state = VimState::Normal;
-                        }
-                        _ => {}
-                    }
+                    vim_visual_key(c, &mut buf, &mut cursor, &mut kill, &mut vim_state);
                 } else {
                     if is_vim_mode() {
                         vim_undo_stack.push(buf.clone());
@@ -1896,23 +1993,7 @@ pub(super) fn read_line_raw_prefill(
                     continue; // loop top re-renders the popup
                 }
                 if let Ok(h) = history().lock() {
-                    if !h.is_empty() {
-                        if let Some(cur) = hist_idx {
-                            if buf != h[cur].chars().collect::<Vec<char>>() {
-                                hist_idx = None;
-                            }
-                        }
-                        if hist_idx.is_none() {
-                            // First ↑: stash the draft and filter recall by it.
-                            hist_draft = buf.clone();
-                            hist_prefix = buf.iter().collect();
-                        }
-                        if let Some(idx) = hist_match(&h, &hist_prefix, hist_idx, true) {
-                            hist_idx = Some(idx);
-                            buf = h[idx].chars().collect();
-                            cursor = buf.len();
-                        }
-                    }
+                    recall.up(&h, &mut buf, &mut cursor);
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
@@ -1922,26 +2003,7 @@ pub(super) fn read_line_raw_prefill(
                     continue; // loop top re-renders the popup
                 }
                 if let Ok(h) = history().lock() {
-                    if let Some(cur) = hist_idx {
-                        if buf != h[cur].chars().collect::<Vec<char>>() {
-                            hist_idx = None;
-                        } else {
-                            match hist_match(&h, &hist_prefix, Some(cur), false) {
-                                Some(idx) => {
-                                    hist_idx = Some(idx);
-                                    buf = h[idx].chars().collect();
-                                    cursor = buf.len();
-                                }
-                                None => {
-                                    // Past the newest entry: the draft comes back
-                                    // instead of a destroyed line.
-                                    hist_idx = None;
-                                    buf = hist_draft.clone();
-                                    cursor = buf.len();
-                                }
-                            }
-                        }
-                    }
+                    recall.down(&h, &mut buf, &mut cursor);
                 }
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
