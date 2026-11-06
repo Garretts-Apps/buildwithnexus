@@ -268,3 +268,58 @@ There is no database, so the N+1, pagination and index checks do not apply. Ever
 - **Every direct crate is imported.**
 - **Commented-out code:** none longer than five lines in any language.
 - **Every JS, MJS and shell script has an inbound reference.**
+
+## Status after the rebuild branch
+
+Every item was worked on `claude/rebuild`. "Narrowed" means part of the proposal was left out on purpose, for the reason given.
+
+### Correctness issues
+
+| Item | Outcome |
+| --- | --- |
+| C-1 Windows home folder | Fixed. Reproduced first on windows-2022, PowerShell 5.1, standard user, with the released 0.16.0 from `npm install -g`. `npx` hid the bug because npm sets `HOME` for its children. Verified fixed on a Windows build of the branch. |
+| C-2 symlink loops | Fixed in the indexer and in the shared project walker, which had the same bug (grep, find, `@` completion). Links out of the project are still followed. |
+| C-3 `str_replace` behind the editor | Fixed: it now reads and writes through the editor like `edit_file`. New ACP test. |
+| C-4 temp file left behind | Fixed with the shared atomic write. |
+
+### Priority 1
+
+All done (ENT-001 to ENT-008). One plan finding was wrong: `RuleEngine::new` is called inside `rules.rs` as `Self::new()`. It now uses the derived `Default`.
+
+### Priority 2
+
+| Item | Outcome |
+| --- | --- |
+| ENT-020 to ENT-023, ENT-025, ENT-026 | Done. |
+| ENT-024 settings layers | Narrowed: only the three-file user list is shared. The four loops do different work per file (merge, trust, issues), and one iterator would hide the trust differences. |
+
+### Priority 3
+
+| Item | Outcome |
+| --- | --- |
+| ENT-030 BUILD turn | `TurnState` and `on_text_reply` done; 942 to 776 lines. The per-call loop stays inline: it threads eight round locals and its own `continue` and `break`. |
+| ENT-031 kb indexer | Done; a differential test over the repository's sources found no change in the symbols it extracts. |
+| ENT-032 REPL | `run_mode_turn`, `reset_session` and `tick_background` done; 1,039 to 892 lines. No `ReplState`: the input read's `continue` and `return` paths would need a flow enum that adds more than it removes. |
+| ENT-033 line editor | Reverse search, history recall and the vim keymaps extracted; 868 to 616 lines. No `Editor` struct: the remaining arms share two macros and the popup state, and a struct would only rename them. |
+| ENT-034 file splits | Done. tools.rs 11,302 to 6,002 lines, agent.rs 10,449 to 3,136, lib.rs 10,816 to 2,930, tui.rs 9,613 to 4,752, provider.rs 5,885 to 1,899 (mod.rs). |
+
+### Performance track
+
+| Item | Outcome |
+| --- | --- |
+| PERF-001 session save | Done: 10.1 ms to 7.0 ms a save with three 1.5 MB screenshots. |
+| PERF-002, 009, 010, 012 | Done. |
+| PERF-003 grep | Narrowed: no per-line copy in case-sensitive search (373 to 310 ms over 10,000 files). No size cap: it would hide matches in large logs. Lowercasing each file once measured about 10% slower and was dropped. |
+| PERF-004 walks | Done: `find_paths` 42 to 30 ms. |
+| PERF-005 `@` completion | Done. |
+| PERF-006 repaints | Narrowed: the duplicate repaint per chunk is gone. Relying on the 15 ms thread alone could leave the composer overdrawn between frames, which needs a real terminal to rule out. |
+| PERF-007 read_file | Narrowed: no extra full copy. The whole file is still read, because the binary-file check and the total line count need it. |
+| PERF-008 re-wrap | Measured and left: about 30 us per chunk for a 2,000-character line. The benchmark stays as a guard. |
+| PERF-011 git spawns | Narrowed: one `rev-parse` instead of two. The git-config safety check still runs at both ends of a turn, since the agent can change the config in between. |
+
+### Found along the way
+
+- **Fixed:** the running turn's task label was one global, so one folder's turn could stamp another's checkpoints. It also made a checkpoint test fail about one run in five; it now fails 0 in 30.
+- **Not fixed:** a headless run piped into a reader that closes early (`bwn run … | head -1`) panics with exit code 101.
+- **Not fixed:** `.buildwithnexus/knowledge/entities.json` in this repository uses an older shape, an array without `last_updated`, so it has never loaded. The deleted `schema.json` described that shape.
+- **Not fixed:** on Windows, clippy flags `sig.unwrap_or(0)` in `hooks.rs`. It is on `main` too, and CI does not run clippy on Windows.
