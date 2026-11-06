@@ -355,7 +355,32 @@ mod cli_option_tests {
     }
 }
 
+/// Exit code of a process a shell reports as killed by SIGPIPE (128 + 13).
+const EXIT_BROKEN_PIPE: i32 = 141;
+
+// Rust ignores SIGPIPE so that a closed socket or hook pipe is an error to
+// handle, and println! then panics once the reader of our stdout is gone
+// (`bwn run ... | head -1`). Only that panic ends the run, quietly, with the
+// code a shell gives SIGPIPE; every other panic goes on as before. SIGPIPE
+// itself stays ignored: sockets and child pipes depend on it.
+fn exit_quietly_on_closed_stdout() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if message.starts_with("failed printing to std") && message.contains("Broken pipe") {
+            std::process::exit(EXIT_BROKEN_PIPE);
+        }
+        prev(info);
+    }));
+}
+
 pub fn run() {
+    exit_quietly_on_closed_stdout();
     #[cfg(unix)]
     {
         sandbox::cloexec_inherited_fds();

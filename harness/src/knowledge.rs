@@ -217,6 +217,22 @@ fn iso_from_epoch(secs: u64) -> String {
 mod tests {
     use super::*;
 
+    // This repository's own knowledge file is read into the prompt of every
+    // session run here, so it must load, and its paths must still exist.
+    #[test]
+    fn the_repositorys_knowledge_file_loads_and_names_real_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let kb = KnowledgeBase::new(&root.to_string_lossy());
+        assert!(kb.entities.len() >= 20, "loaded {}", kb.entities.len());
+        for e in kb.entities.values() {
+            if let Some(path) = &e.path {
+                assert!(root.join(path).exists(), "{} names missing {path}", e.id);
+            }
+        }
+        let summary = kb.generate_context_summary(&[]);
+        assert!(summary.contains("No async runtime"), "{summary}");
+    }
+
     #[test]
     fn test_knowledge_base_crud() {
         let mut kb = KnowledgeBase::default();

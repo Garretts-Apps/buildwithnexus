@@ -56,6 +56,17 @@ const HOOK_TIMEOUT_CODE: i32 = 124; // matches timeout(1) convention
 const HOOK_SPAWN_FAILED_CODE: i32 = 126;
 const HOOK_SIGNAL_CODE: i32 = 128; // plus the signal number, like a shell
 
+// The signal that ended a process, where the platform has signals.
+#[cfg(unix)]
+fn exit_signal(st: &std::process::ExitStatus) -> Option<i32> {
+    std::os::unix::process::ExitStatusExt::signal(st)
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_st: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
 // Why a hook has no exit status of its own. PreToolUse blocks the call on any
 // of these: a guard that never ran, or died midway, must not read as "allow".
 enum HookFailure {
@@ -2559,10 +2570,7 @@ fn run_child(c: &mut Command, payload: &Value, timeout: Duration) -> HookRun {
             Some(code) => (code, None),
             // Signal-killed: never report exit 0 for a hook that died.
             None => {
-                #[cfg(unix)]
-                let sig = std::os::unix::process::ExitStatusExt::signal(&st);
-                #[cfg(not(unix))]
-                let sig = None;
+                let sig = exit_signal(&st);
                 (
                     HOOK_SIGNAL_CODE + sig.unwrap_or(0),
                     Some(HookFailure::Signal(sig)),

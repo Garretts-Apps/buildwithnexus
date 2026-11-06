@@ -253,6 +253,7 @@ fn hook(command: &str) -> Value {
     json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }])
 }
 
+#[cfg(unix)]
 fn count_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
@@ -1577,6 +1578,39 @@ fn prose_for_an_explicit_file_task_is_finished_with_write_file() {
             .trim(),
         "hello world"
     );
+}
+
+// `bwn run ... | head -1`: a reader that has gone away ends the run quietly,
+// with the exit code a shell gives a process killed by SIGPIPE, not a panic.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_ends_a_headless_run_without_a_panic() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let mut child = Command::new(BIN)
+        .args([
+            "run",
+            "--provider",
+            "custom",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "m",
+            "say hi",
+        ])
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    drop(child.stdout.take()); // nobody reads the output
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(141), "stderr: {stderr}");
 }
 
 // Native Windows sets USERPROFILE and no HOME. `@~/file` must still find the
@@ -4443,6 +4477,7 @@ fn an_answer_that_opens_with_an_example_call_is_a_success() {
 }
 
 // Accepts one chat request and never answers it.
+#[cfg(unix)]
 fn serve_silent() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
