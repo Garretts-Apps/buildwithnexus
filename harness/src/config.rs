@@ -3448,15 +3448,35 @@ mod tests {
     fn default_model_ids_live_only_in_the_presets_table() {
         // Files whose model strings are family prefixes for pricing or
         // capability checks, never a model the harness picks.
-        const PREFIX_TABLES: &[&str] = &["usage.rs", "media.rs", "provider.rs"];
+        const PREFIX_TABLES: &[&str] = &["usage.rs", "media.rs", "provider/"];
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Every source file, nested modules included, but not the files that
+        // hold only a module's tests.
+        let mut files = Vec::new();
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "tests.rs")
+                {
+                    files.push(path);
+                }
+            }
+        }
         let mut stray = Vec::new();
-        for entry in fs::read_dir(&src).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if !name.ends_with(".rs") || PREFIX_TABLES.contains(&name.as_str()) {
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if PREFIX_TABLES.iter().any(|t| rel.starts_with(t)) {
                 continue;
             }
+            let name = rel;
             let text = fs::read_to_string(&path).unwrap();
             // Only shipped code: everything above the first test module.
             let shipped = text.split("#[cfg(test)]").next().unwrap();
