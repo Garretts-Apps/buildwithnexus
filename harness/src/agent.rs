@@ -652,7 +652,7 @@ impl ThinkingStream {
         if content.is_empty() {
             return;
         }
-        let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spinners = tui::SPINNER_FRAMES;
         let s = spinners[self.step % spinners.len()];
         self.step += 1;
         tui::write_stream(&format!(
@@ -2900,7 +2900,7 @@ pub fn ignored_approvals_notice(cwd: &Path) -> Option<String> {
     }
     Some(format!(
         "ignoring saved approval{} for {}: a shell or interpreter approved by name could run any code, so each of its commands is approved on its own",
-        if keys.len() == 1 { "" } else { "s" },
+        crate::report::plural(keys.len()),
         keys.join(", ")
     ))
 }

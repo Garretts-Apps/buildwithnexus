@@ -674,7 +674,7 @@ fn print_session_worktree_hint() {
     let pending = if dirty > 0 {
         format!(
             " ({dirty} uncommitted change{} there — commit them first)",
-            if dirty == 1 { "" } else { "s" }
+            crate::report::plural(dirty)
         )
     } else {
         String::new()
@@ -1480,7 +1480,7 @@ fn headless(
                 "{}",
                 tui::yellow(&format!(
                     "⚠ review found {blocking} blocking issue{} after {elapsed:.2?}",
-                    if blocking == 1 { "" } else { "s" }
+                    crate::report::plural(blocking)
                 ))
             );
         } else if outcome == agent::Outcome::Success {
@@ -1830,7 +1830,7 @@ fn repl(
     {
         tui::line(&tui::green(&format!(
             "  ⟳ restored {restored} scheduled workflow{} from the previous session — /workflows to manage",
-            if restored == 1 { "" } else { "s" }
+            crate::report::plural(restored)
         )));
     }
     if let Some(notice) = update::startup_notice(&settings.auto_update) {
@@ -1905,7 +1905,7 @@ fn repl(
             tui::line(&tui::dim(&format!(
                 "  ⟳ {} workflow{} in queue — /workflows to manage",
                 active,
-                if active == 1 { "" } else { "s" }
+                crate::report::plural(active)
             )));
         }
         shown_active = active;
@@ -2708,7 +2708,7 @@ fn repl(
         let conversational = should_answer_conversationally(t, &mode);
         let n_images = image_data.len();
         if n_images > 0 {
-            let plural = if n_images == 1 { "" } else { "s" };
+            let plural = crate::report::plural(n_images);
             tui::line(&tui::dim(&format!("  ⎘ attached {n_images} image{plural}")));
         }
 
@@ -6236,9 +6236,9 @@ fn diff_summary(files: &[ChangedFile]) -> String {
     format!(
         "{} file{} changed, {added} insertion{}(+), {removed} deletion{}(-)",
         files.len(),
-        if files.len() == 1 { "" } else { "s" },
-        if added == 1 { "" } else { "s" },
-        if removed == 1 { "" } else { "s" },
+        crate::report::plural(files.len()),
+        crate::report::plural(added),
+        crate::report::plural(removed),
     )
 }
 
@@ -6787,7 +6787,7 @@ fn handle_rewind(
                 detail: format!(
                     "{} · {files} file change{} since",
                     session::ago(p.started_ms),
-                    if files == 1 { "" } else { "s" }
+                    crate::report::plural(files)
                 ),
             }
         })
@@ -6821,7 +6821,7 @@ fn handle_rewind(
                 tui::line(&tui::green(&format!(
                     "  ✓ restored {} file{}:",
                     undone.restored.len(),
-                    if undone.restored.len() == 1 { "" } else { "s" }
+                    crate::report::plural(undone.restored.len())
                 )));
                 show_undone(cwd, &undone);
             }
@@ -6941,7 +6941,7 @@ fn undo_last_turn(cwd: &std::path::Path, overwrite: &mut dyn FnMut(&std::path::P
             tui::sanitize_terminal(&last.turn.task),
             session::ago(last.turn.started_ms),
             files.len(),
-            if files.len() == 1 { "" } else { "s" }
+            crate::report::plural(files.len())
         );
         let go = tui::ask(&q).unwrap_or_default();
         if !matches!(go.trim(), "y" | "Y" | "yes" | "YES") {
@@ -6954,7 +6954,7 @@ fn undo_last_turn(cwd: &std::path::Path, overwrite: &mut dyn FnMut(&std::path::P
             let n = undone.restored.len();
             tui::line(&tui::green(&format!(
                 "  ✓ undid the last agent turn — restored {n} file{}:",
-                if n == 1 { "" } else { "s" }
+                crate::report::plural(n)
             )));
             show_undone(cwd, &undone);
             if !last.turn.untracked.is_empty() {
@@ -7025,7 +7025,7 @@ fn handle_undo(cwd: &std::path::Path, arg: &str) {
         tui::line(&tui::yellow(&format!(
             "  /undo all rewinds every checkpoint from the last 24 hours — {} restore{}:",
             pending.len(),
-            if pending.len() == 1 { "" } else { "s" }
+            crate::report::plural(pending.len())
         )));
         for c in pending.iter().take(8) {
             tui::line(&tui::dim(&format!(
@@ -7297,7 +7297,7 @@ fn mcp_checks() -> Vec<DoctorCheck> {
                         "{} · {} tool{}",
                         r.transport,
                         r.tools.len(),
-                        if r.tools.len() == 1 { "" } else { "s" }
+                        crate::report::plural(r.tools.len())
                     ),
                 ),
                 mcp::Status::Disabled => DoctorCheck::note(name, "disabled"),
@@ -7911,7 +7911,7 @@ fn headless_attachments(
     let (task, images) = extract_attachments(task, cwd, Vision::of(p));
     if !images.is_empty() {
         let n = images.len();
-        eprintln!("⎘ attached {n} image{}", if n == 1 { "" } else { "s" });
+        eprintln!("⎘ attached {n} image{}", crate::report::plural(n));
     }
     (task, images)
 }
@@ -8899,7 +8899,7 @@ fn doctor_summary_line(checks: &[DoctorCheck]) -> Option<String> {
         format!(
             "  {} check{} failed: {}",
             failed.len(),
-            if failed.len() == 1 { "" } else { "s" },
+            crate::report::plural(failed.len()),
             tui::sanitize_terminal(&failed.join(", "))
         )
     })

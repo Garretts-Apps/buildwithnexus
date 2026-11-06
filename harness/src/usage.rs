@@ -329,7 +329,7 @@ fn budget_stop_msg(s: &Snapshot, limit: f64) -> Option<String> {
         msg.push_str(&format!(
             " ({} request{} with unknown price for {} not counted)",
             s.unpriced_requests,
-            if s.unpriced_requests == 1 { "" } else { "s" },
+            crate::report::plural(s.unpriced_requests),
             s.unpriced_model
         ));
     }
@@ -388,7 +388,7 @@ pub fn render(s: &Snapshot, current_model: &str) -> Vec<String> {
             line.push_str(&format!(
                 " — {} request{} with unknown price for {} not counted",
                 s.unpriced_requests,
-                if s.unpriced_requests == 1 { "" } else { "s" },
+                crate::report::plural(s.unpriced_requests),
                 s.unpriced_model
             ));
         }

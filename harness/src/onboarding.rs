@@ -64,7 +64,7 @@ fn local_check_line(found: Option<&[String]>) -> String {
         Some(models) => format!(
             "  found Ollama with {} model{}",
             models.len(),
-            if models.len() == 1 { "" } else { "s" }
+            crate::report::plural(models.len())
         ),
     }
 }
@@ -431,7 +431,7 @@ fn start_hints(id: &str) -> Vec<String> {
                     "start it:  llama-server -m {} --port 8080  ({} GGUF file{} in {})",
                     tui::sanitize_terminal(g),
                     ggufs.len(),
-                    if ggufs.len() == 1 { "" } else { "s" },
+                    crate::report::plural(ggufs.len()),
                     local::models_dir().display()
                 )),
                 None => hints.push("start it:  llama-server -m <model.gguf> --port 8080".into()),

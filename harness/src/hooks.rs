@@ -1786,7 +1786,7 @@ fn apply_run_trust(cwd: &Path) {
     if off <= 3 {
         refuse(format!(
             "that digest differs from this folder's in {off} character{} — check it was copied whole from `buildwithnexus trust --print`",
-            if off == 1 { "" } else { "s" }
+            crate::report::plural(off)
         ));
     }
     let mut covered: Vec<String> = files.iter().map(|f| entry_label(f.name)).collect();

@@ -3137,6 +3137,9 @@ fn eat_escape(chars: &mut std::iter::Peekable<std::str::Chars>, mut out: Option<
     }
 }
 
+/// The braille spinner every progress indicator cycles through.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -3383,7 +3386,7 @@ fn queue_footer(out: &mut impl Write) {
         let started = WORK_STARTED_MS.load(Ordering::Relaxed);
         let elapsed_ms = now_ms().saturating_sub(started).max(1);
         let secs = elapsed_ms / 1000;
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frames = SPINNER_FRAMES;
         let frame = frames[((elapsed_ms / 100) % frames.len() as u64) as usize];
         let chars = STREAM_CHARS.load(Ordering::Relaxed);
         let tps = if chars > 0 && elapsed_ms >= 500 {
@@ -3438,16 +3441,8 @@ fn queue_footer(out: &mut impl Write) {
             colored_bar,
             dim(&format!(
                 "{pct}% {}/{}",
-                if used < 1000 {
-                    format!("{}", used)
-                } else {
-                    format!("{:.1}k", used as f64 / 1000.0)
-                },
-                if total < 1000 {
-                    format!("{}", total)
-                } else {
-                    format!("{:.1}k", total as f64 / 1000.0)
-                }
+                crate::provider::short_tokens(used),
+                crate::provider::short_tokens(total)
             ))
         )
     } else {
@@ -4592,8 +4587,13 @@ fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail
 // Clip to at most `max_cols` display columns (not chars): emoji/CJK count as
 // their char_width() so a width-2 char is never split across the boundary.
 fn clip_ansi_line(s: &str, max_cols: usize) -> String {
+    clip_ansi(s, max_cols).0
+}
+
+/// `clip_ansi_line`, plus the display width of what it kept.
+fn clip_ansi(s: &str, max_cols: usize) -> (String, usize) {
     if max_cols == 0 {
-        return String::new();
+        return (String::new(), 0);
     }
     let mut out = String::new();
     let mut visible = 0usize;
@@ -4611,32 +4611,12 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
         out.push(c);
         visible += w;
     }
-    out
+    (out, visible)
 }
 
 fn pad_ansi_line(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut visible = 0usize;
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            out.push(c);
-            eat_escape(&mut chars, Some(&mut out));
-            continue;
-        }
-        let w = char_width(c);
-        if visible + w > width {
-            break;
-        }
-        out.push(c);
-        visible += w;
-    }
-    if visible < width {
-        out.push_str(&" ".repeat(width - visible));
-    }
+    let (mut out, visible) = clip_ansi(s, width);
+    out.push_str(&" ".repeat(width - visible));
     out
 }
 
@@ -8249,7 +8229,7 @@ pub fn spinner_start(label: &str) -> Spinner {
     let r2 = running.clone();
     let label = label.to_string();
     let handle = thread::spawn(move || {
-        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frames = SPINNER_FRAMES;
         let started = std::time::Instant::now();
         let mut i = 0usize;
         while r2.load(Ordering::Relaxed) {
@@ -8261,7 +8241,7 @@ pub fn spinner_start(label: &str) -> Spinner {
                 let _ = write!(
                     out,
                     "{} {} {}",
-                    accent(&frames[i % frames.len()].to_string()),
+                    accent(frames[i % frames.len()]),
                     dim(&label),
                     dim(&format!(
                         "· {}s · Esc to interrupt",
@@ -8272,11 +8252,7 @@ pub fn spinner_start(label: &str) -> Spinner {
                 let _ = execute!(out, RestorePosition);
                 let _ = out.flush();
             } else if !line_mode() {
-                print!(
-                    "\r{} {}",
-                    accent(&frames[i % frames.len()].to_string()),
-                    dim(&label)
-                );
+                print!("\r{} {}", accent(frames[i % frames.len()]), dim(&label));
                 flush();
             }
             i += 1;
@@ -8368,8 +8344,8 @@ mod tests {
     #[test]
     fn the_footer_counts_added_folders() {
         assert_eq!(dirs_badge(0), "");
-        assert_eq!(plain(&dirs_badge(1)), " · +1 dir");
-        assert_eq!(plain(&dirs_badge(3)), " · +3 dirs");
+        assert_eq!(strip_ansi(&dirs_badge(1)), " · +1 dir");
+        assert_eq!(strip_ansi(&dirs_badge(3)), " · +3 dirs");
     }
 
     #[test]
@@ -8399,23 +8375,6 @@ mod tests {
         );
         assert!(!capturing());
         assert!(capture_take().is_empty());
-    }
-
-    fn plain(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for d in chars.by_ref() {
-                    if d == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 
     #[test]
@@ -8600,7 +8559,7 @@ mod tests {
         assert_eq!(clip_ansi_line("ab你cd", 3), "ab");
         assert_eq!(clip_ansi_line("你好世界", 5), "你好");
         // ANSI escapes cost zero columns.
-        assert_eq!(plain(&clip_ansi_line("\x1b[31m你好\x1b[0m", 2)), "你");
+        assert_eq!(strip_ansi(&clip_ansi_line("\x1b[31m你好\x1b[0m", 2)), "你");
         assert_eq!(clip_ansi_line("abc", 0), "");
     }
 
@@ -8729,16 +8688,16 @@ mod tests {
 
     #[test]
     fn no_color_strips_escapes() {
-        assert_eq!(plain("\x1b[31mhi\x1b[0m"), "hi");
+        assert_eq!(strip_ansi("\x1b[31mhi\x1b[0m"), "hi");
     }
 
     #[test]
     fn mode_badge_contains_label() {
-        let b = plain(&mode_badge("BUILD"));
+        let b = strip_ansi(&mode_badge("BUILD"));
         assert!(b.contains("BUILD"), "{b}");
-        let p = plain(&mode_badge("PLAN"));
+        let p = strip_ansi(&mode_badge("PLAN"));
         assert!(p.contains("PLAN"), "{p}");
-        let bs = plain(&mode_badge("BRAINSTORM"));
+        let bs = strip_ansi(&mode_badge("BRAINSTORM"));
         assert!(bs.contains("BRAINSTORM"), "{bs}");
     }
 
@@ -8798,21 +8757,24 @@ mod tests {
         // Balanced emphasis/code: the markers are consumed and the inner text
         // preserved (checked after stripping ANSI, so this holds in any color
         // mode).
-        assert_eq!(plain(&format_inline_md("a *word* b")), "a word b");
-        assert_eq!(plain(&format_inline_md("a **bold** c")), "a bold c");
-        assert_eq!(plain(&format_inline_md("use `code` here")), "use code here");
+        assert_eq!(strip_ansi(&format_inline_md("a *word* b")), "a word b");
+        assert_eq!(strip_ansi(&format_inline_md("a **bold** c")), "a bold c");
+        assert_eq!(
+            strip_ansi(&format_inline_md("use `code` here")),
+            "use code here"
+        );
     }
 
     #[test]
     fn render_md_dim_line_formats_markers_and_stays_muted() {
         // Markers are consumed — no raw ** or # or ` reaches the screen.
         assert_eq!(
-            plain(&render_md_dim_line("a **bold** and `code`")),
+            strip_ansi(&render_md_dim_line("a **bold** and `code`")),
             "a bold and code"
         );
-        assert_eq!(plain(&render_md_dim_line("## a heading")), "a heading");
-        assert_eq!(plain(&render_md_dim_line("- a bullet")), "• a bullet");
-        assert_eq!(plain(&render_md_dim_line("> a quote")), "│ a quote");
+        assert_eq!(strip_ansi(&render_md_dim_line("## a heading")), "a heading");
+        assert_eq!(strip_ansi(&render_md_dim_line("- a bullet")), "• a bullet");
+        assert_eq!(strip_ansi(&render_md_dim_line("> a quote")), "│ a quote");
 
         // Bold is emitted as an attribute toggle (1…22), and the foreground
         // never flips to the bright TEXT color mid-line — the whole line stays
@@ -8826,13 +8788,13 @@ mod tests {
         );
 
         // An unbalanced marker stays literal instead of eating the rest.
-        assert_eq!(plain(&render_md_dim_line("2 * 3 = 6")), "2 * 3 = 6");
+        assert_eq!(strip_ansi(&render_md_dim_line("2 * 3 = 6")), "2 * 3 = 6");
     }
 
     #[test]
     fn render_md_draws_fenced_code_blocks() {
         let doc = "before\n```rust\nlet x = 1;\n```\nafter";
-        let out = plain(&render_md(doc));
+        let out = strip_ansi(&render_md(doc));
         assert!(out.contains("rust"), "{out}");
         assert!(out.contains("│ let x = 1;"), "{out}");
         assert!(out.contains("╭") && out.contains("╰"), "{out}");
@@ -8842,7 +8804,7 @@ mod tests {
 
     #[test]
     fn render_md_closes_unterminated_fence() {
-        let out = plain(&render_md("```py\nprint(1)"));
+        let out = strip_ansi(&render_md("```py\nprint(1)"));
         assert!(out.contains("py"), "{out}");
         assert!(out.contains("│ print(1)"), "{out}");
         assert!(out.contains("╰"), "{out}");
@@ -8861,7 +8823,7 @@ mod tests {
         let mut r = StreamRenderer::new();
         r.push("```python\nx = 1\ny = 2\n```\nafter\n");
         r.flush();
-        let joined = plain(&r.sink.join("\n"));
+        let joined = strip_ansi(&r.sink.join("\n"));
         assert!(joined.contains("python"), "{joined}");
         assert!(
             joined.contains("│ x = 1") && joined.contains("│ y = 2"),
@@ -8946,7 +8908,7 @@ mod tests {
             split.flush();
             assert_eq!(split.sink, whole.sink, "split at byte {cut}");
         }
-        let joined = plain(&whole.sink.join("\n"));
+        let joined = strip_ansi(&whole.sink.join("\n"));
         assert!(
             joined.contains("Title") && !joined.contains("# Title"),
             "{joined}"
@@ -8961,7 +8923,7 @@ mod tests {
         let mut r = StreamRenderer::new();
         r.push("**no trailing newline**");
         r.flush();
-        let joined = plain(&r.sink.join("\n"));
+        let joined = strip_ansi(&r.sink.join("\n"));
         assert!(joined.contains("no trailing newline"), "{joined}");
         assert!(!joined.contains("**"), "{joined}");
     }
@@ -9243,29 +9205,29 @@ mod tests {
     #[test]
     fn test_markdown_rendering_formatting() {
         let md = super::render_md_line("# Hello **world** *italic* `code`");
-        let p = plain(&md);
+        let p = strip_ansi(&md);
         assert!(p.contains("Hello"), "{p}");
         assert!(p.contains("world"), "{p}");
         assert!(p.contains("italic"), "{p}");
         assert!(p.contains("code"), "{p}");
 
         let num_list = super::render_md_line("1. First item");
-        let p_num = plain(&num_list);
+        let p_num = strip_ansi(&num_list);
         assert!(p_num.contains("1."), "{p_num}");
         assert!(p_num.contains("First item"), "{p_num}");
 
         let quote = super::render_md_line("> A blockquote");
-        let p_quote = plain(&quote);
+        let p_quote = strip_ansi(&quote);
         assert!(p_quote.contains("│"), "{p_quote}");
         assert!(p_quote.contains("A blockquote"), "{p_quote}");
 
         let link = super::render_md_line("Click [Google](https://google.com) now");
-        let p_link = plain(&link);
+        let p_link = strip_ansi(&link);
         assert!(p_link.contains("Google"), "{p_link}");
         assert!(p_link.contains("(https://google.com)"), "{p_link}");
 
         let bullet = super::render_md_line("- Bullet item");
-        let p_bullet = plain(&bullet);
+        let p_bullet = strip_ansi(&bullet);
         assert!(p_bullet.contains("•"), "{p_bullet}");
         assert!(p_bullet.contains("Bullet item"), "{p_bullet}");
     }
@@ -9425,7 +9387,7 @@ mod tests {
         for bad in ["\x1b]52", "\x1b[31m", "\x1b[2J", "\x1b[1A", "\x07"] {
             assert!(!out.contains(bad), "{bad:?} leaked: {out:?}");
         }
-        let p = plain(&out);
+        let p = strip_ansi(&out);
         assert!(p.contains("␛]52;c;AAAA ␛[31mred"), "{p}");
         assert!(p.contains("␛[2J"), "{p}");
         assert!(p.contains("let x = \"␛[1A\";"), "{p}");
@@ -9439,7 +9401,7 @@ mod tests {
         r.flush();
         let joined = r.sink.join("\n");
         assert!(!joined.contains("\x1b]52") && !joined.contains('\x07'));
-        assert!(plain(&joined).contains("ok ␛]52;c;QQ== done"));
+        assert!(strip_ansi(&joined).contains("ok ␛]52;c;QQ== done"));
     }
 
     #[test]

@@ -2678,19 +2678,15 @@ pub struct PolicyRule {
 /// across layers (a project cannot drop a user's deny rule), and an
 /// untrusted project file contributes only its ask and deny entries.
 pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
-    let user = [
-        home().join("config.json"),
-        settings_path(),
-        home().join("settings.local.json"),
-    ];
-    let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> = user
-        .iter()
-        .filter_map(|p| fs::read_to_string(p).ok())
-        .filter_map(|t| match serde_json::from_str(&t) {
-            Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
-            _ => None,
-        })
-        .collect();
+    let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> =
+        user_settings_files()
+            .iter()
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .filter_map(|t| match serde_json::from_str(&t) {
+                Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
+                _ => None,
+            })
+            .collect();
     let dot = workdir.join(".buildwithnexus");
     for name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(dot.join(name)) else {
@@ -2734,13 +2730,19 @@ pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
     out
 }
 
-// `workdir: None` loads the user-level files only.
-fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFile>) {
-    let user_paths = [
-        home().join("config.json"), // legacy base
+/// The user-level settings files, lowest precedence first: the legacy
+/// config.json base, settings.json, then settings.local.json.
+fn user_settings_files() -> [PathBuf; 3] {
+    [
+        home().join("config.json"),
         settings_path(),
         home().join("settings.local.json"),
-    ];
+    ]
+}
+
+// `workdir: None` loads the user-level files only.
+fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFile>) {
+    let user_paths = user_settings_files();
 
     let mut merged = serde_json::Map::new();
     let mut any_source = false;

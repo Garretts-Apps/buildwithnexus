@@ -1636,17 +1636,19 @@ pub fn is_readonly_command(cmd: &str) -> bool {
 // prompt, which reuses this).
 const PREVIEW_MAX_CHARS: usize = 80;
 
-fn clamp_preview(s: &str) -> String {
+/// `s` on one line (whitespace runs collapsed), cut to `max` characters with
+/// a trailing `…` when longer.
+pub(crate) fn clamp_preview(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= PREVIEW_MAX_CHARS {
+    if flat.chars().count() <= max {
         return flat;
     }
-    let cut: String = flat.chars().take(PREVIEW_MAX_CHARS - 1).collect();
+    let cut: String = flat.chars().take(max - 1).collect();
     format!("{cut}…")
 }
 
 pub fn preview(name: &str, input: &Value) -> String {
-    clamp_preview(&raw_preview(name, input))
+    clamp_preview(&raw_preview(name, input), PREVIEW_MAX_CHARS)
 }
 
 /// What the permission prompt shows. Unlike `preview`, a shell command is
@@ -6343,76 +6345,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(matches.join("\n"))
             }
         }
-        "grep" | "grep_files" => {
-            let pattern = input["pattern"].as_str().unwrap_or("");
-            if pattern.is_empty() {
-                return err("pattern is required");
-            }
-            let file_pattern = input["file_pattern"]
-                .as_str()
-                .or_else(|| input["include"].as_str())
-                .unwrap_or("*");
-            let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
-            let needle = if case_sensitive {
-                pattern.to_string()
-            } else {
-                pattern.to_lowercase()
-            };
-            let limit = search_limit(input);
-            let mut files = Vec::new();
-            let mut seen = 0;
-            for root in search_roots(input, cwd) {
-                collect_files(&root, &mut files, &mut seen);
-            }
-            files.sort();
-            let mut matches = Vec::new();
-            let mut total = 0usize;
-            for path in files {
-                let rel = display_path(&path, cwd);
-                let basename_matches = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|name| simple_glob_match(file_pattern, name));
-                if !simple_glob_match(file_pattern, &rel) && !basename_matches {
-                    continue;
-                }
-                let Ok(text) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                for (idx, line) in text.lines().enumerate() {
-                    let haystack = if case_sensitive {
-                        line.to_string()
-                    } else {
-                        line.to_lowercase()
-                    };
-                    if haystack.contains(&needle) {
-                        // Keep counting past the limit so the cap header can
-                        // report how much was left out.
-                        total += 1;
-                        if matches.len() < limit {
-                            matches.push(format!(
-                                "{}:{}:{}",
-                                rel,
-                                idx + 1,
-                                clip_line(line.trim_end(), MAX_MATCH_LINE)
-                            ));
-                        }
-                    }
-                }
-            }
-            if matches.is_empty() {
-                ok(format!("no matches for {pattern}"))
-            } else {
-                let shown = matches.len();
-                let body = matches.join("\n");
-                let out = if total > shown {
-                    format!("{total} matches, showing {shown} (raise `max` or narrow the pattern)\n{body}")
-                } else {
-                    body
-                };
-                ok(truncate(out, MAX_OUT))
-            }
-        }
+        "grep" | "grep_files" => run_grep(input, cwd),
         "write" | "write_file" => {
             let p_str = path_arg(input).unwrap_or("").trim();
             if p_str.is_empty() {
@@ -6764,120 +6697,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("web search failed: {e}")),
             }
         }
-        "headless_browser" => {
-            let url = input["url"].as_str().unwrap_or("").trim();
-            if url.is_empty() {
-                return err("url is required");
-            }
-            if let Some(why) = blocked_url(url) {
-                return err(why);
-            }
-            let extract_links = input["extract_links"].as_bool().unwrap_or(false);
-            match http_get_with_retry(url, Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)")) {
-                Ok(resp) => match resp.into_string() {
-                    Ok(html) => {
-                        // Extract <title>
-                        let title = {
-                            // ASCII-only lowercasing keeps byte offsets
-                            // valid for slicing `html` (`İ` grows under
-                            // full Unicode lowercasing).
-                            let lower = html.to_ascii_lowercase();
-                            if let Some(start) = lower.find("<title") {
-                                let after_tag = &html[start..];
-                                if let Some(gt) = after_tag.find('>') {
-                                    let rest = &after_tag[gt + 1..];
-                                    if let Some(end) = rest.to_ascii_lowercase().find("</title") {
-                                        rest[..end].trim().to_string()
-                                    } else {
-                                        String::new()
-                                    }
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
-                        };
-
-                        // Extract clean text content
-                        let content = strip_html(&html);
-
-                        // Extract links if requested
-                        let links: Vec<String> = if extract_links {
-                            let mut found = Vec::new();
-                            let bytes = html.as_bytes();
-                            let len = bytes.len();
-                            let mut i = 0;
-                            while i + 2 < len {
-                                // Look for <a (case-insensitive)
-                                if (bytes[i] == b'<')
-                                    && (bytes[i + 1] == b'a' || bytes[i + 1] == b'A')
-                                    && (bytes[i + 2] == b' '
-                                        || bytes[i + 2] == b'\t'
-                                        || bytes[i + 2] == b'\n')
-                                {
-                                    // Find the closing > of this tag
-                                    let tag_start = i;
-                                    let mut tag_end = i + 3;
-                                    while tag_end < len && bytes[tag_end] != b'>' {
-                                        tag_end += 1;
-                                    }
-                                    if tag_end < len {
-                                        let tag_content = &html[tag_start..=tag_end];
-                                        // Find href="..." or href='...'
-                                        let tag_lower = tag_content.to_ascii_lowercase();
-                                        if let Some(href_pos) = tag_lower.find("href=") {
-                                            let after_href = &tag_content[href_pos + 5..];
-                                            let href_val = if let Some(rest) =
-                                                after_href.strip_prefix('"')
-                                            {
-                                                rest.find('"').map(|end| &rest[..end])
-                                            } else if let Some(rest) = after_href.strip_prefix('\'')
-                                            {
-                                                rest.find('\'').map(|end| &rest[..end])
-                                            } else {
-                                                // Unquoted: take up to whitespace or >
-                                                let end = after_href
-                                                    .find(|c: char| c.is_whitespace() || c == '>')
-                                                    .unwrap_or(after_href.len());
-                                                Some(&after_href[..end])
-                                            };
-                                            if let Some(href) = href_val {
-                                                let href = href.trim();
-                                                if !href.is_empty()
-                                                    && !href.starts_with('#')
-                                                    && !href.starts_with("javascript:")
-                                                {
-                                                    found.push(href.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    i = tag_end + 1;
-                                } else {
-                                    i += 1;
-                                }
-                            }
-                            found.dedup();
-                            found
-                        } else {
-                            Vec::new()
-                        };
-
-                        let mut result = json!({
-                            "title": title,
-                            "content": content,
-                        });
-                        if extract_links {
-                            result["links"] = json!(links);
-                        }
-                        ok(truncate(result.to_string(), MAX_OUT))
-                    }
-                    Err(e) => err(format!("failed to read response body: {e}")),
-                },
-                Err(e) => err(format!("headless_browser fetch failed: {e}")),
-            }
-        }
+        "headless_browser" => run_headless_browser(input),
         "start_server" => start_server(input, cwd),
         "list_servers" => list_servers(),
         "stop_server" => stop_server(input),
@@ -7097,300 +6917,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             err(format!("skill not found: {wanted}"))
         }
         "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
-            let command = input["command"].as_str().unwrap_or("view");
-            let path = input["path"]
-                .as_str()
-                .or_else(|| input["filePath"].as_str())
-                .unwrap_or("");
-            if path.is_empty() {
-                return err("path is required");
-            }
-            match command {
-                "view" => {
-                    let p = resolve(cwd, path);
-                    if p.is_dir() {
-                        match fs::read_dir(&p) {
-                            Ok(rd) => {
-                                let mut names: Vec<String> = rd
-                                    .filter_map(|e| e.ok())
-                                    .map(|e| {
-                                        let n = e.file_name().to_string_lossy().into_owned();
-                                        if e.path().is_dir() {
-                                            format!("{n}/")
-                                        } else {
-                                            n
-                                        }
-                                    })
-                                    .collect();
-                                names.sort();
-                                ok(names.join("\n"))
-                            }
-                            Err(e) => err(format!("cannot list {}: {e}", p.display())),
-                        }
-                    } else {
-                        match fs::read_to_string(&p) {
-                            Ok(c) => {
-                                let lines: Vec<&str> = c.lines().collect();
-                                let total_lines = lines.len();
-                                if total_lines == 0 {
-                                    return ok(String::new());
-                                }
-                                let (start, end) = if let Some(range) =
-                                    input["view_range"].as_array()
-                                {
-                                    let start = range.first().and_then(|v| v.as_u64()).unwrap_or(1)
-                                        as usize;
-                                    let end = range
-                                        .get(1)
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(total_lines as u64)
-                                        as usize;
-                                    (
-                                        start.clamp(1, total_lines.max(1)),
-                                        end.clamp(1, total_lines.max(1)),
-                                    )
-                                } else {
-                                    (1, 500.min(total_lines))
-                                };
-                                let mut selected_lines = Vec::new();
-                                for (i, line) in lines
-                                    .iter()
-                                    .enumerate()
-                                    .take((end - 1).min(total_lines - 1) + 1)
-                                    .skip(start - 1)
-                                {
-                                    selected_lines.push(format!("{:>4}: {}", i + 1, line));
-                                }
-                                ok(selected_lines.join("\n"))
-                            }
-                            Err(e) => err(format!("cannot view {}: {e}", p.display())),
-                        }
-                    }
-                }
-                "create" => {
-                    let p = resolve(cwd, path);
-                    // A dropped `file_text` key must not silently produce an
-                    // empty file (see the same guard on write_file).
-                    let Some(file_text) = input["file_text"].as_str() else {
-                        return err(
-                            "missing required param `file_text` — the file was NOT written; re-send the full create call including the complete `file_text` string (use an explicit empty string to create an empty file)",
-                        );
-                    };
-                    let overwrite_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                    if file_text.is_empty() && overwrite_len > 0 {
-                        return err(format!(
-                            "refusing to overwrite non-empty file {} ({overwrite_len} bytes) with empty content — if you really intend to empty it, remove it first or send the intended replacement content",
-                            p.display()
-                        ));
-                    }
-                    if let Some(dir) = p.parent() {
-                        let _ = fs::create_dir_all(dir);
-                    }
-                    if let Ok(old_content) = fs::read_to_string(&p) {
-                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                        *guard = Some((p.clone(), old_content));
-                    } else {
-                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                        *guard = None;
-                    }
-                    match write_atomic(&p, file_text) {
-                        Ok(_) => ok(format!("successfully created file {}", p.display())),
-                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                    }
-                }
-                "str_replace" => {
-                    let p = resolve(cwd, path);
-                    let old_str = input["old_str"].as_str().unwrap_or("");
-                    let new_str = input["new_str"].as_str().unwrap_or("");
-                    if old_str.is_empty() {
-                        return err("old_str cannot be empty");
-                    }
-                    let body = match read_text(&p) {
-                        Ok(b) => b,
-                        Err(e) => return err(format!("cannot read {}: {e}", p.display())),
-                    };
-                    let (next, note) = match replace_once(&body, old_str, new_str) {
-                        Replaced::Exact(u) => (u, String::new()),
-                        Replaced::Lenient(u) => (u, format!(" ({LENIENT_MATCH_NOTE})")),
-                        Replaced::NotFound => {
-                            return err(format!(
-                                "old text not found in {}. {}.\n\nold text sought:\n{}",
-                                p.display(),
-                                edit_not_found_hint(&body, old_str),
-                                old_str
-                            ))
-                        }
-                        Replaced::Ambiguous(n) => {
-                            return err(format!(
-                                "ambiguous replacement: old text matches {n} times in {}",
-                                p.display()
-                            ))
-                        }
-                    };
-                    {
-                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                        *guard = Some((p.clone(), body));
-                    }
-                    match write_text(&p, &next) {
-                        Ok(_) => ok(format!("successfully edited file {}{note}", p.display())),
-                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                    }
-                }
-                "insert" => {
-                    let p = resolve(cwd, path);
-                    // Standard text_editor semantics: insert AFTER line
-                    // `insert_line`; 0 means the top of the file. (The old
-                    // `insert_line - 1` both inserted before the line and
-                    // underflowed on 0.)
-                    let insert_line = input["insert_line"].as_u64().unwrap_or(0) as usize;
-                    let new_str = input["new_str"].as_str().unwrap_or("");
-                    let body = match fs::read_to_string(&p) {
-                        Ok(b) => b,
-                        Err(e) => return err(format!("cannot read {}: {e}", p.display())),
-                    };
-                    let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
-                    let idx = insert_line.min(lines.len());
-                    lines.insert(idx, new_str.to_string());
-                    // Preserve the file's existing line-ending convention.
-                    let eol = if body.contains("\r\n") { "\r\n" } else { "\n" };
-                    let mut next = lines.join(eol);
-                    if body.ends_with('\n') {
-                        next.push_str(eol);
-                    }
-                    {
-                        let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                        *guard = Some((p.clone(), body));
-                    }
-                    match write_atomic(&p, &next) {
-                        Ok(_) => ok(format!(
-                            "successfully inserted text after line {insert_line} in {}",
-                            p.display()
-                        )),
-                        Err(e) => err(format!("cannot write {}: {e}", p.display())),
-                    }
-                }
-                "undo_edit" => {
-                    let p = resolve(cwd, path);
-                    let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
-                    let is_match = guard.as_ref().is_some_and(|(bp, _)| *bp == p);
-                    if !is_match {
-                        if let Some((backup_path, _)) = &*guard {
-                            return err(format!(
-                                "the last edit was to {}, cannot undo for {}",
-                                backup_path.display(),
-                                p.display()
-                            ));
-                        } else {
-                            return err("no undo backup available for this file");
-                        }
-                    }
-                    if let Some((_, old_content)) = guard.take() {
-                        match write_atomic(&p, &old_content) {
-                            Ok(_) => ok(format!(
-                                "successfully reverted the last edit to {}",
-                                p.display()
-                            )),
-                            Err(e) => {
-                                *guard = Some((p.clone(), old_content));
-                                err(format!("cannot write {}: {e}", p.display()))
-                            }
-                        }
-                    } else {
-                        err("no undo backup available for this file")
-                    }
-                }
-                other => err(format!("unknown editor command: {other}")),
-            }
+            run_str_replace_editor(input, cwd)
         }
-        "Artifact" | "publish_artifact" => {
-            let contents = input["contents"].as_str().unwrap_or("");
-            let title = input["title"].as_str().unwrap_or("artifact");
-            // When the model omits `type`, sniff the contents instead of
-            // assuming HTML — markdown reports were being rejected by
-            // HTML-app rules.
-            let kind = match input["type"].as_str() {
-                Some(k) => k,
-                None => {
-                    let head = contents.trim_start().to_ascii_lowercase();
-                    if head.starts_with("<!doctype") || head.starts_with("<html") {
-                        "html"
-                    } else {
-                        "markdown"
-                    }
-                }
-            };
-            if let Some(reason) = artifact_quality_error(contents, kind) {
-                return err(reason);
-            }
-            let warning = artifact_game_warning(title, contents, kind);
-            let safe_title: String = title
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                .collect();
-            let ext = match kind {
-                "html" => "html",
-                "markdown" => "md",
-                "svg" => "svg",
-                "json" => "json",
-                _ => "txt",
-            };
-            let dir = cwd.join(".buildwithnexus").join("artifacts");
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let filename = format!("{}_{timestamp}.{ext}", safe_title);
-            let p = dir.join(&filename);
-            // Both copies land in the checkout: never through a symlink.
-            if let Err(e) = crate::config::write_project_file(&p, cwd, contents.as_bytes()) {
-                return err(format!("cannot write artifact: {e}"));
-            }
-            let clean_name = if (safe_title.is_empty()
-                || safe_title == "_"
-                || safe_title.eq_ignore_ascii_case("artifact")
-                || safe_title.eq_ignore_ascii_case("index"))
-                && ext == "html"
-            {
-                "index".to_string()
-            } else {
-                safe_title.to_lowercase()
-            };
-            let direct_file = cwd.join(format!("{clean_name}.{ext}"));
-            // The workspace copy can clobber an existing cwd/index.html —
-            // checkpoint it first so /undo can restore, and surface a failed
-            // write instead of swallowing it.
-            if direct_file.exists() {
-                checkpoint::record(cwd, &direct_file, "publish_artifact");
-            }
-            if let Err(e) =
-                crate::config::write_project_file(&direct_file, cwd, contents.as_bytes())
-            {
-                return err(format!(
-                    "artifact archived to {} but the workspace copy {} could not be written: {e}",
-                    p.display(),
-                    direct_file.display()
-                ));
-            }
-            // Auto-open at most once per session per artifact name so
-            // republishing doesn't spawn a new browser tab every time.
-            if ext == "html" && mark_artifact_opened(&clean_name) && !cfg!(test) {
-                let _ = if cfg!(target_os = "macos") {
-                    Command::new("open").arg(&direct_file).status()
-                } else if cfg!(windows) {
-                    Command::new("cmd")
-                        .args(["/C", "start", "", &direct_file.to_string_lossy()])
-                        .status()
-                } else {
-                    Command::new("xdg-open").arg(&direct_file).status()
-                };
-            }
-            ok(format!(
-                "Artifact successfully published locally to: {} (and created directly in workspace at: {}){}",
-                p.display(),
-                direct_file.display(),
-                warning.map(|w| format!("\n{w}")).unwrap_or_default()
-            ))
-        }
+        "Artifact" | "publish_artifact" => run_artifact(input, cwd),
         "finish" => Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
             is_error: false,
@@ -7434,6 +6963,487 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             err(msg)
         }
     }
+}
+
+/// `grep_files`: search file contents under a folder.
+fn run_grep(input: &Value, cwd: &Path) -> Outcome {
+    let pattern = input["pattern"].as_str().unwrap_or("");
+    if pattern.is_empty() {
+        return err("pattern is required");
+    }
+    let file_pattern = input["file_pattern"]
+        .as_str()
+        .or_else(|| input["include"].as_str())
+        .unwrap_or("*");
+    let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
+    let needle = if case_sensitive {
+        pattern.to_string()
+    } else {
+        pattern.to_lowercase()
+    };
+    let limit = search_limit(input);
+    let mut files = Vec::new();
+    let mut seen = 0;
+    for root in search_roots(input, cwd) {
+        collect_files(&root, &mut files, &mut seen);
+    }
+    files.sort();
+    let mut matches = Vec::new();
+    let mut total = 0usize;
+    for path in files {
+        let rel = display_path(&path, cwd);
+        let basename_matches = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| simple_glob_match(file_pattern, name));
+        if !simple_glob_match(file_pattern, &rel) && !basename_matches {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for (idx, line) in text.lines().enumerate() {
+            let haystack = if case_sensitive {
+                line.to_string()
+            } else {
+                line.to_lowercase()
+            };
+            if haystack.contains(&needle) {
+                // Keep counting past the limit so the cap header can
+                // report how much was left out.
+                total += 1;
+                if matches.len() < limit {
+                    matches.push(format!(
+                        "{}:{}:{}",
+                        rel,
+                        idx + 1,
+                        clip_line(line.trim_end(), MAX_MATCH_LINE)
+                    ));
+                }
+            }
+        }
+    }
+    if matches.is_empty() {
+        ok(format!("no matches for {pattern}"))
+    } else {
+        let shown = matches.len();
+        let body = matches.join("\n");
+        let out = if total > shown {
+            format!("{total} matches, showing {shown} (raise `max` or narrow the pattern)\n{body}")
+        } else {
+            body
+        };
+        ok(truncate(out, MAX_OUT))
+    }
+}
+
+/// `headless_browser`: drive a local headless browser.
+fn run_headless_browser(input: &Value) -> Outcome {
+    let url = input["url"].as_str().unwrap_or("").trim();
+    if url.is_empty() {
+        return err("url is required");
+    }
+    if let Some(why) = blocked_url(url) {
+        return err(why);
+    }
+    let extract_links = input["extract_links"].as_bool().unwrap_or(false);
+    match http_get_with_retry(url, Some("Mozilla/5.0 (compatible; buildwithnexus/1.0)")) {
+        Ok(resp) => match resp.into_string() {
+            Ok(html) => {
+                // Extract <title>
+                let title = {
+                    // ASCII-only lowercasing keeps byte offsets
+                    // valid for slicing `html` (`İ` grows under
+                    // full Unicode lowercasing).
+                    let lower = html.to_ascii_lowercase();
+                    if let Some(start) = lower.find("<title") {
+                        let after_tag = &html[start..];
+                        if let Some(gt) = after_tag.find('>') {
+                            let rest = &after_tag[gt + 1..];
+                            if let Some(end) = rest.to_ascii_lowercase().find("</title") {
+                                rest[..end].trim().to_string()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                };
+
+                // Extract clean text content
+                let content = strip_html(&html);
+
+                // Extract links if requested
+                let links: Vec<String> = if extract_links {
+                    let mut found = Vec::new();
+                    let bytes = html.as_bytes();
+                    let len = bytes.len();
+                    let mut i = 0;
+                    while i + 2 < len {
+                        // Look for <a (case-insensitive)
+                        if (bytes[i] == b'<')
+                            && (bytes[i + 1] == b'a' || bytes[i + 1] == b'A')
+                            && (bytes[i + 2] == b' '
+                                || bytes[i + 2] == b'\t'
+                                || bytes[i + 2] == b'\n')
+                        {
+                            // Find the closing > of this tag
+                            let tag_start = i;
+                            let mut tag_end = i + 3;
+                            while tag_end < len && bytes[tag_end] != b'>' {
+                                tag_end += 1;
+                            }
+                            if tag_end < len {
+                                let tag_content = &html[tag_start..=tag_end];
+                                // Find href="..." or href='...'
+                                let tag_lower = tag_content.to_ascii_lowercase();
+                                if let Some(href_pos) = tag_lower.find("href=") {
+                                    let after_href = &tag_content[href_pos + 5..];
+                                    let href_val = if let Some(rest) = after_href.strip_prefix('"')
+                                    {
+                                        rest.find('"').map(|end| &rest[..end])
+                                    } else if let Some(rest) = after_href.strip_prefix('\'') {
+                                        rest.find('\'').map(|end| &rest[..end])
+                                    } else {
+                                        // Unquoted: take up to whitespace or >
+                                        let end = after_href
+                                            .find(|c: char| c.is_whitespace() || c == '>')
+                                            .unwrap_or(after_href.len());
+                                        Some(&after_href[..end])
+                                    };
+                                    if let Some(href) = href_val {
+                                        let href = href.trim();
+                                        if !href.is_empty()
+                                            && !href.starts_with('#')
+                                            && !href.starts_with("javascript:")
+                                        {
+                                            found.push(href.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            i = tag_end + 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    found.dedup();
+                    found
+                } else {
+                    Vec::new()
+                };
+
+                let mut result = json!({
+                    "title": title,
+                    "content": content,
+                });
+                if extract_links {
+                    result["links"] = json!(links);
+                }
+                ok(truncate(result.to_string(), MAX_OUT))
+            }
+            Err(e) => err(format!("failed to read response body: {e}")),
+        },
+        Err(e) => err(format!("headless_browser fetch failed: {e}")),
+    }
+}
+
+/// `str_replace_editor`: the text-editor tool's view, create, str_replace, insert and undo_edit.
+fn run_str_replace_editor(input: &Value, cwd: &Path) -> Outcome {
+    let command = input["command"].as_str().unwrap_or("view");
+    let path = input["path"]
+        .as_str()
+        .or_else(|| input["filePath"].as_str())
+        .unwrap_or("");
+    if path.is_empty() {
+        return err("path is required");
+    }
+    match command {
+        "view" => {
+            let p = resolve(cwd, path);
+            if p.is_dir() {
+                match fs::read_dir(&p) {
+                    Ok(rd) => {
+                        let mut names: Vec<String> = rd
+                            .filter_map(|e| e.ok())
+                            .map(|e| {
+                                let n = e.file_name().to_string_lossy().into_owned();
+                                if e.path().is_dir() {
+                                    format!("{n}/")
+                                } else {
+                                    n
+                                }
+                            })
+                            .collect();
+                        names.sort();
+                        ok(names.join("\n"))
+                    }
+                    Err(e) => err(format!("cannot list {}: {e}", p.display())),
+                }
+            } else {
+                match fs::read_to_string(&p) {
+                    Ok(c) => {
+                        let lines: Vec<&str> = c.lines().collect();
+                        let total_lines = lines.len();
+                        if total_lines == 0 {
+                            return ok(String::new());
+                        }
+                        let (start, end) = if let Some(range) = input["view_range"].as_array() {
+                            let start =
+                                range.first().and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                            let end = range
+                                .get(1)
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(total_lines as u64)
+                                as usize;
+                            (
+                                start.clamp(1, total_lines.max(1)),
+                                end.clamp(1, total_lines.max(1)),
+                            )
+                        } else {
+                            (1, 500.min(total_lines))
+                        };
+                        let mut selected_lines = Vec::new();
+                        for (i, line) in lines
+                            .iter()
+                            .enumerate()
+                            .take((end - 1).min(total_lines - 1) + 1)
+                            .skip(start - 1)
+                        {
+                            selected_lines.push(format!("{:>4}: {}", i + 1, line));
+                        }
+                        ok(selected_lines.join("\n"))
+                    }
+                    Err(e) => err(format!("cannot view {}: {e}", p.display())),
+                }
+            }
+        }
+        "create" => {
+            let p = resolve(cwd, path);
+            // A dropped `file_text` key must not silently produce an
+            // empty file (see the same guard on write_file).
+            let Some(file_text) = input["file_text"].as_str() else {
+                return err(
+                        "missing required param `file_text` — the file was NOT written; re-send the full create call including the complete `file_text` string (use an explicit empty string to create an empty file)",
+                    );
+            };
+            let overwrite_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if file_text.is_empty() && overwrite_len > 0 {
+                return err(format!(
+                        "refusing to overwrite non-empty file {} ({overwrite_len} bytes) with empty content — if you really intend to empty it, remove it first or send the intended replacement content",
+                        p.display()
+                    ));
+            }
+            if let Some(dir) = p.parent() {
+                let _ = fs::create_dir_all(dir);
+            }
+            if let Ok(old_content) = fs::read_to_string(&p) {
+                let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((p.clone(), old_content));
+            } else {
+                let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+            }
+            match write_atomic(&p, file_text) {
+                Ok(_) => ok(format!("successfully created file {}", p.display())),
+                Err(e) => err(format!("cannot write {}: {e}", p.display())),
+            }
+        }
+        "str_replace" => {
+            let p = resolve(cwd, path);
+            let old_str = input["old_str"].as_str().unwrap_or("");
+            let new_str = input["new_str"].as_str().unwrap_or("");
+            if old_str.is_empty() {
+                return err("old_str cannot be empty");
+            }
+            let body = match read_text(&p) {
+                Ok(b) => b,
+                Err(e) => return err(format!("cannot read {}: {e}", p.display())),
+            };
+            let (next, note) = match replace_once(&body, old_str, new_str) {
+                Replaced::Exact(u) => (u, String::new()),
+                Replaced::Lenient(u) => (u, format!(" ({LENIENT_MATCH_NOTE})")),
+                Replaced::NotFound => {
+                    return err(format!(
+                        "old text not found in {}. {}.\n\nold text sought:\n{}",
+                        p.display(),
+                        edit_not_found_hint(&body, old_str),
+                        old_str
+                    ))
+                }
+                Replaced::Ambiguous(n) => {
+                    return err(format!(
+                        "ambiguous replacement: old text matches {n} times in {}",
+                        p.display()
+                    ))
+                }
+            };
+            {
+                let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((p.clone(), body));
+            }
+            match write_text(&p, &next) {
+                Ok(_) => ok(format!("successfully edited file {}{note}", p.display())),
+                Err(e) => err(format!("cannot write {}: {e}", p.display())),
+            }
+        }
+        "insert" => {
+            let p = resolve(cwd, path);
+            // Standard text_editor semantics: insert AFTER line
+            // `insert_line`; 0 means the top of the file. (The old
+            // `insert_line - 1` both inserted before the line and
+            // underflowed on 0.)
+            let insert_line = input["insert_line"].as_u64().unwrap_or(0) as usize;
+            let new_str = input["new_str"].as_str().unwrap_or("");
+            let body = match fs::read_to_string(&p) {
+                Ok(b) => b,
+                Err(e) => return err(format!("cannot read {}: {e}", p.display())),
+            };
+            let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
+            let idx = insert_line.min(lines.len());
+            lines.insert(idx, new_str.to_string());
+            // Preserve the file's existing line-ending convention.
+            let eol = if body.contains("\r\n") { "\r\n" } else { "\n" };
+            let mut next = lines.join(eol);
+            if body.ends_with('\n') {
+                next.push_str(eol);
+            }
+            {
+                let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some((p.clone(), body));
+            }
+            match write_atomic(&p, &next) {
+                Ok(_) => ok(format!(
+                    "successfully inserted text after line {insert_line} in {}",
+                    p.display()
+                )),
+                Err(e) => err(format!("cannot write {}: {e}", p.display())),
+            }
+        }
+        "undo_edit" => {
+            let p = resolve(cwd, path);
+            let mut guard = UNDO_BACKUP.lock().unwrap_or_else(|e| e.into_inner());
+            let is_match = guard.as_ref().is_some_and(|(bp, _)| *bp == p);
+            if !is_match {
+                if let Some((backup_path, _)) = &*guard {
+                    return err(format!(
+                        "the last edit was to {}, cannot undo for {}",
+                        backup_path.display(),
+                        p.display()
+                    ));
+                } else {
+                    return err("no undo backup available for this file");
+                }
+            }
+            if let Some((_, old_content)) = guard.take() {
+                match write_atomic(&p, &old_content) {
+                    Ok(_) => ok(format!(
+                        "successfully reverted the last edit to {}",
+                        p.display()
+                    )),
+                    Err(e) => {
+                        *guard = Some((p.clone(), old_content));
+                        err(format!("cannot write {}: {e}", p.display()))
+                    }
+                }
+            } else {
+                err("no undo backup available for this file")
+            }
+        }
+        other => err(format!("unknown editor command: {other}")),
+    }
+}
+
+/// `Artifact`: publish a self-contained local artifact.
+fn run_artifact(input: &Value, cwd: &Path) -> Outcome {
+    let contents = input["contents"].as_str().unwrap_or("");
+    let title = input["title"].as_str().unwrap_or("artifact");
+    // When the model omits `type`, sniff the contents instead of
+    // assuming HTML — markdown reports were being rejected by
+    // HTML-app rules.
+    let kind = match input["type"].as_str() {
+        Some(k) => k,
+        None => {
+            let head = contents.trim_start().to_ascii_lowercase();
+            if head.starts_with("<!doctype") || head.starts_with("<html") {
+                "html"
+            } else {
+                "markdown"
+            }
+        }
+    };
+    if let Some(reason) = artifact_quality_error(contents, kind) {
+        return err(reason);
+    }
+    let warning = artifact_game_warning(title, contents, kind);
+    let safe_title: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let ext = match kind {
+        "html" => "html",
+        "markdown" => "md",
+        "svg" => "svg",
+        "json" => "json",
+        _ => "txt",
+    };
+    let dir = cwd.join(".buildwithnexus").join("artifacts");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let filename = format!("{}_{timestamp}.{ext}", safe_title);
+    let p = dir.join(&filename);
+    // Both copies land in the checkout: never through a symlink.
+    if let Err(e) = crate::config::write_project_file(&p, cwd, contents.as_bytes()) {
+        return err(format!("cannot write artifact: {e}"));
+    }
+    let clean_name = if (safe_title.is_empty()
+        || safe_title == "_"
+        || safe_title.eq_ignore_ascii_case("artifact")
+        || safe_title.eq_ignore_ascii_case("index"))
+        && ext == "html"
+    {
+        "index".to_string()
+    } else {
+        safe_title.to_lowercase()
+    };
+    let direct_file = cwd.join(format!("{clean_name}.{ext}"));
+    // The workspace copy can clobber an existing cwd/index.html —
+    // checkpoint it first so /undo can restore, and surface a failed
+    // write instead of swallowing it.
+    if direct_file.exists() {
+        checkpoint::record(cwd, &direct_file, "publish_artifact");
+    }
+    if let Err(e) = crate::config::write_project_file(&direct_file, cwd, contents.as_bytes()) {
+        return err(format!(
+            "artifact archived to {} but the workspace copy {} could not be written: {e}",
+            p.display(),
+            direct_file.display()
+        ));
+    }
+    // Auto-open at most once per session per artifact name so
+    // republishing doesn't spawn a new browser tab every time.
+    if ext == "html" && mark_artifact_opened(&clean_name) && !cfg!(test) {
+        let _ = if cfg!(target_os = "macos") {
+            Command::new("open").arg(&direct_file).status()
+        } else if cfg!(windows) {
+            Command::new("cmd")
+                .args(["/C", "start", "", &direct_file.to_string_lossy()])
+                .status()
+        } else {
+            Command::new("xdg-open").arg(&direct_file).status()
+        };
+    }
+    ok(format!(
+            "Artifact successfully published locally to: {} (and created directly in workspace at: {}){}",
+            p.display(),
+            direct_file.display(),
+            warning.map(|w| format!("\n{w}")).unwrap_or_default()
+        ))
 }
 
 // Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)

@@ -806,7 +806,7 @@ fn restore_set(
         return Err(format!(
             "nothing restored — {} checkpoint{} cannot be restored:\n  {}",
             blocked.len(),
-            if blocked.len() == 1 { "" } else { "s" },
+            crate::report::plural(blocked.len()),
             blocked.join("\n  ")
         ));
     }
@@ -831,7 +831,7 @@ fn restore_set(
     let mut msg = format!(
         "{} restore{} failed:",
         failed.len(),
-        if failed.len() == 1 { "" } else { "s" }
+        crate::report::plural(failed.len())
     );
     for e in &failed {
         msg.push_str(&format!("\n  ✗ {e}"));

@@ -346,7 +346,7 @@ pub fn to_markdown(s: &Session) -> String {
                     let n = images.len();
                     out.push_str(&format!(
                         "\n_{n} image{} attached_\n",
-                        if n == 1 { "" } else { "s" }
+                        crate::report::plural(n)
                     ));
                 }
             }

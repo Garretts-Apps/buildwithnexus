@@ -866,10 +866,10 @@ fn openai_exchange(
     if flatten_remembered(&url) {
         flatten_openai_messages(&mut body, true);
         let resp = send_raw(req, body)?;
-        return finish_openai(resp, streaming, on_text, on_thinking);
+        return finish(resp, streaming, OPENAI, on_text, on_thinking);
     }
     match send_raw(req.clone(), body.clone()) {
-        Ok(resp) => finish_openai(resp, streaming, on_text, on_thinking),
+        Ok(resp) => finish(resp, streaming, OPENAI, on_text, on_thinking),
         Err(e) if needs_flatten(&e) => {
             if flatten_is_sticky(&e) {
                 remember_flatten(&url);
@@ -880,7 +880,7 @@ fn openai_exchange(
             // A one-off image rejection retries without the images.
             flatten_openai_messages(&mut body, !e.to_lowercase().contains("image"));
             let resp = send_raw(req, body)?;
-            finish_openai(resp, streaming, on_text, on_thinking)
+            finish(resp, streaming, OPENAI, on_text, on_thinking)
         }
         Err(e) => Err(e),
     }
@@ -907,10 +907,16 @@ fn ollama_exchange(
     }
     if flatten_remembered(&key) {
         flatten_ollama_messages(&mut body);
-        return finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking);
+        return finish(
+            send_raw(req, body)?,
+            streaming,
+            OLLAMA,
+            on_text,
+            on_thinking,
+        );
     }
     match send_raw(req.clone(), body.clone()) {
-        Ok(resp) => finish_ollama(resp, streaming, on_text, on_thinking),
+        Ok(resp) => finish(resp, streaming, OLLAMA, on_text, on_thinking),
         // A reasoning effort asked of a model without thinking: drop the
         // option for this model for the rest of the session and retry, which
         // still gets the tools fallback below if that is needed too.
@@ -929,7 +935,13 @@ fn ollama_exchange(
                 p.model
             ));
             flatten_ollama_messages(&mut body);
-            finish_ollama(send_raw(req, body)?, streaming, on_text, on_thinking)
+            finish(
+                send_raw(req, body)?,
+                streaming,
+                OLLAMA,
+                on_text,
+                on_thinking,
+            )
         }
         Err(e) => Err(e),
     }
@@ -945,14 +957,20 @@ fn ollama_rejects_tools(e: &str) -> bool {
     e.starts_with("HTTP 400") && e.to_lowercase().contains("does not support tools")
 }
 
-fn finish_ollama(
+type StreamParser =
+    fn(InterruptibleReader, &mut dyn FnMut(&str), &mut dyn FnMut(&str)) -> Result<Reply, String>;
+
+/// Reads a model reply with the protocol's own parser: its stream parser
+/// over an interruptible reader when streaming, else its JSON parser.
+fn finish(
     resp: ureq::Response,
     streaming: bool,
+    (stream, parse): Parsers,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
     if streaming {
-        ollama_stream(
+        stream(
             InterruptibleReader::new(resp.into_reader()),
             on_text,
             on_thinking,
@@ -961,29 +979,14 @@ fn finish_ollama(
         let v = resp
             .into_json::<Value>()
             .map_err(|e| format!("bad JSON from server: {e}"))?;
-        ollama_parse(v)
+        parse(v)
     }
 }
 
-fn finish_openai(
-    resp: ureq::Response,
-    streaming: bool,
-    on_text: &mut dyn FnMut(&str),
-    on_thinking: &mut dyn FnMut(&str),
-) -> Result<Reply, String> {
-    if streaming {
-        openai_stream(
-            InterruptibleReader::new(resp.into_reader()),
-            on_text,
-            on_thinking,
-        )
-    } else {
-        let v = resp
-            .into_json::<Value>()
-            .map_err(|e| format!("bad JSON from server: {e}"))?;
-        openai_parse(v)
-    }
-}
+type Parsers = (StreamParser, fn(Value) -> Result<Reply, String>);
+const ANTHROPIC: Parsers = (anthropic_stream, anthropic_parse);
+const OPENAI: Parsers = (openai_stream, openai_parse);
+const OLLAMA: Parsers = (ollama_stream, ollama_parse);
 
 // The one choke point every model call passes through (blocking, streaming,
 // sub-agents, the /model probe): each completed reply is booked into the
@@ -1035,14 +1038,14 @@ fn request_inner(
             let (req, mut body) = anthropic_request(p, msgs, tools)?;
             if streaming {
                 body["stream"] = json!(true);
-                anthropic_stream(
-                    InterruptibleReader::new(send_raw(req, body)?.into_reader()),
-                    on_text,
-                    on_thinking,
-                )
-            } else {
-                anthropic_parse(send(req, body)?)
             }
+            finish(
+                send_raw(req, body)?,
+                streaming,
+                ANTHROPIC,
+                on_text,
+                on_thinking,
+            )
         }
         Protocol::OpenAi => {
             let (req, body) = openai_request_at(p, &p.base_url, msgs, tools);
@@ -1075,12 +1078,6 @@ fn request_inner(
 }
 
 // ── HTTP plumbing ──────────────────────────────────────────────────────────
-fn send(req: ureq::Request, body: Value) -> Result<Value, String> {
-    send_raw(req, body)?
-        .into_json::<Value>()
-        .map_err(|e| format!("bad JSON from server: {e}"))
-}
-
 // Esc and Ctrl-C only raise a flag; a socket read on the calling thread can't
 // be cancelled. So the request runs on a worker thread and this thread waits
 // in 50 ms slices, checking the flag. Without it an interrupt waited for the
