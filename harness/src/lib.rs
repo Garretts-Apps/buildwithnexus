@@ -552,7 +552,7 @@ pub fn run() {
 
 // `--json sessions`: one `session` event per saved session, newest first,
 // and nothing else on stdout (an empty list prints nothing).
-fn print_sessions_json(all: &[session::Session]) {
+fn print_sessions_json(all: &[session::SessionInfo]) {
     for s in all {
         report::event(serde_json::json!({
             "type": "session",
@@ -562,7 +562,7 @@ fn print_sessions_json(all: &[session::Session]) {
             "model": s.model,
             "created_ms": s.created_ms as u64,
             "updated_ms": s.updated_ms as u64,
-            "messages": s.msgs.len(),
+            "messages": s.msg_count,
         }));
     }
 }
@@ -2943,13 +2943,17 @@ fn looks_like_action_request(task: &str) -> bool {
 
 // Where a session ran, as a list shows it: "this folder", or the last two
 // parts of its path.
-fn session_folder(s: &session::Session, cwd: &std::path::Path) -> String {
-    if s.is_in(cwd) {
+// Where a session ran, short: "this folder", or its last two folder names.
+fn session_folder(folder: &str, here: bool) -> String {
+    if here {
         return "this folder".to_string();
     }
-    let parts: Vec<&str> = s.cwd.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = folder
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .collect();
     match parts.len() {
-        0 => s.cwd.clone(),
+        0 => folder.to_string(),
         1 => parts[0].to_string(),
         n => format!("…/{}/{}", parts[n - 2], parts[n - 1]),
     }
@@ -2957,7 +2961,7 @@ fn session_folder(s: &session::Session, cwd: &std::path::Path) -> String {
 
 // One picker row for a saved session: its title, then age, message count
 // and folder.
-fn session_item(s: &session::Session, cwd: &std::path::Path) -> tui::SelectItem {
+fn session_item(s: &session::SessionInfo, cwd: &std::path::Path) -> tui::SelectItem {
     // Titles come from task text and cwd from the checkout's folder name.
     let label: String = tui::sanitize_terminal(s.label()).chars().take(56).collect();
     tui::SelectItem {
@@ -2965,8 +2969,8 @@ fn session_item(s: &session::Session, cwd: &std::path::Path) -> tui::SelectItem 
         detail: format!(
             "{} · {} msgs · {}",
             session::ago(s.updated_ms),
-            s.msgs.len(),
-            tui::sanitize_terminal(&session_folder(s, cwd))
+            s.msg_count,
+            tui::sanitize_terminal(&session_folder(&s.cwd, s.is_in(cwd)))
         ),
     }
 }
@@ -3184,7 +3188,7 @@ fn sessions_command(args: &[String]) {
             "  {}  {:<9} {:>4} msgs  {:<48}  {}",
             s.id,
             session::ago(s.updated_ms),
-            s.msgs.len(),
+            s.msg_count,
             title,
             tui::sanitize_terminal(&s.cwd)
         );
@@ -3229,7 +3233,7 @@ fn continue_command(opts: CliOptions, task: String) {
                     tui::yellow(&format!(
                         "no session in this folder — continuing '{}' from {}",
                         tui::sanitize_terminal(s.label()),
-                        tui::sanitize_terminal(&session_folder(&s, &cwd))
+                        tui::sanitize_terminal(&session_folder(&s.cwd, s.is_in(&cwd)))
                     ))
                 );
                 s
@@ -9335,15 +9339,14 @@ mod tests {
 
     #[test]
     fn resume_rows_name_age_messages_and_folder() {
-        let mk = |title: &str, cwd: &str| session::Session {
-            schema_version: 1,
+        let mk = |title: &str, cwd: &str| session::SessionInfo {
             id: title.into(),
             title: title.into(),
             cwd: cwd.into(),
             model: "m".into(),
             created_ms: 0,
             updated_ms: 0,
-            msgs: vec![],
+            msg_count: 0,
             name: None,
         };
         let all = [
@@ -9358,8 +9361,14 @@ mod tests {
             item.detail
         );
         let here = std::path::Path::new("/work/api");
-        assert_eq!(session_folder(&all[0], here), "this folder");
-        assert_eq!(session_folder(&all[1], here), "…/work/cli");
+        assert_eq!(
+            session_folder(&all[0].cwd, all[0].is_in(here)),
+            "this folder"
+        );
+        assert_eq!(
+            session_folder(&all[1].cwd, all[1].is_in(here)),
+            "…/work/cli"
+        );
     }
 
     #[test]

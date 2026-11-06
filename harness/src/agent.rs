@@ -6966,7 +6966,7 @@ fn chat_reply(
 ) -> Result<(), String> {
     let started = checkpoint::now_ms();
     let r = chat_rounds(p, perm, readonly, cwd, question, msgs);
-    checkpoint::seal_since(cwd, started);
+    let _ = checkpoint::seal_since(cwd, started);
     r
 }
 

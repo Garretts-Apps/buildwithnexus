@@ -138,7 +138,7 @@ const PRUNE_AT: usize = 600;
 
 // The turn now running: its task (stamped on each checkpoint) and the git
 // state it started from, by folder.
-static CURRENT_TASK: Mutex<Option<String>> = Mutex::new(None);
+static CURRENT_TASK: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
 static TURN_SNAPSHOTS: Mutex<Vec<(PathBuf, Option<GitSnap>)>> = Mutex::new(Vec::new());
 // Turns this process began, by folder: a relaunch must ask before undoing.
 static OWN_TURNS: Mutex<Vec<(PathBuf, u128)>> = Mutex::new(Vec::new());
@@ -187,7 +187,8 @@ pub fn begin_turn(cwd: &Path, task: &str) -> usize {
         .take(80)
         .collect();
     if let Ok(mut t) = CURRENT_TASK.lock() {
-        *t = Some(label.clone());
+        t.retain(|(c, _)| c != cwd);
+        t.push((cwd.to_path_buf(), label.clone()));
     }
     let pruned = prune_once(cwd);
     let snap = git_snapshot(cwd);
@@ -213,22 +214,18 @@ pub fn begin_turn(cwd: &Path, task: &str) -> usize {
 /// (see `changed_after_agent`) and which changed files no checkpoint covers.
 pub fn end_turn(cwd: &Path) {
     if let Ok(mut t) = CURRENT_TASK.lock() {
-        *t = None;
+        t.retain(|(c, _)| c != cwd);
     }
     let Some(mut turn) = load_turn(cwd) else {
         return;
     };
-    seal_since(cwd, turn.started_ms);
+    let this_turn = seal_since(cwd, turn.started_ms);
     let before = TURN_SNAPSHOTS.lock().ok().and_then(|mut snaps| {
         let i = snaps.iter().position(|(c, _)| c == cwd)?;
         snaps.swap_remove(i).1
     });
     if let (Some(before), Some(after)) = (before, git_snapshot(cwd)) {
-        let covered: HashSet<PathBuf> = list(cwd)
-            .into_iter()
-            .filter(|cp| cp.created_ms >= turn.started_ms)
-            .map(|cp| normalized(&cp.path))
-            .collect();
+        let covered: HashSet<PathBuf> = this_turn.iter().map(|cp| normalized(&cp.path)).collect();
         // A new folder counts as covered when checkpoints hold files in it.
         turn.untracked = changed_between(&before, &after)
             .into_iter()
@@ -459,16 +456,15 @@ pub fn undo_note(paths: &[PathBuf]) -> Option<String> {
 /// `since_ms` (see `changed_after_agent`). `end_turn` does this for a task;
 /// a conversational turn, which is not the folder's last task for bare
 /// /undo, calls it directly.
-pub fn seal_since(cwd: &Path, since_ms: u128) {
-    for mut cp in list(cwd)
-        .into_iter()
-        .filter(|cp| cp.created_ms >= since_ms && cp.after.is_none())
-    {
+pub fn seal_since(cwd: &Path, since_ms: u128) -> Vec<Checkpoint> {
+    let mut cps = list_since(cwd, since_ms);
+    for cp in cps.iter_mut().filter(|cp| cp.after.is_none()) {
         cp.after = Some(fingerprint(&cp.path));
         if let Ok(body) = serde_json::to_string_pretty(&cp) {
             let _ = write_atomic(&dir(cwd).join(format!("{}.json", cp.id)), body.as_bytes());
         }
     }
+    cps
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -610,7 +606,10 @@ pub fn record(cwd: &Path, path: &Path, action: &str) {
         seq,
         mode,
         after: None,
-        task: CURRENT_TASK.lock().ok().and_then(|t| t.clone()),
+        task: CURRENT_TASK
+            .lock()
+            .ok()
+            .and_then(|t| t.iter().find(|(c, _)| c == cwd).map(|(_, l)| l.clone())),
         root: crate::workdirs::containing(path).filter(|_| !inside_tree(path, cwd)),
     };
     let checkpoint_dir = dir(cwd);
@@ -647,11 +646,27 @@ fn write_atomic_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io
 
 /// Returns all recorded checkpoints for the given workspace directory, sorted newest first.
 pub fn list(cwd: &Path) -> Vec<Checkpoint> {
+    list_since(cwd, 0)
+}
+
+/// The checkpoints recorded for `cwd` at or after `since_ms`, newest first.
+/// A checkpoint's file name starts with its creation time, so older ones are
+/// skipped without reading them; the store holds every project's
+/// checkpoints, each with a file snapshot of up to 2 MiB.
+fn list_since(cwd: &Path, since_ms: u128) -> Vec<Checkpoint> {
     let Ok(rd) = fs::read_dir(dir(cwd)) else {
         return Vec::new();
     };
+    let recent = |name: &std::ffi::OsStr| {
+        let created = name
+            .to_str()
+            .and_then(|n| n.split('-').next()?.parse::<u128>().ok());
+        // A name that does not parse is read, as before.
+        created.is_none_or(|ms| ms >= since_ms)
+    };
     let mut items: Vec<Checkpoint> = rd
         .filter_map(|e| e.ok())
+        .filter(|e| since_ms == 0 || recent(&e.file_name()))
         .filter_map(|e| fs::read_to_string(e.path()).ok())
         .filter_map(|s| serde_json::from_str::<Checkpoint>(&s).ok())
         .filter(|cp| cp.cwd == cwd)
