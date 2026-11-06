@@ -4,6 +4,70 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-11-06
+
+Fixes for Windows home folders, symlink loops, editor integrations and a
+closed pipe, plus faster saves and searches. Nothing here changes a default.
+
+### Fixed
+- **Windows: `~` finds your home folder.** Windows sets `USERPROFILE`, not
+  `HOME`. bwn read only `HOME` in four places, so with a global npm install
+  `@~/notes.txt` was looked up in the working folder and sent as typed,
+  LM Studio's model folders were never scanned, and the system prompt named
+  no home folder. `npx` hid the problem, because npm sets `HOME` for its
+  child processes.
+- **Symlink loops.** A link back up the project (`src/up -> ..`) made `/kb`,
+  `grep_files`, `find_files`, `find_paths` and `@` completion walk the project
+  again and again, listing one file under dozens of ever longer paths. A link
+  to a parent, or to a folder already reached through a link, is now skipped.
+  Links that lead out of the project are still followed.
+- **`str_replace_editor` in an editor.** Under `buildwithnexus acp`, its
+  `str_replace` command read and wrote the file on disk, so it missed unsaved
+  changes in the open buffer and wrote behind the editor's back. It now goes
+  through the editor, like `edit_file`.
+- **A closed pipe ends a run quietly.** `bwn run ... | head -1` panicked and
+  exited 101. It now stops without a message and exits 141, the code a shell
+  reports for SIGPIPE.
+- **A failed save leaves nothing behind.** A failed save of a session, the
+  workflow store, settings or a checkpoint could leave a temp file, and two
+  bwn processes could pick the same temp name. Temp names are unique now and
+  are removed when a save fails.
+- **Checkpoints from the wrong folder.** The task label stamped on checkpoints
+  was one value for the whole process, so one folder's turn could label
+  another folder's checkpoints. It is kept per folder.
+
+### Changed
+- **Faster.** Saving a long session after each tool round no longer re-reads
+  and re-parses the whole previous file (10.1 ms to 7.0 ms with three 1.5 MB
+  screenshots). The end of a turn reads only that turn's checkpoints, not
+  every checkpoint of every project. `/resume` and `bwn sessions` read
+  session headers, not whole transcripts. Project walks, `grep_files` and
+  `read_file` copy less (`find_paths` 42 ms to 30 ms, case-sensitive grep
+  over 10,000 files 373 ms to 310 ms). `@` completion no longer walks the
+  project on the input thread every five seconds. Each streamed chunk
+  repaints the composer once, not twice, and each turn starts two fewer git
+  processes.
+- `/kb` (`/index`) now skips what `.gitignore` ignores, build output, and
+  Python virtual environments, as the search tools do. It still skips hidden
+  files and folders.
+- The mode-change line appears only when the mode actually changes.
+
+### For crate users
+The `buildwithnexus` library is not a stable API (see the crate docs). This
+release removes public items nothing in bwn used: the knowledge base's
+relationship and judgment types and `KnowledgeBase::find_related`,
+`index_from_tree_sitter_output`, `get_entity`, `remove_entity` and
+`find_by_type`; the verifier's static-analysis stub, `Verifier::with_rules`
+and `format_decision_memo`; `RuleEngine::new`, `is_blocked` and
+`format_violations_json`; and `tui::drain_stdin`. Knowledge files written by
+older versions still load.
+
+### Internal
+`tools`, `agent`, `lib`, `tui` and `provider` are split into modules by
+section, with their unit tests in their own files, and duplicate helpers
+(home lookup, UTF-8 truncation, atomic writes, find-and-replace) are one each.
+A checkpoint test that failed about one run in five now passes reliably.
+
 ## [0.16.0] - 2026-10-27
 
 Safer defaults for what the agent's commands can see and run, an install that
@@ -1243,7 +1307,8 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.17.0
 [0.15.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.15.0
 [0.14.10]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.10
 [0.14.9]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.9

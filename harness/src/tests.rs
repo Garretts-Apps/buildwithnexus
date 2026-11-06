@@ -1187,6 +1187,23 @@ fn test_handle_kb_index_and_rules() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// The index covers visible source files only.
+#[test]
+fn kb_index_skips_hidden_folders_and_files() {
+    let dir = std::env::temp_dir().join(format!("bwn-kb-hidden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".hooks")).unwrap();
+    std::fs::write(dir.join("a.rs"), "pub fn shown() {}\n").unwrap();
+    std::fs::write(dir.join(".hooks/b.rs"), "pub fn hidden_dir() {}\n").unwrap();
+    std::fs::write(dir.join(".c.rs"), "pub fn hidden_file() {}\n").unwrap();
+    super::handle_kb_index(&dir);
+    let kb = crate::knowledge::KnowledgeBase::new(&dir.to_string_lossy());
+    let mut names: Vec<&str> = kb.entities.values().map(|e| e.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["shown"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // A symlink back up the tree must not make the indexer walk the project
 // again and again under ever longer paths.
 #[cfg(unix)]

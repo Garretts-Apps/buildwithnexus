@@ -3100,6 +3100,10 @@ pub(super) fn handle_kb_index(cwd: &std::path::Path) {
         if !matches!(ext, "rs" | "js" | "ts" | "py" | "go" | "java" | "c" | "cpp") {
             continue;
         }
+        // Hidden files and folders (.github, .claude, ...) are not indexed.
+        if rel_path.split('/').any(|part| part.starts_with('.')) {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(cwd.join(&rel_path)) else {
             continue;
         };
