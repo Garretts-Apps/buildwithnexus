@@ -1511,6 +1511,7 @@ fn command_outcome_reports_timeout_actionably() {
         stderr: String::new(),
         code: None,
         timed_out: true,
+        omitted: 0,
     };
     let o = command_outcome(cap, COMMAND_TIMEOUT);
     assert!(o.is_error);
@@ -1526,6 +1527,7 @@ fn command_outcome_appends_exit_marker() {
         stderr: String::new(),
         code: Some(3),
         timed_out: false,
+        omitted: 0,
     };
     let o = command_outcome(cap, COMMAND_TIMEOUT);
     assert!(o.is_error);
@@ -1592,6 +1594,180 @@ fn run_with_timeout_kills_hanging_command_and_keeps_partial_output() {
     assert!(cap.timed_out);
     assert!(cap.stdout.contains("started"), "{}", cap.stdout);
     assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn bounded_buf_keeps_head_and_tail_and_counts_the_rest() {
+    let mut b = BoundedBuf::new(4, 3);
+    b.push(b"ab");
+    b.push(b"cdefg");
+    b.push(b"hij");
+    b.push(b"k");
+    let (bytes, omitted) = b.into_parts();
+    assert_eq!(bytes, b"abcdijk");
+    assert_eq!(omitted, 4); // e f g h
+                            // A chunk bigger than the tail on its own replaces it outright.
+    let mut b = BoundedBuf::new(1, 2);
+    b.push(b"a");
+    b.push(b"xy");
+    b.push(b"0123456789");
+    let (bytes, omitted) = b.into_parts();
+    assert_eq!(bytes, b"a89");
+    assert_eq!(omitted, 10);
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_capture_reports_what_the_full_output_would() {
+    // The model must see the same head, tail and omitted count whether the
+    // whole output was kept or only its ends.
+    let script = "seq 1 100000; seq 1 3000 >&2";
+    let full = Command::new("sh").args(["-c", script]).output().unwrap();
+    let mut whole = String::from_utf8(full.stdout).unwrap();
+    whole.push_str("\n[stderr]\n");
+    whole.push_str(&String::from_utf8(full.stderr).unwrap());
+    whole.push_str("\n[exit 0]");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script]);
+    let cap = run_with_timeout(cmd, None, Duration::from_secs(30)).unwrap();
+    assert!(cap.omitted > 0);
+    assert!(cap.stdout.len() <= 2 * CAPTURE_KEEP);
+    let shown = command_outcome(cap, Duration::from_secs(30)).content;
+    assert_eq!(shown, truncate_head_tail(whole, MAX_OUT));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_with_timeout_does_not_buffer_an_endless_writer() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "yes"]);
+    let cap = run_with_timeout(cmd, None, Duration::from_millis(500)).unwrap();
+    assert!(cap.timed_out);
+    assert!(cap.stdout.len() <= 2 * CAPTURE_KEEP, "{}", cap.stdout.len());
+    assert!(cap.omitted > 0);
+    let out = command_outcome(cap, Duration::from_millis(500)).content;
+    assert!(out.starts_with("y\ny\n"), "{out:.40}");
+    assert!(out.contains("bytes omitted"));
+    assert!(out.contains("command timed out"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_with_timeout_kills_the_whole_process_group() {
+    // The shell's background child must die with it on timeout, not linger.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 30 & echo $!; wait"]);
+    let cap = run_with_timeout(cmd, None, Duration::from_millis(300)).unwrap();
+    assert!(cap.timed_out);
+    let pid: u32 = cap.stdout.trim().parse().expect("background pid");
+    // Gone, or a zombie waiting for a reaper: either way no longer running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .chars()
+            .next();
+        if stat.is_empty() || matches!(state, Some('Z' | 'X')) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background sleep {pid} survived the timeout: {stat}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_payload_cannot_block_past_the_deadline() {
+    // Far more than a pipe buffer, to a child that never reads: a synchronous
+    // write would block until the child exited by itself (30s).
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "exec sleep 30"]);
+    let start = std::time::Instant::now();
+    let cap = run_with_timeout(cmd, Some(vec![b'x'; 4 << 20]), Duration::from_millis(300)).unwrap();
+    assert!(cap.timed_out);
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn read_prefix_cuts_on_a_character_boundary() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-prefix-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("t.txt");
+    fs::write(&p, "aé€b").unwrap(); // 1 + 2 + 3 + 1 bytes
+    let (f, len) = open_regular(&p).unwrap();
+    assert_eq!(read_prefix(f, len, 5).unwrap(), ("aé".to_string(), true));
+    let (f, len) = open_regular(&p).unwrap();
+    assert_eq!(read_prefix(f, len, 7).unwrap(), ("aé€b".to_string(), false));
+    // read_many_files stops at its per-file budget and marks the cut.
+    fs::write(dir.join("long.txt"), "z".repeat(5000)).unwrap();
+    let out = run(
+        "read_many_files",
+        &json!({"paths": ["long.txt"], "max_bytes_per_file": 1000}),
+        &dir,
+    );
+    assert!(out.content.contains("…[truncated]"), "{}", out.content);
+    assert!(out.content.len() < 1200, "{}", out.content.len());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn text_tools_refuse_oversized_files_for_edits_and_cap_reads() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-cap-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.log");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(MAX_TEXT_FILE + 10).unwrap(); // sparse: no disk used
+    drop(f);
+    let out = run(
+        "edit_file",
+        &json!({"path": "big.log", "old": "a", "new": "b"}),
+        &dir,
+    );
+    assert!(
+        out.is_error && out.content.contains("limit for text tools"),
+        "{}",
+        out.content
+    );
+    let out = run("read_file", &json!({"path": "big.log"}), &dir);
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("only that much was read"),
+        "{:.200}",
+        out.content
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_file_refuses_a_fifo_instead_of_hanging() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-fifo-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe.pdf");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo touches nothing else.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    for name in ["read_file", "read_many_files"] {
+        let input = if name == "read_file" {
+            json!({"path": "pipe.pdf"})
+        } else {
+            json!({"paths": ["pipe.pdf"]})
+        };
+        let out = run(name, &input, &dir);
+        assert!(
+            out.content.contains("not a regular file"),
+            "{name}: {}",
+            out.content
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── readonly command classification ─────────────────────────────────────
