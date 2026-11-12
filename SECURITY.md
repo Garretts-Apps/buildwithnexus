@@ -400,8 +400,11 @@ never auto-updated.
 - npm publish is **gated on the release workflow succeeding**, so a package
   version can never point at binaries that don't exist. Before anything is
   published, every release binary is started once on the machine that
-  built it and must report the version being released, and the packed npm
-  tarball is installed in clean containers.
+  built it and must report the version being released. The order is then:
+  the GitHub release becomes public, the npm tarball packed from it is
+  installed in clean containers, and only when that passes are crates.io
+  and then npm published, so a package that does not install reaches
+  neither registry.
 - A pushed release tag must match `package.json` and be on `main`. A manual
   release run for a version that is already tagged rebuilds nothing (new
   binaries would not match the hashes pinned in the published npm package);
