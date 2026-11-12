@@ -435,6 +435,12 @@ command runs with your user's permissions, and checkpoints can rewind file
 edits in the working tree but not network calls, pushed commits, published
 packages, or other external effects.
 
+Read-only calls the model makes in a row (reads, searches, fetches) may run
+at the same time (`max_parallel_tools`, default 4). Their checks and
+approval prompts still happen one by one, in order, before any of them
+runs; a refused call is never run, and nothing that writes, runs a command
+or asks a question is ever run beside another call.
+
 Shell commands (`run_command`/`bash`, `!cmd`, and `check_work`) can also run
 inside an opt-in OS sandbox. It is off by default. Turn it on with the
 `"sandbox"` setting, `--sandbox <mode>`, or `/sandbox <mode>`:
