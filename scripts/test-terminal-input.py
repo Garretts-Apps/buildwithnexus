@@ -630,6 +630,13 @@ class CustomEndpointKeyTests(TerminalHarness):
     def keys_file(self):
         return (self.home / ".env.keys").read_text()
 
+    def swapped(self, model, server):
+        """The success line of a swap to `model` on `server`. The TUI repaints
+        its viewport, so an earlier swap's line recurs in the output: counting
+        "hot-swapped" can pass before a later swap has even sent its probe."""
+        host = server.origin().split("://", 1)[1]
+        return f"hot-swapped → {model} on custom endpoint ({host})".encode()
+
     def test_a_new_endpoint_never_receives_the_saved_key(self):
         self.send(f"/model {self.second.url} m2\r")
         self.wait_for(lambda: b"hot-swapped" in self.output
@@ -648,7 +655,7 @@ class CustomEndpointKeyTests(TerminalHarness):
         # (a question would hold the swap).
         sent_before = len(self.first.keys_sent())
         self.send(f"/model {self.first.url} m\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the swap back",
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
                       timeout=15)
         self.assertGreater(len(self.first.keys_sent()), sent_before)
         self.assertEqual(self.second.keys_sent(), [])
@@ -673,12 +680,12 @@ class EnvironmentCustomKeyTests(CustomEndpointKeyTests):
         self.wait_for(lambda: b"hot-swapped" in self.output, "the swap", timeout=15)
         # Another model on the same endpoint: still no key.
         self.send("/model m3\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the second swap",
-                      timeout=15)
+        self.wait_for(lambda: self.swapped("m3", self.second) in self.output,
+                      "the second swap", timeout=15)
         self.assertTrue(self.second.posts())
         self.assertEqual(self.second.keys_sent(), [])
         self.send(f"/model {self.first.url} m\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 3, "the swap back",
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
                       timeout=15)
         self.assertEqual(self.first.keys_sent()[-1], f"Bearer {self.KEY}")
         self.assertEqual(self.second.keys_sent(), [])
@@ -710,7 +717,8 @@ class UnboundCustomKeyTests(CustomEndpointKeyTests):
         self.send(f"/model {self.first.url} m\r")
         self.until_asked(b"? [y/N]: ")
         self.send("y\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the swap", timeout=15)
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
+                      timeout=15)
         self.assertEqual(self.first.keys_sent()[-1], f"Bearer {self.KEY}")
         keys = self.keys_file()
         self.assertEqual(keys, f"CUSTOM_API_KEY@{self.first.origin()}={self.KEY}\n")
