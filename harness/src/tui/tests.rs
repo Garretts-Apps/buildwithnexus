@@ -1289,3 +1289,146 @@ fn only_web_and_mail_model_links_are_clickable() {
         assert!(!model_link_clickable(url), "{url}");
     }
 }
+
+// ── damage tracking ──────────────────────────────────────────────────────────
+// A local Screen: nothing here touches the terminal or the process's screen.
+fn frame_screen(width: usize, height: usize) -> screen::Screen {
+    let mut s = screen::Screen::new();
+    s.transcript.text.ensure_size(width, height);
+    s
+}
+
+// One frame, as render_output builds it; returns the bytes and the rows
+// (1-based, as addressed) it repainted.
+fn frame(s: &mut screen::Screen, width: usize, rows: usize) -> (String, Vec<usize>, bool) {
+    let mut out = Vec::new();
+    let (placements, _kept, full) = build_output_frame(s, &mut out, (width, 10), rows, "");
+    s.images.drawn = placements;
+    let text = String::from_utf8(out).unwrap();
+    let painted = text
+        .split("\x1b[")
+        .skip(1)
+        .filter_map(|part| part.split_once(";1H")?.0.parse::<usize>().ok())
+        .collect();
+    (text, painted, full)
+}
+
+#[test]
+fn an_output_frame_repaints_only_the_rows_that_changed() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("one\ntwo\nthree");
+    // Nothing is known about the screen: every row, each padded to the width.
+    let (text, rows, full) = frame(&mut s, 20, 5);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3, 4, 5]);
+    assert!(
+        text.contains(&format!("\x1b[2;1H{:<20}", "two")),
+        "{text:?}"
+    );
+    assert_eq!(s.transcript.visible_rows[1], "two");
+    // The same transcript again: not one byte.
+    let (text, rows, full) = frame(&mut s, 20, 5);
+    assert!(!full && rows.is_empty() && text.is_empty(), "{text:?}");
+    // A streamed chunk lands on one row; a second lengthens only that row.
+    s.transcript.stream("stre");
+    assert_eq!(frame(&mut s, 20, 5).1, vec![4]);
+    s.transcript.stream("amed");
+    let (text, rows, _) = frame(&mut s, 20, 5);
+    assert_eq!(rows, vec![4]);
+    assert_eq!(text, format!("\x1b[4;1H{:<20}", "streamed"));
+    assert_eq!(s.transcript.visible_rows[3], "streamed");
+    // Lines that scroll the view change every row above them too.
+    s.transcript.push_lines("five\nsix");
+    assert_eq!(frame(&mut s, 20, 5).1, vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        s.transcript.visible_rows,
+        ["two", "three", "streamed", "five", "six"]
+    );
+}
+
+#[test]
+fn a_frame_after_something_else_drew_is_a_full_repaint() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("one\ntwo");
+    assert!(frame(&mut s, 20, 4).2);
+    assert!(!frame(&mut s, 20, 4).2);
+    // A popup, a clear or a resize: what is on screen is unknown again.
+    s.transcript.forget_painted();
+    let (_, rows, full) = frame(&mut s, 20, 4);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    // A different number of output rows (a queued message took one).
+    let (_, rows, full) = frame(&mut s, 20, 3);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3]);
+    // Pixels drawn over (the image store's flag) count the same.
+    s.images.dirty = true;
+    assert!(frame(&mut s, 20, 3).2);
+}
+
+#[test]
+fn a_selection_repaints_the_rows_it_covers_and_uncovers() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("alpha\nbeta\ngamma");
+    frame(&mut s, 20, 3);
+    let at = |row, col| SelectPos { row, col };
+    s.selection.current = Some(Selection {
+        anchor: at(1, 0),
+        focus: at(1, 3),
+        sticky: false,
+    });
+    let (text, rows, _) = frame(&mut s, 20, 3);
+    assert_eq!(rows, vec![2]);
+    assert!(text.contains(&selection_span("beta")), "{text:?}");
+    // The copy text is the plain row, whatever it is painted with.
+    assert_eq!(s.transcript.visible_rows[1], "beta");
+    s.selection.current = None;
+    let (text, rows, _) = frame(&mut s, 20, 3);
+    assert_eq!(rows, vec![2]);
+    assert_eq!(text, format!("\x1b[2;1H{:<20}", "beta"));
+}
+
+#[test]
+fn a_sixel_image_in_place_is_left_alone_and_its_rows_repaint_when_it_moves() {
+    // An id no image is registered under: the marker rows stay as they are.
+    let m = |r: usize| format!("{IMG_MARK}987654:{r}");
+    let mut s = frame_screen(20, 10);
+    s.transcript
+        .push_lines(&format!("text\n{}\n{}", m(0), m(1)));
+    // First frame: the rows under the image are blanked for it.
+    let (text, rows, _) = frame(&mut s, 20, 4);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    assert!(
+        text.contains(&format!("\x1b[2;1H{}", " ".repeat(20))),
+        "{text:?}"
+    );
+    assert_eq!(s.images.drawn, vec![(987654, 1, 0, 2)]);
+    // In place: its rows are not touched, nor is anything else.
+    assert!(frame(&mut s, 20, 4).1.is_empty());
+    // Text beside it changes: only that row.
+    s.transcript.push_lines("after");
+    assert_eq!(frame(&mut s, 20, 4).1, vec![4]);
+    // The view scrolls: the image moves up a row, so its new rows are
+    // blanked again and the row it left shows text.
+    s.transcript.push_lines("more");
+    let (_, rows, _) = frame(&mut s, 20, 4);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    assert_eq!(s.images.drawn, vec![(987654, 0, 0, 2)]);
+    assert_eq!(s.transcript.visible_rows, ["", "", "after", "more"]);
+}
+
+#[test]
+fn padding_a_row_clips_to_the_width_and_keeps_escapes() {
+    let pad = |s: &str, w: usize| {
+        let mut out = String::from("x");
+        pad_ansi_into(&mut out, s, w);
+        out
+    };
+    assert_eq!(pad("ab", 5), "xab   ");
+    assert_eq!(pad("abcdef", 3), "xabc");
+    assert_eq!(pad("\x1b[1mab\x1b[0m", 4), "x\x1b[1mab\x1b[0m  ");
+    // A wide character that would straddle the edge is left out.
+    assert_eq!(pad("a日本", 4), "xa日 ");
+    assert_eq!(pad("", 2), "x  ");
+    assert_eq!(pad("abc", 0), "x");
+}

@@ -493,6 +493,8 @@ struct InputOwner {
 impl InputOwner {
     fn open(prompt: &str, buf: &[char], cursor: usize) -> Self {
         let keys = keyboard_lock();
+        // Whatever was printed before the question is on screen before it.
+        settle_output();
         let input = OpenInput {
             prompt: prompt.to_string(),
             buf: buf.to_vec(),
@@ -525,6 +527,8 @@ fn read() -> io::Result<Event> {
     let ev = crossterm::event::read()?;
     if let Event::Resize(w, h) = ev {
         store_term_size(w, h);
+        // The terminal reflowed or cleared what it showed.
+        invalidate_inline_pixels();
     }
     Ok(ev)
 }
@@ -1009,44 +1013,67 @@ pub fn render_queued_composer() {
         let c = &s.composer;
         (c.typeahead.buf.clone(), c.typeahead.cursor, c.queue.clone())
     });
-    let mut out: Vec<u8> = Vec::new();
-    // One atomic frame (DEC 2026): the queued rows paint together with
-    // no intermediate state a fast terminal could show mid-repaint.
-    let _ = write!(out, "\x1b[?2026h");
-    let c_top = composer_top();
-    let q_len = queued.len() as u16;
-    for (i, msg) in queued.iter().enumerate() {
-        let row = c_top.saturating_sub(q_len).saturating_add(i as u16);
-        let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
-        let _ = write!(
-            out,
-            "  {} {} {} {}",
-            dim("├─"),
-            dim("queued:"),
-            bold(&composer_glyphs(&msg.chars().collect::<Vec<_>>())),
-            dim(queued_row_hint(i))
-        );
+    // The whole composer as one frame: queued rows, the input row, and the
+    // cursor's look. Callers repaint it on every poll (each streamed chunk,
+    // every tick), so a frame equal to the one on screen is not written.
+    let mut own: Vec<u8> = Vec::new();
+    if !queued.is_empty() {
+        // One atomic frame (DEC 2026): the queued rows paint together with
+        // no intermediate state a fast terminal could show mid-repaint.
+        let _ = write!(own, "\x1b[?2026h");
+        let c_top = composer_top();
+        let q_len = queued.len() as u16;
+        for (i, msg) in queued.iter().enumerate() {
+            let row = c_top.saturating_sub(q_len).saturating_add(i as u16);
+            let _ = queue!(own, MoveTo(0, row), Clear(ClearType::CurrentLine));
+            let _ = write!(
+                own,
+                "  {} {} {} {}",
+                dim("├─"),
+                dim("queued:"),
+                bold(&composer_glyphs(&msg.chars().collect::<Vec<_>>())),
+                dim(queued_row_hint(i))
+            );
+        }
+        let _ = write!(own, "\x1b[?2026l");
     }
-    let _ = write!(out, "\x1b[?2026l");
-    write_frame(&out);
     let has_queued = !queued.is_empty();
     let mut scroll = 0usize;
     if let Some(open) = open {
         // A prompt or picker owns the box: repaint it as it is, never
         // the idle composer.
-        render_composer(&open.prompt, &open.buf, open.cursor, &mut scroll);
-        cursor_show();
+        queue_composer_row(&mut own, &open.prompt, &open.buf, open.cursor, &mut scroll);
+        own.extend_from_slice(cursor_show_seq().as_bytes());
+    } else {
+        let prompt_str = if is_agent_running() && (!buf.is_empty() || has_queued) {
+            format!("{} {} ", dim("queued"), accent("›"))
+        } else {
+            format!("{} ", accent("›"))
+        };
+        queue_composer_row(&mut own, &prompt_str, &buf, cursor, &mut scroll);
+        own.extend_from_slice(cursor_color_seq().as_bytes());
+        own.extend_from_slice(cursor_shape_seq(CursorShape::Bar).as_bytes());
+        own.extend_from_slice(cursor_show_seq().as_bytes());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    queue_chrome(&mut out);
+    let valid = COMPOSER_PAINTED.load(Ordering::Relaxed);
+    let same = screen::with(|s| {
+        let last = &mut s.transcript.painted_composer;
+        let same = valid && *last == own;
+        if !same {
+            last.clear();
+            last.extend_from_slice(&own);
+        }
+        same
+    });
+    if same && out.is_empty() {
         return;
     }
-    let prompt_str = if is_agent_running() && (!buf.is_empty() || has_queued) {
-        format!("{} {} ", dim("queued"), accent("›"))
-    } else {
-        format!("{} ", accent("›"))
-    };
-    render_composer(&prompt_str, &buf, cursor, &mut scroll);
-    cursor_color_accent();
-    set_cursor_shape(CursorShape::Bar);
-    cursor_show();
+    // The chrome first: the input row ends with the cursor in the box.
+    out.extend_from_slice(&own);
+    write_frame(&out);
+    COMPOSER_PAINTED.store(true, Ordering::Relaxed);
 }
 
 fn take_typeahead() -> (Vec<char>, usize) {
@@ -1775,24 +1802,29 @@ fn set_output_region() {
     let (_, h) = term_size();
     let bottom = h.saturating_sub(reserved_rows()).max(1);
     LAST_REGION_BOTTOM.store(bottom, Ordering::Relaxed);
+    COMPOSER_PAINTED.store(false, Ordering::Relaxed);
     print!("\x1b[1;{bottom}r\x1b[1;1H");
     flush();
 }
 
 // Re-assert the scroll region only when the reserved-row count changed (a
 // queued prompt appeared/cleared, or the terminal resized). Cheap on the hot
-// path — no write when nothing moved — and unlike set_output_region it never
-// homes the cursor, so it's safe to call every frame.
-fn ensure_output_region() {
+// path — no write when nothing moved — so it's safe to call every frame.
+// True when the region was set: that moves the cursor (DECSTBM homes it), so
+// the caller repaints the composer, which puts it back.
+fn ensure_output_region() -> bool {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
-        return;
+        return false;
     }
     let (_, h) = term_size();
     let bottom = h.saturating_sub(reserved_rows()).max(1);
     if LAST_REGION_BOTTOM.swap(bottom, Ordering::Relaxed) != bottom {
+        COMPOSER_PAINTED.store(false, Ordering::Relaxed);
         print!("\x1b[1;{bottom}r");
         flush();
+        return true;
     }
+    false
 }
 
 fn reset_output_region() {
@@ -1807,9 +1839,8 @@ fn clear_composer() {
     render_queued_composer();
 }
 
-// Draw the composer box borders and return with the cursor ready at the
-// start of the input row's content area. The caller writes the inner line.
-fn queue_composer_box(out: &mut impl Write) {
+// The composer box's top and bottom borders.
+fn queue_composer_borders(out: &mut impl Write) {
     let (width, _) = term_size();
     let w = width as usize;
     let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
@@ -1826,6 +1857,11 @@ fn queue_composer_box(out: &mut impl Write) {
         Clear(ClearType::CurrentLine)
     );
     let _ = write!(out, "{}", dim(&bottom));
+}
+
+// Clear the input row and return with the cursor ready at the start of its
+// content area. The caller writes the inner line.
+fn queue_composer_row_start(out: &mut impl Write) {
     let _ = queue!(
         out,
         MoveTo(0, composer_row()),
@@ -1834,12 +1870,40 @@ fn queue_composer_box(out: &mut impl Write) {
     let _ = write!(out, "{} ", dim("│"));
 }
 
+// Draw the composer box borders and return with the cursor ready at the
+// start of the input row's content area. The caller writes the inner line.
+fn queue_composer_box(out: &mut impl Write) {
+    queue_composer_borders(out);
+    queue_composer_row_start(out);
+}
+
 // Close the input row with the right-hand border, clipping anything that
 // would collide with it.
 fn queue_composer_right_border(out: &mut impl Write) {
     let (width, _) = term_size();
     let _ = queue!(out, MoveTo(width.saturating_sub(1), composer_row()));
     let _ = write!(out, "{}", dim("│"));
+}
+
+// The chrome around the input row — the box borders and the footer — queued
+// only where it differs from what was last painted: typing a character
+// changes neither, and they are most of a composer frame's bytes.
+fn queue_chrome(out: &mut Vec<u8>) {
+    let mut borders: Vec<u8> = Vec::new();
+    queue_composer_borders(&mut borders);
+    let mut footer: Vec<u8> = Vec::new();
+    queue_footer(&mut footer);
+    screen::with(|s| {
+        let t = &mut s.transcript;
+        if t.painted_borders != borders {
+            out.extend_from_slice(&borders);
+            t.painted_borders = borders;
+        }
+        if t.painted_footer != footer {
+            out.extend_from_slice(&footer);
+            t.painted_footer = footer;
+        }
+    });
 }
 
 fn queue_footer(out: &mut impl Write) {
@@ -1987,13 +2051,16 @@ fn render_footer() {
         return;
     }
     let _frame = render_lock();
-    let mut out: Vec<u8> = Vec::new();
+    let mut footer: Vec<u8> = Vec::new();
+    queue_footer(&mut footer);
+    let mut out: Vec<u8> = Vec::with_capacity(footer.len() + 24);
     let _ = write!(out, "\x1b[?2026h");
     let _ = queue!(out, SavePosition);
-    queue_footer(&mut out);
+    out.extend_from_slice(&footer);
     let _ = queue!(out, RestorePosition);
     let _ = write!(out, "\x1b[?2026l");
     write_frame(&out);
+    screen::with(|s| s.transcript.painted_footer = footer);
 }
 
 // ── footer flash ─────────────────────────────────────────────────────────────
@@ -2023,51 +2090,69 @@ pub enum CursorShape {
     Underline,
 }
 
-pub fn set_cursor_shape(shape: CursorShape) {
+// The cursor's look is part of the composer frame (`render_queued_composer`
+// ends by setting it). Each `*_seq` is what the matching function writes,
+// or nothing when it would not; the functions themselves, called from
+// anywhere else, mark the composer frame as no longer what is on screen.
+fn cursor_shape_seq(shape: CursorShape) -> String {
     if !is_raw() || line_mode() {
-        return;
+        return String::new();
     }
     let n = match shape {
         CursorShape::Bar => 5,       // blinking bar
         CursorShape::Block => 2,     // steady block
         CursorShape::Underline => 4, // steady underline
     };
-    print!("\x1b[{n} q");
+    format!("\x1b[{n} q")
+}
+
+fn cursor_color_seq() -> String {
+    match pal().cursor {
+        Some(color) if !no_color() && !line_mode() => format!("\x1b]12;{color}\x07"),
+        _ => String::new(),
+    }
+}
+
+fn cursor_show_seq() -> &'static str {
+    if line_mode() {
+        ""
+    } else {
+        "\x1b[?25h"
+    }
+}
+
+fn write_cursor_seq(seq: &str) {
+    if seq.is_empty() {
+        return;
+    }
+    COMPOSER_PAINTED.store(false, Ordering::Relaxed);
+    print!("{seq}");
     flush();
 }
 
+pub fn set_cursor_shape(shape: CursorShape) {
+    write_cursor_seq(&cursor_shape_seq(shape));
+}
+
 fn cursor_color_accent() {
-    let Some(color) = pal().cursor else {
-        return;
-    };
-    if no_color() || line_mode() {
-        return;
-    }
-    print!("\x1b]12;{color}\x07");
-    flush();
+    write_cursor_seq(&cursor_color_seq());
 }
 
 fn cursor_reset_style() {
     if line_mode() {
         return;
     }
-    print!("\x1b[0 q\x1b]112\x07");
-    flush();
+    write_cursor_seq("\x1b[0 q\x1b]112\x07");
 }
 
 pub fn cursor_hide() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        print!("\x1b[?25l");
-        flush();
+        write_cursor_seq("\x1b[?25l");
     }
 }
 
 pub fn cursor_show() {
-    if line_mode() {
-        return;
-    }
-    print!("\x1b[?25h");
-    flush();
+    write_cursor_seq(cursor_show_seq());
 }
 
 pub fn set_permission_mode(mode: &str) {
@@ -2081,91 +2166,153 @@ pub fn set_permission_mode(mode: &str) {
     render_footer();
 }
 
+// What `painted` holds for a row a Sixel image covers: never equal to the
+// bytes of a text row, so the row is repainted once the image has moved on.
+const SIXEL_ROW: &str = "\x00sixel";
+
+/// Queue the output rows that differ from what the terminal shows
+/// (`painted`), each addressed by its own cursor move, and record them as
+/// painted. With nothing known about the screen (`painted` empty or made
+/// for another height, or pixels drawn over) every row is queued, bar those
+/// under a Sixel image known to be intact. Returns
+/// this frame's Sixel placements, the ones left in place, and whether it
+/// was a full repaint. Runs under the screen lock: no terminal write here.
+fn build_output_frame(
+    s: &mut screen::Screen,
+    out: &mut Vec<u8>,
+    (width, height): (usize, usize),
+    rows: usize,
+    bg: &str,
+) -> (Vec<Placement>, Vec<Placement>, bool) {
+    let sel = s.selection.current;
+    let drawn_over = std::mem::replace(&mut s.images.dirty, false);
+    let drawn = &s.images.drawn;
+    let view = &mut s.transcript;
+    view.text.ensure_size(width, height);
+    let total = view.text.total_rows();
+    let max_offset = total.saturating_sub(rows);
+    view.scroll_offset = view.scroll_offset.min(max_offset);
+    let start = total.saturating_sub(rows + view.scroll_offset);
+    let screen::TranscriptState {
+        text,
+        painted,
+        visible_rows,
+        ..
+    } = view;
+    let visible = text.rows_range(start, rows);
+    let full = drawn_over || painted.len() != rows || visible_rows.len() != rows;
+    if full {
+        painted.clear();
+        painted.resize(rows, String::new());
+        visible_rows.clear();
+        visible_rows.resize(rows, String::new());
+    }
+    // Sixel images are pixels over blank rows. One that is on screen at
+    // the same place as last frame, with nothing drawn over it since, is
+    // left alone: rewriting its rows would erase it, and re-sending it
+    // every streamed frame would be slow.
+    let placements = sixel_placements(&visible, rows);
+    let kept: Vec<Placement> = if drawn_over {
+        Vec::new()
+    } else {
+        placements
+            .iter()
+            .filter(|p| drawn.contains(p))
+            .copied()
+            .collect()
+    };
+    let within = |set: &[Placement], row: usize| {
+        set.iter()
+            .any(|&(_, top, _, n)| row >= top && row < top + n)
+    };
+    // One row's bytes, reused: a changed row swaps it with its `painted`
+    // entry, so a steady stream allocates nothing per row.
+    let mut buf = String::with_capacity(width + 32);
+    for row in 0..rows {
+        let line = visible.get(row).copied();
+        let image_row = line.is_some_and(|l| l.starts_with(IMG_MARK));
+        if image_row && within(&kept, row) {
+            if full {
+                painted[row].push_str(SIXEL_ROW);
+            }
+            continue;
+        }
+        buf.clear();
+        buf.push_str(bg);
+        let mut plain: Option<String> = None;
+        match line {
+            Some(line) if !image_row => match sel {
+                Some(sel) => {
+                    let text = strip_ansi(line);
+                    match selection_range_for(sel, row as u16, &text) {
+                        Some(range) => pad_ansi_into(&mut buf, &selected_line(&text, range), width),
+                        None => pad_ansi_into(&mut buf, line, width),
+                    }
+                    plain = Some(text);
+                }
+                None => pad_ansi_into(&mut buf, line, width),
+            },
+            _ => buf.extend(std::iter::repeat_n(' ', width)),
+        }
+        // A row an image is about to be drawn on is blanked first, whatever
+        // was there.
+        let under_image = image_row && within(&placements, row);
+        if !full && !under_image && painted[row] == buf {
+            continue;
+        }
+        let _ = queue!(out, MoveTo(0, row as u16));
+        out.extend_from_slice(buf.as_bytes());
+        visible_rows[row] = match line {
+            Some(line) if !image_row => plain.unwrap_or_else(|| strip_ansi(line)),
+            _ => String::new(),
+        };
+        if under_image {
+            painted[row].clear();
+            painted[row].push_str(SIXEL_ROW);
+        } else {
+            std::mem::swap(&mut painted[row], &mut buf);
+        }
+    }
+    (placements, kept, full)
+}
+
+// Paint the output rows: only those that changed since the last frame (see
+// `build_output_frame`), as one write inside a synchronized-output bracket.
+// The cursor is saved and restored around them, so the composer — where the
+// cursor lives — is not repainted for a frame that only touched the output.
 fn render_output() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
     let _frame = render_lock();
+    // Again under the lock: `leave_alt` switches screens while holding it.
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    // Cleared before the transcript is read: a line landing from here on
+    // asks for its own frame.
+    OUTPUT_DIRTY.store(false, Ordering::Relaxed);
+    LAST_FRAME_MS.store(monotonic_ms() as usize, Ordering::Relaxed);
     // Keep the scroll region matched to the current reserved rows before we
     // repaint — a just-queued prompt must not be scrolled over.
-    ensure_output_region();
+    let region_moved = ensure_output_region();
     let (width, height) = term_size();
     let width = width as usize;
     let rows = height.saturating_sub(reserved_rows()) as usize;
-    let mut out: Vec<u8> = Vec::with_capacity(rows * (width + 16));
+    let mut out: Vec<u8> = Vec::with_capacity(256);
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
-    // — zero tearing/flicker. Ignored elsewhere.
-    let _ = write!(out, "\x1b[?2026h");
+    // — zero tearing/flicker. Ignored elsewhere. Then DECSC: the cursor and
+    // its colours come back with DECRC at the end.
+    let _ = write!(out, "\x1b[?2026h\x1b7");
+    let head = out.len();
     // Every row starts on the theme's background, whatever the row before
     // it left set, so a painted theme stays whole on any terminal.
     let bg = theme_bg();
     // The frame is built from the transcript under the screen lock; nothing
     // in here writes to the terminal or takes the lock again.
-    let (placements, kept) = screen::with(|s| {
-        let sel = s.selection.current;
-        let view = &mut s.transcript;
-        view.text.ensure_size(width, height as usize);
-        let total = view.text.total_rows();
-        let max_offset = total.saturating_sub(rows);
-        view.scroll_offset = view.scroll_offset.min(max_offset);
-        let start = total.saturating_sub(rows + view.scroll_offset);
-        let visible = view.text.rows_range(start, rows);
-        // Sixel images are pixels over blank rows. One that is on screen at
-        // the same place as last frame, with nothing drawn over it since, is
-        // left alone: rewriting its rows would erase it, and re-sending it
-        // every streamed frame would be slow.
-        let placements = sixel_placements(&visible, rows);
-        let kept: Vec<Placement> = if std::mem::replace(&mut s.images.dirty, false) {
-            Vec::new()
-        } else {
-            placements
-                .iter()
-                .filter(|p| s.images.drawn.contains(p))
-                .copied()
-                .collect()
-        };
-        let in_kept = |row: usize| {
-            kept.iter()
-                .any(|&(_, top, _, n)| row >= top && row < top + n)
-        };
-        let mut plain_rows = Vec::with_capacity(rows);
-        for row in 0..rows {
-            if in_kept(row) {
-                plain_rows.push(String::new());
-                continue;
-            }
-            let _ = queue!(out, MoveTo(0, row as u16));
-            out.extend_from_slice(bg.as_bytes());
-            if let Some(line) = visible.get(row) {
-                if line.starts_with(IMG_MARK) {
-                    let _ = write!(out, "{}", pad_ansi_line("", width));
-                    plain_rows.push(String::new());
-                    continue;
-                }
-                let plain = strip_ansi(line);
-                if let Some(sel) = sel {
-                    if let Some(range) = selection_range_for(sel, row as u16, &plain) {
-                        let _ = write!(
-                            out,
-                            "{}",
-                            pad_ansi_line(&selected_line(&plain, range), width)
-                        );
-                    } else {
-                        let _ = write!(out, "{}", pad_ansi_line(line, width));
-                    }
-                } else {
-                    let _ = write!(out, "{}", pad_ansi_line(line, width));
-                }
-                plain_rows.push(plain);
-            } else {
-                let _ = write!(out, "{}", " ".repeat(width));
-                plain_rows.push(String::new());
-            }
-        }
-        view.visible_rows = plain_rows;
-        (placements, kept)
-    });
+    let (placements, kept, full) =
+        screen::with(|s| build_output_frame(s, &mut out, (width, height as usize), rows, &bg));
     // Drawing a Sixel leaves the cursor on the row below the image; with the
     // scroll region's bottom margin there, the terminal would scroll the
     // transcript. The margins are lifted while images are drawn: the rows
@@ -2193,19 +2340,43 @@ fn render_output() {
     }
     drop(redraw);
     screen::with(|s| s.images.drawn = placements);
-    let _ = write!(out, "\x1b[?2026l");
-    write_frame(&out);
-    render_queued_composer();
+    if out.len() > head {
+        let _ = write!(out, "\x1b8\x1b[?2026l");
+        write_frame(&out);
+    }
+    if full || region_moved {
+        // Nothing was known about the screen, or the cursor was moved:
+        // the composer is painted afresh too.
+        COMPOSER_PAINTED.store(false, Ordering::Relaxed);
+        render_queued_composer();
+    }
 }
 
-// ── streaming frame coalescing ───────────────────────────────────────────────
-// Streamed token chunks can arrive hundreds of times per second; painting the
-// screen for each one wastes CPU and looks like flicker, not speed. Cap
-// streaming repaints at ~60fps. Correctness doesn't depend on any single
-// frame: render_output() is a stateless full repaint, and the unthrottled
-// paths (line(), commit_stream_line(), assistant_end) always paint the final
-// state.
+// A full repaint: for when something else drew over the output rows.
+fn repaint_output() {
+    invalidate_inline_pixels();
+    render_output();
+}
+
+// ── frame coalescing ─────────────────────────────────────────────────────────
+// Lines and streamed chunks can arrive hundreds of times per second; a frame
+// for each wastes CPU and looks like flicker, not speed. Appending marks the
+// output dirty (`request_frame`) and paints at most one frame per FRAME_MS:
+// at once when the last frame is older than that, otherwise by the ticker
+// thread (`start_typeahead_thread`) within one more interval — so the final
+// state always reaches the screen without waiting for another event.
+// `settle_output` paints a pending frame now: before a prompt opens, and
+// before the screen is handed back.
 const FRAME_MS: u64 = 16;
+
+static OUTPUT_DIRTY: AtomicBool = AtomicBool::new(false);
+// monotonic_ms() of the last output frame (wraps with usize; only compared
+// by wrapping difference).
+static LAST_FRAME_MS: AtomicUsize = AtomicUsize::new(0);
+// Whether the composer on screen is the frame `render_queued_composer` last
+// wrote. An atomic: the cursor functions clear it, and the panic hook calls
+// those.
+static COMPOSER_PAINTED: AtomicBool = AtomicBool::new(false);
 
 fn monotonic_ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -2215,17 +2386,27 @@ fn monotonic_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn render_output_throttled() {
-    let now = monotonic_ms();
-    let due = screen::with(|s| {
-        let last = s.transcript.last_stream_frame_ms;
-        let due = now.saturating_sub(last) >= FRAME_MS || last == 0;
-        if due {
-            s.transcript.last_stream_frame_ms = now.max(1);
-        }
-        due
-    });
-    if due {
+fn frame_due() -> bool {
+    let last = LAST_FRAME_MS.load(Ordering::Relaxed);
+    (monotonic_ms() as usize).wrapping_sub(last) >= FRAME_MS as usize
+}
+
+fn request_frame() {
+    OUTPUT_DIRTY.store(true, Ordering::Relaxed);
+    if frame_due() {
+        render_output();
+    }
+}
+
+// Called by the ticker thread every tick.
+fn paint_if_due() {
+    if OUTPUT_DIRTY.load(Ordering::Relaxed) && frame_due() {
+        render_output();
+    }
+}
+
+fn settle_output() {
+    if OUTPUT_DIRTY.load(Ordering::Relaxed) {
         render_output();
     }
 }
@@ -2491,11 +2672,15 @@ fn selected_text() -> Option<String> {
     Some(out.join("\n"))
 }
 
-fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize) {
-    if !ALT_SCREEN.load(Ordering::Relaxed) {
-        return;
-    }
-    let _frame = render_lock();
+// The input row: the left border, the prompt, as much of `buf` as fits, the
+// right border, and the cursor left where `cursor` is.
+fn queue_composer_row(
+    out: &mut Vec<u8>,
+    prompt: &str,
+    buf: &[char],
+    cursor: usize,
+    scroll: &mut usize,
+) {
     let (width, _) = term_size();
     let pwidth = prompt_width(prompt);
     // Room inside the box: left border "│ " + prompt … text … " │" right border.
@@ -2517,11 +2702,9 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
         .copied()
         .map(char_width)
         .sum::<usize>();
-    let mut out: Vec<u8> = Vec::new();
-    queue_composer_box(&mut out);
+    queue_composer_row_start(out);
     let _ = write!(out, "{prompt}{shown}");
-    queue_composer_right_border(&mut out);
-    queue_footer(&mut out);
+    queue_composer_right_border(out);
     let _ = queue!(
         out,
         MoveTo(
@@ -2531,6 +2714,17 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
             composer_row()
         )
     );
+}
+
+fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize) {
+    if !ALT_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let _frame = render_lock();
+    let mut out: Vec<u8> = Vec::new();
+    queue_chrome(&mut out);
+    queue_composer_row(&mut out, prompt, buf, cursor, scroll);
+    COMPOSER_PAINTED.store(false, Ordering::Relaxed);
     write_frame(&out);
 }
 
@@ -2830,7 +3024,9 @@ pub fn enter_alt(raw: bool) {
         let _ = execute!(out, Clear(ClearType::All), MoveTo(0, 0));
         let _ = out.flush();
         ALT_SCREEN.store(true, Ordering::Relaxed);
+        OUTPUT_DIRTY.store(false, Ordering::Relaxed);
         invalidate_inline_pixels();
+        start_typeahead_thread();
         set_output_region();
         let _ = execute!(io::stdout(), MoveTo(0, 0));
         // Never show a black frame: paint the composer box and footer right
@@ -2904,6 +3100,10 @@ pub fn leave_alt() {
         }
         return;
     }
+    // Under the render lock from here on: no frame from the ticker thread
+    // can land on the screen being handed back.
+    let _frame = render_lock();
+    settle_output();
     clear_composer();
     reset_output_region();
     if RAW.load(Ordering::Relaxed) {
@@ -2935,8 +3135,13 @@ pub fn clear() {
         });
         free_images();
         screen::with(|s| s.transcript.text.clear());
-        let _ = write!(io::stdout(), "{}", theme_bg());
-        let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
+        {
+            let _frame = render_lock();
+            OUTPUT_DIRTY.store(false, Ordering::Relaxed);
+            invalidate_inline_pixels();
+            let _ = write!(io::stdout(), "{}", theme_bg());
+            let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
+        }
         set_output_region();
         clear_composer();
         render_footer();
@@ -2957,6 +3162,7 @@ pub fn browse_items(title: &str, items: &[(String, String)]) {
         return;
     }
 
+    settle_output();
     reset_output_region();
     let mut selected = 0usize;
     let mut detail = false;
@@ -2988,7 +3194,7 @@ pub fn browse_items(title: &str, items: &[(String, String)]) {
     }
     let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
     set_output_region();
-    render_output();
+    repaint_output();
     clear_composer();
     render_footer();
 }
@@ -3008,6 +3214,8 @@ fn browse_safe(items: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail: bool) {
+    // Drawn over the whole screen.
+    invalidate_inline_pixels();
     let (width, height) = term_size();
     let mut out = io::stdout();
     let _ = queue!(out, MoveTo(0, 0), Clear(ClearType::All));
@@ -3057,16 +3265,22 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
 
 /// `clip_ansi_line`, plus the display width of what it kept.
 fn clip_ansi(s: &str, max_cols: usize) -> (String, usize) {
-    if max_cols == 0 {
-        return (String::new(), 0);
-    }
     let mut out = String::new();
+    let visible = clip_ansi_into(&mut out, s, max_cols);
+    (out, visible)
+}
+
+/// `clip_ansi`, appended to `out`: nothing is allocated for the row.
+fn clip_ansi_into(out: &mut String, s: &str, max_cols: usize) -> usize {
+    if max_cols == 0 {
+        return 0;
+    }
     let mut visible = 0usize;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             out.push(c);
-            eat_escape(&mut chars, Some(&mut out));
+            eat_escape(&mut chars, Some(out));
             continue;
         }
         let w = char_width(c);
@@ -3076,13 +3290,13 @@ fn clip_ansi(s: &str, max_cols: usize) -> (String, usize) {
         out.push(c);
         visible += w;
     }
-    (out, visible)
+    visible
 }
 
-fn pad_ansi_line(s: &str, width: usize) -> String {
-    let (mut out, visible) = clip_ansi(s, width);
-    out.push_str(&" ".repeat(width - visible));
-    out
+/// `s` clipped to `width` columns and padded with spaces to exactly that.
+fn pad_ansi_into(out: &mut String, s: &str, width: usize) {
+    let visible = clip_ansi_into(out, s, width);
+    out.extend(std::iter::repeat_n(' ', width - visible));
 }
 
 // Wrap into rows of at most `max_cols` display columns; width-aware like
@@ -3313,8 +3527,7 @@ fn commit_stream_line(rendered: &str) {
     }
     // The lock is released before painting: render_output() takes it again.
     if screen::with(|s| s.transcript.commit_stream(rendered)) {
-        render_output();
-        clear_composer();
+        request_frame();
     } else {
         line(rendered);
     }
@@ -3330,8 +3543,7 @@ fn retract_stream_line() {
         return;
     }
     screen::with(|s| s.transcript.retract_stream());
-    render_output();
-    clear_composer();
+    request_frame();
 }
 
 pub fn line(s: &str) {
@@ -3340,8 +3552,9 @@ pub fn line(s: &str) {
     }
     if ALT_SCREEN.load(Ordering::Relaxed) {
         screen::with(|scr| scr.transcript.push_lines(s));
-        render_output();
-        clear_composer();
+        // Coalesced: a burst of lines is one frame, and the ticker paints
+        // the last of them (see `request_frame`).
+        request_frame();
     } else if is_raw() {
         print!("{}\r\n", s.replace('\n', "\r\n"));
         flush();
@@ -3359,9 +3572,9 @@ pub fn write_stream(chunk: &str) {
         screen::with(|s| s.transcript.stream(chunk));
         // Streaming repaints are frame-coalesced (~60fps): the transcript
         // state above is always current, so a skipped frame just means the
-        // next one paints more at once. Unthrottled paths (line, commit)
-        // guarantee the final state always lands on screen.
-        render_output_throttled();
+        // next one paints more at once, and the ticker paints the last.
+        request_frame();
+        return;
     } else if is_raw() && chunk.contains('\n') {
         print!("{}", chunk.replace('\n', "\r\n"));
     } else {
@@ -3381,10 +3594,15 @@ pub fn bell() {
     }
 }
 
+// The ticker: one thread, started when the TUI takes the screen. Every 15ms
+// it paints an output frame left pending by the coalescing (`request_frame`)
+// and, while the agent works, drains typed keys and keeps the footer's
+// elapsed time moving.
 fn start_typeahead_thread() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         std::thread::spawn(|| loop {
+            paint_if_due();
             if is_raw() && is_agent_running() {
                 poll_typeahead();
                 // Elapsed-time / tokens-per-second readout: repaint the
@@ -3698,8 +3916,11 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
         // longer covers before drawing it again.
         if drawn.is_some_and(|(top, _)| top < base) {
             clear_rows(drawn);
-            render_output();
+            repaint_output();
         }
+
+        // The list is drawn over the output rows.
+        invalidate_inline_pixels();
 
         let mut out: Vec<u8> = Vec::new();
         let _ = write!(out, "\x1b[?2026h");
@@ -3791,7 +4012,7 @@ pub fn select_item(title: &str, items: &[SelectItem]) -> Option<usize> {
     // Hand the box back before the outcome line repaints it.
     clear_rows(drawn);
     drop(owner);
-    render_output();
+    repaint_output();
     match result {
         Some(i) => line(&green(&format!(
             "  ✓ selected: {}",
@@ -4383,6 +4604,7 @@ pub fn ask_secret(prompt: &str) -> Option<String> {
     let raw_here = !is_raw() && enable_raw_mode().is_ok();
     let alt = ALT_SCREEN.load(Ordering::Relaxed);
     if alt {
+        settle_output();
         cursor_show();
     }
     let mut scroll = 0usize;
@@ -4494,6 +4716,11 @@ pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     if !is_raw() {
         return ask(prompt).map(InputEvent::Text);
     }
+    // Once a turn, before the composer opens, the output rows are painted
+    // whole: anything that reached the terminal behind our back (a child
+    // process writing to /dev/tty) is gone by the next prompt.
+    screen::with(|s| s.transcript.forget_painted());
+    OUTPUT_DIRTY.store(true, Ordering::Relaxed);
     // A mode change must preserve both the current line/cursor and any
     // completed continuation lines. Keep this separate from queued messages.
     let mut draft = screen::with(|s| s.composer.draft.take()).unwrap_or_else(|| {
@@ -4599,6 +4826,7 @@ pub fn spinner_start(label: &str) -> Spinner {
         while r2.load(Ordering::Relaxed) {
             if ALT_SCREEN.load(Ordering::Relaxed) {
                 let _frame = render_lock();
+                COMPOSER_PAINTED.store(false, Ordering::Relaxed);
                 let mut out = io::stdout();
                 let _ = execute!(out, SavePosition);
                 queue_composer_box(&mut out);

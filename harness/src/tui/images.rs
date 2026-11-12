@@ -138,7 +138,10 @@ pub(super) fn inline_images() -> &'static Mutex<Vec<InlineImage>> {
 // popup, a clear, a resize): the next frame redraws every Sixel image
 // instead of keeping the ones that did not move.
 pub(super) fn invalidate_inline_pixels() {
-    screen::with(|s| s.images.dirty = true);
+    screen::with(|s| {
+        s.images.dirty = true;
+        s.transcript.forget_painted();
+    });
 }
 
 // Rows for an image marker line at the current size, or None when `line`
@@ -213,6 +216,7 @@ pub(super) fn image_cell_budget_for(
 pub(super) fn free_images() {
     let sent = screen::with(|s| {
         s.images.dirty = true;
+        s.transcript.forget_painted();
         std::mem::replace(&mut s.images.sent, false)
     });
     if sent {

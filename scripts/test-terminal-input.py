@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import struct
@@ -326,6 +327,17 @@ class TerminalHarness(unittest.TestCase):
         os.write(self.master, text.encode())
         self.pump(0.1)
 
+    def wait_in_scrollback(self, predicate, label, pages=8):
+        """Like wait_for, for text that a burst of lines may have carried
+        off the top within one frame: pages back until it has been shown."""
+        self.pump(0.3)
+        for _ in range(pages):
+            if predicate():
+                return
+            self.send("\x1b[5~")  # PageUp
+            self.pump(0.2)
+        self.wait_for(predicate, label)
+
     def assert_submitted(self, expected):
         def saved():
             path = self.home / "history"
@@ -387,7 +399,7 @@ class TerminalInputTests(TerminalHarness):
         self.send("/help\r")
         self.wait_for(lambda: b"buildwithnexus.dev/docs/data" in self.output, "data page link")
         for cmd in (b"/rename", b"/export", b"/copy", b"/ask", b"/rewind", b"Esc Esc"):
-            self.assertIn(cmd, bytes(self.output))
+            self.wait_in_scrollback(lambda: cmd in self.output, cmd.decode())
 
     def test_editor_keeps_newlines(self):
         self.send("draft")
@@ -720,6 +732,140 @@ class ResizeTests(TerminalHarness):
         self.assertIn(b"\x1b[38;1H", self.output, "the input row is row 38 of 40")
 
 
+class StreamModel:
+    """An OpenAI-compatible model whose reply is `script`: a list of
+    (text, seconds to wait after it). Each text is one streamed event;
+    texts with no wait between them go out in one write."""
+
+    def __init__(self, script):
+        self.requests = []
+        model = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = b'{"object":"list","data":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                model.requests.append(body.get("messages", []))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                pending = b""
+                try:
+                    for text, wait in script:
+                        delta = {"role": "assistant", "content": text}
+                        event = {"choices": [{"index": 0, "delta": delta}]}
+                        pending += f"data: {json.dumps(event)}\n\n".encode()
+                        if wait:
+                            self.wfile.write(pending)
+                            self.wfile.flush()
+                            pending = b""
+                            time.sleep(wait)
+                    done = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    self.wfile.write(pending + f"data: {json.dumps(done)}\n\ndata: [DONE]\n\n".encode())
+                except OSError:
+                    pass  # the session ended first
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class FrameTests(TerminalHarness):
+    """How much is written: a burst of lines is a few frames, not one per
+    line; the last streamed chunk is painted without waiting for another
+    event; a frame carries only the rows that changed; and a typed
+    character repaints the input row, not the box around it."""
+
+    # Two chunks in one write: the second lands inside the first's frame
+    # interval, and nothing follows it for three seconds.
+    SCRIPT = [("first words ", 0), ("tail-marker", 3.0), (" end.\n", 0)]
+    # An output frame: synchronized-output bracket, cursor saved, then the
+    # first changed row (the footer's frame addresses row 30 of 30 instead).
+    FRAME = re.compile(rb"\x1b\[\?2026h\x1b7\x1b\[(\d+);1H")
+
+    def prepare(self):
+        self.model = StreamModel(self.SCRIPT)
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def output_frames(self, since):
+        """The output frames written after `since`, as lists of the rows
+        each one repainted."""
+        frames = []
+        tail = bytes(self.output[since:])
+        for part in tail.split(b"\x1b[?2026h\x1b7")[1:]:
+            body = part.split(b"\x1b8\x1b[?2026l")[0]
+            rows = [int(r) for r in re.findall(rb"\x1b\[(\d+);1H", body)]
+            if rows and max(rows) <= 26:
+                frames.append(rows)
+        return frames
+
+    def test_a_burst_of_lines_is_a_few_frames_and_the_last_line_lands(self):
+        since = len(self.output)
+        self.send("/help\r")
+        self.wait_for(lambda: b"buildwithnexus.dev/docs/data" in self.output[since:],
+                      "the last line of /help")
+        self.pump(0.3)
+        frames = self.output_frames(since)
+        self.assertTrue(1 <= len(frames) <= 6, f"{len(frames)} frames for one /help")
+
+    def test_the_last_streamed_chunk_is_painted_without_another_event(self):
+        self.send("hello\r")
+        self.wait_for(lambda: self.model.requests, "the request", timeout=15)
+        # Well inside the model's three-second silence.
+        self.wait_for(lambda: b"tail-marker" in self.output, "the last chunk", timeout=1.5)
+        self.assertNotIn(b" end.", bytes(self.output))
+
+    def test_a_streamed_chunk_repaints_one_row(self):
+        self.send("hello\r")
+        self.wait_for(lambda: b"tail-marker" in self.output, "the reply", timeout=15)
+        self.pump(0.3)
+        frames = self.output_frames(0)
+        with_marker = [f for f in frames if f]
+        self.assertTrue(with_marker)
+        # The frame that brought the marker touched one row; the frames
+        # after it (nothing changed) wrote nothing at all.
+        at = bytes(self.output).index(b"tail-marker")
+        last = bytes(self.output)[:at].rsplit(b"\x1b[?2026h\x1b7", 1)[1]
+        self.assertEqual(len(re.findall(rb"\x1b\[\d+;1H", last)), 1, last)
+        quiet = len(self.output)
+        self.pump(1.0)
+        self.assertEqual(self.output_frames(quiet), [])
+
+    def test_typing_repaints_the_input_row_only(self):
+        self.pump(0.3)
+        since = len(self.output)
+        for ch in "ten chars!":
+            self.send(ch)
+        self.pump(0.2)
+        typed = bytes(self.output[since:])
+        self.assertIn(b"ten chars!", typed)
+        self.assertNotIn("╭".encode(), typed, "the box border is not redrawn")
+        self.assertNotIn(b"permission:", typed, "nor the footer")
+        self.assertEqual(self.output_frames(since), [])
+
+
 class GitAttachmentTests(TerminalHarness):
     """@diff in a repository whose git config runs a program asks first."""
 
@@ -927,8 +1073,8 @@ class KeyQuestionTests(TerminalHarness):
         self.send(f"/model {self.gateway.url} m2\r")
         self.until_asked(b"API key for this endpoint")
         self.send("/help\r")
-        self.wait_for(lambda: b"key question closed" in self.output, "closed")
         self.wait_for(lambda: b"buildwithnexus.dev/docs/data" in self.output, "/help ran")
+        self.wait_in_scrollback(lambda: b"key question closed" in self.output, "closed")
         self.assertEqual(self.gateway.keys_sent(), [])
 
     def test_no_key_is_asked_for_plain_http_to_another_machine(self):
@@ -2031,7 +2177,8 @@ class FileMentionTests(TerminalHarness):
 
     def test_help_lists_custom_commands(self):
         self.send("/help\r")
-        self.wait_for(lambda: b"ship it to an environment" in self.output, "custom command")
+        self.wait_in_scrollback(lambda: b"ship it to an environment" in self.output,
+                                "custom command")
         self.assertIn(b"/deploy", bytes(self.output))
 
 

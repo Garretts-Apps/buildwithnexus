@@ -1593,7 +1593,7 @@ pub(super) fn read_line_raw_prefill(
             if show < sug_rows {
                 // Popup shrank or closed: repaint the transcript rows it
                 // covered, then restore the composer it clobbers.
-                render_output();
+                repaint_output();
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             if !sug.is_empty() {
