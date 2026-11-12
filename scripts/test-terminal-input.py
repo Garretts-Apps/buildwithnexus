@@ -563,6 +563,68 @@ class OneOffModeCommandTests(TerminalHarness):
         self.assertTrue(any("a fresh start" in u for u in users), users)
 
 
+@unittest.skipIf(sys.platform == "win32", "needs a Unix PTY")
+class InteractiveSmokeTests(TerminalHarness):
+    """The interactive path end to end: the TUI starts in the alternate
+    screen with raw mode on, answers a typed message, and on a double
+    Ctrl+C or a SIGTERM exits with the terminal put back."""
+
+    REPLY = "smoke reply from the mock model"
+    ENTER_ALT = b"\x1b[?1049h"
+    LEAVE_ALT = b"\x1b[?1049l"
+    SHOW_CURSOR = b"\x1b[?25h"
+    # tui.rs RESTORE: what the signal handler writes before _exit.
+    RESTORE = (b"\x1b[r\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l"
+               b"\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[0 q\x1b[?1049l")
+
+    def prepare(self):
+        self.model = ChatModel(lambda messages: ("text", self.REPLY))
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def chat(self):
+        self.assertIn(self.ENTER_ALT, self.output)
+        lflag = termios.tcgetattr(self.master)[3]
+        self.assertFalse(lflag & (termios.ICANON | termios.ECHO), "raw mode is on")
+        self.send("hello smoke\r")
+        self.wait_for(lambda: self.model.requests and self.REPLY.encode() in self.output,
+                      "the mock reply", timeout=15)
+        self.assertTrue(any("hello smoke" in u for u in self.model.user_texts()))
+
+    def wait_exit(self):
+        self.wait_for(lambda: self.proc.poll() is not None, "the exit", timeout=10)
+        self.pump(0.2)  # whatever was written before exiting
+        # The pty is cooked again (a fresh one is): echo and line editing.
+        lflag = termios.tcgetattr(self.master)[3]
+        self.assertEqual(lflag & (termios.ICANON | termios.ECHO),
+                         termios.ICANON | termios.ECHO, "raw mode is off")
+        return self.proc.returncode
+
+    def test_double_ctrl_c_quits_and_restores_the_terminal(self):
+        self.chat()
+        quit_from = len(self.output)
+        self.send("\x03")
+        self.wait_for(lambda: b"press Ctrl+C again to quit" in self.output, "the quit hint")
+        self.assertIsNone(self.proc.poll(), "one Ctrl+C does not quit")
+        self.send("\x03")
+        self.assertEqual(self.wait_exit(), 0)
+        tail = bytes(self.output[quit_from:])
+        self.assertIn(self.SHOW_CURSOR, tail)
+        self.assertIn(self.LEAVE_ALT, tail)
+        self.assertNotIn(self.ENTER_ALT, tail[tail.rindex(self.LEAVE_ALT):])
+
+    def test_sigterm_exits_and_restores_the_terminal(self):
+        self.chat()
+        quit_from = len(self.output)
+        os.kill(self.proc.pid, signal.SIGTERM)
+        self.assertEqual(self.wait_exit(), 128 + signal.SIGTERM)
+        self.assertIn(self.RESTORE, bytes(self.output[quit_from:]))
+
+
 class GitAttachmentTests(TerminalHarness):
     """@diff in a repository whose git config runs a program asks first."""
 
