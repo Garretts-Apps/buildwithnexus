@@ -1432,3 +1432,231 @@ fn padding_a_row_clips_to_the_width_and_keeps_escapes() {
     assert_eq!(pad("", 2), "x  ");
     assert_eq!(pad("abc", 0), "x");
 }
+
+// ── streamed-line wrap ───────────────────────────────────────────────────────
+// `wrap_ansi_line` as it was before it could be resumed: wrap the whole line
+// in one pass. Kept as the reference the resumable wrap is checked against.
+fn wrap_ansi_line_reference(s: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 {
+        return vec![String::new()];
+    }
+    if s.starts_with(IMG_MARK) {
+        if let Some(rows) = inline_image_rows(s, max_cols) {
+            return rows;
+        }
+    }
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    // Leading indent of the visible text, repeated on continuation rows
+    // while it leaves at least half the row for text.
+    let lead = strip_ansi(s).chars().take_while(|c| *c == ' ').count();
+    let indent = if lead * 2 <= max_cols { lead } else { 0 };
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut visible = 0usize;
+    // SGR sequences in force at the wrap point, replayed at the start of
+    // the continuation row: a terminal repaints rows independently, so a
+    // colour or tint that started on row 1 would otherwise vanish on row 2
+    // (and an image row's id colour would break its placeholder cells).
+    let mut active = String::new();
+    // Last place this row may break: byte offset just after a space that
+    // follows some text, the columns used up to it, and the SGR state there.
+    let mut brk: Option<(usize, usize, String)> = None;
+    let mut seen_text = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            let start = current.len();
+            current.push(c);
+            eat_escape(&mut chars, Some(&mut current));
+            let seq = &current[start..];
+            if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                if seq == "\x1b[0m" || seq == "\x1b[m" {
+                    active.clear();
+                } else {
+                    active.push_str(seq);
+                }
+            }
+            continue;
+        }
+        let w = char_width(c);
+        // `visible > 0` guard: a width-2 char on a 1-column terminal still
+        // gets a row of its own instead of an infinite run of empty rows.
+        if visible + w > max_cols && visible > 0 {
+            let pad = " ".repeat(indent);
+            match brk.take().filter(|_| c != ' ') {
+                // Carry the partial word over to the next row.
+                Some((at, cols, sgr)) => {
+                    let rest = current.split_off(at);
+                    out.push(std::mem::take(&mut current));
+                    current = format!("{sgr}{pad}{rest}");
+                    visible = indent + visible - cols;
+                }
+                None => {
+                    out.push(std::mem::take(&mut current));
+                    current = format!("{active}{pad}");
+                    visible = indent;
+                }
+            }
+            if c == ' ' {
+                // The space that ended the row is not carried over.
+                continue;
+            }
+        }
+        current.push(c);
+        visible += w;
+        if c == ' ' {
+            if seen_text {
+                brk = Some((current.len(), visible, active.clone()));
+            }
+        } else {
+            seen_text = true;
+        }
+    }
+    out.push(current);
+    out
+}
+
+fn wrap_rng(seed: &mut u64) -> usize {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 11) as usize
+}
+
+// A streamed line is wrapped from where the last chunk left off. Whatever
+// the chunks are — cut inside a word, a wide character's neighbour, an
+// escape sequence — the rows must be those of wrapping the whole line.
+#[test]
+fn a_streamed_line_wraps_as_the_whole_line_would() {
+    let atoms = [
+        "a",
+        "word",
+        "longerword",
+        " ",
+        "  ",
+        "   ",
+        "\t",
+        "-",
+        "日本",
+        "🎉",
+        "e\u{301}",
+        "\u{200b}",
+        "\x1b[31m",
+        "\x1b[1m",
+        "\x1b[0m",
+        "\x1b[m",
+        "\x1b[39m",
+        "\x1b[38;2;1;2;3m",
+        "\x1b[2K",
+        "\x1b]8;;http://x\x07",
+        "\x1b]8;;\x1b\\",
+        "\x1b\\",
+        "\x1b",
+        "[",
+        "m",
+        "]",
+        "\x07",
+        "\u{F8FF}",
+        "supercalifragilisticexpialidocious",
+        ". ",
+        ", ",
+    ];
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    for round in 0..3000 {
+        let mut t = Transcript::new();
+        let mut width = 1 + wrap_rng(&mut seed) % 40;
+        t.ensure_width(width);
+        t.push("before".to_string());
+        t.push(String::new());
+        let i = t.len() - 1;
+        // Some lines start with an indent, or with nothing but spaces.
+        let mut line = " ".repeat(wrap_rng(&mut seed) % 4 * (wrap_rng(&mut seed) % 5));
+        let mut whole = String::new();
+        for _ in 0..wrap_rng(&mut seed) % 60 {
+            line.push_str(atoms[wrap_rng(&mut seed) % atoms.len()]);
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < chars.len() {
+            let n = 1 + wrap_rng(&mut seed) % 9;
+            let chunk: String = chars[at..(at + n).min(chars.len())].iter().collect();
+            at += n;
+            assert!(t.append_to(i, &chunk));
+            whole.push_str(&chunk);
+            assert_eq!(
+                t.wrapped[i],
+                wrap_ansi_line_reference(&whole, width),
+                "round {round}, width {width}, line {whole:?}"
+            );
+            // Now and then the terminal is resized mid-line, or another
+            // line lands or goes.
+            match wrap_rng(&mut seed) % 40 {
+                0 => {
+                    width = 1 + wrap_rng(&mut seed) % 40;
+                    t.ensure_width(width);
+                }
+                1 => t.ensure_size(width, 10 + wrap_rng(&mut seed) % 5),
+                2 => {
+                    t.set(0, "changed".to_string());
+                }
+                _ => {}
+            }
+            assert_eq!(t.wrapped[i], wrap_ansi_line_reference(&whole, width));
+        }
+        assert_eq!(t.lines[i], whole);
+    }
+}
+
+#[test]
+fn the_wrap_of_a_whole_line_is_what_it_was() {
+    let lines = [
+        "",
+        " ",
+        "      ",
+        "plain words that wrap at a narrow width and carry on",
+        "    indented text that keeps its indent on the rows that follow it",
+        "\x1b[31mred words \x1b[1mbold too\x1b[0m and plain again after the reset",
+        "wide 日本語のテキスト and emoji 🎉🎉🎉 in the middle of words",
+        "tabs\tare\tone\tcolumn\teach\there",
+        "a-word-with-no-spaces-at-all-that-is-longer-than-any-row-it-could-be-put-on",
+        "trailing spaces      ",
+        "\x1b]8;;http://example.com\x07a link\x1b]8;;\x07 then text",
+        "cut short \x1b[3",
+    ];
+    for line in lines {
+        for width in [0usize, 1, 2, 3, 7, 10, 20, 80] {
+            assert_eq!(
+                wrap_ansi_line(line, width),
+                wrap_ansi_line_reference(line, width),
+                "{line:?} at {width}"
+            );
+        }
+    }
+}
+
+// The cost of a chunk must not depend on how long the open line already is:
+// only the row being filled is touched.
+#[test]
+fn appending_to_a_long_line_touches_only_its_last_row() {
+    let mut t = Transcript::new();
+    t.ensure_width(40);
+    t.push(String::new());
+    for _ in 0..500 {
+        t.append_to(0, "token ");
+    }
+    let rows = t.wrapped[0].len();
+    assert!(rows > 50);
+    let ptrs: Vec<*const u8> = t.wrapped[0].iter().map(|r| r.as_ptr()).collect();
+    let (_, st) = t.open.as_ref().expect("the line's wrap is resumable");
+    assert_eq!(st.pos, t.lines[0].len());
+    t.append_to(0, "x");
+    let after: Vec<*const u8> = t.wrapped[0].iter().map(|r| r.as_ptr()).collect();
+    assert_eq!(
+        ptrs[..rows - 1],
+        after[..rows - 1],
+        "finished rows are not rebuilt"
+    );
+    assert_cache_coherent(&t);
+}

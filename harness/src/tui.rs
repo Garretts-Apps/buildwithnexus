@@ -149,6 +149,10 @@ struct Transcript {
     wrapped: Vec<Vec<String>>, // parallel to `lines`, wrapped at `width`
     width: usize,              // 0 = not yet sized
     height: usize,             // terminal rows the wrap was made for (images)
+    // The line last appended to and where its wrap stands: the next chunk
+    // of a streamed line is wrapped from there (`append_to`). Dropped by
+    // anything else that changes a line, the line count or the width.
+    open: Option<(usize, WrapState)>,
 }
 
 /// Bench-only surface for the transcript wrap cache — criterion can't reach
@@ -202,6 +206,7 @@ impl Transcript {
             wrapped: Vec::new(),
             width: 0,
             height: 0,
+            open: None,
         }
     }
 
@@ -227,24 +232,41 @@ impl Transcript {
             return;
         }
         let w = self.cur_width();
+        self.open = None;
         self.wrapped[i] = wrap_ansi_line(&s, w);
         self.lines[i] = s;
     }
 
-    // Append to line `i`, re-wrapping only that line. False when `i` is out
-    // of range (no open stream line).
+    // Append to line `i`, wrapping only what was appended: the rows before
+    // the one being filled are left as they are. (The whole line is wrapped
+    // on the first chunk, after a width change, and while it is only
+    // leading spaces.) False when `i` is out of range (no open stream line).
     fn append_to(&mut self, i: usize, chunk: &str) -> bool {
         if i >= self.lines.len() {
             return false;
         }
         self.lines[i].push_str(chunk);
         let w = self.cur_width();
-        self.wrapped[i] = wrap_ansi_line(&self.lines[i], w);
+        let line = &self.lines[i];
+        if let Some((at, st)) = self.open.as_mut() {
+            if *at == i
+                && st.max_cols == w
+                && st.lead_final
+                && !line.starts_with(IMG_MARK)
+                && st.feed(&mut self.wrapped[i], line)
+            {
+                return true;
+            }
+        }
+        let (rows, st) = wrap_ansi_open(line, w);
+        self.wrapped[i] = rows;
+        self.open = st.map(|st| (i, st));
         true
     }
 
     fn remove(&mut self, i: usize) {
         if i < self.lines.len() {
+            self.open = None;
             self.lines.remove(i);
             self.wrapped.remove(i);
         }
@@ -252,11 +274,13 @@ impl Transcript {
 
     fn drain_front(&mut self, n: usize) {
         let n = n.min(self.lines.len());
+        self.open = None;
         self.lines.drain(0..n);
         self.wrapped.drain(0..n);
     }
 
     fn clear(&mut self) {
+        self.open = None;
         self.lines.clear();
         self.wrapped.clear();
     }
@@ -264,6 +288,7 @@ impl Transcript {
     // Rewrap everything if the terminal width changed (resize only).
     fn ensure_width(&mut self, w: usize) {
         if w != self.width {
+            self.open = None;
             self.width = w;
             self.wrapped = self.lines.iter().map(|l| wrap_ansi_line(l, w)).collect();
         }
@@ -3318,85 +3343,152 @@ fn pad_ansi_into(out: &mut String, s: &str, width: usize) {
 // `<reason> deny` instead of `d <r` / `eason> deny`. A word longer than the
 // row is broken where the row ends.
 fn wrap_ansi_line(s: &str, max_cols: usize) -> Vec<String> {
+    wrap_ansi_open(s, max_cols).0
+}
+
+// Where `wrap_ansi_line` stands at the end of a line, so that text appended
+// to the line is wrapped from there instead of from the line's start: a
+// streamed paragraph costs its length once, not once per chunk. The rows
+// themselves are the caller's (`Transcript::wrapped`); the last of them is
+// the row still being filled.
+struct WrapState {
+    max_cols: usize,
+    indent: usize,
+    // False while the line is nothing but its leading spaces: appending
+    // could still change the indent, so the line is wrapped afresh.
+    lead_final: bool,
+    // Columns used in the row being filled.
+    visible: usize,
+    // SGR sequences in force, replayed at the start of a continuation row:
+    // a terminal repaints rows independently, so a colour or tint that
+    // started on row 1 would otherwise vanish on row 2 (and an image row's
+    // id colour would break its placeholder cells).
+    active: String,
+    // Last place this row may break: byte offset just after a space that
+    // follows some text, the columns used up to it, and the SGR state there.
+    brk: Option<(usize, usize, String)>,
+    seen_text: bool,
+    // Bytes of the line taken in.
+    pos: usize,
+    // Set when the line ends in escape sequences: where they start in the
+    // line and in the row being filled, and the SGR state before them. The
+    // last one may be cut short (a chunk can end anywhere), so they are read
+    // again once more text has arrived.
+    tail: Option<(usize, usize, String)>,
+}
+
+// `wrap_ansi_line`, plus the state to carry on from (none for the lines that
+// are not wrapped as text: images, or no columns at all).
+fn wrap_ansi_open(s: &str, max_cols: usize) -> (Vec<String>, Option<WrapState>) {
     if max_cols == 0 {
-        return vec![String::new()];
+        return (vec![String::new()], None);
     }
     if s.starts_with(IMG_MARK) {
         if let Some(rows) = inline_image_rows(s, max_cols) {
-            return rows;
+            return (rows, None);
         }
     }
     if s.is_empty() {
-        return vec![String::new()];
+        return (vec![String::new()], None);
     }
     // Leading indent of the visible text, repeated on continuation rows
     // while it leaves at least half the row for text.
-    let lead = strip_ansi(s).chars().take_while(|c| *c == ' ').count();
-    let indent = if lead * 2 <= max_cols { lead } else { 0 };
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut visible = 0usize;
-    // SGR sequences in force at the wrap point, replayed at the start of
-    // the continuation row: a terminal repaints rows independently, so a
-    // colour or tint that started on row 1 would otherwise vanish on row 2
-    // (and an image row's id colour would break its placeholder cells).
-    let mut active = String::new();
-    // Last place this row may break: byte offset just after a space that
-    // follows some text, the columns used up to it, and the SGR state there.
-    let mut brk: Option<(usize, usize, String)> = None;
-    let mut seen_text = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            let start = current.len();
-            current.push(c);
-            eat_escape(&mut chars, Some(&mut current));
-            let seq = &current[start..];
-            if seq.ends_with('m') && seq.starts_with("\x1b[") {
-                if seq == "\x1b[0m" || seq == "\x1b[m" {
-                    active.clear();
-                } else {
-                    active.push_str(seq);
-                }
-            }
-            continue;
+    let stripped = strip_ansi(s);
+    let lead = stripped.chars().take_while(|c| *c == ' ').count();
+    let mut st = WrapState {
+        max_cols,
+        indent: if lead * 2 <= max_cols { lead } else { 0 },
+        lead_final: stripped.len() > lead,
+        visible: 0,
+        active: String::new(),
+        brk: None,
+        seen_text: false,
+        pos: 0,
+        tail: None,
+    };
+    let mut rows = vec![String::new()];
+    st.feed(&mut rows, s);
+    (rows, Some(st))
+}
+
+impl WrapState {
+    // Wrap what `line` has gained since the last call onto `rows`. False,
+    // with nothing changed, when `line` is not the line this state was made
+    // from with text added.
+    fn feed(&mut self, rows: &mut Vec<String>, line: &str) -> bool {
+        let from = self.tail.as_ref().map_or(self.pos, |t| t.0);
+        let Some(rest) = line.get(from..) else {
+            return false;
+        };
+        let Some(mut current) = rows.pop() else {
+            return false;
+        };
+        if let Some((at, row_len, active)) = self.tail.take() {
+            current.truncate(row_len);
+            self.active = active;
+            self.pos = at;
         }
-        let w = char_width(c);
-        // `visible > 0` guard: a width-2 char on a 1-column terminal still
-        // gets a row of its own instead of an infinite run of empty rows.
-        if visible + w > max_cols && visible > 0 {
-            let pad = " ".repeat(indent);
-            match brk.take().filter(|_| c != ' ') {
-                // Carry the partial word over to the next row.
-                Some((at, cols, sgr)) => {
-                    let rest = current.split_off(at);
-                    out.push(std::mem::take(&mut current));
-                    current = format!("{sgr}{pad}{rest}");
-                    visible = indent + visible - cols;
+        let max_cols = self.max_cols;
+        let indent = self.indent;
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if self.tail.is_none() {
+                    self.tail = Some((self.pos, current.len(), self.active.clone()));
                 }
-                None => {
-                    out.push(std::mem::take(&mut current));
-                    current = format!("{active}{pad}");
-                    visible = indent;
+                let start = current.len();
+                current.push(c);
+                eat_escape(&mut chars, Some(&mut current));
+                let seq = &current[start..];
+                self.pos += seq.len();
+                if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                    if seq == "\x1b[0m" || seq == "\x1b[m" {
+                        self.active.clear();
+                    } else {
+                        self.active.push_str(seq);
+                    }
                 }
-            }
-            if c == ' ' {
-                // The space that ended the row is not carried over.
                 continue;
             }
-        }
-        current.push(c);
-        visible += w;
-        if c == ' ' {
-            if seen_text {
-                brk = Some((current.len(), visible, active.clone()));
+            self.tail = None;
+            self.pos += c.len_utf8();
+            let w = char_width(c);
+            // `visible > 0` guard: a width-2 char on a 1-column terminal still
+            // gets a row of its own instead of an infinite run of empty rows.
+            if self.visible + w > max_cols && self.visible > 0 {
+                let pad = " ".repeat(indent);
+                match self.brk.take().filter(|_| c != ' ') {
+                    // Carry the partial word over to the next row.
+                    Some((at, cols, sgr)) => {
+                        let rest = current.split_off(at);
+                        rows.push(std::mem::take(&mut current));
+                        current = format!("{sgr}{pad}{rest}");
+                        self.visible = indent + self.visible - cols;
+                    }
+                    None => {
+                        rows.push(std::mem::take(&mut current));
+                        current = format!("{}{pad}", self.active);
+                        self.visible = indent;
+                    }
+                }
+                if c == ' ' {
+                    // The space that ended the row is not carried over.
+                    continue;
+                }
             }
-        } else {
-            seen_text = true;
+            current.push(c);
+            self.visible += w;
+            if c == ' ' {
+                if self.seen_text {
+                    self.brk = Some((current.len(), self.visible, self.active.clone()));
+                }
+            } else {
+                self.seen_text = true;
+            }
         }
+        rows.push(current);
+        true
     }
-    out.push(current);
-    out
 }
 
 /// Fit one line into `max_cols`: unchanged when it fits, else cut one
