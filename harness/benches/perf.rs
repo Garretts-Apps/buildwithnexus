@@ -290,9 +290,85 @@ fn slow_server(delay_ms: u64) -> u16 {
     port
 }
 
+// ── perf-tools: grep_files and large-file read_file ─────────────────────
+// A 2,000-file, ~8 MB tree: `bench_project` plus filler so each file is
+// about 4 KB, the size the search was measured on.
+fn grep_tree() -> std::path::PathBuf {
+    let dir = bench_project(2000);
+    for i in 0..2000 {
+        let path = dir.join(format!("src/m{}/f{i}.rs", i % 40));
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        for n in 0..48 {
+            text.push_str(&format!(
+                "    let value_{n} = compute(alpha, beta) + offset; // filler {n}\n"
+            ));
+        }
+        std::fs::write(&path, text).unwrap();
+    }
+    dir
+}
+
+fn bench_grep_files(c: &mut Criterion) {
+    use serde_json::json;
+    let dir = grep_tree();
+    let mut g = c.benchmark_group("grep_files");
+    g.sample_size(20);
+    for (label, pattern) in [
+        ("zero", "zzz_not_there"),
+        ("few", "run_1999()"),
+        ("many", "pub fn"),
+    ] {
+        for (case, sensitive) in [("insensitive", false), ("sensitive", true)] {
+            let input = json!({"pattern": pattern, "case_sensitive": sensitive});
+            g.bench_function(format!("{label}/{case}"), |b| {
+                b.iter(|| tools::run("grep_files", black_box(&input), &dir))
+            });
+        }
+    }
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn bench_read_large_file(c: &mut Criterion) {
+    use serde_json::json;
+    let dir = std::env::temp_dir().join(format!("bwn-bench-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let line = "2026-01-01T00:00:00Z INFO worker: handled request id=123456 in 12 ms\n";
+    std::fs::write(
+        dir.join("big.log"),
+        line.repeat(60 * 1024 * 1024 / line.len()),
+    )
+    .unwrap();
+    std::fs::write(dir.join("small.rs"), "fn main() {}\n".repeat(40)).unwrap();
+    let mut g = c.benchmark_group("read_file");
+    g.sample_size(10);
+    for (label, input) in [
+        ("small", json!({"path": "small.rs"})),
+        ("60mb/whole", json!({"path": "big.log"})),
+        (
+            "60mb/lines_100_200",
+            json!({"path": "big.log", "start_line": 100, "end_line": 200}),
+        ),
+        (
+            "60mb/last_lines",
+            json!({"path": "big.log", "start_line": 880000, "end_line": 880100}),
+        ),
+    ] {
+        g.bench_function(label, |b| {
+            b.iter(|| tools::run("read_file", black_box(&input), &dir))
+        });
+    }
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+// ── end perf-tools ──────────────────────────────────────────────────────
+
 criterion_group!(
     benches,
     bench_tool_batch,
+    bench_grep_files,
+    bench_read_large_file,
     bench_wrap_cache,
     bench_body_builders,
     bench_cache_pass,
