@@ -6,7 +6,7 @@ use super::*;
 // Link-local addresses and cloud metadata endpoints hand out instance
 // credentials, so the fetch tools never reach them: not by literal, not by a
 // hostname that resolves there, not through a redirect. Loopback stays
-// usable for dev servers.
+// usable for dev servers (auto mode asks first; see private_network_host).
 pub(super) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
@@ -14,11 +14,92 @@ pub(super) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
         IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
                 || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
+                || embedded_ipv4(v6).is_some_and(|v4| is_blocked_ip(IpAddr::V4(v4)))
         }
     }
+}
+
+// The IPv4 address an IPv6 one carries and is routed to: IPv4-mapped
+// (::ffff:a.b.c.d), the deprecated IPv4-compatible form (::a.b.c.d), and
+// the NAT64 well-known prefix (64:ff9b::a.b.c.d), which a NAT64 gateway
+// translates to that IPv4 address. Without this `[64:ff9b::a9fe:a9fe]`
+// reaches 169.254.169.254 past a check that reads only the IPv6 form.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let seg = v6.segments();
+    let tail = std::net::Ipv4Addr::new(
+        (seg[6] >> 8) as u8,
+        seg[6] as u8,
+        (seg[7] >> 8) as u8,
+        seg[7] as u8,
+    );
+    // :: and ::1 are IPv6's own unspecified and loopback addresses.
+    if seg[..6] == [0; 6] && u32::from(tail) > 1 {
+        return Some(tail);
+    }
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(tail);
+    }
+    None
+}
+
+// Addresses on this machine or its private networks: loopback, RFC 1918,
+// CGNAT (100.64.0.0/10), "this network" (0.0.0.0/8), IPv6 unique-local
+// (fc00::/7), and the IPv6 forms that carry one of those IPv4 addresses.
+pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback() || v4.is_private() || o[0] == 0 || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || embedded_ipv4(v6).is_some_and(|v4| is_private_ip(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// Whether a fetch to `authority` (`host[:port]`, as network_host gives it)
+/// reaches this machine or a private network: a localhost name, a private
+/// literal, or a name that resolves to a private address now. Auto mode asks
+/// before such a fetch unless network.allow or an allow rule names the host.
+/// A name that does not resolve here (behind a proxy, say) counts as public;
+/// the proxy reaches it, not this machine.
+pub fn private_network_host(authority: &str) -> bool {
+    let a = authority.trim().to_ascii_lowercase();
+    let (host, port) = if let Some(rest) = a.strip_prefix('[') {
+        let (h, after) = rest.split_once(']').unwrap_or((rest, ""));
+        (
+            h.to_string(),
+            after.strip_prefix(':').and_then(|p| p.parse().ok()),
+        )
+    } else if a.matches(':').count() > 1 {
+        (a.clone(), None) // a bare IPv6 address
+    } else {
+        match a.split_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()),
+            None => (a.clone(), None),
+        }
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() || host == "?" {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return is_private_ip(ip);
+    }
+    use std::net::ToSocketAddrs;
+    (host, port.unwrap_or(80u16))
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|a| is_private_ip(a.ip())))
 }
 
 pub(super) const METADATA_HOSTS: &[&str] = &[

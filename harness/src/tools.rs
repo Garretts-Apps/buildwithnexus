@@ -6231,8 +6231,8 @@ fn run_artifact(input: &Value, cwd: &Path) -> Outcome {
 // Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
 mod net_guard;
-pub use net_guard::blocked_url;
 use net_guard::*;
+pub use net_guard::{blocked_url, private_network_host};
 
 #[cfg(test)]
 pub(crate) mod tests;

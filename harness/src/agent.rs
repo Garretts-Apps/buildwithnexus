@@ -1025,13 +1025,34 @@ pub(crate) fn gate(
     // Network tools can send what the agent has read to any host and reach
     // services on the local network, so outside `auto` each new host is
     // approved once (read-only mode included). `fetch *` or a network.allow
-    // entry allows them without asking.
+    // entry allows them without asking. In `auto`, the tools that hand a
+    // page's content back to the model (fetch_url, headless_browser) still
+    // ask before reaching this machine or a private network: that is where
+    // a router's admin page, a database console or the Docker API answer
+    // without a login, and a prompt injection could have the agent read and
+    // repeat them. Headless, with nobody to ask, such a fetch is refused
+    // with how to allow it.
     if let Some(h) = host_ref {
-        if matches!(perm, Permission::Auto) || allowed_by_rule {
+        let auto = matches!(perm, Permission::Auto);
+        let reads_back = matches!(name, "webfetch" | "fetch_url" | "headless_browser");
+        let private = auto && reads_back && !allowed_by_rule && tools::private_network_host(h);
+        if allowed_by_rule || (auto && !private) {
             return None;
         }
         if is_pre_approved(None, &tool_key, cwd) || is_pre_approved(None, "fetch *", cwd) {
             return None;
+        }
+        if private {
+            return confirm_call(
+                name,
+                input,
+                &format!(
+                    "network access to {h}, on this machine or a private network (auto mode asks; add \"{h}\" to network.allow in settings to allow it) — {}",
+                    tools::approval_label(name, input)
+                ),
+                &tool_key,
+                cwd,
+            );
         }
         return confirm_call_auto_allows(
             name,

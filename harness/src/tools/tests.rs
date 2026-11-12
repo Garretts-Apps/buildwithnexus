@@ -2846,8 +2846,19 @@ fn fetch_tools_refuse_link_local_and_metadata_hosts() {
         "http://169.254.169.254\\@docs.example/",
         "http://[::ffff:a9fe:a9fe]/",
         "http://[::169.254.169.254]/",
+        // NAT64 gateways translate 64:ff9b::/96 to the IPv4 address inside.
+        "http://[64:ff9b::a9fe:a9fe]/",
+        "http://[64:ff9b::169.254.169.254]/",
+        "http://[64:ff9b::6464:64c8]/",
     ] {
         assert!(blocked_url(u).is_some(), "{u} should be blocked");
+    }
+    // Resolved addresses are checked the same way (GuardedResolver).
+    for ip in ["64:ff9b::a9fe:a9fe", "::a9fe:a9fe", "::ffff:169.254.0.1"] {
+        assert!(is_blocked_ip(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in ["::1", "::", "64:ff9b::808:808", "2001:db8::1"] {
+        assert!(!is_blocked_ip(ip.parse().unwrap()), "{ip}");
     }
     for u in [
         "http://localhost:3000/",
@@ -3770,4 +3781,40 @@ fn iso8601_known_values() {
     let now = iso8601_utc_now();
     assert_ne!(now, "2026-07-06T00:00:00Z".to_string());
     assert!(now.ends_with('Z') && now.contains('T'));
+}
+
+#[test]
+fn private_addresses_are_told_from_public_ones() {
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.31.255.255",
+        "192.168.0.1",
+        "100.64.0.1",
+        "100.127.255.255",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "fc00::1",
+        "fdff::1",
+        "::ffff:192.168.1.1",
+        "::10.0.0.1",
+        "64:ff9b::7f00:1",
+    ] {
+        assert!(net_guard::is_private_ip(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in [
+        "8.8.8.8",
+        "100.128.0.1",
+        "172.32.0.1",
+        "2606:4700::1111",
+        "64:ff9b::808:808",
+    ] {
+        assert!(!net_guard::is_private_ip(ip.parse().unwrap()), "{ip}");
+    }
+    assert!(private_network_host("localhost:3000"));
+    assert!(private_network_host("[::1]:8080"));
+    assert!(private_network_host("10.0.0.1"));
+    assert!(!private_network_host("8.8.8.8:443"));
+    assert!(!private_network_host("?"));
 }

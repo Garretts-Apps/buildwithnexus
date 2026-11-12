@@ -2954,6 +2954,70 @@ fn network_deny_sees_every_spelling_of_an_address() {
         "http://[::2]/",
         "http://10.0.0.10/",
     ] {
+        // wait_for_url: auto mode asks before fetch_url reaches a private
+        // address (below), and this is about what network.deny matches.
+        assert_eq!(
+            gate(
+                Permission::Auto,
+                "wait_for_url",
+                &json!({"url": url}),
+                &proj
+            ),
+            None,
+            "{url}"
+        );
+    }
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn auto_mode_asks_before_fetching_private_addresses() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home(
+        "net-private",
+        json!({"network": {"allow": ["127.0.0.1:3000", "192.168.1.*"]}}),
+    );
+    for url in [
+        "http://localhost:8080/",
+        "http://app.localhost/",
+        "http://127.0.0.1:2375/containers/json",
+        "http://10.1.2.3/",
+        "http://172.16.0.1/",
+        "http://100.64.0.1/",
+        "http://0.0.0.0:9000/",
+        "http://[::1]:5432/",
+        "http://[fd12::1]/",
+        "http://[::ffff:10.0.0.1]/",
+        "http://[64:ff9b::a00:1]/",
+    ] {
+        for tool in ["fetch_url", "headless_browser"] {
+            // No terminal in tests: the prompt shows up as a refusal that
+            // says how to allow the host.
+            let r = gate(Permission::Auto, tool, &json!({"url": url}), &proj)
+                .unwrap_or_else(|| panic!("{tool} {url} must ask"));
+            assert!(r.contains("network.allow"), "{r}");
+        }
+        // Tools that only poll or open a page keep working for dev servers.
+        assert_eq!(
+            gate(
+                Permission::Auto,
+                "wait_for_url",
+                &json!({"url": url}),
+                &proj
+            ),
+            None,
+            "{url}"
+        );
+    }
+    // network.allow lets them through without asking; public hosts never ask.
+    for url in [
+        "http://127.0.0.1:3000/",
+        "http://192.168.1.20/",
+        "http://93.184.215.14/",
+    ] {
         assert_eq!(
             gate(Permission::Auto, "fetch_url", &json!({"url": url}), &proj),
             None,
