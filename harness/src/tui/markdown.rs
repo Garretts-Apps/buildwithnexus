@@ -104,7 +104,7 @@ impl StreamRenderer {
 
     // Echo the not-yet-terminated tail of the current line raw so streaming
     // stays visibly live between newlines. Alt-screen only: the transcript
-    // tracks the open line there (OPEN_STREAM_LINE), so the raw text can be
+    // tracks the open line there (`Screen.transcript`), so the raw text can be
     // replaced by the rendered line once the newline arrives. Lines that may
     // still classify as fence openers or protocol JSON are held back — they
     // may never be shown at all.

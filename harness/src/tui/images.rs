@@ -12,12 +12,16 @@ use super::*;
 
 pub(super) const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
+fn images_mode() -> u8 {
+    screen::with(|s| s.flags.images_mode)
+}
+
 pub(super) fn images_enabled() -> bool {
-    IMAGES_MODE.load(Ordering::Relaxed) != 0
+    images_mode() != 0
 }
 
 pub(super) fn use_placeholders() -> bool {
-    match IMAGES_MODE.load(Ordering::Relaxed) {
+    match images_mode() {
         2 => true,
         3 | 4 | 0 => false,
         _ => crate::graphics::placeholders_supported(),
@@ -27,7 +31,7 @@ pub(super) fn use_placeholders() -> bool {
 // Sixel previews: the `images` setting picks them explicitly, or `auto`
 // follows BWN_IMAGES and the startup probe.
 pub(super) fn use_sixel() -> bool {
-    match IMAGES_MODE.load(Ordering::Relaxed) {
+    match images_mode() {
         4 => true,
         2 | 3 | 0 => false,
         _ => crate::sixel::supported(),
@@ -130,19 +134,11 @@ pub(super) fn inline_images() -> &'static Mutex<Vec<InlineImage>> {
     IMAGES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-// Set when something other than render_output may have drawn over the
-// output rows (a popup, a clear, a resize): the next frame redraws every
-// Sixel image instead of keeping the ones that did not move.
-pub(super) static SIXEL_DIRTY: AtomicBool = AtomicBool::new(true);
-
+// Something other than render_output may have drawn over the output rows (a
+// popup, a clear, a resize): the next frame redraws every Sixel image
+// instead of keeping the ones that did not move.
 pub(super) fn invalidate_inline_pixels() {
-    SIXEL_DIRTY.store(true, Ordering::Relaxed);
-}
-
-// Sixel images drawn by the last frame.
-pub(super) fn drawn_sixels() -> &'static Mutex<Vec<Placement>> {
-    static DRAWN: OnceLock<Mutex<Vec<Placement>>> = OnceLock::new();
-    DRAWN.get_or_init(|| Mutex::new(Vec::new()))
+    screen::with(|s| s.images.dirty = true);
 }
 
 // Rows for an image marker line at the current size, or None when `line`
@@ -215,8 +211,11 @@ pub(super) fn image_cell_budget_for(
 }
 
 pub(super) fn free_images() {
-    invalidate_inline_pixels();
-    if IMAGES_SENT.swap(false, Ordering::Relaxed) {
+    let sent = screen::with(|s| {
+        s.images.dirty = true;
+        std::mem::replace(&mut s.images.sent, false)
+    });
+    if sent {
         let _ = write!(io::stdout(), "{}", crate::graphics::delete_all());
         flush();
     }
@@ -230,10 +229,9 @@ pub fn show_image_file(path: &std::path::Path, once: bool) -> bool {
     if !images_enabled() || no_color() {
         return false;
     }
-    if let Ok(mut seen) = previewed_paths().lock() {
-        if !seen.insert(path.to_path_buf()) && once {
-            return true;
-        }
+    let seen = !screen::with(|s| s.images.previewed.insert(path.to_path_buf()));
+    if seen && once {
+        return true;
     }
     let name = path
         .file_name()
@@ -246,14 +244,18 @@ pub fn show_image_file(path: &std::path::Path, once: bool) -> bool {
         if let Some((png, iw, ih)) = crate::media::png_for_terminal(path, 1600) {
             let cell = crate::graphics::cell_pixels();
             let (cols, rows) = crate::graphics::fit_cells(iw, ih, max_cols, max_rows, cell);
-            let id = NEXT_IMAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let id = screen::with(|s| {
+                let id = s.images.next_id;
+                s.images.next_id = id.wrapping_add(1);
+                id
+            });
             let _ = write!(
                 io::stdout(),
                 "{}",
                 crate::graphics::transmit(&png, id, cols, rows)
             );
             flush();
-            IMAGES_SENT.store(true, Ordering::Relaxed);
+            screen::with(|s| s.images.sent = true);
             let mut rows_out = vec![format!(
                 "  {} {} {}",
                 dim("⎘"),

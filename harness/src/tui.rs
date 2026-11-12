@@ -5,7 +5,7 @@
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,7 +24,6 @@ use crossterm::{execute, queue};
 static RAW: AtomicBool = AtomicBool::new(false);
 static ALT_SCREEN: AtomicBool = AtomicBool::new(false);
 static MOUSE_CAPTURED: AtomicBool = AtomicBool::new(false);
-static SCROLL_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InterruptKind {
@@ -38,35 +37,9 @@ static INTERRUPT_KIND_VAL: AtomicU8 = AtomicU8::new(0);
 // it, and a cancel from the editor raises the interrupt without raw mode.
 static PROTOCOL_STDIN: AtomicBool = AtomicBool::new(false);
 static AGENT_RUNNING: AtomicBool = AtomicBool::new(false);
-// Live "working" readout: when the current turn started, how many streamed
-// characters have landed since (→ tokens/s), and when the footer last
-// repainted its elapsed-time tick.
-static WORK_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+// Streamed characters landed this turn (→ tokens/s in the footer). Bumped per
+// chunk, also by helper threads that capture their output: stays lock-free.
 static STREAM_CHARS: AtomicUsize = AtomicUsize::new(0);
-static LAST_STATUS_TICK_MS: AtomicU64 = AtomicU64::new(0);
-static LAST_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
-// Terminal focus (CSI ?1004 reports); assumed focused until told otherwise,
-// so a terminal that never reports focus never gets a stray notification.
-static FOCUSED: AtomicBool = AtomicBool::new(true);
-// `notify` setting: 0 off, 1 auto (only while unfocused), 2 always.
-static NOTIFY_MODE: AtomicU8 = AtomicU8::new(1);
-// `images` setting: 0 off, 1 auto, 2 kitty (force placeholders), 3 blocks.
-static IMAGES_MODE: AtomicU8 = AtomicU8::new(1);
-// kitty image ids handed out this session; whether any were uploaded (so
-// leaving the screen frees them).
-static NEXT_IMAGE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-static IMAGES_SENT: AtomicBool = AtomicBool::new(false);
-
-fn model_label() -> &'static Mutex<String> {
-    static M: OnceLock<Mutex<String>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(String::new()))
-}
-
-fn previewed_paths() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
-    static P: OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
-    P.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -76,50 +49,46 @@ fn now_ms() -> u64 {
 
 /// Model name shown in the footer (set at startup and on `/model`).
 pub fn set_model_label(model: &str) {
-    if let Ok(mut m) = model_label().lock() {
-        *m = model.to_string();
-    }
+    screen::with(|s| s.status.model = model.to_string());
     render_footer();
 }
 
 /// Apply the `images` and `notify` settings keys.
 pub fn configure_ui(images: &str, notify: &str) {
-    IMAGES_MODE.store(
-        match images.trim().to_ascii_lowercase().as_str() {
-            "off" | "false" | "0" => 0,
-            "kitty" => 2,
-            "blocks" | "half" => 3,
-            "sixel" => 4,
-            _ => 1,
-        },
-        Ordering::Relaxed,
-    );
-    NOTIFY_MODE.store(
-        match notify.trim().to_ascii_lowercase().as_str() {
-            "off" | "false" | "0" => 0,
-            "always" => 2,
-            _ => 1,
-        },
-        Ordering::Relaxed,
-    );
+    let images_mode = match images.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" => 0,
+        "kitty" => 2,
+        "blocks" | "half" => 3,
+        "sixel" => 4,
+        _ => 1,
+    };
+    let notify_mode = match notify.trim().to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" => 0,
+        "always" => 2,
+        _ => 1,
+    };
+    screen::with(|s| {
+        s.flags.images_mode = images_mode;
+        s.flags.notify_mode = notify_mode;
+    });
 }
 
 /// Whether the terminal window currently has focus (per CSI ?1004 reports).
 pub fn is_focused() -> bool {
-    FOCUSED.load(Ordering::Relaxed)
+    screen::with(|s| s.flags.focused)
 }
+
+fn set_focused(focused: bool) {
+    screen::with(|s| s.flags.focused = focused);
+}
+
+mod screen;
 
 mod notify;
 use notify::*;
 pub use notify::{notify, on_idle};
 
-// ── shared terminal state: context meter, vim mode, transcript, selection ──
-static CONTEXT_USED: AtomicUsize = AtomicUsize::new(0);
-static CONTEXT_TOTAL: AtomicUsize = AtomicUsize::new(0);
-
-static VIM_MODE: AtomicBool = AtomicBool::new(false);
-static VIM_STATE_VAL: AtomicU8 = AtomicU8::new(0); // 0 = Normal, 1 = Insert, 2 = Visual
-
+// ── shared terminal state: vim mode, transcript, selection ──────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VimState {
     Insert,
@@ -128,28 +97,31 @@ pub enum VimState {
 }
 
 pub fn get_vim_state_label() -> &'static str {
-    if !is_vim_mode() {
-        return "";
-    }
-    match VIM_STATE_VAL.load(Ordering::Relaxed) {
-        0 => "NORMAL",
-        1 => "INSERT",
-        2 => "VISUAL",
-        _ => "NORMAL",
+    match screen::with(|s| (s.flags.vim_mode, s.flags.vim_state)) {
+        (false, _) => "",
+        (true, 1) => "INSERT",
+        (true, 2) => "VISUAL",
+        (true, _) => "NORMAL",
     }
 }
 
 pub fn toggle_vim_mode() -> bool {
-    let old = VIM_MODE.load(Ordering::Relaxed);
-    VIM_MODE.store(!old, Ordering::Relaxed);
-    if !old {
-        VIM_STATE_VAL.store(0, Ordering::Relaxed); // Default to Normal mode
-    }
-    !old
+    screen::with(|s| {
+        s.flags.vim_mode = !s.flags.vim_mode;
+        if s.flags.vim_mode {
+            s.flags.vim_state = 0; // Default to Normal mode
+        }
+        s.flags.vim_mode
+    })
 }
 
 pub fn is_vim_mode() -> bool {
-    VIM_MODE.load(Ordering::Relaxed)
+    screen::with(|s| s.flags.vim_mode)
+}
+
+// 0 = Normal, 1 = Insert, 2 = Visual.
+fn set_vim_state(state: u8) {
+    screen::with(|s| s.flags.vim_state = state);
 }
 
 #[derive(Clone, Copy)]
@@ -324,26 +296,6 @@ impl Transcript {
     }
 }
 
-fn transcript() -> &'static Mutex<Transcript> {
-    static LINES: OnceLock<Mutex<Transcript>> = OnceLock::new();
-    LINES.get_or_init(|| Mutex::new(Transcript::new()))
-}
-
-fn footer_text() -> &'static Mutex<String> {
-    static FOOTER: OnceLock<Mutex<String>> = OnceLock::new();
-    FOOTER.get_or_init(|| Mutex::new(String::new()))
-}
-
-fn visible_rows() -> &'static Mutex<Vec<String>> {
-    static ROWS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-    ROWS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn selection() -> &'static Mutex<Option<Selection>> {
-    static SELECTION: OnceLock<Mutex<Option<Selection>>> = OnceLock::new();
-    SELECTION.get_or_init(|| Mutex::new(None))
-}
-
 pub fn is_raw() -> bool {
     RAW.load(Ordering::Relaxed)
 }
@@ -434,22 +386,6 @@ struct TypeAheadState {
     from_queue: bool,
 }
 
-fn typeahead() -> &'static std::sync::Mutex<TypeAheadState> {
-    static TA: std::sync::OnceLock<std::sync::Mutex<TypeAheadState>> = std::sync::OnceLock::new();
-    TA.get_or_init(|| {
-        std::sync::Mutex::new(TypeAheadState {
-            buf: Vec::new(),
-            cursor: 0,
-            from_queue: false,
-        })
-    })
-}
-
-fn message_queue() -> &'static std::sync::Mutex<Vec<String>> {
-    static MQ: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    MQ.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
 // The queue is FIFO: ask_task sends index 0 next, so Ctrl+Q / Ctrl+X must act
 // on the front too — never `pop()`, which would edit or drop the newest
 // message while the oldest one goes out untouched.
@@ -532,25 +468,20 @@ struct OpenInput {
     cursor: usize,
 }
 
-fn open_inputs() -> &'static Mutex<Vec<OpenInput>> {
-    static OPEN: OnceLock<Mutex<Vec<OpenInput>>> = OnceLock::new();
-    OPEN.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 fn top_open_input() -> Option<OpenInput> {
-    open_inputs().lock().ok().and_then(|o| o.last().cloned())
+    screen::with(|s| s.composer.open_inputs.last().cloned())
 }
 
 fn update_open_input(prompt: &str, buf: &[char], cursor: usize) {
-    if let Ok(mut open) = open_inputs().lock() {
-        if let Some(top) = open.last_mut() {
+    screen::with(|s| {
+        if let Some(top) = s.composer.open_inputs.last_mut() {
             top.prompt.clear();
             top.prompt.push_str(prompt);
             top.buf.clear();
             top.buf.extend_from_slice(buf);
             top.cursor = cursor;
         }
-    }
+    });
 }
 
 /// Registration of an open prompt, picker or composer: owns the keyboard
@@ -562,22 +493,19 @@ struct InputOwner {
 impl InputOwner {
     fn open(prompt: &str, buf: &[char], cursor: usize) -> Self {
         let keys = keyboard_lock();
-        if let Ok(mut open) = open_inputs().lock() {
-            open.push(OpenInput {
-                prompt: prompt.to_string(),
-                buf: buf.to_vec(),
-                cursor,
-            });
-        }
+        let input = OpenInput {
+            prompt: prompt.to_string(),
+            buf: buf.to_vec(),
+            cursor,
+        };
+        screen::with(|s| s.composer.open_inputs.push(input));
         InputOwner { _keys: keys }
     }
 }
 
 impl Drop for InputOwner {
     fn drop(&mut self) {
-        if let Ok(mut open) = open_inputs().lock() {
-            open.pop();
-        }
+        screen::with(|s| s.composer.open_inputs.pop());
     }
 }
 
@@ -658,162 +586,130 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
                 }
                 _ => {}
             }
-            let mut ta = match typeahead().lock() {
-                Ok(g) => g,
-                Err(_) => return raised,
-            };
-            match k.code {
-                KeyCode::Enter => {
-                    let text: String = ta.buf.iter().collect();
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        if let Ok(mut mq) = message_queue().lock() {
+            // The buffer and the queue are edited under the screen lock;
+            // the repaint runs after it is released (render_output and
+            // render_queued_composer take it again).
+            let repaint = screen::with(|s| {
+                let (ta, mq) = (&mut s.composer.typeahead, &mut s.composer.queue);
+                match k.code {
+                    KeyCode::Enter => {
+                        let text: String = ta.buf.iter().collect();
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
                             if ta.from_queue {
-                                queue_put_back(&mut mq, trimmed.to_string());
+                                queue_put_back(mq, trimmed.to_string());
                             } else {
                                 mq.push(trimmed.to_string());
                             }
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            ta.from_queue = false;
+                            return true;
                         }
+                    }
+                    // Plain Up is intentionally a no-op for the queue: queue
+                    // editing is Ctrl+Q (as the queued-row hint says), so a
+                    // stray Up can't destructively pop the newest message.
+                    KeyCode::Up if !alt => {}
+                    KeyCode::Char('q') if ctrl => {
+                        // Take the NEXT message (front) into the buffer.
+                        if let Some(next) = queue_take_next(mq) {
+                            ta.buf = next.chars().collect();
+                            ta.cursor = ta.buf.len();
+                            ta.from_queue = true;
+                            return true;
+                        }
+                    }
+                    KeyCode::Char('x') if ctrl => {
+                        return queue_take_next(mq).is_some();
+                    }
+                    KeyCode::Char('c') if ctrl => {
+                        raised = InterruptKind::CtrlC;
                         ta.buf.clear();
                         ta.cursor = 0;
                         ta.from_queue = false;
-                        // Drop the guard before rendering: render_output /
-                        // render_queued_composer re-lock typeahead and the
-                        // message queue, and std Mutex is not reentrant.
-                        drop(ta);
-                        render_output();
-                        clear_composer();
-                        render_footer();
-                        render_queued_composer();
                     }
-                    return raised;
-                }
-                // Plain Up is intentionally a no-op for the queue: queue
-                // editing is Ctrl+Q (as the queued-row hint says), so a
-                // stray Up can't destructively pop the newest message.
-                KeyCode::Up if !alt => {
-                    return raised;
-                }
-                KeyCode::Char('q') if ctrl => {
-                    // Take the NEXT message (front) under a short-lived
-                    // lock, then render with no guards held (see deadlock
-                    // note on Enter above).
-                    let next = message_queue()
-                        .lock()
-                        .ok()
-                        .and_then(|mut mq| queue_take_next(&mut mq));
-                    if let Some(next) = next {
-                        ta.buf = next.chars().collect();
+                    KeyCode::Char('u') if ctrl => {
+                        let d = ta.cursor;
+                        ta.buf.drain(..d);
+                        ta.cursor = 0;
+                    }
+                    KeyCode::Esc => {
+                        if agent_running {
+                            raised = InterruptKind::Escape;
+                        } else if ta.from_queue && !ta.buf.is_empty() {
+                            let msg: String = ta.buf.iter().collect();
+                            queue_put_back(mq, msg);
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            ta.from_queue = false;
+                            return true;
+                        } else if !ta.buf.is_empty() {
+                            ta.buf.clear();
+                            ta.cursor = 0;
+                            ta.from_queue = false;
+                        } else {
+                            raised = InterruptKind::Escape;
+                        }
+                    }
+                    KeyCode::Home | KeyCode::Char('a') if ctrl => {
+                        ta.cursor = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('e') if ctrl => {
                         ta.cursor = ta.buf.len();
-                        ta.from_queue = true;
-                        drop(ta);
-                        render_output();
-                        clear_composer();
-                        render_footer();
-                        render_queued_composer();
                     }
-                    return raised;
-                }
-                KeyCode::Char('x') if ctrl => {
-                    let removed = message_queue()
-                        .lock()
-                        .ok()
-                        .and_then(|mut mq| queue_take_next(&mut mq))
-                        .is_some();
-                    if removed {
-                        drop(ta);
-                        render_output();
-                        clear_composer();
-                        render_footer();
-                        render_queued_composer();
-                    }
-                    return raised;
-                }
-                KeyCode::Char('c') if ctrl => {
-                    raised = InterruptKind::CtrlC;
-                    ta.buf.clear();
-                    ta.cursor = 0;
-                    ta.from_queue = false;
-                }
-                KeyCode::Char('u') if ctrl => {
-                    let d = ta.cursor;
-                    ta.buf.drain(..d);
-                    ta.cursor = 0;
-                }
-                KeyCode::Esc => {
-                    if agent_running {
-                        raised = InterruptKind::Escape;
-                    } else if ta.from_queue && !ta.buf.is_empty() {
-                        let msg: String = ta.buf.iter().collect();
-                        if let Ok(mut mq) = message_queue().lock() {
-                            queue_put_back(&mut mq, msg);
+                    KeyCode::Char('w') if ctrl => {
+                        let d = ta.cursor;
+                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] == ' ' {
+                            ta.cursor -= 1;
                         }
-                        ta.buf.clear();
-                        ta.cursor = 0;
-                        ta.from_queue = false;
-                        drop(ta);
-                        render_output();
-                        clear_composer();
-                        render_footer();
-                        render_queued_composer();
-                        return raised;
-                    } else if !ta.buf.is_empty() {
-                        ta.buf.clear();
-                        ta.cursor = 0;
-                        ta.from_queue = false;
-                    } else {
-                        raised = InterruptKind::Escape;
+                        while ta.cursor > 0 && ta.buf[ta.cursor - 1] != ' ' {
+                            ta.cursor -= 1;
+                        }
+                        let cur = ta.cursor;
+                        ta.buf.drain(cur..d);
                     }
-                }
-                KeyCode::Home | KeyCode::Char('a') if ctrl => {
-                    ta.cursor = 0;
-                }
-                KeyCode::End | KeyCode::Char('e') if ctrl => {
-                    ta.cursor = ta.buf.len();
-                }
-                KeyCode::Char('w') if ctrl => {
-                    let d = ta.cursor;
-                    while ta.cursor > 0 && ta.buf[ta.cursor - 1] == ' ' {
-                        ta.cursor -= 1;
+                    KeyCode::Char('k') if ctrl => {
+                        let cur = ta.cursor;
+                        ta.buf.truncate(cur);
                     }
-                    while ta.cursor > 0 && ta.buf[ta.cursor - 1] != ' ' {
-                        ta.cursor -= 1;
+                    KeyCode::Backspace if !ctrl => {
+                        if ta.cursor > 0 {
+                            let i = ta.cursor - 1;
+                            ta.buf.remove(i);
+                            ta.cursor = i;
+                        }
                     }
-                    let cur = ta.cursor;
-                    ta.buf.drain(cur..d);
-                }
-                KeyCode::Char('k') if ctrl => {
-                    let cur = ta.cursor;
-                    ta.buf.truncate(cur);
-                }
-                KeyCode::Backspace if !ctrl => {
-                    if ta.cursor > 0 {
-                        let i = ta.cursor - 1;
-                        ta.buf.remove(i);
-                        ta.cursor = i;
+                    KeyCode::Delete => {
+                        let i = ta.cursor;
+                        if i < ta.buf.len() {
+                            ta.buf.remove(i);
+                        }
                     }
-                }
-                KeyCode::Delete => {
-                    let i = ta.cursor;
-                    if i < ta.buf.len() {
-                        ta.buf.remove(i);
+                    KeyCode::Left => {
+                        ta.cursor = ta.cursor.saturating_sub(1);
                     }
-                }
-                KeyCode::Left => {
-                    ta.cursor = ta.cursor.saturating_sub(1);
-                }
-                KeyCode::Right => {
-                    let i = ta.cursor;
-                    if i < ta.buf.len() {
+                    KeyCode::Right => {
+                        let i = ta.cursor;
+                        if i < ta.buf.len() {
+                            ta.cursor += 1;
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        let i = ta.cursor;
+                        ta.buf.insert(i, c);
                         ta.cursor += 1;
                     }
+                    _ => {}
                 }
-                KeyCode::Char(c) if !ctrl && !alt => {
-                    let i = ta.cursor;
-                    ta.buf.insert(i, c);
-                    ta.cursor += 1;
-                }
-                _ => {}
+                false
+            });
+            if repaint {
+                render_output();
+                clear_composer();
+                render_footer();
+                render_queued_composer();
+                return raised;
             }
         }
         Event::Paste(s) => {
@@ -824,15 +720,13 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
                 Some(p) => attachment_token(p),
                 None => collapse_paste(&s).unwrap_or_else(|| s.clone()),
             };
-            let mut ta = match typeahead().lock() {
-                Ok(g) => g,
-                Err(_) => return raised,
-            };
             let chars: Vec<char> = clean_paste(&text).chars().collect();
-            let i = ta.cursor;
-            ta.buf.splice(i..i, chars.iter().copied());
-            ta.cursor += chars.len();
-            drop(ta);
+            screen::with(|s| {
+                let ta = &mut s.composer.typeahead;
+                let i = ta.cursor;
+                ta.buf.splice(i..i, chars.iter().copied());
+                ta.cursor += chars.len();
+            });
             if let Some(p) = media {
                 show_image_file(&p, false);
             }
@@ -854,8 +748,8 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
                 render_queued_composer();
             }
         }
-        Event::FocusGained => FOCUSED.store(true, Ordering::Relaxed),
-        Event::FocusLost => FOCUSED.store(false, Ordering::Relaxed),
+        Event::FocusGained => set_focused(true),
+        Event::FocusLost => set_focused(false),
     }
     if raised != InterruptKind::None {
         trigger_interrupt(raised);
@@ -868,9 +762,10 @@ fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
 // every frame (render_output, render_queued_composer, render_footer,
 // render_composer) runs under one process-wide lock. Re-entrant per thread,
 // since render_output ends with render_queued_composer, which calls
-// render_composer. Lock order: RENDER → typeahead → message_queue → the leaf
-// locks (transcript, selection, visible_rows, footer/model/flash text). Never
-// call a render function while holding typeahead or message_queue.
+// render_composer. Lock order: KEYBOARD → RENDER → SCREEN (tui/screen.rs:
+// transcript, composer, selection, footer) → the image store. Never call a
+// render function, or anything else that takes the screen lock, from inside
+// `screen::with`.
 static RENDER: Mutex<()> = Mutex::new(());
 
 thread_local! {
@@ -923,13 +818,6 @@ fn sanitize_paste(s: &str) -> Vec<char> {
 const PASTE_COLLAPSE_CHARS: usize = 1_000;
 const PASTE_COLLAPSE_LINES: usize = 10;
 
-// Every collapsed paste of the session, by its token: a history recall of a
-// message with a token still sends the paste.
-fn pastes() -> &'static Mutex<Vec<(String, String)>> {
-    static PASTES: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
-    PASTES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 // 20024 → "20,024".
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -975,26 +863,28 @@ fn collapse_paste(s: &str) -> Option<String> {
     if chars <= PASTE_COLLAPSE_CHARS && text.lines().count() <= PASTE_COLLAPSE_LINES {
         return None;
     }
-    let mut store = pastes().lock().ok()?;
-    let token = match store.len() {
-        0 => format!("[pasted {} chars]", thousands(chars)),
-        n => format!("[pasted {} chars #{}]", thousands(chars), n + 1),
-    };
-    store.push((token.clone(), text));
-    Some(token)
+    let size = thousands(chars);
+    Some(screen::with(|s| {
+        let store = &mut s.composer.pastes;
+        let token = match store.len() {
+            0 => format!("[pasted {size} chars]"),
+            n => format!("[pasted {size} chars #{}]", n + 1),
+        };
+        store.push((token.clone(), text));
+        token
+    }))
 }
 
 /// A submitted message with each paste token replaced by its paste.
 fn expand_pastes(text: &str) -> String {
-    let Ok(store) = pastes().lock() else {
-        return text.to_string();
-    };
     let mut out = text.to_string();
-    for (token, full) in store.iter() {
-        if out.contains(token.as_str()) {
-            out = out.replacen(token.as_str(), full, 1);
+    screen::with(|s| {
+        for (token, full) in s.composer.pastes.iter() {
+            if out.contains(token.as_str()) {
+                out = out.replacen(token.as_str(), full, 1);
+            }
         }
-    }
+    });
     out
 }
 
@@ -1018,62 +908,53 @@ pub fn render_queued_composer() {
     // scrolled away between now and the next stream frame.
     ensure_output_region();
     let open = top_open_input();
-    if let Ok(ta) = typeahead().lock() {
-        let has_queued = if let Ok(mq) = message_queue().lock() {
-            let mut out: Vec<u8> = Vec::new();
-            // One atomic frame (DEC 2026): the queued rows paint together with
-            // no intermediate state a fast terminal could show mid-repaint.
-            let _ = write!(out, "\x1b[?2026h");
-            let c_top = composer_top();
-            let q_len = mq.len() as u16;
-            for (i, msg) in mq.iter().enumerate() {
-                let row = c_top.saturating_sub(q_len).saturating_add(i as u16);
-                let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
-                let _ = write!(
-                    out,
-                    "  {} {} {} {}",
-                    dim("├─"),
-                    dim("queued:"),
-                    bold(&composer_glyphs(&msg.chars().collect::<Vec<_>>())),
-                    dim(queued_row_hint(i))
-                );
-            }
-            let _ = write!(out, "\x1b[?2026l");
-            write_frame(&out);
-            !mq.is_empty()
-        } else {
-            false
-        };
-        let mut scroll = 0usize;
-        if let Some(open) = open {
-            // A prompt or picker owns the box: repaint it as it is, never
-            // the idle composer.
-            render_composer(&open.prompt, &open.buf, open.cursor, &mut scroll);
-            cursor_show();
-            return;
-        }
-        let prompt_str = if is_agent_running() && (!ta.buf.is_empty() || has_queued) {
-            format!("{} {} ", dim("queued"), accent("›"))
-        } else {
-            format!("{} ", accent("›"))
-        };
-        render_composer(&prompt_str, &ta.buf, ta.cursor, &mut scroll);
-        cursor_color_accent();
-        set_cursor_shape(CursorShape::Bar);
-        cursor_show();
+    // Painted from a snapshot: the composer repaint takes the screen lock.
+    let (buf, cursor, queued) = screen::with(|s| {
+        let c = &s.composer;
+        (c.typeahead.buf.clone(), c.typeahead.cursor, c.queue.clone())
+    });
+    let mut out: Vec<u8> = Vec::new();
+    // One atomic frame (DEC 2026): the queued rows paint together with
+    // no intermediate state a fast terminal could show mid-repaint.
+    let _ = write!(out, "\x1b[?2026h");
+    let c_top = composer_top();
+    let q_len = queued.len() as u16;
+    for (i, msg) in queued.iter().enumerate() {
+        let row = c_top.saturating_sub(q_len).saturating_add(i as u16);
+        let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+        let _ = write!(
+            out,
+            "  {} {} {} {}",
+            dim("├─"),
+            dim("queued:"),
+            bold(&composer_glyphs(&msg.chars().collect::<Vec<_>>())),
+            dim(queued_row_hint(i))
+        );
     }
+    let _ = write!(out, "\x1b[?2026l");
+    write_frame(&out);
+    let has_queued = !queued.is_empty();
+    let mut scroll = 0usize;
+    if let Some(open) = open {
+        // A prompt or picker owns the box: repaint it as it is, never
+        // the idle composer.
+        render_composer(&open.prompt, &open.buf, open.cursor, &mut scroll);
+        cursor_show();
+        return;
+    }
+    let prompt_str = if is_agent_running() && (!buf.is_empty() || has_queued) {
+        format!("{} {} ", dim("queued"), accent("›"))
+    } else {
+        format!("{} ", accent("›"))
+    };
+    render_composer(&prompt_str, &buf, cursor, &mut scroll);
+    cursor_color_accent();
+    set_cursor_shape(CursorShape::Bar);
+    cursor_show();
 }
 
 fn take_typeahead() -> (Vec<char>, usize) {
-    match typeahead().lock() {
-        Ok(mut ta) => {
-            let buf = std::mem::take(&mut ta.buf);
-            let cur = std::mem::replace(&mut ta.cursor, 0);
-            ta.from_queue = false;
-            (buf, cur)
-        }
-        Err(_) => (Vec::new(), 0),
-    }
+    screen::with(|s| s.composer.take_typeahead())
 }
 
 fn term_size() -> (u16, u16) {
@@ -1088,7 +969,7 @@ fn term_size() -> (u16, u16) {
 //   h-1  permission: ask · …     footer_row()
 // Queued messages stack directly above the box.
 fn reserved_rows() -> u16 {
-    let q_len = message_queue().lock().map(|q| q.len()).unwrap_or(0) as u16;
+    let q_len = screen::with(|s| s.composer.queue.len()) as u16;
     if ALT_SCREEN.load(Ordering::Relaxed) {
         4 + q_len
     } else {
@@ -1750,7 +1631,9 @@ fn prompt_width(prompt: &str) -> u16 {
 // Last DECSTBM bottom row we told the terminal about. reserved_rows() grows
 // when a prompt is queued, so the scroll region must shrink to match — else
 // streaming output scrolls over (or scrolls away) the queued-composer row and
-// can scroll the whole screen (a visible flash). 0 = no region set.
+// can scroll the whole screen (a visible flash). 0 = no region set. An atomic,
+// not a `Screen` field: the panic hook resets it (reset_output_region), and
+// the panicking thread may be the one holding the screen lock.
 static LAST_REGION_BOTTOM: AtomicU16 = AtomicU16::new(0);
 
 fn set_output_region() {
@@ -1834,8 +1717,16 @@ fn queue_footer(out: &mut impl Write) {
     let (width, _) = term_size();
     let _ = queue!(out, MoveTo(0, footer_row()), Clear(ClearType::CurrentLine));
 
-    let footer = footer_text().lock().map(|f| f.clone()).unwrap_or_default();
-    let model = model_label().lock().map(|m| m.clone()).unwrap_or_default();
+    let (footer, model, started, used, total) = screen::with(|s| {
+        let st = &s.status;
+        (
+            st.footer.clone(),
+            st.model.clone(),
+            st.work_started_ms,
+            st.context_used,
+            st.context_total,
+        )
+    });
     let model_badge = if model.is_empty() {
         String::new()
     } else {
@@ -1843,7 +1734,6 @@ fn queue_footer(out: &mut impl Write) {
     };
     let base_text = if is_agent_running() {
         // Live readout: braille spinner, elapsed, streamed tokens/s.
-        let started = WORK_STARTED_MS.load(Ordering::Relaxed);
         let elapsed_ms = now_ms().saturating_sub(started).max(1);
         let secs = elapsed_ms / 1000;
         let frames = SPINNER_FRAMES;
@@ -1881,8 +1771,6 @@ fn queue_footer(out: &mut impl Write) {
         format!("{model_badge}{footer}")
     };
 
-    let used = CONTEXT_USED.load(Ordering::Relaxed);
-    let total = CONTEXT_TOTAL.load(Ordering::Relaxed);
     let ctx_badge = if let Some(raw_pct) = (used * 100).checked_div(total) {
         let pct = raw_pct.min(100);
         let bar_width = 8usize;
@@ -1909,7 +1797,7 @@ fn queue_footer(out: &mut impl Write) {
         String::new()
     };
 
-    let offset = SCROLL_OFFSET.load(Ordering::Relaxed);
+    let offset = screen::with(|s| s.transcript.scroll_offset);
     let vim_badge = if is_vim_mode() {
         let label = get_vim_state_label();
         let colored = match label {
@@ -1979,30 +1867,15 @@ fn render_footer() {
 // ── footer flash ─────────────────────────────────────────────────────────────
 // Transient feedback ("⎘ copied 42 chars") appended to the footer for ~2s —
 // visible confirmation without polluting the transcript.
-static FLASH_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
-
-fn flash_text() -> &'static Mutex<String> {
-    static FLASH: OnceLock<Mutex<String>> = OnceLock::new();
-    FLASH.get_or_init(|| Mutex::new(String::new()))
-}
-
 pub fn flash_footer(msg: &str) {
-    if let Ok(mut f) = flash_text().lock() {
-        *f = msg.to_string();
-    }
-    FLASH_UNTIL_MS.store(monotonic_ms() + 2_000, Ordering::Relaxed);
+    let now = monotonic_ms();
+    screen::with(|s| s.status.set_flash(msg, now));
     render_footer();
 }
 
 fn active_flash() -> Option<String> {
-    if monotonic_ms() >= FLASH_UNTIL_MS.load(Ordering::Relaxed) {
-        return None;
-    }
-    flash_text()
-        .lock()
-        .ok()
-        .map(|f| f.clone())
-        .filter(|f| !f.is_empty())
+    let now = monotonic_ms();
+    screen::with(|s| s.status.active_flash(now))
 }
 
 // ── cursor shape & visibility ────────────────────────────────────────────────
@@ -2066,14 +1939,13 @@ pub fn cursor_show() {
 }
 
 pub fn set_permission_mode(mode: &str) {
-    if let Ok(mut footer) = footer_text().lock() {
-        *footer = format!(
-            "{} {} {}",
-            dim("permission:"),
-            bold(mode),
-            dim("· /permissions · wheel/PgUp · drag-copy · /mouse")
-        );
-    }
+    let footer = format!(
+        "{} {} {}",
+        dim("permission:"),
+        bold(mode),
+        dim("· /permissions · wheel/PgUp · drag-copy · /mouse")
+    );
+    screen::with(|s| s.status.footer = footer);
     render_footer();
 }
 
@@ -2088,81 +1960,80 @@ fn render_output() {
     let (width, height) = term_size();
     let width = width as usize;
     let rows = height.saturating_sub(reserved_rows()) as usize;
-    let Ok(mut t) = transcript().lock() else {
-        return;
-    };
-    t.ensure_size(width, height as usize);
-    let total = t.total_rows();
-    let max_offset = total.saturating_sub(rows);
-    let offset = SCROLL_OFFSET.load(Ordering::Relaxed).min(max_offset);
-    if offset != SCROLL_OFFSET.load(Ordering::Relaxed) {
-        SCROLL_OFFSET.store(offset, Ordering::Relaxed);
-    }
-    let start = total.saturating_sub(rows + offset);
-    let visible = t.rows_range(start, rows);
-    // Sixel images are pixels over blank rows. One that is on screen at the
-    // same place as last frame, with nothing drawn over it since, is left
-    // alone: rewriting its rows would erase it, and re-sending it every
-    // streamed frame would be slow.
-    let placements = sixel_placements(&visible, rows);
-    let kept: Vec<Placement> = if SIXEL_DIRTY.swap(false, Ordering::Relaxed) {
-        Vec::new()
-    } else {
-        let drawn = drawn_sixels().lock().map(|d| d.clone()).unwrap_or_default();
-        placements
-            .iter()
-            .filter(|p| drawn.contains(p))
-            .copied()
-            .collect()
-    };
-    let in_kept = |row: usize| {
-        kept.iter()
-            .any(|&(_, top, _, n)| row >= top && row < top + n)
-    };
     let mut out: Vec<u8> = Vec::with_capacity(rows * (width + 16));
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
     // — zero tearing/flicker. Ignored elsewhere.
     let _ = write!(out, "\x1b[?2026h");
-    let sel = selection().lock().ok().and_then(|g| *g);
-    let mut plain_rows = Vec::with_capacity(rows);
     // Every row starts on the theme's background, whatever the row before
     // it left set, so a painted theme stays whole on any terminal.
     let bg = theme_bg();
-    for row in 0..rows {
-        if in_kept(row) {
-            plain_rows.push(String::new());
-            continue;
-        }
-        let _ = queue!(out, MoveTo(0, row as u16));
-        out.extend_from_slice(bg.as_bytes());
-        if let Some(line) = visible.get(row) {
-            if line.starts_with(IMG_MARK) {
-                let _ = write!(out, "{}", pad_ansi_line("", width));
+    // The frame is built from the transcript under the screen lock; nothing
+    // in here writes to the terminal or takes the lock again.
+    let (placements, kept) = screen::with(|s| {
+        let sel = s.selection.current;
+        let view = &mut s.transcript;
+        view.text.ensure_size(width, height as usize);
+        let total = view.text.total_rows();
+        let max_offset = total.saturating_sub(rows);
+        view.scroll_offset = view.scroll_offset.min(max_offset);
+        let start = total.saturating_sub(rows + view.scroll_offset);
+        let visible = view.text.rows_range(start, rows);
+        // Sixel images are pixels over blank rows. One that is on screen at
+        // the same place as last frame, with nothing drawn over it since, is
+        // left alone: rewriting its rows would erase it, and re-sending it
+        // every streamed frame would be slow.
+        let placements = sixel_placements(&visible, rows);
+        let kept: Vec<Placement> = if std::mem::replace(&mut s.images.dirty, false) {
+            Vec::new()
+        } else {
+            placements
+                .iter()
+                .filter(|p| s.images.drawn.contains(p))
+                .copied()
+                .collect()
+        };
+        let in_kept = |row: usize| {
+            kept.iter()
+                .any(|&(_, top, _, n)| row >= top && row < top + n)
+        };
+        let mut plain_rows = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if in_kept(row) {
                 plain_rows.push(String::new());
                 continue;
             }
-            let plain = strip_ansi(line);
-            if let Some(sel) = sel {
-                if let Some(range) = selection_range_for(sel, row as u16, &plain) {
-                    let _ = write!(
-                        out,
-                        "{}",
-                        pad_ansi_line(&selected_line(&plain, range), width)
-                    );
+            let _ = queue!(out, MoveTo(0, row as u16));
+            out.extend_from_slice(bg.as_bytes());
+            if let Some(line) = visible.get(row) {
+                if line.starts_with(IMG_MARK) {
+                    let _ = write!(out, "{}", pad_ansi_line("", width));
+                    plain_rows.push(String::new());
+                    continue;
+                }
+                let plain = strip_ansi(line);
+                if let Some(sel) = sel {
+                    if let Some(range) = selection_range_for(sel, row as u16, &plain) {
+                        let _ = write!(
+                            out,
+                            "{}",
+                            pad_ansi_line(&selected_line(&plain, range), width)
+                        );
+                    } else {
+                        let _ = write!(out, "{}", pad_ansi_line(line, width));
+                    }
                 } else {
                     let _ = write!(out, "{}", pad_ansi_line(line, width));
                 }
+                plain_rows.push(plain);
             } else {
-                let _ = write!(out, "{}", pad_ansi_line(line, width));
+                let _ = write!(out, "{}", " ".repeat(width));
+                plain_rows.push(String::new());
             }
-            plain_rows.push(plain);
-        } else {
-            let _ = write!(out, "{}", " ".repeat(width));
-            plain_rows.push(String::new());
         }
-    }
-    drop(t);
+        view.visible_rows = plain_rows;
+        (placements, kept)
+    });
     // Drawing a Sixel leaves the cursor on the row below the image; with the
     // scroll region's bottom margin there, the terminal would scroll the
     // transcript. The margins are lifted while images are drawn: the rows
@@ -2189,12 +2060,7 @@ fn render_output() {
         );
     }
     drop(redraw);
-    if let Ok(mut drawn) = drawn_sixels().lock() {
-        *drawn = placements;
-    }
-    if let Ok(mut rows) = visible_rows().lock() {
-        *rows = plain_rows;
-    }
+    screen::with(|s| s.images.drawn = placements);
     let _ = write!(out, "\x1b[?2026l");
     write_frame(&out);
     render_queued_composer();
@@ -2208,7 +2074,6 @@ fn render_output() {
 // paths (line(), commit_stream_line(), assistant_end) always paint the final
 // state.
 const FRAME_MS: u64 = 16;
-static LAST_STREAM_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 
 fn monotonic_ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -2220,9 +2085,15 @@ fn monotonic_ms() -> u64 {
 
 fn render_output_throttled() {
     let now = monotonic_ms();
-    let last = LAST_STREAM_FRAME_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= FRAME_MS || last == 0 {
-        LAST_STREAM_FRAME_MS.store(now.max(1), Ordering::Relaxed);
+    let due = screen::with(|s| {
+        let last = s.transcript.last_stream_frame_ms;
+        let due = now.saturating_sub(last) >= FRAME_MS || last == 0;
+        if due {
+            s.transcript.last_stream_frame_ms = now.max(1);
+        }
+        due
+    });
+    if due {
         render_output();
     }
 }
@@ -2231,20 +2102,22 @@ fn scroll_output(delta: isize) {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    let current = SCROLL_OFFSET.load(Ordering::Relaxed);
-    let next = if delta.is_negative() {
-        current.saturating_sub(delta.unsigned_abs())
+    let rows = if delta.is_negative() {
+        0
     } else {
-        let total = if let Ok(t) = transcript().lock() {
-            t.total_rows()
-        } else {
-            0
-        };
-        let rows = term_size().1.saturating_sub(reserved_rows()) as usize;
-        let max_offset = total.saturating_sub(rows);
-        current.saturating_add(delta as usize).min(max_offset)
+        term_size().1.saturating_sub(reserved_rows()) as usize
     };
-    SCROLL_OFFSET.store(next, Ordering::Relaxed);
+    screen::with(|s| {
+        let view = &mut s.transcript;
+        view.scroll_offset = if delta.is_negative() {
+            view.scroll_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            let max_offset = view.text.total_rows().saturating_sub(rows);
+            view.scroll_offset
+                .saturating_add(delta as usize)
+                .min(max_offset)
+        };
+    });
     render_output();
     clear_composer();
     render_footer();
@@ -2261,7 +2134,7 @@ fn scroll_page_down() {
 }
 
 fn scroll_to_bottom() {
-    SCROLL_OFFSET.store(0, Ordering::Relaxed);
+    screen::with(|s| s.transcript.scroll_offset = 0);
     render_output();
 }
 
@@ -2269,24 +2142,9 @@ fn in_output_region(row: u16) -> bool {
     ALT_SCREEN.load(Ordering::Relaxed) && row < composer_top()
 }
 
-// Multi-click detection: (last click ms, row, col, count). Two clicks on the
-// same cell within 400ms select the word, three the whole line.
-static LAST_CLICK: Mutex<(u64, u16, u16, u8)> = Mutex::new((0, 0, 0, 0));
-
 fn click_count(row: u16, col: u16) -> u8 {
     let now = monotonic_ms();
-    let mut guard = match LAST_CLICK.lock() {
-        Ok(g) => g,
-        Err(_) => return 1,
-    };
-    let (t, r, c, n) = *guard;
-    let count = if now.saturating_sub(t) <= 400 && r == row && c == col {
-        (n % 3) + 1
-    } else {
-        1
-    };
-    *guard = (now, row, col, count);
-    count
+    screen::with(|s| s.selection.click_count(now, row, col))
 }
 
 // Word span (code-friendly: [A-Za-z0-9_], else a non-space run) around `col`
@@ -2334,10 +2192,7 @@ fn selection_start(row: u16, col: u16) {
     let new_sel = match clicks {
         // Double click: select the word under the cursor.
         2 => {
-            let span = visible_rows()
-                .lock()
-                .ok()
-                .and_then(|rows| rows.get(row as usize).cloned())
+            let span = screen::with(|s| s.transcript.visible_rows.get(row as usize).cloned())
                 .and_then(|line| word_span_at(&line, col as usize));
             match span {
                 Some((s, e)) => Selection {
@@ -2354,10 +2209,8 @@ fn selection_start(row: u16, col: u16) {
         }
         // Triple click: select the whole visible line.
         3 => {
-            let len = visible_rows()
-                .lock()
-                .ok()
-                .and_then(|rows| rows.get(row as usize).map(|l| str_width(l)))
+            let len = screen::with(|s| s.transcript.visible_rows.get(row as usize).cloned())
+                .map(|l| str_width(&l))
                 .unwrap_or(0);
             Selection {
                 anchor: SelectPos { row, col: 0 },
@@ -2374,9 +2227,7 @@ fn selection_start(row: u16, col: u16) {
             sticky: false,
         },
     };
-    if let Ok(mut sel) = selection().lock() {
-        *sel = Some(new_sel);
-    }
+    screen::with(|s| s.selection.current = Some(new_sel));
     render_output();
     render_queued_composer();
 }
@@ -2385,31 +2236,29 @@ fn selection_drag(row: u16, col: u16) {
     if !in_output_region(row) {
         return;
     }
-    if let Ok(mut sel) = selection().lock() {
-        if let Some(s) = sel.as_mut() {
-            s.focus = SelectPos { row, col };
-            s.sticky = false;
+    screen::with(|s| {
+        if let Some(sel) = s.selection.current.as_mut() {
+            sel.focus = SelectPos { row, col };
+            sel.sticky = false;
         }
-    }
+    });
     render_output();
     render_queued_composer();
 }
 
 fn selection_finish(row: u16, col: u16) {
     if in_output_region(row) {
-        if let Ok(mut sel) = selection().lock() {
-            if let Some(s) = sel.as_mut() {
+        screen::with(|s| {
+            if let Some(sel) = s.selection.current.as_mut() {
                 // A word/line selection stays put on the release click.
-                if !s.sticky {
-                    s.focus = SelectPos { row, col };
+                if !sel.sticky {
+                    sel.focus = SelectPos { row, col };
                 }
             }
-        }
+        });
     }
     let copied = selected_text();
-    if let Ok(mut sel) = selection().lock() {
-        *sel = None;
-    }
+    screen::with(|s| s.selection.current = None);
     render_output();
     if let Some(text) = copied.filter(|s| !s.trim().is_empty()) {
         osc52_copy(&text);
@@ -2492,8 +2341,11 @@ fn selected_line(line: &str, range: (usize, usize)) -> String {
 }
 
 fn selected_text() -> Option<String> {
-    let sel = selection().lock().ok().and_then(|g| *g)?;
-    let rows = visible_rows().lock().ok()?;
+    let (sel, rows) = screen::with(|s| {
+        s.selection
+            .current
+            .map(|sel| (sel, s.transcript.visible_rows.clone()))
+    })?;
     let (start, end) = normalized_selection(sel);
     let mut out = Vec::new();
     for row in start.row..=end.row {
@@ -2552,7 +2404,7 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
 
 fn echo_submitted(prompt: &str, text: &str) {
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        screen::with(|s| s.transcript.scroll_offset = 0);
         clear_composer();
         line(&format!("{prompt}{text}"));
     } else {
@@ -2651,18 +2503,18 @@ fn refresh_banner_mode(mode: &str) {
     }
     let width = term_size().0 as usize;
     let row = banner_mode_row(mode, width);
-    let Ok(mut t) = transcript().lock() else {
-        return;
-    };
     // "Shift+Tab cycle" is unique to the banner's mode row (the REPL hint
     // line says "Shift+Tab to change mode").
-    let idx = t
-        .lines
-        .iter()
-        .position(|l| strip_ansi(l).contains("Shift+Tab cycle"));
-    if let Some(i) = idx {
-        t.set(i, row);
-    }
+    screen::with(|s| {
+        let t = &mut s.transcript.text;
+        let idx = t
+            .lines
+            .iter()
+            .position(|l| strip_ansi(l).contains("Shift+Tab cycle"));
+        if let Some(i) = idx {
+            t.set(i, row);
+        }
+    });
 }
 
 // Refresh the mode indicator line in-place after a mode change (no full clear).
@@ -2682,8 +2534,10 @@ pub fn context_meter(used: usize, total: usize) {
     if total == 0 {
         return;
     }
-    CONTEXT_USED.store(used, Ordering::Relaxed);
-    CONTEXT_TOTAL.store(total, Ordering::Relaxed);
+    screen::with(|s| {
+        s.status.context_used = used;
+        s.status.context_total = total;
+    });
     render_footer();
 }
 
@@ -2820,11 +2674,11 @@ pub fn enter_alt(raw: bool) {
         // arm the restore-on-signal handlers.
         #[cfg(any(unix, windows))]
         signal_restore::install();
-        SCROLL_OFFSET.store(0, Ordering::Relaxed);
-        invalidate_stream_line();
-        if let Ok(mut t) = transcript().lock() {
-            t.clear();
-        }
+        screen::with(|s| {
+            s.transcript.scroll_offset = 0;
+            s.transcript.invalidate_stream_line();
+            s.transcript.text.clear();
+        });
         let mut out = io::stdout();
         // Some terminals preserve the user's current scrollback viewport when
         // switching buffers. Force the normal screen to its bottom first, then
@@ -2924,12 +2778,12 @@ pub fn leave_alt() {
 
 pub fn clear() {
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        SCROLL_OFFSET.store(0, Ordering::Relaxed);
-        invalidate_stream_line();
+        screen::with(|s| {
+            s.transcript.scroll_offset = 0;
+            s.transcript.invalidate_stream_line();
+        });
         free_images();
-        if let Ok(mut t) = transcript().lock() {
-            t.clear();
-        }
+        screen::with(|s| s.transcript.text.clear());
         let _ = write!(io::stdout(), "{}", theme_bg());
         let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0));
         set_output_region();
@@ -3295,16 +3149,6 @@ pub(crate) fn capture_event(line: &str) -> bool {
     })
 }
 
-// Transcript index of the line currently receiving streamed text, or
-// usize::MAX when no stream line is open. line() (and transcript clears)
-// invalidate it so interleaved notices (trace records, hook lines) never get
-// streamed text welded onto them.
-static OPEN_STREAM_LINE: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-fn invalidate_stream_line() {
-    OPEN_STREAM_LINE.store(usize::MAX, Ordering::Relaxed);
-}
-
 // Replace the open streamed line with its rendered form and close it. Falls
 // back to appending a fresh line when no stream line is open (start of turn,
 // or a notice landed mid-stream and invalidated the index).
@@ -3316,17 +3160,8 @@ fn commit_stream_line(rendered: &str) {
         line(rendered);
         return;
     }
-    let mut replaced = false;
-    if let Ok(mut t) = transcript().lock() {
-        let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-        if open < t.len() {
-            t.set(open, rendered.to_string());
-            replaced = true;
-        }
-    }
-    // Lock released above: render_output() re-locks the transcript.
-    invalidate_stream_line();
-    if replaced {
+    // The lock is released before painting: render_output() takes it again.
+    if screen::with(|s| s.transcript.commit_stream(rendered)) {
         render_output();
         clear_composer();
     } else {
@@ -3343,26 +3178,9 @@ fn retract_stream_line() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut t) = transcript().lock() {
-        let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-        t.remove(open);
-    }
-    invalidate_stream_line();
+    screen::with(|s| s.transcript.retract_stream());
     render_output();
     clear_composer();
-}
-
-// Keep a scrolled-back view pinned to what the reader is looking at: rows
-// appended at the bottom push the bottom-relative offset up by the same
-// amount. (Rows dropped from the front don't move the view — the offset is
-// measured from the end.)
-fn pin_scroll(before_rows: usize, t: &Transcript) {
-    if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
-        let added = t.total_rows().saturating_sub(before_rows);
-        if added > 0 {
-            SCROLL_OFFSET.fetch_add(added, Ordering::Relaxed);
-        }
-    }
 }
 
 pub fn line(s: &str) {
@@ -3370,23 +3188,7 @@ pub fn line(s: &str) {
         return;
     }
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        invalidate_stream_line();
-        if let Ok(mut t) = transcript().lock() {
-            let before = if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
-                t.total_rows()
-            } else {
-                0
-            };
-            for part in s.replace('\r', "").split('\n') {
-                t.push(part.to_string());
-            }
-            pin_scroll(before, &t);
-            const MAX_LINES: usize = 2_000;
-            if t.len() > MAX_LINES {
-                let extra = t.len() - MAX_LINES;
-                t.drain_front(extra);
-            }
-        }
+        screen::with(|scr| scr.transcript.push_lines(s));
         render_output();
         clear_composer();
     } else if is_raw() {
@@ -3403,43 +3205,7 @@ pub fn write_stream(chunk: &str) {
         return;
     }
     if ALT_SCREEN.load(Ordering::Relaxed) {
-        if let Ok(mut t) = transcript().lock() {
-            let before = if SCROLL_OFFSET.load(Ordering::Relaxed) > 0 {
-                t.total_rows()
-            } else {
-                0
-            };
-            let normalized = chunk.replace('\r', "");
-            let mut parts = normalized.split('\n');
-            if let Some(first) = parts.next() {
-                // Append to the tracked open stream line only; if none is
-                // open (start of stream, or a line() intervened) start fresh.
-                let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-                if !t.append_to(open, first) {
-                    t.push(first.to_string());
-                    OPEN_STREAM_LINE.store(t.len() - 1, Ordering::Relaxed);
-                }
-            }
-            for part in parts {
-                t.push(part.to_string());
-                OPEN_STREAM_LINE.store(t.len() - 1, Ordering::Relaxed);
-            }
-            pin_scroll(before, &t);
-            const MAX_LINES: usize = 2_000;
-            if t.len() > MAX_LINES {
-                let extra = t.len() - MAX_LINES;
-                t.drain_front(extra);
-                // Keep the open-line index in step with the drained prefix.
-                let open = OPEN_STREAM_LINE.load(Ordering::Relaxed);
-                if open != usize::MAX {
-                    if open >= extra {
-                        OPEN_STREAM_LINE.store(open - extra, Ordering::Relaxed);
-                    } else {
-                        invalidate_stream_line();
-                    }
-                }
-            }
-        }
+        screen::with(|s| s.transcript.stream(chunk));
         // Streaming repaints are frame-coalesced (~60fps): the transcript
         // state above is always current, so a skipped frame just means the
         // next one paints more at once. Unthrottled paths (line, commit)
@@ -3473,8 +3239,14 @@ fn start_typeahead_thread() {
                 // Elapsed-time / tokens-per-second readout: repaint the
                 // footer row a few times a second while the agent works.
                 let now = now_ms();
-                if now.saturating_sub(LAST_STATUS_TICK_MS.load(Ordering::Relaxed)) >= 250 {
-                    LAST_STATUS_TICK_MS.store(now, Ordering::Relaxed);
+                let due = screen::with(|s| {
+                    let due = now.saturating_sub(s.status.last_status_tick_ms) >= 250;
+                    if due {
+                        s.status.last_status_tick_ms = now;
+                    }
+                    due
+                });
+                if due {
                     render_footer();
                 }
             }
@@ -3489,21 +3261,26 @@ pub fn set_agent_running(running: bool) {
     if running {
         INTERRUPT_KIND_VAL.store(0, Ordering::Relaxed);
         if !was {
-            WORK_STARTED_MS.store(now_ms(), Ordering::Relaxed);
+            let now = now_ms();
+            screen::with(|s| s.status.work_started_ms = now);
             STREAM_CHARS.store(0, Ordering::Relaxed);
             taskbar_progress(true);
         }
         start_typeahead_thread();
     } else if was {
         taskbar_progress(false);
-        let started = WORK_STARTED_MS.load(Ordering::Relaxed);
-        let elapsed = now_ms().saturating_sub(started);
+        let now = now_ms();
         // A turn long enough to have walked away from, and not a burst of
         // nested start/stop pairs (sub-agents) re-announcing the same turn.
-        if elapsed >= 8_000
-            && now_ms().saturating_sub(LAST_NOTIFY_MS.load(Ordering::Relaxed)) > 5_000
-        {
-            LAST_NOTIFY_MS.store(now_ms(), Ordering::Relaxed);
+        let announce = screen::with(|s| {
+            let elapsed = now.saturating_sub(s.status.work_started_ms);
+            let due = elapsed >= 8_000 && now.saturating_sub(s.status.last_notify_ms) > 5_000;
+            if due {
+                s.status.last_notify_ms = now;
+            }
+            due.then_some(elapsed)
+        });
+        if let Some(elapsed) = announce {
             let secs = elapsed / 1000;
             let took = if secs >= 60 {
                 format!("{}m {:02}s", secs / 60, secs % 60)
@@ -3526,9 +3303,7 @@ pub fn is_agent_running() -> bool {
 pub fn trigger_interrupt(kind: InterruptKind) {
     INTERRUPT_KIND_VAL.store(kind as u8, Ordering::Relaxed);
     if kind == InterruptKind::CtrlC {
-        if let Ok(mut mq) = message_queue().lock() {
-            mq.clear();
-        }
+        screen::with(|s| s.composer.queue.clear());
     }
 }
 
@@ -4016,7 +3791,7 @@ mod picker_tests {
         assert!(esc_esc_rewinds(Some(5_000), 5_900));
         assert!(!esc_esc_rewinds(Some(5_000), 6_001));
         prefill_composer("fix it\r\nplease");
-        let draft = task_draft().lock().unwrap().take().unwrap();
+        let draft = screen::with(|s| s.composer.draft.take()).unwrap();
         assert_eq!(draft.buf.iter().collect::<String>(), "fix it\nplease");
         assert_eq!(draft.cursor, draft.buf.len());
         assert!(draft.lines.is_empty());
@@ -4417,21 +4192,18 @@ pub fn ask_key(prompt: &str, keys: &[char]) -> Option<char> {
 /// line breaks kept (/rewind hands back the prompt it went back to).
 pub fn prefill_composer(text: &str) {
     let buf: Vec<char> = clean_paste(text).chars().collect();
-    if let Ok(mut draft) = task_draft().lock() {
-        *draft = Some(TaskDraft {
-            lines: Vec::new(),
-            cursor: buf.len(),
-            buf,
-        });
-    }
+    let draft = TaskDraft {
+        lines: Vec::new(),
+        cursor: buf.len(),
+        buf,
+    };
+    screen::with(|s| s.composer.draft = Some(draft));
 }
 
 /// Sends `text` as the next input, as if typed and submitted: a `/command`
 /// typed at a key question runs once the question has closed.
 pub fn queue_message(text: &str) {
-    if let Ok(mut mq) = message_queue().lock() {
-        mq.push(text.to_string());
-    }
+    screen::with(|s| s.composer.queue.push(text.to_string()));
 }
 
 // ── secret ask ───────────────────────────────────────────────────────────────
@@ -4478,7 +4250,7 @@ pub fn ask_secret(prompt: &str) -> Option<String> {
     );
     let shown = answer.as_deref().map(secret_echo).unwrap_or_default();
     if alt {
-        SCROLL_OFFSET.store(0, Ordering::Relaxed);
+        screen::with(|s| s.transcript.scroll_offset = 0);
         clear_composer();
         line(&format!("{prompt}{shown}"));
     } else {
@@ -4555,19 +4327,14 @@ struct TaskDraft {
     cursor: usize,
 }
 
-fn task_draft() -> &'static Mutex<Option<TaskDraft>> {
-    static DRAFT: std::sync::OnceLock<Mutex<Option<TaskDraft>>> = std::sync::OnceLock::new();
-    DRAFT.get_or_init(|| Mutex::new(None))
-}
-
 pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     let prompt = &*sanitize_prompt(prompt);
-    // Take the message out inside a tight block: echo_submitted → line →
-    // render_output re-locks the queue, and std Mutex is not reentrant.
-    let queued = message_queue()
-        .lock()
-        .ok()
-        .and_then(|mut mq| (!mq.is_empty()).then(|| mq.remove(0)));
+    // Take the message out first: echo_submitted → line → render_output
+    // takes the screen lock again, and std Mutex is not reentrant.
+    let queued = screen::with(|s| {
+        let mq = &mut s.composer.queue;
+        (!mq.is_empty()).then(|| mq.remove(0))
+    });
     if let Some(msg) = queued {
         push_history(&msg);
         echo_submitted(prompt, &msg);
@@ -4578,18 +4345,14 @@ pub fn ask_task(prompt: &str) -> Option<InputEvent> {
     }
     // A mode change must preserve both the current line/cursor and any
     // completed continuation lines. Keep this separate from queued messages.
-    let mut draft = task_draft()
-        .lock()
-        .ok()
-        .and_then(|mut d| d.take())
-        .unwrap_or_else(|| {
-            let (buf, cursor) = take_typeahead();
-            TaskDraft {
-                buf,
-                cursor,
-                ..TaskDraft::default()
-            }
-        });
+    let mut draft = screen::with(|s| s.composer.draft.take()).unwrap_or_else(|| {
+        let (buf, cursor) = take_typeahead();
+        TaskDraft {
+            buf,
+            cursor,
+            ..TaskDraft::default()
+        }
+    });
     let mut p = if draft.lines.is_empty() {
         prompt.to_string()
     } else {
@@ -4607,9 +4370,7 @@ pub fn ask_task(prompt: &str) -> Option<InputEvent> {
             RawLine::CycleMode(buf, cursor) => {
                 draft.buf = buf;
                 draft.cursor = cursor;
-                if let Ok(mut saved) = task_draft().lock() {
-                    *saved = Some(draft);
-                }
+                screen::with(|s| s.composer.draft = Some(draft));
                 return Some(InputEvent::CycleMode);
             }
             // A continued message is not left half-sent for /rewind.
@@ -4632,17 +4393,30 @@ fn push_history(s: &str) {
     if s.trim().is_empty() {
         return;
     }
-    if let Ok(mut h) = history().lock() {
-        if h.last().map(String::as_str) != Some(s) {
+    let changed = with_history(|h| {
+        let new = h.last().map(String::as_str) != Some(s);
+        if new {
             h.push(s.to_string());
-            crate::config::save_history(&h);
         }
+        new.then(|| h.clone())
+    });
+    // Written with the lock released: a slow disk must not hold up a frame.
+    if let Some(h) = changed {
+        crate::config::save_history(&h);
     }
 }
 
-fn history() -> &'static std::sync::Mutex<Vec<String>> {
-    static H: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(crate::config::load_history()))
+// Run `f` on the message history, reading it from disk on first use. The
+// read happens outside the screen lock; `f` runs under it and must not call
+// back into the screen.
+fn with_history<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
+    if !screen::with(|s| s.composer.history.is_some()) {
+        let loaded = crate::config::load_history();
+        screen::with(|s| {
+            s.composer.history.get_or_insert(loaded);
+        });
+    }
+    screen::with(|s| f(s.composer.history.get_or_insert_with(Vec::new)))
 }
 
 mod editor;

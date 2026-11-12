@@ -1170,7 +1170,7 @@ pub(super) fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) 
                 buf.truncate(i);
             }
             KeyCode::Up | KeyCode::Down if composer => {
-                let entry = history().lock().ok().map(|h| {
+                let entry = with_history(|h| {
                     let next = match (ev.code, hist_idx) {
                         (KeyCode::Up, None) => h.len().checked_sub(1),
                         (KeyCode::Up, Some(i)) => Some(i.saturating_sub(1)),
@@ -1180,11 +1180,9 @@ pub(super) fn read_line_plain(prompt: &str, prefill: Vec<char>, composer: bool) 
                     hist_idx = next;
                     next.map(|i| h[i].clone()).unwrap_or_default()
                 });
-                if let Some(entry) = entry {
-                    erase(&mut out, &buf);
-                    buf = clean_paste(&entry).chars().collect();
-                    let _ = write!(out, "{}", composer_glyphs(&buf));
-                }
+                erase(&mut out, &buf);
+                buf = clean_paste(&entry).chars().collect();
+                let _ = write!(out, "{}", composer_glyphs(&buf));
             }
             KeyCode::Char(c) if !ctrl && !ev.modifiers.contains(KeyModifiers::ALT) => {
                 buf.push(c);
@@ -1428,10 +1426,7 @@ fn reverse_search(buf: &mut Vec<char>, cursor: &mut usize, row: u16) -> Option<S
     let mut query = String::new();
     let mut skip = 0usize;
     loop {
-        let m = {
-            let h = history().lock();
-            h.ok().and_then(|h| history_search(&h, &query, skip))
-        };
+        let m = with_history(|h| history_search(h, &query, skip));
         {
             let mut out = io::stdout();
             if ALT_SCREEN.load(Ordering::Relaxed) {
@@ -1548,7 +1543,7 @@ pub(super) fn read_line_raw_prefill(
     };
     let mut vim_undo_stack: Vec<Vec<char>> = vec![buf.clone()];
     if is_vim_mode() {
-        VIM_STATE_VAL.store(0, Ordering::Relaxed);
+        set_vim_state(0);
     }
     // Cursor: visible again (the working spinner hides it), shaped for the
     // editing mode — accent bar for insert, block for vim NORMAL.
@@ -1715,11 +1710,11 @@ pub(super) fn read_line_raw_prefill(
                 continue;
             }
             Ok(Event::FocusGained) => {
-                FOCUSED.store(true, Ordering::Relaxed);
+                set_focused(true);
                 continue;
             }
             Ok(Event::FocusLost) => {
-                FOCUSED.store(false, Ordering::Relaxed);
+                set_focused(false);
                 continue;
             }
             Ok(_) => continue,
@@ -1992,9 +1987,7 @@ pub(super) fn read_line_raw_prefill(
                     };
                     continue; // loop top re-renders the popup
                 }
-                if let Ok(h) = history().lock() {
-                    recall.up(&h, &mut buf, &mut cursor);
-                }
+                with_history(|h| recall.up(h, &mut buf, &mut cursor));
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Down => {
@@ -2002,9 +1995,7 @@ pub(super) fn read_line_raw_prefill(
                     sug_idx = (sug_idx + 1) % sug.len();
                     continue; // loop top re-renders the popup
                 }
-                if let Ok(h) = history().lock() {
-                    recall.down(&h, &mut buf, &mut cursor);
-                }
+                with_history(|h| recall.down(h, &mut buf, &mut cursor));
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             KeyCode::Enter => {
@@ -2110,7 +2101,7 @@ pub(super) fn read_line_raw_prefill(
                 VimState::Insert => 1,
                 VimState::Visual(_) => 2,
             };
-            VIM_STATE_VAL.store(val, Ordering::Relaxed);
+            set_vim_state(val);
         }
         // Cursor shape tracks the editing mode: accent bar for insert,
         // steady block for vim NORMAL, underline for VISUAL.
