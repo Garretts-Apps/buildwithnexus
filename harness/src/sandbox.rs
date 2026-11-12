@@ -225,7 +225,7 @@ fn bwrap_argv(
     let roots: Vec<&Path> = std::iter::once(cwd)
         .chain(extra.iter().map(PathBuf::as_path))
         .collect();
-    let protected: Vec<(String, bool)> = roots
+    let mut protected: Vec<(String, bool)> = roots
         .iter()
         .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
         .filter(|_| protect)
@@ -234,6 +234,15 @@ fn bwrap_argv(
             (p.to_string_lossy().into_owned(), exists)
         })
         .collect();
+    if protect {
+        for r in &roots {
+            protected.extend(
+                nested_git_entries(r)
+                    .into_iter()
+                    .map(|p| (p.to_string_lossy().into_owned(), true)),
+            );
+        }
+    }
     let cwd = cwd.to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["--unshare-all".into()];
     if network {
@@ -285,6 +294,58 @@ fn bwrap_argv(
 
 /// Workspace entries a sandboxed command may read but never write.
 const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
+
+// How far the search for nested repositories goes: at most this many
+// folders read, and this many `.git` entries kept, per root. Every sandboxed
+// command pays for the search, so it is bounded; it runs breadth-first, so
+// shallow repositories are found before the budget is spent.
+const NESTED_GIT_MAX: usize = 64;
+const NESTED_GIT_DIRS: usize = 10_000;
+
+/// The `.git` entries (folders, or a submodule's `.git` file) of
+/// repositories nested inside `root`, besides its own. A command that could
+/// write one could plant a hook or a `core.fsmonitor` that runs, unsandboxed,
+/// the next time anyone uses git in that folder; so they are kept read-only
+/// like the top-level `.git`. Only entries that exist now are found: a
+/// sandboxed `git clone` into the workspace still works. Symlinks are never
+/// followed, and `node_modules` and `target` (dependency and build output)
+/// are not searched.
+pub fn nested_git_entries(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut read = 0;
+    while let Some(dir) = queue.pop_front() {
+        if read >= NESTED_GIT_DIRS {
+            break;
+        }
+        read += 1;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(t) = e.file_type() else {
+                continue;
+            };
+            if t.is_symlink() {
+                continue;
+            }
+            let name = e.file_name();
+            if name == ".git" {
+                if dir != root {
+                    found.push(e.path());
+                    if found.len() >= NESTED_GIT_MAX {
+                        return found;
+                    }
+                }
+                continue; // a repository's own store holds no repositories
+            }
+            if t.is_dir() && name != "node_modules" && name != "target" {
+                queue.push_back(e.path());
+            }
+        }
+    }
+    found
+}
 
 /// Environment a sandboxed child never inherits: session buses and agent
 /// sockets reach outside the sandbox, and provider keys and other credentials
@@ -487,6 +548,9 @@ pub fn seatbelt_profile(
     for root in &roots {
         for d in PROTECTED_IN_WORKSPACE {
             p.push_str(&format!("\n  (subpath {})", sbpl_quote(&root.join(d))));
+        }
+        for nested in nested_git_entries(root) {
+            p.push_str(&format!("\n  (subpath {})", sbpl_quote(&nested)));
         }
     }
     p.push_str(")\n(deny appleevent-send)\n");
@@ -708,6 +772,44 @@ mod tests {
             deny.contains("(subpath \"/srv/data/.buildwithnexus\")"),
             "{p}"
         );
+    }
+
+    #[test]
+    fn nested_repositories_stay_read_only_too() {
+        let ws = std::env::temp_dir().join(format!("bwn-sandbox-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        for d in [
+            ".git/modules/x",
+            "vendor/lib/.git/hooks",
+            "a/b/c/.git",
+            "node_modules/dep/.git",
+            "target/x/.git",
+        ] {
+            std::fs::create_dir_all(ws.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::write(ws.join("sub/.git"), "gitdir: ../.git/modules/x\n").unwrap();
+        let mut found = nested_git_entries(&ws);
+        found.sort();
+        let want: Vec<PathBuf> = ["a/b/c/.git", "sub/.git", "vendor/lib/.git"]
+            .iter()
+            .map(|p| ws.join(p))
+            .collect();
+        assert_eq!(found, want);
+        let s = bwrap_args("true", &ws, false).join(" ");
+        let rw = s
+            .find(&format!("--bind {w} {w} ", w = ws.display()))
+            .unwrap();
+        for p in &want {
+            let bind = format!("--ro-bind {p} {p}", p = p.display());
+            assert!(s.find(&bind).is_some_and(|at| at > rw), "{bind}: {s}");
+        }
+        let profile = seatbelt_profile(&ws, &[], None, true);
+        let deny = profile.split_once("(deny file-write*\n").unwrap().1;
+        for p in &want {
+            assert!(deny.contains(&sbpl_quote(p)), "{p:?}: {profile}");
+        }
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]
