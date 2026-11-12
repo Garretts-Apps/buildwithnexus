@@ -415,6 +415,35 @@ pub(super) fn paint(c: Col, s: &str) -> String {
     format!("\x1b[{}m{s}{}", sgr_fg(c), reset_fg())
 }
 
+/// What `paint` wraps text in, per colour role, for a caller that paints
+/// many spans (the code highlighter): looked up once, not once per span.
+/// All empty when colour is off.
+#[derive(Default)]
+pub(crate) struct SpanPaint {
+    pub accent: String,
+    pub info: String,
+    pub success: String,
+    pub warning: String,
+    pub muted: String,
+    pub reset: String,
+}
+
+pub(crate) fn span_paint() -> SpanPaint {
+    if no_color() {
+        return SpanPaint::default();
+    }
+    let p = pal();
+    let on = |c: Col| format!("\x1b[{}m", sgr_fg(c));
+    SpanPaint {
+        accent: on(p.accent),
+        info: on(p.info),
+        success: on(p.success),
+        warning: on(p.warning),
+        muted: on(p.muted),
+        reset: reset_fg(),
+    }
+}
+
 pub(super) fn attr(code: &str, s: &str) -> String {
     if no_color() {
         return s.to_string();

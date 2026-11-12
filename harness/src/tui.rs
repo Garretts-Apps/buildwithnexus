@@ -330,12 +330,12 @@ pub fn mouse_capture_enabled() -> bool {
 }
 
 mod theme;
-pub(crate) use theme::no_color;
 use theme::*;
 pub use theme::{
     accent, blue, bold, cyan, dim, green, init_console, italic, line_mode, mode_badge, red, rule,
     set_line_mode, set_theme, text, theme_name, underline, yellow, THEME_NAMES,
 };
+pub(crate) use theme::{no_color, span_paint, SpanPaint};
 
 // ── diff paint helpers ───────────────────────────────────────────────────────
 // Used by report's diff renderer: background-tinted spans in the GitHub /
