@@ -4,6 +4,89 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-11-12
+
+Bounds on what a runaway command, file or MCP server can do to a session,
+two safer defaults, and a release pipeline that runs every binary before it
+ships. Two defaults change; both are under *Changed*.
+
+### Changed
+- **MCP servers no longer inherit credentials.** A stdio MCP server now gets
+  the environment commands get: variables ending in `_API_KEY`, `_TOKEN`,
+  `_SECRET`, `_PASSWORD` and the like, and every `AWS_*`, are removed. A
+  server that needs one gets it from its own `env` entry
+  (`"env": { "GITHUB_TOKEN": "…" }`), or from `shell_env_passthrough`.
+- **`auto` mode asks before fetching local and private addresses.**
+  `fetch_url`, `webfetch` and `headless_browser` ask before reaching
+  `localhost`, a loopback, private (RFC 1918), CGNAT or IPv6 unique-local
+  address, or a name that resolves to one, so a page the agent reads cannot
+  steer it at a service on your machine or network. Headless runs refuse
+  with a hint. `network.allow`, an allow rule, a saved answer or `"fetch *"`
+  lets the host through as before.
+- Markdown links the model writes are clickable only for `http`, `https` and
+  `mailto`; bwn's own file links are unchanged.
+
+### Fixed
+- **A command that floods its output no longer grows memory.** `run_command`
+  and `check_work` kept every byte until the command ended, so `yes` ran the
+  session out of memory. Each stream now keeps its first and last 16 KB while
+  it runs, which is what the model saw anyway.
+- **A timeout kills everything the command started.** Only the shell was
+  killed, so `npm test` or `make` children kept running and changing files
+  after "timed out". The whole process group (Linux, macOS) or process tree
+  (Windows) is killed now.
+- **Commands that prompt on the terminal fail at once.** Commands run with no
+  controlling terminal, so `sudo` or an `ssh` password prompt says "no tty"
+  instead of reading keys meant for bwn.
+- **`python_tool` with a large input could hang forever.** Its input is
+  written on a thread now, so the timeout and Ctrl+C still work when the
+  script does not read it.
+- **Huge and special files.** `read_file`, `read_many_files` and the edit
+  tools refuse FIFOs, sockets and devices, which never end. A file over
+  64 MB is read up to 64 MB and says so; editing one is refused.
+- **MCP stdio servers.** A line over 8 MB is a transport error instead of
+  unbounded memory, and bytes that are not UTF-8 are decoded instead of
+  silently ending the connection (after which every call timed out).
+- **`bwn acp` keeps serving after bad input.** A line that is not UTF-8 ended
+  the server as if the editor had closed it; it now gets a JSON-RPC parse
+  error.
+- **A failed session save says so.** Saves that failed (disk full, read-only
+  home) were silent, and Ctrl+C still said "session saved". bwn now shows
+  "session not saved: …" once, and does not claim a save that failed.
+- Copying to the clipboard no longer leaves a zombie process per copy on
+  macOS and WSL.
+- `remove_path` on a symlink to a folder removes the link, not refuses it.
+- Settings, session and other saves are flushed to disk before they replace
+  the old file, so a power cut cannot leave an empty file.
+- An update check accepts only a plain `MAJOR.MINOR.PATCH` version from the
+  registry.
+
+### Security
+- Link-local and cloud-metadata addresses are also refused when written as
+  IPv4-compatible (`::169.254.169.254`) or NAT64 (`64:ff9b::/96`) addresses.
+- With the sandbox on, the `.git` of repositories nested in the workspace
+  (submodules, vendored repos) is read-only too, so a sandboxed command
+  cannot plant hooks that run later outside it.
+- npm launcher: a `checksums.json` without this platform's asset refuses to
+  download instead of trusting the release's own `.sha256`; concurrent first
+  runs no longer share a temp file; musl, an old glibc and platforms with no
+  prebuilt binary are explained before anything is downloaded.
+
+### npm launcher
+- SIGTERM and SIGHUP sent to `bwn` reach the binary, and a binary killed by a
+  signal makes the launcher exit the same way, so a CI timeout or a closed
+  terminal no longer leaves the agent running.
+
+### Release pipeline
+- Every release binary is started on the machine that built it, and must
+  print the version being released, before anything is published. The
+  macOS and Windows binaries were never run before this.
+- A pushed tag must match `package.json` and be on `main`; a manual release
+  of a version that is already tagged rebuilds nothing and only retries
+  crates.io; `publish.yml` can be dispatched only from `main`.
+- CI also checks the `bwn` crate, Rust 1.94 (the declared `rust-version`)
+  and the launcher on Node 18 and 20.
+
 ## [0.17.0] - 2026-11-06
 
 Fixes for Windows home folders, symlink loops, editor integrations and a
@@ -1307,7 +1390,8 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.18.0
 [0.17.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.17.0
 [0.15.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.15.0
 [0.14.10]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.14.10

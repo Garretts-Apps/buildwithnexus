@@ -585,7 +585,13 @@ Network tools (`fetch_url`, `web_search`, `headless_browser`,
 `auto`, `readonly` included, since a fetch or a search query can carry data
 out or reach services on your network. `web_search` sends its query to
 `lite.duckduckgo.com`. `s` / `a` allow that host; an `allowed_commands` entry
-`"fetch *"` allows every host.
+`"fetch *"` allows every host. In `auto` mode, `fetch_url`, `webfetch` and
+`headless_browser` still ask before reaching `localhost`, a loopback,
+private (`10/8`, `172.16/12`, `192.168/16`), CGNAT or IPv6 unique-local
+address, or a name that resolves to one, so a page the agent reads cannot
+send it to a service on your machine or network; a headless run refuses
+instead. `network.allow`, an allow rule, a saved answer or `"fetch *"` lets
+such a host through.
 
 Commands the agent runs (including `check_work` and `start_server`, sandboxed
 or not) do not inherit credentials. These variables are removed from their
@@ -594,7 +600,13 @@ environment: names ending in `_API_KEY`, `_API_TOKEN`, `_TOKEN`, `_SECRET`,
 every `AWS_*` variable (`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, ...), and
 the presets' key variables such as `HF_TOKEN`. List any your build needs in
 `"shell_env_passthrough": ["GITHUB_TOKEN", "AWS_PROFILE"]`. Hooks are your own
-and keep their environment.
+and keep their environment. MCP servers started over stdio get the same
+scrubbed environment; give a server the token it needs in its own `env`
+entry (`"env": { "GITHUB_TOKEN": "…" }`) or name it in `shell_env_passthrough`.
+
+A command that times out or is interrupted is killed together with
+everything it started, and commands run without a terminal of their own, so
+`sudo` or an `ssh` password prompt fails at once instead of waiting.
 
 ### More folders
 
@@ -1046,7 +1058,7 @@ client. Configure servers under `mcp_servers` in `~/.buildwithnexus/settings.jso
 | Key | Meaning |
 |---|---|
 | `type` | `"stdio"` or `"http"` (Streamable HTTP). Optional: a `url` means http, a `command` means stdio. |
-| `command`, `args`, `env` | stdio: the process to spawn, kept alive for the whole session; stderr is captured for diagnostics. |
+| `command`, `args`, `env` | stdio: the process to spawn, kept alive for the whole session; stderr is captured for diagnostics. It does not inherit credential variables (see *Permissions*); `env` sets the ones it needs. |
 | `url`, `headers` | http: the endpoint and extra request headers (a static token goes here). `Mcp-Session-Id` is tracked automatically. |
 | `oauth` | http: a client registered ahead of time, for a server whose authorization server has no dynamic registration: `client_id`, optional `client_secret`, `scopes`, and `callback_port` when the redirect URI must be exact. |
 | `timeout_secs` | Per-request deadline (default `30`). A server that hangs or exits is reported once and its tools drop out for the session. |
