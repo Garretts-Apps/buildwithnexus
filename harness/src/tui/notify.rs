@@ -36,7 +36,7 @@ pub fn notify(title: &str, body: &str) {
     if !ALT_SCREEN.load(Ordering::Relaxed) || !io::stdout().is_terminal() {
         return;
     }
-    match NOTIFY_MODE.load(Ordering::Relaxed) {
+    match screen::with(|s| s.flags.notify_mode) {
         0 => return,
         1 if is_focused() => return,
         _ => {}
