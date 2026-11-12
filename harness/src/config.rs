@@ -3251,7 +3251,18 @@ pub(crate) fn atomic_write(
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     name.push(format!(".bwn-tmp-{}-{seq}", std::process::id()));
     let tmp = path.with_file_name(name);
-    fs::write(&tmp, contents)?;
+    // Flushed to disk before the rename: otherwise a power loss soon after
+    // can leave the new name pointing at an empty or partial file on file
+    // systems that commit the rename first (ext4 without auto_da_alloc, XFS),
+    // which is the very truncation this function exists to prevent.
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        std::io::Write::write_all(&mut f, contents)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     let set = match perm {
         Perm::Default => Ok(()),
         Perm::KeepExisting => {
