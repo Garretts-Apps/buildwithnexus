@@ -806,7 +806,10 @@ test('first run: a failed download says why and how proxies work, not "no termin
   const port = await proxyFixture.closedPort();
   const cases = [
     [['version'], {}, /connect ECONNREFUSED 140/,
-      /If this network needs a proxy, set HTTPS_PROXY to its http:\/\/ URL[\s\S]*HTTPS_PROXY=http:\/\/<proxy>:<port> bwn --bootstrap/],
+      // The retry line is in the user's own shell: PowerShell on Windows.
+      WIN
+        ? /If this network needs a proxy, set HTTPS_PROXY to its http:\/\/ URL[\s\S]*\$env:HTTPS_PROXY = 'http:\/\/<proxy>:<port>'; bwn --bootstrap/
+        : /If this network needs a proxy, set HTTPS_PROXY to its http:\/\/ URL[\s\S]*HTTPS_PROXY=http:\/\/<proxy>:<port> bwn --bootstrap/],
     // The launcher's own tunnel: the error names the proxy it could not reach.
     [['--bootstrap', '--version'], { BWN_ALLOW_BOOTSTRAP: undefined, HTTPS_PROXY: `http://127.0.0.1:${port}` },
       new RegExp(`proxy 127\\.0\\.0\\.1:${port} \\(HTTPS_PROXY\\): connect ECONNREFUSED`),
