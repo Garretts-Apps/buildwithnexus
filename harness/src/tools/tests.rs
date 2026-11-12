@@ -3818,3 +3818,19 @@ fn private_addresses_are_told_from_public_ones() {
     assert!(!private_network_host("8.8.8.8:443"));
     assert!(!private_network_host("?"));
 }
+
+#[cfg(unix)]
+#[test]
+fn remove_path_removes_a_symlink_to_a_directory_not_the_directory() {
+    let d = tempdir();
+    fs::create_dir_all(d.join("real")).unwrap();
+    fs::write(d.join("real/keep.txt"), "kept").unwrap();
+    std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+    let out = run("remove_path", &json!({"path": "link"}), &d);
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        fs::symlink_metadata(d.join("link")).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(fs::read_to_string(d.join("real/keep.txt")).unwrap(), "kept");
+}

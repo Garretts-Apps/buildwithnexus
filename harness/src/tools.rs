@@ -5343,10 +5343,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let p = resolve(cwd, p_str);
             checkpoint::record(cwd, &p, "remove_path");
-            let res = if p.is_dir() {
-                fs::remove_dir(&p)
-            } else {
-                fs::remove_file(&p)
+            // The entry itself decides, not what it points at: a symlink to
+            // a directory is a link to remove, where is_dir() (which follows
+            // it) sent it to remove_dir and failed. Windows keeps a link to a
+            // directory as a directory entry that only remove_dir deletes;
+            // either way the target is never touched.
+            let res = match fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => fs::remove_dir(&p),
+                Ok(m) if cfg!(windows) && m.file_type().is_symlink() && p.is_dir() => {
+                    fs::remove_dir(&p)
+                }
+                _ => fs::remove_file(&p),
             };
             match res {
                 Ok(_) => ok(format!("removed {}", p.display())),
