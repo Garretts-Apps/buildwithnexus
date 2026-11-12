@@ -6177,6 +6177,7 @@ fn run_artifact(input: &Value, cwd: &Path) -> Outcome {
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
 mod net_guard;
 use net_guard::*;
+pub use net_guard::{blocked_url, private_network_host};
 
 mod table;
 pub use net_guard::{blocked_url, private_network_host};
