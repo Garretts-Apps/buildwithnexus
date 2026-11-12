@@ -9040,6 +9040,21 @@ fn acp_invalid_requests_get_json_rpc_errors_and_the_server_keeps_serving() {
     assert_eq!(r["error"]["code"], -32700, "{r}");
     assert!(r["id"].is_null(), "{r}");
 
+    // Bytes that are not UTF-8 are a parse error too, not the end of input.
+    {
+        let stdin = acp.stdin.as_mut().expect("stdin open");
+        stdin
+            .write_all(b"{\"jsonrpc\": \"2.0\", \xff\xfe}\n")
+            .unwrap();
+        stdin.flush().unwrap();
+    }
+    let r = acp.recv();
+    assert_eq!(r["error"]["code"], -32700, "{r}");
+    assert!(
+        r["error"]["message"].as_str().unwrap().contains("UTF-8"),
+        "{r}"
+    );
+
     acp.send(json!({"jsonrpc": "2.0", "id": 41, "params": {}}));
     let r = acp.recv();
     assert_eq!(r["error"]["code"], -32600, "{r}");
