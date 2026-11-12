@@ -229,6 +229,10 @@ class TerminalHarness(unittest.TestCase):
         """Command-line arguments after the binary."""
         return []
 
+    def wrapper(self):
+        """A command to run the binary under (strace), as a list."""
+        return []
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="bwn-terminal-test-")
         self.root = Path(self.temp.name)
@@ -263,7 +267,7 @@ class TerminalHarness(unittest.TestCase):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
         self.proc = subprocess.Popen(
-            [BINARY, *self.args()], stdin=slave, stdout=slave, stderr=slave,
+            [*self.wrapper(), BINARY, *self.args()], stdin=slave, stdout=slave, stderr=slave,
             cwd=self.root, start_new_session=True, env=self.env,
         )
         os.close(slave)
@@ -623,6 +627,97 @@ class InteractiveSmokeTests(TerminalHarness):
         os.kill(self.proc.pid, signal.SIGTERM)
         self.assertEqual(self.wait_exit(), 128 + signal.SIGTERM)
         self.assertIn(self.RESTORE, bytes(self.output[quit_from:]))
+
+
+def cpu_seconds(pid):
+    """User plus system CPU time a process has used so far."""
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+@unittest.skipIf(not sys.platform.startswith("linux"), "reads /proc")
+class TerminalGoneTests(TerminalHarness):
+    """The terminal goes away with no SIGHUP delivered (the pty is not the
+    session's controlling terminal here): reads return end-of-input for
+    ever. The TUI must exit as SIGHUP would have, not spin on them."""
+
+    def prepare(self):
+        # Never answers: the agent is still working when the terminal goes.
+        self.model = ChatModel(lambda messages: threading.Event().wait(600) or ("text", ""))
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def hang_up(self):
+        before = cpu_seconds(self.proc.pid)
+        os.close(self.master)
+        self.master = os.open(os.devnull, os.O_RDWR)  # stop() closes it
+        deadline = time.monotonic() + 5
+        used = before
+        while time.monotonic() < deadline and self.proc.poll() is None:
+            try:
+                used = cpu_seconds(self.proc.pid)
+            except (OSError, IndexError):
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(self.proc.poll(), "exits once the terminal is gone")
+        self.assertEqual(self.proc.returncode, 128 + signal.SIGHUP)
+        self.assertLess(used - before, 0.5, "did not spin on the dead terminal")
+
+    def test_hangup_at_the_composer_exits(self):
+        self.hang_up()
+
+    def test_hangup_while_the_agent_works_exits(self):
+        self.send("hello\r")
+        self.wait_for(lambda: self.model.requests, "the request", timeout=15)
+        self.hang_up()
+
+
+def strace_works():
+    try:
+        return subprocess.run(["strace", "-o", os.devnull, "true"],
+                              capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and strace_works(), "needs strace")
+class TerminalSizeCacheTests(TerminalHarness):
+    """Asking the terminal for its size opens /dev/tty. Typing must not:
+    the size is read when the TUI starts and when the terminal resizes."""
+
+    def wrapper(self):
+        self.trace = self.root / "trace"
+        return ["strace", "-f", "-e", "trace=openat", "-o", str(self.trace)]
+
+    def tty_opens(self):
+        return self.trace.read_text(errors="replace").count('"/dev/tty"')
+
+    def test_typing_does_not_ask_the_terminal_for_its_size(self):
+        self.pump(0.5)
+        self.assertGreater(self.tty_opens(), 0, "the size is read at start-up")
+        before = self.tty_opens()
+        for ch in "thirty characters typed slowly":
+            self.send(ch)
+        self.pump(0.3)
+        self.assertEqual(self.tty_opens() - before, 0)
+
+
+class ResizeTests(TerminalHarness):
+    """A resize is the one time the cached size changes: the next frame is
+    laid out for the new width."""
+
+    def test_a_resize_repaints_at_the_new_width(self):
+        wide = ("╭" + "─" * 118 + "╮").encode()
+        self.assertNotIn(wide, self.output)
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        os.kill(self.proc.pid, signal.SIGWINCH)  # no controlling terminal sends it here
+        self.wait_for(lambda: wide in self.output, "the composer box at 120 columns")
+        self.send("x")
+        self.assertIn(b"\x1b[38;1H", self.output, "the input row is row 38 of 40")
 
 
 class GitAttachmentTests(TerminalHarness):

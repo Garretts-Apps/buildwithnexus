@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::event::{
-    poll, read, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
-    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEventKind,
+    poll, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -519,6 +519,102 @@ pub fn input_closed() -> bool {
     INPUT_CLOSED.load(Ordering::Relaxed)
 }
 
+// Every keyboard read goes through here: a resize event carries the new
+// size, which is the only time the cached size changes while the TUI runs.
+fn read() -> io::Result<Event> {
+    let ev = crossterm::event::read()?;
+    if let Event::Resize(w, h) = ev {
+        store_term_size(w, h);
+    }
+    Ok(ev)
+}
+
+// ── terminal gone ────────────────────────────────────────────────────────────
+// When the terminal goes away and no SIGHUP reaches the process (it is not
+// the terminal's session leader, or the signal went elsewhere), every read
+// of the keyboard returns end-of-input at once, for ever, and crossterm's
+// reader loops on that without returning (a pinned core, and no `Err` for
+// the callers that set INPUT_CLOSED). A watcher thread therefore sleeps in
+// poll(2) on stdin asking for no events — a hangup is reported regardless —
+// and ends the process the way SIGHUP would have: terminal restored, status
+// 129. It never wakes otherwise.
+#[cfg(unix)]
+static STDIN_IS_TTY: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
+static HANGUP_WATCHED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn watch_for_hangup() {
+    STDIN_IS_TTY.store(io::stdin().is_terminal(), Ordering::Relaxed);
+    if !STDIN_IS_TTY.load(Ordering::Relaxed) || HANGUP_WATCHED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = thread::Builder::new()
+        .name("hangup".into())
+        .stack_size(64 * 1024)
+        .spawn(|| {
+            loop {
+                let mut fd = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: 0,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd; blocks until the terminal hangs up.
+                let n = unsafe { libc::poll(&mut fd, 1, -1) };
+                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if n < 0 || !RAW.load(Ordering::Relaxed) {
+                    // The TUI has let go of the terminal (leaving, or a
+                    // child process has it): plain reads see the end of
+                    // input. The next `enter_alt` starts a new watch.
+                    break;
+                }
+                exit_if_terminal_gone();
+                // Woken without a hangup: not expected; do not spin on it.
+                thread::sleep(Duration::from_millis(250));
+            }
+            HANGUP_WATCHED.store(false, Ordering::Relaxed);
+        });
+    if spawned.is_err() {
+        HANGUP_WATCHED.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(unix))]
+fn watch_for_hangup() {}
+
+/// Whether the terminal on stdin has hung up. A poll with no wait: no lock,
+/// no allocation, so the panic hook may call it.
+#[cfg(unix)]
+fn terminal_hung_up() -> bool {
+    if !STDIN_IS_TTY.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, zero timeout.
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    n > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+}
+
+/// Exit status when the terminal is gone: the one SIGHUP gives (128 + 1).
+#[cfg(unix)]
+const TERMINAL_GONE_STATUS: i32 = 128 + libc::SIGHUP;
+
+// The terminal is gone: put it back as far as that still means anything and
+// exit as SIGHUP would have. Never returns on Unix.
+#[cfg(unix)]
+fn exit_if_terminal_gone() {
+    if terminal_hung_up() {
+        INPUT_CLOSED.store(true, Ordering::Relaxed);
+        signal_restore::restore_and_exit(TERMINAL_GONE_STATUS);
+    }
+}
+
 // Returns whether any event was read. The typeahead thread and the main
 // thread (via interrupted()) both drain; one at a time, so typed keys can't
 // be applied out of order. A busy drain means the other side has the events,
@@ -957,9 +1053,45 @@ fn take_typeahead() -> (Vec<char>, usize) {
     screen::with(|s| s.composer.take_typeahead())
 }
 
-fn term_size() -> (u16, u16) {
+// ── terminal size ────────────────────────────────────────────────────────────
+// Asking the terminal for its size is an open of /dev/tty, an ioctl and a
+// close, and one keystroke asks about ten times. The size is therefore kept
+// in two atomics while the TUI owns the keyboard (raw mode): read once when
+// it takes the screen, and again only when a resize event arrives (`read`)
+// — the event is how SIGWINCH reaches us. Outside raw mode nothing reads
+// events, so every call asks afresh, as before. 0 = not known.
+static TERM_W: AtomicU16 = AtomicU16::new(0);
+static TERM_H: AtomicU16 = AtomicU16::new(0);
+
+fn query_term_size() -> (u16, u16) {
     let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
     (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
+}
+
+fn store_term_size(w: u16, h: u16) {
+    TERM_W.store(if w == 0 { 80 } else { w }, Ordering::Relaxed);
+    TERM_H.store(if h == 0 { 24 } else { h }, Ordering::Relaxed);
+}
+
+/// Ask the terminal and remember the answer: start-up, and after anything
+/// that may have changed the size unseen (a child process had the terminal).
+fn refresh_term_size() -> (u16, u16) {
+    let (w, h) = query_term_size();
+    store_term_size(w, h);
+    (w, h)
+}
+
+fn term_size() -> (u16, u16) {
+    if !RAW.load(Ordering::Relaxed) {
+        return query_term_size();
+    }
+    match (
+        TERM_W.load(Ordering::Relaxed),
+        TERM_H.load(Ordering::Relaxed),
+    ) {
+        (0, _) | (_, 0) => refresh_term_size(),
+        size => size,
+    }
 }
 
 // Alt-screen bottom chrome: a 3-row bordered composer box plus the footer.
@@ -2582,6 +2714,13 @@ mod signal_restore {
     }
 
     extern "C" fn handler(sig: libc::c_int) {
+        restore_and_exit(128 + sig);
+    }
+
+    /// Put the terminal back and end the process with `status`. Only
+    /// atomics, `write`, `tcsetattr` and `_exit`: safe in a signal handler
+    /// and on any thread, whatever locks are held elsewhere.
+    pub fn restore_and_exit(status: libc::c_int) -> ! {
         unsafe {
             if ALT_SCREEN.load(Ordering::Relaxed) {
                 let _ = libc::write(
@@ -2595,7 +2734,7 @@ mod signal_restore {
                     let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
                 }
             }
-            libc::_exit(128 + sig);
+            libc::_exit(status);
         }
     }
 }
@@ -2664,7 +2803,9 @@ pub fn enter_alt(raw: bool) {
         #[cfg(any(unix, windows))]
         signal_restore::install();
         if enable_raw_mode().is_ok() {
+            refresh_term_size();
             RAW.store(true, Ordering::Relaxed);
+            watch_for_hangup();
         }
         install_panic_hook();
         return;
@@ -2705,7 +2846,10 @@ pub fn enter_alt(raw: bool) {
         let _ = execute!(io::stdout(), MoveTo(0, 0));
     }
     if raw && enable_raw_mode().is_ok() {
+        // The size as it is now: a child process may have had the terminal.
+        refresh_term_size();
         RAW.store(true, Ordering::Relaxed);
+        watch_for_hangup();
         // Ask for Sixel support and the cell size once, before any other
         // reader of stdin starts and before focus reports can interleave.
         if io::stdin().is_terminal() && io::stdout().is_terminal() && images_enabled() {
@@ -2742,6 +2886,13 @@ fn install_panic_hook() {
             ALT_SCREEN.store(false, Ordering::Relaxed);
             let _ = disable_raw_mode();
             prev(info);
+            // A write to a terminal that has gone away panics (`print!`):
+            // that is a hangup, not a crash.
+            #[cfg(unix)]
+            if terminal_hung_up() {
+                // SAFETY: `_exit` only ends the process.
+                unsafe { libc::_exit(TERMINAL_GONE_STATUS) };
+            }
         }));
     });
 }
