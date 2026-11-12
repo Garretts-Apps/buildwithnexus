@@ -6254,4 +6254,6 @@ use net_guard::*;
 pub use net_guard::{blocked_url, private_network_host};
 
 #[cfg(test)]
+mod classify_tests;
+#[cfg(test)]
 pub(crate) mod tests;
