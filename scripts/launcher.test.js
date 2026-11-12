@@ -841,3 +841,58 @@ test('launcher (Windows): an exe denied execute gets security guidance', { skip:
   assert.match(r.stderr, /SHA-256: [0-9a-f]{64}/);
   assert.ok(r.stderr.includes(diag.IT_GUIDE_URL));
 });
+
+// ── signals, fail-closed checksums, unsupported platforms ───────────────────
+
+test('launcher: SIGTERM to the launcher reaches the binary', { skip: WIN && 'POSIX signals' }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-sig-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const got = path.join(dir, 'got-sigterm');
+  const { spawn } = require('node:child_process');
+  // Node stands in for the binary: it says when it is listening, and records
+  // the SIGTERM before exiting 7.
+  const script = `process.on('SIGTERM', () => { require('fs').writeFileSync(${JSON.stringify(got)}, 'x'); process.exit(7); });` +
+    "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);";
+  const child = spawn(process.execPath, [launcher, '-e', script], {
+    env: { ...process.env, BWN_BIN: process.execPath }, stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise((resolve) => child.stdout.on('data', (d) => String(d).includes('ready') && resolve()));
+  child.kill('SIGTERM');
+  const status = await new Promise((resolve) => child.on('exit', (code) => resolve(code)));
+  assert.equal(status, 7);
+  assert.ok(fs.existsSync(got), 'the binary did not get SIGTERM');
+});
+
+test('launcher: a binary killed by a signal makes the launcher die the same way', { skip: WIN && 'POSIX signals' }, () => {
+  const result = spawnSync(process.execPath, [launcher, '-e', "process.kill(process.pid, 'SIGKILL')"], {
+    encoding: 'utf8',
+    env: { ...process.env, BWN_BIN: process.execPath },
+  });
+  assert.equal(result.signal, 'SIGKILL');
+  assert.equal(result.stderr, '');
+});
+
+test('first run: a checksums.json without this asset refuses to download', { skip: needsSh || noRelease }, (t) => {
+  const pkg = tempPackage(t);
+  fs.writeFileSync(path.join(pkg.root, 'checksums.json'), JSON.stringify({ 'buildwithnexus-other': 'a'.repeat(64) }));
+  const r = launchFake(pkg, ['version'], { env: { FAKE_ASSET: path.join(STUBS, 'prints-version') } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, new RegExp(`checksums\\.json in this package has no entry for ${ASSET}`));
+  // Not even the release's own .sha256 is asked for.
+  assert.deepEqual(r.requests, []);
+  assert.ok(!fs.existsSync(pkg.bin));
+});
+
+test('first run: musl is explained before anything is downloaded', {
+  skip: (process.platform !== 'linux' || noRelease) && 'Linux only',
+}, (t) => {
+  const pkg = tempPackage(t);
+  const r = launchFake(pkg, ['version'], {
+    asset: path.join(STUBS, 'prints-version'),
+    // Both fakes, in the launcher and in the bootstrap it starts.
+    env: { FAKE_GLIBC: 'musl', NODE_OPTIONS: `--require=${JSON.stringify(FAKE_RELEASE)} --require=${JSON.stringify(FAKE_GLIBC)}` },
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /musl/i);
+  assert.deepEqual(r.requests, []);
+});

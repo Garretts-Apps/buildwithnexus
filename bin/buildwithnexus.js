@@ -5,7 +5,7 @@
 // Deliberately boring — no install scripts, no network, no dynamic code. The
 // binary itself handles update checks.
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const {
   existing, hasPrebuilt, target, installedBinary, readInstallMarker, EXIT_EXPLAINED,
 } = require('../scripts/resolve-binary.js');
@@ -96,18 +96,38 @@ if (!bin) {
   process.exit(1);
 }
 
-const result = spawnSync(bin, args, { stdio: 'inherit' });
-if (result.error || result.status !== 0) {
-  // Did the binary start at all? If not (blocked, removed, wrong libc), say
-  // why instead of a bare "spawnSync ... EPERM" or loader error.
-  const { explainRunFailure } = require('../scripts/diagnose.js');
-  const marker = readInstallMarker(bin);
-  const found = explainRunFailure(bin, result, {
-    verified: Boolean(marker),
-    sha256: marker && marker.sha256,
-  });
-  if (found) process.stderr.write(found.text);
-  else if (result.error) process.stderr.write(`buildwithnexus: ${result.error.message}\n`);
-  if (found || result.error) process.exit(1);
-}
-process.exit(result.status === null ? 1 : result.status);
+// Not spawnSync: a SIGTERM or SIGHUP sent to this process (a timeout, a
+// supervisor, a cancelled CI job, a closed terminal) must reach the binary
+// too, or the agent keeps running with no parent. Ctrl+C reaches both through
+// the terminal, so this process leaves SIGINT to the binary and waits.
+const child = spawn(bin, args, { stdio: 'inherit' });
+const forwarded = ['SIGTERM', 'SIGHUP'];
+const forward = (sig) => { try { child.kill(sig); } catch {} };
+for (const sig of forwarded) process.on(sig, forward);
+process.on('SIGINT', () => {});
+let spawnError = null;
+child.on('error', (e) => { spawnError = e; });
+child.on('close', (status, signal) => {
+  for (const sig of forwarded) process.removeListener(sig, forward);
+  const result = { error: spawnError, status: spawnError ? null : status, signal };
+  if (result.error || (result.status !== 0 && !signal)) {
+    // Did the binary start at all? If not (blocked, removed, wrong libc), say
+    // why instead of a bare "spawn ... EPERM" or loader error.
+    const { explainRunFailure } = require('../scripts/diagnose.js');
+    const marker = readInstallMarker(bin);
+    const found = explainRunFailure(bin, result, {
+      verified: Boolean(marker),
+      sha256: marker && marker.sha256,
+    });
+    if (found) process.stderr.write(found.text);
+    else if (result.error) process.stderr.write(`buildwithnexus: ${result.error.message}\n`);
+    if (found || result.error) process.exit(1);
+  }
+  if (signal) {
+    // Die the way the binary died, so a shell sees 128+n, not 1.
+    process.removeAllListeners('SIGINT');
+    try { process.kill(process.pid, signal); } catch {}
+    process.exit(128 + (require('os').constants.signals[signal] || 0));
+  }
+  process.exit(status === null ? 1 : status);
+});

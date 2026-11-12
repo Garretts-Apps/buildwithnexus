@@ -10,7 +10,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { pipeline } = require('stream');
 const {
-  ROOT, ext, target, installedBinary, installMarker, existing, pruneOldVersions, EXIT_EXPLAINED,
+  ROOT, ext, target, hasPrebuilt, installedBinary, installMarker, existing, pruneOldVersions, EXIT_EXPLAINED,
 } = require('./resolve-binary.js');
 
 const pkg = require(path.join(ROOT, 'package.json'));
@@ -103,13 +103,21 @@ function download(url, dest) {
   });
 }
 
+// The hash checksums.json pins for this asset. A published package always
+// has the file, so once it exists a missing or unreadable entry is an error,
+// not a reason to trust the release's own .sha256. Only a source checkout,
+// which has no checksums.json, falls back to that.
 function pinnedChecksum(asset) {
+  const file = path.join(ROOT, 'checksums.json');
+  if (!fs.existsSync(file)) return null;
+  let sums;
   try {
-    const sums = JSON.parse(fs.readFileSync(path.join(ROOT, 'checksums.json'), 'utf8'));
-    return typeof sums[asset] === 'string' ? sums[asset] : null;
-  } catch {
-    return null;
+    sums = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    throw new Error(`checksums.json in this package is unreadable (${e.message})`);
   }
+  if (typeof sums[asset] !== 'string') throw new Error(`checksums.json in this package has no entry for ${asset}`);
+  return sums[asset];
 }
 
 function sha256(file) {
@@ -130,12 +138,20 @@ async function obtain() {
   if (process.env.BWN_SKIP_INSTALL) return {};
   if (existing()) return { present: true };
   const t = target();
-  if (!t) return {};
+  // No request for a binary that does not exist or cannot run here: the
+  // launcher explains those (musl, a glibc below the floor, no prebuilt for
+  // this CPU) instead of a 404 or a download it would then reject.
+  if (!t || !hasPrebuilt()) return {};
+  const { platformProblem } = require('./diagnose.js');
+  const problem = platformProblem();
+  if (problem) return { unsupported: problem };
 
   const asset = `buildwithnexus-${t}${ext()}`;
   const base = `${RELEASES}/download/v${pkg.version}`;
   const bin = installedBinary();
-  const tmp = bin + '.download';
+  // Per process: two first runs at once (parallel CI jobs sharing a home
+  // folder) must not write into the same file.
+  const tmp = `${bin}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.download`;
   let got;
   try {
     log('buildwithnexus: downloading prebuilt binary…');
@@ -162,6 +178,12 @@ async function obtain() {
   try {
     // What is on disk is what will run, so it must hash the same.
     if (sha256(tmp) !== got) throw new Error('the file changed after it was verified — refusing to install');
+    // Another first run may have finished while this one downloaded. Its
+    // binary passed the same check, so keep it.
+    if (existing()) {
+      discard(tmp);
+      return { present: true };
+    }
     fs.renameSync(tmp, bin);
   } catch (e) {
     if (!fs.existsSync(tmp) && !fs.existsSync(bin)) return { removed: got };
@@ -264,6 +286,7 @@ obtain()
         bin: installedBinary(), vanished: true, verified: true, sha256: r.removed, expectedVersion: pkg.version,
       }).text);
     }
+    if (r.unsupported) explained(r.unsupported.text);
     if (r.error) explained(downloadFailure(r.error));
     if (r.installed) {
       // "Verified" only means the download is intact. Say "ready" only once

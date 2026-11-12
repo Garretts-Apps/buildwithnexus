@@ -57,6 +57,16 @@ jobs:
       sha256: ${{ steps.pack.outputs.sha256 }}
 
     steps:
+      # A manual run publishes what is on the dispatched branch, so it must
+      # be main: a branch copy of this file must not reach npm.
+      - name: Manual runs only from main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::publish can only be dispatched from main (got $REF)"
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,6 +103,7 @@ jobs:
       # checksums.json inside the immutable npm tarball. The launcher's
       # first-run download trusts only these.
       - name: Verify release binaries and record checksums
+        if: steps.published.outputs.already == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -121,11 +132,13 @@ jobs:
       # Guard the launch path: a syntax error in the wrapper or bootstrap
       # would break `npm install` for every user. Cheap to check, expensive to miss.
       - name: Syntax-check wrapper scripts
+        if: steps.published.outputs.already == 'false'
         run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
 
       # The tarball npm will get: checksums.json from the step above included.
       - name: Pack
         id: pack
+        if: steps.published.outputs.already == 'false'
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -136,6 +149,7 @@ jobs:
           echo "sha256=$sum" >> "$GITHUB_OUTPUT"
 
       - name: Hand the tarball to the field and publish jobs
+        if: steps.published.outputs.already == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
@@ -192,12 +206,9 @@ jobs:
 
   publish:
     needs: [pack, field]
-    # A field run that did not pass stops it; a skipped one (the version is
-    # already on npm) does not, so a re-dispatch can still publish crates.
-    if: >-
-      ${{ !cancelled() && needs.pack.result == 'success' &&
-          (needs.field.result == 'success' ||
-           (needs.field.result == 'skipped' && needs.pack.outputs.already == 'true')) }}
+    # Only after the field run passed. A version already on npm skips the
+    # field run and this job; crates.io is published by release.yml.
+    if: needs.pack.outputs.already == 'false' && needs.field.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -271,72 +282,6 @@ jobs:
           TARBALL: ./dist/${{ needs.pack.outputs.tarball }}
         run: npm publish "$TARBALL" --access public --provenance
 
-      # crates.io: `cargo install buildwithnexus` (both binaries) and
-      # `cargo install bwn` (alias crate). OIDC only — the auth action
-      # exchanges this job's OIDC token for a 30-minute crates.io token.
-      # Like npm, crates.io Trusted Publishing must be configured per crate
-      # (crates.io → crate → Settings → Trusted Publishing: this repo,
-      # publish.yml) and the FIRST publish of each crate is a one-time
-      # `cargo publish` from a maintainer machine (cargo login).
-      # Not gated on the npm check: crates.io can be published later (add the
-      # token or configure Trusted Publishing, then re-run this workflow) —
-      # the step skips crate versions that already exist.
-      - name: Install Rust for crates.io publish
-        if: github.event_name == 'workflow_dispatch'
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
-
-      - name: Get crates.io token via OIDC
-        if: github.event_name == 'workflow_dispatch'
-        id: cratesio
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Publish to crates.io
-        id: crates
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          # OIDC token when Trusted Publishing is configured; otherwise the
-          # one-time bootstrap token secret (crates.io UI → API Tokens) used
-          # to create the crates. Delete the secret after attaching Trusted
-          # Publishing to both crates.
-          CARGO_REGISTRY_TOKEN: ${{ steps.cratesio.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "::warning::no crates.io OIDC token and no CARGO_REGISTRY_TOKEN bootstrap secret — skipping crates.io publish."
-            exit 0
-          fi
-          set -e
-          V=$(node -p "require('./package.json').version")
-          # `cargo info <name>` resolves workspace members LOCALLY, so from
-          # inside this repo it always says our crates exist — ask the
-          # registry's sparse index instead.
-          on_registry() {
-            local n=$1 p
-            case ${#n} in
-              1) p="1/$n" ;;
-              2) p="2/$n" ;;
-              3) p="3/${n:0:1}/$n" ;;
-              *) p="${n:0:2}/${n:2:2}/$n" ;;
-            esac
-            curl -sf "https://index.crates.io/$p" | grep -q "\"vers\":\"$V\""
-          }
-          if on_registry buildwithnexus; then
-            echo "buildwithnexus ${V} already on crates.io — skipping."
-          else
-            cargo publish -p buildwithnexus --locked
-          fi
-          if on_registry bwn; then
-            echo "bwn ${V} already on crates.io — done."
-            exit 0
-          fi
-          # bwn depends on the crate above; wait out index propagation.
-          for i in 1 2 3 4 5; do
-            if cargo publish -p bwn --locked; then exit 0; fi
-            echo "bwn publish attempt ${i} failed (index propagation?) — retrying in 30s"
-            sleep 30
-          done
-          echo "::warning::bwn alias crate did not publish — run 'cargo publish -p bwn' manually."
-
       # Built from what the steps above actually did, not from what they were
       # meant to do.
       - name: Summary
@@ -344,7 +289,6 @@ jobs:
         env:
           ALREADY: ${{ needs.pack.outputs.already }}
           NPM_PUBLISH: ${{ steps.npm-publish.outcome }}
-          CRATES: ${{ steps.crates.outcome }}
         run: |
           PKG_VERSION=$(node -e 'console.log(require("./package.json").version)')
           if [[ "$ALREADY" == true ]]; then
@@ -357,5 +301,5 @@ jobs:
             echo ""
             echo "- Version: \`$PKG_VERSION\`"
             echo "- npm: ${npm_line}"
-            echo "- crates.io: ${CRATES:-not run}"
+            echo "- crates.io: published by release.yml"
           } >> "$GITHUB_STEP_SUMMARY"

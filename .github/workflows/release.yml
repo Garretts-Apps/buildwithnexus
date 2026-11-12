@@ -39,10 +39,14 @@ jobs:
       contents: read
     outputs:
       release: ${{ steps.check.outputs.release }}
+      # A manual run for a version that is already released retries only the
+      # crates.io publish (see the crates job), never the build.
+      crates_retry: ${{ steps.check.outputs.crates_retry }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Release only unreleased versions on main pushes
         id: check
         env:
@@ -55,11 +59,24 @@ jobs:
             echo "::error::release can only be dispatched from main (got $REF)"
             exit 1
           fi
-          if [[ "$REF" == refs/tags/* || "$EVENT" == workflow_dispatch ]]; then
+          V=$(node -p "require('./package.json').version")
+          # A pushed tag must name the version in package.json and point at
+          # a commit on main. Otherwise the release would carry one version's
+          # name and another's binaries, and npm would look for assets under
+          # a tag that does not exist.
+          if [[ "$REF" == refs/tags/* ]]; then
+            if [[ "$REF" != "refs/tags/v${V}" ]]; then
+              echo "::error::tag ${REF#refs/tags/} does not match package.json version ${V}"
+              exit 1
+            fi
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::tag ${REF#refs/tags/} is not on main"
+              exit 1
+            fi
             echo "release=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          V=$(node -p "require('./package.json').version")
           # --exit-code: 0 = tag exists, 2 = no such tag, anything else is a
           # lookup failure. Never treat a failed lookup as "untagged", which
           # would re-release (and overwrite the assets of) a shipped version.
@@ -67,8 +84,16 @@ jobs:
           git ls-remote --exit-code --tags origin "refs/tags/v${V}" >/dev/null 2>&1 || rc=$?
           case $rc in
             0)
-              echo "v${V} is already tagged — nothing to release."
-              echo "release=false" >> "$GITHUB_OUTPUT" ;;
+              # The npm tarball of a shipped version pins the hashes of its
+              # binaries, so rebuilding them (a new toolchain gives new
+              # bytes) would break every later install. A manual run only
+              # retries crates.io.
+              echo "v${V} is already tagged — nothing to build."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              if [[ "$EVENT" == workflow_dispatch ]]; then
+                echo "Manual run: retrying the crates.io publish only."
+                echo "crates_retry=true" >> "$GITHUB_OUTPUT"
+              fi ;;
             2)
               echo "v${V} is not tagged yet — releasing."
               echo "release=true" >> "$GITHUB_OUTPUT" ;;
@@ -228,6 +253,38 @@ jobs:
           asset="buildwithnexus-$TARGET${ext}"
           cp "$src" "$asset"
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      # Every binary that ships is started once on the machine that built it
+      # before anything is published. Linux arm64 is cross-compiled and runs
+      # under qemu; macOS x64 runs under Rosetta where the runner has it.
+      - name: Run the release binary
+        shell: bash
+        env:
+          ASSET: ${{ steps.stage.outputs.asset }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          V=$(node -p "require('./package.json').version")
+          run=("./$ASSET")
+          case "$TARGET" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y -q qemu-user >/dev/null
+              run=(qemu-aarch64 -L /usr/aarch64-linux-gnu "./$ASSET") ;;
+            x86_64-apple-darwin)
+              if [[ "$(uname -m)" == arm64 ]]; then
+                if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+                  sudo softwareupdate --install-rosetta --agree-to-license >/dev/null
+                fi
+                run=(arch -x86_64 "./$ASSET")
+              fi ;;
+          esac
+          out=$("${run[@]}" version)
+          echo "$out"
+          if [[ "$out" != "buildwithnexus $V" ]]; then
+            echo "::error::$ASSET printed '$out', expected 'buildwithnexus $V'"
+            exit 1
+          fi
+          "${run[@]}" --help >/dev/null
 
       # IT teams and security tools read these fields; an .exe without them
       # looks anonymous. harness/build.rs embeds them, and only warns if it
@@ -414,13 +471,17 @@ jobs:
   # could never authenticate without a stored token. This workflow's triggers
   # (v* tag push, workflow_dispatch) are both accepted. Requires a Trusted
   # Publishing entry on BOTH crates pointing at workflow file `release.yml`.
-  # Idempotent: versions already on the registry are skipped, so
-  # re-dispatching a release is safe. Anything else that goes wrong (no OIDC
+  # Idempotent: versions already on the registry are skipped, and a manual
+  # run for a released version runs only this job, so re-dispatching to
+  # finish a crates.io publish is safe. Anything else that goes wrong (no OIDC
   # token, a publish error) fails the job, so a half-published release shows
   # up red instead of green-with-a-warning.
   crates:
     needs: [gate, assets]
-    if: needs.gate.outputs.release == 'true'
+    if: >-
+      ${{ !cancelled() &&
+          ((needs.gate.outputs.release == 'true' && needs.assets.result == 'success') ||
+           needs.gate.outputs.crates_retry == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
