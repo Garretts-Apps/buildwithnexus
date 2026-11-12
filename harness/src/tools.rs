@@ -3632,9 +3632,13 @@ fn truncate_read(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
-    let total_bytes = s.len();
-    let total_lines = s.lines().count();
     let shown = crate::config::cut_at_char_boundary(&s, max);
+    read_truncation(shown, s.len(), s.lines().count())
+}
+
+// `shown`, the head of a text of `total_bytes` and `total_lines`, with the
+// marker that says so.
+fn read_truncation(shown: &str, total_bytes: usize, total_lines: usize) -> String {
     let shown_lines = shown.lines().count();
     format!(
         "{shown}\n…[truncated: content is {total_bytes} bytes / {total_lines} lines total; showing the first {shown_lines} lines — pass start_line/end_line to read the rest in ranges]"
@@ -3710,6 +3714,9 @@ fn skip_dir(path: &Path) -> bool {
 
 mod grep;
 use grep::run_grep;
+
+mod read_view;
+use read_view::read_file_view;
 
 mod walk;
 use walk::*;
@@ -4874,10 +4881,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(out) = read_media(&p, input, cwd) {
                 return out;
             }
-            match read_text_view(&p, MAX_TEXT_FILE) {
-                Ok((c, false)) => ok(truncate_read(apply_line_range(c, line_range(input)), MAX_READ)),
-                Ok((c, true)) => {
-                    let mut out = truncate_read(apply_line_range(c, line_range(input)), MAX_READ);
+            match read_file_view(&p, line_range(input)) {
+                Ok((out, false)) => ok(out),
+                Ok((mut out, true)) => {
                     out.push_str(&format!(
                         "\n…[{} is larger than {}: only that much was read, so line numbers past it are not available here; use run_command (`sed -n 'A,Bp'`, `tail`) for the rest]",
                         p.display(),
@@ -6129,6 +6135,8 @@ pub use net_guard::{blocked_url, private_network_host};
 mod classify_tests;
 #[cfg(test)]
 mod perf_tests;
+#[cfg(test)]
+mod read_view_tests;
 #[cfg(test)]
 mod table_tests;
 #[cfg(test)]

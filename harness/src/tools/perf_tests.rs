@@ -5,7 +5,7 @@
 use super::*;
 use std::path::PathBuf;
 
-fn tempdir(tag: &str) -> PathBuf {
+pub(super) fn tempdir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let id = N.fetch_add(1, Ordering::Relaxed);
@@ -17,7 +17,7 @@ fn tempdir(tag: &str) -> PathBuf {
 
 // A small deterministic generator, so the random corpora are the same on
 // every run.
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 impl Rng {
     fn next(&mut self) -> u64 {
         self.0 = self
@@ -26,7 +26,7 @@ impl Rng {
             .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
-    fn below(&mut self, n: usize) -> usize {
+    pub(super) fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
