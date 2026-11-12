@@ -29,15 +29,18 @@ doc = false
 [dependencies]
 # Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
 crossterm = "0.29"
-# Blocking HTTP with rustls — no async runtime, fast cold start, one TLS stack.
-ureq = { version = "2.10", features = ["json", "tls"] }
-# The same rustls ureq links, named directly so net.rs can build the client
-# config: the bundled webpki roots plus the OS trust store (or SSL_CERT_FILE),
-# so a TLS-inspecting proxy whose CA IT installed is trusted like curl trusts it.
+# Blocking HTTP — no async runtime, fast cold start. Built without its own
+# TLS: net/http.rs plugs the rustls below in through ureq's connector API,
+# which is outside ureq's semver promise (it changes only in minor
+# releases), hence ~3.5.
+ureq = { version = "~3.5.2", default-features = false, features = ["json", "gzip"] }
+# The one TLS stack, configured in net.rs: the bundled webpki roots plus the
+# OS trust store (or SSL_CERT_FILE), so a TLS-inspecting proxy whose CA IT
+# installed is trusted like curl trusts it.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
-# Already in the tree through ureq; net.rs reads each URL's host with it.
+# net.rs reads each URL's host with it, and requests go out as it spells them.
 url = "2"
 # Already in the tree through rustls; MCP OAuth takes SHA-256 (the PKCE
 # challenge) and the OS random source (verifier and state) from it.

@@ -2895,7 +2895,7 @@ fn fetch_tools_refuse_link_local_and_metadata_hosts() {
         );
     }
     // A hostname that resolves to link-local is caught at connect time.
-    use ureq::Resolver;
+    use crate::net::Resolver;
     assert!(GuardedResolver.resolve("169.254.169.254:80").is_err());
     assert!(GuardedResolver.resolve("127.0.0.1:80").is_ok());
     let _ = fs::remove_dir_all(&d);

@@ -2229,10 +2229,10 @@ fn run_http(
             let status = resp.status();
             answered(status, resp.into_string().unwrap_or_default())
         }
-        Err(ureq::Error::Status(status, resp)) => {
+        Err(crate::net::Error::Status(status, resp)) => {
             answered(status, resp.into_string().unwrap_or_default())
         }
-        Err(ureq::Error::Transport(t)) => {
+        Err(crate::net::Error::Transport(t)) => {
             let why = t.to_string();
             let failure = if why.contains("timed out") {
                 HookFailure::TimedOut(timeout)

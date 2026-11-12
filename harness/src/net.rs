@@ -5,26 +5,30 @@
 // the bundled webpki roots, so a TLS-inspecting proxy whose CA IT installed
 // works.
 //
-// ureq 2 sets its proxy per agent, so a Client holds one agent per route
-// (direct, and one per proxy URL) and picks by destination URL.
+// A Client holds one agent per route (direct, and one per proxy URL) and
+// picks by destination URL; NO_PROXY is decided here, not by ureq. The
+// request and response types over ureq are in net/http.rs.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-type Configure<'a> = &'a dyn Fn(ureq::AgentBuilder) -> ureq::AgentBuilder;
+mod http;
+pub use http::{Agent, Builder, Error, ErrorKind, Request, Resolver, Response, Transport};
+
+type Configure<'a> = &'a dyn Fn(Builder) -> Builder;
 
 pub struct Client {
-    direct: ureq::Agent,
-    proxied: Vec<(String, ureq::Agent)>,
+    direct: Agent,
+    proxied: Vec<(String, Agent)>,
     env: ProxyEnv,
 }
 
 impl Client {
     /// Agents from `configure` (timeouts, redirects, resolver), one per
     /// route the process environment names.
-    pub fn new(configure: impl Fn(ureq::AgentBuilder) -> ureq::AgentBuilder) -> Client {
+    pub fn new(configure: impl Fn(Builder) -> Builder) -> Client {
         Client::with_env(ProxyEnv::from_env(), &configure)
     }
 
@@ -33,35 +37,35 @@ impl Client {
     #[cfg(test)]
     pub(crate) fn with_lookup(
         get: impl Fn(&str) -> Option<String>,
-        configure: impl Fn(ureq::AgentBuilder) -> ureq::AgentBuilder,
+        configure: impl Fn(Builder) -> Builder,
     ) -> Client {
         Client::with_env(ProxyEnv::from_lookup(get), &configure)
     }
 
     fn with_env(env: ProxyEnv, configure: Configure) -> Client {
-        let base = || configure(ureq::AgentBuilder::new().tls_config(tls_config()));
-        let mut proxied: Vec<(String, ureq::Agent)> = Vec::new();
+        let builder = configure(Builder::new());
+        let mut proxied: Vec<(String, Agent)> = Vec::new();
         for (_, url) in [&env.https, &env.http].into_iter().flatten() {
             if proxied.iter().any(|(u, _)| u == url) {
                 continue;
             }
             // An unusable value fails every request that would use it with
             // the reason, instead of quietly connecting direct.
-            let agent = match parse_proxy(url) {
-                Ok(proxy) => base().proxy(proxy).build(),
-                Err(why) => base().resolver(Unusable(why)).build(),
+            let route = match parse_proxy(url) {
+                Ok(proxy) => http::Route::Proxy(proxy),
+                Err(why) => http::Route::Unusable(why),
             };
-            proxied.push((url.clone(), agent));
+            proxied.push((url.clone(), Agent::build(&builder, route)));
         }
         Client {
-            direct: base().build(),
+            direct: Agent::build(&builder, http::Route::Direct),
             proxied,
             env,
         }
     }
 
     /// The agent for `url`: through its proxy, or direct.
-    pub fn agent_for(&self, url: &str) -> &ureq::Agent {
+    pub fn agent_for(&self, url: &str) -> &Agent {
         self.env
             .proxy_for(url)
             .and_then(|p| self.proxied.iter().find(|(u, _)| u == p))
@@ -87,16 +91,17 @@ impl Client {
         })
     }
 
-    pub fn get(&self, url: &str) -> ureq::Request {
+    pub fn get(&self, url: &str) -> Request {
         self.agent_for(url).get(url)
     }
 
-    pub fn post(&self, url: &str) -> ureq::Request {
+    pub fn post(&self, url: &str) -> Request {
         self.agent_for(url).post(url)
     }
 }
 
-/// A client with ureq's defaults, for one-off requests.
+/// A client with the default settings (30 s to connect, 5 redirects), for
+/// one-off requests.
 pub fn shared() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| Client::new(|b| b))
@@ -119,7 +124,7 @@ pub struct ProxyRoute {
 
 /// What to tell the user when `e` is a certificate the roots do not trust.
 /// Retrying cannot fix it, so callers fail at once with this.
-pub fn cert_error_hint(e: &ureq::Error) -> Option<String> {
+pub fn cert_error_hint(e: &Error) -> Option<String> {
     e.to_string()
         .contains("invalid peer certificate")
         .then(|| cert_hint(|k| std::env::var(k).ok()))
@@ -449,15 +454,14 @@ fn in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
     }
 }
 
-// ureq takes `[http://][user:pass@]host[:port]`, without percent-decoding
-// the credentials. TLS to the proxy itself (https://) and SOCKS are not
-// built in.
+// `[http://][user:pass@]host[:port]`, the credentials percent-decoded. TLS
+// to the proxy itself (https://) and SOCKS are not built in.
 fn parse_proxy(value: &str) -> Result<ureq::Proxy, String> {
     let rest = match value.split_once("://") {
         None => value,
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
         // The tunnel to the server is TLS either way; only the hop to the
-        // proxy would be encrypted, and ureq cannot do that.
+        // proxy would be encrypted, and bwn cannot do that.
         Some((scheme, _)) if scheme.eq_ignore_ascii_case("https") => {
             return Err(format!(
                 "https:// proxy URLs are not supported — use http:// ({} as http://…); \
@@ -472,20 +476,37 @@ fn parse_proxy(value: &str) -> Result<ureq::Proxy, String> {
             ))
         }
     };
+    let unusable = |why: &str| format!("proxy {} is not usable: {why}", redact_userinfo(value));
     let authority = rest.split('/').next().unwrap_or("");
-    let target = match authority.rsplit_once('@') {
-        Some((creds, hostport)) => {
-            let (user, pass) = creds.split_once(':').unwrap_or((creds, ""));
-            format!(
-                "http://{}:{}@{hostport}",
-                percent_decode(user),
-                percent_decode(pass)
-            )
-        }
-        None => format!("http://{authority}"),
+    let (creds, hostport) = match authority.rsplit_once('@') {
+        Some((creds, hostport)) => (Some(creds), hostport),
+        None => (None, authority),
     };
-    ureq::Proxy::new(target)
-        .map_err(|e| format!("proxy {} is not usable: {e}", redact_userinfo(value)))
+    // [v6]:port, host:port, or a host alone (port 80).
+    let (host, port) = match hostport.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((v6, tail)) => (format!("[{v6}]"), tail.strip_prefix(':')),
+            None => return Err(unusable("unclosed [ in the host")),
+        },
+        None => match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), Some(p)),
+            None => (hostport.to_string(), None),
+        },
+    };
+    if host.is_empty() {
+        return Err(unusable("no host"));
+    }
+    let mut b = ureq::Proxy::builder(ureq::ProxyProtocol::Http).host(&host);
+    if let Some(p) = port.filter(|p| !p.is_empty()) {
+        b = b.port(p.parse().map_err(|_| unusable(&format!("bad port {p}")))?);
+    }
+    if let Some(creds) = creds {
+        let (user, pass) = creds.split_once(':').unwrap_or((creds, ""));
+        b = b
+            .username(&percent_decode(user))
+            .password(&percent_decode(pass));
+    }
+    b.build().map_err(|e| unusable(&e.to_string()))
 }
 
 fn redact_userinfo(url: &str) -> String {
@@ -522,14 +543,6 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-struct Unusable(String);
-
-impl ureq::Resolver for Unusable {
-    fn resolve(&self, _netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-        Err(std::io::Error::other(self.0.clone()))
-    }
-}
-
 // ── trust roots ────────────────────────────────────────────────────────────
 
 // BWN_TLS_ROOTS=bundled trusts the bundled roots alone, as bwn did before
@@ -552,7 +565,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
-// The same provider and versions ureq's own default config uses.
+// ring, TLS 1.2 and 1.3: what ureq 2's default config used.
 fn client_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
     rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
@@ -803,15 +816,16 @@ mod tests {
 
     #[test]
     fn proxy_urls() {
-        let p = format!(
-            "{:?}",
-            parse_proxy("http://u%40corp:p%3As@proxy.corp:3128/").unwrap()
-        );
-        assert!(p.contains("server: \"proxy.corp\""), "{p}");
-        assert!(p.contains("port: 3128"), "{p}");
-        assert!(p.contains("user: Some(\"u@corp\")"), "{p}");
-        assert!(p.contains("password: Some(\"p:s\")"), "{p}");
-        assert!(parse_proxy("proxy.corp:8080").is_ok());
+        let p = parse_proxy("http://u%40corp:p%3As@proxy.corp:3128/").unwrap();
+        assert_eq!(p.host(), "proxy.corp");
+        assert_eq!(p.port(), 3128);
+        assert_eq!(p.username(), Some("u@corp"));
+        assert_eq!(p.password(), Some("p:s"));
+        let p = parse_proxy("proxy.corp:8080").unwrap();
+        assert_eq!((p.host(), p.port()), ("proxy.corp", 8080));
+        let p = parse_proxy("http://[fd00::1]:3128").unwrap();
+        assert_eq!((p.host(), p.port()), ("[fd00::1]", 3128));
+        assert_eq!(parse_proxy("http://proxy.corp").unwrap().port(), 80);
         for bad in ["https://proxy:443", "socks5://proxy:1080"] {
             let e = parse_proxy(bad).unwrap_err();
             assert!(e.contains("http://"), "{e}");
@@ -940,5 +954,57 @@ mod tests {
         let client = Client::with_lookup(env(&[("HTTPS_PROXY", "socks5://proxy:1080")]), |b| b);
         let e = client.get("https://api.example.com/").call().unwrap_err();
         assert!(e.to_string().contains("use an http:// proxy URL"), "{e}");
+    }
+
+    // Plain http:// through a proxy is sent in absolute form with the
+    // proxy's credentials, on every request of a kept-alive connection.
+    #[test]
+    fn plain_http_through_a_proxy_is_absolute_form_with_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut head = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        head.push(line.trim().to_string());
+                    }
+                    log.lock().unwrap().push(head);
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                }
+            }
+        });
+        let proxy = format!("http://me:p%40ss@127.0.0.1:{port}");
+        let client = Client::with_lookup(env(&[("HTTP_PROXY", proxy.as_str())]), |b| b);
+        for path in ["a", "b?q=1"] {
+            let url = format!("http://api.example/{path}");
+            assert_eq!(
+                client.get(&url).call().unwrap().into_string().unwrap(),
+                "ok"
+            );
+        }
+        let seen = seen.lock().unwrap();
+        // One connection, two requests.
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (head, path) in seen.iter().zip(["a", "b?q=1"]) {
+            assert_eq!(head[0], format!("GET http://api.example/{path} HTTP/1.1"));
+            // me:p@ss
+            assert!(
+                head.contains(&"Proxy-Authorization: Basic bWU6cEBzcw==".to_string()),
+                "{head:?}"
+            );
+            assert!(head.contains(&"host: api.example".to_string()), "{head:?}");
+        }
     }
 }

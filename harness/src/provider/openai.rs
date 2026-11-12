@@ -100,7 +100,7 @@ pub(super) fn openai_request_at(
     base: &str,
     msgs: &[Msg],
     tools: &[ToolDef],
-) -> (ureq::Request, Value) {
+) -> (crate::net::Request, Value) {
     let mut body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
     apply_openai_effort(&mut body, &p.model, p.effort);
     let mut req = agent()
