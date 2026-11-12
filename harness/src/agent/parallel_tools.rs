@@ -35,33 +35,7 @@ pub fn max_parallel_tools() -> usize {
 /// PostToolUse hook that matches it keeps it in line, so a hook sees each
 /// result before the next call runs, as it always has.
 pub(super) fn may_run_beside_others(name: &str, input: &Value) -> bool {
-    is_parallel_safe(name, input) && !hooks::has_post_tool_use(name, input)
-}
-
-// Read-only, non-interactive tools that print nothing while they run and
-// touch no turn state. Everything else runs in line.
-fn is_parallel_safe(name: &str, input: &Value) -> bool {
-    input.get(tools::INVALID_ARGS).is_none()
-        && matches!(
-            name,
-            "read"
-                | "read_file"
-                | "read_many_files"
-                | "list"
-                | "list_dir"
-                | "list_tree"
-                | "file_info"
-                | "glob"
-                | "find_paths"
-                | "find_files"
-                | "grep"
-                | "grep_files"
-                | "kb_query"
-                | "webfetch"
-                | "fetch_url"
-                | "websearch"
-                | "web_search"
-        )
+    tools::is_parallel_safe(name, input) && !hooks::has_post_tool_use(name, input)
 }
 
 /// A call that passed its gate and waits for the rest of its run of
