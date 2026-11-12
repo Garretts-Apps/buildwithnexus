@@ -4007,7 +4007,7 @@ fn run_with_timeout_keeping(
     tail_keep: usize,
 ) -> Result<CommandCapture, String> {
     // stdin is never the terminal (null, or a pipe for the payload), so the
-    // separate process group below cannot strand a command waiting on the
+    // separate session below cannot strand a command waiting on the
     // TUI's tty for input it would otherwise have stolen.
     cmd.stdin(if stdin_payload.is_some() {
         Stdio::piped()
@@ -4016,8 +4016,20 @@ fn run_with_timeout_keeping(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    // A session of its own, not only a process group: the group lets a
+    // timeout kill the whole tree, and having no controlling terminal makes a
+    // command that opens /dev/tty itself (sudo, an ssh password prompt) fail
+    // at once with "no tty" instead of stopping in the background until the
+    // timeout. setsid(2) is async-signal-safe, as pre_exec requires.
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
     if let Some(payload) = stdin_payload {
         if let Some(mut stdin) = child.stdin.take() {

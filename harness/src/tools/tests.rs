@@ -1653,6 +1653,23 @@ fn run_with_timeout_does_not_buffer_an_endless_writer() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg(unix)]
+fn run_with_timeout_gives_the_command_no_terminal() {
+    // A command that opens /dev/tty itself (sudo, ssh) must fail at once,
+    // not stop in the background until the timeout.
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        "if (exec 3</dev/tty) 2>/dev/null; then echo tty; else echo no-tty; fi",
+    ]);
+    let start = std::time::Instant::now();
+    let cap = run_with_timeout(cmd, None, Duration::from_secs(20)).unwrap();
+    assert!(!cap.timed_out);
+    assert_eq!(cap.stdout.trim(), "no-tty");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
 fn run_with_timeout_kills_the_whole_process_group() {
     // The shell's background child must die with it on timeout, not linger.
     let mut cmd = Command::new("sh");
