@@ -709,6 +709,160 @@ fn redact_empty_string() {
     assert_eq!(redact(""), "");
 }
 
+// `redact` as it was before it became one pass (main at 83190bc), verbatim.
+fn reference_redact(s: &str) -> String {
+    s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
+        .map(|tok| {
+            let core =
+                tok.trim_end_matches(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c));
+            let secretish = core.len() >= 12
+                && (core.starts_with("sk-")
+                    || core.starts_with("AIza")
+                    || core.starts_with("hf_")
+                    || core.starts_with("Bearer")
+                    || (core.len() > 32
+                        && core
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')));
+            if secretish {
+                tok.replacen(core, "[redacted]", 1)
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn redact_handles_adjacent_keys_and_keys_at_the_ends() {
+    let k = "sk-ABCDEFGHIJKLMNOP";
+    let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF";
+    for (input, want) in [
+        // A key that is the whole text, first, or last.
+        (k.to_string(), "[redacted]".to_string()),
+        (format!("{k} tail"), "[redacted] tail".to_string()),
+        (format!("head {k}"), "head [redacted]".to_string()),
+        (format!("{k}\n"), "[redacted]\n".to_string()),
+        (format!(" {k}"), " [redacted]".to_string()),
+        // Keys separated by one delimiter, by several, and by none.
+        (format!("{k},{k}"), "[redacted],[redacted]".to_string()),
+        (
+            format!("{k} {k} {k}"),
+            "[redacted] [redacted] [redacted]".to_string(),
+        ),
+        (
+            format!("{k}\"',:;()[]{{}}{k}"),
+            "[redacted]\"',:;()[]{}[redacted]".to_string(),
+        ),
+        (format!("{k}{k}"), "[redacted]".to_string()),
+        (format!("{k}AIzaSyABCDEFGHIJKL"), "[redacted]".to_string()),
+        (
+            format!("{long}:{long}"),
+            "[redacted]:[redacted]".to_string(),
+        ),
+        (format!("{long}{k}"), "[redacted]".to_string()),
+        // A prefix inside a word is not a key; a prefix after one is its own.
+        (format!("x{k}"), format!("x{k}")),
+        (format!("x={k}"), format!("x={k}")),
+        (format!("x:{k}"), "x:[redacted]".to_string()),
+        // The length floors: 12 for a prefixed key, more than 32 for an opaque one.
+        ("sk-ABCDEFGH".to_string(), "sk-ABCDEFGH".to_string()),
+        ("sk-ABCDEFGHI".to_string(), "[redacted]".to_string()),
+        (long[..32].to_string(), long[..32].to_string()),
+        (long[..33].to_string(), "[redacted]".to_string()),
+        (
+            format!("{}.{}", &long[..20], &long[..20]),
+            format!("{}.{}", &long[..20], &long[..20]),
+        ),
+        // "Bearer" joins what follows only without a delimiter between.
+        (format!("Bearer {k}"), "Bearer [redacted]".to_string()),
+        ("Bearer abcdef".to_string(), "Bearer abcdef".to_string()),
+        ("Bearer-abcdef".to_string(), "[redacted]".to_string()),
+        // Unicode: other whitespace delimits, other characters do not.
+        (
+            format!("é{k}\u{a0}{k}\u{3000}日本{k}"),
+            format!("é{k}\u{a0}[redacted]\u{3000}日本{k}"),
+        ),
+        (format!("{k}é🚀 {long}é"), format!("[redacted] {long}é")),
+        ("sk-ééééé".to_string(), "[redacted]".to_string()),
+        ("\u{2028}".to_string(), "\u{2028}".to_string()),
+    ] {
+        assert_eq!(redact(&input), want, "{input:?}");
+        assert_eq!(reference_redact(&input), want, "reference, {input:?}");
+    }
+}
+
+#[test]
+fn redact_matches_the_reference_on_every_mix_of_pieces() {
+    // Pieces that matter to the scan: key prefixes, runs on each side of the
+    // length floors, every delimiter, multi-byte text and whitespace.
+    let pieces = [
+        "sk-",
+        "AIza",
+        "hf_",
+        "Bearer",
+        "s",
+        "k-",
+        "ABCDEFGHI",
+        "abcdefghijklmnopqrstuvwxyz012345",
+        "x",
+        "-",
+        "_",
+        ".",
+        "=",
+        "/",
+        "+",
+        "é",
+        "日本",
+        "🚀",
+        " ",
+        "\t",
+        "\n",
+        "\r\n",
+        "\u{b}",
+        "\u{c}",
+        "\u{85}",
+        "\u{a0}",
+        "\u{2003}",
+        "\u{2028}",
+        "\u{3000}",
+        "\u{1f}",
+        "\u{200b}",
+        "\"",
+        "'",
+        ",",
+        ":",
+        ";",
+        "(",
+        ")",
+        "[",
+        "]",
+        "{",
+        "}",
+        "",
+    ];
+    // Every sequence of up to three pieces, then longer pseudo-random ones.
+    let n = pieces.len();
+    for i in 0..n * n * n {
+        let s = [pieces[i % n], pieces[i / n % n], pieces[i / n / n]].concat();
+        assert_eq!(redact(&s), reference_redact(&s), "{s:?}");
+    }
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..20_000 {
+        let len = next() % 24;
+        let s: String = (0..len)
+            .map(|_| pieces[(next() % n as u64) as usize])
+            .collect();
+        assert_eq!(redact(&s), reference_redact(&s), "{s:?}");
+    }
+}
+
 // ── parse_args ──────────────────────────────────────────────────────────
 #[test]
 fn parse_args_empty_is_object() {

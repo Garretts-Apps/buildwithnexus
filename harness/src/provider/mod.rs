@@ -1609,26 +1609,76 @@ fn retry_after_ms(header: Option<&str>) -> Option<u64> {
 // Defense-in-depth: blank out anything that looks like an API key/token before
 // surfacing an upstream error body to the user or logs.
 pub(crate) fn redact(s: &str) -> String {
-    s.split_inclusive(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c))
-        .map(|tok| {
-            let core =
-                tok.trim_end_matches(|c: char| c.is_whitespace() || "\"',:;()[]{}".contains(c));
-            let secretish = core.len() >= 12
-                && (core.starts_with("sk-")
-                    || core.starts_with("AIza")
-                    || core.starts_with("hf_")
-                    || core.starts_with("Bearer")
-                    || (core.len() > 32
-                        && core
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')));
-            if secretish {
-                tok.replacen(core, "[redacted]", 1)
-            } else {
-                tok.to_string()
+    // One pass: a token runs up to the next delimiter (whitespace or one of
+    // "',:;()[]{}), and is judged from what the scan saw on the way. Text
+    // between secrets is copied in whole runs.
+    const DELIMITER: u8 = 1;
+    const KEY_CHAR: u8 = 2;
+    const CLASS: [u8; 128] = {
+        let mut t = [0u8; 128];
+        let mut i = 0;
+        while i < 128 {
+            let b = i as u8;
+            t[i] = match b {
+                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ' => DELIMITER,
+                b'"' | b'\'' | b',' | b':' | b';' | b'(' | b')' | b'[' | b']' | b'{' | b'}' => {
+                    DELIMITER
+                }
+                b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' => KEY_CHAR,
+                _ => 0,
+            };
+            i += 1;
+        }
+        t
+    };
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0; // everything before this is already in `out`
+    let mut start = 0; // where the current token begins
+    let mut opaque = true; // the token so far is only key characters
+    let mut i = 0;
+    loop {
+        // The width of the delimiter at `i`; None at the end of the text.
+        let delimiter = match bytes.get(i) {
+            None => None,
+            Some(&b) if b < 128 => {
+                let class = CLASS[b as usize];
+                if class != DELIMITER {
+                    opaque &= class == KEY_CHAR;
+                    i += 1;
+                    continue;
+                }
+                Some(1)
             }
-        })
-        .collect()
+            Some(_) => {
+                let c = s[i..].chars().next().unwrap_or(' ');
+                if !c.is_whitespace() {
+                    opaque = false;
+                    i += c.len_utf8();
+                    continue;
+                }
+                Some(c.len_utf8())
+            }
+        };
+        let token = &bytes[start..i];
+        let secretish = token.len() >= 12
+            && (token.starts_with(b"sk-")
+                || token.starts_with(b"AIza")
+                || token.starts_with(b"hf_")
+                || token.starts_with(b"Bearer")
+                || (token.len() > 32 && opaque));
+        if secretish {
+            out.push_str(&s[copied..start]);
+            out.push_str("[redacted]");
+            copied = i;
+        }
+        let Some(width) = delimiter else { break };
+        i += width;
+        start = i;
+        opaque = true;
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 // Map vendor finish/stop reasons onto one shared vocabulary so the agent loop
