@@ -8,6 +8,7 @@
 // `complete()` and the streaming `stream()` so there's exactly one place that
 // knows each vendor's JSON shape.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
@@ -1687,15 +1688,19 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<bo
 }
 
 mod anthropic;
+mod borrowed;
 mod ollama;
 mod openai;
 mod wire;
 use anthropic::*;
+use borrowed::*;
 use ollama::*;
 pub use ollama::{ollama_ctx, startup_problem};
 use openai::*;
 use wire::*;
 
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

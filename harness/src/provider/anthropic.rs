@@ -359,21 +359,115 @@ pub(super) fn anthropic_parse(v: Value) -> Result<Reply, String> {
     })
 }
 
+// A `content_block_delta` event, the one that arrives per token; strings
+// borrow from the line (see `borrowed`). Every other event is rare and is
+// read as a `Value`.
+#[derive(Deserialize)]
+struct BlockDelta<'a> {
+    #[serde(borrow, default, rename = "type", deserialize_with = "opt_str")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(default)]
+    index: Option<u64>,
+    #[serde(borrow, default)]
+    delta: Obj<DeltaBody<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaBody<'a> {
+    #[serde(borrow, default, rename = "type", deserialize_with = "opt_str")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    text: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    thinking: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    signature: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    partial_json: Option<Cow<'a, str>>,
+}
+
+impl<'a> DeltaBody<'a> {
+    // The same fields out of a `Value`, for an event the typed read refused.
+    fn from_value(d: &'a Value) -> DeltaBody<'a> {
+        DeltaBody {
+            kind: value_str(&d["type"]),
+            text: value_str(&d["text"]),
+            thinking: value_str(&d["thinking"]),
+            signature: value_str(&d["signature"]),
+            partial_json: value_str(&d["partial_json"]),
+        }
+    }
+}
+
+// What a reply's content blocks have added up to so far.
+#[derive(Default)]
+struct Blocks {
+    text: String,
+    // (index, id, name, accumulated input JSON)
+    pending: Vec<(usize, String, String, String)>,
+    // (index, thinking/redacted_thinking block), assembled from its deltas
+    // so it can be replayed verbatim (signature included) on the next request.
+    thinking: Vec<(usize, Value)>,
+}
+
+impl Blocks {
+    fn delta(
+        &mut self,
+        idx: usize,
+        d: &DeltaBody,
+        on_text: &mut dyn FnMut(&str),
+        on_thinking: &mut dyn FnMut(&str),
+    ) {
+        match d.kind.as_deref() {
+            Some("text_delta") => {
+                let t = d.text.as_deref().unwrap_or_default();
+                self.text.push_str(t);
+                on_text(t);
+            }
+            Some("thinking_delta") => {
+                // Extended thinking tokens (claude-3-7+): surfaced separately so
+                // the caller can render them as internal monologue.
+                let t = d.thinking.as_deref().unwrap_or_default();
+                if let Some((_, block)) = self.thinking.iter_mut().find(|e| e.0 == idx) {
+                    if let Some(Value::String(acc)) = block.get_mut("thinking") {
+                        acc.push_str(t);
+                    }
+                }
+                on_thinking(t);
+            }
+            Some("signature_delta") => {
+                if let Some((_, block)) = self.thinking.iter_mut().find(|e| e.0 == idx) {
+                    block["signature"] = json!(d.signature.as_deref().unwrap_or_default());
+                }
+            }
+            Some("input_json_delta") => {
+                if let Some(e) = self.pending.iter_mut().find(|e| e.0 == idx) {
+                    e.3.push_str(d.partial_json.as_deref().unwrap_or_default());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn anthropic_stream(
     reader: impl Read,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
-    let mut text = String::new();
+    let mut blocks = Blocks::default();
     let mut stop_reason: Option<String> = None;
     let mut stream_err: Option<String> = None;
     let mut usage = Usage::default();
-    // index → (id, name, accumulated input JSON)
-    let mut pending: Vec<(usize, String, String, String)> = Vec::new();
-    // index → thinking/redacted_thinking block, assembled from its deltas so
-    // it can be replayed verbatim (signature included) on the next request.
-    let mut thinking: Vec<(usize, Value)> = Vec::new();
     let stopped = for_each_sse(reader, |data| {
+        if let Ok(Obj(Some(event))) = serde_json::from_str::<Obj<BlockDelta>>(data) {
+            if event.kind.as_deref() == Some("content_block_delta") {
+                let idx = event.index.unwrap_or(0) as usize;
+                let delta = event.delta.0.unwrap_or_default();
+                blocks.delta(idx, &delta, on_text, on_thinking);
+                return false;
+            }
+        }
         let Ok(v) = serde_json::from_str::<Value>(data) else {
             return false;
         };
@@ -385,52 +479,25 @@ pub(super) fn anthropic_stream(
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 let cb = &v["content_block"];
                 match cb["type"].as_str() {
-                    Some("tool_use") => pending.push((
+                    Some("tool_use") => blocks.pending.push((
                         idx,
                         cb["id"].as_str().unwrap_or_default().to_string(),
                         cb["name"].as_str().unwrap_or_default().to_string(),
                         String::new(),
                     )),
-                    Some("thinking") => thinking.push((
+                    Some("thinking") => blocks.thinking.push((
                         idx,
                         json!({"type": "thinking", "thinking": "", "signature": ""}),
                     )),
-                    Some("redacted_thinking") => thinking.push((idx, cb.clone())),
+                    Some("redacted_thinking") => blocks.thinking.push((idx, cb.clone())),
                     _ => {}
                 }
             }
+            // One whose fields are not the types the typed read expects.
             Some("content_block_delta") => {
-                let d = &v["delta"];
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
-                match d["type"].as_str() {
-                    Some("text_delta") => {
-                        let t = d["text"].as_str().unwrap_or_default();
-                        text.push_str(t);
-                        on_text(t);
-                    }
-                    Some("thinking_delta") => {
-                        // Extended thinking tokens (claude-3-7+): surfaced separately so
-                        // the caller can render them as internal monologue.
-                        let t = d["thinking"].as_str().unwrap_or_default();
-                        if let Some((_, block)) = thinking.iter_mut().find(|e| e.0 == idx) {
-                            if let Some(acc) = block["thinking"].as_str() {
-                                block["thinking"] = json!(format!("{acc}{t}"));
-                            }
-                        }
-                        on_thinking(t);
-                    }
-                    Some("signature_delta") => {
-                        if let Some((_, block)) = thinking.iter_mut().find(|e| e.0 == idx) {
-                            block["signature"] = json!(d["signature"].as_str().unwrap_or_default());
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if let Some(e) = pending.iter_mut().find(|e| e.0 == idx) {
-                            e.3.push_str(d["partial_json"].as_str().unwrap_or_default());
-                        }
-                    }
-                    _ => {}
-                }
+                let delta = DeltaBody::from_value(&v["delta"]);
+                blocks.delta(idx, &delta, on_text, on_thinking);
             }
             Some("message_delta") => {
                 // Final metadata for the turn — carries the stop reason and
@@ -467,7 +534,8 @@ pub(super) fn anthropic_stream(
     }
     // Same INVALID_ARGS flagging as the OpenAI path: a truncated tool call must
     // reach the agent loop as malformed, not silently execute with empty input.
-    let calls = pending
+    let calls = blocks
+        .pending
         .into_iter()
         .map(|(_, id, name, args)| ToolCall {
             id,
@@ -476,10 +544,10 @@ pub(super) fn anthropic_stream(
         })
         .collect();
     Ok(Reply {
-        text,
+        text: blocks.text,
         calls,
         stop_reason,
         usage,
-        thinking_blocks: thinking.into_iter().map(|(_, b)| b).collect(),
+        thinking_blocks: blocks.thinking.into_iter().map(|(_, b)| b).collect(),
     })
 }

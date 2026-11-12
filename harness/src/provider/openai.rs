@@ -202,21 +202,25 @@ pub(super) fn is_openai_reasoning_model(model: &str) -> bool {
 // like the Anthropic shape. None when the chunk carries no usage object.
 pub(super) fn openai_usage(v: &Value) -> Option<Usage> {
     let u = v.get("usage")?.as_object()?;
-    let prompt = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let count = |k: &str| u.get(k).and_then(Value::as_u64);
     let cached = u
         .get("prompt_tokens_details")
-        .and_then(|d| d["cached_tokens"].as_u64())
-        .unwrap_or(0)
-        .min(prompt);
-    Some(Usage {
+        .and_then(|d| d["cached_tokens"].as_u64());
+    Some(usage_of(
+        count("prompt_tokens").unwrap_or(0),
+        cached,
+        count("completion_tokens").unwrap_or(0),
+    ))
+}
+
+fn usage_of(prompt: u64, cached: Option<u64>, completion: u64) -> Usage {
+    let cached = cached.unwrap_or(0).min(prompt);
+    Usage {
         input: prompt - cached,
-        output: u
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        output: completion,
         cache_read: cached,
         cache_write: 0,
-    })
+    }
 }
 
 // Remove `<think>…</think>` reasoning blocks that local reasoning models
@@ -385,6 +389,120 @@ pub(super) fn flush_think_carry(
     }
 }
 
+// One streamed chunk, with only the fields the parser reads; strings borrow
+// from the line (see `borrowed`). Unknown fields are skipped unparsed.
+#[derive(Deserialize, Default)]
+struct Chunk<'a> {
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    usage: Obj<ChunkUsage>,
+    #[serde(borrow, default)]
+    choices: Option<Vec<Obj<Choice<'a>>>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChunkUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Obj<TokenDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct TokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct Choice<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    finish_reason: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    delta: Obj<Delta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct Delta<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    reasoning_content: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    reasoning: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    content: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    tool_calls: Option<Vec<Obj<CallDelta<'a>>>>,
+}
+
+#[derive(Deserialize, Default)]
+struct CallDelta<'a> {
+    #[serde(default)]
+    index: Option<u64>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    function: Obj<FunctionDelta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct FunctionDelta<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    arguments: Option<Cow<'a, str>>,
+}
+
+impl<'a> Chunk<'a> {
+    // The same fields out of a `Value`, for a chunk the typed read refused:
+    // whatever has an unexpected type counts as absent.
+    fn from_value(v: &'a Value) -> Chunk<'a> {
+        let usage = v.get("usage").and_then(Value::as_object).map(|u| {
+            let count = |k: &str| u.get(k).and_then(Value::as_u64);
+            ChunkUsage {
+                prompt_tokens: count("prompt_tokens"),
+                completion_tokens: count("completion_tokens"),
+                prompt_tokens_details: Obj(Some(TokenDetails {
+                    cached_tokens: u
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d["cached_tokens"].as_u64()),
+                })),
+            }
+        });
+        let choice = &v["choices"][0];
+        let delta = &choice["delta"];
+        let tool_calls = delta["tool_calls"].as_array().map(|tcs| {
+            tcs.iter()
+                .map(|tc| {
+                    Obj(Some(CallDelta {
+                        index: tc["index"].as_u64(),
+                        id: value_str(&tc["id"]),
+                        function: Obj(Some(FunctionDelta {
+                            name: value_str(&tc["function"]["name"]),
+                            arguments: value_str(&tc["function"]["arguments"]),
+                        })),
+                    }))
+                })
+                .collect()
+        });
+        Chunk {
+            error: None,
+            usage: Obj(usage),
+            choices: Some(vec![Obj(Some(Choice {
+                finish_reason: value_str(&choice["finish_reason"]),
+                delta: Obj(Some(Delta {
+                    reasoning_content: value_str(&delta["reasoning_content"]),
+                    reasoning: value_str(&delta["reasoning"]),
+                    content: value_str(&delta["content"]),
+                    tool_calls,
+                })),
+            }))]),
+        }
+    }
+}
+
 pub(super) fn openai_stream(
     reader: impl Read,
     on_text: &mut dyn FnMut(&str),
@@ -402,32 +520,50 @@ pub(super) fn openai_stream(
         if data == "[DONE]" {
             return true;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return false;
+        let tolerant;
+        let chunk = match serde_json::from_str::<Obj<Chunk>>(data) {
+            Ok(Obj(Some(chunk))) if chunk.error.is_none() => chunk,
+            // An {"error": …} chunk, or one with a field of an unexpected
+            // type: read it the tolerant way.
+            _ => {
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    return false;
+                };
+                // vLLM, LiteLLM, OpenRouter and friends report mid-stream
+                // failures as an {"error": …} chunk rather than an HTTP status.
+                if let Some(e) = openai_error(&v) {
+                    stream_err = Some(e);
+                    return true;
+                }
+                tolerant = v;
+                Chunk::from_value(&tolerant)
+            }
         };
-        // vLLM, LiteLLM, OpenRouter and friends report mid-stream failures as
-        // an {"error": …} chunk rather than an HTTP status.
-        if let Some(e) = openai_error(&v) {
-            stream_err = Some(e);
-            return true;
-        }
         // With stream_options.include_usage the final chunk (empty choices)
         // carries the totals; some servers put usage on every chunk instead.
-        if let Some(u) = openai_usage(&v) {
-            usage = u;
+        if let Some(u) = chunk.usage.0 {
+            usage = usage_of(
+                u.prompt_tokens.unwrap_or(0),
+                u.prompt_tokens_details.0.and_then(|d| d.cached_tokens),
+                u.completion_tokens.unwrap_or(0),
+            );
         }
+        let Some(choice) = chunk
+            .choices
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.0)
+        else {
+            return false;
+        };
         // finish_reason rides on the last content-bearing chunk (or one after).
-        if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
+        if let Some(r) = &choice.finish_reason {
             stop_reason = Some(normalize_stop_reason(r));
         }
-        let delta = &v["choices"][0]["delta"];
-        if let Some(r) = delta["reasoning_content"]
-            .as_str()
-            .or_else(|| delta["reasoning"].as_str())
-        {
-            on_thinking(r);
+        let delta = choice.delta.0.unwrap_or_default();
+        if let Some(r) = delta.reasoning_content.or(delta.reasoning) {
+            on_thinking(&r);
         }
-        if let Some(t) = delta["content"].as_str() {
+        if let Some(t) = &delta.content {
             route_openai_content(
                 t,
                 &mut in_think,
@@ -437,26 +573,22 @@ pub(super) fn openai_stream(
                 on_thinking,
             );
         }
-        if let Some(tcs) = delta["tool_calls"].as_array() {
-            for tc in tcs {
-                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                while pending.len() <= idx {
-                    pending.push((String::new(), String::new(), String::new()));
-                }
-                let e = &mut pending[idx];
-                if let Some(id) = tc["id"].as_str() {
-                    if !id.is_empty() {
-                        e.0 = id.to_string();
-                    }
-                }
-                if let Some(name) = tc["function"]["name"].as_str() {
-                    if !name.is_empty() {
-                        e.1 = name.to_string();
-                    }
-                }
-                if let Some(args) = tc["function"]["arguments"].as_str() {
-                    e.2.push_str(args);
-                }
+        for tc in delta.tool_calls.into_iter().flatten() {
+            let tc = tc.0.unwrap_or_default();
+            let idx = tc.index.unwrap_or(0) as usize;
+            while pending.len() <= idx {
+                pending.push((String::new(), String::new(), String::new()));
+            }
+            let e = &mut pending[idx];
+            if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
+                e.0 = id.into_owned();
+            }
+            let function = tc.function.0.unwrap_or_default();
+            if let Some(name) = function.name.filter(|name| !name.is_empty()) {
+                e.1 = name.into_owned();
+            }
+            if let Some(args) = &function.arguments {
+                e.2.push_str(args);
             }
         }
         false
