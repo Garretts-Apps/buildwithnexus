@@ -18,33 +18,59 @@ use buildwithnexus::provider::{Msg, ToolCall, ToolResult};
 use buildwithnexus::tools;
 use buildwithnexus::tools::bench as tbench;
 
-// A long, realistic multi-step conversation: system + alternating
-// user/assistant(+tool_use)/tool turns. This is what the body builders and the
-// cache pass walk on every single agent iteration, so its cost matters.
-fn long_conversation(turns: usize) -> Vec<Msg> {
+// A session as the agent loop sends it: a long system prompt, then turns of
+// user ask → assistant text + read_file call → tool result holding source
+// text (newlines, quotes and indentation to escape) → assistant summary.
+// `result_bytes` sizes each tool result; `image_bytes` is the base64 length
+// of each of the two images (one pasted by the user, one returned by a
+// tool), or 0 for none.
+fn session(turns: usize, result_bytes: usize, image_bytes: usize) -> Vec<Msg> {
+    let source_line =
+        "    let item = lexer.next().expect(\"unexpected end of input\"); // advance\n";
+    let base64 = |n: usize| {
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".repeat(n / 44 + 1)[..n].to_string()
+    };
     let mut msgs = vec![Msg::System(
         "You are an autonomous senior software engineer. Read before you write. \
-         Prefer small, verifiable edits. Call finish when done."
-            .repeat(4),
+         Prefer small, verifiable edits. Call finish when done.\n"
+            .repeat(32),
     )];
     for i in 0..turns {
-        msgs.push(Msg::User(format!(
-            "step {i}: please inspect and modify the project as needed"
-        )));
+        let ask = format!("step {i}: the test for module_{i} fails, find out why and fix it");
+        if image_bytes > 0 && i == turns / 3 {
+            msgs.push(Msg::UserImages {
+                text: ask,
+                images: vec![("image/png".into(), base64(image_bytes))],
+            });
+        } else {
+            msgs.push(Msg::User(ask));
+        }
         msgs.push(Msg::Assistant {
             text: format!("Working on step {i}. Reading the relevant files first."),
             calls: vec![ToolCall {
                 id: format!("call_{i}"),
                 name: "read_file".into(),
-                input: serde_json::json!({"path": format!("src/module_{i}.rs")}),
+                input: serde_json::json!({"path": format!("src/module_{i}.rs"), "limit": 400}),
             }],
         });
+        let images = if image_bytes > 0 && i == 2 * turns / 3 {
+            vec![("image/png".to_string(), base64(image_bytes))]
+        } else {
+            Vec::new()
+        };
         msgs.push(Msg::Tool(vec![ToolResult {
             id: format!("call_{i}"),
-            content: format!("// contents of module {i}\n").repeat(20),
+            content: source_line.repeat(result_bytes / source_line.len() + 1),
             is_error: false,
-            images: Vec::new(),
+            images,
         }]));
+        msgs.push(Msg::Assistant {
+            text: format!(
+                "module_{i} drops the last item when the input ends without a newline. \
+                 I changed the loop to flush the pending item and re-ran the test: it passes."
+            ),
+            calls: vec![],
+        });
     }
     msgs
 }
@@ -83,23 +109,46 @@ fn bench_wrap_cache(c: &mut Criterion) {
     g.finish();
 }
 
-fn bench_body_builders(c: &mut Criterion) {
-    let msgs = long_conversation(30);
+// Msg → the bytes of one streaming request, per protocol, at three session
+// sizes. Tool definitions (the real set, ~23 KB) ride on every request.
+fn bench_request_body(c: &mut Criterion) {
     let defs = tools::defs(true);
-
-    let mut g = c.benchmark_group("body_builders");
-    g.bench_function("anthropic_body/30turns", |b| {
-        b.iter(|| {
-            pbench::anthropic_body(
-                black_box("claude-sonnet-4-6"),
-                black_box(&msgs),
-                black_box(&defs),
-            )
-        })
-    });
-    g.bench_function("openai_body/30turns", |b| {
-        b.iter(|| pbench::openai_body(black_box("gpt-4o"), black_box(&msgs), black_box(&defs)))
-    });
+    let mut g = c.benchmark_group("request_body");
+    for (label, msgs) in [
+        ("30turns_50kb", session(30, 330, 0)),
+        ("120turns_1.4mb", session(120, 8_100, 150_000)),
+        ("300turns_4.6mb", session(300, 11_200, 450_000)),
+    ] {
+        let wire = pbench::anthropic_request_bytes("claude-sonnet-4-5", &msgs, &defs).len();
+        g.throughput(Throughput::Bytes(wire as u64));
+        g.bench_function(format!("anthropic/{label}"), |b| {
+            b.iter(|| {
+                pbench::anthropic_request_bytes(
+                    black_box("claude-sonnet-4-5"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+        g.bench_function(format!("openai/{label}"), |b| {
+            b.iter(|| {
+                pbench::openai_request_bytes(
+                    black_box("gpt-4o"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+        g.bench_function(format!("ollama/{label}"), |b| {
+            b.iter(|| {
+                pbench::ollama_request_bytes(
+                    black_box("qwen3:8b"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+    }
     g.finish();
 }
 
@@ -157,6 +206,35 @@ fn bench_sse_parse(c: &mut Criterion) {
             let mut sink = |_: &str| {};
             let mut think_sink = |_: &str| {};
             let _ = pbench::openai_stream(
+                black_box(Cursor::new(sse.as_bytes())),
+                &mut sink,
+                &mut think_sink,
+            );
+        })
+    });
+    // The Anthropic event stream for the same shape of reply.
+    let mut sse = String::from(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":900,\"output_tokens\":1}}}\n\n\
+         event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    for i in 0..2000 {
+        sse.push_str(&format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"tok{i} \"}}}}\n\n"
+        ));
+    }
+    sse.push_str(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"finish\",\"input\":{}}}\n\n\
+         event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"summary\\\"\"}}\n\n\
+         event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\":\\\"done\\\"}\"}}\n\n\
+         event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2100}}\n\n\
+         event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    g.throughput(Throughput::Bytes(sse.len() as u64));
+    g.bench_function("anthropic_stream/2000deltas", |b| {
+        b.iter(|| {
+            let mut sink = |_: &str| {};
+            let mut think_sink = |_: &str| {};
+            let _ = pbench::anthropic_stream(
                 black_box(Cursor::new(sse.as_bytes())),
                 &mut sink,
                 &mut think_sink,
@@ -294,7 +372,7 @@ criterion_group!(
     benches,
     bench_tool_batch,
     bench_wrap_cache,
-    bench_body_builders,
+    bench_request_body,
     bench_cache_pass,
     bench_redact,
     bench_parse_args,

@@ -173,6 +173,41 @@ pub mod bench {
     ) -> Result<Reply, String> {
         super::openai_stream(reader, on_text, on_thinking)
     }
+    pub fn anthropic_stream(
+        reader: impl Read,
+        on_text: &mut dyn FnMut(&str),
+        on_thinking: &mut dyn FnMut(&str),
+    ) -> Result<Reply, String> {
+        super::anthropic_stream(reader, on_text, on_thinking)
+    }
+    // The bytes a streaming request puts on the wire, built the way the
+    // request path builds them (including the copies it makes on the way).
+    pub fn anthropic_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
+        let mut body = super::anthropic_body(model, msgs, tools, None);
+        super::apply_anthropic_effort(&mut body, model, Effort::Off);
+        body["stream"] = json!(true);
+        // send_raw_blocking clones the body for each attempt.
+        let attempt = body.clone();
+        serde_json::to_vec(&attempt).unwrap_or_default()
+    }
+    pub fn openai_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
+        let mut body = super::openai_body(model, msgs, tools, None, None);
+        super::apply_openai_effort(&mut body, model, Effort::Off);
+        super::mark_streaming(&mut body);
+        // openai_exchange keeps a copy for the flatten fallback, and
+        // send_raw_blocking clones again for each attempt.
+        let sent = body.clone();
+        let attempt = sent.clone();
+        serde_json::to_vec(&attempt).unwrap_or_default()
+    }
+    pub fn ollama_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
+        let mut body = super::ollama_body(model, msgs, tools, None, None, 32_768);
+        super::apply_ollama_effort(&mut body, Effort::Off);
+        body["stream"] = json!(true);
+        let sent = body.clone();
+        let attempt = sent.clone();
+        serde_json::to_vec(&attempt).unwrap_or_default()
+    }
 }
 
 // Ollama's native API lives at the host root; tolerate both a bare host base
@@ -1899,3 +1934,5 @@ use openai::*;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
