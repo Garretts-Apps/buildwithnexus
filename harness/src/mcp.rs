@@ -600,7 +600,7 @@ pub struct HttpConn {
     url: String,
     headers: Vec<(String, String)>,
     session_id: Option<String>,
-    agent: ureq::Agent,
+    agent: crate::net::Agent,
     next_id: u64,
     // OAuth for a server whose settings send no Authorization header.
     auth: Option<crate::mcp_auth::Session>,
@@ -641,7 +641,7 @@ impl HttpConn {
         }
     }
 
-    fn post(&mut self, body: &Value) -> Result<ureq::Response, RpcError> {
+    fn post(&mut self, body: &Value) -> Result<crate::net::Response, RpcError> {
         let mut retried = false;
         loop {
             let bearer = self.auth.as_mut().and_then(|a| a.bearer());
@@ -665,7 +665,7 @@ impl HttpConn {
                 // A login is what is missing when a token was refused or
                 // the server asks for one; any other 401 (an API key the
                 // settings lack) is reported as it came.
-                Err(ureq::Error::Status(401, r))
+                Err(crate::net::Error::Status(401, r))
                     if self.auth.is_some() && (bearer.is_some() || asks_for_bearer(&r)) =>
                 {
                     let auth = self.auth.as_mut().expect("checked above");
@@ -675,7 +675,7 @@ impl HttpConn {
                     }
                     return Err(RpcError::Unauthorized(auth.login_reason()));
                 }
-                Err(ureq::Error::Status(code, r)) => {
+                Err(crate::net::Error::Status(code, r)) => {
                     let text = r.into_string().unwrap_or_default();
                     let snippet: String = text.chars().take(200).collect();
                     let hint = if code == 404 && self.session_id.is_some() {
@@ -687,7 +687,7 @@ impl HttpConn {
                         self.scrub(&format!("HTTP {code}{hint}: {}", snippet.trim())),
                     ));
                 }
-                Err(ureq::Error::Transport(t)) => {
+                Err(crate::net::Error::Transport(t)) => {
                     return Err(RpcError::Transport(self.scrub(&format!("{t}"))));
                 }
             };
@@ -699,7 +699,7 @@ impl HttpConn {
     }
 }
 
-fn asks_for_bearer(r: &ureq::Response) -> bool {
+fn asks_for_bearer(r: &crate::net::Response) -> bool {
     r.all("www-authenticate").iter().any(|h| {
         h.split(|c: char| c == ',' || c.is_whitespace())
             .any(|w| w.eq_ignore_ascii_case("bearer"))

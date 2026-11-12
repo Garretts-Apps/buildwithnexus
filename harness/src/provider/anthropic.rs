@@ -4,7 +4,7 @@ use super::*;
 
 // Pure request-body builder, split out from the HTTP wiring so the JSON shape
 // (system caching, tool schema mapping, tool_use/tool_result, the last-message
-// cache breakpoint) is unit-testable without constructing a `ureq::Request`.
+// cache breakpoint) is unit-testable without constructing a `crate::net::Request`.
 pub(super) fn anthropic_body(
     model: &str,
     msgs: &[Msg],
@@ -139,7 +139,7 @@ pub(super) fn anthropic_request(
     p: &Provider,
     msgs: &[Msg],
     tools: &[ToolDef],
-) -> Result<(ureq::Request, Value), String> {
+) -> Result<(crate::net::Request, Value), String> {
     let mut body = anthropic_body(&p.model, msgs, tools, p.max_tokens);
     apply_anthropic_effort(&mut body, &p.model, p.effort);
     let key = p

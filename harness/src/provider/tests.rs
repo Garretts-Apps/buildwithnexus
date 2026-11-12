@@ -365,15 +365,23 @@ fn definitive_failures_are_not_retried() {
     std::env::remove_var("BWN_MAX_RETRIES");
 }
 
-// A one-shot proxy that answers its first request with `reply`.
+// A one-shot proxy that answers its first request with `reply`. It reads
+// the whole request head first (ureq writes a CONNECT line by line), so
+// closing does not reset a connection with unread data in it.
 fn proxy_answering(reply: &'static str) -> u16 {
     use std::io::{Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     std::thread::spawn(move || {
         if let Ok((mut s, _)) = l.accept() {
+            let mut head = Vec::new();
             let mut buf = [0u8; 4096];
-            let _ = s.read(&mut buf);
+            while !head.ends_with(b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
             let _ = s.write_all(reply.as_bytes());
         }
     });

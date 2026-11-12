@@ -2742,8 +2742,8 @@ fn wait_for_url(input: &Value) -> Outcome {
                 )
             }
             Err(WebError::Blocked(why)) => return err(why),
-            Err(WebError::Http(e)) if matches!(*e, ureq::Error::Status(..)) => {
-                let ureq::Error::Status(status, resp) = *e else {
+            Err(WebError::Http(e)) if matches!(*e, crate::net::Error::Status(..)) => {
+                let crate::net::Error::Status(status, resp) = *e else {
                     unreachable!()
                 };
                 let body = resp.into_string().unwrap_or_default();
@@ -4708,7 +4708,7 @@ fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
     // error page. One request, no redirects followed.
     let status = match web_client().get(url).call() {
         Ok(r) => r.status(),
-        Err(ureq::Error::Status(code, _)) => code,
+        Err(crate::net::Error::Status(code, _)) => code,
         Err(e) => {
             return err(format!(
                 "nothing answered at {url} ({e}). Start the server first (start_server), wait for \

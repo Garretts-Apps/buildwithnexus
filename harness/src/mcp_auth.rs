@@ -676,7 +676,7 @@ fn http() -> crate::net::Client {
     crate::net::Client::new(|b| b.timeout(HTTP_TIMEOUT).redirects(0))
 }
 
-fn transport_error(url: &str, e: &ureq::Error) -> String {
+fn transport_error(url: &str, e: &crate::net::Error) -> String {
     if let Some(hint) = crate::net::cert_error_hint(e) {
         return format!("{url}: {hint}");
     }
@@ -685,10 +685,13 @@ fn transport_error(url: &str, e: &ureq::Error) -> String {
 
 // Status and JSON body of an answer, error statuses included; Err only when
 // nothing usable came back.
-fn json_reply(url: &str, r: Result<ureq::Response, ureq::Error>) -> Result<(u16, Value), String> {
+fn json_reply(
+    url: &str,
+    r: Result<crate::net::Response, crate::net::Error>,
+) -> Result<(u16, Value), String> {
     let resp = match r {
         Ok(r) => r,
-        Err(ureq::Error::Status(_, r)) => r,
+        Err(crate::net::Error::Status(_, r)) => r,
         Err(e) => return Err(transport_error(url, &e)),
     };
     let status = resp.status();
@@ -732,7 +735,7 @@ fn probe(client: &crate::net::Client, mcp_url: &str) -> Result<(u16, Challenge),
         .send_string(&body.to_string());
     let resp = match r {
         Ok(r) => r,
-        Err(ureq::Error::Status(_, r)) => r,
+        Err(crate::net::Error::Status(_, r)) => r,
         Err(e) => return Err(transport_error(mcp_url, &e)),
     };
     let challenge = resp
@@ -1070,10 +1073,10 @@ pub fn wait_for_callback(
 // itself in the form; a secret goes in a Basic header (RFC 6749 §2.3.1)
 // unless the client was set up for client_secret_post.
 fn authenticate(
-    req: ureq::Request,
+    req: crate::net::Request,
     client: &Client,
     form: &mut Vec<(&'static str, String)>,
-) -> ureq::Request {
+) -> crate::net::Request {
     match &client.secret {
         Some(secret) if client.auth_method.as_deref() == Some("client_secret_post") => {
             form.push(("client_id", client.id.clone()));
@@ -1400,7 +1403,7 @@ fn token_request_status(
     let pairs: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
     match req.send_form(&pairs) {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(crate::net::Error::Status(code, _)) => Err(format!("HTTP {code}")),
         Err(e) => Err(transport_error(endpoint, &e)),
     }
 }

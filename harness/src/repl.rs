@@ -2129,7 +2129,7 @@ pub(super) fn find_active_local_base_url_in(candidates: &[&str]) -> Option<Strin
                 .call()
                 .ok()
         };
-        let json = |res: &ureq::Response| {
+        let json = |res: &crate::net::Response| {
             res.status() < 500
                 && res
                     .header("content-type")

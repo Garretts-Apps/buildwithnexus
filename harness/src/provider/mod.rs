@@ -853,7 +853,7 @@ fn mark_streaming(body: &mut Value) {
 // once with the flattened, tool-less body and remember the endpoint so the
 // rest of the session skips the failing attempt.
 fn openai_exchange(
-    req: ureq::Request,
+    req: crate::net::Request,
     mut body: Value,
     streaming: bool,
     on_text: &mut dyn FnMut(&str),
@@ -892,7 +892,7 @@ fn openai_exchange(
 // the rest of the session skips the failing attempt.
 fn ollama_exchange(
     p: &Provider,
-    req: ureq::Request,
+    req: crate::net::Request,
     mut body: Value,
     streaming: bool,
     on_text: &mut dyn FnMut(&str),
@@ -963,7 +963,7 @@ type StreamParser =
 /// Reads a model reply with the protocol's own parser: its stream parser
 /// over an interruptible reader when streaming, else its JSON parser.
 fn finish(
-    resp: ureq::Response,
+    resp: crate::net::Response,
     streaming: bool,
     (stream, parse): Parsers,
     on_text: &mut dyn FnMut(&str),
@@ -1172,11 +1172,14 @@ impl Read for InterruptibleReader {
     }
 }
 
-fn send_raw(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
+fn send_raw(req: crate::net::Request, body: Value) -> Result<crate::net::Response, String> {
     interruptible(move || send_raw_blocking(req, body))?
 }
 
-fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, String> {
+fn send_raw_blocking(
+    req: crate::net::Request,
+    body: Value,
+) -> Result<crate::net::Response, String> {
     let mut retries = 0;
     let mut delay_ms = 500;
     // A proxy URL bwn cannot use fails every attempt the same way.
@@ -1201,7 +1204,7 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
                 ));
             }
             Ok(resp) => return Ok(resp),
-            Err(ureq::Error::Status(code, resp)) => {
+            Err(crate::net::Error::Status(code, resp)) => {
                 let server_wait = retry_after_ms(resp.header("retry-after"));
                 let detail = resp.into_string().unwrap_or_default();
                 let budget = retries_for(code, &detail);
@@ -1270,30 +1273,30 @@ fn send_raw_blocking(req: ureq::Request, body: Value) -> Result<ureq::Response, 
 fn proxy_failure(
     url: &str,
     r: &crate::net::ProxyRoute,
-    e: &ureq::Error,
+    e: &crate::net::Error,
     kind: Option<std::io::ErrorKind>,
 ) -> String {
     let (target, host) = target_of(url);
     let named = format!("the proxy in {} ({})", r.var, r.shown);
-    let ureq::Error::Transport(t) = e else {
+    let crate::net::Error::Transport(t) = e else {
         return transport_failure(url, e, kind);
     };
     match t.kind() {
-        ureq::ErrorKind::ProxyUnauthorized => proxy_credentials_msg(r),
-        ureq::ErrorKind::ProxyConnect => format!(
+        crate::net::ErrorKind::ProxyUnauthorized => proxy_credentials_msg(r),
+        crate::net::ErrorKind::ProxyConnect => format!(
             "{named} would not connect to {target} — if {host} is on your network, add it to NO_PROXY"
         ),
-        ureq::ErrorKind::ConnectionFailed
+        crate::net::ErrorKind::ConnectionFailed
             if kind == Some(std::io::ErrorKind::ConnectionRefused) =>
         {
             format!(
                 "{named} refused the connection — is it running (VPN connected)? To reach {host} without it, add {host} to NO_PROXY"
             )
         }
-        ureq::ErrorKind::ConnectionFailed => format!(
+        crate::net::ErrorKind::ConnectionFailed => format!(
             "{named} did not answer — is it running and reachable? To reach {host} without it, add {host} to NO_PROXY"
         ),
-        ureq::ErrorKind::Dns => {
+        crate::net::ErrorKind::Dns => {
             format!("{named} could not be found — check the host name in {}", r.var)
         }
         _ => format!("{}\n  through {named}", transport_failure(url, e, kind)),
@@ -1326,14 +1329,14 @@ fn target_of(url: &str) -> (String, String) {
     }
 }
 
-fn transport_retryable(e: &ureq::Error) -> bool {
-    matches!(e, ureq::Error::Transport(t)
-        if matches!(t.kind(), ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Dns))
+fn transport_retryable(e: &crate::net::Error) -> bool {
+    matches!(e, crate::net::Error::Transport(t)
+        if matches!(t.kind(), crate::net::ErrorKind::ConnectionFailed | crate::net::ErrorKind::Dns))
 }
 
 // The io::Error under a transport failure (refused, timed out, …), found by
 // walking the source chain ureq wraps it in.
-fn io_kind(e: &ureq::Error) -> Option<std::io::ErrorKind> {
+fn io_kind(e: &crate::net::Error) -> Option<std::io::ErrorKind> {
     let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
     while let Some(s) = src {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
@@ -1346,11 +1349,10 @@ fn io_kind(e: &ureq::Error) -> Option<std::io::ErrorKind> {
 
 // What a transport failure means and what to do about it. Library text
 // ("Network Error: … status line") stays only as the last resort.
-fn transport_failure(url: &str, e: &ureq::Error, kind: Option<std::io::ErrorKind>) -> String {
+fn transport_failure(url: &str, e: &crate::net::Error, kind: Option<std::io::ErrorKind>) -> String {
     use std::io::ErrorKind;
     let text = e.to_string();
-    let failed_to_connect =
-        matches!(e, ureq::Error::Transport(t) if t.kind() == ureq::ErrorKind::ConnectionFailed);
+    let failed_to_connect = matches!(e, crate::net::Error::Transport(t) if t.kind() == crate::net::ErrorKind::ConnectionFailed);
     match kind {
         Some(ErrorKind::ConnectionRefused) if failed_to_connect => server_down_msg(url),
         Some(ErrorKind::TimedOut | ErrorKind::WouldBlock) if failed_to_connect => format!(
