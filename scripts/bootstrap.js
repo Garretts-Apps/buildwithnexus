@@ -6,7 +6,10 @@
 // SHA-256 doesn't match the published checksum.
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const https = require('https');
+const net = require('net');
+const tls = require('tls');
 const crypto = require('crypto');
 const { pipeline } = require('stream');
 const {
@@ -30,18 +33,161 @@ function allowedHost(u) {
   return h === 'github.com' || h === 'objects.githubusercontent.com' || h.endsWith('.githubusercontent.com');
 }
 
+// ── proxy ──────────────────────────────────────────────────────────────────
+// Node's https module ignores HTTPS_PROXY unless Node 22.21+/24.5+ is told
+// to use it, so otherwise the launcher opens the CONNECT tunnel itself. TLS
+// still runs end to end with GitHub inside the tunnel, with Node's usual
+// certificate checks (and NODE_EXTRA_CA_CERTS).
+
+const PROXY_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+const NO_PROXY_VARS = ['NO_PROXY', 'no_proxy'];
+
+// NODE_USE_ENV_PROXY=1 makes the https module use HTTPS_PROXY/NO_PROXY from
+// Node 22.21 and 24.5 on (checked on 22.20/22.21, 23.11, 24.4/24.5, 25, 26).
+function envProxySupported(version = process.versions.node) {
+  const [major, minor] = version.split('.').map(Number);
+  return major >= 25 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
+}
+
+// Node sends https requests through the proxy itself; tunnelling here too
+// would proxy twice.
+function nodeHandlesProxy(env = process.env, version = process.versions.node) {
+  const asked = env.NODE_USE_ENV_PROXY === '1' || /(^|\s)--use-env-proxy(\s|$)/.test(env.NODE_OPTIONS || '') ||
+    process.execArgv.includes('--use-env-proxy');
+  return asked && envProxySupported(version);
+}
+
+function firstSet(env, names) {
+  const name = names.find((k) => env[k]);
+  return name ? { name, value: env[name] } : null;
+}
+
+// Does a NO_PROXY list (as curl and npm read it) exempt host:port? Entries
+// are separated by commas or spaces. `*` matches everything; `example.com`,
+// `.example.com` and `*.example.com` match that domain and its subdomains;
+// `host:port` (or `[v6]:port`) only that port. IP addresses match exactly.
+function noProxyMatch(host, port, list) {
+  host = String(host).toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  for (let entry of String(list || '').split(/[\s,]+/)) {
+    entry = entry.toLowerCase();
+    if (!entry) continue;
+    if (entry === '*') return true;
+    let entryPort;
+    const v6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(entry);
+    if (v6) {
+      [, entry, entryPort] = v6;
+    } else if (/^[^:]+:\d+$/.test(entry)) {
+      [entry, entryPort] = entry.split(':');
+    }
+    if (entryPort && Number(entryPort) !== Number(port)) continue;
+    entry = entry.replace(/^\*?\./, '').replace(/\.$/, '');
+    if (!entry) continue;
+    if (host === entry || (!net.isIP(host) && host.endsWith(`.${entry}`))) return true;
+  }
+  return false;
+}
+
+function proxyError(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+// How to reach host:port. `proxy` is null for a direct connection (`node`:
+// Node proxies it itself; `bypass`: NO_PROXY matched), else the proxy to
+// tunnel through. `display` is the proxy's host:port: credentials are never
+// shown.
+function proxyRoute(host, port = 443, env = process.env) {
+  if (nodeHandlesProxy(env)) return { proxy: null, node: true };
+  const set = firstSet(env, PROXY_VARS);
+  if (!set) return { proxy: null };
+  const noProxy = firstSet(env, NO_PROXY_VARS);
+  if (noProxy && noProxyMatch(host, port, noProxy.value)) return { proxy: null, var: set.name, bypass: noProxy.name };
+  const raw = set.value.trim();
+  let u;
+  try {
+    // curl and npm take a bare host:port as an http:// proxy.
+    u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+  } catch {
+    throw proxyError(`${set.name} is not a valid proxy URL`, 'BWN_PROXY_URL');
+  }
+  if (u.protocol !== 'http:' || !u.hostname) {
+    throw proxyError(`${set.name} is a ${u.protocol.slice(0, -1)}:// URL (${u.host}), but the launcher only ` +
+      'connects to http:// proxies', 'BWN_PROXY_URL');
+  }
+  const decode = (s) => {
+    try { return decodeURIComponent(s); } catch { return s; }
+  };
+  const hostname = u.hostname.replace(/^\[|\]$/g, '');
+  const proxyPort = Number(u.port) || 80;
+  return {
+    var: set.name,
+    proxy: { hostname, port: proxyPort, auth: u.username || u.password ? `${decode(u.username)}:${decode(u.password)}` : null },
+    display: `${net.isIPv6(hostname) ? `[${hostname}]` : hostname}:${proxyPort}`,
+  };
+}
+
+function proxyAuthorization(auth) {
+  return `Basic ${Buffer.from(auth, 'utf8').toString('base64')}`;
+}
+
+// Asks the proxy for a tunnel to host:port. Returns the CONNECT request (to
+// destroy on a stall) and a promise of the tunnel's socket.
+function openTunnel(route, host, port, onActivity = () => {}) {
+  const { proxy } = route;
+  const who = `proxy ${route.display} (${route.var})`;
+  const headers = { host: `${host}:${port}`, 'user-agent': 'buildwithnexus-installer' };
+  if (proxy.auth) headers['proxy-authorization'] = proxyAuthorization(proxy.auth);
+  const req = http.request({
+    host: proxy.hostname, port: proxy.port, method: 'CONNECT', path: `${host}:${port}`, headers, agent: false,
+  });
+  const refused = (status, text) => (status === 407
+    ? proxyError(proxy.auth
+      ? `${who} rejected the credentials in ${route.var} (HTTP 407)`
+      : `${who} needs credentials (HTTP 407 Proxy Authentication Required)`, 'BWN_PROXY_AUTH')
+    : proxyError(`${who} refused the tunnel to ${host}:${port} (HTTP ${status}${text ? ` ${text}` : ''})`,
+      'BWN_PROXY_REFUSED'));
+  const socket = new Promise((resolve, reject) => {
+    req.on('connect', (res, sock, head) => {
+      onActivity();
+      if (res.statusCode !== 200) {
+        sock.destroy();
+        return reject(refused(res.statusCode, res.statusMessage));
+      }
+      if (head && head.length) sock.unshift(head);
+      resolve(sock);
+    });
+    req.on('error', (e) => {
+      if (!e.bwnStall) e.message = `${who}: ${e.message}`;
+      reject(e);
+    });
+  });
+  req.end();
+  return { req, socket };
+}
+
 function get(url, redirects, onResponse) {
   return new Promise((resolve, reject) => {
     if (redirects > 5) return reject(new Error('too many redirects'));
     if (!allowedHost(url)) return reject(new Error(`refusing non-GitHub host ${new URL(url).host}`));
+    const target = new URL(url);
+    const port = Number(target.port) || 443;
+    let route;
+    try {
+      route = proxyRoute(target.hostname, port);
+    } catch (e) {
+      return reject(e);
+    }
     let response;
+    let req;
+    let tunnel;
     let timer;
     const stalled = () => {
+      const who = req ? target.host : `proxy ${route.display} (${route.var})`;
       const e = Object.assign(
-        new Error(`no response from ${new URL(url).host} for ${IDLE_TIMEOUT_MS / 1000} s`), { code: 'ETIMEDOUT' });
+        new Error(`no response from ${who} for ${IDLE_TIMEOUT_MS / 1000} s`), { code: 'ETIMEDOUT', bwnStall: true });
       // Fail the body stream with this error too, not a bare "aborted".
       if (response) response.destroy(e);
-      req.destroy(e);
+      if (req) req.destroy(e);
+      else tunnel.req.destroy(e);
     };
     // Restarted by every chunk. The request's own timeout option (still set:
     // Node's proxy tunnel uses it) waits twice as long on a stuck TLS handshake.
@@ -49,31 +195,42 @@ function get(url, redirects, onResponse) {
       clearTimeout(timer);
       timer = setTimeout(stalled, IDLE_TIMEOUT_MS);
     };
-    const req = https.get(url, {
-      headers: { 'user-agent': 'buildwithnexus-installer' },
-      timeout: IDLE_TIMEOUT_MS,
-    }, (res) => {
-      response = res;
-      wait();
-      res.on('data', wait);
-      res.on('close', () => clearTimeout(timer));
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        const next = new URL(res.headers.location, url).toString();
-        return resolve(get(next, redirects + 1, onResponse));
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode} from ${new URL(url).host}`));
-      }
-      onResponse(res, resolve, reject);
-    });
-    wait();
-    req.on('timeout', stalled);
-    req.on('error', (e) => {
+    const fail = (e) => {
       clearTimeout(timer);
       reject(e);
-    });
+    };
+    const start = (createConnection) => {
+      const options = { headers: { 'user-agent': 'buildwithnexus-installer' }, timeout: IDLE_TIMEOUT_MS };
+      // With no agent, Node would otherwise send "Host: github.com:443".
+      if (createConnection) Object.assign(options, { createConnection, defaultPort: 443 });
+      req = https.get(url, options, (res) => {
+        response = res;
+        wait();
+        res.on('data', wait);
+        res.on('close', () => clearTimeout(timer));
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const next = new URL(res.headers.location, url).toString();
+          return resolve(get(next, redirects + 1, onResponse));
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode} from ${target.host}`));
+        }
+        onResponse(res, resolve, reject);
+      });
+      req.on('timeout', stalled);
+      req.on('error', fail);
+    };
+    wait();
+    if (!route.proxy) return start();
+    tunnel = openTunnel(route, target.hostname, port, wait);
+    tunnel.socket.then((socket) => {
+      // TLS with GitHub itself, inside the tunnel: the certificate is checked
+      // for this host name as on a direct connection.
+      const secure = tls.connect({ socket, servername: net.isIP(target.hostname) ? undefined : target.hostname });
+      start(() => secure);
+    }, fail);
   });
 }
 
@@ -201,35 +358,45 @@ const NETWORK_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNR
 const TLS_CODES = new Set(['SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
   'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'CERT_UNTRUSTED']);
 
-// NODE_USE_ENV_PROXY=1 makes the https module use HTTPS_PROXY/NO_PROXY from
-// Node 22.21 and 24.5 on (checked on 22.20/22.21, 23.11, 24.4/24.5, 25, 26).
-function envProxySupported(version = process.versions.node) {
-  const [major, minor] = version.split('.').map(Number);
-  return major >= 25 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
-}
+const PROXY_HOSTS = 'github.com and objects.githubusercontent.com';
 
-function proxyHint(win) {
-  const proxyVar = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'].find((k) => process.env[k]);
-  const node = `Node ${process.versions.node}`;
-  if (process.env.NODE_USE_ENV_PROXY === '1' && envProxySupported()) {
+// Which proxy the download used, if any, and how to set one.
+function proxyHint(win, env = process.env) {
+  let route;
+  try {
+    route = proxyRoute('github.com', 443, env);
+  } catch {
+    return []; // a bad proxy URL is the error itself, already explained
+  }
+  const proxyVar = (firstSet(env, PROXY_VARS) || {}).name;
+  if (route.node) {
     return [proxyVar
-      ? `  It went through the proxy in ${proxyVar}; check that the proxy allows github.com.`
+      ? `  Node sent it through the proxy in ${proxyVar}; check that the proxy allows ${PROXY_HOSTS}.`
       : '  If this network needs a proxy, set HTTPS_PROXY to it.'];
   }
-  const lines = [proxyVar
-    ? `  ${proxyVar} is set, but Node's https module ignores it unless NODE_USE_ENV_PROXY=1 is set too.`
-    : "  If this network needs a proxy: Node's https module uses HTTPS_PROXY only with NODE_USE_ENV_PROXY=1."];
-  if (!envProxySupported()) {
-    lines.push(`  Only Node 22.21+ and 24.5+ support that (this is ${node}), so this Node cannot`,
-      '  download through a proxy.');
-  } else if (win) {
-    lines.push(`  ${node} supports it. In PowerShell:`,
-      `    ${proxyVar ? '' : "$env:HTTPS_PROXY = 'http://<proxy>:<port>'; "}$env:NODE_USE_ENV_PROXY = '1'; bwn --bootstrap`);
-  } else {
-    lines.push(`  ${node} supports it:`,
-      `    ${proxyVar ? '' : 'HTTPS_PROXY=http://<proxy>:<port> '}NODE_USE_ENV_PROXY=1 bwn --bootstrap`);
+  if (route.proxy) return [`  It went through the proxy in ${route.var} (${route.display}); check that it allows ${PROXY_HOSTS}.`];
+  if (route.bypass) {
+    return [`  ${route.var} is set, but ${route.bypass} matches github.com, so the launcher connected directly.`];
   }
-  return lines;
+  return ['  If this network needs a proxy, set HTTPS_PROXY to its http:// URL (user:password@ if it needs a login):',
+    win ? "    $env:HTTPS_PROXY = 'http://<proxy>:<port>'; bwn --bootstrap" : '    HTTPS_PROXY=http://<proxy>:<port> bwn --bootstrap'];
+}
+
+// What to do about a proxy that answered but would not open the tunnel.
+function proxyAdvice(code, win) {
+  if (code === 'BWN_PROXY_AUTH') {
+    return ['  Put the proxy user name and password in the proxy URL, percent-encoding @ : / % in them:',
+      win ? "    $env:HTTPS_PROXY = 'http://<user>:<password>@<proxy>:<port>'; bwn --bootstrap"
+        : "    HTTPS_PROXY='http://<user>:<password>@<proxy>:<port>' bwn --bootstrap"];
+  }
+  if (code === 'BWN_PROXY_REFUSED') {
+    return [`  Ask for ${PROXY_HOSTS} to be allowed through the proxy, or, if this`,
+      '  network reaches GitHub without it, add github.com,githubusercontent.com to NO_PROXY.'];
+  }
+  if (code === 'BWN_PROXY_URL') {
+    return ['  Set it to the http:// URL of the proxy, for example http://<proxy>:<port>. The tunnel to', '  GitHub is TLS either way.'];
+  }
+  return [];
 }
 
 // Why nothing was installed, and what to do about it.
@@ -237,15 +404,18 @@ function downloadFailure(e) {
   const code = e && e.code;
   const msg = (e && e.message) || String(e);
   const win = process.platform === 'win32';
-  const out = [`buildwithnexus: could not download the prebuilt binary: ${msg}${code && !msg.includes(code) ? ` (${code})` : ''}.`];
+  const shown = code && !msg.includes(code) && !String(code).startsWith('BWN_') ? ` (${code})` : '';
+  const out = [`buildwithnexus: could not download the prebuilt binary: ${msg}${shown}.`];
   if (TLS_CODES.has(code)) {
     out.push('  The connection was not trusted. A proxy that inspects TLS does this: point');
     out.push("  NODE_EXTRA_CA_CERTS at your organization's root certificate (a PEM file).");
   }
+  out.push(...proxyAdvice(code, win));
   if (NETWORK_CODES.has(code) || TLS_CODES.has(code)) out.push(...proxyHint(win));
   out.push('  To try again:  bwn --bootstrap');
   out.push(`  Other ways to install (source build and BWN_BIN): ${DOCS_URL}`);
-  return out.join('\n') + '\n';
+  // No message above includes a proxy URL; this keeps it that way.
+  return out.join('\n').replace(/(\/\/)(?!<)[^/@\s]+@/g, '$1***@') + '\n';
 }
 
 // Colour only for a terminal, and not when NO_COLOR asks for none: piped
@@ -278,32 +448,41 @@ function explained(text) {
   process.exit(EXIT_EXPLAINED);
 }
 
-obtain()
-  .then((r) => {
-    const { checkInstalled, diagnose } = require('./diagnose.js');
-    if (r.removed) {
-      explained(diagnose({
-        bin: installedBinary(), vanished: true, verified: true, sha256: r.removed, expectedVersion: pkg.version,
-      }).text);
-    }
-    if (r.unsupported) explained(r.unsupported.text);
-    if (r.error) explained(downloadFailure(r.error));
-    if (r.installed) {
-      // "Verified" only means the download is intact. Say "ready" only once
-      // it has run: a glibc too old, musl, or endpoint protection all show up
-      // here, and each gets its own explanation instead of a raw error later.
-      let problem;
-      try {
-        problem = checkInstalled(installedBinary(), pkg.version, { sha256: r.installed });
-      } catch (e) {
-        problem = { text: `buildwithnexus: could not check the installed binary: ${e.message}\n` };
+// The tests load the proxy helpers without running a download.
+module.exports = {
+  noProxyMatch, proxyRoute, proxyAuthorization, openTunnel, proxyHint, envProxySupported, nodeHandlesProxy,
+};
+
+if (require.main === module) main();
+
+function main() {
+  obtain()
+    .then((r) => {
+      const { checkInstalled, diagnose } = require('./diagnose.js');
+      if (r.removed) {
+        explained(diagnose({
+          bin: installedBinary(), vanished: true, verified: true, sha256: r.removed, expectedVersion: pkg.version,
+        }).text);
       }
-      if (problem) explained(problem.text);
-      // It runs. Older versions' binaries are no longer needed (~6 MB each).
-      if (process.env.BWN_INSTALL_IN_PACKAGE !== '1') pruneOldVersions(pkg.version);
-    }
-    const ok = Boolean(r.installed || r.present);
-    walkthrough(ok);
-    process.exit(ok ? 0 : 1);
-  })
-  .catch((e) => explained(`buildwithnexus: first-run setup failed: ${e.message}\n  Docs: ${DOCS_URL}\n`));
+      if (r.unsupported) explained(r.unsupported.text);
+      if (r.error) explained(downloadFailure(r.error));
+      if (r.installed) {
+        // "Verified" only means the download is intact. Say "ready" only once
+        // it has run: a glibc too old, musl, or endpoint protection all show up
+        // here, and each gets its own explanation instead of a raw error later.
+        let problem;
+        try {
+          problem = checkInstalled(installedBinary(), pkg.version, { sha256: r.installed });
+        } catch (e) {
+          problem = { text: `buildwithnexus: could not check the installed binary: ${e.message}\n` };
+        }
+        if (problem) explained(problem.text);
+        // It runs. Older versions' binaries are no longer needed (~6 MB each).
+        if (process.env.BWN_INSTALL_IN_PACKAGE !== '1') pruneOldVersions(pkg.version);
+      }
+      const ok = Boolean(r.installed || r.present);
+      walkthrough(ok);
+      process.exit(ok ? 0 : 1);
+    })
+    .catch((e) => explained(`buildwithnexus: first-run setup failed: ${e.message}\n  Docs: ${DOCS_URL}\n`));
+}

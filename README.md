@@ -1295,6 +1295,16 @@ settings.
 To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
 `BWN_TLS_ROOTS=bundled` (bundled roots only).
 
+The npm launcher's first-run download uses the same variables on every
+supported Node (18 and later): `HTTPS_PROXY` or `HTTP_PROXY` (an `http://`
+URL, optionally with `user:password@`, percent-encoded), and `NO_PROXY` with
+`*`, domains (which also cover their subdomains) and `host:port`. It tunnels
+through the proxy to GitHub, and TLS is checked against GitHub's certificate
+as on a direct connection: if the proxy inspects TLS, point
+`NODE_EXTRA_CA_CERTS` at its root certificate (a PEM file). A failed download
+names the proxy and says whether it needed credentials, refused the tunnel or
+did not answer, and `bwn --bootstrap` tries again.
+
 ## Safety
 
 - Default permission is **ask** — every edit and every command that can
