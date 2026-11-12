@@ -341,10 +341,7 @@ pub(super) fn truecolor() -> bool {
         }
     }
     let term = std::env::var("TERM").unwrap_or_default();
-    if term == "linux" || term == "vt100" || term == "dumb" {
-        return false;
-    }
-    true
+    !(term == "linux" || term == "vt100" || term == "dumb")
 }
 
 pub(super) fn cube(c: u8) -> u32 {

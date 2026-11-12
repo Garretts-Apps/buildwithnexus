@@ -16,6 +16,11 @@ const launcher = path.join(REPO, 'bin', 'buildwithnexus.js');
 const STUBS = path.join(__dirname, 'test-fixtures', 'stub-bin');
 const FAKE_GLIBC = path.join(__dirname, 'test-fixtures', 'fake-glibc.js');
 const FAKE_RELEASE = path.join(__dirname, 'test-fixtures', 'fake-release.js');
+const SHORT_TIMERS = path.join(__dirname, 'test-fixtures', 'short-timers.js');
+const proxyFixture = require('./test-fixtures/connect-proxy.js');
+const {
+  noProxyMatch, proxyRoute, proxyAuthorization, openTunnel, proxyHint, envProxySupported, nodeHandlesProxy,
+} = require('./bootstrap.js');
 const VERSION = require('../package.json').version;
 const WIN = process.platform === 'win32';
 const needsSh = WIN && 'the stubs are POSIX shell scripts';
@@ -796,20 +801,34 @@ test('first run: a download with the wrong checksum is refused and not recorded'
   assert.ok(!fs.existsSync(`${pkg.bin}.download`));
 });
 
-test('first run: a failed download says why and how proxies work, not "no terminal"', { skip: noRelease }, (t) => {
+test('first run: a failed download says why and how proxies work, not "no terminal"', { skip: noRelease }, async (t) => {
   const pkg = tempPackage(t);
-  const [major, minor] = process.versions.node.split('.').map(Number);
-  const envProxy = major >= 25 || (major === 24 && minor >= 5) || (major === 22 && minor >= 21);
-  for (const [how, env, said] of [
-    [['version'], {}, /If this network needs a proxy: Node's https module uses HTTPS_PROXY only with NODE_USE_ENV_PROXY=1/],
-    [['--bootstrap', '--version'], { BWN_ALLOW_BOOTSTRAP: undefined, HTTPS_PROXY: 'http://proxy.example:8080' },
-      /HTTPS_PROXY is set, but Node's https module ignores it unless NODE_USE_ENV_PROXY=1 is set too/],
-  ]) {
-    const r = launchFake(pkg, how, { env: { FAKE_NET_ERROR: 'ECONNREFUSED', ...env } });
+  const port = await proxyFixture.closedPort();
+  const cases = [
+    [['version'], {}, /connect ECONNREFUSED 140/,
+      // The retry line is in the user's own shell: PowerShell on Windows.
+      WIN
+        ? /If this network needs a proxy, set HTTPS_PROXY to its http:\/\/ URL[\s\S]*\$env:HTTPS_PROXY = 'http:\/\/<proxy>:<port>'; bwn --bootstrap/
+        : /If this network needs a proxy, set HTTPS_PROXY to its http:\/\/ URL[\s\S]*HTTPS_PROXY=http:\/\/<proxy>:<port> bwn --bootstrap/],
+    // The launcher's own tunnel: the error names the proxy it could not reach.
+    [['--bootstrap', '--version'], { BWN_ALLOW_BOOTSTRAP: undefined, HTTPS_PROXY: `http://127.0.0.1:${port}` },
+      new RegExp(`proxy 127\\.0\\.0\\.1:${port} \\(HTTPS_PROXY\\): connect ECONNREFUSED`),
+      new RegExp(`It went through the proxy in HTTPS_PROXY \\(127\\.0\\.0\\.1:${port}\\)`)],
+    [['version'], { HTTPS_PROXY: `http://127.0.0.1:${port}`, NO_PROXY: '.github.com,githubusercontent.com' },
+      /connect ECONNREFUSED 140/, /HTTPS_PROXY is set, but NO_PROXY matches github\.com, so the launcher connected directly/],
+  ];
+  if (envProxySupported()) {
+    cases.push([['version'], { HTTPS_PROXY: `http://127.0.0.1:${port}`, NODE_USE_ENV_PROXY: '1' },
+      /connect ECONNREFUSED 140/, /Node sent it through the proxy in HTTPS_PROXY/]);
+  }
+  for (const [how, env, why, said] of cases) {
+    const r = launchFake(pkg, how, { env: { FAKE_NET_ERROR: 'ECONNREFUSED', NO_PROXY: undefined, no_proxy: undefined, ...env } });
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /could not download the prebuilt binary: connect ECONNREFUSED/);
+    assert.match(r.stderr, /could not download the prebuilt binary: /);
+    assert.match(r.stderr, why);
     assert.match(r.stderr, said);
-    assert.match(r.stderr, envProxy ? /supports it/ : /Only Node 22\.21\+ and 24\.5\+ support that/);
+    // Every Node from 18 on can download through a proxy now.
+    assert.doesNotMatch(r.stderr, /cannot|only with NODE_USE_ENV_PROXY|ignores it/);
     assert.match(r.stderr, /To try again: +bwn --bootstrap/);
     assert.doesNotMatch(r.stderr, /no terminal here|native binary not found/);
     assert.ok(!fs.existsSync(pkg.marker));
@@ -823,7 +842,7 @@ test('first run: a download that gets no answer times out instead of hanging', {
   const r = launchFake(pkg, ['version'], { env: { FAKE_HANG: '300' } });
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stderr, /no response from github\.com for 30 s \(ETIMEDOUT\)/);
-  assert.match(r.stderr, /NODE_USE_ENV_PROXY/);
+  assert.match(r.stderr, /If this network needs a proxy, set HTTPS_PROXY/);
 });
 
 test('launcher (Windows): an exe denied execute gets security guidance', { skip: !WIN && 'Windows only' }, (t) => {
@@ -895,4 +914,307 @@ test('first run: musl is explained before anything is downloaded', {
   assert.equal(r.status, 1);
   assert.match(r.stderr, /musl/i);
   assert.deepEqual(r.requests, []);
+});
+
+// ── proxy: the launcher's own CONNECT tunnel (test-fixtures/connect-proxy.js) ─
+
+test('NO_PROXY matches the way curl and npm read it', () => {
+  for (const [host, port, list, want] of [
+    ['github.com', 443, '*', true],
+    ['github.com', 443, 'github.com', true],
+    ['api.github.com', 443, 'github.com', true],
+    ['api.github.com', 443, '.github.com', true],
+    ['github.com', 443, '.github.com', true],
+    ['api.github.com', 443, '*.github.com', true],
+    ['objects.githubusercontent.com', 443, 'githubusercontent.com', true],
+    ['notgithub.com', 443, 'github.com', false],
+    ['github.com.evil.example', 443, 'github.com', false],
+    ['github.com', 443, 'GitHub.COM', true],
+    ['github.com.', 443, 'github.com', true],
+    ['github.com', 443, 'github.com:443', true],
+    ['github.com', 443, 'github.com:8443', false],
+    ['github.com', 443, 'localhost, 127.0.0.1 ,github.com', true],
+    ['github.com', 443, 'localhost 127.0.0.1', false],
+    ['github.com', 443, '', false],
+    ['github.com', 443, ',, ,', false],
+    ['github.com', 443, '.', false],
+    ['10.1.2.3', 443, '10.1.2.3', true],
+    ['10.1.2.3', 443, '2.3', false],
+    ['::1', 443, '[::1]:443', true],
+    ['[::1]', 443, '::1', true],
+    ['::1', 443, '[::1]:80', false],
+  ]) {
+    assert.equal(noProxyMatch(host, port, list), want, `${host}:${port} against ${JSON.stringify(list)}`);
+  }
+});
+
+test('proxyRoute: which variable, which proxy, and what is refused', () => {
+  const route = (env) => proxyRoute('github.com', 443, env);
+  assert.deepEqual(route({}), { proxy: null });
+  assert.equal(route({ HTTPS_PROXY: 'http://a:1', https_proxy: 'http://b:2', HTTP_PROXY: 'http://c:3' }).display, 'a:1');
+  assert.equal(route({ HTTPS_PROXY: '', https_proxy: 'http://b:2' }).var, 'https_proxy');
+  assert.equal(route({ HTTP_PROXY: 'http://c:3' }).var, 'HTTP_PROXY');
+  assert.equal(route({ http_proxy: 'c' }).display, 'c:80');
+  // curl and npm take a bare host:port as http://.
+  assert.deepEqual(route({ HTTPS_PROXY: 'proxy.corp:3128' }).proxy, { hostname: 'proxy.corp', port: 3128, auth: null });
+  assert.equal(route({ HTTPS_PROXY: 'http://[::1]:3128' }).display, '[::1]:3128');
+  // Percent-encoded credentials are decoded for the header, never displayed.
+  const withAuth = route({ HTTPS_PROXY: 'http://me%40corp:p%3Ass%2Fw@proxy.corp:8080/' });
+  assert.equal(withAuth.proxy.auth, 'me@corp:p:ss/w');
+  assert.equal(withAuth.display, 'proxy.corp:8080');
+  assert.equal(proxyAuthorization(withAuth.proxy.auth), `Basic ${Buffer.from('me@corp:p:ss/w').toString('base64')}`);
+  assert.deepEqual(route({ HTTPS_PROXY: 'http://a:1', no_proxy: 'github.com' }),
+    { proxy: null, var: 'HTTPS_PROXY', bypass: 'no_proxy' });
+  for (const [value, said] of [
+    ['https://user:secret@proxy.corp:443', /HTTPS_PROXY is a https:\/\/ URL \(proxy\.corp\), but the launcher only connects to http:\/\/ proxies/],
+    ['socks5://user:secret@proxy.corp:1080', /HTTPS_PROXY is a socks5:\/\/ URL/],
+    ['http://user:secret@', /HTTPS_PROXY is not a valid proxy URL/],
+  ]) {
+    assert.throws(() => route({ HTTPS_PROXY: value }), (e) => {
+      assert.equal(e.code, 'BWN_PROXY_URL');
+      assert.match(e.message, said);
+      assert.doesNotMatch(e.message, /secret|user/);
+      return true;
+    });
+  }
+});
+
+test('Node\'s own proxy support is used only where it exists, so nothing is proxied twice', () => {
+  for (const [env, version, want] of [
+    [{ NODE_USE_ENV_PROXY: '1' }, '22.21.0', true],
+    [{ NODE_USE_ENV_PROXY: '1' }, '24.5.0', true],
+    [{ NODE_USE_ENV_PROXY: '1' }, '26.0.0', true],
+    [{ NODE_OPTIONS: '--use-env-proxy' }, '24.5.0', true],
+    [{ NODE_USE_ENV_PROXY: '1' }, '22.20.0', false],
+    [{ NODE_USE_ENV_PROXY: '1' }, '24.4.0', false],
+    [{ NODE_USE_ENV_PROXY: '1' }, '20.19.0', false],
+    [{ NODE_USE_ENV_PROXY: '1' }, '18.20.8', false],
+    [{ NODE_USE_ENV_PROXY: '0' }, '24.5.0', false],
+    [{}, '24.5.0', false],
+  ]) {
+    assert.equal(nodeHandlesProxy(env, version), want, `${JSON.stringify(env)} on ${version}`);
+  }
+  const env = { HTTPS_PROXY: 'http://proxy.corp:8080', NODE_USE_ENV_PROXY: '1' };
+  assert.deepEqual(proxyRoute('github.com', 443, env), envProxySupported() ? { proxy: null, node: true }
+    : { var: 'HTTPS_PROXY', proxy: { hostname: 'proxy.corp', port: 8080, auth: null }, display: 'proxy.corp:8080' });
+  // The hint never says a Node cannot use a proxy.
+  for (const e of [{}, { HTTPS_PROXY: 'http://u:pw@proxy.corp:8080' }, env, { HTTPS_PROXY: 'x', NO_PROXY: '*' }]) {
+    for (const win of [false, true]) {
+      const text = proxyHint(win, e).join('\n');
+      assert.doesNotMatch(text, /cannot|ignores it|Only Node/);
+      assert.doesNotMatch(text, /pw/);
+    }
+  }
+  assert.match(proxyHint(true, {}).join('\n'), /\$env:HTTPS_PROXY = 'http:\/\/<proxy>:<port>'; bwn --bootstrap/);
+});
+
+// A plain TCP server that answers "hello" through the tunnel.
+async function helloServer(t) {
+  const net = require('node:net');
+  const server = net.createServer((s) => s.end('hello'));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  return server.address().port;
+}
+
+async function proxyFor(t, opts) {
+  const proxy = await proxyFixture.startProxy(opts);
+  t.after(() => proxy.close());
+  return proxy;
+}
+
+test('openTunnel: a 200 hands back the tunnel, with Basic credentials sent', async (t) => {
+  const upstream = await helloServer(t);
+  const proxy = await proxyFor(t, { upstream: ['127.0.0.1', upstream], user: 'me@corp', password: 'p:ss' });
+  const route = proxyRoute('github.com', 443, { HTTPS_PROXY: `http://me%40corp:p%3Ass@127.0.0.1:${proxy.port}` });
+  let active = 0;
+  const { socket } = openTunnel(route, 'github.com', 443, () => active++);
+  const sock = await socket;
+  const got = await new Promise((resolve) => {
+    let s = '';
+    sock.on('data', (c) => (s += c));
+    sock.on('end', () => resolve(s));
+  });
+  assert.equal(got, 'hello');
+  assert.ok(active >= 1, 'the CONNECT answer counts as activity');
+  assert.deepEqual(proxy.log, [{
+    target: 'github.com:443',
+    auth: `Basic ${Buffer.from('me@corp:p:ss').toString('base64')}`,
+    userAgent: 'buildwithnexus-installer',
+  }]);
+});
+
+test('openTunnel: 407 says the proxy needs credentials; another status names the proxy and status', async (t) => {
+  const upstream = await helloServer(t);
+  const authProxy = await proxyFor(t, { upstream: ['127.0.0.1', upstream], user: 'u', password: 'right' });
+  const refusing = await proxyFor(t, { upstream: ['127.0.0.1', upstream], status: 403 });
+  for (const [url, code, said] of [
+    [`http://127.0.0.1:${authProxy.port}`, 'BWN_PROXY_AUTH',
+      `proxy 127.0.0.1:${authProxy.port} (HTTPS_PROXY) needs credentials (HTTP 407 Proxy Authentication Required)`],
+    [`http://u:wrong-secret@127.0.0.1:${authProxy.port}`, 'BWN_PROXY_AUTH',
+      `proxy 127.0.0.1:${authProxy.port} (HTTPS_PROXY) rejected the credentials in HTTPS_PROXY (HTTP 407)`],
+    [`http://127.0.0.1:${refusing.port}`, 'BWN_PROXY_REFUSED',
+      `proxy 127.0.0.1:${refusing.port} (HTTPS_PROXY) refused the tunnel to github.com:443 (HTTP 403 Forbidden)`],
+  ]) {
+    const { socket } = openTunnel(proxyRoute('github.com', 443, { HTTPS_PROXY: url }), 'github.com', 443);
+    await assert.rejects(socket, (e) => {
+      assert.equal(e.code, code);
+      assert.equal(e.message, said);
+      return true;
+    });
+  }
+});
+
+const noOpenssl = !proxyFixture.opensslAvailable() && 'needs openssl for a throwaway certificate';
+
+// The launcher, started without blocking this process (the proxy and the
+// fake GitHub run here), with only the proxy variables a test gives it.
+function launchAsync(pkg, args, env = {}, preload = []) {
+  const { spawn } = require('node:child_process');
+  const clean = { ...process.env };
+  for (const k of ['BWN_BIN', 'BWN_SKIP_INSTALL', 'BWN_INSTALL_IN_PACKAGE', 'NODE_OPTIONS', 'NODE_USE_ENV_PROXY',
+    'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy', 'NODE_EXTRA_CA_CERTS']) delete clean[k];
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath,
+      [...preload.flatMap((p) => ['-r', p]), path.join(pkg.root, 'bin', 'buildwithnexus.js'), ...args],
+      { env: { ...clean, NEXUS_HOME: pkg.home, BWN_ALLOW_BOOTSTRAP: '1', ...env } });
+    child.stdin.end();
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => (stdout += c));
+    child.stderr.on('data', (c) => (stderr += c));
+    const killer = setTimeout(() => child.kill(), 60000);
+    child.on('close', (status) => {
+      clearTimeout(killer);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+async function fakeGitHub(t, opts) {
+  const gh = await proxyFixture.startFakeGitHub(opts);
+  t.after(() => gh.close());
+  return gh;
+}
+
+function pinAsset(pkg, asset) {
+  fs.writeFileSync(path.join(pkg.root, 'checksums.json'), JSON.stringify({ [ASSET]: sha256(asset) }));
+}
+
+test('first run through a proxy: tunnel per hop, TLS to GitHub, credentials sent and never shown', {
+  skip: needsSh || noRelease || noOpenssl,
+}, async (t) => {
+  const pkg = tempPackage(t);
+  const asset = path.join(STUBS, 'prints-version');
+  pinAsset(pkg, asset);
+  const gh = await fakeGitHub(t, { asset });
+  const proxy = await proxyFor(t, { upstream: ['127.0.0.1', gh.port], user: 'me@corp', password: 'Sup3r/s3cret' });
+  const r = await launchAsync(pkg, ['version'], {
+    HTTPS_PROXY: `http://me%40corp:Sup3r%2Fs3cret@127.0.0.1:${proxy.port}`,
+    // The throwaway certificate is trusted only this way: verification is on.
+    NODE_EXTRA_CA_CERTS: gh.certFile,
+    STUB_VERSION: VERSION,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /installed prebuilt binary \(sha256 verified\)[\s\S]*is ready/);
+  assert.ok(r.stdout.endsWith(`buildwithnexus ${VERSION}\n`), r.stdout);
+  assert.equal(sha256(pkg.bin), sha256(asset));
+  // The redirect to objects.githubusercontent.com got its own tunnel.
+  assert.deepEqual(proxy.log.map((l) => l.target), ['github.com:443', 'objects.githubusercontent.com:443']);
+  for (const l of proxy.log) assert.equal(l.auth, `Basic ${Buffer.from('me@corp:Sup3r/s3cret').toString('base64')}`);
+  assert.deepEqual(gh.requests, [
+    `github.com/Garretts-Apps/buildwithnexus/releases/download/v${VERSION}/${ASSET}`,
+    `objects.githubusercontent.com/release-asset/${ASSET}`,
+  ]);
+  assert.doesNotMatch(r.stdout + r.stderr, /s3cret|me%40corp|me@corp/);
+});
+
+test('first run through a proxy: a redirect off GitHub is refused before any tunnel to it', {
+  skip: noRelease || noOpenssl,
+}, async (t) => {
+  const pkg = tempPackage(t);
+  pinAsset(pkg, path.join(STUBS, 'prints-version'));
+  const gh = await fakeGitHub(t, { redirectTo: 'https://evil.example/payload' });
+  const proxy = await proxyFor(t, { upstream: ['127.0.0.1', gh.port] });
+  const r = await launchAsync(pkg, ['version'], {
+    HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`, NODE_EXTRA_CA_CERTS: gh.certFile,
+  });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /could not download the prebuilt binary: refusing non-GitHub host evil\.example/);
+  assert.deepEqual(proxy.log.map((l) => l.target), ['github.com:443']);
+  assert.ok(!fs.existsSync(pkg.bin));
+});
+
+test('first run through a proxy: a certificate the system does not trust is refused', {
+  skip: noRelease || noOpenssl,
+}, async (t) => {
+  const pkg = tempPackage(t);
+  pinAsset(pkg, path.join(STUBS, 'prints-version'));
+  const gh = await fakeGitHub(t, {});
+  const proxy = await proxyFor(t, { upstream: ['127.0.0.1', gh.port] });
+  // No NODE_EXTRA_CA_CERTS: the tunnel does not loosen certificate checks.
+  const r = await launchAsync(pkg, ['version'], { HTTPS_PROXY: `http://127.0.0.1:${proxy.port}` });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|self.signed/i);
+  assert.match(r.stderr, /NODE_EXTRA_CA_CERTS/);
+  assert.deepEqual(gh.requests, []);
+});
+
+test('first run through a proxy: 407, a refused tunnel, a stall and an https:// proxy URL are each explained', {
+  skip: noRelease,
+}, async (t) => {
+  const pkg = tempPackage(t);
+  const upstream = await helloServer(t);
+  const auth = await proxyFor(t, { upstream: ['127.0.0.1', upstream], user: 'u', password: 'right' });
+  const refusing = await proxyFor(t, { upstream: ['127.0.0.1', upstream], status: 502 });
+  const silent = await proxyFor(t, { hang: true });
+  const literal = (s) => new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  for (const [proxyUrl, said, env = {}] of [
+    [`http://127.0.0.1:${auth.port}`, [
+      literal(`proxy 127.0.0.1:${auth.port} (HTTPS_PROXY) needs credentials (HTTP 407 Proxy Authentication Required).`),
+      /Put the proxy user name and password in the proxy URL/,
+      WIN ? /\$env:HTTPS_PROXY = 'http:\/\/<user>:<password>@<proxy>:<port>'; bwn --bootstrap/
+        : /HTTPS_PROXY='http:\/\/<user>:<password>@<proxy>:<port>' bwn --bootstrap/]],
+    [`http://u:Wr0ng-s3cret@127.0.0.1:${auth.port}`, [
+      literal(`proxy 127.0.0.1:${auth.port} (HTTPS_PROXY) rejected the credentials in HTTPS_PROXY (HTTP 407).`)]],
+    [`http://127.0.0.1:${refusing.port}`, [
+      literal(`proxy 127.0.0.1:${refusing.port} (HTTPS_PROXY) refused the tunnel to github.com:443 (HTTP 502 Bad Gateway).`),
+      /Ask for github\.com and objects\.githubusercontent\.com to be allowed through the proxy/]],
+    // The idle timeout covers the CONNECT phase too (cut to 300 ms here).
+    [`http://127.0.0.1:${silent.port}`, [
+      literal(`no response from proxy 127.0.0.1:${silent.port} (HTTPS_PROXY) for 30 s (ETIMEDOUT).`),
+      literal(`It went through the proxy in HTTPS_PROXY (127.0.0.1:${silent.port})`)], {
+      // NODE_OPTIONS, so bootstrap.js (a child of the launcher) gets it too.
+      NODE_OPTIONS: `--require=${JSON.stringify(SHORT_TIMERS)}`, SHORT_TIMERS: '300' }],
+    ['https://u:Wr0ng-s3cret@127.0.0.1:1', [
+      literal('HTTPS_PROXY is a https:// URL (127.0.0.1:1), but the launcher only connects to http:// proxies.'),
+      /Set it to the http:\/\/ URL of the proxy/]],
+  ]) {
+    const r = await launchAsync(pkg, ['version'], { HTTPS_PROXY: proxyUrl, ...env });
+    assert.equal(r.status, 1, r.stderr);
+    for (const s of said) assert.match(r.stderr, s);
+    assert.match(r.stderr, /To try again: +bwn --bootstrap/);
+    assert.doesNotMatch(r.stdout + r.stderr, /s3cret|right/);
+    assert.ok(!fs.existsSync(pkg.bin));
+  }
+  assert.equal(auth.log.length, 2);
+  assert.equal(auth.log[0].auth, null);
+});
+
+test('first run with NODE_USE_ENV_PROXY=1 on a Node that supports it: Node tunnels, the launcher does not', {
+  skip: (needsSh || noRelease || noOpenssl) || (!envProxySupported() && 'Node lacks NODE_USE_ENV_PROXY'),
+}, async (t) => {
+  const pkg = tempPackage(t);
+  const asset = path.join(STUBS, 'prints-version');
+  pinAsset(pkg, asset);
+  const gh = await fakeGitHub(t, { asset });
+  const proxy = await proxyFor(t, { upstream: ['127.0.0.1', gh.port] });
+  const r = await launchAsync(pkg, ['version'], {
+    HTTPS_PROXY: `http://127.0.0.1:${proxy.port}`, NODE_USE_ENV_PROXY: '1', NODE_EXTRA_CA_CERTS: gh.certFile,
+    STUB_VERSION: VERSION,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(proxy.log.map((l) => l.target), ['github.com:443', 'objects.githubusercontent.com:443']);
+  // The launcher's own CONNECT carries its user agent; Node's does not.
+  for (const l of proxy.log) assert.notEqual(l.userAgent, 'buildwithnexus-installer');
 });

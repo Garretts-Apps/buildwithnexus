@@ -10164,3 +10164,200 @@ fn an_overflow_with_nothing_to_compact_is_not_resent() {
     assert!(!r.success);
     assert_eq!(posts.load(Ordering::SeqCst), 1, "{}", r.stderr);
 }
+
+// ── read-only calls side by side (max_parallel_tools) ───────────────────────
+
+// One reply mixing reads, a search, a write and a read of what was written,
+// run with `max_parallel_tools` set to `width`. Returns the run and what the
+// model was sent back (the second request), with the project folder
+// replaced so two runs in different folders compare equal.
+fn mixed_reply_run(width: usize) -> (Run, String, Vec<Value>) {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("a.txt"), "alpha one\n").unwrap();
+    std::fs::write(cwd.join("b.txt"), "beta two\nalpha three\n").unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_calls(&[
+            ("c1", "read_file", json!({"path": "a.txt"})),
+            ("c2", "grep_files", json!({"pattern": "alpha"})),
+            ("c3", "read_file", json!({"path": "b.txt"})),
+            (
+                "c4",
+                "write_file",
+                json!({"path": "c.txt", "content": "gamma\n"}),
+            ),
+            ("c5", "read_file", json!({"path": "c.txt"})),
+            ("c6", "find_files", json!({"pattern": "*.txt"})),
+            ("c7", "read_file", json!({"path": "missing.txt"})),
+        ]),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    std::fs::write(
+        home.join("settings.json"),
+        json!({"max_parallel_tools": width}).to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "read and write");
+    let sent = posts.lock().unwrap().get(1).cloned().unwrap_or_default();
+    let cwd_s = cwd.to_string_lossy().to_string();
+    // The batches that ran side by side, from the session's trace.
+    let batches = std::fs::read_dir(home.join("traces"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|e| {
+            std::fs::read_to_string(e.path())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|v| v["kind"] == "tool_batch")
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (r, sent.replace(&cwd_s, "<cwd>"), batches)
+}
+
+#[test]
+fn read_only_calls_side_by_side_send_the_model_exactly_what_one_at_a_time_does() {
+    let (one, sent_one, batches_one) = mixed_reply_run(1);
+    let (four, sent_four, batches_four) = mixed_reply_run(4);
+    // One at a time runs no batch; side by side runs the reads before the
+    // write (three calls) and the three after it.
+    assert!(batches_one.is_empty(), "{batches_one:?}");
+    let sizes: Vec<u64> = batches_four
+        .iter()
+        .map(|b| b["detail"]["calls"].as_u64().unwrap_or(0))
+        .collect();
+    assert_eq!(sizes, [3, 3], "{batches_four:?}");
+    assert!(one.success, "stderr: {}", one.stderr);
+    assert!(four.success, "stderr: {}", four.stderr);
+    assert!(!sent_four.is_empty());
+    assert_eq!(
+        sent_one, sent_four,
+        "the model must get the same results in the same order"
+    );
+    let results = |r: &Run| -> Vec<(String, bool)> {
+        r.events
+            .iter()
+            .filter(|e| e["type"] == "tool_result")
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap_or("").to_string(),
+                    e["is_error"] == true,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(results(&one), results(&four));
+    // The reply's seven calls, then the finish and the automatic checks.
+    let names: Vec<String> = results(&four).into_iter().take(7).map(|(n, _)| n).collect();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "grep_files",
+            "read_file",
+            "write_file",
+            "read_file",
+            "find_files",
+            "read_file"
+        ]
+    );
+    // The read after the write saw it; the missing file is an error in its own slot.
+    let contents: Vec<String> = four
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result")
+        .map(|e| e["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert!(contents[4].contains("gamma"), "{}", contents[4]);
+    assert!(contents[0].contains("alpha one"), "{}", contents[0]);
+    assert!(contents[2].contains("beta two"), "{}", contents[2]);
+    assert!(results(&four)[6].1, "a missing file is an error");
+}
+
+#[test]
+fn a_refused_call_among_queued_reads_keeps_its_place() {
+    // Headless `ask`: the fetch of a host nobody approved is refused; the
+    // reads on either side still run and every result stays in its slot.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(cwd.join("a.txt"), "first file\n").unwrap();
+    std::fs::write(cwd.join("b.txt"), "second file\n").unwrap();
+    let port = serve(vec![
+        tool_calls(&[
+            ("c1", "read_file", json!({"path": "a.txt"})),
+            (
+                "c2",
+                "fetch_url",
+                json!({"url": "https://example.invalid/x"}),
+            ),
+            ("c3", "read_file", json!({"path": "b.txt"})),
+        ]),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "ask", port);
+    let r = run(&home, &cwd, "read and fetch");
+    let order: Vec<(String, String)> = r
+        .events
+        .iter()
+        .filter(|e| e["type"] == "tool_result" || e["type"] == "tool_denied")
+        .map(|e| {
+            (
+                e["name"]
+                    .as_str()
+                    .unwrap_or(e["type"].as_str().unwrap_or(""))
+                    .to_string(),
+                e["content"]
+                    .as_str()
+                    .or(e["reason"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let first = order
+        .iter()
+        .position(|(_, c)| c.contains("first file"))
+        .expect("a.txt read");
+    let second = order
+        .iter()
+        .position(|(_, c)| c.contains("second file"))
+        .expect("b.txt read");
+    assert!(first < second, "{order:?}");
+    assert!(r.has_event("tool_denied"), "{order:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_post_tool_use_hook_sees_read_only_calls_in_order() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(cwd.join(f), f).unwrap();
+    }
+    let log = cwd.join("hook.log");
+    let port = serve(vec![
+        tool_calls(&[
+            ("c1", "read_file", json!({"path": "a.txt"})),
+            ("c2", "read_file", json!({"path": "b.txt"})),
+            ("c3", "read_file", json!({"path": "c.txt"})),
+        ]),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let cmd = format!(
+        "python3 -c 'import json,sys; d=json.load(sys.stdin); i=d[\"tool_input\"]; p=[v for v in i.values() if isinstance(v,str) and v.endswith(\".txt\")]; open(\"{}\",\"a\").write(p[0]+\"\\n\")'",
+        log.display()
+    );
+    write_hooks(&home, json!({"PostToolUse": hook(&cmd)}));
+    let r = run(&home, &cwd, "read three files");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let seen = std::fs::read_to_string(&log).unwrap_or_default();
+    let names: Vec<&str> = seen
+        .lines()
+        .map(|l| l.rsplit('/').next().unwrap_or(l))
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt", "c.txt"], "{seen}");
+}

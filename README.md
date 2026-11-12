@@ -1017,6 +1017,17 @@ when it finishes, a helper that needs an approval says which one it is,
 and Esc or Ctrl+C stops them all. Helpers that write in your folder always
 run one after another. Their tokens and cost count toward the session.
 
+Read-only tool calls that the model makes in a row in one reply
+(`read_file`, `read_many_files`, `list_dir`, `list_tree`, `file_info`,
+`find_paths`, `find_files`, `grep_files`, `kb_query`, `fetch_url`,
+`web_search`) run at the same time, up to `max_parallel_tools` at once
+(default 4; `1` runs every call one after another). Each call is still
+checked, approved and shown in order before any of them runs, the model
+gets the results in the order it asked, and at most one call per website
+is in flight. Anything that writes, commands, questions, helpers, MCP and
+browser tools, and any call a PostToolUse hook matches, run one at a time
+as before.
+
 Agent files load from `~/.buildwithnexus/agents/` and `~/.claude/agents/`,
 and, once you trust them, from the project's `.buildwithnexus/agents/`
 and `.claude/agents/`. A helper that runs isolated in a git worktree shows
@@ -1283,6 +1294,16 @@ settings.
 
 To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
 `BWN_TLS_ROOTS=bundled` (bundled roots only).
+
+The npm launcher's first-run download uses the same variables on every
+supported Node (18 and later): `HTTPS_PROXY` or `HTTP_PROXY` (an `http://`
+URL, optionally with `user:password@`, percent-encoded), and `NO_PROXY` with
+`*`, domains (which also cover their subdomains) and `host:port`. It tunnels
+through the proxy to GitHub, and TLS is checked against GitHub's certificate
+as on a direct connection: if the proxy inspects TLS, point
+`NODE_EXTRA_CA_CERTS` at its root certificate (a PEM file). A failed download
+names the proxy and says whether it needed credentials, refused the tunnel or
+did not answer, and `bwn --bootstrap` tries again.
 
 ## Safety
 

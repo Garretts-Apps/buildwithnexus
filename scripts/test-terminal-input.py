@@ -563,6 +563,68 @@ class OneOffModeCommandTests(TerminalHarness):
         self.assertTrue(any("a fresh start" in u for u in users), users)
 
 
+@unittest.skipIf(sys.platform == "win32", "needs a Unix PTY")
+class InteractiveSmokeTests(TerminalHarness):
+    """The interactive path end to end: the TUI starts in the alternate
+    screen with raw mode on, answers a typed message, and on a double
+    Ctrl+C or a SIGTERM exits with the terminal put back."""
+
+    REPLY = "smoke reply from the mock model"
+    ENTER_ALT = b"\x1b[?1049h"
+    LEAVE_ALT = b"\x1b[?1049l"
+    SHOW_CURSOR = b"\x1b[?25h"
+    # tui.rs RESTORE: what the signal handler writes before _exit.
+    RESTORE = (b"\x1b[r\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l"
+               b"\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[0 q\x1b[?1049l")
+
+    def prepare(self):
+        self.model = ChatModel(lambda messages: ("text", self.REPLY))
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def chat(self):
+        self.assertIn(self.ENTER_ALT, self.output)
+        lflag = termios.tcgetattr(self.master)[3]
+        self.assertFalse(lflag & (termios.ICANON | termios.ECHO), "raw mode is on")
+        self.send("hello smoke\r")
+        self.wait_for(lambda: self.model.requests and self.REPLY.encode() in self.output,
+                      "the mock reply", timeout=15)
+        self.assertTrue(any("hello smoke" in u for u in self.model.user_texts()))
+
+    def wait_exit(self):
+        self.wait_for(lambda: self.proc.poll() is not None, "the exit", timeout=10)
+        self.pump(0.2)  # whatever was written before exiting
+        # The pty is cooked again (a fresh one is): echo and line editing.
+        lflag = termios.tcgetattr(self.master)[3]
+        self.assertEqual(lflag & (termios.ICANON | termios.ECHO),
+                         termios.ICANON | termios.ECHO, "raw mode is off")
+        return self.proc.returncode
+
+    def test_double_ctrl_c_quits_and_restores_the_terminal(self):
+        self.chat()
+        quit_from = len(self.output)
+        self.send("\x03")
+        self.wait_for(lambda: b"press Ctrl+C again to quit" in self.output, "the quit hint")
+        self.assertIsNone(self.proc.poll(), "one Ctrl+C does not quit")
+        self.send("\x03")
+        self.assertEqual(self.wait_exit(), 0)
+        tail = bytes(self.output[quit_from:])
+        self.assertIn(self.SHOW_CURSOR, tail)
+        self.assertIn(self.LEAVE_ALT, tail)
+        self.assertNotIn(self.ENTER_ALT, tail[tail.rindex(self.LEAVE_ALT):])
+
+    def test_sigterm_exits_and_restores_the_terminal(self):
+        self.chat()
+        quit_from = len(self.output)
+        os.kill(self.proc.pid, signal.SIGTERM)
+        self.assertEqual(self.wait_exit(), 128 + signal.SIGTERM)
+        self.assertIn(self.RESTORE, bytes(self.output[quit_from:]))
+
+
 class GitAttachmentTests(TerminalHarness):
     """@diff in a repository whose git config runs a program asks first."""
 
@@ -630,6 +692,13 @@ class CustomEndpointKeyTests(TerminalHarness):
     def keys_file(self):
         return (self.home / ".env.keys").read_text()
 
+    def swapped(self, model, server):
+        """The success line of a swap to `model` on `server`. The TUI repaints
+        its viewport, so an earlier swap's line recurs in the output: counting
+        "hot-swapped" can pass before a later swap has even sent its probe."""
+        host = server.origin().split("://", 1)[1]
+        return f"hot-swapped → {model} on custom endpoint ({host})".encode()
+
     def test_a_new_endpoint_never_receives_the_saved_key(self):
         self.send(f"/model {self.second.url} m2\r")
         self.wait_for(lambda: b"hot-swapped" in self.output
@@ -648,7 +717,7 @@ class CustomEndpointKeyTests(TerminalHarness):
         # (a question would hold the swap).
         sent_before = len(self.first.keys_sent())
         self.send(f"/model {self.first.url} m\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the swap back",
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
                       timeout=15)
         self.assertGreater(len(self.first.keys_sent()), sent_before)
         self.assertEqual(self.second.keys_sent(), [])
@@ -673,12 +742,12 @@ class EnvironmentCustomKeyTests(CustomEndpointKeyTests):
         self.wait_for(lambda: b"hot-swapped" in self.output, "the swap", timeout=15)
         # Another model on the same endpoint: still no key.
         self.send("/model m3\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the second swap",
-                      timeout=15)
+        self.wait_for(lambda: self.swapped("m3", self.second) in self.output,
+                      "the second swap", timeout=15)
         self.assertTrue(self.second.posts())
         self.assertEqual(self.second.keys_sent(), [])
         self.send(f"/model {self.first.url} m\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 3, "the swap back",
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
                       timeout=15)
         self.assertEqual(self.first.keys_sent()[-1], f"Bearer {self.KEY}")
         self.assertEqual(self.second.keys_sent(), [])
@@ -710,7 +779,8 @@ class UnboundCustomKeyTests(CustomEndpointKeyTests):
         self.send(f"/model {self.first.url} m\r")
         self.until_asked(b"? [y/N]: ")
         self.send("y\r")
-        self.wait_for(lambda: self.output.count(b"hot-swapped") >= 2, "the swap", timeout=15)
+        self.wait_for(lambda: self.swapped("m", self.first) in self.output, "the swap back",
+                      timeout=15)
         self.assertEqual(self.first.keys_sent()[-1], f"Bearer {self.KEY}")
         keys = self.keys_file()
         self.assertEqual(keys, f"CUSTOM_API_KEY@{self.first.origin()}={self.KEY}\n")

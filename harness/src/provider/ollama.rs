@@ -83,7 +83,7 @@ pub(super) fn probe_show(p: &Provider) -> Show {
         },
         // Ollama's own 404 names the model; a router's "404 page not
         // found" means the endpoint itself is missing.
-        Err(ureq::Error::Status(404, resp)) => {
+        Err(crate::net::Error::Status(404, resp)) => {
             if model_missing(&resp.into_string().unwrap_or_default().to_ascii_lowercase()) {
                 Show::Missing
             } else {
@@ -280,7 +280,7 @@ pub(super) fn ollama_request(
     msgs: &[Msg],
     tools: &[ToolDef],
     num_ctx: u32,
-) -> (ureq::Request, Value) {
+) -> (crate::net::Request, Value) {
     let mut body = ollama_body(&p.model, msgs, tools, p.temperature, p.max_tokens, num_ctx);
     apply_ollama_effort(&mut body, p.effort);
     // Local server: no auth header.

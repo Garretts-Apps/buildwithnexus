@@ -2129,7 +2129,7 @@ pub(super) fn find_active_local_base_url_in(candidates: &[&str]) -> Option<Strin
                 .call()
                 .ok()
         };
-        let json = |res: &ureq::Response| {
+        let json = |res: &crate::net::Response| {
             res.status() < 500
                 && res
                     .header("content-type")
@@ -2437,9 +2437,12 @@ pub(super) fn swap_model(
             });
         }
         // Keys are kept per endpoint: a new address gets its own key (or
-        // none), never the key of the one before.
+        // none), never the key of the one before. The endpoint the run
+        // started on keeps CUSTOM_API_KEY from the environment.
         let new_address = custom_url.as_deref().filter(|u| Some(*u) != current);
-        if let Some(url) = new_address.filter(|u| config::saved_custom_key(u).is_none()) {
+        if let Some(url) = new_address
+            .filter(|u| config::saved_custom_key(u).is_none() && !config::env_custom_key_serves(u))
+        {
             new_key = Some(match onboarding::ask_custom_key(url) {
                 onboarding::KeyAnswer::Key(k) => k,
                 onboarding::KeyAnswer::Empty => String::new(),

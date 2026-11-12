@@ -254,6 +254,10 @@ pub struct Settings {
     /// it answers at once (one unless it reports more).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_helpers: Option<usize>,
+    /// How many read-only calls from one reply (reads, searches, fetches)
+    /// run at once; 1 runs every call one after another. Unset: 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tools: Option<usize>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -412,6 +416,7 @@ impl Default for Settings {
             project_allowed: BTreeMap::new(),
             max_concurrent_workflows: default_max_concurrent_workflows(),
             max_parallel_helpers: None,
+            max_parallel_tools: None,
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             instruction_files: default_instruction_files(),
@@ -3028,6 +3033,18 @@ pub fn load_custom_key(base_url: &str) -> Option<String> {
     saved_custom_key(base_url)
 }
 
+/// True when `CUSTOM_API_KEY` from the environment is already the key of
+/// the endpoint at `base_url`: the one this run started on. Unlike
+/// `load_custom_key`, it never ties the variable to an endpoint.
+pub fn env_custom_key_serves(base_url: &str) -> bool {
+    key_from_env(CUSTOM_KEY)
+        && ENV_CUSTOM_KEY_ORIGIN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            == Some(endpoint_origin(base_url).as_str())
+}
+
 #[cfg(test)]
 pub(crate) fn forget_env_custom_key_origin() {
     *ENV_CUSTOM_KEY_ORIGIN
@@ -5041,6 +5058,8 @@ mod tests {
         // on, and of no other.
         std::env::set_var(CUSTOM_KEY, "sk-env");
         forget_env_custom_key_origin();
+        // Asking does not tie the variable to an endpoint.
+        assert!(!env_custom_key_serves("https://any.example.com/v1"));
         assert_eq!(
             load_custom_key("https://any.example.com/v1").as_deref(),
             Some("sk-env")
@@ -5050,6 +5069,9 @@ mod tests {
             Some("sk-env")
         );
         assert_eq!(saved_custom_key("https://any.example.com/v1"), None);
+        // A /model back to the endpoint the run started on needs no key.
+        assert!(env_custom_key_serves("https://any.example.com/v1"));
+        assert!(!env_custom_key_serves("https://other.example.com/v1"));
         assert_eq!(load_custom_key("https://other.example.com/v1"), None);
         save_custom_key("https://other.example.com/v1", "sk-other");
         assert_eq!(

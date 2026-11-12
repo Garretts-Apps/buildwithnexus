@@ -798,6 +798,11 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     agent::set_max_parallel_helpers(settings.max_parallel_helpers.unwrap_or_else(|| {
         agent::default_parallel_helpers(local, provider::served_slots(&provider))
     }));
+    agent::set_max_parallel_tools(
+        settings
+            .max_parallel_tools
+            .unwrap_or(agent::DEFAULT_MAX_PARALLEL_TOOLS),
+    );
     if let Some(note) = agent::max_parallel_helpers_note(settings.max_parallel_helpers) {
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: {note}")));
     }

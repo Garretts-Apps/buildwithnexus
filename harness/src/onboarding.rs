@@ -451,7 +451,7 @@ fn http_status(url: &str) -> Option<u16> {
         .call()
     {
         Ok(r) => Some(r.status()),
-        Err(ureq::Error::Status(code, _)) => Some(code),
+        Err(crate::net::Error::Status(code, _)) => Some(code),
         Err(_) => None,
     }
 }

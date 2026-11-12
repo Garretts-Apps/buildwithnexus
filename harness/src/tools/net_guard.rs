@@ -143,7 +143,7 @@ pub fn blocked_url(url: &str) -> Option<String> {
 
 pub(super) struct GuardedResolver;
 
-impl ureq::Resolver for GuardedResolver {
+impl crate::net::Resolver for GuardedResolver {
     fn resolve(&self, netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
         use std::net::ToSocketAddrs;
         let addrs: Vec<_> = netloc.to_socket_addrs()?.collect();
@@ -167,7 +167,7 @@ pub(super) fn web_client() -> &'static crate::net::Client {
 
 pub(super) enum WebError {
     Blocked(String),
-    Http(Box<ureq::Error>),
+    Http(Box<crate::net::Error>),
 }
 
 impl std::fmt::Display for WebError {
@@ -212,7 +212,10 @@ pub(super) fn redirect_denied(to: &url::Url) -> Option<String> {
     Some(format!("refusing to follow the redirect to {to}: {why}"))
 }
 
-pub(super) fn web_get(url: &str, user_agent: Option<&str>) -> Result<ureq::Response, WebError> {
+pub(super) fn web_get(
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<crate::net::Response, WebError> {
     web_get_with(web_client(), url, user_agent)
 }
 
@@ -220,7 +223,7 @@ pub(super) fn web_get_with(
     client: &crate::net::Client,
     url: &str,
     user_agent: Option<&str>,
-) -> Result<ureq::Response, WebError> {
+) -> Result<crate::net::Response, WebError> {
     let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         if let Some(why) = blocked_url(&url) {
@@ -253,7 +256,7 @@ pub(super) fn web_get_with(
 pub(super) fn http_get_with_retry(
     url: &str,
     user_agent: Option<&str>,
-) -> Result<ureq::Response, WebError> {
+) -> Result<crate::net::Response, WebError> {
     let mut attempts = 0;
     let max_attempts = 4;
     let mut delay_ms = 500;
@@ -263,7 +266,7 @@ pub(super) fn http_get_with_retry(
         match web_get(url, user_agent) {
             Ok(resp) => return Ok(resp),
             Err(WebError::Http(e))
-                if matches!(*e, ureq::Error::Status(code, _)
+                if matches!(*e, crate::net::Error::Status(code, _)
                     if code == 429 || (500..=504).contains(&code))
                     && attempts < max_attempts =>
             {
@@ -272,7 +275,7 @@ pub(super) fn http_get_with_retry(
                 continue;
             }
             Err(WebError::Http(e))
-                if matches!(*e, ureq::Error::Transport(_)) && attempts < max_attempts =>
+                if matches!(*e, crate::net::Error::Transport(_)) && attempts < max_attempts =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms *= 2;

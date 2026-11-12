@@ -123,9 +123,17 @@ is there but the binary is not, the launcher does not download it again on its
 own, because whatever removed it would remove the next copy too. Once the file
 is allowed, `bwn --bootstrap` downloads it again.
 
-A request that gets no data for 30 s fails with the reason. Node's `https`
-module ignores `HTTPS_PROXY` unless `NODE_USE_ENV_PROXY=1` is set, which Node
-22.21+ and 24.5+ support; a failed download says so and prints the command.
+A request that gets no data for 30 s fails with the reason, including while
+it waits for a proxy. The download goes through the proxy in `HTTPS_PROXY`
+(or `HTTP_PROXY`; either case) on every supported Node, unless `NO_PROXY`
+matches the host. The launcher opens a CONNECT tunnel through that `http://`
+proxy for each request and redirect, and checks each one against the GitHub
+host list first. TLS runs inside the tunnel to GitHub itself, with Node's usual
+certificate checks (`NODE_EXTRA_CA_CERTS` adds a root), so the proxy cannot
+read or alter the download. `user:password@` in the proxy URL is sent as
+`Proxy-Authorization: Basic`, and no message prints it. With
+`NODE_USE_ENV_PROXY=1` on Node 22.21+ or 24.5+, Node's own proxy support is
+used instead.
 
 The launcher ignores a relative `BWN_BIN`, and only runs a binary from `BWN_BIN`,
 `<home>/bin/<version>/` (where the download goes), the package's own `bin/`
@@ -434,6 +442,12 @@ rules, protected paths, and checkpoints are guardrails against mistakes. They ar
 command runs with your user's permissions, and checkpoints can rewind file
 edits in the working tree but not network calls, pushed commits, published
 packages, or other external effects.
+
+Read-only calls the model makes in a row (reads, searches, fetches) may run
+at the same time (`max_parallel_tools`, default 4). Their checks and
+approval prompts still happen one by one, in order, before any of them
+runs; a refused call is never run, and nothing that writes, runs a command
+or asks a question is ever run beside another call.
 
 Shell commands (`run_command`/`bash`, `!cmd`, and `check_work`) can also run
 inside an opt-in OS sandbox. It is off by default. Turn it on with the
