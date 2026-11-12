@@ -3302,6 +3302,19 @@ fn is_sensitive_for(p: &Path, windows: bool) -> bool {
     check(&normalize(p)) || check(&canonicalize_lenient(p))
 }
 
+// `is_sensitive` for an entry a walk lists in a folder whose real path is
+// `real_parent`. An entry that is not itself a symlink has the real path
+// `real_parent/name`, so the walk resolves each folder once instead of
+// every file in it.
+fn is_sensitive_entry(p: &Path, real_parent: &Path) -> bool {
+    let windows = cfg!(windows);
+    let check = |q: &Path| sensitive_names(&path_names(q, windows), windows, false);
+    match p.file_name() {
+        Some(name) => check(&normalize(p)) || check(&real_parent.join(name)),
+        None => is_sensitive(p),
+    }
+}
+
 // Shell glob match for one path component (`*`, `?`, `[...]` as any one
 // char). Like the shell, a leading wildcard never matches a leading dot.
 fn component_glob_match(pat: &str, name: &str) -> bool {
@@ -3694,6 +3707,9 @@ fn skip_dir(path: &Path) -> bool {
         // A Python virtualenv under any name (`venv`, `env`, `.py311`).
         || path.join("pyvenv.cfg").is_file()
 }
+
+mod grep;
+use grep::run_grep;
 
 mod walk;
 use walk::*;
@@ -5692,78 +5708,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     }
 }
 
-/// `grep_files`: search file contents under a folder.
-fn run_grep(input: &Value, cwd: &Path) -> Outcome {
-    let pattern = input["pattern"].as_str().unwrap_or("");
-    if pattern.is_empty() {
-        return err("pattern is required");
-    }
-    let file_pattern = input["file_pattern"]
-        .as_str()
-        .or_else(|| input["include"].as_str())
-        .unwrap_or("*");
-    let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
-    let needle = if case_sensitive {
-        pattern.to_string()
-    } else {
-        pattern.to_lowercase()
-    };
-    let limit = search_limit(input);
-    let mut files = Vec::new();
-    let mut seen = 0;
-    for root in search_roots(input, cwd) {
-        collect_files(&root, &mut files, &mut seen);
-    }
-    files.sort();
-    let mut matches = Vec::new();
-    let mut total = 0usize;
-    for path in files {
-        let rel = display_path(&path, cwd);
-        let basename_matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| simple_glob_match(file_pattern, name));
-        if !simple_glob_match(file_pattern, &rel) && !basename_matches {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, line) in text.lines().enumerate() {
-            let hit = if case_sensitive {
-                line.contains(needle.as_str())
-            } else {
-                line.to_lowercase().contains(&needle)
-            };
-            if hit {
-                // Keep counting past the limit so the cap header can
-                // report how much was left out.
-                total += 1;
-                if matches.len() < limit {
-                    matches.push(format!(
-                        "{}:{}:{}",
-                        rel,
-                        idx + 1,
-                        clip_line(line.trim_end(), MAX_MATCH_LINE)
-                    ));
-                }
-            }
-        }
-    }
-    if matches.is_empty() {
-        ok(format!("no matches for {pattern}"))
-    } else {
-        let shown = matches.len();
-        let body = matches.join("\n");
-        let out = if total > shown {
-            format!("{total} matches, showing {shown} (raise `max` or narrow the pattern)\n{body}")
-        } else {
-            body
-        };
-        ok(truncate(out, MAX_OUT))
-    }
-}
-
 /// `headless_browser`: drive a local headless browser.
 fn run_headless_browser(input: &Value) -> Outcome {
     let url = input["url"].as_str().unwrap_or("").trim();
@@ -6183,6 +6127,8 @@ pub use net_guard::{blocked_url, private_network_host};
 
 #[cfg(test)]
 mod classify_tests;
+#[cfg(test)]
+mod perf_tests;
 #[cfg(test)]
 mod table_tests;
 #[cfg(test)]
