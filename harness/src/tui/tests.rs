@@ -1660,3 +1660,23 @@ fn appending_to_a_long_line_touches_only_its_last_row() {
     );
     assert_cache_coherent(&t);
 }
+
+// A row is repainted on its own, so it cannot lean on what the row above
+// left set; and since the row's start carries the theme, a new theme
+// repaints every row without being told to.
+#[test]
+fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("\x1b[31mred, never closed\nplain");
+    let paint = |s: &mut screen::Screen, row_start: &str| {
+        let mut out = Vec::new();
+        build_output_frame(s, &mut out, (20, 10), 3, row_start);
+        String::from_utf8(out).unwrap()
+    };
+    let first = paint(&mut s, "\x1b[0m");
+    assert!(first.contains("\x1b[2;1H\x1b[0mplain"), "{first:?}");
+    assert!(paint(&mut s, "\x1b[0m").is_empty());
+    let themed = paint(&mut s, "\x1b[0m\x1b[48;5;17m");
+    assert_eq!(themed.matches(";1H").count(), 3, "{themed:?}");
+    assert!(themed.contains("\x1b[2;1H\x1b[0m\x1b[48;5;17mplain"));
+}

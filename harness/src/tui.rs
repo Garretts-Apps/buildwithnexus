@@ -2343,9 +2343,11 @@ fn render_output() {
     // its colours come back with DECRC at the end.
     let _ = write!(out, "\x1b[?2026h\x1b7");
     let head = out.len();
-    // Every row starts on the theme's background, whatever the row before
-    // it left set, so a painted theme stays whole on any terminal.
-    let bg = theme_bg();
+    // Every row starts from plain text on the theme's background, whatever
+    // was written before it: a row is repainted on its own, so it must look
+    // the same whichever rows are painted with it (an unclosed colour on
+    // the row above must not reach it in one frame and not in the next).
+    let bg = reset_all();
     // The frame is built from the transcript under the screen lock; nothing
     // in here writes to the terminal or takes the lock again.
     let (placements, kept, full) =
