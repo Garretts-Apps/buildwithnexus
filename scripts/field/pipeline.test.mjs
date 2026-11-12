@@ -55,23 +55,47 @@ test('release.yml keeps the release a draft until every asset is on it', () => {
     }
   }
 
-  // One job publishes it, after everything that writes to it or ships the
-  // version elsewhere, and nothing waits on it: it is the last job.
+  // One job publishes it, after everything that writes to it.
   const publishers = Object.entries(all).filter(([, job]) => /--draft=false/.test(job));
   assert.deepEqual(publishers.map(([name]) => name), ['publish-release']);
   const last = all['publish-release'];
-  for (const dep of ['release', 'assets', 'sbom', 'crates']) {
+  for (const dep of ['release', 'assets', 'sbom']) {
     assert.ok(needs(last).includes(dep), `publish-release needs ${dep}`);
   }
   assert.match(last, /if: needs\.gate\.outputs\.release == 'true'/);
-  for (const [name, job] of Object.entries(all)) {
-    assert.ok(!needs(job).includes('publish-release'), `${name} runs after publish-release`);
-  }
   // It checks the assets before publishing.
   const [check, publish] = steps(last);
   assert.match(check, /buildwithnexus-\$t\$ext\.sha256/);
   assert.match(check, /buildwithnexus\.cdx\.json/);
   assert.match(publish, /gh release edit "\$TAG" --repo "\$GITHUB_REPOSITORY" --draft=false/);
+});
+
+test('release.yml publishes crates.io last, after the packed tarball installed', () => {
+  // A crate version cannot be replaced, so nothing irreversible happens
+  // until the public release's npm tarball has installed in clean containers.
+  const all = jobs(workflow('release.yml'));
+  const gate = all['tarball-gate'];
+  assert.ok(gate, 'release.yml has a tarball-gate job');
+  assert.ok(needs(gate).includes('publish-release'), 'the gate needs the public release');
+  assert.match(gate, /bash scripts\/pack-verified\.sh/);
+  assert.match(gate, /linux-install\.sh --tarball "\$TARBALL"/);
+  for (const c of ['ubuntu:22.04', 'node:22-bookworm', 'node:20-bullseye', 'node:22-alpine']) {
+    assert.ok(gate.includes(c), `the gate runs ${c}`);
+  }
+  assert.doesNotMatch(gate, /id-token|contents: write/, 'the job running third-party images holds no write or OIDC token');
+  const crates = all.crates;
+  assert.ok(needs(crates).includes('tarball-gate'), 'crates needs tarball-gate');
+  assert.match(crates, /needs\.tarball-gate\.result == 'success'/);
+  assert.match(crates, /needs\.gate\.outputs\.crates_retry == 'true'/);
+  // Nothing runs after crates.io: it is the last job.
+  for (const [name, job] of Object.entries(all)) {
+    assert.ok(!needs(job).includes('crates'), `${name} must not wait on crates`);
+  }
+  // Both workflows pack with the same script, so both gates test one thing.
+  assert.match(jobs(workflow('publish.yml')).pack, /bash scripts\/pack-verified\.sh/);
+  const script = readFileSync(join(repo, 'scripts', 'pack-verified.sh'), 'utf8');
+  assert.match(script, /gh attestation verify/);
+  assert.match(script, /--signer-workflow "\$\{GITHUB_REPOSITORY\}\/\.github\/workflows\/release\.yml"/);
 });
 
 test('publish.yml chains on release.yml completing and has no version bump', () => {
@@ -91,11 +115,14 @@ test('publish.yml installs the exact tarball in clean containers before npm publ
   assert.deepEqual(needs(all.field), ['pack']);
   assert.deepEqual(needs(all.publish), ['pack', 'field']);
 
-  // pack: checksums.json first, then the tarball, handed on as an artifact.
+  // pack: the shared script writes checksums.json first, then the tarball,
+  // which is handed on as an artifact.
   const pack = steps(all.pack).map((s) => s.split('\n')[0]);
   const at = (re) => pack.findIndex((s) => re.test(s));
-  assert.ok(at(/record checksums/) >= 0 && at(/record checksums/) < at(/name: Pack$/), pack.join('\n'));
-  assert.match(all.pack, /npm pack --pack-destination dist --json/);
+  assert.ok(at(/name: Pack$/) >= 0 && at(/name: Pack$/) < at(/Hand the tarball/), pack.join('\n'));
+  const packScript = readFileSync(join(repo, 'scripts', 'pack-verified.sh'), 'utf8');
+  assert.ok(packScript.indexOf("echo '{}' > checksums.json") < packScript.indexOf('npm pack --pack-destination dist --json'));
+  assert.match(packScript, /npm pack --pack-destination dist --json/);
 
   // field: the install matrix against that tarball and this release.yml,
   // on a supported glibc, a glibc below the floor and musl.
@@ -131,8 +158,7 @@ test('publish.yml skips the field run for a version already on npm', () => {
   assert.match(all.pack, /already: \$\{\{ steps\.published\.outputs\.already \}\}/);
   assert.match(all.field, /^ {4}if: needs\.pack\.outputs\.already == 'false'$/m);
   // Nor does it download and verify the binaries or pack a tarball.
-  for (const name of ['Verify release binaries and record checksums', 'Pack',
-    'Hand the tarball to the field and publish jobs', 'Syntax-check wrapper scripts']) {
+  for (const name of ['Pack', 'Hand the tarball to the field and publish jobs']) {
     const [step] = steps(all.pack).filter((s) => s.includes(`name: ${name}`));
     assert.ok(step, `pack has the step "${name}"`);
     assert.match(step, /if: steps\.published\.outputs\.already == 'false'/, `"${name}" is skipped when already on npm`);

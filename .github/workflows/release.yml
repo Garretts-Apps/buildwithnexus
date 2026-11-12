@@ -12,10 +12,13 @@ name: release
 # main always release. (The tag this workflow creates is made with
 # GITHUB_TOKEN, which never triggers workflows — no recursion.)
 #
-# The release is a draft until the last job: every asset is uploaded and
-# attested first, and only then is it published (and its tag created), so a
-# public release never exists without binaries. v0.14.9 was public for about
-# three minutes with none, and a first run in that window got a 404.
+# The release is a draft until every asset is uploaded and attested, and
+# only then is it published (and its tag created), so a public release
+# never exists without binaries. v0.14.9 was public for about three minutes
+# with none, and a first run in that window got a 404. After that the npm
+# tarball packed from the public release is installed in clean containers
+# (`tarball-gate`), and crates.io is published last, so nothing reaches a
+# registry before the package has been seen to install.
 on:
   push:
     tags: ["v*"]
@@ -465,6 +468,95 @@ jobs:
           files: buildwithnexus.cdx.json
           draft: true
 
+  # Publishes the draft once every asset is on it, so the npm launcher's
+  # download never races the assets. Drafts are invisible to unauthenticated
+  # reads, so neither the launcher's download nor the tarball gate below can
+  # see the release before this job. Nothing is on a registry yet: a public
+  # GitHub release can still be taken back, crates.io and npm cannot.
+  publish-release:
+    needs: [gate, release, assets, sbom]
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write   # publish the release, which creates the tag
+    steps:
+      - name: Check every asset is on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          missing=0
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
+            for a in "buildwithnexus-$t$ext" "buildwithnexus-$t$ext.sha256"; do
+              grep -qxF "$a" <<<"$have" || { echo "::error::$TAG has no $a"; missing=1; }
+            done
+          done
+          grep -qxF buildwithnexus.cdx.json <<<"$have" || { echo "::error::$TAG has no buildwithnexus.cdx.json"; missing=1; }
+          exit "$missing"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,url
+
+  # The npm tarball, packed from the now-public release exactly as publish.yml
+  # packs it, installed in clean containers the way users install it: a
+  # supported glibc as the bare asset and through npm, a glibc below the
+  # floor, and musl (the two unsupported ones must explain themselves). Until
+  # this passes, nothing has reached crates.io or npm, so a release whose
+  # package does not install stops here, red, with both registries untouched.
+  # No write or OIDC permission: this job runs third-party images.
+  tarball-gate:
+    needs: [gate, publish-release]
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: read  # verify the release binaries' build provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Pack
+        id: pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/pack-verified.sh
+
+      # Writes the cell table to the log; exits 1 on any FAIL row.
+      - name: Install the tarball in clean containers
+        env:
+          TARBALL: dist/${{ steps.pack.outputs.tarball }}
+        run: >-
+          bash scripts/field/linux-install.sh --tarball "$TARBALL"
+          --release-yml .github/workflows/release.yml
+          --cells ubuntu:22.04,node:22-bookworm,node:20-bullseye,node:22-alpine
+          --json field-prerelease.json
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: field-prerelease
+          path: field-prerelease.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
   # Publishing refuses OIDC tokens for workflow_run-triggered jobs, and
   # publish.yml chains off this workflow via workflow_run — so its crates step
@@ -476,11 +568,17 @@ jobs:
   # finish a crates.io publish is safe. Anything else that goes wrong (no OIDC
   # token, a publish error) fails the job, so a half-published release shows
   # up red instead of green-with-a-warning.
+  #
+  # Last job of the release: a crate version can be yanked but never
+  # replaced, so it goes out only after the GitHub release is public and the
+  # npm tarball built from it has installed and run in clean containers
+  # (`tarball-gate`). publish.yml, which chains on this workflow succeeding,
+  # then sends that tarball to npm.
   crates:
-    needs: [gate, assets]
+    needs: [gate, tarball-gate]
     if: >-
       ${{ !cancelled() &&
-          ((needs.gate.outputs.release == 'true' && needs.assets.result == 'success') ||
+          ((needs.gate.outputs.release == 'true' && needs.tarball-gate.result == 'success') ||
            needs.gate.outputs.crates_retry == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -568,42 +666,3 @@ jobs:
           done
           echo "::error::bwn alias crate did not publish after 5 attempts. Re-run this job; buildwithnexus itself is already published."
           exit 1
-
-  # Last: publish the draft once everything is on it. The workflow only
-  # succeeds (and publish.yml, which chains on that, only starts) after this,
-  # so the npm launcher's download never races the assets. Drafts are
-  # invisible to unauthenticated reads, so neither the launcher's download
-  # nor field.yml can see the release before this job.
-  publish-release:
-    needs: [gate, release, assets, sbom, crates]
-    if: needs.gate.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write   # publish the release, which creates the tag
-    steps:
-      - name: Check every asset is on the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
-          missing=0
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
-            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
-            for a in "buildwithnexus-$t$ext" "buildwithnexus-$t$ext.sha256"; do
-              grep -qxF "$a" <<<"$have" || { echo "::error::$TAG has no $a"; missing=1; }
-            done
-          done
-          grep -qxF buildwithnexus.cdx.json <<<"$have" || { echo "::error::$TAG has no buildwithnexus.cdx.json"; missing=1; }
-          exit "$missing"
-
-      - name: Publish the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,url

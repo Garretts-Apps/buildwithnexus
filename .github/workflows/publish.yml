@@ -96,57 +96,17 @@ jobs:
             echo "already=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Release assets can be replaced after publishing, so their .sha256
-      # files only catch corruption. Before anything reaches npm, check each
-      # binary against its build-provenance attestation (Sigstore, tied to
-      # release.yml in this repo), then record the verified hashes in
-      # checksums.json inside the immutable npm tarball. The launcher's
-      # first-run download trusts only these.
-      - name: Verify release binaries and record checksums
-        if: steps.published.outputs.already == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          V=$(node -p "require('./package.json').version")
-          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${V}"
-          mkdir -p verified
-          echo '{}' > checksums.json
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
-            ext=""; [[ "$t" == *windows* ]] && ext=".exe"
-            asset="buildwithnexus-${t}${ext}"
-            curl -fsSL --retry 3 -o "verified/${asset}" "${BASE}/${asset}"
-            gh attestation verify "verified/${asset}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release.yml"
-            sum=$(sha256sum "verified/${asset}" | cut -d' ' -f1)
-            ASSET="$asset" SUM="$sum" node -e '
-              const fs = require("fs");
-              const j = JSON.parse(fs.readFileSync("checksums.json", "utf8"));
-              j[process.env.ASSET] = process.env.SUM;
-              fs.writeFileSync("checksums.json", JSON.stringify(j, null, 2) + "\n");
-            '
-          done
-          cat checksums.json
-
-      # Guard the launch path: a syntax error in the wrapper or bootstrap
-      # would break `npm install` for every user. Cheap to check, expensive to miss.
-      - name: Syntax-check wrapper scripts
-        if: steps.published.outputs.already == 'false'
-        run: node --check bin/buildwithnexus.js && for f in scripts/*.js; do node --check "$f"; done
-
-      # The tarball npm will get: checksums.json from the step above included.
+      # The tarball npm will get. scripts/pack-verified.sh checks every release
+      # binary against its build-provenance attestation and records the
+      # verified hashes in checksums.json inside the tarball, which cannot
+      # change once published; the launcher's first-run download trusts only
+      # these. release.yml packed and tested the same thing before crates.io.
       - name: Pack
         id: pack
         if: steps.published.outputs.already == 'false'
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          tgz=$(npm pack --pack-destination dist --json | node -e 'console.log(JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename)')
-          sum=$(sha256sum "dist/$tgz" | cut -d' ' -f1)
-          echo "$sum  $tgz"
-          echo "tarball=$tgz" >> "$GITHUB_OUTPUT"
-          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/pack-verified.sh
 
       - name: Hand the tarball to the field and publish jobs
         if: steps.published.outputs.already == 'false'
