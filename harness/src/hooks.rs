@@ -2746,6 +2746,11 @@ fn pre_tool_use_with(tool: &str, input: &Value, tool_input: &Value, cwd: &Path) 
 /// `{"decision": "block", "reason": …}`, `additionalContext` from
 /// `hookSpecificOutput`, or the stderr of a hook that exited 2. The call
 /// itself already happened either way.
+/// Whether a PostToolUse hook would run for this call (nothing is run).
+pub fn has_post_tool_use(tool: &str, input: &Value) -> bool {
+    !commands_for("PostToolUse", Some((tool, input))).is_empty()
+}
+
 pub fn post_tool_use(
     tool: &str,
     input: &Value,

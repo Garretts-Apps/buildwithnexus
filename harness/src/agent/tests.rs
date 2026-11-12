@@ -3256,3 +3256,196 @@ fn accept_edits_asks_before_changing_anything_inside_git() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ── read-only calls side by side ────────────────────────────────────────────
+
+fn pending_calls(names_inputs: &[(&str, serde_json::Value)]) -> Vec<PendingCall> {
+    names_inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, input))| PendingCall {
+            slot: i,
+            id: format!("c{i}"),
+            name: name.to_string(),
+            input: input.clone(),
+        })
+        .collect()
+}
+
+fn outcome(s: String) -> tools::Outcome {
+    tools::Outcome {
+        content: s,
+        is_error: false,
+        finished: false,
+        images: Vec::new(),
+    }
+}
+
+#[test]
+fn side_by_side_outcomes_come_back_in_call_order() {
+    for n in [1usize, 2, 4, 7] {
+        let calls = pending_calls(
+            &(0..n)
+                .map(|i| ("read_file", serde_json::json!({"path": format!("f{i}")})))
+                .collect::<Vec<_>>(),
+        );
+        // Later calls finish first.
+        let outs = run_with(&calls, 4, |c| {
+            std::thread::sleep(std::time::Duration::from_millis(
+                (n as u64 - c.slot as u64) * 3,
+            ));
+            outcome(c.input["path"].as_str().unwrap().to_string())
+        });
+        let got: Vec<String> = outs.into_iter().map(|o| o.content).collect();
+        let want: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn side_by_side_never_runs_more_than_the_width() {
+    use std::sync::atomic::AtomicUsize;
+    for width in [1usize, 2, 3] {
+        let now = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let calls = pending_calls(&vec![("grep_files", serde_json::json!({})); 8]);
+        let _ = run_with(&calls, width, |_| {
+            let in_flight = now.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(in_flight, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            now.fetch_sub(1, Ordering::SeqCst);
+            outcome(String::new())
+        });
+        assert!(peak.load(Ordering::SeqCst) <= width, "width {width}");
+    }
+}
+
+#[test]
+fn one_call_or_width_one_runs_on_the_turns_thread() {
+    let me = std::thread::current().id();
+    let calls = pending_calls(&[
+        ("read_file", serde_json::json!({})),
+        ("read_file", serde_json::json!({})),
+    ]);
+    let _ = run_with(&calls, 1, |_| {
+        assert_eq!(std::thread::current().id(), me);
+        outcome(String::new())
+    });
+    let _ = run_with(&calls[..1], 4, |_| {
+        assert_eq!(std::thread::current().id(), me);
+        outcome(String::new())
+    });
+}
+
+#[test]
+fn side_by_side_fetches_to_one_host_never_overlap() {
+    use std::sync::atomic::AtomicUsize;
+    let now = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let calls = pending_calls(&[
+        (
+            "fetch_url",
+            serde_json::json!({"url": "https://one.example/a"}),
+        ),
+        (
+            "fetch_url",
+            serde_json::json!({"url": "https://one.example/b"}),
+        ),
+        (
+            "fetch_url",
+            serde_json::json!({"url": "https://one.example/c"}),
+        ),
+    ]);
+    let _ = run_with(&calls, 3, |_| {
+        let in_flight = now.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(in_flight, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        now.fetch_sub(1, Ordering::SeqCst);
+        outcome(String::new())
+    });
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    // Different hosts may.
+    let peak2 = AtomicUsize::new(0);
+    let now2 = AtomicUsize::new(0);
+    let calls = pending_calls(&[
+        (
+            "fetch_url",
+            serde_json::json!({"url": "https://one.example/a"}),
+        ),
+        (
+            "fetch_url",
+            serde_json::json!({"url": "https://two.example/a"}),
+        ),
+    ]);
+    let barrier = std::sync::Barrier::new(2);
+    let _ = run_with(&calls, 2, |_| {
+        let in_flight = now2.fetch_add(1, Ordering::SeqCst) + 1;
+        peak2.fetch_max(in_flight, Ordering::SeqCst);
+        barrier.wait();
+        now2.fetch_sub(1, Ordering::SeqCst);
+        outcome(String::new())
+    });
+    assert_eq!(peak2.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn only_reads_searches_and_fetches_run_beside_others() {
+    use serde_json::json;
+    for name in [
+        "read",
+        "read_file",
+        "read_many_files",
+        "list",
+        "list_dir",
+        "list_tree",
+        "file_info",
+        "glob",
+        "find_paths",
+        "find_files",
+        "grep",
+        "grep_files",
+        "kb_query",
+        "webfetch",
+        "fetch_url",
+        "websearch",
+        "web_search",
+    ] {
+        assert!(may_run_beside_others(name, &json!({})), "{name}");
+    }
+    for name in [
+        "write_file",
+        "edit_file",
+        "multi_edit",
+        "apply_patch",
+        "move_path",
+        "remove_path",
+        "run_command",
+        "bash",
+        "check_work",
+        "python_tool",
+        "task",
+        "spawn_subagent",
+        "question",
+        "AskUserQuestion",
+        "finish",
+        "save_memory",
+        "todo_write",
+        "todo_read",
+        "str_replace_editor",
+        "mcp__fs__read",
+        "mcp_call",
+        "headless_browser",
+        "screenshot_url",
+        "open_browser",
+        "wait_for_url",
+        "start_server",
+        "Artifact",
+        "no_such_tool",
+    ] {
+        assert!(!may_run_beside_others(name, &json!({})), "{name}");
+    }
+    assert!(!may_run_beside_others(
+        "read_file",
+        &json!({ tools::INVALID_ARGS: "{bad" })
+    ));
+}

@@ -200,8 +200,99 @@ fn bench_path_and_classify(c: &mut Criterion) {
     });
 }
 
+// A project of `files` source files under a fresh temp folder, for the
+// tool-batch benchmarks: real files, so reads and searches hit the disk
+// cache the way they do in a session.
+fn bench_project(files: usize) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("bwn-bench-batch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for i in 0..files {
+        let sub = dir.join(format!("src/m{}", i % 40));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join(format!("f{i}.rs")),
+            format!("// module {i}\npub fn run_{i}() -> u32 {{ {i} }}\n").repeat(30),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+// One reply's read-only calls, one at a time (width 1, what the build loop
+// did before 0.19) and side by side (width 4, the default).
+fn bench_tool_batch(c: &mut Criterion) {
+    use buildwithnexus::agent::run_read_only_calls;
+    use serde_json::json;
+    let dir = bench_project(2000);
+    let greps: Vec<(String, serde_json::Value)> = ["run_1", "module 2", "u32", "pub fn"]
+        .iter()
+        .map(|p| ("grep_files".to_string(), json!({"pattern": p})))
+        .collect();
+    let reads: Vec<(String, serde_json::Value)> = (0..6)
+        .map(|i| {
+            (
+                "read_file".to_string(),
+                json!({"path": format!("src/m{i}/f{i}.rs")}),
+            )
+        })
+        .collect();
+    let mut g = c.benchmark_group("tool_batch");
+    g.sample_size(20);
+    for (label, calls) in [("grep4", &greps), ("read6", &reads)] {
+        for width in [1usize, 4] {
+            g.bench_function(format!("{label}/width{width}"), |b| {
+                b.iter(|| run_read_only_calls(black_box(calls), &dir, width))
+            });
+        }
+    }
+    // Four fetches to four local servers that each take 100 ms to answer:
+    // simulated network latency, not a real network.
+    let ports: Vec<u16> = (0..4).map(|_| slow_server(100)).collect();
+    let fetches: Vec<(String, serde_json::Value)> = ports
+        .iter()
+        .map(|p| {
+            (
+                "fetch_url".to_string(),
+                json!({"url": format!("http://127.0.0.1:{p}/")}),
+            )
+        })
+        .collect();
+    for width in [1usize, 4] {
+        g.bench_function(format!("fetch4_simulated_100ms/width{width}"), |b| {
+            b.iter(|| run_read_only_calls(black_box(&fetches), &dir, width))
+        });
+    }
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A local HTTP server that answers every request after `delay_ms`.
+fn slow_server(delay_ms: u64) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let body = "<html><body>slow page</body></html>";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    port
+}
+
 criterion_group!(
     benches,
+    bench_tool_batch,
     bench_wrap_cache,
     bench_body_builders,
     bench_cache_pass,

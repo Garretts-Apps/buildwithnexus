@@ -2155,11 +2155,20 @@ fn build_turn(
         }
 
         let mut results = Vec::new();
-        let mut summary: Option<String> = None;
-        let mut loop_nudge: Option<String> = None;
-        let mut loop_stop: Option<String> = None;
-        let mut artifact_recovery: Option<String> = None;
-        let mut round_unrun: Option<String> = None;
+        let mut round = Round::default();
+        let ctx = RecordCtx {
+            p,
+            defs: &defs,
+            task: &task_for_recovery,
+            cwd,
+            depth,
+        };
+        // Read-only calls that passed their gates, held until the next call
+        // that is not one of them (or the end of the reply) and then run side
+        // by side; every check, prompt and result stays in call order.
+        // Top-level turns only, like helpers.
+        let batch_ok = depth == 0 && max_parallel_tools() > 1;
+        let mut pending: Vec<PendingCall> = Vec::new();
         // Helpers from this reply that may run side by side (they only read,
         // or work in a worktree of their own), held until the next call that
         // is not one of them or the end of the reply, so every other call
@@ -2177,9 +2186,16 @@ fn build_turn(
             if side_by_side.is_none() && !waiting.is_empty() {
                 start_waiting_helpers(p, perm, &mut waiting, &mut results, cwd, depth);
             }
+            let queueable = batch_ok && may_run_beside_others(&call.name, &call.input);
+            if !queueable {
+                flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
+            }
             if let Some(raw) = call.input.get(tools::INVALID_ARGS).and_then(|v| v.as_str()) {
+                flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
                 let msg = invalid_args_feedback(&call.name, raw, &defs);
-                round_unrun.get_or_insert_with(|| format!("{} (invalid arguments)", call.name));
+                round
+                    .unrun
+                    .get_or_insert_with(|| format!("{} (invalid arguments)", call.name));
                 report::tool_denied(&msg);
                 note_loop_result(
                     &mut st.loop_guard,
@@ -2187,8 +2203,8 @@ fn build_turn(
                     &call.input,
                     &msg,
                     true,
-                    &mut loop_nudge,
-                    &mut loop_stop,
+                    &mut round.loop_nudge,
+                    &mut round.loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -2201,11 +2217,14 @@ fn build_turn(
             let refusal = text_only_refusal(p, &call.name).or_else(|| {
                 let r = unoffered_call(&call.name, &defs, false);
                 if r.is_some() {
-                    round_unrun.get_or_insert_with(|| format!("{} (not a tool here)", call.name));
+                    round
+                        .unrun
+                        .get_or_insert_with(|| format!("{} (not a tool here)", call.name));
                 }
                 r
             });
             if let Some((shown, told)) = refusal {
+                flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
                 report::tool_denied(&shown);
                 note_loop_result(
                     &mut st.loop_guard,
@@ -2213,8 +2232,8 @@ fn build_turn(
                     &call.input,
                     &told,
                     true,
-                    &mut loop_nudge,
-                    &mut loop_stop,
+                    &mut round.loop_nudge,
+                    &mut round.loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -2250,8 +2269,8 @@ fn build_turn(
                     &call_input,
                     &answer,
                     is_error,
-                    &mut loop_nudge,
-                    &mut loop_stop,
+                    &mut round.loop_nudge,
+                    &mut round.loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -2295,6 +2314,7 @@ fn build_turn(
                 }
             });
             if let Some(reason) = reason {
+                flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
                 report::tool_denied(&reason);
                 trace::record_visible(
                     "tool_denied",
@@ -2332,8 +2352,8 @@ fn build_turn(
                     &call_input,
                     &reason,
                     true,
-                    &mut loop_nudge,
-                    &mut loop_stop,
+                    &mut round.loop_nudge,
+                    &mut round.loop_stop,
                 );
                 results.push(ToolResult {
                     id: call.id.clone(),
@@ -2363,8 +2383,8 @@ fn build_turn(
                         &call_input,
                         &msg,
                         true,
-                        &mut loop_nudge,
-                        &mut loop_stop,
+                        &mut round.loop_nudge,
+                        &mut round.loop_stop,
                     );
                     results.push(ToolResult {
                         id: call.id.clone(),
@@ -2376,6 +2396,24 @@ fn build_turn(
                 }
             }
 
+            if queueable && may_run_beside_others(&call.name, &call_input) {
+                pending.push(PendingCall {
+                    slot: results.len(),
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    input: call_input,
+                });
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    content: String::new(),
+                    is_error: false,
+                    images: Vec::new(),
+                });
+                continue;
+            }
+            // A call queued by name whose input changed its mind (a hook now
+            // matches) runs in line, after the ones before it.
+            flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
             if matches!(call.name.as_str(), "task" | "spawn_subagent") {
                 // A subagent can mutate the workspace — count it as action.
                 st.mutating_tool_ran = true;
@@ -2424,89 +2462,26 @@ fn build_turn(
             if tools::is_mutating_call(&call.name, &call_input) {
                 st.mutating_tool_ran = true;
             }
-            let mut out = vision_checked(p, tools::run(&call.name, &call_input, cwd));
-            post_tool_hooks(&call.name, &call_input, &mut out, cwd);
-            if out.is_error {
-                hooks::notify("OnError", cwd);
-                if call_could_not_run(&call.name, &call_input, &defs) {
-                    round_unrun.get_or_insert_with(|| {
-                        let why = out.content.lines().next().unwrap_or("").trim();
-                        format!("{} ({})", call.name, trace::preview(why, 100))
-                    });
-                }
-            }
-            report::tool_result(&call.name, &out.content, out.is_error);
-            trace_tool_result(&call.name, &out.content, out.is_error, "build", depth);
-            if call.name == "check_work" {
-                st.check_work_called = true;
-                if !check_work_found_no_project(&out.content) {
-                    st.check_work_passed = Some(!out.is_error);
-                }
-            }
-            // Feed the verifier real data: every executed call, and the files
-            // touched by successful write/edit tools.
-            st.tool_records.push(crate::verifier::ToolCallRecord {
-                tool_name: call.name.clone(),
-                args_summary: tools::preview(&call.name, &call_input),
-                result_preview: out.content.chars().take(200).collect(),
-                timestamp: String::new(),
-            });
-            if !out.is_error {
-                if let Some(pb) = tools::edit_tracking_path(&call.name, &call_input, cwd) {
-                    let path = pb.display().to_string();
-                    if !st.changed_files.contains(&path) {
-                        st.changed_files.push(path);
-                    }
-                }
-            }
-            if matches!(call.name.as_str(), "Artifact" | "publish_artifact")
-                && out.is_error
-                && (static_artifact_requested(&task_for_recovery)
-                    || canvas_game_requested(&task_for_recovery))
-            {
-                // No fabricated fallback artifact: tell the model exactly why
-                // publishing was rejected and ask it to fix and re-publish;
-                // fail honestly after bounded recovery attempts.
-                st.artifact_error_count += 1;
-                if st.artifact_error_count <= 2 {
-                    artifact_recovery = Some(format!(
-                        "Your artifact was rejected: {}. Fix that exact problem and call \
-                         Artifact/publish_artifact again with one complete self-contained HTML file \
-                         (all CSS/JS inline). Do not answer with markdown code.",
-                        out.content
-                    ));
-                } else {
-                    loop_stop = Some(format!(
-                        "artifact publishing failed after {} attempts; \
-                         last rejection: {}",
-                        st.artifact_error_count, out.content
-                    ));
-                }
-            }
-            if out.finished {
-                report::finish(&out.content);
-                if depth == 0 {
-                    report::refused_this_turn();
-                }
-                summary = Some(out.content.clone());
-            } else {
-                note_loop_result(
-                    &mut st.loop_guard,
-                    &call.name,
-                    &call_input,
-                    &out.content,
-                    out.is_error,
-                    &mut loop_nudge,
-                    &mut loop_stop,
-                );
-            }
-            results.push(ToolResult {
-                id: call.id.clone(),
-                content: out.content,
-                is_error: out.is_error,
-                images: out.images,
-            });
+            let out = tools::run(&call.name, &call_input, cwd);
+            let r = record_outcome(
+                &ctx,
+                &mut st,
+                &mut round,
+                call.id.clone(),
+                &call.name,
+                &call_input,
+                out,
+            );
+            results.push(r);
         }
+        flush_pending(&ctx, &mut st, &mut round, &mut pending, &mut results);
+        let Round {
+            summary,
+            loop_nudge,
+            loop_stop,
+            artifact_recovery,
+            unrun: round_unrun,
+        } = round;
         if !waiting.is_empty() {
             start_waiting_helpers(p, perm, &mut waiting, &mut results, cwd, depth);
         }
@@ -2891,6 +2866,144 @@ fn offered(p: &Provider, defs: Vec<tools::ToolDef>) -> Vec<tools::ToolDef> {
 
 // Images a tool returned reach the model only when it takes them; for one
 // that does not, the result says why there are none.
+// What one tool round left for after its calls: set by the calls, read once
+// the round is over.
+#[derive(Default)]
+struct Round {
+    summary: Option<String>,
+    loop_nudge: Option<String>,
+    loop_stop: Option<String>,
+    artifact_recovery: Option<String>,
+    unrun: Option<String>,
+}
+
+// What recording an outcome needs from the turn.
+struct RecordCtx<'a> {
+    p: &'a Provider,
+    defs: &'a [tools::ToolDef],
+    task: &'a str,
+    cwd: &'a Path,
+    depth: usize,
+}
+
+// Everything after a call ran: its hooks, the screen, the trace and the
+// turn's bookkeeping. The same for a call that ran in line and one that ran
+// beside others, so both leave the turn in the same state.
+fn record_outcome(
+    ctx: &RecordCtx,
+    st: &mut TurnState,
+    round: &mut Round,
+    id: String,
+    name: &str,
+    input: &serde_json::Value,
+    out: tools::Outcome,
+) -> ToolResult {
+    let mut out = vision_checked(ctx.p, out);
+    post_tool_hooks(name, input, &mut out, ctx.cwd);
+    if out.is_error {
+        hooks::notify("OnError", ctx.cwd);
+        if call_could_not_run(name, input, ctx.defs) {
+            round.unrun.get_or_insert_with(|| {
+                let why = out.content.lines().next().unwrap_or("").trim();
+                format!("{} ({})", name, trace::preview(why, 100))
+            });
+        }
+    }
+    report::tool_result(name, &out.content, out.is_error);
+    trace_tool_result(name, &out.content, out.is_error, "build", ctx.depth);
+    if name == "check_work" {
+        st.check_work_called = true;
+        if !check_work_found_no_project(&out.content) {
+            st.check_work_passed = Some(!out.is_error);
+        }
+    }
+    // Feed the verifier real data: every executed call, and the files
+    // touched by successful write/edit tools.
+    st.tool_records.push(crate::verifier::ToolCallRecord {
+        tool_name: name.to_string(),
+        args_summary: tools::preview(name, input),
+        result_preview: out.content.chars().take(200).collect(),
+        timestamp: String::new(),
+    });
+    if !out.is_error {
+        if let Some(pb) = tools::edit_tracking_path(name, input, ctx.cwd) {
+            let path = pb.display().to_string();
+            if !st.changed_files.contains(&path) {
+                st.changed_files.push(path);
+            }
+        }
+    }
+    if matches!(name, "Artifact" | "publish_artifact")
+        && out.is_error
+        && (static_artifact_requested(ctx.task) || canvas_game_requested(ctx.task))
+    {
+        // No fabricated fallback artifact: tell the model exactly why
+        // publishing was rejected and ask it to fix and re-publish;
+        // fail honestly after bounded recovery attempts.
+        st.artifact_error_count += 1;
+        if st.artifact_error_count <= 2 {
+            round.artifact_recovery = Some(format!(
+                "Your artifact was rejected: {}. Fix that exact problem and call \
+                 Artifact/publish_artifact again with one complete self-contained HTML file \
+                 (all CSS/JS inline). Do not answer with markdown code.",
+                out.content
+            ));
+        } else {
+            round.loop_stop = Some(format!(
+                "artifact publishing failed after {} attempts; \
+                 last rejection: {}",
+                st.artifact_error_count, out.content
+            ));
+        }
+    }
+    if out.finished {
+        report::finish(&out.content);
+        if ctx.depth == 0 {
+            report::refused_this_turn();
+        }
+        round.summary = Some(out.content.clone());
+    } else {
+        note_loop_result(
+            &mut st.loop_guard,
+            name,
+            input,
+            &out.content,
+            out.is_error,
+            &mut round.loop_nudge,
+            &mut round.loop_stop,
+        );
+    }
+    ToolResult {
+        id,
+        content: out.content,
+        is_error: out.is_error,
+        images: out.images,
+    }
+}
+
+// Runs the queued read-only calls and records each outcome in its slot, in
+// call order. They passed their gates, so they run even if the user
+// stopped the turn at a later call's prompt, as they would have in line.
+fn flush_pending(
+    ctx: &RecordCtx,
+    st: &mut TurnState,
+    round: &mut Round,
+    pending: &mut Vec<PendingCall>,
+    results: &mut [ToolResult],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let calls = std::mem::take(pending);
+    let outs = run_pending(&calls, ctx.cwd);
+    for (call, out) in calls.into_iter().zip(outs) {
+        let r = record_outcome(ctx, st, round, call.id, &call.name, &call.input, out);
+        if let Some(slot) = results.get_mut(call.slot) {
+            *slot = r;
+        }
+    }
+}
+
 fn vision_checked(p: &Provider, mut out: tools::Outcome) -> tools::Outcome {
     if !out.images.is_empty() && !crate::media::model_supports_vision(p) {
         out.images.clear();
@@ -3066,6 +3179,11 @@ mod unrun_call_tests {
 
 mod review;
 use review::*;
+mod parallel_tools;
+use parallel_tools::*;
+pub use parallel_tools::{
+    max_parallel_tools, run_read_only_calls, set_max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS,
+};
 pub use review::{
     default_parallel_helpers, max_parallel_helpers, max_parallel_helpers_note, run_review,
     set_max_parallel_helpers, DEFAULT_MAX_PARALLEL_HELPERS,

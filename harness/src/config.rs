@@ -254,6 +254,10 @@ pub struct Settings {
     /// it answers at once (one unless it reports more).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_helpers: Option<usize>,
+    /// How many read-only calls from one reply (reads, searches, fetches)
+    /// run at once; 1 runs every call one after another. Unset: 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tools: Option<usize>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -412,6 +416,7 @@ impl Default for Settings {
             project_allowed: BTreeMap::new(),
             max_concurrent_workflows: default_max_concurrent_workflows(),
             max_parallel_helpers: None,
+            max_parallel_tools: None,
             mcp_servers: BTreeMap::new(),
             plugins: BTreeMap::new(),
             instruction_files: default_instruction_files(),
