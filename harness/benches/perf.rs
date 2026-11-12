@@ -290,8 +290,76 @@ fn slow_server(delay_ms: u64) -> u16 {
     port
 }
 
+// ── terminal UI: streamed-line wrap and the code highlighter ────────────────
+// A paragraph streamed with no line break, in chunks the size of a token:
+// the cost of a chunk must not grow with the line (it did: each chunk
+// re-wrapped the open line from its start).
+fn bench_stream_wrap(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    let line = "the agent read three files, proposed a diff with word-level highlights";
+    let chunk = "token ";
+    let mut g = c.benchmark_group("stream_wrap");
+    for chars in [200usize, 2_000, 20_000] {
+        let chunks = chars / chunk.len();
+        g.throughput(Throughput::Elements(chunks as u64));
+        if chars >= 20_000 {
+            g.sample_size(20);
+        }
+        g.bench_function(format!("chunks_into_{chars}char_line"), |b| {
+            let mut t = uibench::transcript(200, 100, line);
+            b.iter(|| uibench::stream_line(black_box(&mut t), black_box(chunk), chunks))
+        });
+    }
+    g.finish();
+}
+
+// A fenced code block is highlighted once, when its closing fence lands.
+fn bench_highlight(c: &mut Criterion) {
+    use buildwithnexus::highlight::highlight_block;
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "rust",
+            "rust",
+            include_str!("../tests/fixtures/highlight/sample.rs.txt"),
+        ),
+        (
+            "python",
+            "python",
+            include_str!("../tests/fixtures/highlight/sample.py"),
+        ),
+        (
+            "yaml",
+            "yaml",
+            include_str!("../tests/fixtures/highlight/sample.yml"),
+        ),
+        (
+            "json",
+            "json",
+            include_str!("../tests/fixtures/highlight/sample.json"),
+        ),
+    ];
+    let mut g = c.benchmark_group("highlight");
+    for (name, tag, text) in cases {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        g.throughput(Throughput::Bytes(text.len() as u64));
+        g.bench_function(format!("{name}/{}lines", lines.len()), |b| {
+            b.iter(|| highlight_block(black_box(tag), black_box(&lines)))
+        });
+    }
+    // One long line: minified code, or a data file pasted into a fence.
+    let long = vec!["f(a, \"s\", 42) + Vec::new(x) ".repeat(400)];
+    g.throughput(Throughput::Bytes(long[0].len() as u64));
+    g.bench_function("rust/one_11kb_line", |b| {
+        b.iter(|| highlight_block(black_box("rust"), black_box(&long)))
+    });
+    g.finish();
+}
+// ── end terminal UI ──────────────────────────────────────────────────────────
+
 criterion_group!(
     benches,
+    bench_stream_wrap,
+    bench_highlight,
     bench_tool_batch,
     bench_wrap_cache,
     bench_body_builders,

@@ -177,6 +177,18 @@ pub mod bench {
         c.0.set(i, base.to_string());
     }
 
+    /// A whole line streamed in: `chunks` appends of `chunk` to one open
+    /// line, which is then dropped again. Per-chunk cost is this over
+    /// `chunks`, and should not depend on how long the line gets.
+    pub fn stream_line(c: &mut WrapCache, chunk: &str, chunks: usize) {
+        c.0.push(String::new());
+        let i = c.0.len() - 1;
+        for _ in 0..chunks {
+            c.0.append_to(i, chunk);
+        }
+        c.0.remove(i);
+    }
+
     /// The old behavior: every chunk re-wrapped the entire transcript.
     pub fn full_rewrap(c: &mut WrapCache, width: usize) {
         c.0.ensure_width(width);

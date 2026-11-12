@@ -1034,4 +1034,271 @@ mod tests {
         assert!(lang_for("TypeScript").is_some());
         assert!(lang_for("ts {1,3}").is_some());
     }
+
+    // ── output snapshot ──────────────────────────────────────────────────────
+    // The lexer's output, pinned: a hash per input of what every language's
+    // lexer makes of it. The inputs are frozen excerpts of this repository
+    // (tests/fixtures/highlight) and the edge cases below. Colours are
+    // replaced by role tags first, so the hashes do not depend on the theme
+    // or the terminal's colour depth.
+
+    const SNAP_LANGS: &[&str] = &[
+        "rust", "c", "js", "py", "go", "java", "sh", "rb", "sql", "json", "yaml", "toml", "css",
+        "html", "diff", "nope",
+    ];
+
+    fn fnv1a(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    // `ESC[<colour>m` … reset becomes `\x02<role>` … `\x03`.
+    fn normalise(s: &str) -> String {
+        let split = |painted: String| -> (String, String) {
+            let (a, b) = painted.split_once('\u{1}').expect("marker");
+            (a.to_string(), b.to_string())
+        };
+        let (_, reset) = split(kw("\u{1}"));
+        let (bold_on, bold_off) = split(tui::bold("\u{1}"));
+        let mut roles = [
+            (split(kw("\u{1}")).0, "k"),
+            (split(ty("\u{1}")).0, "t"),
+            (split(string("\u{1}")).0, "s"),
+            (split(number("\u{1}")).0, "n"),
+            (split(comment("\u{1}")).0, "c"),
+            (split(tui::red("\u{1}")).0, "r"),
+            (bold_on, "b"),
+        ];
+        roles.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        for (i, (a, _)) in roles.iter().enumerate() {
+            assert!(!a.is_empty() && *a != reset, "colour is on");
+            for (b, _) in &roles[i + 1..] {
+                assert_ne!(a, b, "two roles share a colour: the snapshot cannot tell");
+            }
+        }
+        let mut out = s.replace(&reset, "\u{3}").replace(&bold_off, "\u{4}");
+        for (prefix, tag) in &roles {
+            out = out.replace(prefix, &format!("\u{2}{tag}"));
+        }
+        assert!(!out.contains('\x1b'), "an unknown escape: {out:?}");
+        out
+    }
+
+    fn snapshot(tags: &[&str], text: &str) -> u64 {
+        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for tag in tags {
+            let out = highlight_block(tag, &lines);
+            assert_eq!(out.len(), lines.len());
+            for (o, l) in out.iter().zip(&lines) {
+                assert_eq!(tui::strip_ansi(o), *l, "{tag}: text changed");
+                fnv1a(&mut h, normalise(o).as_bytes());
+                fnv1a(&mut h, b"\n");
+            }
+        }
+        h
+    }
+
+    fn edge_cases() -> Vec<(&'static str, String)> {
+        let s = |x: &str| x.to_string();
+        vec![
+            ("empty", s("")),
+            ("blank_lines", s("\n\n   \n\t\n")),
+            (
+                "unterminated_string",
+                s("let s = \"abc\nx = 'it's\nlet t = \"abc\\\nu = 'a\\'"),
+            ),
+            (
+                "backtick_open",
+                s("a = `x\ny ${z}\n` + 1; b = `one` + `two\nstill"),
+            ),
+            (
+                "block_comment_open",
+                s("a /* b\nc\nd */ e /* f */ g /* h\n*/ */ i\n/* never closed"),
+            ),
+            (
+                "html_comment",
+                s("<!-- x\n y --> <div a='1'> <!-- z --> </a-b:c> < 3 <1> <é>"),
+            ),
+            (
+                "triple_quotes",
+                s("\"\"\"doc\nmore\n\"\"\" x = 1\n'''a''' + \"\"\"b\nc\"\"\"\"\"\"\n''''''"),
+            ),
+            (
+                "non_ascii",
+                s("let naïve = \"héllo wörld\"; // ünïcode 日本語 🎉\n变量 = 1\n\
+                   Ünï(x) Élan ÉLAN é1 ٣ 🎉(1)\n'é' \"日本\" `🎉`"),
+            ),
+            (
+                "numbers",
+                s("0x1F 1_000 1.5e3 a1 1a _1 x.0 1..2 9é 1٣ .5 -3 3."),
+            ),
+            (
+                "shell_vars",
+                s("echo $HOME ${X ${Y}z $ $1 $é \"$A\" ${unclosed\n$_a$b ${} $"),
+            ),
+            (
+                "sigils",
+                s("#include <x.h>\n#!sh\n# c\n#é #1 ##a\nfoo? bar?\nbaz?"),
+            ),
+            (
+                "yaml_toml_keys",
+                s("- key: v\nkey : v\n  nested: \"x\": y\n~\na = 1\n[t]\na.b = \"c\"\n- - k: v\nk= 1\nk:v"),
+            ),
+            (
+                "json_keys",
+                s("{\"k\" : 1, \"s\": \"a\\\"b\", \"u\": \"é\" :}\n\"k\"\u{a0}: 1 \"j\"\u{3000}:\n\"last\""),
+            ),
+            (
+                "wide_spaces",
+                s("f\u{2003}(x) g\u{a0}(y) h\t(z) k\u{3000}: 1"),
+            ),
+            (
+                "escapes",
+                s("\"a\\\\\" \"b\\\"\" 'c\\'' \"é\\é\" \"abc\\"),
+            ),
+            (
+                "css",
+                s("@media !important a { color: #fff } /* c */ important @import 'x'"),
+            ),
+            ("lone", s("\"\n'\n`\n$\n#\n<\n/\n/*\n*/\n-\n--\n//\n\\\n?")),
+            (
+                "capitals",
+                s("Foo FOO Fo F fOO Élan ÉLAN Ünï Self String Vec<Option<T>>"),
+            ),
+            (
+                "rustisms",
+                s("r#\"raw\"# b'x' <'a> 'static fn f<'a>(x: &'a str) -> u8 { 1u8 as f64 }"),
+            ),
+            (
+                "comment_starts",
+                s("a//b http://x\na--b --x\na#b\n/ / /**/ /***/ /*/ x */"),
+            ),
+            (
+                "calls",
+                s("f(1) g (2) h\t(3) if (x) T(y) t::u(z) é(1) f?(x) f?"),
+            ),
+            (
+                "long_ascii",
+                "fn f(a: u32) -> Vec<String> { g(\"s\", 1.0) } ".repeat(300),
+            ),
+            (
+                "long_non_ascii",
+                "naïve(\"日本語\", 🎉) + Ünï { 42 } ".repeat(200),
+            ),
+            ("long_word", "x".repeat(50_000)),
+            ("long_string_open", format!("\"{}", "ab ".repeat(2_000))),
+        ]
+    }
+
+    const FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "sample.rs",
+            "rust",
+            include_str!("../tests/fixtures/highlight/sample.rs.txt"),
+        ),
+        (
+            "sample.py",
+            "python",
+            include_str!("../tests/fixtures/highlight/sample.py"),
+        ),
+        (
+            "sample.js",
+            "js",
+            include_str!("../tests/fixtures/highlight/sample.js"),
+        ),
+        (
+            "sample.sh",
+            "bash",
+            include_str!("../tests/fixtures/highlight/sample.sh"),
+        ),
+        (
+            "sample.ps1",
+            "powershell",
+            include_str!("../tests/fixtures/highlight/sample.ps1"),
+        ),
+        (
+            "sample.toml",
+            "toml",
+            include_str!("../tests/fixtures/highlight/sample.toml"),
+        ),
+        (
+            "sample.yml",
+            "yaml",
+            include_str!("../tests/fixtures/highlight/sample.yml"),
+        ),
+        (
+            "sample.json",
+            "json",
+            include_str!("../tests/fixtures/highlight/sample.json"),
+        ),
+    ];
+
+    // (input, hash in its own language, hash across every language).
+    const FIXTURE_HASHES: &[(&str, u64, u64)] = &[
+        ("sample.rs", 0x30e081ccdce308f5, 0xad386793790ad61e),
+        ("sample.py", 0x885367042fd47f87, 0x58d610659d48343f),
+        ("sample.js", 0x604073b1d516b86e, 0x7371a04c210e91db),
+        ("sample.sh", 0xce093bdf6c731d92, 0xe068fe2df0694d7f),
+        ("sample.ps1", 0xce07d0f9b3a6bd8d, 0xb3ee57ba51c70ac4),
+        ("sample.toml", 0x8e89ff06ff99153a, 0x8d6dbfa433983720),
+        ("sample.yml", 0xb9083f9674e29e2e, 0xcb7b7b7b35a0de34),
+        ("sample.json", 0xeed2d63dd0f96557, 0x44e98200f4df31a0),
+    ];
+    const EDGE_HASHES: &[(&str, u64)] = &[
+        ("empty", 0x674bec8e372766a5),
+        ("blank_lines", 0xf089fad8b7900ef5),
+        ("unterminated_string", 0x2deb239d857cb101),
+        ("backtick_open", 0x4fcce5bfc3dd6822),
+        ("block_comment_open", 0xc8769c991f982299),
+        ("html_comment", 0x84db2a3e04d67e2c),
+        ("triple_quotes", 0x330500bf7a6e0546),
+        ("non_ascii", 0x29844091eec1c142),
+        ("numbers", 0x3d73d8f6e1376357),
+        ("shell_vars", 0xcf95a313c70eeaa9),
+        ("sigils", 0x6106ca66e5aede46),
+        ("yaml_toml_keys", 0x2b73d64e66d1387a),
+        ("json_keys", 0xa15a1d1ea395d6a5),
+        ("wide_spaces", 0x279db310f80acf1d),
+        ("escapes", 0xd6b779b1cc529bb5),
+        ("css", 0x3e9f3e0614178b57),
+        ("lone", 0xce42e8fbd102e23b),
+        ("capitals", 0x41bc416ffe100ddc),
+        ("rustisms", 0x974f7c43e9e13001),
+        ("comment_starts", 0x7f65dd3d6b0f929b),
+        ("calls", 0xf261f0e543c78269),
+        ("long_ascii", 0xba22e0369901f56d),
+        ("long_non_ascii", 0x0f1b4f1e7fcb742d),
+        ("long_word", 0x52c9a2d56430eea5),
+        ("long_string_open", 0x1d40d6ca3dcd9c25),
+    ];
+
+    #[test]
+    fn output_matches_the_snapshot() {
+        std::env::remove_var("NO_COLOR");
+        let mut got_fixtures = Vec::new();
+        for (name, tag, text) in FIXTURES {
+            got_fixtures.push((*name, snapshot(&[tag], text), snapshot(SNAP_LANGS, text)));
+        }
+        let mut got_edges = Vec::new();
+        for (name, text) in edge_cases() {
+            got_edges.push((name, snapshot(SNAP_LANGS, &text)));
+        }
+        // To regenerate after an intended change: copy these from the
+        // failure message into the two tables above.
+        let mut listing = String::from("FIXTURE_HASHES:\n");
+        for (n, a, b) in &got_fixtures {
+            listing.push_str(&format!("        (\"{n}\", 0x{a:016x}, 0x{b:016x}),\n"));
+        }
+        listing.push_str("EDGE_HASHES:\n");
+        for (n, a) in &got_edges {
+            listing.push_str(&format!("        (\"{n}\", 0x{a:016x}),\n"));
+        }
+        assert!(
+            got_fixtures == FIXTURE_HASHES && got_edges == EDGE_HASHES,
+            "highlighter output changed:\n{listing}"
+        );
+    }
 }
