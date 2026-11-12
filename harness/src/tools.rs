@@ -450,76 +450,39 @@ pub fn is_mutating(name: &str) -> bool {
     if crate::mcp::is_mcp_tool(name) {
         return !crate::mcp::is_read_only(name);
     }
-    matches!(
-        name,
-        "write"
-            | "write_file"
-            | "edit"
-            | "edit_file"
-            | "multi_edit"
-            | "patch"
-            | "apply_patch"
-            | "create_dir"
-            | "move_path"
-            | "remove_path"
-            | "bash"
-            | "run_command"
-            | "check_work"
-            | "start_server"
-            | "stop_server"
-            | "open_browser"
-            | "python_tool"
-            | "task"
-            | "spawn_subagent"
-            | "todowrite"
-            | "todo_write"
-            | "create_docx"
-            | "Artifact"
-            | "publish_artifact"
-            | "kb_record"
-            | "mcp_call"
-    )
+    table::lookup(name).is_some_and(|s| {
+        matches!(
+            s.mutation,
+            table::Mutation::Always | table::Mutation::UnlessReadOnlyHelper
+        )
+    })
 }
 
 /// The tool an alias stands for (`bash` for run_command), else the name.
 pub fn canonical_name(name: &str) -> &str {
-    match name {
-        "bash" => "run_command",
-        "read" => "read_file",
-        "write" => "write_file",
-        "edit" => "edit_file",
-        "patch" => "apply_patch",
-        "glob" => "find_paths",
-        "grep" => "grep_files",
-        "list" => "list_dir",
-        "webfetch" => "fetch_url",
-        "websearch" => "web_search",
-        "todowrite" => "todo_write",
-        "todoread" => "todo_read",
-        "skill" => "load_skill",
-        "AskUserQuestion" => "question",
-        "ExitPlanMode" => "exit_plan",
-        "publish_artifact" => "Artifact",
-        "task" => "spawn_subagent",
-        other => other,
-    }
+    table::lookup(name).map_or(name, |s| s.canonical)
 }
 
 pub fn is_mutating_call(name: &str, input: &Value) -> bool {
-    if matches!(
-        name,
-        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
-    ) {
-        let cmd = input["command"].as_str().unwrap_or("view");
-        cmd != "view"
-    } else if matches!(name, "task" | "spawn_subagent") {
+    match table::lookup(name).map(|s| s.mutation) {
+        Some(table::Mutation::UnlessView) => {
+            let cmd = input["command"].as_str().unwrap_or("view");
+            cmd != "view"
+        }
         // A helper started with read_only: true is read-only itself (its
         // tools and its gate, see agent::helper_reads_only), so starting
         // one is a read.
-        input["read_only"].as_bool() != Some(true)
-    } else {
-        is_mutating(name)
+        Some(table::Mutation::UnlessReadOnlyHelper) => input["read_only"].as_bool() != Some(true),
+        _ => is_mutating(name),
     }
+}
+
+/// Whether a call is a pure read that can run alongside other such calls:
+/// file reads, listings and searches, knowledge-base queries, fetches and
+/// web searches. Never an MCP tool, any text-editor command, or a call
+/// whose arguments failed to parse.
+pub fn is_parallel_safe(name: &str, input: &Value) -> bool {
+    input.get(INVALID_ARGS).is_none() && table::lookup(name).is_some_and(|s| s.parallel_safe)
 }
 
 // Shell composition, redirection, substitution, expansion and control
@@ -1678,12 +1641,11 @@ pub fn approval_label(name: &str, input: &Value) -> String {
 /// without a prompt inside the project. Deleting (`remove_path`) and every
 /// command still ask.
 pub fn is_file_edit(name: &str, input: &Value) -> bool {
-    match name {
-        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" | "patch" | "apply_patch"
-        | "create_dir" | "move_path" => true,
-        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
-            is_mutating_call(name, input)
-        }
+    match table::lookup(name) {
+        Some(s) if s.file_edit => match s.mutation {
+            table::Mutation::UnlessView => is_mutating_call(name, input),
+            _ => true,
+        },
         _ => false,
     }
 }
@@ -1698,19 +1660,11 @@ const WEB_SEARCH_HOST: &str = "lite.duckduckgo.com";
 /// "my api key is …") and fetches reach local services, so outside `auto`
 /// they are approved per host. `?` when the URL has no parsable host.
 pub fn network_host(name: &str, input: &Value) -> Option<String> {
-    if matches!(name, "websearch" | "web_search") {
-        return Some(WEB_SEARCH_HOST.to_string());
-    }
-    if !matches!(
-        name,
-        "webfetch"
-            | "fetch_url"
-            | "headless_browser"
-            | "wait_for_url"
-            | "screenshot_url"
-            | "open_browser"
-    ) {
-        return None;
+    let network = table::lookup(name)?.network;
+    match network {
+        table::Network::None => return None,
+        table::Network::Search => return Some(WEB_SEARCH_HOST.to_string()),
+        table::Network::Url | table::Network::HttpUrl => {}
     }
     let url = input["url"]
         .as_str()
@@ -1718,7 +1672,7 @@ pub fn network_host(name: &str, input: &Value) -> Option<String> {
         .filter(|u| !u.is_empty())?;
     // screenshot_url opens http(s) pages only and refuses anything else
     // itself, with that reason; there is no host to approve.
-    if name == "screenshot_url"
+    if network == table::Network::HttpUrl
         && !url::Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
     {
         return None;
@@ -2055,39 +2009,20 @@ pub const INVALID_ARGS: &str = "__bwn_invalid_args__";
 // The filesystem path a call touches (for confinement checks), resolved against
 // cwd. None for non-path tools.
 pub fn touched_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
-    match name {
-        "read"
-        | "read_file"
-        | "list"
-        | "list_dir"
-        | "list_tree"
-        | "file_info"
-        | "write"
-        | "write_file"
-        | "edit"
-        | "edit_file"
-        | "multi_edit"
-        | "create_dir"
-        | "remove_path"
-        | "create_docx"
-        | "python_tool"
-        | "str_replace_editor"
-        | "text_editor_20241022"
-        | "text_editor_20250124" => Some(resolve(cwd, path_arg(input).unwrap_or(""))),
-        "move_path" => Some(resolve(cwd, input["from"].as_str().unwrap_or("").trim())),
-        "glob" | "find_paths" | "find_files" | "grep" | "grep_files" => {
-            Some(resolve(cwd, root_arg(input)))
-        }
-        "read_many_files" => touched_paths(name, input, cwd).into_iter().next(),
-        _ => None,
+    match table::lookup(name)?.paths {
+        table::Paths::PathArg => Some(resolve(cwd, path_arg(input).unwrap_or(""))),
+        table::Paths::Move => Some(resolve(cwd, input["from"].as_str().unwrap_or("").trim())),
+        table::Paths::Root => Some(resolve(cwd, root_arg(input))),
+        table::Paths::Many => touched_paths(name, input, cwd).into_iter().next(),
+        table::Paths::Patch | table::Paths::None => None,
     }
 }
 
 /// Every path a call touches: all of read_many_files' paths, both ends of a
 /// move, otherwise touched_path.
 pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
-    match name {
-        "read_many_files" => input["paths"]
+    match table::lookup(name).map(|s| s.paths) {
+        Some(table::Paths::Many) => input["paths"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -2098,14 +2033,14 @@ pub fn touched_paths(name: &str, input: &Value, cwd: &Path) -> Vec<PathBuf> {
             })
             .unwrap_or_default(),
         // The paths move_path itself uses, trimmed as it trims them.
-        "move_path" => ["from", "to"]
+        Some(table::Paths::Move) => ["from", "to"]
             .iter()
             .filter_map(|k| input[*k].as_str())
             .map(|p| resolve(cwd, p.trim()))
             .collect(),
         // `git apply` reads the patch's paths from the top of the work tree
         // (from the folder itself outside one).
-        "patch" | "apply_patch" => {
+        Some(table::Paths::Patch) => {
             let base = git_top(cwd);
             patch_files(input["patch"].as_str().unwrap_or(""))
                 .into_iter()
@@ -2283,29 +2218,21 @@ pub fn command_arg_for<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
 }
 
 pub fn read_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
-    match name {
-        "read" | "read_file" => path_arg(input).map(|p| resolve(cwd, p)),
-        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
-            if input["command"].as_str().unwrap_or("view") == "view" =>
-        {
-            path_arg(input).map(|p| resolve(cwd, p))
-        }
-        _ => None,
-    }
+    let reads = match table::lookup(name)?.tracking {
+        table::Tracking::Read => true,
+        table::Tracking::Editor => input["command"].as_str().unwrap_or("view") == "view",
+        table::Tracking::Edit | table::Tracking::None => false,
+    };
+    reads.then(|| path_arg(input).map(|p| resolve(cwd, p)))?
 }
 
 pub fn edit_tracking_path(name: &str, input: &Value, cwd: &Path) -> Option<PathBuf> {
-    match name {
-        "write" | "write_file" | "edit" | "edit_file" | "multi_edit" | "remove_path" => {
-            path_arg(input).map(|p| resolve(cwd, p))
-        }
-        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124"
-            if input["command"].as_str().unwrap_or("view") != "view" =>
-        {
-            path_arg(input).map(|p| resolve(cwd, p))
-        }
-        _ => None,
-    }
+    let edits = match table::lookup(name)?.tracking {
+        table::Tracking::Edit => true,
+        table::Tracking::Editor => input["command"].as_str().unwrap_or("view") != "view",
+        table::Tracking::Read | table::Tracking::None => false,
+    };
+    edits.then(|| path_arg(input).map(|p| resolve(cwd, p)))?
 }
 
 // Where a search without a folder of its own looks: the working folder and
@@ -3175,20 +3102,11 @@ pub fn out_of_cwd_mutation(name: &str, input: &Value, cwd: &Path) -> Option<Path
     if !is_mutating_call(name, input) {
         return None;
     }
-    let candidate = match name {
-        "write"
-        | "write_file"
-        | "edit"
-        | "edit_file"
-        | "multi_edit"
-        | "create_dir"
-        | "remove_path"
-        | "create_docx"
-        | "str_replace_editor"
-        | "text_editor_20241022"
-        | "text_editor_20250124" => touched_path(name, input, cwd)?,
+    let spec = table::lookup(name).filter(|s| s.confined)?;
+    let candidate = match spec.paths {
+        table::Paths::PathArg => touched_path(name, input, cwd)?,
         // Trimmed, as move_path trims them before it moves anything.
-        "move_path" => {
+        table::Paths::Move => {
             let from = resolve(cwd, input["from"].as_str().unwrap_or("").trim());
             if escapes_roots(&from, cwd) {
                 return Some(from);
@@ -4922,8 +4840,16 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
         ));
     }
     let _fetch_policy = network_host(name, input).map(|_| FetchPolicy::set(cwd));
-    match name {
-        "read" | "read_file" => {
+    // The table's row, else an MCP tool, else unknown. The match is
+    // exhaustive over table::Tool, so every row has a handler.
+    use table::Tool as T;
+    let tool = match table::lookup(name) {
+        Some(spec) => spec.tool,
+        None if crate::mcp::is_mcp_tool(name) => T::Mcp,
+        None => T::Unknown,
+    };
+    match tool {
+        T::ReadFile => {
             let p_str = path_arg(input).unwrap_or("").trim();
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -4962,7 +4888,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 },
             }
         }
-        "read_many_files" => {
+        T::ReadManyFiles => {
             let Some(paths) = input["paths"].as_array() else {
                 return err("paths is required");
             };
@@ -4997,7 +4923,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             ok(truncate(sections.join("\n\n"), MAX_READ))
         }
-        "list" | "list_dir" => {
+        T::ListDir => {
             let p = resolve(cwd, path_arg(input).unwrap_or("."));
             match fs::read_dir(&p) {
                 Ok(rd) => {
@@ -5021,7 +4947,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 )),
             }
         }
-        "list_tree" => {
+        T::ListTree => {
             let root = resolve(cwd, path_arg(input).unwrap_or("."));
             let max_depth = input["max_depth"].as_u64().unwrap_or(3).clamp(1, 8) as usize;
             let max_entries = input["max_entries"].as_u64().unwrap_or(200).clamp(1, 1000) as usize;
@@ -5033,7 +4959,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(truncate(entries.join("\n"), MAX_OUT))
             }
         }
-        "file_info" => {
+        T::FileInfo => {
             let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5068,7 +4994,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 )),
             }
         }
-        "glob" | "find_paths" => {
+        T::FindPaths => {
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -5105,7 +5031,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(matches.join("\n"))
             }
         }
-        "find_files" => {
+        T::FindFiles => {
             let pattern = input["pattern"].as_str().unwrap_or("").trim();
             if pattern.is_empty() {
                 return err("pattern is required");
@@ -5139,8 +5065,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(matches.join("\n"))
             }
         }
-        "grep" | "grep_files" => run_grep(input, cwd),
-        "write" | "write_file" => {
+        T::GrepFiles => run_grep(input, cwd),
+        T::WriteFile => {
             let p_str = path_arg(input).unwrap_or("").trim();
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5173,7 +5099,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "edit" | "edit_file" => {
+        T::EditFile => {
             let p_str = path_arg(input).unwrap_or("").trim();
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5220,7 +5146,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "multi_edit" => {
+        T::MultiEdit => {
             let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5288,7 +5214,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "patch" | "apply_patch" => {
+        T::ApplyPatch => {
             let patch = input["patch"].as_str().unwrap_or("");
             if patch.trim().is_empty() {
                 return err("patch is required");
@@ -5316,7 +5242,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("failed to wait for git apply: {e}")),
             }
         }
-        "create_dir" => {
+        T::CreateDir => {
             let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5327,7 +5253,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot create {}: {e}", p.display())),
             }
         }
-        "move_path" => {
+        T::MovePath => {
             let from_str = input["from"].as_str().unwrap_or("").trim();
             let to_str = input["to"].as_str().unwrap_or("").trim();
             if from_str.is_empty() || to_str.is_empty() {
@@ -5348,7 +5274,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 )),
             }
         }
-        "remove_path" => {
+        T::RemovePath => {
             let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5372,7 +5298,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot remove {}: {e}", p.display())),
             }
         }
-        "bash" | "run_command" => {
+        T::RunCommand => {
             let cmd = input["command"].as_str().unwrap_or("").trim();
             if cmd.is_empty() {
                 return err("command argument is required and cannot be empty");
@@ -5384,7 +5310,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(e),
             }
         }
-        "todowrite" | "todo_write" => {
+        T::TodoWrite => {
             let Some(items) = input["items"].as_array() else {
                 return err("items is required");
             };
@@ -5420,7 +5346,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(_) => err("todo store unavailable"),
             }
         }
-        "todoread" | "todo_read" => match todo_store().lock() {
+        T::TodoRead => match todo_store().lock() {
             Ok(todos) if todos.is_empty() => ok("no todo items"),
             Ok(todos) => ok(todos
                 .iter()
@@ -5430,7 +5356,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 .join("\n")),
             Err(_) => err("todo store unavailable"),
         },
-        "create_docx" => {
+        T::CreateDocx => {
             let p_str = path_arg(input).unwrap_or("");
             if p_str.is_empty() {
                 return err("path argument is required and cannot be empty");
@@ -5451,7 +5377,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("cannot write {}: {e}", p.display())),
             }
         }
-        "webfetch" | "fetch_url" => {
+        T::FetchUrl => {
             let url = input["url"].as_str().unwrap_or("");
             if url.is_empty() {
                 return err("url is required");
@@ -5467,7 +5393,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("fetch failed: {e}")),
             }
         }
-        "websearch" | "web_search" => {
+        T::WebSearch => {
             let query = input["query"].as_str().unwrap_or("").trim();
             if query.is_empty() {
                 return err("query is required");
@@ -5498,15 +5424,15 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("web search failed: {e}")),
             }
         }
-        "headless_browser" => run_headless_browser(input),
-        "start_server" => start_server(input, cwd),
-        "list_servers" => list_servers(),
-        "stop_server" => stop_server(input),
-        "read_server_log" => read_server_log(input),
-        "wait_for_url" => wait_for_url(input),
-        "screenshot_url" => screenshot_url(input, cwd),
-        "open_browser" => open_browser(input, cwd),
-        "list_python_tools" => {
+        T::HeadlessBrowser => run_headless_browser(input),
+        T::StartServer => start_server(input, cwd),
+        T::ListServers => list_servers(),
+        T::StopServer => stop_server(input),
+        T::ReadServerLog => read_server_log(input),
+        T::WaitForUrl => wait_for_url(input),
+        T::ScreenshotUrl => screenshot_url(input, cwd),
+        T::OpenBrowser => open_browser(input, cwd),
+        T::ListPythonTools => {
             let rows = list_python_tools(cwd);
             if rows.is_empty() {
                 ok("no Python tools found in .buildwithnexus/tools or $NEXUS_HOME/tools")
@@ -5514,7 +5440,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(rows.join("\n"))
             }
         }
-        "python_tool" => {
+        T::PythonScript => {
             let raw = input["path"].as_str().unwrap_or("").trim();
             if raw.is_empty() {
                 return err("path is required");
@@ -5534,7 +5460,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 Err(e) => err(format!("python tool {}: {e}", path.display())),
             }
         }
-        "list_skills" => {
+        T::ListSkills => {
             let rows = crate::config::discover_skills(cwd)
                 .into_iter()
                 .map(|s| {
@@ -5555,7 +5481,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ))
             }
         }
-        "kb_query" => {
+        T::KbQuery => {
             let query = input["query"].as_str().unwrap_or("").trim();
             if query.is_empty() {
                 return err("query is required");
@@ -5580,7 +5506,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(formatted.join("\n---\n"))
             }
         }
-        "kb_record" => {
+        T::KbRecord => {
             let name = input["name"].as_str().unwrap_or("").trim();
             if name.is_empty() {
                 return err("name is required");
@@ -5618,7 +5544,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             ok(format!("Successfully recorded knowledge entity: {id}"))
         }
-        "rule_check" => {
+        T::RuleCheck => {
             let engine = crate::rules::RuleEngine::load_defaults();
             let mut changed = Vec::new();
             if let Some(arr) = input["changed_files"].as_array() {
@@ -5649,7 +5575,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 ok(crate::rules::RuleEngine::format_violations(&violations))
             }
         }
-        "verify" => {
+        T::Verify => {
             let verifier = crate::verifier::Verifier::new(&cwd.to_string_lossy());
             let mut changed = Vec::new();
             if let Some(arr) = input["changed_files"].as_array() {
@@ -5675,8 +5601,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             let report = verifier.verify(&ctx);
             ok(crate::verifier::Verifier::format_report(&report))
         }
-        "check_work" => run_check_work(input, cwd),
-        "mcp_call" => {
+        T::CheckWork => run_check_work(input, cwd),
+        T::McpCall => {
             let server = input["server"].as_str().unwrap_or("");
             let tool = input["tool"].as_str().unwrap_or("");
             if server.is_empty() || tool.is_empty() {
@@ -5686,7 +5612,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             crate::mcp::ensure_ready();
             mcp_outcome(crate::mcp::call(server, tool, &input["arguments"]))
         }
-        n if crate::mcp::is_mcp_tool(n) => {
+        T::Mcp => {
+            let n = name;
             let Some((server, tool)) = crate::mcp::demangle(n) else {
                 return err(format!(
                     "malformed MCP tool name: {n} (expected mcp__<server>__<tool>)"
@@ -5694,7 +5621,7 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             };
             mcp_outcome(crate::mcp::call(&server, &tool, input))
         }
-        "skill" | "load_skill" => {
+        T::LoadSkill => {
             let wanted = input["name"]
                 .as_str()
                 .unwrap_or("")
@@ -5717,17 +5644,15 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             err(format!("skill not found: {wanted}"))
         }
-        "str_replace_editor" | "text_editor_20241022" | "text_editor_20250124" => {
-            run_str_replace_editor(input, cwd)
-        }
-        "Artifact" | "publish_artifact" => run_artifact(input, cwd),
-        "finish" => Outcome {
+        T::Editor => run_str_replace_editor(input, cwd),
+        T::Artifact => run_artifact(input, cwd),
+        T::Finish => Outcome {
             content: input["summary"].as_str().unwrap_or("done").to_string(),
             is_error: false,
             finished: true,
             images: Vec::new(),
         },
-        "exit_plan" | "ExitPlanMode" => {
+        T::ExitPlan => {
             if let Some(steps) = input["steps"].as_array() {
                 let rows = steps
                     .iter()
@@ -5748,7 +5673,8 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                 err("exit_plan requires plan or non-empty steps")
             }
         }
-        other => {
+        T::AgentLoop | T::Unknown => {
+            let other = name;
             // List the real tool surface and suggest the nearest name so a
             // cheap model can self-correct instead of retrying blind.
             let names: Vec<&'static str> = defs(true).iter().map(|d| d.name).collect();
@@ -6251,7 +6177,13 @@ fn run_artifact(input: &Value, cwd: &Path) -> Outcome {
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
 mod net_guard;
 use net_guard::*;
+
+mod table;
 pub use net_guard::{blocked_url, private_network_host};
 
+#[cfg(test)]
+mod classify_tests;
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 pub(crate) mod tests;
