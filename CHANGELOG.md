@@ -4,6 +4,67 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-11-12
+
+Read-only tool calls from one reply now run side by side, the npm
+launcher's first download works behind a proxy on every supported Node, and
+HTTP moves to ureq 3. Approvals, hooks and what the model is sent are
+unchanged.
+
+### Added
+- **Reads, searches and fetches in one reply run side by side.** When the
+  model asks for several read-only calls in a row (`read_file`,
+  `read_many_files`, `list_dir`, `list_tree`, `file_info`, `find_paths`,
+  `find_files`, `grep_files`, `kb_query`, `fetch_url`, `web_search`), they
+  run at the same time, up to `max_parallel_tools` at once (default 4; `1`
+  runs every call one after another as before).
+  - **Unchanged:** every call is still checked, approved and shown in order
+    before any of them runs, and the model gets the results in the order it
+    asked.
+  - **Limits:** at most one call per website is in flight.
+  - **Still one at a time:** anything that writes, commands, questions,
+    helpers, MCP and browser tools, and any call a PostToolUse hook matches.
+  - **Measured** (benchmarks `tool_batch/*`):
+    - four `grep_files` over 2,000 files: 68 ms → 22 ms;
+    - four fetches from servers that take 100 ms to answer: 402 ms → 101 ms;
+    - six small reads: 15 µs → 0.45 ms. That is the cost of starting the
+      threads, well under a model request.
+- **The npm launcher downloads through a proxy on Node 18 and later.**
+  - **Proxy:** the first-run download uses `HTTPS_PROXY` / `HTTP_PROXY`
+    (an `http://` proxy, with optional user and password) and honours
+    `NO_PROXY`. Before, this needed `NODE_USE_ENV_PROXY=1` on Node 22.21+
+    or 24.5+.
+  - **Security:** TLS still runs end to end with GitHub and certificates are
+    checked; proxy credentials are never printed.
+  - **Errors:** a proxy that wants credentials, refuses the tunnel or stops
+    answering says so.
+
+### Fixed
+- **`/model` back to the starting custom endpoint no longer asks for a key**
+  that `CUSTOM_API_KEY` already supplies.
+
+### Changed
+- **HTTP moves from ureq 2 to ureq 3.** It sits behind a small adapter, uses
+  the same rustls setup, trust store, proxy rules and fetch guard, and adds
+  no new dependencies. The release binary is 2.8% larger, with no
+  measurable change in start-up time. Small differences:
+  - a plain `http://` request through a proxy now sends the proxy's
+    credentials;
+  - the connect timeout also covers the TLS handshake;
+  - idle connections are closed after five minutes.
+
+### Internal
+- **One tool table.** Each tool's name, aliases and flags (mutating,
+  network, paths, parallel-safe) come from one table in `tools/table.rs`.
+  `run()` matches exhaustively on it, so a new tool cannot skip a gate. A
+  characterization test pins every classification function's output from
+  before the change.
+- **Terminal tests.**
+  - The terminal-input test that failed now and then waited on a repaint of
+    an earlier line; it now waits for the line it means.
+  - New PTY smoke tests check that two Ctrl+C presses and SIGTERM both
+    restore the terminal.
+
 ## [0.18.0] - 2026-11-12
 
 Bounds on what a runaway command, file or MCP server can do to a session,
@@ -1390,7 +1451,8 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.19.0
 [0.18.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.18.0
 [0.17.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.17.0
 [0.15.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.15.0

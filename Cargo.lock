@@ -106,7 +106,7 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "buildwithnexus"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "criterion",
  "crossterm",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "bwn"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "buildwithnexus",
 ]
