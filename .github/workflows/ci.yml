@@ -47,24 +47,46 @@ jobs:
       # only: release builds always start clean.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # --workspace: the bwn alias crate is published too, so it is checked
+      # like the main crate.
       - name: Format check
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Terminal input regression tests
         run: python3 ../scripts/test-terminal-input.py ../target/debug/buildwithnexus
 
-      - name: Build release
-        run: cargo build --release --locked
+      # The release build is the glibc-floor job's; building it here as well
+      # cost a second uncached LTO build on every PR.
 
       # The perf suite shouldn't rot — make sure it still compiles.
       - name: Compile benchmarks
         run: cargo bench --no-run --locked
+
+  # harness/Cargo.toml promises rust-version 1.94 to `cargo install` users;
+  # the other jobs use the latest stable, so check the floor really builds.
+  msrv:
+    name: Rust 1.94 (rust-version)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.94
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Check
+        run: cargo +1.94 check --workspace --locked
 
   # The glibc floor the launcher and docs state, checked on the x86_64 binary
   # built exactly as release.yml builds it (release profile, ubuntu-22.04),
@@ -188,6 +210,31 @@ jobs:
       # (old glibc, musl, EACCES, removed after install), against stub binaries.
       - name: Test launcher
         run: node --test scripts/launcher.test.js scripts/check-pe-imports.test.js
+
+  # package.json allows Node 18 and later, so the launcher's tests also run
+  # on the oldest versions it promises.
+  launcher-node:
+    name: npm launcher (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Test launcher
+        run: node --test scripts/launcher.test.js
 
   # The launcher is the first thing to fail on a user's machine, so its tests
   # also run on macOS and on Windows Server 2022 (what managed machines run;

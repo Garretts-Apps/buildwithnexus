@@ -93,8 +93,13 @@ publishing, `publish.yml` checks every release binary against its
 build-provenance attestation and records the verified hashes there, and a
 published npm tarball cannot change. A binary that does not match is deleted
 instead of being installed, so an asset swapped on the GitHub Release after
-publishing is refused. (A checkout without `checksums.json` falls back to the
-release's own `.sha256` file, which only catches corruption.)
+publishing is refused. If the package's `checksums.json` has no entry for
+this platform's asset, nothing is downloaded. (A source checkout, which has
+no `checksums.json`, falls back to the release's own `.sha256` file, which
+only catches corruption.) Each first run downloads to a temp file of its
+own, so two first runs at once cannot mix their bytes. On a platform with
+no prebuilt binary, or on musl or a glibc below the floor, the launcher
+explains that and downloads nothing.
 
 **Before it says "ready".** A matching checksum only shows the download is
 intact. The launcher then runs the new binary once with `--version` (15 s
@@ -372,10 +377,17 @@ never auto-updated.
 
 - Publishing uses npm's **OIDC Trusted Publisher** flow and crates.io
   **Trusted Publishing**, so no long-lived registry tokens are needed for
-  routine releases. The one exception is the one-time first publish of each
-  per-platform npm package, which npm only allows with a token.
+  releases, and the publish workflows read no registry token.
 - npm publish is **gated on the release workflow succeeding**, so a package
-  version can never point at binaries that don't exist.
+  version can never point at binaries that don't exist. Before anything is
+  published, every release binary is started once on the machine that
+  built it and must report the version being released, and the packed npm
+  tarball is installed in clean containers.
+- A pushed release tag must match `package.json` and be on `main`. A manual
+  release run for a version that is already tagged rebuilds nothing (new
+  binaries would not match the hashes pinned in the published npm package);
+  it only retries the crates.io publish. The npm publish workflow can be
+  started by hand only from `main`.
 - Every third-party GitHub Action is pinned to a full commit SHA (the
   version is in a trailing comment), and tools the workflows download are
   pinned to a version and checked against a recorded SHA-256. Dependabot
@@ -384,8 +396,7 @@ never auto-updated.
   workflow level, with each job granted only what it uses. `id-token: write`
   is granted only to the jobs that sign attestations or exchange OIDC tokens
   with npm and crates.io. Checkouts do not keep the `GITHUB_TOKEN` in
-  `.git/config`, except in the manual publish path that pushes a version
-  bump.
+  `.git/config`.
 - The release jobs that compile code (and so run dependency build scripts)
   hold a read-only token; a separate job that compiles nothing attests the
   binaries and uploads them.

@@ -130,13 +130,17 @@ test('publish.yml skips the field run for a version already on npm', () => {
   assert.ok(check, 'pack checks npm for the version');
   assert.match(all.pack, /already: \$\{\{ steps\.published\.outputs\.already \}\}/);
   assert.match(all.field, /^ {4}if: needs\.pack\.outputs\.already == 'false'$/m);
-  // publish still runs then (crates.io and the summary on a re-dispatch),
-  // but never after a field run that did not pass.
-  const cond = all.publish.match(/^ {4}if: >-\n((?: {6}.*\n)+)/m);
-  assert.ok(cond, 'publish has a job condition');
-  assert.match(cond[1], /needs\.field\.result == 'success'/);
-  assert.match(cond[1], /needs\.field\.result == 'skipped' && needs\.pack\.outputs\.already == 'true'/);
-  assert.match(cond[1], /needs\.pack\.result == 'success'/);
+  // Nor does it download and verify the binaries or pack a tarball.
+  for (const name of ['Verify release binaries and record checksums', 'Pack',
+    'Hand the tarball to the field and publish jobs', 'Syntax-check wrapper scripts']) {
+    const [step] = steps(all.pack).filter((s) => s.includes(`name: ${name}`));
+    assert.ok(step, `pack has the step "${name}"`);
+    assert.match(step, /if: steps\.published\.outputs\.already == 'false'/, `"${name}" is skipped when already on npm`);
+  }
+  // publish runs only for a new version, and never after a field run that
+  // did not pass. crates.io is release.yml's job, so nothing else is left.
+  assert.match(all.publish, /^ {4}if: needs\.pack\.outputs\.already == 'false' && needs\.field\.result == 'success'$/m);
   assert.doesNotMatch(all.publish, /steps\.published/);
+  assert.doesNotMatch(all.publish, /cargo publish|CARGO_REGISTRY_TOKEN/);
   assert.match(all.publish, /if: needs\.pack\.outputs\.already == 'false'\n/);
 });
