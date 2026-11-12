@@ -157,15 +157,6 @@ pub mod bench {
     pub fn parse_args(s: &str) -> Value {
         super::parse_args(s)
     }
-    pub fn cache_last_message(m: &mut [Value]) {
-        super::cache_last_message(m)
-    }
-    pub fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
-        super::anthropic_body(model, msgs, tools, None)
-    }
-    pub fn openai_body(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Value {
-        super::openai_body(model, msgs, tools, None, None)
-    }
     pub fn openai_stream(
         reader: impl Read,
         on_text: &mut dyn FnMut(&str),
@@ -180,33 +171,39 @@ pub mod bench {
     ) -> Result<Reply, String> {
         super::anthropic_stream(reader, on_text, on_thinking)
     }
-    // The bytes a streaming request puts on the wire, built the way the
-    // request path builds them (including the copies it makes on the way).
+    // The bytes a streaming request puts on the wire, as the request path
+    // builds them.
     pub fn anthropic_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
-        let mut body = super::anthropic_body(model, msgs, tools, None);
-        super::apply_anthropic_effort(&mut body, model, Effort::Off);
-        body["stream"] = json!(true);
-        // send_raw_blocking clones the body for each attempt.
-        let attempt = body.clone();
-        serde_json::to_vec(&attempt).unwrap_or_default()
+        let shape = AnthropicBody {
+            model,
+            max_tokens: None,
+            effort: Effort::Off,
+            stream: true,
+        };
+        super::anthropic_bytes(msgs, tools, &shape)
     }
     pub fn openai_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
-        let mut body = super::openai_body(model, msgs, tools, None, None);
-        super::apply_openai_effort(&mut body, model, Effort::Off);
-        super::mark_streaming(&mut body);
-        // openai_exchange keeps a copy for the flatten fallback, and
-        // send_raw_blocking clones again for each attempt.
-        let sent = body.clone();
-        let attempt = sent.clone();
-        serde_json::to_vec(&attempt).unwrap_or_default()
+        let shape = OpenAiBody {
+            model,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            stream: true,
+            flatten: None,
+        };
+        super::openai_bytes(msgs, tools, &shape)
     }
     pub fn ollama_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
-        let mut body = super::ollama_body(model, msgs, tools, None, None, 32_768);
-        super::apply_ollama_effort(&mut body, Effort::Off);
-        body["stream"] = json!(true);
-        let sent = body.clone();
-        let attempt = sent.clone();
-        serde_json::to_vec(&attempt).unwrap_or_default()
+        let shape = OllamaBody {
+            model,
+            temperature: None,
+            max_tokens: None,
+            num_ctx: 32_768,
+            think: false,
+            stream: true,
+            flatten: false,
+        };
+        super::ollama_bytes(msgs, tools, &shape)
     }
 }
 
@@ -590,251 +587,6 @@ fn is_template_role_error(e: &str) -> bool {
         || (l.contains("template") && l.contains("role"))
 }
 
-// Flatten a message's content (string or multimodal parts) to plain text.
-fn message_text(content: &Value) -> String {
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    if let Some(arr) = content.as_array() {
-        return arr
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    String::new()
-}
-
-// One turn of a flattened transcript: text plus the images it carried, in
-// the wire shape of whichever protocol the body uses.
-struct FlatTurn {
-    role: &'static str,
-    text: String,
-    images: Vec<Value>,
-}
-
-// Image parts of an OpenAI message: the `image_url` entries of a content array.
-fn openai_images(m: &Value) -> Vec<Value> {
-    m["content"]
-        .as_array()
-        .map(|parts| {
-            parts
-                .iter()
-                .filter(|p| p["type"] == "image_url")
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-// Images of an Ollama message: the bare base64 strings in `images`.
-fn ollama_images(m: &Value) -> Vec<Value> {
-    m["images"].as_array().cloned().unwrap_or_default()
-}
-
-// Fold a transcript into strictly alternating user/assistant turns with no
-// `system`/`tool` roles: system and tool-result content become user turns, an
-// assistant turn's tool_calls render as text, and consecutive same-role turns
-// merge (keeping every image). The first turn is always `user`.
-fn fold_turns(msgs: &[Value], images_of: fn(&Value) -> Vec<Value>) -> Vec<FlatTurn> {
-    let mut folded: Vec<FlatTurn> = Vec::new();
-    for m in msgs {
-        let text = message_text(&m["content"]);
-        match m["role"].as_str().unwrap_or("user") {
-            "assistant" => {
-                let mut content = text;
-                if let Some(calls) = m["tool_calls"].as_array() {
-                    for c in calls {
-                        let name = c["function"]["name"].as_str().unwrap_or("");
-                        // OpenAI sends a JSON string, Ollama a JSON object.
-                        let args = match &c["function"]["arguments"] {
-                            Value::String(a) => a.clone(),
-                            other => other.to_string(),
-                        };
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
-                        content.push_str(&format!("`{name}({args})`"));
-                    }
-                }
-                if !content.is_empty() {
-                    folded.push(FlatTurn {
-                        role: "assistant",
-                        text: content,
-                        images: Vec::new(),
-                    });
-                }
-            }
-            "tool" => {
-                if !text.is_empty() {
-                    folded.push(FlatTurn {
-                        role: "user",
-                        text: format!("Tool result:\n{text}"),
-                        images: Vec::new(),
-                    });
-                }
-            }
-            _ => folded.push(FlatTurn {
-                role: "user",
-                text,
-                images: images_of(m),
-            }),
-        }
-    }
-    let mut merged: Vec<FlatTurn> = Vec::new();
-    for turn in folded {
-        if let Some(last) = merged.last_mut() {
-            if last.role == turn.role {
-                if !turn.text.is_empty() {
-                    if !last.text.is_empty() {
-                        last.text.push_str("\n\n");
-                    }
-                    last.text.push_str(&turn.text);
-                }
-                last.images.extend(turn.images);
-                continue;
-            }
-        }
-        merged.push(turn);
-    }
-    if merged.first().is_some_and(|t| t.role == "assistant") {
-        merged.insert(
-            0,
-            FlatTurn {
-                role: "user",
-                text: String::new(),
-                images: Vec::new(),
-            },
-        );
-    }
-    merged
-}
-
-// Instructions for calling tools in plain text, built from the native `tools`
-// field that a flattened request drops. Without it the model would not know
-// which tools exist. The JSON shape is the one the agent's text-call parser
-// reads; `None` when the request had no tools.
-fn text_tool_guide(tools: &Value) -> Option<String> {
-    let tools = tools.as_array().filter(|t| !t.is_empty())?;
-    let mut guide = String::from(
-        "This server has no native tool calling. To use a tool, reply with only \
-         a JSON object and nothing else:\n\
-         {\"name\": \"<tool>\", \"arguments\": {\"<param>\": <value>}}\n\
-         The result comes back in the next message. When the task is done, \
-         answer in plain text.\n\nTools (a ? marks an optional parameter):\n",
-    );
-    for t in tools {
-        let f = &t["function"];
-        let Some(name) = f["name"].as_str() else {
-            continue;
-        };
-        let required: Vec<&str> = f["parameters"]["required"]
-            .as_array()
-            .map(|r| r.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        // Required parameters first, in schema order, then the optional ones.
-        let mut params: Vec<String> = required.iter().map(|r| r.to_string()).collect();
-        if let Some(props) = f["parameters"]["properties"].as_object() {
-            for k in props.keys() {
-                if !required.contains(&k.as_str()) {
-                    params.push(format!("{k}?"));
-                }
-            }
-        }
-        let desc = f["description"].as_str().unwrap_or("");
-        let first = desc
-            .split(". ")
-            .next()
-            .unwrap_or(desc)
-            .trim_end_matches('.');
-        let first: String = first.chars().take(160).collect();
-        guide.push_str(&format!("- {name}({}): {first}\n", params.join(", ")));
-    }
-    Some(guide)
-}
-
-// Rewrite an OpenAI request body into the shape restrictive templates accept
-// (notably Gemma's on llama.cpp): strictly alternating user/assistant turns,
-// no `system`/`tool` roles, and no native `tools` field. The tools are
-// described in text at the top of the first turn instead. Images stay on the
-// user turns that carried them unless `keep_images` is false (the server
-// rejected them).
-fn flatten_openai_messages(body: &mut Value, keep_images: bool) {
-    let Some(msgs) = body["messages"].as_array() else {
-        return;
-    };
-    let images_of: fn(&Value) -> Vec<Value> = if keep_images {
-        openai_images
-    } else {
-        |_| Vec::new()
-    };
-    let mut turns = fold_turns(msgs, images_of);
-    if let Some(guide) = text_tool_guide(&body["tools"]) {
-        if let Some(first) = turns.first_mut() {
-            first.text = if first.text.is_empty() {
-                guide
-            } else {
-                format!("{guide}\n{}", first.text)
-            };
-        }
-    }
-    body["messages"] = json!(turns
-        .into_iter()
-        .map(|t| {
-            if t.images.is_empty() {
-                json!({"role": t.role, "content": t.text})
-            } else {
-                let mut parts = t.images;
-                parts.push(json!({"type": "text", "text": t.text}));
-                json!({"role": t.role, "content": parts})
-            }
-        })
-        .collect::<Vec<_>>());
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("tools");
-    }
-}
-
-// The same rewrite for Ollama's native /api/chat body, for models whose
-// template has no tool support (gemma3, for one). The system message stays,
-// with the text tool guide appended; tool traffic folds into user/assistant
-// turns and images stay in each user turn's `images` array.
-fn flatten_ollama_messages(body: &mut Value) {
-    let Some(msgs) = body["messages"].as_array() else {
-        return;
-    };
-    let mut system = String::new();
-    let mut rest: Vec<Value> = Vec::new();
-    for m in msgs {
-        if m["role"] == "system" {
-            system = message_text(&m["content"]);
-        } else {
-            rest.push(m.clone());
-        }
-    }
-    if let Some(guide) = text_tool_guide(&body["tools"]) {
-        if !system.is_empty() {
-            system.push_str("\n\n");
-        }
-        system.push_str(&guide);
-    }
-    let mut out: Vec<Value> = Vec::new();
-    if !system.is_empty() {
-        out.push(json!({"role": "system", "content": system}));
-    }
-    for t in fold_turns(&rest, ollama_images) {
-        let mut m = json!({"role": t.role, "content": t.text});
-        if !t.images.is_empty() {
-            m["images"] = json!(t.images);
-        }
-        out.push(m);
-    }
-    body["messages"] = json!(out);
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("tools");
-    }
-}
-
 // A 400 that means "this server can't take the native request shape": either
 // the template/role rejection above, or a server that rejects the `tools` /
 // `tool_choice` fields outright. Only a 400 qualifies — 5xx/429 are retried
@@ -875,35 +627,40 @@ fn remember_flatten(url: &str) {
     }
 }
 
-// Streaming flags for the OpenAI shape: `stream_options.include_usage` makes
-// the server append a final chunk carrying the request's token counts.
-fn mark_streaming(body: &mut Value) {
-    body["stream"] = json!(true);
-    body["stream_options"] = json!({"include_usage": true});
-}
-
 // Send an OpenAI-compatible request. Native tools and roles go first — local
 // servers (llama.cpp, LM Studio, vLLM, Ollama's /v1) mostly accept them and
 // then call tools properly. On a 400 that names tools/roles/template, retry
 // once with the flattened, tool-less body and remember the endpoint so the
-// rest of the session skips the failing attempt.
+// rest of the session skips the failing attempt. `base` is explicit because
+// the Ollama fallback path targets {host}/v1 while the provider's base_url
+// is the bare host root.
 fn openai_exchange(
-    req: crate::net::Request,
-    mut body: Value,
+    p: &Provider,
+    base: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
     streaming: bool,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
-    if streaming {
-        mark_streaming(&mut body);
-    }
+    let req = openai_request_at(p, base);
+    let body = |flatten: Option<bool>| {
+        let shape = OpenAiBody {
+            model: &p.model,
+            temperature: p.temperature,
+            max_tokens: p.max_tokens,
+            effort: p.effort,
+            stream: streaming,
+            flatten,
+        };
+        openai_bytes(msgs, tools, &shape)
+    };
     let url = req.url().to_string();
     if flatten_remembered(&url) {
-        flatten_openai_messages(&mut body, true);
-        let resp = send_raw(req, body)?;
+        let resp = send_raw(req, body(Some(true)))?;
         return finish(resp, streaming, OPENAI, on_text, on_thinking);
     }
-    match send_raw(req.clone(), body.clone()) {
+    match send_raw(req.clone(), body(None)) {
         Ok(resp) => finish(resp, streaming, OPENAI, on_text, on_thinking),
         Err(e) if needs_flatten(&e) => {
             if flatten_is_sticky(&e) {
@@ -913,8 +670,8 @@ fn openai_exchange(
                 );
             }
             // A one-off image rejection retries without the images.
-            flatten_openai_messages(&mut body, !e.to_lowercase().contains("image"));
-            let resp = send_raw(req, body)?;
+            let keep_images = !e.to_lowercase().contains("image");
+            let resp = send_raw(req, body(Some(keep_images)))?;
             finish(resp, streaming, OPENAI, on_text, on_thinking)
         }
         Err(e) => Err(e),
@@ -927,41 +684,50 @@ fn openai_exchange(
 // the rest of the session skips the failing attempt.
 fn ollama_exchange(
     p: &Provider,
-    req: crate::net::Request,
-    mut body: Value,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    num_ctx: u32,
     streaming: bool,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
+    let req = ollama_request(p);
     let key = format!("{}#{}", req.url(), p.model);
     let no_think_key = format!("no-think:{key}");
-    if flatten_remembered(&no_think_key) {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("think");
-        }
-    }
+    let think = p.effort != Effort::Off && !flatten_remembered(&no_think_key);
+    let body = |flatten: bool| {
+        let shape = OllamaBody {
+            model: &p.model,
+            temperature: p.temperature,
+            max_tokens: p.max_tokens,
+            num_ctx,
+            think,
+            stream: streaming,
+            flatten,
+        };
+        ollama_bytes(msgs, tools, &shape)
+    };
     if flatten_remembered(&key) {
-        flatten_ollama_messages(&mut body);
         return finish(
-            send_raw(req, body)?,
+            send_raw(req, body(true))?,
             streaming,
             OLLAMA,
             on_text,
             on_thinking,
         );
     }
-    match send_raw(req.clone(), body.clone()) {
+    match send_raw(req.clone(), body(false)) {
         Ok(resp) => finish(resp, streaming, OLLAMA, on_text, on_thinking),
         // A reasoning effort asked of a model without thinking: drop the
         // option for this model for the rest of the session and retry, which
         // still gets the tools fallback below if that is needed too.
-        Err(e) if body.get("think").is_some() && ollama_rejects_thinking(&e) => {
+        Err(e) if think && ollama_rejects_thinking(&e) => {
             remember_flatten(&no_think_key);
             crate::report::info(&format!(
                 "  ⟳ {} does not support thinking — continuing without it",
                 p.model
             ));
-            ollama_exchange(p, req, body, streaming, on_text, on_thinking)
+            ollama_exchange(p, msgs, tools, num_ctx, streaming, on_text, on_thinking)
         }
         Err(e) if ollama_rejects_tools(&e) => {
             remember_flatten(&key);
@@ -969,9 +735,8 @@ fn ollama_exchange(
                 "  ⟳ {} has no native tool calling — describing tools in the prompt instead",
                 p.model
             ));
-            flatten_ollama_messages(&mut body);
             finish(
-                send_raw(req, body)?,
+                send_raw(req, body(true))?,
                 streaming,
                 OLLAMA,
                 on_text,
@@ -1070,10 +835,14 @@ fn request_inner(
 ) -> Result<Reply, String> {
     match p.protocol {
         Protocol::Anthropic => {
-            let (req, mut body) = anthropic_request(p, msgs, tools)?;
-            if streaming {
-                body["stream"] = json!(true);
-            }
+            let req = anthropic_request(p)?;
+            let shape = AnthropicBody {
+                model: &p.model,
+                max_tokens: p.max_tokens,
+                effort: p.effort,
+                stream: streaming,
+            };
+            let body = anthropic_bytes(msgs, tools, &shape);
             finish(
                 send_raw(req, body)?,
                 streaming,
@@ -1083,8 +852,7 @@ fn request_inner(
             )
         }
         Protocol::OpenAi => {
-            let (req, body) = openai_request_at(p, &p.base_url, msgs, tools);
-            openai_exchange(req, body, streaming, on_text, on_thinking)
+            openai_exchange(p, &p.base_url, msgs, tools, streaming, on_text, on_thinking)
         }
         Protocol::OllamaNative => {
             // The native path exists to set options.num_ctx (unavailable on
@@ -1095,17 +863,12 @@ fn request_inner(
             // about the context limitation.
             match ollama_window(p)? {
                 Some(num_ctx) => {
-                    let (req, mut body) = ollama_request(p, msgs, tools, num_ctx);
-                    if streaming {
-                        body["stream"] = json!(true);
-                    }
-                    ollama_exchange(p, req, body, streaming, on_text, on_thinking)
+                    ollama_exchange(p, msgs, tools, num_ctx, streaming, on_text, on_thinking)
                 }
                 None => {
                     warn_ollama_fallback();
                     let base = format!("{}/v1", ollama_root(&p.base_url));
-                    let (req, body) = openai_request_at(p, &base, msgs, tools);
-                    openai_exchange(req, body, streaming, on_text, on_thinking)
+                    openai_exchange(p, &base, msgs, tools, streaming, on_text, on_thinking)
                 }
             }
         }
@@ -1207,13 +970,15 @@ impl Read for InterruptibleReader {
     }
 }
 
-fn send_raw(req: crate::net::Request, body: Value) -> Result<crate::net::Response, String> {
-    interruptible(move || send_raw_blocking(req, body))?
+// `body` is the serialised request: it moves to the worker, and every attempt
+// sends those same bytes.
+fn send_raw(req: crate::net::Request, body: Vec<u8>) -> Result<crate::net::Response, String> {
+    interruptible(move || send_raw_blocking(req, &body))?
 }
 
 fn send_raw_blocking(
     req: crate::net::Request,
-    body: Value,
+    body: &[u8],
 ) -> Result<crate::net::Response, String> {
     let mut retries = 0;
     let mut delay_ms = 500;
@@ -1226,10 +991,7 @@ fn send_raw_blocking(
     }
 
     loop {
-        let req_clone = req.clone();
-        let body_clone = body.clone();
-
-        match req_clone.send_json(body_clone) {
+        match req.clone().send_json_bytes(body) {
             Ok(resp) if (300..400).contains(&resp.status()) => {
                 let to = resp.header("location").unwrap_or("?").to_string();
                 return Err(format!(
@@ -1927,10 +1689,12 @@ fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<bo
 mod anthropic;
 mod ollama;
 mod openai;
+mod wire;
 use anthropic::*;
 use ollama::*;
 pub use ollama::{ollama_ctx, startup_problem};
 use openai::*;
+use wire::*;
 
 #[cfg(test)]
 mod tests;

@@ -1,8 +1,8 @@
 //! Characterization of the request bodies each protocol puts on the wire.
 //!
 //! `wire_golden.txt` holds the exact bytes for a set of representative
-//! conversations, captured from the `serde_json::Value` builders before the
-//! bodies were serialised directly. Every case must stay byte-identical.
+//! conversations, captured from the `serde_json::Value` builders that built
+//! bodies before they were written directly (commit d71f5d6). Every case must stay byte-identical.
 //! Regenerate (only when a body is meant to change) with
 //! `BWN_BLESS_WIRE=1 cargo test -p buildwithnexus --lib wire_bodies`.
 
@@ -201,11 +201,13 @@ const ENDINGS: [&str; 11] = [
 // ── the bytes each protocol sends ──────────────────────────────────────────
 
 fn anthropic(p: &Provider, msgs: &[Msg], tools: &[ToolDef], stream: bool) -> Vec<u8> {
-    let (_, mut body) = anthropic_request(p, msgs, tools).unwrap();
-    if stream {
-        body["stream"] = json!(true);
-    }
-    serde_json::to_vec(&body).unwrap()
+    let shape = AnthropicBody {
+        model: &p.model,
+        max_tokens: p.max_tokens,
+        effort: p.effort,
+        stream,
+    };
+    anthropic_bytes(msgs, tools, &shape)
 }
 
 // `flatten`: None for the native shape, Some(keep_images) for the fallback.
@@ -216,14 +218,15 @@ fn openai(
     stream: bool,
     flatten: Option<bool>,
 ) -> Vec<u8> {
-    let (_, mut body) = openai_request_at(p, &p.base_url, msgs, tools);
-    if stream {
-        mark_streaming(&mut body);
-    }
-    if let Some(keep_images) = flatten {
-        flatten_openai_messages(&mut body, keep_images);
-    }
-    serde_json::to_vec(&body).unwrap()
+    let shape = OpenAiBody {
+        model: &p.model,
+        temperature: p.temperature,
+        max_tokens: p.max_tokens,
+        effort: p.effort,
+        stream,
+        flatten,
+    };
+    openai_bytes(msgs, tools, &shape)
 }
 
 fn ollama(
@@ -234,19 +237,16 @@ fn ollama(
     think_allowed: bool,
     flatten: bool,
 ) -> Vec<u8> {
-    let (_, mut body) = ollama_request(p, msgs, tools, 16_384);
-    if stream {
-        body["stream"] = json!(true);
-    }
-    if !think_allowed {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("think");
-        }
-    }
-    if flatten {
-        flatten_ollama_messages(&mut body);
-    }
-    serde_json::to_vec(&body).unwrap()
+    let shape = OllamaBody {
+        model: &p.model,
+        temperature: p.temperature,
+        max_tokens: p.max_tokens,
+        num_ctx: 16_384,
+        think: p.effort != Effort::Off && think_allowed,
+        stream,
+        flatten,
+    };
+    ollama_bytes(msgs, tools, &shape)
 }
 
 fn cases() -> Vec<(String, Vec<u8>)> {
@@ -440,5 +440,49 @@ fn wire_bodies_are_byte_identical_to_the_recorded_ones() {
         );
         // And each is one well-formed JSON document.
         serde_json::from_slice::<Value>(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
+// The buffer is sized up front, so a body is written without being regrown
+// (each regrowth copies what is already there).
+#[test]
+fn the_size_hint_covers_the_body_without_wild_overshoot() {
+    let source = "    let s = lexer.next().expect(\"unexpected end\"); // advance\n".repeat(120);
+    let mut msgs = conversation("hint");
+    for i in 0..40 {
+        let id = format!("h{i}");
+        msgs.push(Msg::Assistant {
+            text: "reading".into(),
+            calls: vec![call(&id, "read_file", json!({"path": "src/lex.rs"}))],
+        });
+        msgs.push(Msg::Tool(vec![result(&id, &source, false, &[])]));
+    }
+    msgs.push(Msg::UserImages {
+        text: "see".into(),
+        images: vec![("image/png".into(), PNG.repeat(2_000))],
+    });
+    let tools = crate::tools::defs(true);
+    let hint = size_hint(&msgs, &tools);
+    let p = |protocol| provider(protocol, "claude-sonnet-4-5");
+    for (name, bytes) in [
+        (
+            "anthropic",
+            anthropic(&p(Protocol::Anthropic), &msgs, &tools, true),
+        ),
+        (
+            "openai",
+            openai(&p(Protocol::OpenAi), &msgs, &tools, true, None),
+        ),
+        (
+            "ollama",
+            ollama(&p(Protocol::OllamaNative), &msgs, &tools, true, true, false),
+        ),
+    ] {
+        assert!(bytes.len() <= hint, "{name}: {} > {hint}", bytes.len());
+        assert!(
+            hint < bytes.len() * 3 / 2,
+            "{name}: {hint} for {}",
+            bytes.len()
+        );
     }
 }

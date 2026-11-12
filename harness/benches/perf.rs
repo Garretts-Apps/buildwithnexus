@@ -152,16 +152,6 @@ fn bench_request_body(c: &mut Criterion) {
     g.finish();
 }
 
-fn bench_cache_pass(c: &mut Criterion) {
-    // The cache breakpoint pass runs once per request on the rendered messages.
-    let mut messages: Vec<serde_json::Value> = (0..60)
-        .map(|i| serde_json::json!({"role": "user", "content": format!("message body number {i}")}))
-        .collect();
-    c.bench_function("cache_last_message/60msgs", |b| {
-        b.iter(|| pbench::cache_last_message(black_box(&mut messages)))
-    });
-}
-
 fn bench_redact(c: &mut Criterion) {
     // Error bodies can be large; redaction scans every whitespace/punct-delimited
     // token. Mix in secret-shaped tokens so the redaction branch is exercised.
@@ -373,7 +363,6 @@ criterion_group!(
     bench_tool_batch,
     bench_wrap_cache,
     bench_request_body,
-    bench_cache_pass,
     bench_redact,
     bench_parse_args,
     bench_sse_parse,

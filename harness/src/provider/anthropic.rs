@@ -2,109 +2,217 @@
 
 use super::*;
 
-// Pure request-body builder, split out from the HTTP wiring so the JSON shape
-// (system caching, tool schema mapping, tool_use/tool_result, the last-message
-// cache breakpoint) is unit-testable without constructing a `crate::net::Request`.
-pub(super) fn anthropic_body(
-    model: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-    max_tokens: Option<u32>,
-) -> Value {
-    let mut system = String::new();
-    let mut messages: Vec<Value> = Vec::new();
-    for m in msgs {
-        match m {
-            Msg::System(s) => {
-                if !system.is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(s);
-            }
-            Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
-            Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images
-                    .iter()
-                    .map(|(mt, data)| {
-                        json!({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": mt, "data": data}
-                        })
-                    })
-                    .collect();
-                parts.push(json!({"type": "text", "text": text}));
-                messages.push(json!({"role": "user", "content": parts}));
-            }
-            Msg::Assistant { text, calls } => {
-                let mut content: Vec<Value> = Vec::new();
-                if !text.is_empty() {
-                    content.push(json!({"type": "text", "text": text}));
-                }
-                for c in calls {
-                    content.push(
-                        json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.input}),
-                    );
-                }
-                messages.push(json!({"role": "assistant", "content": content}));
-            }
-            Msg::Tool(results) => {
-                let content: Vec<Value> = results
-                    .iter()
-                    .map(|r| {
-                        json!({
-                            "type": "tool_result", "tool_use_id": r.id,
-                            "content": anthropic_tool_content(r), "is_error": r.is_error
-                        })
-                    })
-                    .collect();
-                messages.push(json!({"role": "user", "content": content}));
-            }
+/// What shapes an Anthropic request besides the conversation itself.
+pub(super) struct AnthropicBody<'a> {
+    pub(super) model: &'a str,
+    pub(super) max_tokens: Option<u32>,
+    pub(super) effort: Effort,
+    pub(super) stream: bool,
+}
+
+const CACHE_CONTROL: &str = "\"cache_control\":{\"type\":\"ephemeral\"},";
+
+// The request body, written once (see `wire`). Split from the HTTP wiring so
+// the JSON shape (system caching, tool schema mapping, tool_use/tool_result,
+// the last-message cache breakpoint, the thinking forms) is unit-testable
+// without a server.
+//
+// Prompt caching: render order is tools → system → messages, so a breakpoint
+// on the system block caches the stable tools+system prefix, and one on the
+// last content block of the last message caches the growing conversation.
+// Each ReAct step then reads the prior turns from cache — much lower
+// time-to-first-token on multi-step tasks. A last message that is a plain
+// string becomes a single text block so it can carry the marker.
+//
+// Reasoning: Claude 4.6 and later take adaptive thinking plus
+// `output_config.effort` (the fixed `budget_tokens` form is deprecated there
+// and rejected from 4.7 on); earlier models and unversioned ids get
+// `thinking.enabled` with a budget, and max_tokens is raised to stay strictly
+// above it as the API requires. Thinking blocks recorded from the model's
+// earlier replies are put back in front of their tool_use blocks — a
+// thinking-enabled tool round is rejected without them.
+pub(super) fn anthropic_bytes(msgs: &[Msg], tools: &[ToolDef], o: &AnthropicBody) -> Vec<u8> {
+    let budget = thinking_budget(o.effort);
+    let version = claude_version(o.model);
+    let adaptive = version.is_some_and(|v| v >= (4, 6));
+    let mut max_tokens = o.max_tokens.unwrap_or(8192);
+    if let (Some(budget), false) = (budget, adaptive) {
+        if max_tokens <= budget {
+            max_tokens = budget + 4096;
         }
     }
 
-    // Prompt caching: render order is tools → system → messages, so a breakpoint
-    // on the system block caches the stable tools+system prefix, and one on the
-    // last message caches the growing conversation. Each ReAct step then reads the
-    // prior turns from cache — much lower time-to-first-token on multi-step tasks.
-    cache_last_message(&mut messages);
-
-    let mut body = json!({
-        "model": model,
-        "max_tokens": max_tokens.unwrap_or(8192),
-        "messages": messages
-    });
+    let mut j = Json::with_capacity(size_hint(msgs, tools));
+    j.raw("{\"max_tokens\":");
+    j.val(&max_tokens);
+    j.raw(",\"messages\":[");
+    let last = msgs.iter().rposition(|m| !matches!(m, Msg::System(_)));
+    let mut sep = Sep::default();
+    for (i, m) in msgs.iter().enumerate() {
+        let cached = Some(i) == last;
+        match m {
+            Msg::System(_) => {}
+            Msg::User(t) if cached => {
+                sep.next(&mut j);
+                j.raw("{\"content\":[");
+                text_block(&mut j, t, true);
+                j.raw("],\"role\":\"user\"}");
+            }
+            Msg::User(t) => {
+                sep.next(&mut j);
+                text_message(&mut j, "user", t);
+            }
+            Msg::UserImages { text, images } => {
+                sep.next(&mut j);
+                j.raw("{\"content\":[");
+                for image in images {
+                    image_block(&mut j, image);
+                    j.raw(",");
+                }
+                text_block(&mut j, text, cached);
+                j.raw("],\"role\":\"user\"}");
+            }
+            Msg::Assistant { text, calls } => {
+                sep.next(&mut j);
+                j.raw("{\"content\":[");
+                let mut blocks = Sep::default();
+                let replayed = budget
+                    .and(calls.first())
+                    .and_then(|first| thinking_for(&first.id));
+                for block in replayed.iter().flatten() {
+                    blocks.next(&mut j);
+                    j.val(block);
+                }
+                if !text.is_empty() {
+                    blocks.next(&mut j);
+                    text_block(&mut j, text, cached && calls.is_empty());
+                }
+                for (k, c) in calls.iter().enumerate() {
+                    blocks.next(&mut j);
+                    j.raw("{");
+                    if cached && k + 1 == calls.len() {
+                        j.raw(CACHE_CONTROL);
+                    }
+                    j.raw("\"id\":");
+                    j.str(&c.id);
+                    j.raw(",\"input\":");
+                    j.val(&c.input);
+                    j.raw(",\"name\":");
+                    j.str(&c.name);
+                    j.raw(",\"type\":\"tool_use\"}");
+                }
+                j.raw("],\"role\":\"assistant\"}");
+            }
+            Msg::Tool(results) => {
+                sep.next(&mut j);
+                j.raw("{\"content\":[");
+                let mut blocks = Sep::default();
+                for (k, r) in results.iter().enumerate() {
+                    blocks.next(&mut j);
+                    j.raw("{");
+                    if cached && k + 1 == results.len() {
+                        j.raw(CACHE_CONTROL);
+                    }
+                    j.raw("\"content\":");
+                    tool_content(&mut j, r);
+                    j.raw(if r.is_error {
+                        ",\"is_error\":true,\"tool_use_id\":"
+                    } else {
+                        ",\"is_error\":false,\"tool_use_id\":"
+                    });
+                    j.str(&r.id);
+                    j.raw(",\"type\":\"tool_result\"}");
+                }
+                j.raw("],\"role\":\"user\"}");
+            }
+        }
+    }
+    j.raw("],\"model\":");
+    j.str(o.model);
+    if budget.is_some() && adaptive {
+        j.raw(",\"output_config\":{\"effort\":\"");
+        j.raw(o.effort.as_str());
+        j.raw("\"}");
+    }
+    if o.stream {
+        j.raw(",\"stream\":true");
+    }
+    let system = SystemText(msgs);
     if !system.is_empty() {
-        body["system"] =
-            json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]);
+        j.raw(",\"system\":[{");
+        j.raw(CACHE_CONTROL);
+        j.raw("\"text\":");
+        j.display(&system);
+        j.raw(",\"type\":\"text\"}]");
+    }
+    match budget {
+        None => {}
+        // 4.7+ defaults to omitting thinking text; ask for the summary so
+        // the TUI's thinking stream has something to show.
+        Some(_) if version.is_some_and(|v| v >= (4, 7)) => {
+            j.raw(",\"thinking\":{\"display\":\"summarized\",\"type\":\"adaptive\"}")
+        }
+        Some(_) if adaptive => j.raw(",\"thinking\":{\"type\":\"adaptive\"}"),
+        Some(budget) => {
+            j.raw(",\"thinking\":{\"budget_tokens\":");
+            j.val(&budget);
+            j.raw(",\"type\":\"enabled\"}");
+        }
     }
     if !tools.is_empty() {
-        body["tools"] = json!(tools
-            .iter()
-            .map(|t| json!({
-                "name": t.name, "description": t.description, "input_schema": t.schema
-            }))
-            .collect::<Vec<_>>());
+        j.raw(",\"tools\":[");
+        let mut sep = Sep::default();
+        for t in tools {
+            sep.next(&mut j);
+            j.raw("{\"description\":");
+            j.str(t.description);
+            j.raw(",\"input_schema\":");
+            j.val(&t.schema);
+            j.raw(",\"name\":");
+            j.str(t.name);
+            j.raw("}");
+        }
+        j.raw("]");
     }
-    body
+    j.raw("}");
+    j.finish()
+}
+
+fn text_block(j: &mut Json, text: &str, cached: bool) {
+    j.raw("{");
+    if cached {
+        j.raw(CACHE_CONTROL);
+    }
+    j.raw("\"text\":");
+    j.str(text);
+    j.raw(",\"type\":\"text\"}");
+}
+
+fn image_block(j: &mut Json, (media_type, data): &(String, String)) {
+    j.raw("{\"source\":{\"data\":");
+    j.str(data);
+    j.raw(",\"media_type\":");
+    j.str(media_type);
+    j.raw(",\"type\":\"base64\"},\"type\":\"image\"}");
 }
 
 // A tool_result's content: the text alone, or text and image blocks when
 // the tool returned images (an empty text block is refused by the API).
-pub(super) fn anthropic_tool_content(r: &ToolResult) -> Value {
+fn tool_content(j: &mut Json, r: &ToolResult) {
     if r.images.is_empty() {
-        return json!(r.content);
+        return j.str(&r.content);
     }
-    let mut parts = Vec::new();
+    j.raw("[");
+    let mut sep = Sep::default();
     if !r.content.is_empty() {
-        parts.push(json!({"type": "text", "text": r.content}));
+        sep.next(j);
+        text_block(j, &r.content, false);
     }
-    parts.extend(r.images.iter().map(|(mt, data)| {
-        json!({
-            "type": "image",
-            "source": {"type": "base64", "media_type": mt, "data": data}
-        })
-    }));
-    json!(parts)
+    for image in &r.images {
+        sep.next(j);
+        image_block(j, image);
+    }
+    j.raw("]");
 }
 
 // Tool messages on the OpenAI and Ollama protocols carry text only, so the
@@ -135,23 +243,16 @@ pub(super) fn tool_images_label(r: &ToolResult, names: &HashMap<&str, &str>) -> 
     }
 }
 
-pub(super) fn anthropic_request(
-    p: &Provider,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-) -> Result<(crate::net::Request, Value), String> {
-    let mut body = anthropic_body(&p.model, msgs, tools, p.max_tokens);
-    apply_anthropic_effort(&mut body, &p.model, p.effort);
+pub(super) fn anthropic_request(p: &Provider) -> Result<crate::net::Request, String> {
     let key = p
         .api_key
         .as_deref()
         .ok_or("Anthropic requires an API key")?;
-    let req = agent()
+    Ok(agent()
         .post(&url(p, "/v1/messages"))
         .set("x-api-key", key)
         .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json");
-    Ok((req, body))
+        .set("content-type", "application/json"))
 }
 
 // Thinking budgets for the `budget_tokens` form (models before Claude 4.6).
@@ -174,36 +275,6 @@ pub(super) fn claude_version(model: &str) -> Option<(u32, u32)> {
     let major = parts.next()?;
     let minor = parts.next().filter(|m| *m < 100).unwrap_or(0);
     Some((major, minor))
-}
-
-// Reasoning on the Anthropic shape. Claude 4.6 and later take adaptive
-// thinking plus `output_config.effort` (the fixed `budget_tokens` form is
-// deprecated there and rejected from 4.7 on); earlier models and unversioned
-// ids get `thinking.enabled` with a budget, and max_tokens is raised to stay
-// strictly above it as the API requires. Thinking blocks recorded from the
-// model's earlier replies are put back in front of their tool_use blocks —
-// a thinking-enabled tool round is rejected without them.
-pub(super) fn apply_anthropic_effort(body: &mut Value, model: &str, effort: Effort) {
-    let Some(budget) = thinking_budget(effort) else {
-        return;
-    };
-    let adaptive = claude_version(model).is_some_and(|v| v >= (4, 6));
-    if adaptive {
-        body["thinking"] = json!({"type": "adaptive"});
-        if claude_version(model).is_some_and(|v| v >= (4, 7)) {
-            // 4.7+ defaults to omitting thinking text; ask for the summary
-            // so the TUI's thinking stream has something to show.
-            body["thinking"]["display"] = json!("summarized");
-        }
-        body["output_config"] = json!({"effort": effort.as_str()});
-    } else {
-        let max_tokens = body["max_tokens"].as_u64().unwrap_or(8192);
-        if max_tokens <= u64::from(budget) {
-            body["max_tokens"] = json!(budget + 4096);
-        }
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
-    }
-    replay_thinking_blocks(body);
 }
 
 // Thinking blocks from earlier replies, keyed by the id of the first tool
@@ -240,35 +311,6 @@ pub(super) fn thinking_for(call_id: &str) -> Option<Vec<Value>> {
         .map(|(_, blocks)| blocks.clone())
 }
 
-pub(super) fn replay_thinking_blocks(body: &mut Value) {
-    let Some(messages) = body["messages"].as_array_mut() else {
-        return;
-    };
-    for m in messages.iter_mut() {
-        if m["role"].as_str() != Some("assistant") {
-            continue;
-        }
-        let Some(content) = m["content"].as_array_mut() else {
-            continue;
-        };
-        let first_call = content
-            .iter()
-            .find(|b| b["type"].as_str() == Some("tool_use"))
-            .and_then(|b| b["id"].as_str())
-            .map(str::to_string);
-        let Some(blocks) = first_call.and_then(|id| thinking_for(&id)) else {
-            continue;
-        };
-        if content
-            .first()
-            .is_some_and(|b| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking")))
-        {
-            continue;
-        }
-        content.splice(0..0, blocks);
-    }
-}
-
 // Copy whichever usage counters an Anthropic `usage` object carries; fields
 // the server omits keep their previous value (message_start reports input,
 // message_delta reports output).
@@ -284,23 +326,6 @@ pub(super) fn anthropic_usage_into(u: &Value, into: &mut Usage) {
     }
     if let Some(n) = u["output_tokens"].as_u64() {
         into.output = n;
-    }
-}
-
-// Put an ephemeral cache breakpoint on the last content block of the last
-// message, normalizing a string body into a single text block if needed.
-pub(super) fn cache_last_message(messages: &mut [Value]) {
-    let Some(last) = messages.last_mut() else {
-        return;
-    };
-    let content = &mut last["content"];
-    if let Some(text) = content.as_str() {
-        let text = text.to_string();
-        *content = json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
-    } else if let Some(arr) = content.as_array_mut() {
-        if let Some(block) = arr.last_mut() {
-            block["cache_control"] = json!({"type": "ephemeral"});
-        }
     }
 }
 

@@ -565,7 +565,112 @@ fn tc(id: &str, name: &str, input: Value) -> ToolCall {
     }
 }
 
-// ── redact ──────────────────────────────────────────────────────────────
+// Request bodies as the server parses them: the bytes that go on the wire,
+// read back as JSON.
+fn parsed(bytes: Vec<u8>) -> Value {
+    serde_json::from_slice(&bytes).expect("a request body is one JSON document")
+}
+
+fn anthropic_effort_body(
+    model: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    max_tokens: Option<u32>,
+    effort: Effort,
+) -> Value {
+    let shape = AnthropicBody {
+        model,
+        max_tokens,
+        effort,
+        stream: false,
+    };
+    parsed(anthropic_bytes(msgs, tools, &shape))
+}
+
+fn anthropic_body(model: &str, msgs: &[Msg], tools: &[ToolDef], max_tokens: Option<u32>) -> Value {
+    anthropic_effort_body(model, msgs, tools, max_tokens, Effort::Off)
+}
+
+fn openai_shape(model: &str) -> OpenAiBody<'_> {
+    OpenAiBody {
+        model,
+        temperature: None,
+        max_tokens: None,
+        effort: Effort::Off,
+        stream: false,
+        flatten: None,
+    }
+}
+
+fn openai_body(
+    model: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+) -> Value {
+    let shape = OpenAiBody {
+        temperature,
+        max_tokens,
+        ..openai_shape(model)
+    };
+    parsed(openai_bytes(msgs, tools, &shape))
+}
+
+fn openai_flat(msgs: &[Msg], tools: &[ToolDef], keep_images: bool) -> Value {
+    let shape = OpenAiBody {
+        flatten: Some(keep_images),
+        ..openai_shape("m")
+    };
+    parsed(openai_bytes(msgs, tools, &shape))
+}
+
+fn ollama_shape(model: &str) -> OllamaBody<'_> {
+    OllamaBody {
+        model,
+        temperature: None,
+        max_tokens: None,
+        num_ctx: 8_192,
+        think: false,
+        stream: false,
+        flatten: false,
+    }
+}
+
+fn ollama_body(
+    model: &str,
+    msgs: &[Msg],
+    tools: &[ToolDef],
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    num_ctx: u32,
+) -> Value {
+    let shape = OllamaBody {
+        temperature,
+        max_tokens,
+        num_ctx,
+        ..ollama_shape(model)
+    };
+    parsed(ollama_bytes(msgs, tools, &shape))
+}
+
+fn ollama_flat(msgs: &[Msg], tools: &[ToolDef]) -> Value {
+    let shape = OllamaBody {
+        flatten: true,
+        ..ollama_shape("m")
+    };
+    parsed(ollama_bytes(msgs, tools, &shape))
+}
+
+fn tool_result(id: &str, content: &str) -> ToolResult {
+    ToolResult {
+        id: id.into(),
+        content: content.into(),
+        is_error: false,
+        images: Vec::new(),
+    }
+}
+
 #[test]
 fn redact_blanks_known_key_prefixes() {
     // Prefix tokens must clear the 12-char length floor to be flagged.
@@ -653,42 +758,51 @@ fn retry_after_parses_seconds_and_caps_at_60s() {
     assert_eq!(retry_after_ms(None), None);
 }
 
-// ── cache_last_message ──────────────────────────────────────────────────
+// ── the cache breakpoint on the last message ─────────────────────────────
 #[test]
-fn cache_last_message_empty_is_noop() {
-    let mut m: Vec<Value> = vec![];
-    cache_last_message(&mut m);
-    assert!(m.is_empty());
+fn cache_breakpoint_with_no_messages_is_a_noop() {
+    let b = anthropic_body("m", &[], &[], None);
+    assert_eq!(b["messages"], json!([]));
+    let b = anthropic_body("m", &[Msg::System("s".into())], &[], None);
+    assert_eq!(b["messages"], json!([]));
 }
 
 #[test]
-fn cache_last_message_string_body_becomes_text_block() {
-    let mut m = vec![json!({"role": "user", "content": "hi"})];
-    cache_last_message(&mut m);
-    let block = &m[0]["content"][0];
+fn cache_breakpoint_turns_a_string_body_into_a_text_block() {
+    let b = anthropic_body("m", &[Msg::User("hi".into())], &[], None);
+    let block = &b["messages"][0]["content"][0];
     assert_eq!(block["type"], "text");
     assert_eq!(block["text"], "hi");
     assert_eq!(block["cache_control"]["type"], "ephemeral");
 }
 
 #[test]
-fn cache_last_message_array_body_marks_last_block() {
-    let mut m = vec![json!({"role": "user", "content": [
-        {"type": "text", "text": "a"},
-        {"type": "text", "text": "b"}
-    ]})];
-    cache_last_message(&mut m);
+fn cache_breakpoint_marks_the_last_block_of_an_array_body() {
+    let msgs = [Msg::UserImages {
+        text: "b".into(),
+        images: vec![("image/png".into(), "QUJD".into())],
+    }];
+    let m = &anthropic_body("m", &msgs, &[], None)["messages"];
     assert!(m[0]["content"][0].get("cache_control").is_none());
     assert_eq!(m[0]["content"][1]["cache_control"]["type"], "ephemeral");
+    // An assistant turn with nothing in it has no block to mark.
+    let msgs = [Msg::Assistant {
+        text: String::new(),
+        calls: vec![],
+    }];
+    let m = &anthropic_body("m", &msgs, &[], None)["messages"];
+    assert_eq!(m[0]["content"], json!([]));
 }
 
 #[test]
-fn cache_last_message_only_touches_last() {
-    let mut m = vec![
-        json!({"role": "user", "content": "first"}),
-        json!({"role": "user", "content": "second"}),
+fn cache_breakpoint_only_touches_the_last_message() {
+    let msgs = [
+        Msg::User("first".into()),
+        Msg::User("second".into()),
+        // A system message after it is not the last message.
+        Msg::System("s".into()),
     ];
-    cache_last_message(&mut m);
+    let m = &anthropic_body("m", &msgs, &[], None)["messages"];
     assert!(m[0]["content"].is_string());
     assert_eq!(m[1]["content"][0]["cache_control"]["type"], "ephemeral");
 }
@@ -857,8 +971,7 @@ fn ollama_body_follows_the_tool_messages_with_their_images() {
 fn flattened_requests_keep_tool_images_on_the_user_turn() {
     let mut msgs = vec![Msg::User("look at a.png".into())];
     msgs.extend(image_round());
-    let mut b = openai_body("m", &msgs, &[], None, None);
-    flatten_openai_messages(&mut b, true);
+    let b = openai_flat(&msgs, &[], true);
     let last = b["messages"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["role"], "user");
     let parts = last["content"].as_array().unwrap();
@@ -866,8 +979,7 @@ fn flattened_requests_keep_tool_images_on_the_user_turn() {
         parts[0]["image_url"]["url"], "data:image/png;base64,QUJD",
         "{last}"
     );
-    let mut b = ollama_body("m", &msgs, &[], None, None, 8_192);
-    flatten_ollama_messages(&mut b);
+    let b = ollama_flat(&msgs, &[]);
     let last = b["messages"].as_array().unwrap().last().unwrap().clone();
     assert_eq!(last["images"], json!(["QUJD"]), "{last}");
 }
@@ -933,19 +1045,21 @@ fn template_role_error_detected() {
 fn flatten_messages_produces_alternating_user_assistant() {
     // system, user, assistant(+tool_call), tool-result → must collapse to
     // strictly alternating user/assistant with no system/tool roles.
-    let mut body = json!({
-        "model": "gemma",
-        "tools": [{"type": "function"}],
-        "messages": [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "build it"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\":\"a\"}"}}
-            ]},
-            {"role": "tool", "tool_call_id": "1", "content": "wrote a"}
-        ]
-    });
-    flatten_openai_messages(&mut body, true);
+    let tools = [ToolDef {
+        name: "write_file",
+        description: "Write a file.",
+        schema: json!({"type": "object"}),
+    }];
+    let msgs = [
+        Msg::System("You are helpful.".into()),
+        Msg::User("build it".into()),
+        Msg::Assistant {
+            text: String::new(),
+            calls: vec![tc("1", "write_file", json!({"path": "a"}))],
+        },
+        Msg::Tool(vec![tool_result("1", "wrote a")]),
+    ];
+    let body = openai_flat(&msgs, &tools, true);
     let m = body["messages"].as_array().unwrap();
     // The empty tool-call-only assistant turn is dropped (no call-shaped
     // text for a small model to imitate), so the remaining turns are all
@@ -968,10 +1082,11 @@ fn flatten_messages_produces_alternating_user_assistant() {
 
 #[test]
 fn flatten_messages_prepends_user_when_starting_on_assistant() {
-    let mut body = json!({
-        "messages": [{"role": "assistant", "content": "hi"}]
-    });
-    flatten_openai_messages(&mut body, true);
+    let msgs = [Msg::Assistant {
+        text: "hi".into(),
+        calls: vec![],
+    }];
+    let body = openai_flat(&msgs, &[], true);
     let roles: Vec<&str> = body["messages"]
         .as_array()
         .unwrap()
@@ -994,22 +1109,21 @@ fn interruptible_reader_passes_a_stream_through_unchanged() {
 
 #[test]
 fn flatten_openai_keeps_images_and_describes_tools_in_text() {
-    let mut body = json!({
-        "tools": [{"type": "function", "function": {
-            "name": "write_file",
-            "description": "Write a file. Overwrites it.",
-            "parameters": {"type": "object", "required": ["path"],
-                "properties": {"path": {}, "content": {}}}
-        }}],
-        "messages": [
-            {"role": "system", "content": "Be brief."},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
-                {"type": "text", "text": "read this"}
-            ]}
-        ]
-    });
-    flatten_openai_messages(&mut body, true);
+    let tools = [ToolDef {
+        name: "write_file",
+        description: "Write a file. Overwrites it.",
+        schema: json!({"type": "object", "required": ["path"],
+            "properties": {"path": {}, "content": {}}}),
+    }];
+    let image = Msg::UserImages {
+        text: "read this".into(),
+        images: vec![("image/png".into(), "AAA".into())],
+    };
+    let body = openai_flat(
+        &[Msg::System("Be brief.".into()), image.clone()],
+        &tools,
+        true,
+    );
     let m = body["messages"].as_array().unwrap();
     assert_eq!(m.len(), 1, "system folds into the first user turn");
     let parts = m[0]["content"].as_array().unwrap();
@@ -1024,32 +1138,30 @@ fn flatten_openai_keeps_images_and_describes_tools_in_text() {
     assert!(body.get("tools").is_none());
 
     // A server that rejected the image gets the same turns without it.
-    let mut again = json!({"messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
-        {"type": "text", "text": "read this"}
-    ]}]});
-    flatten_openai_messages(&mut again, false);
+    let again = openai_flat(&[image], &[], false);
     assert_eq!(again["messages"][0]["content"], "read this");
 }
 
 #[test]
 fn flatten_ollama_folds_tool_traffic_and_keeps_system_and_images() {
-    let mut body = json!({
-        "tools": [{"type": "function", "function": {
-            "name": "read_file", "description": "Read a file.",
-            "parameters": {"type": "object", "required": ["path"],
-                "properties": {"path": {}}}
-        }}],
-        "messages": [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "look", "images": ["QUJD"]},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"function": {"name": "read_file", "arguments": {"path": "a"}}}
-            ]},
-            {"role": "tool", "content": "file body", "tool_name": "read_file"}
-        ]
-    });
-    flatten_ollama_messages(&mut body);
+    let tools = [ToolDef {
+        name: "read_file",
+        description: "Read a file.",
+        schema: json!({"type": "object", "required": ["path"], "properties": {"path": {}}}),
+    }];
+    let msgs = [
+        Msg::System("sys".into()),
+        Msg::UserImages {
+            text: "look".into(),
+            images: vec![("image/png".into(), "QUJD".into())],
+        },
+        Msg::Assistant {
+            text: String::new(),
+            calls: vec![tc("c1", "read_file", json!({"path": "a"}))],
+        },
+        Msg::Tool(vec![tool_result("c1", "file body")]),
+    ];
+    let body = ollama_flat(&msgs, &tools);
     let m = body["messages"].as_array().unwrap();
     let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
     assert_eq!(roles, ["system", "user", "assistant", "user"]);
@@ -1457,7 +1569,7 @@ fn read_timeout_after_post_is_not_retried() {
     let req = agent()
         .post(&format!("{base}/v1/chat/completions"))
         .timeout(Duration::from_millis(300));
-    let err = send_raw(req, json!({"model": "m"})).unwrap_err();
+    let err = send_raw(req, br#"{"model":"m"}"#.to_vec()).unwrap_err();
     assert!(err.contains("BWN_READ_TIMEOUT_SECS"), "got: {err}");
     assert_eq!(handle.join().unwrap(), 1, "the POST must be sent once");
 }
@@ -1473,7 +1585,7 @@ fn connect_failure_is_retried() {
     assert!(transport_retryable(&e), "{e}");
     // The local-server hint is only given on the second refused attempt,
     // so seeing it proves send_raw retried.
-    let err = send_raw(agent().post(&url), json!({})).unwrap_err();
+    let err = send_raw(agent().post(&url), b"{}".to_vec()).unwrap_err();
     assert!(err.contains("nothing is answering"), "got: {err}");
 }
 
@@ -2344,11 +2456,16 @@ fn openai_stream_reads_usage_from_final_chunk() {
 }
 
 #[test]
-fn mark_streaming_requests_usage_in_the_final_chunk() {
-    let mut body = json!({"model": "m"});
-    mark_streaming(&mut body);
+fn streaming_requests_ask_for_usage_in_the_final_chunk() {
+    let shape = OpenAiBody {
+        stream: true,
+        ..openai_shape("m")
+    };
+    let body = parsed(openai_bytes(&[], &[], &shape));
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
+    let body = openai_body("m", &[], &[], None, None);
+    assert!(body.get("stream").is_none() && body.get("stream_options").is_none());
 }
 
 #[test]
@@ -2412,10 +2529,11 @@ fn claude_version_parses_both_id_layouts() {
 
 #[test]
 fn anthropic_effort_off_leaves_body_untouched() {
-    let mut body = anthropic_body("claude-opus-4-6", &[Msg::User("hi".into())], &[], None);
-    let before = body.clone();
-    apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Off);
-    assert_eq!(body, before);
+    let body = anthropic_body("claude-opus-4-6", &[Msg::User("hi".into())], &[], None);
+    for key in ["thinking", "output_config"] {
+        assert!(body.get(key).is_none(), "{key}");
+    }
+    assert_eq!(body["max_tokens"], 8192);
 }
 
 #[test]
@@ -2425,8 +2543,8 @@ fn anthropic_effort_uses_adaptive_thinking_on_claude_4_6_and_later() {
         ("claude-opus-4-8", true),
         ("claude-opus-5", true),
     ] {
-        let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], None);
-        apply_anthropic_effort(&mut body, model, Effort::Medium);
+        let body =
+            anthropic_effort_body(model, &[Msg::User("hi".into())], &[], None, Effort::Medium);
         assert_eq!(body["thinking"]["type"], "adaptive", "{model}");
         assert!(body["thinking"].get("budget_tokens").is_none(), "{model}");
         assert_eq!(body["output_config"]["effort"], "medium", "{model}");
@@ -2447,8 +2565,7 @@ fn anthropic_effort_uses_budget_tokens_before_4_6_and_raises_max_tokens() {
         (Effort::Medium, 8192),
         (Effort::High, 16384),
     ] {
-        let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], None);
-        apply_anthropic_effort(&mut body, model, effort);
+        let body = anthropic_effort_body(model, &[Msg::User("hi".into())], &[], None, effort);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], budget);
         assert!(body.get("output_config").is_none());
@@ -2456,12 +2573,11 @@ fn anthropic_effort_uses_budget_tokens_before_4_6_and_raises_max_tokens() {
         assert!(max_tokens > budget, "{effort}: {max_tokens} <= {budget}");
     }
     // An explicit max_tokens already above the budget is kept.
-    let mut body = anthropic_body(model, &[Msg::User("hi".into())], &[], Some(30_000));
-    apply_anthropic_effort(&mut body, model, Effort::High);
+    let hi = [Msg::User("hi".into())];
+    let body = anthropic_effort_body(model, &hi, &[], Some(30_000), Effort::High);
     assert_eq!(body["max_tokens"], 30_000);
     // Unversioned ids (a proxy alias) take the classic form too.
-    let mut body = anthropic_body("my-alias", &[Msg::User("hi".into())], &[], None);
-    apply_anthropic_effort(&mut body, "my-alias", Effort::Low);
+    let body = anthropic_effort_body("my-alias", &hi, &[], None, Effort::Low);
     assert_eq!(body["thinking"]["budget_tokens"], 2048);
 }
 
@@ -2487,19 +2603,15 @@ fn anthropic_effort_replays_recorded_thinking_before_tool_use() {
             images: Vec::new(),
         }]),
     ];
-    let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);
-    apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Low);
+    let body = anthropic_effort_body("claude-opus-4-6", &msgs, &[], None, Effort::Low);
     let content = body["messages"][1]["content"].as_array().unwrap();
     assert_eq!(content[0]["type"], "thinking");
     assert_eq!(content[0]["signature"], "s");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[2]["type"], "tool_use");
-    // Idempotent: a second pass doesn't double the block.
-    replay_thinking_blocks(&mut body);
-    assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 3);
+    assert_eq!(content.len(), 3);
     // Off never touches the transcript, even with blocks on record.
-    let mut body = anthropic_body("claude-opus-4-6", &msgs, &[], None);
-    apply_anthropic_effort(&mut body, "claude-opus-4-6", Effort::Off);
+    let body = anthropic_body("claude-opus-4-6", &msgs, &[], None);
     assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
 }
 
@@ -2532,28 +2644,32 @@ fn openai_effort_only_for_reasoning_models() {
     assert!(!is_openai_reasoning_model("local-model"));
     assert!(!is_openai_reasoning_model("o10-something"));
 
-    let mut body = json!({"model": "o3"});
-    apply_openai_effort(&mut body, "o3", Effort::High);
-    assert_eq!(body["reasoning_effort"], "high");
-    let mut body = json!({"model": "o3"});
-    apply_openai_effort(&mut body, "o3", Effort::Off);
-    assert!(body.get("reasoning_effort").is_none());
+    let body = |model, effort| {
+        let shape = OpenAiBody {
+            effort,
+            ..openai_shape(model)
+        };
+        parsed(openai_bytes(&[], &[], &shape))
+    };
+    assert_eq!(body("o3", Effort::High)["reasoning_effort"], "high");
+    assert!(body("o3", Effort::Off).get("reasoning_effort").is_none());
     // Local OpenAI-compatible servers never see it unless the model name matches.
-    let mut body = json!({"model": "qwen3:8b"});
-    apply_openai_effort(&mut body, "qwen3:8b", Effort::High);
-    assert!(body.get("reasoning_effort").is_none());
+    assert!(body("qwen3:8b", Effort::High)
+        .get("reasoning_effort")
+        .is_none());
 }
 
 #[test]
-fn ollama_effort_sets_think_for_any_level_but_off() {
-    let mut body = json!({"model": "m"});
-    apply_ollama_effort(&mut body, Effort::Off);
-    assert!(body.get("think").is_none());
-    for e in [Effort::Low, Effort::Medium, Effort::High] {
-        let mut body = json!({"model": "m"});
-        apply_ollama_effort(&mut body, e);
-        assert_eq!(body["think"], true);
-    }
+fn ollama_think_is_one_switch_and_absent_when_off() {
+    let body = |think| {
+        let shape = OllamaBody {
+            think,
+            ..ollama_shape("m")
+        };
+        parsed(ollama_bytes(&[], &[], &shape))
+    };
+    assert!(body(false).get("think").is_none());
+    assert_eq!(body(true)["think"], true);
 }
 
 // ── native tools on local OpenAI-compatible servers ──────────────────────

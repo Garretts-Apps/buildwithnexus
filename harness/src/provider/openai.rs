@@ -2,114 +2,185 @@
 
 use super::*;
 
-// Pure body builder (see `anthropic_body` for the rationale).
-pub(super) fn openai_body(
-    model: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-    temperature: Option<f64>,
-    max_tokens: Option<u32>,
-) -> Value {
-    let mut messages: Vec<Value> = Vec::new();
-    let mut system = String::new();
-    for m in msgs {
-        if let Msg::System(s) = m {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(s);
-        }
+/// What shapes an OpenAI-compatible request besides the conversation.
+pub(super) struct OpenAiBody<'a> {
+    pub(super) model: &'a str,
+    pub(super) temperature: Option<f64>,
+    pub(super) max_tokens: Option<u32>,
+    pub(super) effort: Effort,
+    /// Also asks for `stream_options.include_usage`, which makes the server
+    /// append a final chunk carrying the request's token counts.
+    pub(super) stream: bool,
+    /// `Some(keep_images)` for the shape restrictive chat templates accept
+    /// (notably Gemma's on llama.cpp): strictly alternating user/assistant
+    /// turns, no `system`/`tool` roles, and no native `tools` field. The
+    /// tools are described in text at the top of the first turn instead.
+    /// Images stay on the user turns that carried them unless `keep_images`
+    /// is false (the server rejected them).
+    pub(super) flatten: Option<bool>,
+}
+
+// The request body, written once (see `wire` and `anthropic_bytes`).
+pub(super) fn openai_bytes(msgs: &[Msg], tools: &[ToolDef], o: &OpenAiBody) -> Vec<u8> {
+    let mut j = Json::with_capacity(size_hint(msgs, tools));
+    j.raw("{\"max_tokens\":");
+    j.val(&o.max_tokens.unwrap_or(4096));
+    j.raw(",\"messages\":[");
+    match o.flatten {
+        Some(keep_images) => flat_messages(&mut j, msgs, tools, keep_images),
+        None => native_messages(&mut j, msgs),
     }
+    j.raw("],\"model\":");
+    j.str(o.model);
+    if o.effort != Effort::Off && is_openai_reasoning_model(o.model) {
+        j.raw(",\"reasoning_effort\":\"");
+        j.raw(o.effort.as_str());
+        j.raw("\"");
+    }
+    if o.stream {
+        j.raw(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    }
+    j.raw(",\"temperature\":");
+    j.val(&o.temperature.unwrap_or(0.2));
+    if !tools.is_empty() && o.flatten.is_none() {
+        function_tools(&mut j, tools);
+    }
+    j.raw("}");
+    j.finish()
+}
+
+fn native_messages(j: &mut Json, msgs: &[Msg]) {
+    let mut sep = Sep::default();
+    let system = SystemText(msgs);
     if !system.is_empty() {
-        messages.push(json!({"role": "system", "content": system}));
+        sep.next(j);
+        j.raw("{\"content\":");
+        j.display(&system);
+        j.raw(",\"role\":\"system\"}");
     }
     let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
-            Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::User(t) => {
+                sep.next(j);
+                text_message(j, "user", t);
+            }
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images.iter().map(openai_image_part).collect();
-                parts.push(json!({"type": "text", "text": text}));
-                messages.push(json!({"role": "user", "content": parts}));
+                sep.next(j);
+                j.raw("{\"content\":[");
+                for image in images {
+                    image_part(j, image);
+                    j.raw(",");
+                }
+                text_part(j, text);
+                j.raw("],\"role\":\"user\"}");
             }
             Msg::Assistant { text, calls } => {
-                let mut msg = json!({"role": "assistant", "content": text});
+                sep.next(j);
+                j.raw("{\"content\":");
+                j.str(text);
+                j.raw(",\"role\":\"assistant\"");
                 if !calls.is_empty() {
-                    msg["tool_calls"] = json!(calls
-                        .iter()
-                        .map(|c| json!({
-                            "id": c.id, "type": "function",
-                            "function": {"name": c.name, "arguments": c.input.to_string()}
-                        }))
-                        .collect::<Vec<_>>());
+                    j.raw(",\"tool_calls\":[");
+                    let mut each = Sep::default();
                     for c in calls {
+                        each.next(j);
+                        // The arguments are a JSON document inside a string.
+                        j.raw("{\"function\":{\"arguments\":");
+                        j.display(&c.input);
+                        j.raw(",\"name\":");
+                        j.str(&c.name);
+                        j.raw("},\"id\":");
+                        j.str(&c.id);
+                        j.raw(",\"type\":\"function\"}");
                         call_names.insert(&c.id, &c.name);
                     }
+                    j.raw("]");
                 }
-                messages.push(msg);
+                j.raw("}");
             }
             Msg::Tool(results) => {
                 for r in results {
-                    messages
-                        .push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
+                    sep.next(j);
+                    j.raw("{\"content\":");
+                    j.str(&r.content);
+                    j.raw(",\"role\":\"tool\",\"tool_call_id\":");
+                    j.str(&r.id);
+                    j.raw("}");
                 }
-                // After every tool message of the round: a user turn between
-                // them would orphan the calls that follow it.
-                if tool_images_intro(results, &call_names).is_some() {
-                    let mut parts: Vec<Value> = Vec::new();
+                // Tool messages carry text only, so the images a round of
+                // tools returned follow it in one user turn, each set named
+                // by the call it came from. After every tool message of the
+                // round: a user turn between them would orphan the calls
+                // that follow it.
+                if results.iter().any(|r| !r.images.is_empty()) {
+                    sep.next(j);
+                    j.raw("{\"content\":[");
+                    let mut each = Sep::default();
                     for r in results.iter().filter(|r| !r.images.is_empty()) {
-                        parts.push(
-                            json!({"type": "text", "text": tool_images_label(r, &call_names)}),
-                        );
-                        parts.extend(r.images.iter().map(openai_image_part));
+                        each.next(j);
+                        text_part(j, &tool_images_label(r, &call_names));
+                        for image in &r.images {
+                            j.raw(",");
+                            image_part(j, image);
+                        }
                     }
-                    messages.push(json!({"role": "user", "content": parts}));
+                    j.raw("],\"role\":\"user\"}");
                 }
             }
         }
     }
+}
 
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "temperature": temperature.unwrap_or(0.2),
-        "max_tokens": max_tokens.unwrap_or(4096)
-    });
-    if !tools.is_empty() {
-        body["tools"] =
-            json!(tools.iter().map(|t| json!({
-            "type": "function",
-            "function": {"name": t.name, "description": t.description, "parameters": t.schema}
-        })).collect::<Vec<_>>());
+fn flat_messages(j: &mut Json, msgs: &[Msg], tools: &[ToolDef], keep_images: bool) {
+    let mut turns = fold_turns(msgs, Flat::OpenAi { keep_images });
+    if let (Some(guide), Some(first)) = (text_tool_guide(tools), turns.first_mut()) {
+        first.text = if first.text.is_empty() {
+            guide
+        } else {
+            format!("{guide}\n{}", first.text)
+        };
     }
-    body
+    let mut sep = Sep::default();
+    for t in &turns {
+        sep.next(j);
+        if t.images.is_empty() {
+            text_message(j, t.role, &t.text);
+        } else {
+            j.raw("{\"content\":[");
+            for image in &t.images {
+                image_part(j, image);
+                j.raw(",");
+            }
+            text_part(j, &t.text);
+            j.raw("],\"role\":\"");
+            j.raw(t.role);
+            j.raw("\"}");
+        }
+    }
 }
 
-pub(super) fn openai_image_part((mt, data): &(String, String)) -> Value {
-    json!({
-        "type": "image_url",
-        "image_url": {"url": format!("data:{mt};base64,{data}")}
-    })
+fn text_part(j: &mut Json, text: &str) {
+    j.raw("{\"text\":");
+    j.str(text);
+    j.raw(",\"type\":\"text\"}");
 }
 
-// Same request against an explicit base URL — the Ollama fallback path targets
-// {host}/v1 while the provider's base_url is the bare host root.
-pub(super) fn openai_request_at(
-    p: &Provider,
-    base: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-) -> (crate::net::Request, Value) {
-    let mut body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
-    apply_openai_effort(&mut body, &p.model, p.effort);
-    let mut req = agent()
+fn image_part(j: &mut Json, (media_type, data): &(String, String)) {
+    j.raw("{\"image_url\":{\"url\":");
+    j.display(&format_args!("data:{media_type};base64,{data}"));
+    j.raw("},\"type\":\"image_url\"}");
+}
+
+pub(super) fn openai_request_at(p: &Provider, base: &str) -> crate::net::Request {
+    let req = agent()
         .post(&format!("{}/chat/completions", base.trim_end_matches('/')))
         .set("content-type", "application/json");
-    if let Some(key) = &p.api_key {
-        req = req.set("authorization", &format!("Bearer {key}"));
+    match &p.api_key {
+        Some(key) => req.set("authorization", &format!("Bearer {key}")),
+        None => req,
     }
-    (req, body)
 }
 
 // Model names that accept `reasoning_effort` on the OpenAI shape: the o-series
@@ -124,12 +195,6 @@ pub(super) fn is_openai_reasoning_model(model: &str) -> bool {
                 .next()
                 .is_none_or(|c| !c.is_ascii_digit())
     })
-}
-
-pub(super) fn apply_openai_effort(body: &mut Value, model: &str, effort: Effort) {
-    if effort != Effort::Off && is_openai_reasoning_model(model) {
-        body["reasoning_effort"] = json!(effort.as_str());
-    }
 }
 
 // Token counts from an OpenAI-shape `usage` object. `prompt_tokens` includes
