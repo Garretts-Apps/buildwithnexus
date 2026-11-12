@@ -1172,12 +1172,18 @@ fn format_links(s: &str) -> String {
                 let label = &rest[start + 1..mid_abs];
                 let url = &rest[mid_abs + 2..end_abs];
                 // OSC 8: the label itself is clickable in modern terminals;
-                // the dim URL suffix keeps older terminals usable.
-                out.push_str(&format!(
-                    "{} {}",
-                    hyperlink(url, &underline(&cyan(label))),
-                    dim(&format!("({url})"))
-                ));
+                // the dim URL suffix keeps older terminals usable. Only web
+                // and mail links become clickable: the model writes these,
+                // and a click on file:, ssh:, or an app's own scheme can run
+                // a handler the user never meant to start. The URL still
+                // shows, so the user can copy it deliberately.
+                let shown = underline(&cyan(label));
+                let label = if model_link_clickable(url) {
+                    hyperlink(url, &shown)
+                } else {
+                    shown
+                };
+                out.push_str(&format!("{label} {}", dim(&format!("({url})"))));
                 rest = &rest[end_abs + 1..];
                 continue;
             }
@@ -1612,6 +1618,15 @@ pub fn hyperlink(url: &str, label: &str) -> String {
         return label.to_string();
     }
     format!("\x1b]8;;{}\x1b\\{label}\x1b]8;;\x1b\\", osc8_url(url))
+}
+
+// Schemes a model-written markdown link may open with a click. File links
+// the harness makes itself (file_link) do not pass through here.
+fn model_link_clickable(url: &str) -> bool {
+    let url = url.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
 }
 
 // Any control char inside the OSC 8 URL could terminate the sequence early and

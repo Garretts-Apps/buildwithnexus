@@ -955,6 +955,17 @@ fn queue_edit_and_remove_act_on_the_message_sent_next() {
     assert_eq!(queued_row_hint(1), "");
 }
 
+#[cfg(unix)]
+#[test]
+fn clipboard_helper_is_fed_and_reaped() {
+    // `cat` stands in for pbcopy/clip.exe: it exits once its stdin closes,
+    // and the helper thread must wait for it (no zombie per copy).
+    let h = pipe_to_clipboard_helper("cat", "copied").expect("spawn cat");
+    let status = h.join().unwrap().expect("waited for the helper");
+    assert!(status.success());
+    assert!(pipe_to_clipboard_helper("definitely-not-a-clipboard-xyz", "x").is_none());
+}
+
 #[test]
 fn osc52_confirmation_suppressed_only_for_known_unsupported_terminals() {
     // WSL/macOS copy through clip.exe/pbcopy, so the check is moot there.
@@ -1260,4 +1271,21 @@ fn ask_secret_never_echoes_and_esc_or_ctrl_c_cancel() {
     // A long key never wraps the row: the dots stop at the width.
     let frame = secret_frame("  KEY: ", 500, 40);
     assert_eq!(frame.matches('•').count(), 40 - 7 - 1);
+}
+
+#[test]
+fn only_web_and_mail_model_links_are_clickable() {
+    assert!(model_link_clickable("https://example.com/x"));
+    assert!(model_link_clickable("HTTP://example.com"));
+    assert!(model_link_clickable("mailto:a@b.c"));
+    for url in [
+        "file:///etc/passwd",
+        "ssh://host",
+        "vscode://open?x",
+        "javascript:alert(1)",
+        "x-man-page://ls",
+        "relative/path",
+    ] {
+        assert!(!model_link_clickable(url), "{url}");
+    }
 }
