@@ -296,9 +296,161 @@ fn executes_tool_then_finishes() {
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .collect();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
-    let saved: Value =
-        serde_json::from_str(&std::fs::read_to_string(&sessions[0]).unwrap()).unwrap();
-    assert_eq!(saved["schema_version"], 1);
+    // The session file is a log (session schema 2): a header line, then one
+    // whole JSON record per message, each on its own line.
+    let text = std::fs::read_to_string(&sessions[0]).unwrap();
+    assert!(text.ends_with('\n'), "the last record is complete");
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every line is one JSON object"))
+        .collect();
+    let header = &lines[0];
+    assert_eq!(header["schema_version"], 2);
+    assert_eq!(header["title"], "create a file");
+    assert_eq!(header["model"], "test-model");
+    for key in ["id", "cwd"] {
+        assert!(header[key].is_string(), "{key}: {header}");
+    }
+    assert!(header["created_ms"].as_u64().unwrap() > 0);
+    assert!(header["updated_ms"].as_u64().unwrap() >= header["created_ms"].as_u64().unwrap());
+    assert!(
+        header.get("msgs").is_none(),
+        "messages are not in the header"
+    );
+    let records = &lines[1..];
+    assert_eq!(header["messages"], records.len());
+    assert!(records.iter().all(|r| r["msg"].is_object()), "{text}");
+    // The system prompt, the task, then each tool round as it happened.
+    assert!(records[0]["msg"]["System"].is_string());
+    assert_eq!(records[1]["msg"]["User"], "create a file");
+    assert_eq!(
+        records[2]["msg"]["Assistant"]["calls"][0]["name"],
+        "write_file"
+    );
+    assert_eq!(records[3]["msg"]["Tool"][0]["is_error"], false);
+    // Listed from that header, and loaded back whole.
+    let listed = run_args(&home, &cwd, &["--json", "sessions"]);
+    let listed = listed.find("session").expect("a session event");
+    assert_eq!(listed["id"], header["id"]);
+    assert_eq!(listed["messages"], records.len());
+}
+
+// Start-up and a turn with two tool rounds go to disk for each settings file
+// once: 0.19 opened and parsed config.json and settings.json 19 times each
+// before the first prompt alone.
+#[test]
+fn a_run_reads_each_settings_file_once() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call("c1", "write_file", json!({"path": "a.txt", "content": "a"})),
+        tool_call("c2", "read_file", json!({"path": "a.txt"})),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    std::fs::write(home.join("settings.json"), r#"{"auto_update":"off"}"#).unwrap();
+    std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        cwd.join(".buildwithnexus/settings.json"),
+        r#"{"temperature":0.2}"#,
+    )
+    .unwrap();
+    // Settings files are not minutes old in a test unless made so; one
+    // written in the last two seconds is read afresh each time by design.
+    let files = [
+        home.join("config.json"),
+        home.join("settings.json"),
+        cwd.join(".buildwithnexus/settings.json"),
+    ];
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for f in &files {
+        let f = std::fs::File::options().write(true).open(f).unwrap();
+        f.set_modified(then).unwrap();
+    }
+    let log = home.join("settings-reads.log");
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "write then read"],
+        &[("BWN_TRACE_SETTINGS_READS", log.to_str().unwrap())],
+    );
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.find("finish").unwrap()["summary"], "done");
+    let reads = std::fs::read_to_string(&log).unwrap();
+    for f in &files {
+        let name = f.to_string_lossy();
+        let n = reads.lines().filter(|l| *l == name).count();
+        assert_eq!(n, 1, "{name} was read {n} times:\n{reads}");
+    }
+    assert_eq!(reads.lines().count(), files.len(), "{reads}");
+}
+
+// A session file as 0.19 wrote it (session schema 1: one JSON object) is
+// listed, exported and resumed, and resuming writes it in the new layout
+// without losing a message.
+#[test]
+fn a_session_file_from_0_19_is_listed_exported_and_resumed() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![finish("picked it up")]);
+    write_config(&home, "ollama", "auto", port);
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let id = "0001790000000000-0badc0de";
+    let file = home.join("sessions").join(format!("{id}.json"));
+    let old = json!({
+        "schema_version": 1,
+        "id": id,
+        "title": "the old task",
+        "cwd": cwd.to_string_lossy(),
+        "model": "test-model",
+        "created_ms": 1_790_000_000_000u64,
+        "updated_ms": 1_790_000_000_500u64,
+        "msgs": [
+            {"User": "the old task"},
+            {"Assistant": {"text": "an answer from before", "calls": []}},
+        ],
+        "name": "kept name",
+    });
+    std::fs::write(&file, old.to_string()).unwrap();
+
+    let listed = run_args(&home, &cwd, &["--json", "sessions"]);
+    let listed = listed.find("session").expect("the old file is listed");
+    assert_eq!(listed["id"], id);
+    assert_eq!(listed["messages"], 2);
+    let out = Command::new(BIN)
+        .args(["sessions", "export", id])
+        .env("NEXUS_HOME", &home)
+        .current_dir(&cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        old.to_string(),
+        "listing and exporting leave the file as it was"
+    );
+
+    let r = run_args(&home, &cwd, &["--json", "resume", id, "and now this"]);
+    assert!(r.success, "stderr: {}", r.stderr);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("every line is one JSON object"))
+        .collect();
+    assert_eq!(lines[0]["schema_version"], 2);
+    assert_eq!(lines[0]["created_ms"], 1_790_000_000_000u64);
+    assert_eq!(lines[0]["name"], "kept name");
+    assert_eq!(lines[0]["messages"], lines.len() - 1);
+    assert!(text.contains("an answer from before") && text.contains("and now this"));
+    let files: Vec<_> = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files.len(), 1, "one session, no leftovers: {files:?}");
 }
 
 #[test]
@@ -3906,8 +4058,14 @@ fn parallel_runs_sharing_a_home_keep_separate_sessions() {
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .map(|p| {
-            let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-            v["title"].as_str().unwrap().to_string()
+            // Each run's own log: its header, then whole records only.
+            let text = std::fs::read_to_string(p).unwrap();
+            let lines: Vec<Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("every line is one JSON object"))
+                .collect();
+            assert_eq!(lines[0]["messages"], lines.len() - 1, "{text}");
+            lines[0]["title"].as_str().unwrap().to_string()
         })
         .collect();
     titles.sort();

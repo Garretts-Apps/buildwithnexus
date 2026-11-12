@@ -2495,7 +2495,7 @@ fn build_turn(
         // Persist the transcript after every tool round so a crash or kill
         // doesn't lose the session (save is cheap and swallows I/O errors).
         if let Some(sid) = sid {
-            crate::session::save(sid, cwd, &p.model, msgs);
+            crate::session::save_round(sid, cwd, &p.model, msgs);
         }
         // The refused call's own line already says the turn stopped.
         if turn_stopped(depth == 0) {

@@ -290,6 +290,110 @@ fn slow_server(delay_ms: u64) -> u16 {
     port
 }
 
+// ── session save per tool round ──────────────────────────────────────────────
+// (begin: session log benches)
+//
+// The transcript is saved after every tool round. `append` is that save: the
+// round's two messages are appended to the session log and flushed, so its
+// cost follows the round, not the conversation. `whole_file` is what every
+// save cost before the log, and what a save still costs when history changed
+// (compaction, /rewind, a new model): the whole transcript serialized,
+// written and flushed. Both include a real fsync, so run them on the kind of
+// disk you care about (TMPDIR picks the folder).
+
+// What one tool round adds, sized so 200 rounds make a 4.6 MB transcript.
+fn session_round(i: usize) -> [Msg; 2] {
+    [
+        Msg::Assistant {
+            text: format!("Reading module {i} before changing it."),
+            calls: vec![ToolCall {
+                id: format!("call_{i}"),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": format!("src/module_{i}.rs")}),
+            }],
+        },
+        Msg::Tool(vec![ToolResult {
+            id: format!("call_{i}"),
+            content: format!("    let value_{i} = compute(input, {i})?; // line\n").repeat(500),
+            is_error: false,
+            images: Vec::new(),
+        }]),
+    ]
+}
+
+fn session_transcript(bytes: usize) -> Vec<Msg> {
+    let mut msgs = vec![
+        Msg::System("You are an autonomous senior software engineer.".repeat(20)),
+        Msg::User("refactor the module layout".into()),
+    ];
+    let mut size = 0;
+    let mut i = 0;
+    while size < bytes {
+        let round = session_round(i);
+        size += serde_json::to_string(&round[..]).unwrap().len();
+        msgs.extend(round);
+        i += 1;
+    }
+    msgs
+}
+
+fn bench_session_save(c: &mut Criterion) {
+    use buildwithnexus::session;
+    use std::time::{Duration, Instant};
+    let home = std::env::temp_dir().join(format!("bwn-bench-session-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("NEXUS_HOME", &home);
+    let cwd = Path::new("/bench/project");
+    let mut g = c.benchmark_group("session_save_per_round");
+    g.sample_size(20);
+    for (label, bytes) in [("46KB", 46_000), ("1.4MB", 1_400_000), ("4.6MB", 4_600_000)] {
+        let base = session_transcript(bytes);
+        let id = format!("bench-{label}");
+        g.bench_function(format!("append/{label}"), |b| {
+            b.iter_custom(|iters| {
+                let mut spent = Duration::ZERO;
+                let mut left = iters;
+                while left > 0 {
+                    // Untimed: the file back at its starting size, and the
+                    // rounds to add built ahead.
+                    let mut msgs = base.clone();
+                    let _ = session::remove(&id);
+                    assert!(session::save(&id, cwd, "bench-model", &msgs));
+                    let n = left.min(32);
+                    let rounds: Vec<[Msg; 2]> = (0..n as usize).map(session_round).collect();
+                    let start = Instant::now();
+                    for round in rounds {
+                        msgs.extend(round);
+                        black_box(session::save_round(&id, cwd, "bench-model", &msgs));
+                    }
+                    spent += start.elapsed();
+                    left -= n;
+                }
+                spent
+            })
+        });
+        g.bench_function(format!("whole_file/{label}"), |b| {
+            let mut msgs = base.clone();
+            msgs.extend(session_round(0));
+            let mut flip = false;
+            b.iter(|| {
+                // A new model is a new header: the file is written whole.
+                flip = !flip;
+                let model = if flip {
+                    "bench-model-a"
+                } else {
+                    "bench-model-b"
+                };
+                black_box(session::save_round(&id, cwd, model, &msgs))
+            })
+        });
+    }
+    g.finish();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+// (end: session log benches)
+
 criterion_group!(
     benches,
     bench_tool_batch,
@@ -301,5 +405,6 @@ criterion_group!(
     bench_sse_parse,
     bench_truncate,
     bench_path_and_classify,
+    bench_session_save,
 );
 criterion_main!(benches);
