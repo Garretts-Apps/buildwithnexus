@@ -140,8 +140,9 @@ fn pending_notice(
             updated.to_string(),
         ));
     }
+    // The state file is ours, but it may predate the registry check above.
     let latest = st["latestSeen"].as_str().unwrap_or("");
-    if latest.is_empty() || !newer(latest, current) || shown == Some(latest) {
+    if !plain_version(latest) || !newer(latest, current) || shown == Some(latest) {
         return None;
     }
     let notice = match policy {
@@ -207,10 +208,27 @@ fn fetch_latest() -> Result<String, String> {
     let body: serde_json::Value = resp
         .into_json()
         .map_err(|e| format!("{url}: not JSON ({e})"))?;
-    body["version"]
+    let version = body["version"]
         .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("{url}: no version in the reply"))
+        .ok_or_else(|| format!("{url}: no version in the reply"))?;
+    // The registry (or a mirror, or whatever answers on its address) is
+    // not trusted to name a version: it becomes an npm argument and a line
+    // in the terminal, so only a plain release number is taken.
+    if !plain_version(version) {
+        return Err(format!(
+            "{url}: the reply's version is not a plain release number"
+        ));
+    }
+    Ok(version.to_string())
+}
+
+// `MAJOR.MINOR.PATCH`, digits only: what ^\d+\.\d+\.\d+$ accepts.
+fn plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 20 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Exit code of `update --check` (and of `update` that could not install)
@@ -365,6 +383,28 @@ pub fn spawn_check(policy: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_plain_release_numbers_are_versions() {
+        for v in ["0.17.0", "1.2.3", "10.20.30"] {
+            assert!(super::plain_version(v), "{v}");
+        }
+        for v in [
+            "",
+            "1.2",
+            "1.2.3.4",
+            "1.2.3-beta.1",
+            "v1.2.3",
+            "1.2.x",
+            "1..3",
+            "1.2.3 --registry=http://evil",
+            "1.2.3\n",
+            "1.2.\u{1b}[31m3",
+            "1.2.3@latest",
+        ] {
+            assert!(!super::plain_version(v), "{v:?}");
+        }
+    }
+
     #[test]
     fn a_failed_lookup_names_the_address_once() {
         let url = "http://127.0.0.1:1/buildwithnexus/latest";

@@ -259,10 +259,15 @@ pub(crate) fn serve(opts: &CliOptions) -> i32 {
     let worker = std::thread::spawn(move || run_turns(&worker_opts));
 
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if !line.trim().is_empty() {
-            handle_line(&line);
+    let mut input = stdin.lock();
+    // Only end of input (or a read error) ends the server: a message that is
+    // not UTF-8 or runs past the cap gets a parse error and the next line is
+    // read as usual, the way a malformed JSON message already is.
+    while let Ok(Some(line)) = next_message(&mut input, MAX_MESSAGE) {
+        match line {
+            Ok(line) if !line.trim().is_empty() => handle_line(&line),
+            Ok(_) => {}
+            Err(why) => respond_error(Value::Null, (PARSE_ERROR, why)),
         }
     }
 
@@ -282,6 +287,56 @@ pub(crate) fn serve(opts: &CliOptions) -> i32 {
 }
 
 // ── incoming messages ───────────────────────────────────────────────────────
+
+// Longest message read from the editor. Prompts carry pasted images as
+// base64, so this is generous; it exists so a peer that never sends a
+// newline cannot grow memory without bound.
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+
+// The next newline-delimited message: Ok(None) at end of input, the line's
+// text, or why it cannot be one (not UTF-8, or over `cap`, in which case the
+// rest of it is read and thrown away so the next message starts clean).
+fn next_message<R: BufRead>(
+    r: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<Result<String, String>>> {
+    let mut buf = Vec::new();
+    let n = std::io::Read::take(&mut *r, cap as u64 + 1).read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    } else if buf.len() > cap {
+        drop(buf);
+        loop {
+            let chunk = r.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            match chunk.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    r.consume(i + 1);
+                    break;
+                }
+                None => {
+                    let len = chunk.len();
+                    r.consume(len);
+                }
+            }
+        }
+        return Ok(Some(Err(format!(
+            "parse error: message is over {} MB",
+            cap / (1024 * 1024)
+        ))));
+    }
+    Ok(Some(String::from_utf8(buf).map_err(|e| {
+        format!("parse error: message is not valid UTF-8 ({e})")
+    })))
+}
 
 fn handle_line(line: &str) {
     let msg: Value = match serde_json::from_str(line) {
@@ -1457,6 +1512,20 @@ mod tests {
 
     fn ev(v: Value) -> Value {
         v
+    }
+
+    #[test]
+    fn next_message_rejects_bad_lines_and_keeps_reading() {
+        let mut r = std::io::BufReader::with_capacity(
+            4,
+            std::io::Cursor::new(b"ok\r\n\xff\nwaytoolong\nafter\n".to_vec()),
+        );
+        let mut next = || next_message(&mut r, 6).unwrap();
+        assert_eq!(next(), Some(Ok("ok".into())));
+        assert!(matches!(next(), Some(Err(e)) if e.contains("UTF-8")));
+        assert!(matches!(next(), Some(Err(e)) if e.contains("over")));
+        assert_eq!(next(), Some(Ok("after".into())));
+        assert_eq!(next(), None);
     }
 
     #[test]

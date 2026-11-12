@@ -1599,9 +1599,13 @@ fn exit_on_interrupt() {
             report::result("interrupted", code);
             let resume = crate::session::current()
                 .map(|id| {
-                    format!(
-                        " — session {id} saved; resume with `buildwithnexus resume {id} <task>`"
-                    )
+                    if crate::session::last_save_ok() {
+                        format!(
+                            " — session {id} saved; resume with `buildwithnexus resume {id} <task>`"
+                        )
+                    } else {
+                        format!(" — session {id} could not be saved")
+                    }
                 })
                 .unwrap_or_default();
             eprintln!(

@@ -1907,10 +1907,98 @@ fn replace_once(body: &str, old: &str, new: &str) -> Replaced {
 // A text file as the editor has it, else from disk. An editor that cannot
 // read it (outside its project, say) leaves the disk to answer: the gate has
 // already allowed the read.
+//
+// Edits go through here and write the whole text back, so a file over
+// MAX_TEXT_FILE is refused rather than read in part.
 fn read_text(path: &Path) -> std::io::Result<String> {
     match EDITOR_FILES.get().and_then(|e| e.read(path)) {
         Some(Ok(text)) => Ok(text),
-        _ => fs::read_to_string(path),
+        _ => {
+            let (file, len) = open_regular(path)?;
+            if len > MAX_TEXT_FILE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "the file is {}, over the {} limit for text tools; edit it with run_command (sed, a script) instead",
+                        human_bytes(len),
+                        human_bytes(MAX_TEXT_FILE)
+                    ),
+                ));
+            }
+            let (text, _) = read_prefix(file, len, MAX_TEXT_FILE)?;
+            Ok(text)
+        }
+    }
+}
+
+// Largest file the text tools take in whole. read_file shows the first
+// MAX_TEXT_FILE bytes of a larger one and says so; edits refuse it. Without
+// a cap a multi-gigabyte log read in full would exhaust memory, all to show
+// the model its first 100 KB.
+const MAX_TEXT_FILE: u64 = 64 * 1024 * 1024;
+
+// Open `path` only when it is a regular file, and return its size. Opening a
+// FIFO blocks until some writer appears, and a device such as /dev/zero or
+// /dev/urandom never ends, so both are refused before they are opened.
+fn open_regular(path: &Path) -> std::io::Result<(fs::File, u64)> {
+    fn refuse(meta: &fs::Metadata) -> Option<std::io::Error> {
+        if meta.is_file() {
+            None
+        } else if meta.is_dir() {
+            Some(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "it is a directory, not a file; list it with list_dir or list_tree",
+            ))
+        } else {
+            Some(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "it is not a regular file (a FIFO, socket or device); text tools read only regular files",
+            ))
+        }
+    }
+    if let Some(e) = refuse(&fs::metadata(path)?) {
+        return Err(e);
+    }
+    let file = fs::File::open(path)?;
+    // Checked again on the open handle: the path may have been swapped.
+    let meta = file.metadata()?;
+    if let Some(e) = refuse(&meta) {
+        return Err(e);
+    }
+    Ok((file, meta.len()))
+}
+
+// Up to `cap` bytes of an open file as UTF-8, and whether any were left
+// unread. A cut that lands inside a multibyte character drops that
+// character's partial bytes instead of failing the whole read as binary.
+fn read_prefix(file: fs::File, len: u64, cap: u64) -> std::io::Result<(String, bool)> {
+    let mut bytes = Vec::with_capacity(len.min(cap) as usize);
+    // One byte past the cap tells a file that grew since stat from one that
+    // is exactly `cap` bytes long.
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, cap + 1), &mut bytes)?;
+    let cut = bytes.len() as u64 > cap;
+    if cut {
+        bytes.truncate(cap as usize);
+        if let Err(e) = std::str::from_utf8(&bytes) {
+            if e.error_len().is_none() {
+                bytes.truncate(e.valid_up_to());
+            }
+        }
+    }
+    String::from_utf8(bytes)
+        .map(|text| (text, cut))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+// A text file for viewing: the editor's copy, else at most `cap` bytes from
+// disk. The flag is true when the file was longer than what was read.
+fn read_text_view(path: &Path, cap: u64) -> std::io::Result<(String, bool)> {
+    match EDITOR_FILES.get().and_then(|e| e.read(path)) {
+        Some(Ok(text)) => Ok((text, false)),
+        _ => {
+            let (file, len) = open_regular(path)?;
+            read_prefix(file, len, cap)
+        }
     }
 }
 
@@ -3582,17 +3670,24 @@ fn truncate(s: String, max: usize) -> String {
 // `[exit N]` marker live at the tail, so keep both ends and cut the middle.
 // File reads keep plain head truncation (see `truncate_read`).
 fn truncate_head_tail(s: String, max: usize) -> String {
-    if s.len() <= max {
+    truncate_head_tail_omitting(s, max, 0)
+}
+
+// truncate_head_tail for text that already lost `extra` bytes from its
+// middle (run_with_timeout's bounded capture): the marker counts them too, so
+// the model sees the same report as if the whole output had been kept.
+fn truncate_head_tail_omitting(s: String, max: usize, extra: usize) -> String {
+    if s.len() <= max && extra == 0 {
         return s;
     }
-    let head_len = HEAD_KEEP.min(max / 2);
-    let tail_len = max - head_len;
+    let head_len = HEAD_KEEP.min(max / 2).min(s.len());
+    let tail_len = (max - HEAD_KEEP.min(max / 2)).min(s.len() - head_len);
     let head_end = crate::config::cut_at_char_boundary(&s, head_len).len();
     let mut tail_start = s.len() - tail_len;
     while tail_start < s.len() && !s.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    let omitted = tail_start - head_end;
+    let omitted = tail_start - head_end + extra;
     format!(
         "{}\n…[{omitted} bytes omitted]…\n{}",
         &s[..head_end],
@@ -3795,17 +3890,125 @@ struct CommandCapture {
     stderr: String,
     code: Option<i32>,
     timed_out: bool,
+    // Bytes dropped from the middle of stdout and stderr while the command
+    // ran (see BoundedBuf); zero unless a stream outgrew what is kept.
+    omitted: usize,
+}
+
+// Bytes of each stream kept from its start and from its end while a command
+// runs. The model only ever sees MAX_OUT of head and tail (command_outcome),
+// so keeping MAX_OUT at each end changes nothing it sees, and a `yes` left
+// running until the deadline cannot grow memory.
+const CAPTURE_KEEP: usize = MAX_OUT;
+
+// A byte sink that keeps the first `head_cap` and the last `tail_cap` bytes
+// written to it and counts what fell out between them.
+struct BoundedBuf {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    head_cap: usize,
+    tail_cap: usize,
+    omitted: usize,
+}
+
+impl BoundedBuf {
+    fn new(head_cap: usize, tail_cap: usize) -> Self {
+        BoundedBuf {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            head_cap,
+            tail_cap,
+            omitted: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        let room = self
+            .head_cap
+            .saturating_sub(self.head.len())
+            .min(chunk.len());
+        self.head.extend_from_slice(&chunk[..room]);
+        let rest = &chunk[room..];
+        if rest.len() >= self.tail_cap {
+            self.omitted += self.tail.len() + rest.len() - self.tail_cap;
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - self.tail_cap..]);
+            return;
+        }
+        self.tail.extend(rest);
+        let excess = self.tail.len().saturating_sub(self.tail_cap);
+        if excess > 0 {
+            self.tail.drain(..excess);
+            self.omitted += excess;
+        }
+    }
+
+    // Head and tail joined. When bytes were omitted the join is a seam in the
+    // middle, which command_outcome's head/tail truncation always cuts away
+    // because each end kept here is at least as long as what it shows.
+    fn into_parts(self) -> (Vec<u8>, usize) {
+        let mut out = self.head;
+        out.extend(self.tail);
+        (out, self.omitted)
+    }
+}
+
+// Kill the command and everything it started. run_with_timeout puts the
+// child in its own process group on unix, so `sh -c 'make'` takes make and
+// its compilers down with it instead of leaving them running (and holding
+// the output pipes open) after the shell is gone.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) with a negative pid signals that process group
+            // and touches no memory of ours. The group is the child's own
+            // (process_group(0) at spawn), and the child is not yet reaped,
+            // so its id cannot have been reused.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Best effort: taskkill /T walks the child's descendants. When it is
+        // missing or fails, child.kill() below still ends the direct child.
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // Run a command with piped stdio and a hard deadline. `Command::output()`
 // blocks forever on hanging commands; here stdout/stderr are drained on
-// threads while the parent polls `try_wait`, killing the child on expiry and
-// returning whatever partial output was collected.
+// threads while the parent polls `try_wait`, killing the child's whole
+// process group on expiry and returning whatever partial output was kept.
 fn run_with_timeout(
-    mut cmd: Command,
+    cmd: Command,
     stdin_payload: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<CommandCapture, String> {
+    run_with_timeout_keeping(cmd, stdin_payload, timeout, CAPTURE_KEEP, CAPTURE_KEEP)
+}
+
+// run_with_timeout with explicit per-stream head/tail sizes, for a caller
+// that needs more than the model-facing MAX_OUT (pdftotext feeds line ranges).
+fn run_with_timeout_keeping(
+    mut cmd: Command,
+    stdin_payload: Option<Vec<u8>>,
+    timeout: Duration,
+    head_keep: usize,
+    tail_keep: usize,
+) -> Result<CommandCapture, String> {
+    // stdin is never the terminal (null, or a pipe for the payload), so the
+    // separate session below cannot strand a command waiting on the
+    // TUI's tty for input it would otherwise have stolen.
     cmd.stdin(if stdin_payload.is_some() {
         Stdio::piped()
     } else {
@@ -3813,19 +4016,41 @@ fn run_with_timeout(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    // A session of its own, not only a process group: the group lets a
+    // timeout kill the whole tree, and having no controlling terminal makes a
+    // command that opens /dev/tty itself (sudo, an ssh password prompt) fail
+    // at once with "no tty" instead of stopping in the background until the
+    // timeout. setsid(2) is async-signal-safe, as pre_exec requires.
+    #[cfg(unix)]
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn().map_err(|e| format!("failed to spawn: {e}"))?;
     if let Some(payload) = stdin_payload {
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = std::io::Write::write_all(&mut stdin, &payload);
-        } // dropping stdin closes it so the child sees EOF
+            // Written on a thread so a child that never reads its input (or
+            // reads it slowly) cannot block us before the deadline starts;
+            // killing it breaks the pipe and ends the write. Dropping stdin
+            // at the end closes it so the child sees EOF.
+            std::thread::spawn(move || {
+                let _ = std::io::Write::write_all(&mut stdin, &payload);
+            });
+        }
     }
     // Reader threads forward chunks over channels instead of being joined:
     // a killed shell can leave grandchildren holding the pipe write end, and
     // joining a blocked read_to_end would hang exactly like Command::output().
+    // The channel is bounded so a fast writer waits on us instead of queueing
+    // gigabytes between two polls.
     fn drain<R: std::io::Read + Send + 'static>(
         pipe: Option<R>,
     ) -> std::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         if let Some(mut p) = pipe {
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -3845,41 +4070,39 @@ fn run_with_timeout(
     }
     // Drain whatever is buffered, then wait up to `grace` for stragglers; a
     // clean EOF disconnects the channel and exits immediately.
-    fn collect(rx: &std::sync::mpsc::Receiver<Vec<u8>>, out: &mut Vec<u8>, grace: Duration) {
+    fn collect(rx: &std::sync::mpsc::Receiver<Vec<u8>>, out: &mut BoundedBuf, grace: Duration) {
         let deadline = std::time::Instant::now() + grace;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(remaining) {
-                Ok(chunk) => out.extend_from_slice(&chunk),
+                Ok(chunk) => out.push(&chunk),
                 Err(_) => break, // disconnected (EOF) or grace expired
             }
         }
     }
     let out_rx = drain(child.stdout.take());
     let err_rx = drain(child.stderr.take());
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
+    let mut stdout_buf = BoundedBuf::new(head_keep, tail_keep);
+    let mut stderr_buf = BoundedBuf::new(head_keep, tail_keep);
     let deadline = std::time::Instant::now() + timeout;
     let mut timed_out = false;
     let code = loop {
         while let Ok(chunk) = out_rx.try_recv() {
-            stdout_bytes.extend_from_slice(&chunk);
+            stdout_buf.push(&chunk);
         }
         while let Ok(chunk) = err_rx.try_recv() {
-            stderr_bytes.extend_from_slice(&chunk);
+            stderr_buf.push(&chunk);
         }
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
             Ok(None) => {
                 if crate::tui::interrupted() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     return Err("command interrupted by user".to_string());
                 }
                 if std::time::Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_process_tree(&mut child);
                     break None;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -3888,13 +4111,16 @@ fn run_with_timeout(
         }
     };
     let grace = Duration::from_millis(250);
-    collect(&out_rx, &mut stdout_bytes, grace);
-    collect(&err_rx, &mut stderr_bytes, grace);
+    collect(&out_rx, &mut stdout_buf, grace);
+    collect(&err_rx, &mut stderr_buf, grace);
+    let (stdout_bytes, out_omitted) = stdout_buf.into_parts();
+    let (stderr_bytes, err_omitted) = stderr_buf.into_parts();
     Ok(CommandCapture {
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         code,
         timed_out,
+        omitted: out_omitted + err_omitted,
     })
 }
 
@@ -3912,7 +4138,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
             timeout.as_secs()
         ));
         return Outcome {
-            content: truncate_head_tail(s, MAX_OUT),
+            content: truncate_head_tail_omitting(s, MAX_OUT, cap.omitted),
             is_error: true,
             finished: false,
             images: Vec::new(),
@@ -3921,7 +4147,7 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
     let code = cap.code.unwrap_or(-1);
     s.push_str(&format!("\n[exit {code}]"));
     Outcome {
-        content: truncate_head_tail(s, MAX_OUT),
+        content: truncate_head_tail_omitting(s, MAX_OUT, cap.omitted),
         is_error: code != 0,
         finished: false,
         images: Vec::new(),
@@ -4479,7 +4705,7 @@ fn read_media(p: &Path, input: &Value, cwd: &Path) -> Option<Outcome> {
 // A PDF's text, through pdftotext (poppler) when it is installed.
 fn read_pdf(p: &Path, input: &Value) -> Option<Outcome> {
     let mut head = [0u8; 5];
-    let mut f = fs::File::open(p).ok()?;
+    let (mut f, _) = open_regular(p).ok()?;
     if std::io::Read::read_exact(&mut f, &mut head).is_err() || &head != b"%PDF-" {
         return None;
     }
@@ -4494,27 +4720,32 @@ fn read_pdf(p: &Path, input: &Value) -> Option<Outcome> {
     let mut cmd = Command::new(bin);
     cmd.args(["-layout", "-enc", "UTF-8", "-q"]).arg(p).arg("-");
     crate::sandbox::scrub_credentials(&mut cmd);
-    Some(match run_with_timeout(cmd, None, PDF_TIMEOUT) {
-        Ok(cap) if cap.timed_out => err(format!(
-            "pdftotext did not finish reading {} within {}s",
-            p.display(),
-            PDF_TIMEOUT.as_secs()
-        )),
-        Ok(cap) if cap.code == Some(0) && cap.stdout.trim().is_empty() => ok(format!(
-            "{} has no text layer (a scanned PDF?): pdftotext found nothing to read",
-            p.display()
-        )),
-        Ok(cap) if cap.code == Some(0) => ok(truncate_read(
-            apply_line_range(cap.stdout, line_range(input)),
-            MAX_READ,
-        )),
-        Ok(cap) => err(format!(
-            "pdftotext could not read {}: {}",
-            p.display(),
-            cap.stderr.trim()
-        )),
-        Err(e) => err(format!("pdftotext could not start: {e}")),
-    })
+    // The text is cut to MAX_TEXT_FILE like any other read, but kept from the
+    // start so start_line/end_line can reach past the first MAX_OUT bytes.
+    let keep = MAX_TEXT_FILE as usize;
+    Some(
+        match run_with_timeout_keeping(cmd, None, PDF_TIMEOUT, keep, 0) {
+            Ok(cap) if cap.timed_out => err(format!(
+                "pdftotext did not finish reading {} within {}s",
+                p.display(),
+                PDF_TIMEOUT.as_secs()
+            )),
+            Ok(cap) if cap.code == Some(0) && cap.stdout.trim().is_empty() => ok(format!(
+                "{} has no text layer (a scanned PDF?): pdftotext found nothing to read",
+                p.display()
+            )),
+            Ok(cap) if cap.code == Some(0) => ok(truncate_read(
+                apply_line_range(cap.stdout, line_range(input)),
+                MAX_READ,
+            )),
+            Ok(cap) => err(format!(
+                "pdftotext could not read {}: {}",
+                p.display(),
+                cap.stderr.trim()
+            )),
+            Err(e) => err(format!("pdftotext could not start: {e}")),
+        },
+    )
 }
 
 // ── screenshots ──────────────────────────────────────────────────────────────
@@ -4701,8 +4932,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(out) = read_media(&p, input, cwd) {
                 return out;
             }
-            match read_text(&p) {
-                Ok(c) => ok(truncate_read(apply_line_range(c, line_range(input)), MAX_READ)),
+            match read_text_view(&p, MAX_TEXT_FILE) {
+                Ok((c, false)) => ok(truncate_read(apply_line_range(c, line_range(input)), MAX_READ)),
+                Ok((c, true)) => {
+                    let mut out = truncate_read(apply_line_range(c, line_range(input)), MAX_READ);
+                    out.push_str(&format!(
+                        "\n…[{} is larger than {}: only that much was read, so line numbers past it are not available here; use run_command (`sed -n 'A,Bp'`, `tail`) for the rest]",
+                        p.display(),
+                        human_bytes(MAX_TEXT_FILE)
+                    ));
+                    ok(out)
+                }
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::InvalidData => err(format!(
                         "cannot read {}: contents are not valid UTF-8 — this looks like a binary file. Do not retry read_file; use run_command with a targeted extractor instead (e.g. `file`, `strings`, `xxd | head`, or a format-specific CLI).",
@@ -4712,6 +4952,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                         "cannot read {}: permission denied — the file exists but this process lacks read access. Check ownership/permissions or ask the user to grant access; do not retry the same call unchanged.",
                         p.display()
                     )),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::IsADirectory => {
+                        err(format!("cannot read {}: {e}", p.display()))
+                    }
                     _ => err(format!(
                         "cannot read {}: {e}\nrecovery: do not invent another path or ask the user immediately. Use list_tree/find_paths/find_files/grep_files to locate likely files; for folders use find_paths kind=`dir`; for personal files try roots like `~`, `~/Documents`, `~/Desktop`, `~/Downloads`, `~/Projects`, and `~/repos`. If a broader search is needed, propose or call a read-only find/rg command.",
                         p.display()
@@ -4737,11 +4980,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     continue;
                 }
                 let p = resolve(cwd, path);
-                match fs::read_to_string(&p) {
-                    Ok(c) => sections.push(format!(
+                // Read a few bytes past `max` so truncate() still sees there
+                // is more and marks it, without reading the rest of the file.
+                match read_text_view(&p, max as u64 + 4) {
+                    Ok((c, cut)) => sections.push(format!(
                         "--- {} ---\n{}",
                         display_path(&p, cwd),
-                        truncate(c, max)
+                        if cut && c.len() <= max {
+                            format!("{c}\n…[truncated]")
+                        } else {
+                            truncate(c, max)
+                        }
                     )),
                     Err(e) => sections.push(format!("--- {} ---\n[error] {e}", p.display())),
                 }
@@ -5106,10 +5355,17 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             }
             let p = resolve(cwd, p_str);
             checkpoint::record(cwd, &p, "remove_path");
-            let res = if p.is_dir() {
-                fs::remove_dir(&p)
-            } else {
-                fs::remove_file(&p)
+            // The entry itself decides, not what it points at: a symlink to
+            // a directory is a link to remove, where is_dir() (which follows
+            // it) sent it to remove_dir and failed. Windows keeps a link to a
+            // directory as a directory entry that only remove_dir deletes;
+            // either way the target is never touched.
+            let res = match fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => fs::remove_dir(&p),
+                Ok(m) if cfg!(windows) && m.file_type().is_symlink() && p.is_dir() => {
+                    fs::remove_dir(&p)
+                }
+                _ => fs::remove_file(&p),
             };
             match res {
                 Ok(_) => ok(format!("removed {}", p.display())),
@@ -5994,8 +6250,8 @@ fn run_artifact(input: &Value, cwd: &Path) -> Outcome {
 // Helper for web tools: retries transient HTTP errors (429, 500..=504, transport failures)
 // up to 3 times with exponential backoff (500ms, 1000ms, 2000ms).
 mod net_guard;
-pub use net_guard::blocked_url;
 use net_guard::*;
+pub use net_guard::{blocked_url, private_network_host};
 
 #[cfg(test)]
 pub(crate) mod tests;

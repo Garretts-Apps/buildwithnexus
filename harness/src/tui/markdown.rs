@@ -554,32 +554,36 @@ pub(super) fn osc52_copy(text: &str) {
     // Native Windows and WSL both have clip.exe; the terminal may not honor
     // OSC 52, so mirror the text into the system clipboard as well.
     if cfg!(windows) || crate::tools::is_wsl() {
-        if let Ok(mut child) = std::process::Command::new("clip.exe")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-        }
+        let _ = pipe_to_clipboard_helper("clip.exe", text);
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-            }
-        }
+        let _ = pipe_to_clipboard_helper("pbcopy", text);
     }
+}
+
+// Hand `text` to a clipboard program on its stdin. A detached thread writes
+// it, closes the pipe and waits for the program, so the TUI never blocks on
+// a slow helper and each copy does not leave a zombie process behind. The
+// handle yields the helper's exit status (tests join it; callers drop it).
+pub(super) fn pipe_to_clipboard_helper(
+    program: &str,
+    text: &str,
+) -> Option<std::thread::JoinHandle<Option<std::process::ExitStatus>>> {
+    let mut child = std::process::Command::new(program)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let bytes = text.as_bytes().to_vec();
+    Some(std::thread::spawn(move || {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        } // dropped here: the helper sees EOF and can exit
+        child.wait().ok()
+    }))
 }
 
 pub(super) fn b64_encode(data: &[u8]) -> String {

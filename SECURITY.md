@@ -205,12 +205,23 @@ shows whether a given file is signed.
   names end in `_API_KEY`, `_API_TOKEN`, `_TOKEN`, `_SECRET`, `_SECRETS` or
   `_PASSWORD`, every `AWS_*` variable, and `HF_TOKEN` and the other provider
   presets' key variables. The user can list any of them in
-  `shell_env_passthrough` to keep it.
+  `shell_env_passthrough` to keep it. MCP servers started over stdio get
+  the same scrubbed environment, plus whatever their own
+  `mcp_servers.<name>.env` entry sets. A command that runs past its timeout,
+  or that the user interrupts, is killed with everything it started (its
+  process group on Linux and macOS, its process tree on Windows), and
+  commands run without a controlling terminal, so one that tries to prompt
+  on `/dev/tty` fails at once.
 - **Network:** the model provider the user configures (for example
   `api.anthropic.com`, `api.openai.com`, or a local Ollama on
   `localhost:11434`); `lite.duckduckgo.com` for web searches, and the pages
   the agent fetches when the model uses the web tools (each new host,
-  including the search host, needs the user's approval outside `auto` mode);
+  including the search host, needs the user's approval outside `auto` mode;
+  in `auto` mode a fetch of `localhost`, a loopback, private (RFC 1918),
+  CGNAT or IPv6 unique-local address, or of a name that resolves to one,
+  still asks first, and a headless run refuses it, unless `network.allow` or
+  an allow rule names the host; link-local and cloud-metadata addresses are
+  refused in every mode, including their IPv4-compatible and NAT64 forms);
   MCP servers the user configures, and the OAuth authorization servers they
   name when the user runs `mcp login` (only over HTTPS, or to this machine;
   sign-in tokens are sent to nothing else); the URLs of `http` hooks the user
@@ -439,7 +450,9 @@ macOS. Windows and WSL have no backend, so `auto` runs unconfined there and
 Inside the sandbox, the command can write only to the working directory,
 the folders added with `--add-dir` and the temp directories; the rest of the
 filesystem, including `~/.buildwithnexus`, is read-only, and so are the
-`.git` and `.buildwithnexus` of the workspace and of each added folder (on
+`.git` and `.buildwithnexus` of the workspace and of each added folder, and
+the `.git` of repositories nested inside them that exist when the command
+starts (on
 Linux an empty read-only placeholder stands in when
 they don't exist yet, so a command cannot create a `.git/config` that runs
 later outside the sandbox). On Linux, `/tmp` is a fresh private
@@ -451,7 +464,8 @@ The sandbox does not confine: reads (the whole filesystem stays readable,
 including files such as `~/.ssh` and `.env` unless their permissions stop
 your user), network access by default, the agent's own file tools (which are
 fenced to the working directory and the added folders by the permission gate
-instead), hooks, MCP
-servers, and `start_server`. It never approves anything; it only limits what
+instead), hooks and MCP servers. `start_server` runs inside it when it is
+on (directly, not in tmux, since a tmux server would run the command
+outside it). It never approves anything; it only limits what
 an already-approved command can touch. For untrusted work, use a container
 or VM.

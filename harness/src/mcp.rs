@@ -389,10 +389,39 @@ pub trait Rpc: Send {
 
 // ── stdio transport ─────────────────────────────────────────────────────────
 
+// Longest line read from a stdio server: one JSON-RPC message, held to the
+// same cap as an HTTP body so a server that never sends a newline cannot
+// grow memory without bound.
+const MAX_STDIO_LINE: usize = MAX_HTTP_BODY;
+
+// One line from `r` without its line ending, decoded lossily so a stray
+// non-UTF-8 byte costs that message instead of the whole connection.
+// Ok(None) at EOF; Err when the line runs past `cap`.
+fn read_capped_line<R: BufRead>(r: &mut R, cap: usize) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = r.take(cap as u64 + 1).read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    } else if buf.len() > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a line over {} MB", cap / (1024 * 1024)),
+        ));
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
 pub struct StdioConn {
     child: Child,
     stdin: ChildStdin,
-    rx: Receiver<String>,
+    // A line from the server, or why the reader gave up on it.
+    rx: Receiver<Result<String, String>>,
     stderr: Arc<Mutex<String>>,
     next_id: u64,
     timeout: Duration,
@@ -405,7 +434,15 @@ impl StdioConn {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<Self, String> {
-        let mut child = Command::new(command)
+        let mut cmd = Command::new(command);
+        // A stdio server no longer inherits the provider keys and other
+        // credential-shaped variables (the same set run_command strips):
+        // a server is third-party code and gets only the secrets meant for
+        // it. Those come from the entry's own `env` map, applied after the
+        // scrub so a declared variable always reaches it, or from
+        // `shell_env_passthrough` for a variable to inherit from the shell.
+        crate::sandbox::scrub_credentials(&mut cmd);
+        let mut child = cmd
             .args(args)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
@@ -415,12 +452,25 @@ impl StdioConn {
             .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin pipe")?;
         let stdout = child.stdout.take().ok_or("no stdout pipe")?;
-        let (tx, rx) = mpsc::channel::<String>();
+        // Bounded, so a server flooding notifications between our requests
+        // waits on its own stdout instead of queueing in our memory.
+        let (tx, rx) = mpsc::sync_channel::<Result<String, String>>(16);
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
-                    break;
+            let mut r = BufReader::new(stdout);
+            loop {
+                match read_capped_line(&mut r, MAX_STDIO_LINE) {
+                    Ok(Some(line)) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // The stream is out of step now; the pending request
+                        // fails with this and the connection is done.
+                        let _ = tx.send(Err(format!("server sent {e}")));
+                        break;
+                    }
                 }
             }
         });
@@ -428,8 +478,15 @@ impl StdioConn {
         if let Some(err_pipe) = child.stderr.take() {
             let buf = Arc::clone(&stderr);
             std::thread::spawn(move || {
-                for line in BufReader::new(err_pipe).lines() {
-                    let Ok(line) = line else { break };
+                // Keep reading past bad bytes and huge lines: a server whose
+                // stderr nobody drains blocks once the pipe fills.
+                let mut r = BufReader::new(err_pipe);
+                loop {
+                    let line = match read_capped_line(&mut r, STDERR_CAP) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(_) => "[a stderr line over the cap was dropped]".to_string(),
+                    };
                     if let Ok(mut b) = buf.lock() {
                         b.push_str(&line);
                         b.push('\n');
@@ -495,7 +552,12 @@ impl Rpc for StdioConn {
                 )));
             }
             match self.rx.recv_timeout(remaining) {
-                Ok(line) => match classify(&line) {
+                Ok(Err(e)) => {
+                    return Err(RpcError::Transport(
+                        self.with_stderr(format!("{e} while waiting for {method}")),
+                    ));
+                }
+                Ok(Ok(line)) => match classify(&line) {
                     Some(Incoming::Response { id: rid, body }) if rid == json!(id) => {
                         return unpack(body);
                     }
@@ -2237,6 +2299,72 @@ mod tests {
         .err()
         .unwrap();
         assert!(err.contains("failed to spawn"));
+    }
+
+    #[test]
+    fn read_capped_line_strips_endings_decodes_lossily_and_caps() {
+        let mut r = std::io::Cursor::new(b"one\r\ntw\xffo\nlast".to_vec());
+        assert_eq!(read_capped_line(&mut r, 64).unwrap().unwrap(), "one");
+        assert_eq!(
+            read_capped_line(&mut r, 64).unwrap().unwrap(),
+            "tw\u{fffd}o"
+        );
+        assert_eq!(read_capped_line(&mut r, 64).unwrap().unwrap(), "last");
+        assert!(read_capped_line(&mut r, 64).unwrap().is_none());
+        // Exactly at the cap is fine; one byte past it without a newline is not.
+        let mut r = std::io::Cursor::new(b"abcd\nabcde\n".to_vec());
+        assert_eq!(read_capped_line(&mut r, 4).unwrap().unwrap(), "abcd");
+        assert!(read_capped_line(&mut r, 4).is_err());
+    }
+
+    // A one-shot stdio "server": a shell script that answers request 1.
+    #[cfg(unix)]
+    fn sh_conn(script: &str, env: &[(String, String)]) -> StdioConn {
+        StdioConn::spawn(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            env,
+            Duration::from_secs(10),
+        )
+        .expect("spawn sh")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_survives_a_non_utf8_line() {
+        let mut conn = sh_conn(
+            r#"printf 'junk \377\376\n'; read l; printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'; sleep 5"#,
+            &[],
+        );
+        assert_eq!(conn.request("ping", None).unwrap(), json!({"ok": true}));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_line_over_the_cap_is_a_transport_error() {
+        let mut conn = sh_conn(
+            "read l; head -c 9000000 /dev/zero | tr '\\0' a; echo; sleep 5",
+            &[],
+        );
+        let err = conn.request("ping", None).unwrap_err();
+        assert!(
+            matches!(err, RpcError::Transport(ref m) if m.contains("over 8 MB")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_server_gets_declared_env_but_not_inherited_credentials() {
+        // A credential-shaped name no other test touches.
+        std::env::set_var("BWN_MCP_SCRUB_TEST_API_KEY", "leaked");
+        let mut conn = sh_conn(
+            r#"read l; printf '{"jsonrpc":"2.0","id":1,"result":{"inherited":"%s","declared":"%s"}}\n' "$BWN_MCP_SCRUB_TEST_API_KEY" "$BWN_MCP_DECLARED_TOKEN"; sleep 5"#,
+            &[("BWN_MCP_DECLARED_TOKEN".into(), "given".into())],
+        );
+        let got = conn.request("ping", None).unwrap();
+        std::env::remove_var("BWN_MCP_SCRUB_TEST_API_KEY");
+        assert_eq!(got, json!({"inherited": "", "declared": "given"}));
     }
 
     // ── HTTP transport against an in-process listener ───────────────────

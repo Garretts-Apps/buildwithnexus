@@ -1511,6 +1511,7 @@ fn command_outcome_reports_timeout_actionably() {
         stderr: String::new(),
         code: None,
         timed_out: true,
+        omitted: 0,
     };
     let o = command_outcome(cap, COMMAND_TIMEOUT);
     assert!(o.is_error);
@@ -1526,6 +1527,7 @@ fn command_outcome_appends_exit_marker() {
         stderr: String::new(),
         code: Some(3),
         timed_out: false,
+        omitted: 0,
     };
     let o = command_outcome(cap, COMMAND_TIMEOUT);
     assert!(o.is_error);
@@ -1592,6 +1594,197 @@ fn run_with_timeout_kills_hanging_command_and_keeps_partial_output() {
     assert!(cap.timed_out);
     assert!(cap.stdout.contains("started"), "{}", cap.stdout);
     assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn bounded_buf_keeps_head_and_tail_and_counts_the_rest() {
+    let mut b = BoundedBuf::new(4, 3);
+    b.push(b"ab");
+    b.push(b"cdefg");
+    b.push(b"hij");
+    b.push(b"k");
+    let (bytes, omitted) = b.into_parts();
+    assert_eq!(bytes, b"abcdijk");
+    assert_eq!(omitted, 4); // e f g h
+                            // A chunk bigger than the tail on its own replaces it outright.
+    let mut b = BoundedBuf::new(1, 2);
+    b.push(b"a");
+    b.push(b"xy");
+    b.push(b"0123456789");
+    let (bytes, omitted) = b.into_parts();
+    assert_eq!(bytes, b"a89");
+    assert_eq!(omitted, 10);
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_capture_reports_what_the_full_output_would() {
+    // The model must see the same head, tail and omitted count whether the
+    // whole output was kept or only its ends.
+    let script = "seq 1 100000; seq 1 3000 >&2";
+    let full = Command::new("sh").args(["-c", script]).output().unwrap();
+    let mut whole = String::from_utf8(full.stdout).unwrap();
+    whole.push_str("\n[stderr]\n");
+    whole.push_str(&String::from_utf8(full.stderr).unwrap());
+    whole.push_str("\n[exit 0]");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", script]);
+    let cap = run_with_timeout(cmd, None, Duration::from_secs(30)).unwrap();
+    assert!(cap.omitted > 0);
+    assert!(cap.stdout.len() <= 2 * CAPTURE_KEEP);
+    let shown = command_outcome(cap, Duration::from_secs(30)).content;
+    assert_eq!(shown, truncate_head_tail(whole, MAX_OUT));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_with_timeout_does_not_buffer_an_endless_writer() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "yes"]);
+    let cap = run_with_timeout(cmd, None, Duration::from_millis(500)).unwrap();
+    assert!(cap.timed_out);
+    assert!(cap.stdout.len() <= 2 * CAPTURE_KEEP, "{}", cap.stdout.len());
+    assert!(cap.omitted > 0);
+    let out = command_outcome(cap, Duration::from_millis(500)).content;
+    assert!(out.starts_with("y\ny\n"), "{out:.40}");
+    assert!(out.contains("bytes omitted"));
+    assert!(out.contains("command timed out"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg(unix)]
+fn run_with_timeout_gives_the_command_no_terminal() {
+    // A command that opens /dev/tty itself (sudo, ssh) must fail at once,
+    // not stop in the background until the timeout.
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        "if (exec 3</dev/tty) 2>/dev/null; then echo tty; else echo no-tty; fi",
+    ]);
+    let start = std::time::Instant::now();
+    let cap = run_with_timeout(cmd, None, Duration::from_secs(20)).unwrap();
+    assert!(!cap.timed_out);
+    assert_eq!(cap.stdout.trim(), "no-tty");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn run_with_timeout_kills_the_whole_process_group() {
+    // The shell's background child must die with it on timeout, not linger.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 30 & echo $!; wait"]);
+    let cap = run_with_timeout(cmd, None, Duration::from_millis(300)).unwrap();
+    assert!(cap.timed_out);
+    let pid: u32 = cap.stdout.trim().parse().expect("background pid");
+    // Gone, or a zombie waiting for a reaper: either way no longer running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .chars()
+            .next();
+        if stat.is_empty() || matches!(state, Some('Z' | 'X')) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background sleep {pid} survived the timeout: {stat}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_payload_cannot_block_past_the_deadline() {
+    // Far more than a pipe buffer, to a child that never reads: a synchronous
+    // write would block until the child exited by itself (30s).
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "exec sleep 30"]);
+    let start = std::time::Instant::now();
+    let cap = run_with_timeout(cmd, Some(vec![b'x'; 4 << 20]), Duration::from_millis(300)).unwrap();
+    assert!(cap.timed_out);
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn read_prefix_cuts_on_a_character_boundary() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-prefix-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("t.txt");
+    fs::write(&p, "aé€b").unwrap(); // 1 + 2 + 3 + 1 bytes
+    let (f, len) = open_regular(&p).unwrap();
+    assert_eq!(read_prefix(f, len, 5).unwrap(), ("aé".to_string(), true));
+    let (f, len) = open_regular(&p).unwrap();
+    assert_eq!(read_prefix(f, len, 7).unwrap(), ("aé€b".to_string(), false));
+    // read_many_files stops at its per-file budget and marks the cut.
+    fs::write(dir.join("long.txt"), "z".repeat(5000)).unwrap();
+    let out = run(
+        "read_many_files",
+        &json!({"paths": ["long.txt"], "max_bytes_per_file": 1000}),
+        &dir,
+    );
+    assert!(out.content.contains("…[truncated]"), "{}", out.content);
+    assert!(out.content.len() < 1200, "{}", out.content.len());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn text_tools_refuse_oversized_files_for_edits_and_cap_reads() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-cap-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.log");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(MAX_TEXT_FILE + 10).unwrap(); // sparse: no disk used
+    drop(f);
+    let out = run(
+        "edit_file",
+        &json!({"path": "big.log", "old": "a", "new": "b"}),
+        &dir,
+    );
+    assert!(
+        out.is_error && out.content.contains("limit for text tools"),
+        "{}",
+        out.content
+    );
+    let out = run("read_file", &json!({"path": "big.log"}), &dir);
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("only that much was read"),
+        "{:.200}",
+        out.content
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_file_refuses_a_fifo_instead_of_hanging() {
+    let dir = std::env::temp_dir().join(format!("bwn-read-fifo-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe.pdf");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path; mkfifo touches nothing else.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    for name in ["read_file", "read_many_files"] {
+        let input = if name == "read_file" {
+            json!({"path": "pipe.pdf"})
+        } else {
+            json!({"paths": ["pipe.pdf"]})
+        };
+        let out = run(name, &input, &dir);
+        assert!(
+            out.content.contains("not a regular file"),
+            "{name}: {}",
+            out.content
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ── readonly command classification ─────────────────────────────────────
@@ -2670,8 +2863,19 @@ fn fetch_tools_refuse_link_local_and_metadata_hosts() {
         "http://169.254.169.254\\@docs.example/",
         "http://[::ffff:a9fe:a9fe]/",
         "http://[::169.254.169.254]/",
+        // NAT64 gateways translate 64:ff9b::/96 to the IPv4 address inside.
+        "http://[64:ff9b::a9fe:a9fe]/",
+        "http://[64:ff9b::169.254.169.254]/",
+        "http://[64:ff9b::6464:64c8]/",
     ] {
         assert!(blocked_url(u).is_some(), "{u} should be blocked");
+    }
+    // Resolved addresses are checked the same way (GuardedResolver).
+    for ip in ["64:ff9b::a9fe:a9fe", "::a9fe:a9fe", "::ffff:169.254.0.1"] {
+        assert!(is_blocked_ip(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in ["::1", "::", "64:ff9b::808:808", "2001:db8::1"] {
+        assert!(!is_blocked_ip(ip.parse().unwrap()), "{ip}");
     }
     for u in [
         "http://localhost:3000/",
@@ -3594,4 +3798,56 @@ fn iso8601_known_values() {
     let now = iso8601_utc_now();
     assert_ne!(now, "2026-07-06T00:00:00Z".to_string());
     assert!(now.ends_with('Z') && now.contains('T'));
+}
+
+#[test]
+fn private_addresses_are_told_from_public_ones() {
+    for ip in [
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.31.255.255",
+        "192.168.0.1",
+        "100.64.0.1",
+        "100.127.255.255",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "fc00::1",
+        "fdff::1",
+        "::ffff:192.168.1.1",
+        "::10.0.0.1",
+        "64:ff9b::7f00:1",
+    ] {
+        assert!(net_guard::is_private_ip(ip.parse().unwrap()), "{ip}");
+    }
+    for ip in [
+        "8.8.8.8",
+        "100.128.0.1",
+        "172.32.0.1",
+        "2606:4700::1111",
+        "64:ff9b::808:808",
+    ] {
+        assert!(!net_guard::is_private_ip(ip.parse().unwrap()), "{ip}");
+    }
+    assert!(private_network_host("localhost:3000"));
+    assert!(private_network_host("[::1]:8080"));
+    assert!(private_network_host("10.0.0.1"));
+    assert!(!private_network_host("8.8.8.8:443"));
+    assert!(!private_network_host("?"));
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_path_removes_a_symlink_to_a_directory_not_the_directory() {
+    let d = tempdir();
+    fs::create_dir_all(d.join("real")).unwrap();
+    fs::write(d.join("real/keep.txt"), "kept").unwrap();
+    std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
+    let out = run("remove_path", &json!({"path": "link"}), &d);
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        fs::symlink_metadata(d.join("link")).is_err(),
+        "the link is gone"
+    );
+    assert_eq!(fs::read_to_string(d.join("real/keep.txt")).unwrap(), "kept");
 }

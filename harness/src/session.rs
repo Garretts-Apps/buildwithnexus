@@ -222,13 +222,42 @@ fn title_of(msgs: &[Msg]) -> String {
     "(untitled)".to_string()
 }
 
+// True while the latest save failed. A full disk or a read-only home fails
+// every save after every tool round, so the user is warned when saving
+// starts failing, not on each attempt, and again only after it has worked.
+static SAVE_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the latest save reached the disk (true before any save), so an
+/// exit message says "saved" only when it is.
+pub fn last_save_ok() -> bool {
+    !SAVE_FAILING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Creates or updates a persisted session file for `id` from the provided transcript.
 ///
 /// Preserves the original creation timestamp across updates. A no-op if `msgs` is empty.
-pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
+/// Returns whether the session is on disk; a failure is also shown to the
+/// user once (until a save succeeds again).
+pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> bool {
     if msgs.is_empty() {
-        return;
+        return true;
     }
+    let result = save_now(id, cwd, model, msgs);
+    let was_failing = SAVE_FAILING.swap(result.is_err(), std::sync::atomic::Ordering::Relaxed);
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            if !was_failing {
+                crate::report::notice(&format!(
+                    "  session not saved: {e} — this conversation cannot be resumed until saving works again"
+                ));
+            }
+            false
+        }
+    }
+}
+
+fn save_now(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> Result<(), String> {
     let _ = std::fs::create_dir_all(dir());
     // Only the header of the previous save is read back, and the messages
     // are serialized where they lie: this runs after every tool round.
@@ -258,16 +287,16 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) {
         msgs,
         name: before.and_then(|s| s.name),
     };
-    write(id, &s);
+    write(id, &s)
 }
 
-fn write(id: &str, s: &impl Serialize) -> bool {
-    let Ok(text) = serde_json::to_string(s) else {
-        return false;
-    };
+fn write(id: &str, s: &impl Serialize) -> Result<(), String> {
+    let text = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    let p = path(id);
     // list() only picks up `.json` files, so the temp file is invisible
     // even if a crash leaves it behind.
-    crate::config::atomic_write(&path(id), text.as_bytes(), crate::config::Perm::Default).is_ok()
+    crate::config::atomic_write(&p, text.as_bytes(), crate::config::Perm::Default)
+        .map_err(|e| format!("could not write {}: {e}", p.display()))
 }
 
 /// Names a saved session (/rename). The name replaces the first prompt in
@@ -278,11 +307,7 @@ pub fn rename(id: &str, name: &str) -> Result<(), String> {
     };
     let name = name.trim();
     s.name = (!name.is_empty()).then(|| name.chars().take(80).collect());
-    if write(id, &s) {
-        Ok(())
-    } else {
-        Err(format!("could not write {}", path(id).display()))
-    }
+    write(id, &s)
 }
 
 /// Deletes a saved session; returns it so the caller can say which.
@@ -559,6 +584,19 @@ mod tests {
             );
             assert!(load("0000000000000009").is_some());
             assert!(!dir().join("0000000000000009.json.tmp").exists());
+        });
+    }
+
+    #[test]
+    fn save_reports_a_failed_write() {
+        with_home(|| {
+            let msgs = [Msg::User("hi".into())];
+            // A directory where the session file belongs: the rename fails.
+            std::fs::create_dir_all(path("0000000000000010")).unwrap();
+            assert!(!save("0000000000000010", Path::new("/p"), "m", &msgs));
+            std::fs::remove_dir_all(path("0000000000000010")).unwrap();
+            assert!(save("0000000000000010", Path::new("/p"), "m", &msgs));
+            assert!(load("0000000000000010").is_some());
         });
     }
 
