@@ -75,6 +75,7 @@ pub mod workflow;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent::Permission;
 use config::Settings;
@@ -767,7 +768,11 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         settings.base_url = Some(u.clone());
     }
     set_active_preset(&settings.provider);
-    let mut provider = build_provider(&settings)?;
+    // The interactive start-up puts the local server's window off until the
+    // first prompt is up; setup (above) and every other caller ask in place.
+    let defer = INTERACTIVE_STARTUP.swap(false, Ordering::Relaxed);
+    let (mut provider, probe_due) = build_provider_deferring(&settings, None, defer)?;
+    SERVER_PROBE_DUE.store(probe_due, Ordering::Relaxed);
     if let Some(model) = &opts.model {
         provider.model = model.clone();
     }
@@ -969,6 +974,18 @@ pub fn build_provider(s: &Settings) -> Result<Provider, String> {
 /// probe before it is written to disk. For the custom endpoint an empty key
 /// means none, not the saved one.
 pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result<Provider, String> {
+    build_provider_deferring(s, key, false).map(|(p, _)| p)
+}
+
+// `build_provider_with_key`, optionally without asking a local model server
+// for its window (a blocking request): the second value is then whether that
+// question is still to be asked, off the main thread.
+fn build_provider_deferring(
+    s: &Settings,
+    key: Option<&str>,
+    defer_probe: bool,
+) -> Result<(Provider, bool), String> {
+    let mut probe_due = false;
     let preset = config::preset(&s.provider).ok_or_else(|| unknown_provider_msg(&s.provider))?;
     let base_url = match &s.base_url {
         Some(u) if !preset.env_key.is_empty() && !u.starts_with("https://") => {
@@ -1065,36 +1082,62 @@ pub(crate) fn build_provider_with_key(s: &Settings, key: Option<&str>) -> Result
         effort: config::Effort::parse(&s.effort).unwrap_or_default(),
         ollama_ctx: std::sync::OnceLock::new(),
     };
-    if provider.protocol == config::Protocol::OllamaNative {
-        if let Some(n) = s.context_tokens {
+    if let Some(n) = s.context_tokens {
+        if provider.protocol == config::Protocol::OllamaNative {
             // Pre-seed the probe cache: the native path uses the override as
             // num_ctx without ever querying /api/show.
             let _ = provider.ollama_ctx.set(Some(n));
-        } else if let Some(n) = provider::ollama_ctx(&provider) {
-            // Detected window replaces the hardcoded 8k local default so
-            // compaction thresholds match what the model can actually hold.
-            provider.context_tokens = n as usize;
         }
-    } else if s.context_tokens.is_none() && (preset.local || is_loopback_url(&provider.base_url)) {
-        // llama.cpp, LM Studio and vLLM report the window they loaded the
-        // model with; the 8k guess stands only when they say nothing.
-        let served = provider::served_model(&provider.base_url, &provider.model);
-        if let Some(n) = served.window {
-            provider.context_tokens = n;
-            provider::remember_window(&provider);
-        }
-        if let Some(v) = served.vision {
-            provider::remember_vision(&provider, v);
-        }
-        if let Some(n) = served.slots {
-            provider::remember_slots(&provider, n);
+    } else if provider.protocol == config::Protocol::OllamaNative
+        || preset.local
+        || is_loopback_url(&provider.base_url)
+    {
+        if defer_probe {
+            probe_due = true;
+        } else {
+            ask_local_server(&mut provider);
         }
     }
     media::set_vision_override(s.vision);
     if s.context_tokens.is_some() {
         provider::remember_window(&provider);
     }
-    Ok(provider)
+    Ok((provider, probe_due))
+}
+
+// Set while the interactive UI is starting: the provider it builds leaves the
+// local model server's window to be asked off the main thread (see
+// `repl::spawn_startup_probes`), so the first prompt never waits on a server
+// that is slow or not there.
+static INTERACTIVE_STARTUP: AtomicBool = AtomicBool::new(false);
+// That question is still to be asked.
+static SERVER_PROBE_DUE: AtomicBool = AtomicBool::new(false);
+
+// Asks the local model server what window (and, where it says, vision and
+// slots) it loaded the model with. Blocks on the network: up to the probe's
+// timeout when the server is slow.
+fn ask_local_server(provider: &mut Provider) {
+    if provider.protocol == config::Protocol::OllamaNative {
+        if let Some(n) = provider::ollama_ctx(provider) {
+            // Detected window replaces the hardcoded 8k local default so
+            // compaction thresholds match what the model can actually hold.
+            provider.context_tokens = n as usize;
+        }
+        return;
+    }
+    // llama.cpp, LM Studio and vLLM report the window they loaded the
+    // model with; the 8k guess stands only when they say nothing.
+    let served = provider::served_model(&provider.base_url, &provider.model);
+    if let Some(n) = served.window {
+        provider.context_tokens = n;
+        provider::remember_window(provider);
+    }
+    if let Some(v) = served.vision {
+        provider::remember_vision(provider, v);
+    }
+    if let Some(n) = served.slots {
+        provider::remember_slots(provider, n);
+    }
 }
 
 /// Most piped input a headless run sends, as the task or as a `[stdin]`
@@ -1769,6 +1812,7 @@ fn interactive(initial_prompt: Option<String>, opts: CliOptions) {
     // Before the provider is built: base_url, permission and sandbox may
     // come from the project only once the user trusts it.
     hooks::trust_project(&cwd, raw);
+    INTERACTIVE_STARTUP.store(true, Ordering::Relaxed);
     let (provider, perm) = match provider_or_onboard(&opts) {
         Ok(v) => v,
         Err(e) => {

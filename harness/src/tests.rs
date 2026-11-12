@@ -1851,3 +1851,151 @@ fn context_breakdown_counts_each_part_of_the_next_request() {
     assert_eq!(b.mcp_tools, 0);
     assert_eq!(b.total(), 100 + 50 + 100 + 5);
 }
+
+// ── The local model server's window is asked off the main thread ─────────────
+
+// A stand-in Ollama: counts connections, and answers each /api/show with a
+// 16k window after `delay`.
+fn mock_ollama(
+    delay: std::time::Duration,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut sock) = sock else { return };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            while let Ok(n) = sock.read(&mut buf) {
+                req.extend_from_slice(&buf[..n]);
+                if n == 0 || (req.windows(4).any(|w| w == b"\r\n\r\n") && req.ends_with(b"}")) {
+                    break;
+                }
+            }
+            std::thread::sleep(delay);
+            let body =
+                r#"{"model_info":{"llama.context_length":16384},"capabilities":["completion"]}"#;
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base, hits)
+}
+
+fn ollama_settings(base: &str) -> Settings {
+    Settings {
+        provider: "ollama".into(),
+        model: "tinycoder:3b".into(),
+        permission: "ask".into(),
+        base_url: Some(base.into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_interactive_build_never_waits_for_the_model_server() {
+    let slow = std::time::Duration::from_millis(400);
+    let (base, hits) = mock_ollama(slow);
+    let s = ollama_settings(&base);
+
+    // Deferred: built at once, without a connection, the question left open.
+    let t = std::time::Instant::now();
+    let (mut provider, due) = build_provider_deferring(&s, None, true).unwrap();
+    assert!(t.elapsed() < slow / 2, "took {:?}", t.elapsed());
+    assert!(due, "the window is still to be asked");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no connection was made");
+    assert!(provider.ollama_ctx.get().is_none());
+    let guess = provider.context_tokens;
+
+    // Asked off-thread, the answer reaches the session's provider.
+    let probe = Provider {
+        protocol: provider.protocol,
+        base_url: provider.base_url.clone(),
+        api_key: None,
+        model: provider.model.clone(),
+        context_tokens: provider.context_tokens,
+        temperature: None,
+        max_tokens: None,
+        effort: provider.effort,
+        ollama_ctx: std::sync::OnceLock::new(),
+    };
+    let answer = std::thread::spawn(move || probe_server(probe))
+        .join()
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "asked exactly once");
+    // An answer for a model the session has since left is dropped.
+    let asked_for = std::mem::replace(&mut provider.model, "other:7b".into());
+    let stale = ServerProbe {
+        model: asked_for.clone(),
+        ..answer.clone()
+    };
+    take_server_probe(&mut provider, stale, &[]);
+    assert_eq!(provider.context_tokens, guess);
+    assert!(provider.ollama_ctx.get().is_none());
+    provider.model = asked_for;
+    take_server_probe(&mut provider, answer, &[]);
+    assert_eq!(provider.context_tokens, 16_384);
+    assert_eq!(provider.ollama_ctx.get(), Some(&Some(16_384)));
+
+    // Every other caller (headless runs, /model, setup) still asks in place.
+    let (provider, due) = build_provider_deferring(&s, None, false).unwrap();
+    assert!(!due);
+    assert_eq!(provider.context_tokens, 16_384);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // A window set in settings is never asked for, deferred or not.
+    let pinned = Settings {
+        context_tokens: Some(4096),
+        ..ollama_settings(&base)
+    };
+    let (provider, due) = build_provider_deferring(&pinned, None, true).unwrap();
+    assert!(!due);
+    assert_eq!(provider.ollama_ctx.get(), Some(&Some(4096)));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn an_unreachable_ollama_is_still_reported_by_the_deferred_probe() {
+    // A port nobody listens on.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let s = ollama_settings(&format!("http://127.0.0.1:{port}"));
+    let (mut provider, due) = build_provider_deferring(&s, None, true).unwrap();
+    assert!(due);
+    let guess = provider.context_tokens;
+    let probe = Provider {
+        protocol: provider.protocol,
+        base_url: provider.base_url.clone(),
+        api_key: None,
+        model: provider.model.clone(),
+        context_tokens: provider.context_tokens,
+        temperature: None,
+        max_tokens: None,
+        effort: provider.effort,
+        ollama_ctx: std::sync::OnceLock::new(),
+    };
+    tui::capture_start();
+    let answer = probe_server(probe);
+    let shown = tui::capture_take().join("\n");
+    assert!(
+        shown.contains(&format!(
+            "⚠ nothing is answering at http://127.0.0.1:{port}"
+        )),
+        "{shown}"
+    );
+    take_server_probe(&mut provider, answer, &[]);
+    assert_eq!(provider.context_tokens, guess);
+    assert!(
+        provider.ollama_ctx.get().is_none(),
+        "a server started later is asked again on the first request"
+    );
+}
