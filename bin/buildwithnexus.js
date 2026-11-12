@@ -100,7 +100,13 @@ if (!bin) {
 // supervisor, a cancelled CI job, a closed terminal) must reach the binary
 // too, or the agent keeps running with no parent. Ctrl+C reaches both through
 // the terminal, so this process leaves SIGINT to the binary and waits.
-const child = spawn(bin, args, { stdio: 'inherit' });
+let child;
+try {
+  child = spawn(bin, args, { stdio: 'inherit' });
+} catch (e) {
+  // Windows throws EPERM/EACCES from spawn() itself, before any event.
+  explainFailed({ error: e, status: null, signal: null });
+}
 const forwarded = ['SIGTERM', 'SIGHUP'];
 const forward = (sig) => { try { child.kill(sig); } catch {} };
 for (const sig of forwarded) process.on(sig, forward);
@@ -110,19 +116,7 @@ child.on('error', (e) => { spawnError = e; });
 child.on('close', (status, signal) => {
   for (const sig of forwarded) process.removeListener(sig, forward);
   const result = { error: spawnError, status: spawnError ? null : status, signal };
-  if (result.error || (result.status !== 0 && !signal)) {
-    // Did the binary start at all? If not (blocked, removed, wrong libc), say
-    // why instead of a bare "spawn ... EPERM" or loader error.
-    const { explainRunFailure } = require('../scripts/diagnose.js');
-    const marker = readInstallMarker(bin);
-    const found = explainRunFailure(bin, result, {
-      verified: Boolean(marker),
-      sha256: marker && marker.sha256,
-    });
-    if (found) process.stderr.write(found.text);
-    else if (result.error) process.stderr.write(`buildwithnexus: ${result.error.message}\n`);
-    if (found || result.error) process.exit(1);
-  }
+  if (result.error || (result.status !== 0 && !signal)) explainFailed(result);
   if (signal) {
     // Die the way the binary died, so a shell sees 128+n, not 1.
     process.removeAllListeners('SIGINT');
@@ -131,3 +125,18 @@ child.on('close', (status, signal) => {
   }
   process.exit(status === null ? 1 : status);
 });
+
+// Did the binary start at all? If not (blocked, removed, wrong libc), say why
+// instead of a bare "spawn ... EPERM" or loader error, and exit 1. Returns
+// when the binary ran and simply failed.
+function explainFailed(result) {
+  const { explainRunFailure } = require('../scripts/diagnose.js');
+  const marker = readInstallMarker(bin);
+  const found = explainRunFailure(bin, result, {
+    verified: Boolean(marker),
+    sha256: marker && marker.sha256,
+  });
+  if (found) process.stderr.write(found.text);
+  else if (result.error) process.stderr.write(`buildwithnexus: ${result.error.message}\n`);
+  if (found || result.error) process.exit(1);
+}
