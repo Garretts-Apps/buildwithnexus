@@ -3,9 +3,10 @@
 //
 // A small file is read whole. A large one is read in fixed-size chunks that
 // are checked for UTF-8, counted and dropped, so showing the first 100 KB of
-// a 60 MB log does not hold 60 MB; a line range stops reading at its last
-// line. The text returned is what reading the whole file and then cutting
-// it down returns.
+// a 60 MB log does not hold 60 MB. A line range still reads to the end (or
+// to MAX_TEXT_FILE): a file that is not UTF-8 anywhere is refused, as it was
+// when the file was read whole. The text returned is what reading the whole
+// file and then cutting it down returns.
 
 use super::*;
 
@@ -30,7 +31,7 @@ pub(super) fn read_file_view(
         let (text, cut) = read_prefix(file, len, MAX_TEXT_FILE)?;
         return Ok((truncate_read(apply_line_range(text, range), MAX_READ), cut));
     }
-    stream_view(file, len, range, MAX_TEXT_FILE, MAX_READ, CHUNK)
+    stream_view(file, range, MAX_TEXT_FILE, MAX_READ, CHUNK)
 }
 
 // What is shown, built up piece by piece: the first `max` bytes (and a few
@@ -163,11 +164,9 @@ fn not_utf8() -> std::io::Error {
 /// `truncate_read(apply_line_range(text, range), max)` for the first `cap`
 /// bytes of `file`, without holding them, and whether the file is longer
 /// than `cap`. Text that is not UTF-8 is an InvalidData error, as it is for
-/// a file read whole; with a range, only what is read up to the range's
-/// last line is checked.
+/// a file read whole, wherever the bad bytes are.
 pub(super) fn stream_view(
     mut file: fs::File,
-    len: u64,
     range: Option<(usize, usize)>,
     cap: u64,
     max: usize,
@@ -189,23 +188,17 @@ pub(super) fn stream_view(
         pending_cr: false,
         done: false,
     });
-    // Takes text in; true once a line range has all its lines.
+    // Past a range's last line, text is checked and dropped.
     let mut feed = |bytes: &[u8], shown: &mut Shown| match &mut lines {
-        Some(lines) => {
-            lines.feed(bytes, shown);
-            lines.done
-        }
-        None => {
-            shown.push(bytes);
-            false
-        }
+        Some(lines) => lines.feed(bytes, shown),
+        None => shown.push(bytes),
     };
     let mut buf = vec![0u8; chunk.max(4)];
     // The bytes of a character split across two chunks.
     let (mut carry, mut carried) = ([0u8; 4], 0usize);
     let mut consumed = 0u64;
-    let (mut cut, mut stopped_early) = (false, false);
-    while !stopped_early {
+    let mut cut = false;
+    loop {
         let room = (cap - consumed).min(buf.len() as u64) as usize;
         if room == 0 {
             // At the cap: one more byte tells a longer file from one that
@@ -225,7 +218,7 @@ pub(super) fn stream_view(
             bytes = &bytes[1..];
             match std::str::from_utf8(&carry[..carried]) {
                 Ok(_) => {
-                    stopped_early = feed(&carry[..carried], &mut shown);
+                    feed(&carry[..carried], &mut shown);
                     carried = 0;
                 }
                 Err(e) if e.error_len().is_some() || carried == carry.len() => {
@@ -234,7 +227,7 @@ pub(super) fn stream_view(
                 Err(_) => {}
             }
         }
-        if carried > 0 || stopped_early {
+        if carried > 0 {
             continue;
         }
         let valid = match std::str::from_utf8(bytes) {
@@ -242,14 +235,11 @@ pub(super) fn stream_view(
             Err(e) if e.error_len().is_some() => return Err(not_utf8()),
             Err(e) => e.valid_up_to(),
         };
-        stopped_early = feed(&bytes[..valid], &mut shown);
+        feed(&bytes[..valid], &mut shown);
         carried = bytes.len() - valid;
         carry[..carried].copy_from_slice(&bytes[valid..]);
     }
-    if stopped_early {
-        // The rest was not read; the size says whether it passes the cap.
-        cut = len > cap;
-    } else if carried > 0 && !cut {
+    if carried > 0 && !cut {
         // The file ends inside a character. (At the cap that character is
         // dropped instead, as when the first `cap` bytes are read whole.)
         return Err(not_utf8());

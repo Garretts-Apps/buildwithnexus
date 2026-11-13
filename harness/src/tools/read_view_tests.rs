@@ -24,8 +24,8 @@ fn streamed(
     max: usize,
     chunk: usize,
 ) -> std::io::Result<(String, bool)> {
-    let (file, len) = open_regular(path)?;
-    read_view::stream_view(file, len, range, cap, max, chunk)
+    let (file, _) = open_regular(path)?;
+    read_view::stream_view(file, range, cap, max, chunk)
 }
 
 const RANGES: &[Option<(usize, usize)>] = &[
@@ -130,6 +130,18 @@ fn read_in_chunks_refuses_text_that_is_not_utf8_like_reading_whole() {
                     assert_eq!(got, want, "bad {bad:?} at {at} cap {cap} chunk {chunk}");
                 }
             }
+            // A range is refused or shown as the whole read decides,
+            // wherever the bad bytes are from its lines.
+            for range in [(1, 1), (2, 2), (3, 3), (2, 9), (7, 9)] {
+                for cap in [12u64, 20, 1000] {
+                    let want = reference_view(&path, Some(range), cap, 16).map_err(|e| e.kind());
+                    for chunk in [4usize, 5, 64] {
+                        let got =
+                            streamed(&path, Some(range), cap, 16, chunk).map_err(|e| e.kind());
+                        assert_eq!(got, want, "bad {bad:?} at {at} {range:?} {cap} {chunk}");
+                    }
+                }
+            }
             // A range that takes in the whole file reads it all, too.
             let want = reference_view(&path, Some((1, 9)), 1000, 16).map_err(|e| e.kind());
             assert_eq!(want, Err(std::io::ErrorKind::InvalidData));
@@ -139,8 +151,8 @@ fn read_in_chunks_refuses_text_that_is_not_utf8_like_reading_whole() {
             }
         }
     }
-    // Bad bytes before the requested lines fail the read; bad bytes in a
-    // chunk past the last requested line are never read.
+    // Bad bytes before the requested lines fail the read, and so do bad
+    // bytes after them, as when the file was read whole.
     let mut bytes = b"\xff\n".to_vec();
     bytes.extend_from_slice(base.as_bytes());
     fs::write(&path, &bytes).unwrap();
@@ -148,9 +160,10 @@ fn read_in_chunks_refuses_text_that_is_not_utf8_like_reading_whole() {
     let mut bytes = base.as_bytes().to_vec();
     bytes.extend_from_slice(b"padding padding\n\xff\n");
     fs::write(&path, &bytes).unwrap();
+    assert!(streamed(&path, Some((1, 2)), 1000, 100, 8).is_err());
     assert_eq!(
-        streamed(&path, Some((1, 2)), 1000, 100, 8).unwrap(),
-        ("line one\nline twö".to_string(), false)
+        streamed(&path, Some((1, 2)), 40, 100, 8).unwrap(),
+        ("line one\nline twö".to_string(), true)
     );
     let _ = fs::remove_dir_all(&d);
 }

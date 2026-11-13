@@ -6138,6 +6138,8 @@ mod grep_golden_tests;
 #[cfg(test)]
 mod perf_tests;
 #[cfg(test)]
+mod read_golden_tests;
+#[cfg(test)]
 mod read_view_tests;
 #[cfg(test)]
 mod table_tests;
