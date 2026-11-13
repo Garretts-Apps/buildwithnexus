@@ -34,8 +34,9 @@ Human-readable output, TUI layout, log wording, and files under
 
 ## Schema versions
 
-Every `--json` event and every session file has an integer `schema_version`:
-`1` for events, `2` for session files (see Session files below). An event:
+Every `--json` event and every session file has an integer `schema_version`,
+now `1` for events and `2` for session files (see Session files below). An
+event:
 
 ```json
 {"schema_version":1,"summary":"wrote the file","type":"finish"}
