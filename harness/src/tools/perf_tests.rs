@@ -343,24 +343,6 @@ fn grep_counts_every_match_past_the_limit_and_numbers_lines_from_one() {
     assert_eq!(grep::search_bytes("q", false, hay.as_bytes(), 10).total, 2);
 }
 
-#[test]
-fn grep_skips_a_file_over_the_text_tool_limit() {
-    // A sparse file one byte over the limit: its first line would match.
-    let d = tempdir("grep-big");
-    let path = d.join("huge.log");
-    fs::write(&path, "needle at the top\n").unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(MAX_TEXT_FILE + 1)
-        .unwrap();
-    fs::write(d.join("small.txt"), "needle in a small file\n").unwrap();
-    let r = run("grep_files", &json!({"pattern": "needle"}), &d);
-    assert_eq!(r.content, "small.txt:1:needle in a small file");
-    let _ = fs::remove_dir_all(&d);
-}
-
 #[cfg(unix)]
 #[test]
 fn walk_sensitivity_by_folder_agrees_with_resolving_every_file() {

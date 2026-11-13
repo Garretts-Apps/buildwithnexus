@@ -230,17 +230,14 @@ fn search_buffer(search: &Search, hay: &[u8], rel: &dyn Fn() -> String, hits: &m
 }
 
 // Reads `path` whole into `buf` (reused across files) and returns its length,
-// or None when it cannot be read or is over MAX_TEXT_FILE, the size the text
-// tools stop at.
+// or None when it cannot be read. There is no size limit, as there was none
+// when each file was read with `read_to_string`.
 fn read_into(path: &Path, buf: &mut Vec<u8>) -> Option<usize> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
     let mut filled = 0usize;
     loop {
         if filled == buf.len() {
-            if filled as u64 > MAX_TEXT_FILE {
-                return None;
-            }
             buf.resize((filled * 2).max(64 * 1024), 0);
         }
         match file.read(&mut buf[filled..]) {
@@ -250,7 +247,7 @@ fn read_into(path: &Path, buf: &mut Vec<u8>) -> Option<usize> {
             Err(_) => return None,
         }
     }
-    (filled as u64 <= MAX_TEXT_FILE).then_some(filled)
+    Some(filled)
 }
 
 /// One file's matches, by the whole-buffer search. For the tests that hold
@@ -312,6 +309,10 @@ pub(super) fn run_grep(input: &Value, cwd: &Path) -> Outcome {
             &|| display_path(&path, cwd),
             &mut hits,
         );
+        // One very large file does not keep its buffer for the rest.
+        if buf.len() as u64 > MAX_TEXT_FILE {
+            buf = Vec::new();
+        }
     }
     if hits.lines.is_empty() {
         ok(format!("no matches for {pattern}"))

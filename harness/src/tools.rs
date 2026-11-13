@@ -6134,6 +6134,8 @@ pub use net_guard::{blocked_url, private_network_host};
 #[cfg(test)]
 mod classify_tests;
 #[cfg(test)]
+mod grep_golden_tests;
+#[cfg(test)]
 mod perf_tests;
 #[cfg(test)]
 mod read_view_tests;
