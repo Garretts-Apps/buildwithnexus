@@ -1017,11 +1017,11 @@ when it finishes, a helper that needs an approval says which one it is,
 and Esc or Ctrl+C stops them all. Helpers that write in your folder always
 run one after another. Their tokens and cost count toward the session.
 
-Read-only tool calls that the model makes in a row in one reply
-(`read_file`, `read_many_files`, `list_dir`, `list_tree`, `file_info`,
-`find_paths`, `find_files`, `grep_files`, `kb_query`, `fetch_url`,
+Searches, tree walks and network calls that the model makes in a row in one
+reply (`grep_files`, `find_paths`, `find_files`, `list_tree`, `fetch_url`,
 `web_search`) run at the same time, up to `max_parallel_tools` at once
-(default 4; `1` runs every call one after another). Each call is still
+(default 4; `1` runs every call one after another). File reads and folder
+listings in the same run are quick enough that they run in line. Each call is still
 checked, approved and shown in order before any of them runs, the model
 gets the results in the order it asked, and at most one call per website
 is in flight. Anything that writes, commands, questions, helpers, MCP and

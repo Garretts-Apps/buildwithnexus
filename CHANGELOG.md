@@ -4,6 +4,87 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-11-13
+
+A hang fixed, and a pass over what bwn makes the machine do: typing,
+start-up, streaming, searching, saving and building requests all do less
+work. Session files change format, which is why this is a minor release;
+see Upgrading.
+
+### Upgrading
+- **Session files are a new format (schema 2).** A session saved or resumed
+  by 0.20 cannot be opened by 0.19 or earlier: the older version lists it as
+  corrupt and skips it, and leaves the file alone. 0.20 reads sessions from
+  every earlier version and converts one the first time it saves it. There
+  is no setting to keep writing the old format.
+- **A session file is now JSON Lines, not one JSON object**: a header line,
+  then one `{"msg": …}` line per message. Anything of your own that parses
+  the file changes with it, including a hook that reads `transcript_path`.
+  `docs/VERSIONING.md` has the layout. The `--json` event stream and
+  `bwn sessions --json` are unchanged.
+
+### Fixed
+- **bwn no longer spins forever when its terminal goes away.** If the
+  terminal closed without a hangup signal reaching bwn (a dropped SSH
+  session, a closed tab under some multiplexers), the UI read end-of-input
+  in a loop, pinning a CPU core and never exiting. It now exits at once with
+  status 129.
+- **Reads, searches and fetches in one reply: small reads were slower side
+  by side.** 0.19.0 started threads for every batch of read-only calls;
+  for file reads that cost more than the reads (six small reads took about
+  ten times longer). File reads, folder listings and `file_info` now run in
+  line; only searches, tree walks and network calls run side by side, where
+  it pays (four searches 28 ms → 11 ms, four slow fetches 403 ms → 101 ms).
+- **`read_file` on a huge file no longer reads 64 MB to show 100 KB.** A
+  line range near the start of a 60 MB file takes 6 ms, down from 48 ms.
+
+### Changed
+- **Typing does less.** bwn asked the terminal for its size ten times per
+  keystroke. The size is now remembered and refreshed on resize; a
+  keystroke writes about 230 bytes, down from about 1,150.
+- **Start-up does less.** Settings files were read and parsed about twenty
+  times before the first prompt; each is now read once and reused until it
+  changes. Start-up paints 23 times, down from 128. The local model server
+  is asked for its details off the main thread, so the first prompt no
+  longer waits on it (9 ms, down from about a second, with a slow server);
+  its "nothing is answering" notice arrives just after the prompt.
+- **Streaming repaints only the rows that changed**, in one write per frame:
+  about 800 bytes per streamed chunk, down from about 4,500. Output can land
+  up to one frame (16 ms) later than before. Wrapping a streamed chunk no
+  longer costs more as the line grows (it was 96 µs per chunk on a
+  20,000-character line; it is under 0.1 µs).
+- **Saving a session after a tool round appends to the file** in place of
+  rewriting the whole conversation: about 0.4 ms at any size, where a
+  4.6 MB session cost about 10 ms per round. A full rewrite still happens
+  when history changes (compaction, `/rewind`, a rename or a new model).
+- **`grep_files` is two to three times faster** (2,000 files, 8.8 MB: 18 ms
+  → 7 ms with no match). It searches each file's bytes whole and only works
+  out line numbers for matches.
+- **A request is built once.** The conversation was copied four or five
+  times for each request to the model, and again for each retry; it is now
+  written once and a retry re-sends the same bytes (a 4.6 MB conversation:
+  7.7 ms → 3.0 ms; a 50 KB one: 0.70 ms → 0.035 ms). The bytes sent are
+  identical.
+- Syntax highlighting of a code block is about seven times faster, reading
+  a streamed reply about 40% cheaper per chunk, and scrubbing keys from
+  error text about six times faster. Output is identical in each case.
+
+### Release pipeline
+- crates.io is now published last: the GitHub release goes public, the npm
+  tarball packed from it is installed in clean containers, and only then
+  are crates.io and npm published. Before, a package that failed to install
+  could leave crates.io published and npm not.
+
+### Internal
+- The terminal UI's state lives in one `Screen` struct behind one lock; the
+  values the signal handler and panic hook read stay lock-free.
+- New benchmarks for what had none: `grep_files`, a large `read_file`,
+  session save per round, request bodies at real session sizes, a long
+  streamed line, the highlighter and tool lookup. `BENCHMARKS.md` is
+  re-measured for this version.
+- Tool output for `grep_files` and `read_file` is pinned to the previous
+  implementation's over 1,475 and 780 recorded calls.
+
 ## [0.19.0] - 2026-11-12
 
 Read-only tool calls from one reply now run side by side, the npm
@@ -1451,7 +1532,8 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.20.0
 [0.19.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.19.0
 [0.18.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.18.0
 [0.17.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.17.0
