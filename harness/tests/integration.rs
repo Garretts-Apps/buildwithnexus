@@ -10339,6 +10339,7 @@ fn mixed_reply_run(width: usize) -> (Run, String, Vec<Value>) {
             ("c1", "read_file", json!({"path": "a.txt"})),
             ("c2", "grep_files", json!({"pattern": "alpha"})),
             ("c3", "read_file", json!({"path": "b.txt"})),
+            ("c3b", "find_paths", json!({"pattern": "*.txt"})),
             (
                 "c4",
                 "write_file",
@@ -10380,14 +10381,19 @@ fn mixed_reply_run(width: usize) -> (Run, String, Vec<Value>) {
 fn read_only_calls_side_by_side_send_the_model_exactly_what_one_at_a_time_does() {
     let (one, sent_one, batches_one) = mixed_reply_run(1);
     let (four, sent_four, batches_four) = mixed_reply_run(4);
-    // One at a time runs no batch; side by side runs the reads before the
-    // write (three calls) and the three after it.
+    // One at a time runs no batch. Side by side, the four calls before the
+    // write are one batch whose two searches share threads while its two
+    // reads run in line; the three after the write hold one search, which
+    // has nothing to run beside, so they run in line and leave no batch.
     assert!(batches_one.is_empty(), "{batches_one:?}");
-    let sizes: Vec<u64> = batches_four
+    let sizes: Vec<(u64, u64, u64)> = batches_four
         .iter()
-        .map(|b| b["detail"]["calls"].as_u64().unwrap_or(0))
+        .map(|b| {
+            let n = |key: &str| b["detail"][key].as_u64().unwrap_or(0);
+            (n("calls"), n("side_by_side"), n("width"))
+        })
         .collect();
-    assert_eq!(sizes, [3, 3], "{batches_four:?}");
+    assert_eq!(sizes, [(4, 2, 2)], "{batches_four:?}");
     assert!(one.success, "stderr: {}", one.stderr);
     assert!(four.success, "stderr: {}", four.stderr);
     assert!(!sent_four.is_empty());
@@ -10408,14 +10414,15 @@ fn read_only_calls_side_by_side_send_the_model_exactly_what_one_at_a_time_does()
             .collect()
     };
     assert_eq!(results(&one), results(&four));
-    // The reply's seven calls, then the finish and the automatic checks.
-    let names: Vec<String> = results(&four).into_iter().take(7).map(|(n, _)| n).collect();
+    // The reply's eight calls, then the finish and the automatic checks.
+    let names: Vec<String> = results(&four).into_iter().take(8).map(|(n, _)| n).collect();
     assert_eq!(
         names,
         [
             "read_file",
             "grep_files",
             "read_file",
+            "find_paths",
             "write_file",
             "read_file",
             "find_files",
@@ -10429,10 +10436,11 @@ fn read_only_calls_side_by_side_send_the_model_exactly_what_one_at_a_time_does()
         .filter(|e| e["type"] == "tool_result")
         .map(|e| e["content"].as_str().unwrap_or("").to_string())
         .collect();
-    assert!(contents[4].contains("gamma"), "{}", contents[4]);
+    assert!(contents[5].contains("gamma"), "{}", contents[5]);
     assert!(contents[0].contains("alpha one"), "{}", contents[0]);
     assert!(contents[2].contains("beta two"), "{}", contents[2]);
-    assert!(results(&four)[6].1, "a missing file is an error");
+    assert!(contents[3].contains("b.txt"), "{}", contents[3]);
+    assert!(results(&four)[7].1, "a missing file is an error");
 }
 
 #[test]

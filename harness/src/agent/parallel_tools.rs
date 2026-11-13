@@ -2,8 +2,9 @@
 //!
 //! The build loop still checks, approves and reports every call in the
 //! order the model gave, on the turn's own thread. Only the execution of a
-//! run of consecutive read-only calls (reads, searches, fetches) is spread
-//! over scoped threads, and their outcomes are recorded back in call order,
+//! run of consecutive read-only calls is batched: its searches and fetches
+//! are spread over scoped threads while its file reads, which cost less
+//! than a thread, run on this one. Outcomes are recorded back in call order,
 //! so the conversation and the saved session are the same as when they ran
 //! one after another. See `build_turn` for where calls are queued.
 
@@ -50,15 +51,22 @@ pub(super) struct PendingCall {
 /// Runs the calls and returns their outcomes in the order given.
 pub(super) fn run_pending(calls: &[PendingCall], cwd: &Path) -> Vec<tools::Outcome> {
     let started = std::time::Instant::now();
-    let width = max_parallel_tools();
-    let outs = run_with(calls, width, |c| tools::run(&c.name, &c.input, cwd));
-    if calls.len() > 1 {
+    let (outs, ran) = run_counted(calls, max_parallel_tools(), |c| {
+        tools::run(&c.name, &c.input, cwd)
+    });
+    // Only a batch that ran calls side by side is one worth a trace line.
+    if ran.side_by_side > 0 {
         trace::record(
             "tool_batch",
-            format!("{} read-only calls side by side", calls.len()),
+            format!(
+                "{} read-only calls, {} side by side",
+                calls.len(),
+                ran.side_by_side
+            ),
             serde_json::json!({
                 "calls": calls.len(),
-                "width": width.min(calls.len()),
+                "side_by_side": ran.side_by_side,
+                "width": ran.width,
                 "tools": calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
                 "ms": started.elapsed().as_millis() as u64,
             }),
@@ -89,52 +97,98 @@ pub fn run_read_only_calls(
     run_with(&calls, width, |c| tools::run(&c.name, &c.input, cwd))
 }
 
+/// What a batch did beyond running calls in line: how many calls shared
+/// the threads, and how many threads (this one included) ran them. Both
+/// are zero when every call ran on this thread, one after another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct SideBySide {
+    pub(super) side_by_side: usize,
+    pub(super) width: usize,
+}
+
 /// The scheduler, with the work passed in so tests can run it without
-/// tools. One call, or a width of one, runs on this thread; more run on at
-/// most `width` scoped threads, each taking the next call in order. Calls
-/// to the same network host never overlap, so a batch of fetches is never
-/// a burst against one server.
+/// tools. Calls that cost less than a thread (`tools::is_worth_a_thread`)
+/// run on this thread, in order. The rest (fetches, searches of the tree)
+/// are shared between at most `width` threads, this one among them, when
+/// there are two or more; a lone one runs in line too. Calls to the same
+/// network host never overlap, so a batch of fetches is never a burst
+/// against one server.
 pub(super) fn run_with<F>(calls: &[PendingCall], width: usize, exec: F) -> Vec<tools::Outcome>
 where
     F: Fn(&PendingCall) -> tools::Outcome + Sync,
 {
-    let n = calls.len();
-    if n <= 1 || width <= 1 {
-        return calls.iter().map(&exec).collect();
+    run_counted(calls, width, exec).0
+}
+
+pub(super) fn run_counted<F>(
+    calls: &[PendingCall],
+    width: usize,
+    exec: F,
+) -> (Vec<tools::Outcome>, SideBySide)
+where
+    F: Fn(&PendingCall) -> tools::Outcome + Sync,
+{
+    let queue: Vec<usize> = if calls.len() > 1 && width > 1 {
+        (0..calls.len())
+            .filter(|&i| tools::is_worth_a_thread(&calls[i].name, &calls[i].input))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let threads = width.min(queue.len());
+    if threads <= 1 {
+        return (calls.iter().map(&exec).collect(), SideBySide::default());
     }
     let next = AtomicUsize::new(0);
     let hosts = HostLocks::default();
-    let mut outs: Vec<Option<tools::Outcome>> = (0..n).map(|_| None).collect();
+    // The next queued call, run: None once the queue is empty.
+    let take = || -> Option<(usize, tools::Outcome)> {
+        let i = *queue.get(next.fetch_add(1, Ordering::Relaxed))?;
+        let call = &calls[i];
+        let host = tools::network_host(&call.name, &call.input);
+        let _held = host.as_deref().map(|h| hosts.hold(h));
+        Some((i, exec(call)))
+    };
+    let mut outs: Vec<Option<tools::Outcome>> = (0..calls.len()).map(|_| None).collect();
     std::thread::scope(|s| {
         let (tx, rx) = std::sync::mpsc::channel::<(usize, tools::Outcome)>();
-        for _ in 0..width.min(n) {
-            let tx = tx.clone();
-            let (next, hosts, exec) = (&next, &hosts, &exec);
-            s.spawn(move || loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(call) = calls.get(i) else {
-                    break;
-                };
-                let host = tools::network_host(&call.name, &call.input);
-                let _held = host.as_deref().map(|h| hosts.hold(h));
-                let out = exec(call);
-                drop(_held);
-                if tx.send((i, out)).is_err() {
-                    break;
+        for _ in 1..threads {
+            let (tx, take) = (tx.clone(), &take);
+            s.spawn(move || {
+                while let Some(done) = take() {
+                    if tx.send(done).is_err() {
+                        break;
+                    }
                 }
             });
         }
         drop(tx);
+        // This thread runs the cheap calls, then takes queued ones too.
+        let mut queued = queue.iter().copied().peekable();
+        for (i, call) in calls.iter().enumerate() {
+            if queued.next_if_eq(&i).is_none() {
+                outs[i] = Some(exec(call));
+            }
+        }
+        while let Some((i, out)) = take() {
+            outs[i] = Some(out);
+        }
         for (i, out) in rx {
             outs[i] = Some(out);
         }
     });
-    // Every index was taken by exactly one worker and sent once; a worker
-    // that panicked has already ended the process (panic = "abort"), or,
-    // in tests, the scope above.
-    outs.into_iter()
+    // Every call was run by exactly one thread; a worker that panicked has
+    // already ended the process (panic = "abort"), or, in tests, the scope
+    // above.
+    let outs = outs
+        .into_iter()
         .map(|o| o.expect("every pending call has an outcome"))
-        .collect()
+        .collect();
+    let ran = SideBySide {
+        side_by_side: queue.len(),
+        width: threads,
+    };
+    (outs, ran)
 }
 
 // Network hosts with a call in flight. `hold` waits until the host is free.
