@@ -426,7 +426,8 @@ fn keep_tracked(t: Tracked) {
 }
 
 // A fingerprint of a message. `edges` hashes, for each string, its address,
-// its length and up to EDGE bytes from each end; otherwise every byte and no
+// its length, up to EDGE bytes from each end and INNER short windows from
+// the middle of a long one; otherwise every byte and no
 // address, so equal messages have equal prints wherever they live.
 struct Print {
     h: u64,
@@ -434,6 +435,7 @@ struct Print {
 }
 
 const EDGE: usize = 64;
+const INNER: usize = 8;
 
 impl Print {
     fn of(m: &Msg, edges: bool) -> u64 {
@@ -470,6 +472,13 @@ impl Print {
                 self.raw(b);
             } else {
                 self.raw(&b[..EDGE]);
+                // A few short windows from the middle too, so a change that
+                // keeps the length and both ends is still likely seen here
+                // and not only by the full compare at the end of the turn.
+                for k in 1..=INNER {
+                    let at = b.len() / (INNER + 1) * k;
+                    self.raw(&b[at..(at + 16).min(b.len())]);
+                }
                 self.raw(&b[b.len() - EDGE..]);
             }
         }
