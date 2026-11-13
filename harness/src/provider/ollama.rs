@@ -175,30 +175,72 @@ pub(super) fn warn_ollama_fallback() {
     });
 }
 
-// Pure body builder (see `anthropic_body` for the rationale). Message roles
-// mirror the OpenAI shape, but tool-call arguments are JSON *objects*, images
-// are a bare base64 array on the user message, and sampling knobs nest under
-// "options". "stream" defaults to true server-side, so it's always explicit.
-pub(super) fn ollama_body(
-    model: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-    temperature: Option<f64>,
-    max_tokens: Option<u32>,
-    num_ctx: u32,
-) -> Value {
-    let mut messages: Vec<Value> = Vec::new();
-    let mut system = String::new();
-    for m in msgs {
-        if let Msg::System(s) = m {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(s);
-        }
+/// What shapes an Ollama /api/chat request besides the conversation.
+pub(super) struct OllamaBody<'a> {
+    pub(super) model: &'a str,
+    pub(super) temperature: Option<f64>,
+    pub(super) max_tokens: Option<u32>,
+    pub(super) num_ctx: u32,
+    /// The native API has one switch for thinking-capable models: any effort
+    /// other than Off turns it on (the model then streams a `thinking`
+    /// field), unless the model refused it earlier in the session.
+    pub(super) think: bool,
+    pub(super) stream: bool,
+    /// For models whose template has no tool support (gemma3, for one): the
+    /// system message stays, with the text tool guide appended; tool traffic
+    /// folds into user/assistant turns and images stay in each user turn's
+    /// `images` array.
+    pub(super) flatten: bool,
+}
+
+// The request body, written once (see `wire` and `anthropic_bytes`). Message
+// roles mirror the OpenAI shape, but tool-call arguments are JSON *objects*,
+// images are a bare base64 array on the user message, and sampling knobs
+// nest under "options". "stream" defaults to true server-side, so it's
+// always explicit.
+pub(super) fn ollama_bytes(msgs: &[Msg], tools: &[ToolDef], o: &OllamaBody) -> Vec<u8> {
+    let mut j = Json::with_capacity(size_hint(msgs, tools));
+    j.raw("{\"messages\":[");
+    if o.flatten {
+        flat_messages(&mut j, msgs, tools);
+    } else {
+        native_messages(&mut j, msgs);
     }
+    j.raw("],\"model\":");
+    j.str(o.model);
+    // num_ctx is the reason the native path exists — see the section
+    // comment. Ollama's 1.1 repeat_penalty default penalizes the repetition
+    // inherent in JSON and code; 1.0 disables it.
+    j.raw(",\"options\":{\"num_ctx\":");
+    j.val(&o.num_ctx);
+    j.raw(",\"num_predict\":");
+    j.val(&o.max_tokens.unwrap_or(4096));
+    j.raw(",\"repeat_penalty\":1.0,\"temperature\":");
+    j.val(&o.temperature.unwrap_or(0.2));
+    j.raw(if o.stream {
+        "},\"stream\":true"
+    } else {
+        "},\"stream\":false"
+    });
+    if o.think {
+        j.raw(",\"think\":true");
+    }
+    if !tools.is_empty() && !o.flatten {
+        // Same schema wrapper as the OpenAI shape.
+        function_tools(&mut j, tools);
+    }
+    j.raw("}");
+    j.finish()
+}
+
+fn native_messages(j: &mut Json, msgs: &[Msg]) {
+    let mut sep = Sep::default();
+    let system = SystemText(msgs);
     if !system.is_empty() {
-        messages.push(json!({"role": "system", "content": system}));
+        sep.next(j);
+        j.raw("{\"content\":");
+        j.display(&system);
+        j.raw(",\"role\":\"system\"}");
     }
     // Ollama tool-call messages carry no ids on the wire, so tool results are
     // threaded by name instead: map call ids to names while walking the
@@ -207,95 +249,109 @@ pub(super) fn ollama_body(
     for m in msgs {
         match m {
             Msg::System(_) => {}
-            Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::User(t) => {
+                sep.next(j);
+                text_message(j, "user", t);
+            }
             Msg::UserImages { text, images } => {
+                sep.next(j);
                 // Raw base64 strings; the server sniffs the media type.
-                let imgs: Vec<&str> = images.iter().map(|(_, data)| data.as_str()).collect();
-                messages.push(json!({"role": "user", "content": text, "images": imgs}));
+                image_message(j, "user", text, images.iter());
             }
             Msg::Assistant { text, calls } => {
-                let mut msg = json!({"role": "assistant", "content": text});
+                sep.next(j);
+                j.raw("{\"content\":");
+                j.str(text);
+                j.raw(",\"role\":\"assistant\"");
                 if !calls.is_empty() {
-                    msg["tool_calls"] = json!(calls
-                        .iter()
-                        .map(|c| {
-                            // arguments is an object here, not OpenAI's string.
-                            json!({"function": {"name": c.name, "arguments": c.input}})
-                        })
-                        .collect::<Vec<_>>());
+                    j.raw(",\"tool_calls\":[");
+                    let mut each = Sep::default();
                     for c in calls {
+                        each.next(j);
+                        // arguments is an object here, not OpenAI's string.
+                        j.raw("{\"function\":{\"arguments\":");
+                        j.val(&c.input);
+                        j.raw(",\"name\":");
+                        j.str(&c.name);
+                        j.raw("}}");
                         call_names.insert(&c.id, &c.name);
                     }
+                    j.raw("]");
                 }
-                messages.push(msg);
+                j.raw("}");
             }
             Msg::Tool(results) => {
                 for r in results {
-                    let mut msg = json!({"role": "tool", "content": r.content});
+                    sep.next(j);
+                    j.raw("{\"content\":");
+                    j.str(&r.content);
+                    j.raw(",\"role\":\"tool\"");
                     if let Some(name) = call_names.get(r.id.as_str()) {
-                        msg["tool_name"] = json!(name);
+                        j.raw(",\"tool_name\":");
+                        j.str(name);
                     }
-                    messages.push(msg);
+                    j.raw("}");
                 }
                 // Images go on a user turn, the role every vision template
                 // renders them for.
                 if let Some(intro) = tool_images_intro(results, &call_names) {
-                    let imgs: Vec<&str> = results
-                        .iter()
-                        .flat_map(|r| r.images.iter().map(|(_, data)| data.as_str()))
-                        .collect();
-                    messages.push(json!({"role": "user", "content": intro, "images": imgs}));
+                    sep.next(j);
+                    let images = results.iter().flat_map(|r| r.images.iter());
+                    image_message(j, "user", &intro, images);
                 }
             }
         }
     }
+}
 
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-        "options": {
-            // The reason the native path exists — see the section comment.
-            "num_ctx": num_ctx,
-            "temperature": temperature.unwrap_or(0.2),
-            // Ollama's 1.1 default penalizes the repetition inherent in JSON
-            // and code; 1.0 disables it.
-            "repeat_penalty": 1.0,
-            "num_predict": max_tokens.unwrap_or(4096),
+fn flat_messages(j: &mut Json, msgs: &[Msg], tools: &[ToolDef]) {
+    let mut system = SystemText(msgs).to_string();
+    if let Some(guide) = text_tool_guide(tools) {
+        if !system.is_empty() {
+            system.push_str("\n\n");
         }
-    });
-    if !tools.is_empty() {
-        // Same schema wrapper as the OpenAI shape.
-        body["tools"] =
-            json!(tools.iter().map(|t| json!({
-            "type": "function",
-            "function": {"name": t.name, "description": t.description, "parameters": t.schema}
-        })).collect::<Vec<_>>());
+        system.push_str(&guide);
     }
-    body
+    let mut sep = Sep::default();
+    if !system.is_empty() {
+        sep.next(j);
+        text_message(j, "system", &system);
+    }
+    for t in fold_turns(msgs, Flat::Ollama) {
+        sep.next(j);
+        if t.images.is_empty() {
+            text_message(j, t.role, &t.text);
+        } else {
+            image_message(j, t.role, &t.text, t.images.iter().copied());
+        }
+    }
 }
 
-pub(super) fn ollama_request(
-    p: &Provider,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-    num_ctx: u32,
-) -> (crate::net::Request, Value) {
-    let mut body = ollama_body(&p.model, msgs, tools, p.temperature, p.max_tokens, num_ctx);
-    apply_ollama_effort(&mut body, p.effort);
+// `{"content":…,"images":[…],"role":…}`.
+fn image_message<'a>(
+    j: &mut Json,
+    role: &str,
+    content: &str,
+    images: impl Iterator<Item = &'a (String, String)>,
+) {
+    j.raw("{\"content\":");
+    j.str(content);
+    j.raw(",\"images\":[");
+    let mut sep = Sep::default();
+    for (_, data) in images {
+        sep.next(j);
+        j.str(data);
+    }
+    j.raw("],\"role\":\"");
+    j.raw(role);
+    j.raw("\"}");
+}
+
+pub(super) fn ollama_request(p: &Provider) -> crate::net::Request {
     // Local server: no auth header.
-    let req = agent()
+    agent()
         .post(&format!("{}/api/chat", ollama_root(&p.base_url)))
-        .set("content-type", "application/json");
-    (req, body)
-}
-
-// Ollama's native API has one switch for thinking-capable models: any level
-// other than Off turns it on (the model then streams a `thinking` field).
-pub(super) fn apply_ollama_effort(body: &mut Value, effort: Effort) {
-    if effort != Effort::Off {
-        body["think"] = json!(true);
-    }
+        .set("content-type", "application/json")
 }
 
 // Ollama reports prompt/response token counts on the final object.

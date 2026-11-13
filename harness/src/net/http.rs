@@ -244,14 +244,20 @@ impl Request {
 
     pub fn send_json(self, data: impl serde::Serialize) -> Result<Response, Error> {
         match serde_json::to_vec(&data) {
-            Ok(body) => self.typed("application/json").send(Some(body)),
+            Ok(body) => self.send_json_bytes(&body),
             Err(e) => Err(self.invalid(format!("serializing the JSON body: {e}"))),
         }
     }
 
+    /// A body that is already serialised JSON, sent as it is: a caller that
+    /// retries keeps the bytes and sends them again.
+    pub fn send_json_bytes(self, body: &[u8]) -> Result<Response, Error> {
+        self.typed("application/json").send(Some(body))
+    }
+
     pub fn send_string(self, data: &str) -> Result<Response, Error> {
-        let body = data.as_bytes().to_vec();
-        self.typed("text/plain; charset=utf-8").send(Some(body))
+        self.typed("text/plain; charset=utf-8")
+            .send(Some(data.as_bytes()))
     }
 
     pub fn send_form(self, pairs: &[(&str, &str)]) -> Result<Response, Error> {
@@ -259,7 +265,7 @@ impl Request {
             .extend_pairs(pairs)
             .finish();
         self.typed("application/x-www-form-urlencoded")
-            .send(Some(body.into_bytes()))
+            .send(Some(body.as_bytes()))
     }
 
     fn typed(self, content_type: &str) -> Request {
@@ -279,7 +285,7 @@ impl Request {
         ))
     }
 
-    fn send(self, body: Option<Vec<u8>>) -> Result<Response, Error> {
+    fn send(self, body: Option<&[u8]>) -> Result<Response, Error> {
         // As ureq 2 did: the URL parser's spelling (spaces and non-ASCII
         // percent-encoded, IDNA host names), without the fragment.
         let target = match url::Url::parse(&self.url) {
@@ -292,8 +298,8 @@ impl Request {
         let inner = &self.agent.inner;
         let result = if self.post {
             let req = prepare(inner.post(&target), &self.headers, self.timeout);
-            match &body {
-                Some(b) => req.send(&b[..]),
+            match body {
+                Some(b) => req.send(b),
                 None => req.send_empty(),
             }
         } else {
