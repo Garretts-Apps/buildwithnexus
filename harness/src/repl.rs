@@ -37,9 +37,6 @@ pub(super) fn repl(
         "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
     ));
     tui::line(&tui::dim(&format!("  {}", startup_tip())));
-    if let Some(problem) = provider::startup_problem(&provider) {
-        report::notice(&format!("  ⚠ {problem}"));
-    }
     // Skill names and paths come from files in the checkout.
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
@@ -78,9 +75,7 @@ pub(super) fn repl(
     if let Some(notice) = update::startup_notice(&settings.auto_update) {
         tui::line(&tui::dim(&notice));
     }
-    // Off the critical path: five `which` probes cost real startup latency,
-    // and with interactive=false this only prints when something is missing.
-    std::thread::spawn(check_and_offer_install_dependencies);
+    spawn_startup_probes(&provider);
     update::spawn_check(&settings.auto_update);
 
     // The REPL owns the id SessionStart already announced: a fresh one, or
@@ -105,6 +100,7 @@ pub(super) fn repl(
     let mut rewind_points: Vec<RewindPoint> = Vec::new();
 
     loop {
+        apply_server_probe(&mut provider, &transcript);
         tick_background(perm, &provider, &mut shown_active);
 
         let mut task = if let Some(prompted) = pending_prompt.take() {
@@ -123,7 +119,10 @@ pub(super) fn repl(
                 tui::mode_badge(mode_label(&mode)),
                 tui::accent("›")
             );
-            match tui::ask_task(&prompt) {
+            let asked = tui::ask_task(&prompt);
+            // The server may have answered while the prompt was open.
+            apply_server_probe(&mut provider, &transcript);
+            match asked {
                 None if confirm_quit() => return Ok(()),
                 None => continue,
                 Some(tui::InputEvent::CycleMode) => {
@@ -893,6 +892,103 @@ pub(super) fn repl(
         switch_after_turn(r, &mut mode);
         follow_reported_window(&mut provider, &transcript);
         tui::bell();
+    }
+}
+
+// What the local model server said when it was asked at start-up.
+#[derive(Clone)]
+pub(super) struct ServerProbe {
+    pub(super) base_url: String,
+    pub(super) model: String,
+    /// The window to plan with, when the server reported one.
+    pub(super) context_tokens: usize,
+    /// Ollama native only: the definitive /api/show answer, if there was one.
+    pub(super) ollama_ctx: Option<Option<u32>>,
+}
+
+static SERVER_PROBE: std::sync::Mutex<Option<ServerProbe>> = std::sync::Mutex::new(None);
+
+// The start-up checks that go to the network or search PATH, on one thread
+// off the critical path so the first prompt paints without them: the five
+// `which` probes (which print only when something is missing), then the local
+// model server's window. Their notices are posted as each one returns.
+fn spawn_startup_probes(provider: &Provider) {
+    let server = SERVER_PROBE_DUE
+        .swap(false, Ordering::Relaxed)
+        .then(|| Provider {
+            protocol: provider.protocol,
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: provider.model.clone(),
+            context_tokens: provider.context_tokens,
+            temperature: provider.temperature,
+            max_tokens: provider.max_tokens,
+            effort: provider.effort,
+            ollama_ctx: std::sync::OnceLock::new(),
+        });
+    std::thread::spawn(move || {
+        check_and_offer_install_dependencies();
+        if let Some(probe) = server {
+            let answer = probe_server(probe);
+            *SERVER_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+        }
+    });
+}
+
+// Asks the server (blocking, so never on the main thread at start-up) and
+// tells the user when the configured Ollama model is not installed or nothing
+// answers at the address.
+pub(super) fn probe_server(mut probe: Provider) -> ServerProbe {
+    if probe.protocol == config::Protocol::OllamaNative {
+        match provider::startup_problem(&probe) {
+            Some(problem) => report::notice(&format!("  ⚠ {problem}")),
+            None => {
+                if let Some(Some(n)) = probe.ollama_ctx.get() {
+                    probe.context_tokens = *n as usize;
+                }
+            }
+        }
+    } else {
+        ask_local_server(&mut probe);
+    }
+    ServerProbe {
+        ollama_ctx: probe.ollama_ctx.get().copied(),
+        context_tokens: probe.context_tokens,
+        base_url: probe.base_url,
+        model: probe.model,
+    }
+}
+
+// Takes the start-up answer into the session's provider, unless /model or
+// /provider moved on before it arrived (the new provider asked for itself).
+pub(super) fn apply_server_probe(provider: &mut Provider, transcript: &[provider::Msg]) {
+    let Some(answer) = SERVER_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    else {
+        return;
+    };
+    take_server_probe(provider, answer, transcript);
+}
+
+pub(super) fn take_server_probe(
+    provider: &mut Provider,
+    answer: ServerProbe,
+    transcript: &[provider::Msg],
+) {
+    if answer.base_url != provider.base_url || answer.model != provider.model {
+        return;
+    }
+    if let Some(ctx) = answer.ollama_ctx {
+        let _ = provider.ollama_ctx.set(ctx);
+    }
+    if answer.context_tokens != provider.context_tokens {
+        provider.context_tokens = answer.context_tokens;
+        tui::context_meter(
+            context_in_use(transcript, answer.context_tokens),
+            answer.context_tokens,
+        );
     }
 }
 

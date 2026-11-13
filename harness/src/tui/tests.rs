@@ -1289,3 +1289,394 @@ fn only_web_and_mail_model_links_are_clickable() {
         assert!(!model_link_clickable(url), "{url}");
     }
 }
+
+// ── damage tracking ──────────────────────────────────────────────────────────
+// A local Screen: nothing here touches the terminal or the process's screen.
+fn frame_screen(width: usize, height: usize) -> screen::Screen {
+    let mut s = screen::Screen::new();
+    s.transcript.text.ensure_size(width, height);
+    s
+}
+
+// One frame, as render_output builds it; returns the bytes and the rows
+// (1-based, as addressed) it repainted.
+fn frame(s: &mut screen::Screen, width: usize, rows: usize) -> (String, Vec<usize>, bool) {
+    let mut out = Vec::new();
+    let (placements, _kept, full) = build_output_frame(s, &mut out, (width, 10), rows, "");
+    s.images.drawn = placements;
+    let text = String::from_utf8(out).unwrap();
+    let painted = text
+        .split("\x1b[")
+        .skip(1)
+        .filter_map(|part| part.split_once(";1H")?.0.parse::<usize>().ok())
+        .collect();
+    (text, painted, full)
+}
+
+#[test]
+fn an_output_frame_repaints_only_the_rows_that_changed() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("one\ntwo\nthree");
+    // Nothing is known about the screen: every row, each padded to the width.
+    let (text, rows, full) = frame(&mut s, 20, 5);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3, 4, 5]);
+    assert!(
+        text.contains(&format!("\x1b[2;1H{:<20}", "two")),
+        "{text:?}"
+    );
+    assert_eq!(s.transcript.visible_rows[1], "two");
+    // The same transcript again: not one byte.
+    let (text, rows, full) = frame(&mut s, 20, 5);
+    assert!(!full && rows.is_empty() && text.is_empty(), "{text:?}");
+    // A streamed chunk lands on one row; a second lengthens only that row.
+    s.transcript.stream("stre");
+    assert_eq!(frame(&mut s, 20, 5).1, vec![4]);
+    s.transcript.stream("amed");
+    let (text, rows, _) = frame(&mut s, 20, 5);
+    assert_eq!(rows, vec![4]);
+    assert_eq!(text, format!("\x1b[4;1H{:<20}", "streamed"));
+    assert_eq!(s.transcript.visible_rows[3], "streamed");
+    // Lines that scroll the view change every row above them too.
+    s.transcript.push_lines("five\nsix");
+    assert_eq!(frame(&mut s, 20, 5).1, vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        s.transcript.visible_rows,
+        ["two", "three", "streamed", "five", "six"]
+    );
+}
+
+#[test]
+fn a_frame_after_something_else_drew_is_a_full_repaint() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("one\ntwo");
+    assert!(frame(&mut s, 20, 4).2);
+    assert!(!frame(&mut s, 20, 4).2);
+    // A popup, a clear or a resize: what is on screen is unknown again.
+    s.transcript.forget_painted();
+    let (_, rows, full) = frame(&mut s, 20, 4);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    // A different number of output rows (a queued message took one).
+    let (_, rows, full) = frame(&mut s, 20, 3);
+    assert!(full);
+    assert_eq!(rows, vec![1, 2, 3]);
+    // Pixels drawn over (the image store's flag) count the same.
+    s.images.dirty = true;
+    assert!(frame(&mut s, 20, 3).2);
+}
+
+#[test]
+fn a_selection_repaints_the_rows_it_covers_and_uncovers() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("alpha\nbeta\ngamma");
+    frame(&mut s, 20, 3);
+    let at = |row, col| SelectPos { row, col };
+    s.selection.current = Some(Selection {
+        anchor: at(1, 0),
+        focus: at(1, 3),
+        sticky: false,
+    });
+    let (text, rows, _) = frame(&mut s, 20, 3);
+    assert_eq!(rows, vec![2]);
+    assert!(text.contains(&selection_span("beta")), "{text:?}");
+    // The copy text is the plain row, whatever it is painted with.
+    assert_eq!(s.transcript.visible_rows[1], "beta");
+    s.selection.current = None;
+    let (text, rows, _) = frame(&mut s, 20, 3);
+    assert_eq!(rows, vec![2]);
+    assert_eq!(text, format!("\x1b[2;1H{:<20}", "beta"));
+}
+
+#[test]
+fn a_sixel_image_in_place_is_left_alone_and_its_rows_repaint_when_it_moves() {
+    // An id no image is registered under: the marker rows stay as they are.
+    let m = |r: usize| format!("{IMG_MARK}987654:{r}");
+    let mut s = frame_screen(20, 10);
+    s.transcript
+        .push_lines(&format!("text\n{}\n{}", m(0), m(1)));
+    // First frame: the rows under the image are blanked for it.
+    let (text, rows, _) = frame(&mut s, 20, 4);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    assert!(
+        text.contains(&format!("\x1b[2;1H{}", " ".repeat(20))),
+        "{text:?}"
+    );
+    assert_eq!(s.images.drawn, vec![(987654, 1, 0, 2)]);
+    // In place: its rows are not touched, nor is anything else.
+    assert!(frame(&mut s, 20, 4).1.is_empty());
+    // Text beside it changes: only that row.
+    s.transcript.push_lines("after");
+    assert_eq!(frame(&mut s, 20, 4).1, vec![4]);
+    // The view scrolls: the image moves up a row, so its new rows are
+    // blanked again and the row it left shows text.
+    s.transcript.push_lines("more");
+    let (_, rows, _) = frame(&mut s, 20, 4);
+    assert_eq!(rows, vec![1, 2, 3, 4]);
+    assert_eq!(s.images.drawn, vec![(987654, 0, 0, 2)]);
+    assert_eq!(s.transcript.visible_rows, ["", "", "after", "more"]);
+}
+
+#[test]
+fn padding_a_row_clips_to_the_width_and_keeps_escapes() {
+    let pad = |s: &str, w: usize| {
+        let mut out = String::from("x");
+        pad_ansi_into(&mut out, s, w);
+        out
+    };
+    assert_eq!(pad("ab", 5), "xab   ");
+    assert_eq!(pad("abcdef", 3), "xabc");
+    assert_eq!(pad("\x1b[1mab\x1b[0m", 4), "x\x1b[1mab\x1b[0m  ");
+    // A wide character that would straddle the edge is left out.
+    assert_eq!(pad("a日本", 4), "xa日 ");
+    assert_eq!(pad("", 2), "x  ");
+    assert_eq!(pad("abc", 0), "x");
+}
+
+// ── streamed-line wrap ───────────────────────────────────────────────────────
+// `wrap_ansi_line` as it was before it could be resumed: wrap the whole line
+// in one pass. Kept as the reference the resumable wrap is checked against.
+fn wrap_ansi_line_reference(s: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 {
+        return vec![String::new()];
+    }
+    if s.starts_with(IMG_MARK) {
+        if let Some(rows) = inline_image_rows(s, max_cols) {
+            return rows;
+        }
+    }
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    // Leading indent of the visible text, repeated on continuation rows
+    // while it leaves at least half the row for text.
+    let lead = strip_ansi(s).chars().take_while(|c| *c == ' ').count();
+    let indent = if lead * 2 <= max_cols { lead } else { 0 };
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut visible = 0usize;
+    // SGR sequences in force at the wrap point, replayed at the start of
+    // the continuation row: a terminal repaints rows independently, so a
+    // colour or tint that started on row 1 would otherwise vanish on row 2
+    // (and an image row's id colour would break its placeholder cells).
+    let mut active = String::new();
+    // Last place this row may break: byte offset just after a space that
+    // follows some text, the columns used up to it, and the SGR state there.
+    let mut brk: Option<(usize, usize, String)> = None;
+    let mut seen_text = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            let start = current.len();
+            current.push(c);
+            eat_escape(&mut chars, Some(&mut current));
+            let seq = &current[start..];
+            if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                if seq == "\x1b[0m" || seq == "\x1b[m" {
+                    active.clear();
+                } else {
+                    active.push_str(seq);
+                }
+            }
+            continue;
+        }
+        let w = char_width(c);
+        // `visible > 0` guard: a width-2 char on a 1-column terminal still
+        // gets a row of its own instead of an infinite run of empty rows.
+        if visible + w > max_cols && visible > 0 {
+            let pad = " ".repeat(indent);
+            match brk.take().filter(|_| c != ' ') {
+                // Carry the partial word over to the next row.
+                Some((at, cols, sgr)) => {
+                    let rest = current.split_off(at);
+                    out.push(std::mem::take(&mut current));
+                    current = format!("{sgr}{pad}{rest}");
+                    visible = indent + visible - cols;
+                }
+                None => {
+                    out.push(std::mem::take(&mut current));
+                    current = format!("{active}{pad}");
+                    visible = indent;
+                }
+            }
+            if c == ' ' {
+                // The space that ended the row is not carried over.
+                continue;
+            }
+        }
+        current.push(c);
+        visible += w;
+        if c == ' ' {
+            if seen_text {
+                brk = Some((current.len(), visible, active.clone()));
+            }
+        } else {
+            seen_text = true;
+        }
+    }
+    out.push(current);
+    out
+}
+
+fn wrap_rng(seed: &mut u64) -> usize {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 11) as usize
+}
+
+// A streamed line is wrapped from where the last chunk left off. Whatever
+// the chunks are — cut inside a word, a wide character's neighbour, an
+// escape sequence — the rows must be those of wrapping the whole line.
+#[test]
+fn a_streamed_line_wraps_as_the_whole_line_would() {
+    let atoms = [
+        "a",
+        "word",
+        "longerword",
+        " ",
+        "  ",
+        "   ",
+        "\t",
+        "-",
+        "日本",
+        "🎉",
+        "e\u{301}",
+        "\u{200b}",
+        "\x1b[31m",
+        "\x1b[1m",
+        "\x1b[0m",
+        "\x1b[m",
+        "\x1b[39m",
+        "\x1b[38;2;1;2;3m",
+        "\x1b[2K",
+        "\x1b]8;;http://x\x07",
+        "\x1b]8;;\x1b\\",
+        "\x1b\\",
+        "\x1b",
+        "[",
+        "m",
+        "]",
+        "\x07",
+        "\u{F8FF}",
+        "supercalifragilisticexpialidocious",
+        ". ",
+        ", ",
+    ];
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    for round in 0..3000 {
+        let mut t = Transcript::new();
+        let mut width = 1 + wrap_rng(&mut seed) % 40;
+        t.ensure_width(width);
+        t.push("before".to_string());
+        t.push(String::new());
+        let i = t.len() - 1;
+        // Some lines start with an indent, or with nothing but spaces.
+        let mut line = " ".repeat(wrap_rng(&mut seed) % 4 * (wrap_rng(&mut seed) % 5));
+        let mut whole = String::new();
+        for _ in 0..wrap_rng(&mut seed) % 60 {
+            line.push_str(atoms[wrap_rng(&mut seed) % atoms.len()]);
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < chars.len() {
+            let n = 1 + wrap_rng(&mut seed) % 9;
+            let chunk: String = chars[at..(at + n).min(chars.len())].iter().collect();
+            at += n;
+            assert!(t.append_to(i, &chunk));
+            whole.push_str(&chunk);
+            assert_eq!(
+                t.wrapped[i],
+                wrap_ansi_line_reference(&whole, width),
+                "round {round}, width {width}, line {whole:?}"
+            );
+            // Now and then the terminal is resized mid-line, or another
+            // line lands or goes.
+            match wrap_rng(&mut seed) % 40 {
+                0 => {
+                    width = 1 + wrap_rng(&mut seed) % 40;
+                    t.ensure_width(width);
+                }
+                1 => t.ensure_size(width, 10 + wrap_rng(&mut seed) % 5),
+                2 => {
+                    t.set(0, "changed".to_string());
+                }
+                _ => {}
+            }
+            assert_eq!(t.wrapped[i], wrap_ansi_line_reference(&whole, width));
+        }
+        assert_eq!(t.lines[i], whole);
+    }
+}
+
+#[test]
+fn the_wrap_of_a_whole_line_is_what_it_was() {
+    let lines = [
+        "",
+        " ",
+        "      ",
+        "plain words that wrap at a narrow width and carry on",
+        "    indented text that keeps its indent on the rows that follow it",
+        "\x1b[31mred words \x1b[1mbold too\x1b[0m and plain again after the reset",
+        "wide 日本語のテキスト and emoji 🎉🎉🎉 in the middle of words",
+        "tabs\tare\tone\tcolumn\teach\there",
+        "a-word-with-no-spaces-at-all-that-is-longer-than-any-row-it-could-be-put-on",
+        "trailing spaces      ",
+        "\x1b]8;;http://example.com\x07a link\x1b]8;;\x07 then text",
+        "cut short \x1b[3",
+    ];
+    for line in lines {
+        for width in [0usize, 1, 2, 3, 7, 10, 20, 80] {
+            assert_eq!(
+                wrap_ansi_line(line, width),
+                wrap_ansi_line_reference(line, width),
+                "{line:?} at {width}"
+            );
+        }
+    }
+}
+
+// The cost of a chunk must not depend on how long the open line already is:
+// only the row being filled is touched.
+#[test]
+fn appending_to_a_long_line_touches_only_its_last_row() {
+    let mut t = Transcript::new();
+    t.ensure_width(40);
+    t.push(String::new());
+    for _ in 0..500 {
+        t.append_to(0, "token ");
+    }
+    let rows = t.wrapped[0].len();
+    assert!(rows > 50);
+    let ptrs: Vec<*const u8> = t.wrapped[0].iter().map(|r| r.as_ptr()).collect();
+    let (_, st) = t.open.as_ref().expect("the line's wrap is resumable");
+    assert_eq!(st.pos, t.lines[0].len());
+    t.append_to(0, "x");
+    let after: Vec<*const u8> = t.wrapped[0].iter().map(|r| r.as_ptr()).collect();
+    assert_eq!(
+        ptrs[..rows - 1],
+        after[..rows - 1],
+        "finished rows are not rebuilt"
+    );
+    assert_cache_coherent(&t);
+}
+
+// A row is repainted on its own, so it cannot lean on what the row above
+// left set; and since the row's start carries the theme, a new theme
+// repaints every row without being told to.
+#[test]
+fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("\x1b[31mred, never closed\nplain");
+    let paint = |s: &mut screen::Screen, row_start: &str| {
+        let mut out = Vec::new();
+        build_output_frame(s, &mut out, (20, 10), 3, row_start);
+        String::from_utf8(out).unwrap()
+    };
+    let first = paint(&mut s, "\x1b[0m");
+    assert!(first.contains("\x1b[2;1H\x1b[0mplain"), "{first:?}");
+    assert!(paint(&mut s, "\x1b[0m").is_empty());
+    let themed = paint(&mut s, "\x1b[0m\x1b[48;5;17m");
+    assert_eq!(themed.matches(";1H").count(), 3, "{themed:?}");
+    assert!(themed.contains("\x1b[2;1H\x1b[0m\x1b[48;5;17mplain"));
+}

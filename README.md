@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-An **agentic AI CLI** written in Rust. The native binary starts in about 2 ms (`--version`, [measured](BENCHMARKS.md)). Remote models via
+An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](BENCHMARKS.md); about 27 ms through the npm launcher, which starts Node first). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
 commands. By default it asks before each change; accept-edits, auto and
 readonly modes let you choose. It ships as one self-contained binary with
@@ -87,8 +87,9 @@ to let it work on the current folder.
 
 - **Startup** — chrome paints before anything
   else; dependency probes and connection warming run off the critical path.
-- **Fast rendering** — each transcript line is wrapped once, repaints are
-  frame-coalesced (~60fps) and wrapped in synchronized-output brackets, so
+- **Fast rendering** — each transcript line is wrapped once, a frame carries
+  only the rows that changed, and frames are capped at one per 16 ms and
+  wrapped in synchronized-output brackets, so
   streaming does not tear on kitty/iTerm2/WezTerm/Alacritty.
 - **Live autocomplete** — type `/` for a command popup with descriptions;
   `@` completes files, `kb:` symbols. ↑/↓ navigate, Tab/Enter accept.
@@ -155,10 +156,11 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
-The speed is measured: 2 ms for the native binary to run `--version`
-(about 47 ms through the npm launcher, which starts Node first), a 7.7 MiB
-resident TUI, and 4.2 µs to render a streamed chunk into a 2,000-line
-transcript. Every number and how to regenerate it:
+The speed is measured: 1.2 ms for the native binary to run `--version`
+(about 27 ms through the npm launcher, which starts Node first, so that is
+what an npm install gets), a 9 MiB resident TUI, 2.8 µs to render a streamed
+chunk into a 2,000-line transcript, and no terminal-size checks or
+full-screen repaints per keystroke. Every number and how to regenerate it:
 [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Package history
@@ -817,7 +819,8 @@ the prompt has waited `idle_notify_secs`, default 60, `0` for never). A
 `PreCompact` or `Notification` matcher matches the trigger or the type. Each
 hook receives the event as JSON on stdin with Claude Code's field names:
 `hook_event_name`, `session_id` (the id the transcript is saved under),
-`transcript_path`, `permission_mode` (`ask` | `accept-edits` | `auto` | `readonly`), `cwd`, plus
+`transcript_path` (a JSON Lines file since 0.20: a header line, then one
+`{"msg": …}` line per message; see [docs/VERSIONING.md](docs/VERSIONING.md)), `permission_mode` (`ask` | `accept-edits` | `auto` | `readonly`), `cwd`, plus
 the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`,
 `stop_hook_active`, `trigger`, `notification_type`, `message`).
 
@@ -1017,11 +1020,11 @@ when it finishes, a helper that needs an approval says which one it is,
 and Esc or Ctrl+C stops them all. Helpers that write in your folder always
 run one after another. Their tokens and cost count toward the session.
 
-Read-only tool calls that the model makes in a row in one reply
-(`read_file`, `read_many_files`, `list_dir`, `list_tree`, `file_info`,
-`find_paths`, `find_files`, `grep_files`, `kb_query`, `fetch_url`,
+Searches, tree walks and network calls that the model makes in a row in one
+reply (`grep_files`, `find_paths`, `find_files`, `list_tree`, `fetch_url`,
 `web_search`) run at the same time, up to `max_parallel_tools` at once
-(default 4; `1` runs every call one after another). Each call is still
+(default 4; `1` runs every call one after another). File reads and folder
+listings in the same run are quick enough that they run in line. Each call is still
 checked, approved and shown in order before any of them runs, the model
 gets the results in the order it asked, and at most one call per website
 is in flight. Anything that writes, commands, questions, helpers, MCP and

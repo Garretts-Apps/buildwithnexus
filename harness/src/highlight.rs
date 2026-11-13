@@ -673,23 +673,37 @@ enum Str {
     Backtick,
 }
 
-fn kw(s: &str) -> String {
-    tui::accent(s)
-}
-fn ty(s: &str) -> String {
-    tui::cyan(s)
-}
-fn string(s: &str) -> String {
-    tui::green(s)
-}
-fn number(s: &str) -> String {
-    tui::yellow(s)
-}
-fn comment(s: &str) -> String {
-    tui::dim(s)
-}
-fn func(s: &str) -> String {
-    tui::blue(s)
+/// The escapes each token class is wrapped in, looked up once per block
+/// (or line) rather than once per token.
+struct Paints(tui::SpanPaint);
+
+impl Paints {
+    fn new() -> Self {
+        Paints(tui::span_paint())
+    }
+    fn span(&self, out: &mut String, on: &str, s: &str) {
+        out.push_str(on);
+        out.push_str(s);
+        out.push_str(&self.0.reset);
+    }
+    fn kw(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.accent, s);
+    }
+    fn ty(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.info, s);
+    }
+    fn string(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.success, s);
+    }
+    fn number(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.warning, s);
+    }
+    fn comment(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.muted, s);
+    }
+    fn func(&self, out: &mut String, s: &str) {
+        self.span(out, &self.0.info, s);
+    }
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -699,236 +713,291 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+// The character starting at byte `i` (a character boundary, `i < len`).
+fn char_at(s: &str, i: usize) -> char {
+    let b = s.as_bytes()[i];
+    if b < 0x80 {
+        b as char
+    } else {
+        s[i..].chars().next().unwrap_or('\u{fffd}')
+    }
+}
+
+// Three `q` in a row, as a pattern to search for.
+struct Triple {
+    buf: [u8; 12],
+    len: usize,
+}
+
+impl Triple {
+    fn new(q: char) -> Self {
+        let mut buf = [0u8; 12];
+        let n = q.len_utf8();
+        for k in 0..3 {
+            q.encode_utf8(&mut buf[k * n..]);
+        }
+        Triple { buf, len: 3 * n }
+    }
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+// Byte offset of the first run of three `q` in `s`.
+fn find_triple(s: &str, q: char) -> Option<usize> {
+    s.find(Triple::new(q).as_str())
+}
+
 /// Highlight one line. Diff-style fences (`diff`, `patch`) are handled by
 /// [`highlight_block`] before the lexer; everything else lands here.
 pub fn highlight_line(lang: &Lang, line: &str, st: &mut State) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let n = chars.len();
     let mut out = String::with_capacity(line.len() * 2);
-    let mut i = 0;
-    // Fast path: continue a multi-line construct.
-    if st.in_block_comment {
-        let end = lang.block_comment.map(|b| b.1).unwrap_or("*/");
-        if let Some(pos) = line.find(end) {
+    lex_line(lang, line, st, &Paints::new(), &mut out);
+    out
+}
+
+// One pass over `line` by byte offset: plain text is copied through in
+// slices, each token is pushed between its colour and the reset. Nothing is
+// allocated but `out`.
+fn lex_line(lang: &Lang, mut line: &str, st: &mut State, p: &Paints, out: &mut String) {
+    // Continue a multi-line construct. What follows its end is lexed as a
+    // line of its own: "start of line" below means the start of that rest.
+    loop {
+        if st.in_block_comment {
+            let end = lang.block_comment.map(|b| b.1).unwrap_or("*/");
+            let Some(pos) = line.find(end) else {
+                p.comment(out, line);
+                return;
+            };
             let cut = pos + end.len();
-            out.push_str(&comment(&line[..cut]));
+            p.comment(out, &line[..cut]);
             st.in_block_comment = false;
-            let rest = highlight_line(lang, &line[cut..], st);
-            out.push_str(&rest);
-        } else {
-            out.push_str(&comment(line));
-        }
-        return out;
-    }
-    if let Some(kind) = st.in_string {
-        let close = match kind {
-            Str::Triple(q) => std::iter::repeat_n(q, 3).collect::<String>(),
-            Str::Backtick => "`".to_string(),
-        };
-        if let Some(pos) = line.find(&close) {
-            let cut = pos + close.len();
-            out.push_str(&string(&line[..cut]));
+            line = &line[cut..];
+        } else if let Some(kind) = st.in_string {
+            let found = match kind {
+                Str::Triple(q) => find_triple(line, q).map(|pos| pos + 3 * q.len_utf8()),
+                Str::Backtick => line.find('`').map(|pos| pos + 1),
+            };
+            let Some(cut) = found else {
+                p.string(out, line);
+                return;
+            };
+            p.string(out, &line[..cut]);
             st.in_string = None;
-            out.push_str(&highlight_line(lang, &line[cut..], st));
+            line = &line[cut..];
         } else {
-            out.push_str(&string(line));
+            break;
         }
-        return out;
     }
-    let at = |i: usize, pat: &str| -> bool {
-        let pc: Vec<char> = pat.chars().collect();
-        i + pc.len() <= n && chars[i..i + pc.len()] == pc[..]
-    };
-    let mut plain = String::new();
-    let flush = |plain: &mut String, out: &mut String| {
-        if !plain.is_empty() {
-            out.push_str(plain);
-            plain.clear();
-        }
-    };
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let is_json = std::ptr::eq(lang, &JSON);
+    let is_yaml = std::ptr::eq(lang, &YAML);
+    let is_toml = std::ptr::eq(lang, &TOML);
+    let is_html = std::ptr::eq(lang, &HTML);
+    // Plain text not yet copied to `out` starts here.
+    let mut plain = 0usize;
+    let mut i = 0usize;
     while i < n {
-        let c = chars[i];
+        let c = char_at(line, i);
+        let cl = c.len_utf8();
+        let rest = &line[i..];
         // Comments.
-        if lang
-            .line_comment
-            .iter()
-            .any(|lc| lc.starts_with(c) && at(i, lc))
-        {
-            flush(&mut plain, &mut out);
-            let rest: String = chars[i..].iter().collect();
-            out.push_str(&comment(&rest));
-            return out;
+        if lang.line_comment.iter().any(|lc| rest.starts_with(lc)) {
+            out.push_str(&line[plain..i]);
+            p.comment(out, rest);
+            return;
         }
         if let Some((open, close)) = lang.block_comment {
-            if open.starts_with(c) && at(i, open) {
-                flush(&mut plain, &mut out);
-                let rest: String = chars[i..].iter().collect();
-                if let Some(pos) = rest[open.len()..].find(close) {
+            if let Some(body) = rest.strip_prefix(open) {
+                out.push_str(&line[plain..i]);
+                if let Some(pos) = body.find(close) {
                     let cut = open.len() + pos + close.len();
-                    out.push_str(&comment(&rest[..cut]));
-                    i += rest[..cut].chars().count();
+                    p.comment(out, &rest[..cut]);
+                    i += cut;
+                    plain = i;
                     continue;
                 }
-                out.push_str(&comment(&rest));
+                p.comment(out, rest);
                 st.in_block_comment = true;
-                return out;
+                return;
             }
         }
         // Strings.
         if lang.quotes.contains(&c) || (lang.backtick_strings && c == '`') {
-            flush(&mut plain, &mut out);
             // Python-style triple quotes and JS template literals may span lines.
-            if c != '`' && at(i, &std::iter::repeat_n(c, 3).collect::<String>()) {
-                let rest: String = chars[i + 3..].iter().collect();
-                let close: String = std::iter::repeat_n(c, 3).collect();
-                if let Some(pos) = rest.find(&close) {
-                    let taken = 3 + rest[..pos].chars().count() + 3;
-                    let s: String = chars[i..i + taken].iter().collect();
-                    out.push_str(&string(&s));
+            if c != '`' && rest.starts_with(Triple::new(c).as_str()) {
+                out.push_str(&line[plain..i]);
+                let body = &rest[3 * cl..];
+                if let Some(pos) = find_triple(body, c) {
+                    let taken = 3 * cl + pos + 3 * cl;
+                    p.string(out, &rest[..taken]);
                     i += taken;
+                    plain = i;
                 } else {
-                    let s: String = chars[i..].iter().collect();
-                    out.push_str(&string(&s));
+                    p.string(out, rest);
                     st.in_string = Some(Str::Triple(c));
-                    return out;
+                    return;
                 }
                 continue;
             }
-            let mut j = i + 1;
-            let mut closed = false;
-            while j < n {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == c {
-                    closed = true;
+            // The closing quote: the first one not preceded by a backslash
+            // (a backslash hides whatever one character follows it).
+            let mut closed = None;
+            let mut chars = rest[cl..].char_indices();
+            while let Some((off, ch)) = chars.next() {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == c {
+                    closed = Some(cl + off + cl);
                     break;
                 }
-                j += 1;
             }
-            if closed {
-                let s: String = chars[i..=j].iter().collect();
+            if let Some(len) = closed {
+                out.push_str(&line[plain..i]);
+                let s = &rest[..len];
                 // JSON/YAML object keys read better in the type colour.
-                let is_key = std::ptr::eq(lang, &JSON)
-                    && chars[j + 1..].iter().find(|ch| !ch.is_whitespace()) == Some(&':');
-                out.push_str(&if is_key { ty(&s) } else { string(&s) });
-                i = j + 1;
+                let is_key =
+                    is_json && rest[len..].chars().find(|ch| !ch.is_whitespace()) == Some(':');
+                if is_key {
+                    p.ty(out, s);
+                } else {
+                    p.string(out, s);
+                }
+                i += len;
+                plain = i;
             } else if c == '`' {
-                let s: String = chars[i..].iter().collect();
-                out.push_str(&string(&s));
+                out.push_str(&line[plain..i]);
+                p.string(out, rest);
                 st.in_string = Some(Str::Backtick);
-                return out;
+                return;
             } else {
                 // Unterminated single-line string (or an apostrophe in
                 // prose): leave the quote plain and carry on.
-                plain.push(c);
-                i += 1;
+                i += cl;
             }
             continue;
         }
         // Shell/Ruby variables.
-        if lang.dollar_vars
-            && c == '$'
-            && i + 1 < n
-            && (is_ident(chars[i + 1]) || chars[i + 1] == '{')
-        {
-            flush(&mut plain, &mut out);
-            let mut j = i + 1;
-            if chars[j] == '{' {
-                while j < n && chars[j] != '}' {
-                    j += 1;
-                }
-                j = (j + 1).min(n);
-            } else {
-                while j < n && is_ident(chars[j]) {
-                    j += 1;
-                }
+        if lang.dollar_vars && c == '$' {
+            let next = rest[1..].chars().next();
+            if next.is_some_and(|d| is_ident(d) || d == '{') {
+                let len = if next == Some('{') {
+                    rest.find('}').map_or(rest.len(), |pos| pos + 1)
+                } else {
+                    1 + ident_len(&rest[1..])
+                };
+                out.push_str(&line[plain..i]);
+                p.ty(out, &rest[..len]);
+                i += len;
+                plain = i;
+                continue;
             }
-            let s: String = chars[i..j].iter().collect();
-            out.push_str(&ty(&s));
-            i = j;
-            continue;
         }
         // Numbers.
-        if c.is_ascii_digit() && (i == 0 || !is_ident(chars[i - 1])) {
-            flush(&mut plain, &mut out);
+        if c.is_ascii_digit() && !line[..i].chars().next_back().is_some_and(is_ident) {
             let mut j = i + 1;
-            while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+            while j < n
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'.' || bytes[j] == b'_')
             {
                 j += 1;
             }
-            let s: String = chars[i..j].iter().collect();
-            out.push_str(&number(&s));
+            out.push_str(&line[plain..i]);
+            p.number(out, &line[i..j]);
             i = j;
+            plain = i;
             continue;
         }
         // Identifiers, keywords, types, calls. `#include`-style words keep
         // their sigil so C preprocessor lines match the keyword table.
-        if is_ident_start(c) || (c == '#' && i + 1 < n && is_ident_start(chars[i + 1])) {
-            let mut j = i + 1;
-            while j < n && (is_ident(chars[j]) || chars[j] == '?' && j + 1 == n) {
-                j += 1;
-            }
-            let word: String = chars[i..j].iter().collect();
-            let next_nonspace = chars[j..].iter().find(|ch| !ch.is_whitespace()).copied();
-            let styled = if lang.keywords.contains(&word.as_str()) {
-                Some(kw(&word))
-            } else if lang.types.contains(&word.as_str()) {
-                Some(ty(&word))
-            } else if std::ptr::eq(lang, &YAML) || std::ptr::eq(lang, &TOML) {
-                // `key:` / `key =` at the start of a YAML/TOML line.
-                let lead: String = chars[..i].iter().collect();
-                let is_key = lead.trim().is_empty() || lead.trim() == "-";
-                let sep = if std::ptr::eq(lang, &YAML) { ':' } else { '=' };
-                if is_key && next_nonspace == Some(sep) {
-                    Some(ty(&word))
+        if is_ident_start(c) || (c == '#' && rest[1..].chars().next().is_some_and(is_ident_start)) {
+            let mut j = i + cl;
+            for ch in line[j..].chars() {
+                let len = ch.len_utf8();
+                if is_ident(ch) || (ch == '?' && j + len == n) {
+                    j += len;
                 } else {
-                    None
+                    break;
                 }
-            } else if next_nonspace == Some('(') {
-                Some(func(&word))
+            }
+            let word = &line[i..j];
+            let next_nonspace = || line[j..].chars().find(|ch| !ch.is_whitespace());
+            #[derive(Clone, Copy)]
+            enum Class {
+                Kw,
+                Ty,
+                Func,
+                Plain,
+            }
+            let class = if lang.keywords.contains(&word) {
+                Class::Kw
+            } else if lang.types.contains(&word) {
+                Class::Ty
+            } else if is_yaml || is_toml {
+                // `key:` / `key =` at the start of a YAML/TOML line.
+                let lead = line[..i].trim();
+                let is_key = lead.is_empty() || lead == "-";
+                let sep = if is_yaml { ':' } else { '=' };
+                if is_key && next_nonspace() == Some(sep) {
+                    Class::Ty
+                } else {
+                    Class::Plain
+                }
+            } else if next_nonspace() == Some('(') {
+                Class::Func
             } else if lang.capital_types
                 && c.is_uppercase()
                 && word.chars().any(|ch| ch.is_lowercase())
             {
-                Some(ty(&word))
+                Class::Ty
             } else {
-                None
+                Class::Plain
             };
-            match styled {
-                Some(s) => {
-                    flush(&mut plain, &mut out);
-                    out.push_str(&s);
+            if !matches!(class, Class::Plain) {
+                out.push_str(&line[plain..i]);
+                match class {
+                    Class::Kw => p.kw(out, word),
+                    Class::Ty => p.ty(out, word),
+                    _ => p.func(out, word),
                 }
-                None => plain.push_str(&word),
+                plain = j;
             }
             i = j;
             continue;
         }
         // HTML tags: `<name` and `</name`.
-        if std::ptr::eq(lang, &HTML) && c == '<' {
+        if is_html && c == '<' {
             let mut j = i + 1;
-            if j < n && chars[j] == '/' {
+            if j < n && bytes[j] == b'/' {
                 j += 1;
             }
             let start = j;
-            while j < n && (is_ident(chars[j]) || chars[j] == '-' || chars[j] == ':') {
-                j += 1;
+            for ch in line[j..].chars() {
+                if is_ident(ch) || ch == '-' || ch == ':' {
+                    j += ch.len_utf8();
+                } else {
+                    break;
+                }
             }
             if j > start {
-                flush(&mut plain, &mut out);
-                let s: String = chars[i..j].iter().collect();
-                out.push_str(&kw(&s));
+                out.push_str(&line[plain..i]);
+                p.kw(out, &line[i..j]);
                 i = j;
+                plain = i;
                 continue;
             }
         }
-        plain.push(c);
-        i += 1;
+        i += cl;
     }
-    flush(&mut plain, &mut out);
-    out
+    out.push_str(&line[plain..]);
+}
+
+// Bytes of the run of identifier characters at the start of `s`.
+fn ident_len(s: &str) -> usize {
+    s.chars()
+        .take_while(|c| is_ident(*c))
+        .map(char::len_utf8)
+        .sum()
 }
 
 /// Highlight a whole fenced block. Returns the lines unchanged when the tag
@@ -960,15 +1029,39 @@ pub fn highlight_block(tag: &str, lines: &[String]) -> Vec<String> {
         return lines.to_vec();
     };
     let mut st = State::default();
+    let paints = Paints::new();
     lines
         .iter()
-        .map(|l| highlight_line(lang, l, &mut st))
+        .map(|l| {
+            let mut out = String::with_capacity(l.len() * 2);
+            lex_line(lang, l, &mut st, &paints, &mut out);
+            out
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kw(s: &str) -> String {
+        tui::accent(s)
+    }
+    fn ty(s: &str) -> String {
+        tui::cyan(s)
+    }
+    fn string(s: &str) -> String {
+        tui::green(s)
+    }
+    fn number(s: &str) -> String {
+        tui::yellow(s)
+    }
+    fn comment(s: &str) -> String {
+        tui::dim(s)
+    }
+    fn func(s: &str) -> String {
+        tui::blue(s)
+    }
 
     #[test]
     fn content_is_preserved_exactly() {
@@ -1033,5 +1126,272 @@ mod tests {
         assert_eq!(highlight_block("brainfuck", &lines), lines);
         assert!(lang_for("TypeScript").is_some());
         assert!(lang_for("ts {1,3}").is_some());
+    }
+
+    // ── output snapshot ──────────────────────────────────────────────────────
+    // The lexer's output, pinned: a hash per input of what every language's
+    // lexer makes of it. The inputs are frozen excerpts of this repository
+    // (tests/fixtures/highlight) and the edge cases below. Colours are
+    // replaced by role tags first, so the hashes do not depend on the theme
+    // or the terminal's colour depth.
+
+    const SNAP_LANGS: &[&str] = &[
+        "rust", "c", "js", "py", "go", "java", "sh", "rb", "sql", "json", "yaml", "toml", "css",
+        "html", "diff", "nope",
+    ];
+
+    fn fnv1a(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    // `ESC[<colour>m` … reset becomes `\x02<role>` … `\x03`.
+    fn normalise(s: &str) -> String {
+        let split = |painted: String| -> (String, String) {
+            let (a, b) = painted.split_once('\u{1}').expect("marker");
+            (a.to_string(), b.to_string())
+        };
+        let (_, reset) = split(kw("\u{1}"));
+        let (bold_on, bold_off) = split(tui::bold("\u{1}"));
+        let mut roles = [
+            (split(kw("\u{1}")).0, "k"),
+            (split(ty("\u{1}")).0, "t"),
+            (split(string("\u{1}")).0, "s"),
+            (split(number("\u{1}")).0, "n"),
+            (split(comment("\u{1}")).0, "c"),
+            (split(tui::red("\u{1}")).0, "r"),
+            (bold_on, "b"),
+        ];
+        roles.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        for (i, (a, _)) in roles.iter().enumerate() {
+            assert!(!a.is_empty() && *a != reset, "colour is on");
+            for (b, _) in &roles[i + 1..] {
+                assert_ne!(a, b, "two roles share a colour: the snapshot cannot tell");
+            }
+        }
+        let mut out = s.replace(&reset, "\u{3}").replace(&bold_off, "\u{4}");
+        for (prefix, tag) in &roles {
+            out = out.replace(prefix, &format!("\u{2}{tag}"));
+        }
+        assert!(!out.contains('\x1b'), "an unknown escape: {out:?}");
+        out
+    }
+
+    fn snapshot(tags: &[&str], text: &str) -> u64 {
+        let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for tag in tags {
+            let out = highlight_block(tag, &lines);
+            assert_eq!(out.len(), lines.len());
+            for (o, l) in out.iter().zip(&lines) {
+                assert_eq!(tui::strip_ansi(o), *l, "{tag}: text changed");
+                fnv1a(&mut h, normalise(o).as_bytes());
+                fnv1a(&mut h, b"\n");
+            }
+        }
+        h
+    }
+
+    fn edge_cases() -> Vec<(&'static str, String)> {
+        let s = |x: &str| x.to_string();
+        vec![
+            ("empty", s("")),
+            ("blank_lines", s("\n\n   \n\t\n")),
+            (
+                "unterminated_string",
+                s("let s = \"abc\nx = 'it's\nlet t = \"abc\\\nu = 'a\\'"),
+            ),
+            (
+                "backtick_open",
+                s("a = `x\ny ${z}\n` + 1; b = `one` + `two\nstill"),
+            ),
+            (
+                "block_comment_open",
+                s("a /* b\nc\nd */ e /* f */ g /* h\n*/ */ i\n/* never closed"),
+            ),
+            (
+                "html_comment",
+                s("<!-- x\n y --> <div a='1'> <!-- z --> </a-b:c> < 3 <1> <é>"),
+            ),
+            (
+                "triple_quotes",
+                s("\"\"\"doc\nmore\n\"\"\" x = 1\n'''a''' + \"\"\"b\nc\"\"\"\"\"\"\n''''''"),
+            ),
+            (
+                "non_ascii",
+                s("let naïve = \"héllo wörld\"; // ünïcode 日本語 🎉\n变量 = 1\n\
+                   Ünï(x) Élan ÉLAN é1 ٣ 🎉(1)\n'é' \"日本\" `🎉`"),
+            ),
+            (
+                "numbers",
+                s("0x1F 1_000 1.5e3 a1 1a _1 x.0 1..2 9é 1٣ .5 -3 3."),
+            ),
+            (
+                "shell_vars",
+                s("echo $HOME ${X ${Y}z $ $1 $é \"$A\" ${unclosed\n$_a$b ${} $"),
+            ),
+            (
+                "sigils",
+                s("#include <x.h>\n#!sh\n# c\n#é #1 ##a\nfoo? bar?\nbaz?"),
+            ),
+            (
+                "yaml_toml_keys",
+                s("- key: v\nkey : v\n  nested: \"x\": y\n~\na = 1\n[t]\na.b = \"c\"\n- - k: v\nk= 1\nk:v"),
+            ),
+            (
+                "json_keys",
+                s("{\"k\" : 1, \"s\": \"a\\\"b\", \"u\": \"é\" :}\n\"k\"\u{a0}: 1 \"j\"\u{3000}:\n\"last\""),
+            ),
+            (
+                "wide_spaces",
+                s("f\u{2003}(x) g\u{a0}(y) h\t(z) k\u{3000}: 1"),
+            ),
+            (
+                "escapes",
+                s("\"a\\\\\" \"b\\\"\" 'c\\'' \"é\\é\" \"abc\\"),
+            ),
+            (
+                "css",
+                s("@media !important a { color: #fff } /* c */ important @import 'x'"),
+            ),
+            ("lone", s("\"\n'\n`\n$\n#\n<\n/\n/*\n*/\n-\n--\n//\n\\\n?")),
+            (
+                "capitals",
+                s("Foo FOO Fo F fOO Élan ÉLAN Ünï Self String Vec<Option<T>>"),
+            ),
+            (
+                "rustisms",
+                s("r#\"raw\"# b'x' <'a> 'static fn f<'a>(x: &'a str) -> u8 { 1u8 as f64 }"),
+            ),
+            (
+                "comment_starts",
+                s("a//b http://x\na--b --x\na#b\n/ / /**/ /***/ /*/ x */"),
+            ),
+            (
+                "calls",
+                s("f(1) g (2) h\t(3) if (x) T(y) t::u(z) é(1) f?(x) f?"),
+            ),
+            (
+                "long_ascii",
+                "fn f(a: u32) -> Vec<String> { g(\"s\", 1.0) } ".repeat(300),
+            ),
+            (
+                "long_non_ascii",
+                "naïve(\"日本語\", 🎉) + Ünï { 42 } ".repeat(200),
+            ),
+            ("long_word", "x".repeat(50_000)),
+            ("long_string_open", format!("\"{}", "ab ".repeat(2_000))),
+        ]
+    }
+
+    const FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "sample.rs",
+            "rust",
+            include_str!("../tests/fixtures/highlight/sample.rs.txt"),
+        ),
+        (
+            "sample.py",
+            "python",
+            include_str!("../tests/fixtures/highlight/sample.py"),
+        ),
+        (
+            "sample.js",
+            "js",
+            include_str!("../tests/fixtures/highlight/sample.js"),
+        ),
+        (
+            "sample.sh",
+            "bash",
+            include_str!("../tests/fixtures/highlight/sample.sh"),
+        ),
+        (
+            "sample.ps1",
+            "powershell",
+            include_str!("../tests/fixtures/highlight/sample.ps1"),
+        ),
+        (
+            "sample.toml",
+            "toml",
+            include_str!("../tests/fixtures/highlight/sample.toml"),
+        ),
+        (
+            "sample.yml",
+            "yaml",
+            include_str!("../tests/fixtures/highlight/sample.yml"),
+        ),
+        (
+            "sample.json",
+            "json",
+            include_str!("../tests/fixtures/highlight/sample.json"),
+        ),
+    ];
+
+    // (input, hash in its own language, hash across every language).
+    const FIXTURE_HASHES: &[(&str, u64, u64)] = &[
+        ("sample.rs", 0x30e081ccdce308f5, 0xad386793790ad61e),
+        ("sample.py", 0x885367042fd47f87, 0x58d610659d48343f),
+        ("sample.js", 0x604073b1d516b86e, 0x7371a04c210e91db),
+        ("sample.sh", 0xce093bdf6c731d92, 0xe068fe2df0694d7f),
+        ("sample.ps1", 0xce07d0f9b3a6bd8d, 0xb3ee57ba51c70ac4),
+        ("sample.toml", 0x8e89ff06ff99153a, 0x8d6dbfa433983720),
+        ("sample.yml", 0xb9083f9674e29e2e, 0xcb7b7b7b35a0de34),
+        ("sample.json", 0xeed2d63dd0f96557, 0x44e98200f4df31a0),
+    ];
+    const EDGE_HASHES: &[(&str, u64)] = &[
+        ("empty", 0x674bec8e372766a5),
+        ("blank_lines", 0xf089fad8b7900ef5),
+        ("unterminated_string", 0x2deb239d857cb101),
+        ("backtick_open", 0x4fcce5bfc3dd6822),
+        ("block_comment_open", 0xc8769c991f982299),
+        ("html_comment", 0x84db2a3e04d67e2c),
+        ("triple_quotes", 0x330500bf7a6e0546),
+        ("non_ascii", 0x29844091eec1c142),
+        ("numbers", 0x3d73d8f6e1376357),
+        ("shell_vars", 0xcf95a313c70eeaa9),
+        ("sigils", 0x6106ca66e5aede46),
+        ("yaml_toml_keys", 0x2b73d64e66d1387a),
+        ("json_keys", 0xa15a1d1ea395d6a5),
+        ("wide_spaces", 0x279db310f80acf1d),
+        ("escapes", 0xd6b779b1cc529bb5),
+        ("css", 0x3e9f3e0614178b57),
+        ("lone", 0xce42e8fbd102e23b),
+        ("capitals", 0x41bc416ffe100ddc),
+        ("rustisms", 0x974f7c43e9e13001),
+        ("comment_starts", 0x7f65dd3d6b0f929b),
+        ("calls", 0xf261f0e543c78269),
+        ("long_ascii", 0xba22e0369901f56d),
+        ("long_non_ascii", 0x0f1b4f1e7fcb742d),
+        ("long_word", 0x52c9a2d56430eea5),
+        ("long_string_open", 0x1d40d6ca3dcd9c25),
+    ];
+
+    #[test]
+    fn output_matches_the_snapshot() {
+        std::env::remove_var("NO_COLOR");
+        let mut got_fixtures = Vec::new();
+        for (name, tag, text) in FIXTURES {
+            got_fixtures.push((*name, snapshot(&[tag], text), snapshot(SNAP_LANGS, text)));
+        }
+        let mut got_edges = Vec::new();
+        for (name, text) in edge_cases() {
+            got_edges.push((name, snapshot(SNAP_LANGS, &text)));
+        }
+        // To regenerate after an intended change: copy these from the
+        // failure message into the two tables above.
+        let mut listing = String::from("FIXTURE_HASHES:\n");
+        for (n, a, b) in &got_fixtures {
+            listing.push_str(&format!("        (\"{n}\", 0x{a:016x}, 0x{b:016x}),\n"));
+        }
+        listing.push_str("EDGE_HASHES:\n");
+        for (n, a) in &got_edges {
+            listing.push_str(&format!("        (\"{n}\", 0x{a:016x}),\n"));
+        }
+        assert!(
+            got_fixtures == FIXTURE_HASHES && got_edges == EDGE_HASHES,
+            "highlighter output changed:\n{listing}"
+        );
     }
 }

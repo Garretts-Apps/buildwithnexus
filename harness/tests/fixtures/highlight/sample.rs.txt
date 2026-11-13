@@ -1,0 +1,271 @@
+/// Lexer state carried between lines of one block (an open `/* … */` or a
+/// still-open backtick/triple-quote string).
+#[derive(Default)]
+pub struct State {
+    in_block_comment: bool,
+    in_string: Option<Str>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Str {
+    Triple(char),
+    Backtick,
+}
+
+fn kw(s: &str) -> String {
+    tui::accent(s)
+}
+fn ty(s: &str) -> String {
+    tui::cyan(s)
+}
+fn string(s: &str) -> String {
+    tui::green(s)
+}
+fn number(s: &str) -> String {
+    tui::yellow(s)
+}
+fn comment(s: &str) -> String {
+    tui::dim(s)
+}
+fn func(s: &str) -> String {
+    tui::blue(s)
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Highlight one line. Diff-style fences (`diff`, `patch`) are handled by
+/// [`highlight_block`] before the lexer; everything else lands here.
+pub fn highlight_line(lang: &Lang, line: &str, st: &mut State) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(line.len() * 2);
+    let mut i = 0;
+    // Fast path: continue a multi-line construct.
+    if st.in_block_comment {
+        let end = lang.block_comment.map(|b| b.1).unwrap_or("*/");
+        if let Some(pos) = line.find(end) {
+            let cut = pos + end.len();
+            out.push_str(&comment(&line[..cut]));
+            st.in_block_comment = false;
+            let rest = highlight_line(lang, &line[cut..], st);
+            out.push_str(&rest);
+        } else {
+            out.push_str(&comment(line));
+        }
+        return out;
+    }
+    if let Some(kind) = st.in_string {
+        let close = match kind {
+            Str::Triple(q) => std::iter::repeat_n(q, 3).collect::<String>(),
+            Str::Backtick => "`".to_string(),
+        };
+        if let Some(pos) = line.find(&close) {
+            let cut = pos + close.len();
+            out.push_str(&string(&line[..cut]));
+            st.in_string = None;
+            out.push_str(&highlight_line(lang, &line[cut..], st));
+        } else {
+            out.push_str(&string(line));
+        }
+        return out;
+    }
+    let at = |i: usize, pat: &str| -> bool {
+        let pc: Vec<char> = pat.chars().collect();
+        i + pc.len() <= n && chars[i..i + pc.len()] == pc[..]
+    };
+    let mut plain = String::new();
+    let flush = |plain: &mut String, out: &mut String| {
+        if !plain.is_empty() {
+            out.push_str(plain);
+            plain.clear();
+        }
+    };
+    while i < n {
+        let c = chars[i];
+        // Comments.
+        if lang
+            .line_comment
+            .iter()
+            .any(|lc| lc.starts_with(c) && at(i, lc))
+        {
+            flush(&mut plain, &mut out);
+            let rest: String = chars[i..].iter().collect();
+            out.push_str(&comment(&rest));
+            return out;
+        }
+        if let Some((open, close)) = lang.block_comment {
+            if open.starts_with(c) && at(i, open) {
+                flush(&mut plain, &mut out);
+                let rest: String = chars[i..].iter().collect();
+                if let Some(pos) = rest[open.len()..].find(close) {
+                    let cut = open.len() + pos + close.len();
+                    out.push_str(&comment(&rest[..cut]));
+                    i += rest[..cut].chars().count();
+                    continue;
+                }
+                out.push_str(&comment(&rest));
+                st.in_block_comment = true;
+                return out;
+            }
+        }
+        // Strings.
+        if lang.quotes.contains(&c) || (lang.backtick_strings && c == '`') {
+            flush(&mut plain, &mut out);
+            // Python-style triple quotes and JS template literals may span lines.
+            if c != '`' && at(i, &std::iter::repeat_n(c, 3).collect::<String>()) {
+                let rest: String = chars[i + 3..].iter().collect();
+                let close: String = std::iter::repeat_n(c, 3).collect();
+                if let Some(pos) = rest.find(&close) {
+                    let taken = 3 + rest[..pos].chars().count() + 3;
+                    let s: String = chars[i..i + taken].iter().collect();
+                    out.push_str(&string(&s));
+                    i += taken;
+                } else {
+                    let s: String = chars[i..].iter().collect();
+                    out.push_str(&string(&s));
+                    st.in_string = Some(Str::Triple(c));
+                    return out;
+                }
+                continue;
+            }
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < n {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == c {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if closed {
+                let s: String = chars[i..=j].iter().collect();
+                // JSON/YAML object keys read better in the type colour.
+                let is_key = std::ptr::eq(lang, &JSON)
+                    && chars[j + 1..].iter().find(|ch| !ch.is_whitespace()) == Some(&':');
+                out.push_str(&if is_key { ty(&s) } else { string(&s) });
+                i = j + 1;
+            } else if c == '`' {
+                let s: String = chars[i..].iter().collect();
+                out.push_str(&string(&s));
+                st.in_string = Some(Str::Backtick);
+                return out;
+            } else {
+                // Unterminated single-line string (or an apostrophe in
+                // prose): leave the quote plain and carry on.
+                plain.push(c);
+                i += 1;
+            }
+            continue;
+        }
+        // Shell/Ruby variables.
+        if lang.dollar_vars
+            && c == '$'
+            && i + 1 < n
+            && (is_ident(chars[i + 1]) || chars[i + 1] == '{')
+        {
+            flush(&mut plain, &mut out);
+            let mut j = i + 1;
+            if chars[j] == '{' {
+                while j < n && chars[j] != '}' {
+                    j += 1;
+                }
+                j = (j + 1).min(n);
+            } else {
+                while j < n && is_ident(chars[j]) {
+                    j += 1;
+                }
+            }
+            let s: String = chars[i..j].iter().collect();
+            out.push_str(&ty(&s));
+            i = j;
+            continue;
+        }
+        // Numbers.
+        if c.is_ascii_digit() && (i == 0 || !is_ident(chars[i - 1])) {
+            flush(&mut plain, &mut out);
+            let mut j = i + 1;
+            while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+            {
+                j += 1;
+            }
+            let s: String = chars[i..j].iter().collect();
+            out.push_str(&number(&s));
+            i = j;
+            continue;
+        }
+        // Identifiers, keywords, types, calls. `#include`-style words keep
+        // their sigil so C preprocessor lines match the keyword table.
+        if is_ident_start(c) || (c == '#' && i + 1 < n && is_ident_start(chars[i + 1])) {
+            let mut j = i + 1;
+            while j < n && (is_ident(chars[j]) || chars[j] == '?' && j + 1 == n) {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            let next_nonspace = chars[j..].iter().find(|ch| !ch.is_whitespace()).copied();
+            let styled = if lang.keywords.contains(&word.as_str()) {
+                Some(kw(&word))
+            } else if lang.types.contains(&word.as_str()) {
+                Some(ty(&word))
+            } else if std::ptr::eq(lang, &YAML) || std::ptr::eq(lang, &TOML) {
+                // `key:` / `key =` at the start of a YAML/TOML line.
+                let lead: String = chars[..i].iter().collect();
+                let is_key = lead.trim().is_empty() || lead.trim() == "-";
+                let sep = if std::ptr::eq(lang, &YAML) { ':' } else { '=' };
+                if is_key && next_nonspace == Some(sep) {
+                    Some(ty(&word))
+                } else {
+                    None
+                }
+            } else if next_nonspace == Some('(') {
+                Some(func(&word))
+            } else if lang.capital_types
+                && c.is_uppercase()
+                && word.chars().any(|ch| ch.is_lowercase())
+            {
+                Some(ty(&word))
+            } else {
+                None
+            };
+            match styled {
+                Some(s) => {
+                    flush(&mut plain, &mut out);
+                    out.push_str(&s);
+                }
+                None => plain.push_str(&word),
+            }
+            i = j;
+            continue;
+        }
+        // HTML tags: `<name` and `</name`.
+        if std::ptr::eq(lang, &HTML) && c == '<' {
+            let mut j = i + 1;
+            if j < n && chars[j] == '/' {
+                j += 1;
+            }
+            let start = j;
+            while j < n && (is_ident(chars[j]) || chars[j] == '-' || chars[j] == ':') {
+                j += 1;
+            }
+            if j > start {
+                flush(&mut plain, &mut out);
+                let s: String = chars[i..j].iter().collect();
+                out.push_str(&kw(&s));
+                i = j;
+                continue;
+            }
+        }
+        plain.push(c);
+        i += 1;
+    }
+    flush(&mut plain, &mut out);
+    out
+}

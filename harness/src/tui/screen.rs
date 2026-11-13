@@ -13,6 +13,10 @@
 // panic hook or a signal handler calls may take SCREEN either. Code that used
 // to hold the typeahead or queue lock across a repaint now takes a snapshot
 // and paints from that; frames are still serialized by RENDER.
+// `transcript.painted` (what the terminal shows) is written while a frame is
+// built and is only right because every frame is built and written under
+// RENDER, in that order; anything else that draws over the output rows calls
+// `forget_painted` (via `tui::invalidate_painted`).
 //
 // Kept outside on purpose:
 //   RAW, ALT_SCREEN, MOUSE_CAPTURED,
@@ -109,11 +113,30 @@ pub(super) struct TranscriptState {
     open_stream_line: usize,
     /// Plain text of the rows the last frame painted (selection, copy).
     pub visible_rows: Vec<String>,
-    /// Monotonic time of the last throttled streaming repaint.
-    pub last_stream_frame_ms: u64,
+    /// What is on the terminal: the bytes the output rows were last painted
+    /// with, one entry per row, so a frame emits only the rows that differ
+    /// (`tui::build_output_frame`). Empty = not known: the next frame
+    /// paints every row.
+    pub painted: Vec<String>,
+    /// The composer's box borders and the footer as last painted
+    /// (`tui::queue_chrome`), and the rest of the composer frame
+    /// (`tui::render_queued_composer`): not written again while unchanged.
+    /// Empty = not known.
+    pub painted_borders: Vec<u8>,
+    pub painted_footer: Vec<u8>,
+    pub painted_composer: Vec<u8>,
 }
 
 impl TranscriptState {
+    /// Something other than an output frame drew on the screen, or cleared
+    /// it: the next frame repaints every row.
+    pub fn forget_painted(&mut self) {
+        self.painted.clear();
+        self.painted_borders.clear();
+        self.painted_footer.clear();
+        self.painted_composer.clear();
+    }
+
     pub fn invalidate_stream_line(&mut self) {
         self.open_stream_line = NO_STREAM_LINE;
     }
@@ -280,14 +303,17 @@ pub(super) struct Screen {
 }
 
 impl Screen {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Screen {
             transcript: TranscriptState {
                 text: Transcript::new(),
                 scroll_offset: 0,
                 open_stream_line: NO_STREAM_LINE,
                 visible_rows: Vec::new(),
-                last_stream_frame_ms: 0,
+                painted: Vec::new(),
+                painted_borders: Vec::new(),
+                painted_footer: Vec::new(),
+                painted_composer: Vec::new(),
             },
             composer: Composer {
                 typeahead: TypeAheadState {

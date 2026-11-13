@@ -1,0 +1,63 @@
+{
+  "name": "buildwithnexus",
+  "version": "0.19.0",
+  "description": "Fast AI coding agent for the terminal, written in Rust. Works with hosted APIs (Anthropic, OpenAI) or local models (Ollama).",
+  "main": "index.js",
+  "bin": {
+    "buildwithnexus": "bin/buildwithnexus.js",
+    "bwn": "bin/buildwithnexus.js"
+  },
+  "files": [
+    "index.js",
+    "index.browser.js",
+    "bin/buildwithnexus.js",
+    "scripts/resolve-binary.js",
+    "scripts/bootstrap.js",
+    "scripts/diagnose.js",
+    "checksums.json",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "harness/Cargo.toml"
+  ],
+  "scripts": {
+    "build": "cargo build --release --manifest-path harness/Cargo.toml",
+    "start": "node bin/buildwithnexus.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "rust",
+    "tui",
+    "anthropic",
+    "openai",
+    "ollama",
+    "local-llm",
+    "multimodal",
+    "ffmpeg",
+    "terminal-ui",
+    "claude",
+    "developer-tools"
+  ],
+  "author": "Garrett Eaglin",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Garretts-Apps/buildwithnexus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Garretts-Apps/buildwithnexus/issues"
+  },
+  "homepage": "https://buildwithnexus.dev",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "browser": "./index.browser.js"
+}

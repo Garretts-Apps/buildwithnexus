@@ -482,7 +482,16 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
 /// web searches. Never an MCP tool, any text-editor command, or a call
 /// whose arguments failed to parse.
 pub fn is_parallel_safe(name: &str, input: &Value) -> bool {
-    input.get(INVALID_ARGS).is_none() && table::lookup(name).is_some_and(|s| s.parallel_safe)
+    input.get(INVALID_ARGS).is_none()
+        && table::lookup(name).is_some_and(|s| s.parallel != table::Parallel::No)
+}
+
+/// Whether a pure read is worth a thread of its own within a batch of them:
+/// a network call or a walk of the tree. Reading one file or folder costs
+/// less than starting the thread, so it runs on the thread that asked.
+pub fn is_worth_a_thread(name: &str, input: &Value) -> bool {
+    input.get(INVALID_ARGS).is_none()
+        && table::lookup(name).is_some_and(|s| s.parallel == table::Parallel::Spawn)
 }
 
 // Shell composition, redirection, substitution, expansion and control
@@ -1306,22 +1315,17 @@ fn loose_words(cmd: &str) -> Vec<String> {
 /// git's own options (`-C dir`, `-c k=v`, `--git-dir`) taken out before its
 /// subcommand. `git -C . push` and `sudo sh -c 'git push'` both give
 /// `git push`.
-pub fn guard_subjects(cmd: &str) -> std::rc::Rc<[String]> {
-    thread_local! {
-        // Every deny and ask rule checks the same command in turn.
-        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<[String]>)>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    if let Some(hit) = LAST.with_borrow(|l| {
-        l.as_ref()
-            .filter(|(c, _)| c == cmd)
-            .map(|(_, s)| std::rc::Rc::clone(s))
-    }) {
-        return hit;
-    }
-    let out: std::rc::Rc<[String]> = guard_subjects_for(cmd, cfg!(windows)).into();
-    LAST.set(Some((cmd.to_string(), std::rc::Rc::clone(&out))));
-    out
+pub fn guard_subjects(cmd: &str) -> Vec<String> {
+    #[cfg(test)]
+    GUARD_SUBJECT_RUNS.set(GUARD_SUBJECT_RUNS.get() + 1);
+    guard_subjects_for(cmd, cfg!(windows))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has worked out `guard_subjects`.
+    pub(crate) static GUARD_SUBJECT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn guard_subjects_for(cmd: &str, windows: bool) -> Vec<String> {
@@ -3302,6 +3306,19 @@ fn is_sensitive_for(p: &Path, windows: bool) -> bool {
     check(&normalize(p)) || check(&canonicalize_lenient(p))
 }
 
+// `is_sensitive` for an entry a walk lists in a folder whose real path is
+// `real_parent`. An entry that is not itself a symlink has the real path
+// `real_parent/name`, so the walk resolves each folder once instead of
+// every file in it.
+fn is_sensitive_entry(p: &Path, real_parent: &Path) -> bool {
+    let windows = cfg!(windows);
+    let check = |q: &Path| sensitive_names(&path_names(q, windows), windows, false);
+    match p.file_name() {
+        Some(name) => check(&normalize(p)) || check(&real_parent.join(name)),
+        None => is_sensitive(p),
+    }
+}
+
 // Shell glob match for one path component (`*`, `?`, `[...]` as any one
 // char). Like the shell, a leading wildcard never matches a leading dot.
 fn component_glob_match(pat: &str, name: &str) -> bool {
@@ -3619,9 +3636,13 @@ fn truncate_read(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
     }
-    let total_bytes = s.len();
-    let total_lines = s.lines().count();
     let shown = crate::config::cut_at_char_boundary(&s, max);
+    read_truncation(shown, s.len(), s.lines().count())
+}
+
+// `shown`, the head of a text of `total_bytes` and `total_lines`, with the
+// marker that says so.
+fn read_truncation(shown: &str, total_bytes: usize, total_lines: usize) -> String {
     let shown_lines = shown.lines().count();
     format!(
         "{shown}\n…[truncated: content is {total_bytes} bytes / {total_lines} lines total; showing the first {shown_lines} lines — pass start_line/end_line to read the rest in ranges]"
@@ -3694,6 +3715,12 @@ fn skip_dir(path: &Path) -> bool {
         // A Python virtualenv under any name (`venv`, `env`, `.py311`).
         || path.join("pyvenv.cfg").is_file()
 }
+
+mod grep;
+use grep::run_grep;
+
+mod read_view;
+use read_view::read_file_view;
 
 mod walk;
 use walk::*;
@@ -4858,10 +4885,9 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
             if let Some(out) = read_media(&p, input, cwd) {
                 return out;
             }
-            match read_text_view(&p, MAX_TEXT_FILE) {
-                Ok((c, false)) => ok(truncate_read(apply_line_range(c, line_range(input)), MAX_READ)),
-                Ok((c, true)) => {
-                    let mut out = truncate_read(apply_line_range(c, line_range(input)), MAX_READ);
+            match read_file_view(&p, line_range(input)) {
+                Ok((out, false)) => ok(out),
+                Ok((mut out, true)) => {
                     out.push_str(&format!(
                         "\n…[{} is larger than {}: only that much was read, so line numbers past it are not available here; use run_command (`sed -n 'A,Bp'`, `tail`) for the rest]",
                         p.display(),
@@ -5692,78 +5718,6 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     }
 }
 
-/// `grep_files`: search file contents under a folder.
-fn run_grep(input: &Value, cwd: &Path) -> Outcome {
-    let pattern = input["pattern"].as_str().unwrap_or("");
-    if pattern.is_empty() {
-        return err("pattern is required");
-    }
-    let file_pattern = input["file_pattern"]
-        .as_str()
-        .or_else(|| input["include"].as_str())
-        .unwrap_or("*");
-    let case_sensitive = input["case_sensitive"].as_bool().unwrap_or(false);
-    let needle = if case_sensitive {
-        pattern.to_string()
-    } else {
-        pattern.to_lowercase()
-    };
-    let limit = search_limit(input);
-    let mut files = Vec::new();
-    let mut seen = 0;
-    for root in search_roots(input, cwd) {
-        collect_files(&root, &mut files, &mut seen);
-    }
-    files.sort();
-    let mut matches = Vec::new();
-    let mut total = 0usize;
-    for path in files {
-        let rel = display_path(&path, cwd);
-        let basename_matches = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| simple_glob_match(file_pattern, name));
-        if !simple_glob_match(file_pattern, &rel) && !basename_matches {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        for (idx, line) in text.lines().enumerate() {
-            let hit = if case_sensitive {
-                line.contains(needle.as_str())
-            } else {
-                line.to_lowercase().contains(&needle)
-            };
-            if hit {
-                // Keep counting past the limit so the cap header can
-                // report how much was left out.
-                total += 1;
-                if matches.len() < limit {
-                    matches.push(format!(
-                        "{}:{}:{}",
-                        rel,
-                        idx + 1,
-                        clip_line(line.trim_end(), MAX_MATCH_LINE)
-                    ));
-                }
-            }
-        }
-    }
-    if matches.is_empty() {
-        ok(format!("no matches for {pattern}"))
-    } else {
-        let shown = matches.len();
-        let body = matches.join("\n");
-        let out = if total > shown {
-            format!("{total} matches, showing {shown} (raise `max` or narrow the pattern)\n{body}")
-        } else {
-            body
-        };
-        ok(truncate(out, MAX_OUT))
-    }
-}
-
 /// `headless_browser`: drive a local headless browser.
 fn run_headless_browser(input: &Value) -> Outcome {
     let url = input["url"].as_str().unwrap_or("").trim();
@@ -6183,6 +6137,14 @@ pub use net_guard::{blocked_url, private_network_host};
 
 #[cfg(test)]
 mod classify_tests;
+#[cfg(test)]
+mod grep_golden_tests;
+#[cfg(test)]
+mod perf_tests;
+#[cfg(test)]
+mod read_golden_tests;
+#[cfg(test)]
+mod read_view_tests;
 #[cfg(test)]
 mod table_tests;
 #[cfg(test)]

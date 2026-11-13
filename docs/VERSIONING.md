@@ -35,7 +35,8 @@ Human-readable output, TUI layout, log wording, and files under
 ## Schema versions
 
 Every `--json` event and every session file has an integer `schema_version`,
-now `1`:
+now `1` for events and `2` for session files (see Session files below). An
+event:
 
 ```json
 {"schema_version":1,"summary":"wrote the file","type":"finish"}
@@ -46,9 +47,10 @@ release (a major one from 1.0). New event types and new fields keep the same
 number, so readers should ignore fields and event types they do not know.
 
 Session files written before 0.15 have no `schema_version`. They still load,
-read as version 1 (the layout is the same), and get the field the next time
-they are saved. Versions before 0.15 ignore the field, so they can still
-load sessions that 0.15 saved.
+read as version 1 (the layout is the same). Session schema 2 is a different
+layout: every version from 0.20 reads both and writes 2, and a version before
+0.20 lists a schema 2 file as corrupt and skips it (the file is left as it
+is), so a session saved or resumed by 0.20 cannot be opened by 0.19 again.
 
 The event types in schema 1:
 
@@ -114,10 +116,53 @@ anything follows it on the command line.
 
 ## Session files
 
-A session file holds `schema_version`, `id`, `title`, `cwd`, `model`,
-`created_ms`, `updated_ms` and `msgs`, plus `name` once the session is renamed
-with `/rename`. Since 0.15, ids are `<16-digit milliseconds>-<8 hex digits>`;
-16-digit ids from 0.14 still load and resume.
+A session is one file, `~/.buildwithnexus/sessions/<id>.json`. Since 0.15,
+ids are `<16-digit milliseconds>-<8 hex digits>`; 16-digit ids from 0.14 still
+load and resume. This is the file a hook is given as `transcript_path`.
+
+**Schema 2** (written since 0.20) is a log in JSON Lines: every line is one
+JSON object, and a line is never rewritten once a later line follows it,
+except the first.
+
+```
+{"schema_version":2,"id":"…","title":"…","cwd":"…","model":"…","created_ms":1790000000000,"updated_ms":       1790000004211,"messages":         4}
+{"msg":{"System":"…"}}
+{"msg":{"User":"fix the parser"}}
+{"msg":{"Assistant":{"text":"…","calls":[{"id":"c1","name":"read_file","input":{"path":"src/parser.rs"}}]}}}
+{"msg":{"Tool":[{"id":"c1","content":"…","is_error":false}]}}
+```
+
+- Line 1 is the header: `schema_version`, `id`, `title` (the first prompt),
+  `cwd`, `model`, `created_ms`, `name` (only once the session is renamed with
+  `/rename`), then `updated_ms` and `messages` (how many message lines
+  follow). Those last two are padded with spaces to a fixed width, because
+  they are brought up to date in place when messages are appended; any JSON
+  parser reads them as ordinary numbers. `bwn sessions` and `/resume` read
+  this line and nothing else.
+- Every other line is a record. `{"msg": …}` holds one message, in the same
+  shape a schema 1 file had inside `msgs`: `System`, `User`, `UserImages`
+  (`text`, and `images` as `[media type, base64]` pairs), `Assistant` (`text`,
+  `calls`) or `Tool` (a list of `id`, `content`, `is_error`, and `images`
+  when there are any). Readers should skip a record without `msg`: a later
+  version may add other kinds without a new schema version.
+- After each tool round the new messages are appended in a single write and
+  flushed to disk (`fdatasync`) before the next request is sent, so a crash
+  or power loss costs at most the round being written. A last line that is
+  not a whole JSON object is such a round: readers should drop it and keep
+  the rest, as bwn does. The header's `messages` and `updated_ms` are
+  written just after the records, so after a crash they can be one round
+  behind the lines that follow.
+- The whole file is written again (to a temporary file, flushed, then
+  renamed over the old one) when earlier messages changed or the header did:
+  compaction, `/rewind`, `/rename`, a new model, and the first save of each
+  run, which is also when a schema 1 file is converted. Two runs on the same
+  session never leave a mixed or partial line; as before, the last one to
+  save decides what the file holds.
+
+**Schema 1** (0.19 and earlier) is a single JSON object: `schema_version`,
+`id`, `title`, `cwd`, `model`, `created_ms`, `updated_ms`, `msgs` (the list
+of messages) and `name` once renamed. It is still listed, exported and
+resumed; reading one never changes it.
 
 ## Hooks
 

@@ -2686,18 +2686,16 @@ pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
     let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> =
         user_settings_files()
             .iter()
-            .filter_map(|p| fs::read_to_string(p).ok())
-            .filter_map(|t| match serde_json::from_str(&t) {
-                Ok(serde_json::Value::Object(m)) => Some(("user settings", m)),
-                _ => None,
-            })
+            .filter_map(|p| settings_file(p)?.object())
+            .map(|m| ("user settings", m))
             .collect();
     let dot = workdir.join(".buildwithnexus");
     for name in PROJECT_SETTINGS_FILES {
-        let Ok(text) = fs::read_to_string(dot.join(name)) else {
+        let Some(file) = settings_file(&dot.join(name)) else {
             continue;
         };
-        let Ok(serde_json::Value::Object(m)) = serde_json::from_str(&text) else {
+        let text = file.text.clone();
+        let Some(m) = file.object() else {
             continue;
         };
         let m = project_view(workdir, name, &text, &serde_json::Map::new(), m).0;
@@ -2735,6 +2733,154 @@ pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
     out
 }
 
+// ── Parsed settings files, kept for the life of the process ──────────────────
+//
+// Start-up and every turn ask for settings many times over (the REPL, the
+// provider, permissions, hooks, MCP, the sandbox), and each ask used to open
+// and parse every settings file again. A file is now read and parsed once and
+// reused for as long as it is unchanged on disk: each ask costs one `stat`
+// per file. Trust decisions are not cached, so trusting a project file takes
+// effect on the next ask as before.
+//
+// A file edited outside bwn mid-session (a hook added to settings.json, a
+// project file changed by a pull) is picked up on the next ask, as it always
+// was: its size, modification time or inode differs. A file modified within
+// the last `SETTLE` is never served from memory, since two writes inside one
+// tick of a coarse file-system clock can leave all three alike. bwn's own
+// writes drop the entry outright.
+
+#[derive(Clone, PartialEq)]
+struct FileStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    inode: u64,
+}
+
+impl FileStamp {
+    fn of(meta: &fs::Metadata) -> Option<FileStamp> {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Some(FileStamp {
+            modified: meta.modified().ok()?,
+            len: meta.len(),
+            inode,
+        })
+    }
+
+    // Old enough that another write would have moved the clock on.
+    fn settled(&self) -> bool {
+        const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+        self.modified.elapsed().is_ok_and(|age| age >= SETTLE)
+    }
+}
+
+/// What a settings file holds.
+#[derive(Clone)]
+enum SettingsJson {
+    Object(serde_json::Map<String, serde_json::Value>),
+    /// Valid JSON whose top level is not an object.
+    NotObject,
+    /// Not JSON; serde_json's message, which has the line and column.
+    Invalid(String),
+}
+
+#[derive(Clone)]
+struct SettingsFile {
+    text: std::sync::Arc<str>,
+    json: SettingsJson,
+}
+
+impl SettingsFile {
+    fn object(self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        match self.json {
+            SettingsJson::Object(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+static SETTINGS_FILES: std::sync::Mutex<Vec<(PathBuf, FileStamp, SettingsFile)>> =
+    std::sync::Mutex::new(Vec::new());
+static SETTINGS_FILE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// Which files those reads were, so a test counts only its own.
+#[cfg(test)]
+static SETTINGS_READ_LOG: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// How many times a settings file has been read from disk and parsed by this
+/// process. Tests assert a bound on it; nothing else reads it.
+pub fn settings_file_reads() -> usize {
+    SETTINGS_FILE_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forgets every parsed settings file, so the next ask reads them again.
+/// bwn's own writes already drop the file they change; this is for a caller
+/// that changed settings some other way.
+pub fn invalidate_settings_cache() {
+    SETTINGS_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+fn forget_settings_file(path: &Path) {
+    SETTINGS_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(p, _, _)| p != path);
+}
+
+// The settings file at `path`, parsed; None when it cannot be read.
+fn settings_file(path: &Path) -> Option<SettingsFile> {
+    let mut files = SETTINGS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    let at = files.iter().position(|(p, _, _)| p == path);
+    // Most of the five candidate files do not exist: one failed `stat` each.
+    let Ok(meta) = fs::metadata(path) else {
+        if let Some(i) = at {
+            files.swap_remove(i);
+        }
+        return None;
+    };
+    let stamp = FileStamp::of(&meta);
+    if let (Some(i), Some(stamp)) = (at, &stamp) {
+        if files[i].1 == *stamp && stamp.settled() {
+            return Some(files[i].2.clone());
+        }
+    }
+    if let Some(i) = at {
+        files.swap_remove(i);
+    }
+    let text = fs::read_to_string(path).ok()?;
+    SETTINGS_FILE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    SETTINGS_READ_LOG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(path.to_path_buf());
+    // BWN_TRACE_SETTINGS_READS=<file>: one line per real read, for the tests
+    // that bound how often a run goes to disk for its settings.
+    if let Some(log) = std::env::var_os("BWN_TRACE_SETTINGS_READS") {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = std::io::Write::write_all(&mut f, format!("{}\n", path.display()).as_bytes());
+        }
+    }
+    let json = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(m)) => SettingsJson::Object(m),
+        Ok(_) => SettingsJson::NotObject,
+        Err(e) => SettingsJson::Invalid(e.to_string()),
+    };
+    let file = SettingsFile {
+        text: text.into(),
+        json,
+    };
+    if let Some(stamp) = stamp {
+        files.push((path.to_path_buf(), stamp, file.clone()));
+    }
+    Some(file)
+}
+
 /// The user-level settings files, lowest precedence first: the legacy
 /// config.json base, settings.json, then settings.local.json.
 fn user_settings_files() -> [PathBuf; 3] {
@@ -2756,19 +2902,19 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
     let mut untrusted = Vec::new();
 
     let mut read = |p: &Path, issues: &mut Vec<SettingsIssue>| {
-        let text = fs::read_to_string(p).ok()?;
+        let file = settings_file(p)?;
         any_present = true;
-        // serde_json's Display includes line and column — keep it verbatim.
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Object(m)) => Some((text, m)),
-            Ok(_) => {
+        match file.json {
+            SettingsJson::Object(m) => Some((file.text, m)),
+            SettingsJson::NotObject => {
                 issues.push(SettingsIssue {
                     source: p.display().to_string(),
                     error: "top level must be a JSON object — file ignored".into(),
                 });
                 None
             }
-            Err(e) => {
+            // serde_json's Display includes line and column — keep it verbatim.
+            SettingsJson::Invalid(e) => {
                 issues.push(SettingsIssue {
                     source: p.display().to_string(),
                     error: format!("{e} — file ignored"),
@@ -2805,7 +2951,11 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
             let (keep, keys) = project_view(workdir, name, &text, &merged, m);
             merge_objects(&mut merged, keep);
             if !keys.is_empty() {
-                untrusted.push(UntrustedProjectFile { name, text, keys });
+                untrusted.push(UntrustedProjectFile {
+                    name,
+                    text: text.to_string(),
+                    keys,
+                });
             }
         }
     }
@@ -2902,6 +3052,7 @@ pub fn save_settings(s: &Settings) {
     ensure_home();
     if let Ok(text) = serde_json::to_string_pretty(s) {
         write_atomic(&settings_path(), &text, true);
+        forget_settings_file(&settings_path());
     }
 }
 
@@ -2931,7 +3082,9 @@ pub fn update_settings_json(
     f(&mut obj);
     let text =
         serde_json::to_string_pretty(&serde_json::Value::Object(obj)).map_err(|e| e.to_string())?;
-    if write_atomic(&path, &text, true) {
+    let written = write_atomic(&path, &text, true);
+    forget_settings_file(&path);
+    if written {
         Ok(())
     } else {
         Err(format!("could not write {}", path.display()))
@@ -5080,6 +5233,124 @@ mod tests {
         );
         forget_env_custom_key_origin();
         std::env::remove_var(CUSTOM_KEY);
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+}
+
+#[cfg(test)]
+mod settings_cache_tests {
+    use super::*;
+
+    fn reads_under(dir: &Path) -> usize {
+        SETTINGS_READ_LOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    // Back-dates a file past the settle window, as any real settings file is.
+    fn age(path: &Path) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    fn write_aged(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+        age(path);
+    }
+
+    // Everything start-up and one turn ask of the settings files.
+    fn startup_and_one_turn(proj: &Path) {
+        for _ in 0..6 {
+            let load = load_settings_from_dir_diag(proj);
+            assert_eq!(load.settings.unwrap().provider, "groq");
+        }
+        for _ in 0..13 {
+            let _ = load_settings_from_dir(proj);
+            let _ = load_user_settings();
+            let _ = load_project_allowed(proj);
+            let _ = untrusted_project_files(proj);
+        }
+        for _ in 0..20 {
+            let _ = policy_rules(proj);
+            let _ = load_settings_from_dir(proj);
+        }
+    }
+
+    #[test]
+    fn startup_and_a_turn_read_each_settings_file_once() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("bwn-cfg-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (h, proj) = (root.join("home"), root.join("proj"));
+        std::env::set_var("NEXUS_HOME", &h);
+        write_aged(&h.join("config.json"), r#"{"provider":"groq"}"#);
+        write_aged(&h.join("settings.json"), r#"{"permission":"ask"}"#);
+        let proj_file = proj.join(".buildwithnexus/settings.json");
+        write_aged(&proj_file, r#"{"temperature":0.5}"#);
+
+        startup_and_one_turn(&proj);
+        assert_eq!(reads_under(&root), 3, "one read per file that exists");
+        let s = load_settings_from_dir(&proj).unwrap();
+        assert_eq!(s.temperature, Some(0.5), "the project layer still applies");
+        assert!(load_user_settings().unwrap().temperature.is_none());
+
+        // A file edited outside bwn is read again, once.
+        write_aged(&proj_file, r#"{"temperature":0.25}"#);
+        startup_and_one_turn(&proj);
+        assert_eq!(
+            load_settings_from_dir(&proj).unwrap().temperature,
+            Some(0.25)
+        );
+        assert_eq!(reads_under(&root), 4);
+
+        // bwn's own write is seen at once, before the file has settled.
+        save_user_settings(&[("permission", Some("auto".into()))]).unwrap();
+        assert_eq!(load_user_settings().unwrap().permission, "auto");
+        // And a file that appears, or goes away, is noticed.
+        let local = h.join("settings.local.json");
+        write_aged(&local, r#"{"provider":"xai"}"#);
+        assert_eq!(load_user_settings().unwrap().provider, "xai");
+        fs::remove_file(&local).unwrap();
+        assert_eq!(load_user_settings().unwrap().provider, "groq");
+
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_written_moments_ago_is_never_served_from_memory() {
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-cfg-fresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        // Same length, same inode, and as far as a coarse clock can tell the
+        // same time: only the settle window tells these apart.
+        for provider in ["groq", "xai1", "xai2"] {
+            fs::write(
+                h.join("settings.json"),
+                format!(r#"{{"provider":"{provider}"}}"#),
+            )
+            .unwrap();
+            assert_eq!(load_user_settings().unwrap().provider, provider);
+        }
+        // A broken file is reported each time it is asked for, cached or not.
+        write_aged(&h.join("settings.json"), "{oops");
+        for _ in 0..2 {
+            let load = load_layers(None).0;
+            assert!(load.settings.is_none() && load.any_present);
+            assert!(load.issues[0].error.ends_with("— file ignored"));
+        }
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }

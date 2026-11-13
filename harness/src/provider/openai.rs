@@ -2,114 +2,185 @@
 
 use super::*;
 
-// Pure body builder (see `anthropic_body` for the rationale).
-pub(super) fn openai_body(
-    model: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-    temperature: Option<f64>,
-    max_tokens: Option<u32>,
-) -> Value {
-    let mut messages: Vec<Value> = Vec::new();
-    let mut system = String::new();
-    for m in msgs {
-        if let Msg::System(s) = m {
-            if !system.is_empty() {
-                system.push_str("\n\n");
-            }
-            system.push_str(s);
-        }
+/// What shapes an OpenAI-compatible request besides the conversation.
+pub(super) struct OpenAiBody<'a> {
+    pub(super) model: &'a str,
+    pub(super) temperature: Option<f64>,
+    pub(super) max_tokens: Option<u32>,
+    pub(super) effort: Effort,
+    /// Also asks for `stream_options.include_usage`, which makes the server
+    /// append a final chunk carrying the request's token counts.
+    pub(super) stream: bool,
+    /// `Some(keep_images)` for the shape restrictive chat templates accept
+    /// (notably Gemma's on llama.cpp): strictly alternating user/assistant
+    /// turns, no `system`/`tool` roles, and no native `tools` field. The
+    /// tools are described in text at the top of the first turn instead.
+    /// Images stay on the user turns that carried them unless `keep_images`
+    /// is false (the server rejected them).
+    pub(super) flatten: Option<bool>,
+}
+
+// The request body, written once (see `wire` and `anthropic_bytes`).
+pub(super) fn openai_bytes(msgs: &[Msg], tools: &[ToolDef], o: &OpenAiBody) -> Vec<u8> {
+    let mut j = Json::with_capacity(size_hint(msgs, tools));
+    j.raw("{\"max_tokens\":");
+    j.val(&o.max_tokens.unwrap_or(4096));
+    j.raw(",\"messages\":[");
+    match o.flatten {
+        Some(keep_images) => flat_messages(&mut j, msgs, tools, keep_images),
+        None => native_messages(&mut j, msgs),
     }
+    j.raw("],\"model\":");
+    j.str(o.model);
+    if o.effort != Effort::Off && is_openai_reasoning_model(o.model) {
+        j.raw(",\"reasoning_effort\":\"");
+        j.raw(o.effort.as_str());
+        j.raw("\"");
+    }
+    if o.stream {
+        j.raw(",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+    }
+    j.raw(",\"temperature\":");
+    j.val(&o.temperature.unwrap_or(0.2));
+    if !tools.is_empty() && o.flatten.is_none() {
+        function_tools(&mut j, tools);
+    }
+    j.raw("}");
+    j.finish()
+}
+
+fn native_messages(j: &mut Json, msgs: &[Msg]) {
+    let mut sep = Sep::default();
+    let system = SystemText(msgs);
     if !system.is_empty() {
-        messages.push(json!({"role": "system", "content": system}));
+        sep.next(j);
+        j.raw("{\"content\":");
+        j.display(&system);
+        j.raw(",\"role\":\"system\"}");
     }
     let mut call_names: HashMap<&str, &str> = HashMap::new();
     for m in msgs {
         match m {
             Msg::System(_) => {}
-            Msg::User(t) => messages.push(json!({"role": "user", "content": t})),
+            Msg::User(t) => {
+                sep.next(j);
+                text_message(j, "user", t);
+            }
             Msg::UserImages { text, images } => {
-                let mut parts: Vec<Value> = images.iter().map(openai_image_part).collect();
-                parts.push(json!({"type": "text", "text": text}));
-                messages.push(json!({"role": "user", "content": parts}));
+                sep.next(j);
+                j.raw("{\"content\":[");
+                for image in images {
+                    image_part(j, image);
+                    j.raw(",");
+                }
+                text_part(j, text);
+                j.raw("],\"role\":\"user\"}");
             }
             Msg::Assistant { text, calls } => {
-                let mut msg = json!({"role": "assistant", "content": text});
+                sep.next(j);
+                j.raw("{\"content\":");
+                j.str(text);
+                j.raw(",\"role\":\"assistant\"");
                 if !calls.is_empty() {
-                    msg["tool_calls"] = json!(calls
-                        .iter()
-                        .map(|c| json!({
-                            "id": c.id, "type": "function",
-                            "function": {"name": c.name, "arguments": c.input.to_string()}
-                        }))
-                        .collect::<Vec<_>>());
+                    j.raw(",\"tool_calls\":[");
+                    let mut each = Sep::default();
                     for c in calls {
+                        each.next(j);
+                        // The arguments are a JSON document inside a string.
+                        j.raw("{\"function\":{\"arguments\":");
+                        j.display(&c.input);
+                        j.raw(",\"name\":");
+                        j.str(&c.name);
+                        j.raw("},\"id\":");
+                        j.str(&c.id);
+                        j.raw(",\"type\":\"function\"}");
                         call_names.insert(&c.id, &c.name);
                     }
+                    j.raw("]");
                 }
-                messages.push(msg);
+                j.raw("}");
             }
             Msg::Tool(results) => {
                 for r in results {
-                    messages
-                        .push(json!({"role": "tool", "tool_call_id": r.id, "content": r.content}));
+                    sep.next(j);
+                    j.raw("{\"content\":");
+                    j.str(&r.content);
+                    j.raw(",\"role\":\"tool\",\"tool_call_id\":");
+                    j.str(&r.id);
+                    j.raw("}");
                 }
-                // After every tool message of the round: a user turn between
-                // them would orphan the calls that follow it.
-                if tool_images_intro(results, &call_names).is_some() {
-                    let mut parts: Vec<Value> = Vec::new();
+                // Tool messages carry text only, so the images a round of
+                // tools returned follow it in one user turn, each set named
+                // by the call it came from. After every tool message of the
+                // round: a user turn between them would orphan the calls
+                // that follow it.
+                if results.iter().any(|r| !r.images.is_empty()) {
+                    sep.next(j);
+                    j.raw("{\"content\":[");
+                    let mut each = Sep::default();
                     for r in results.iter().filter(|r| !r.images.is_empty()) {
-                        parts.push(
-                            json!({"type": "text", "text": tool_images_label(r, &call_names)}),
-                        );
-                        parts.extend(r.images.iter().map(openai_image_part));
+                        each.next(j);
+                        text_part(j, &tool_images_label(r, &call_names));
+                        for image in &r.images {
+                            j.raw(",");
+                            image_part(j, image);
+                        }
                     }
-                    messages.push(json!({"role": "user", "content": parts}));
+                    j.raw("],\"role\":\"user\"}");
                 }
             }
         }
     }
+}
 
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "temperature": temperature.unwrap_or(0.2),
-        "max_tokens": max_tokens.unwrap_or(4096)
-    });
-    if !tools.is_empty() {
-        body["tools"] =
-            json!(tools.iter().map(|t| json!({
-            "type": "function",
-            "function": {"name": t.name, "description": t.description, "parameters": t.schema}
-        })).collect::<Vec<_>>());
+fn flat_messages(j: &mut Json, msgs: &[Msg], tools: &[ToolDef], keep_images: bool) {
+    let mut turns = fold_turns(msgs, Flat::OpenAi { keep_images });
+    if let (Some(guide), Some(first)) = (text_tool_guide(tools), turns.first_mut()) {
+        first.text = if first.text.is_empty() {
+            guide
+        } else {
+            format!("{guide}\n{}", first.text)
+        };
     }
-    body
+    let mut sep = Sep::default();
+    for t in &turns {
+        sep.next(j);
+        if t.images.is_empty() {
+            text_message(j, t.role, &t.text);
+        } else {
+            j.raw("{\"content\":[");
+            for image in &t.images {
+                image_part(j, image);
+                j.raw(",");
+            }
+            text_part(j, &t.text);
+            j.raw("],\"role\":\"");
+            j.raw(t.role);
+            j.raw("\"}");
+        }
+    }
 }
 
-pub(super) fn openai_image_part((mt, data): &(String, String)) -> Value {
-    json!({
-        "type": "image_url",
-        "image_url": {"url": format!("data:{mt};base64,{data}")}
-    })
+fn text_part(j: &mut Json, text: &str) {
+    j.raw("{\"text\":");
+    j.str(text);
+    j.raw(",\"type\":\"text\"}");
 }
 
-// Same request against an explicit base URL — the Ollama fallback path targets
-// {host}/v1 while the provider's base_url is the bare host root.
-pub(super) fn openai_request_at(
-    p: &Provider,
-    base: &str,
-    msgs: &[Msg],
-    tools: &[ToolDef],
-) -> (crate::net::Request, Value) {
-    let mut body = openai_body(&p.model, msgs, tools, p.temperature, p.max_tokens);
-    apply_openai_effort(&mut body, &p.model, p.effort);
-    let mut req = agent()
+fn image_part(j: &mut Json, (media_type, data): &(String, String)) {
+    j.raw("{\"image_url\":{\"url\":");
+    j.display(&format_args!("data:{media_type};base64,{data}"));
+    j.raw("},\"type\":\"image_url\"}");
+}
+
+pub(super) fn openai_request_at(p: &Provider, base: &str) -> crate::net::Request {
+    let req = agent()
         .post(&format!("{}/chat/completions", base.trim_end_matches('/')))
         .set("content-type", "application/json");
-    if let Some(key) = &p.api_key {
-        req = req.set("authorization", &format!("Bearer {key}"));
+    match &p.api_key {
+        Some(key) => req.set("authorization", &format!("Bearer {key}")),
+        None => req,
     }
-    (req, body)
 }
 
 // Model names that accept `reasoning_effort` on the OpenAI shape: the o-series
@@ -126,32 +197,30 @@ pub(super) fn is_openai_reasoning_model(model: &str) -> bool {
     })
 }
 
-pub(super) fn apply_openai_effort(body: &mut Value, model: &str, effort: Effort) {
-    if effort != Effort::Off && is_openai_reasoning_model(model) {
-        body["reasoning_effort"] = json!(effort.as_str());
-    }
-}
-
 // Token counts from an OpenAI-shape `usage` object. `prompt_tokens` includes
 // the cached portion, which is split out so `input` means uncached tokens
 // like the Anthropic shape. None when the chunk carries no usage object.
 pub(super) fn openai_usage(v: &Value) -> Option<Usage> {
     let u = v.get("usage")?.as_object()?;
-    let prompt = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let count = |k: &str| u.get(k).and_then(Value::as_u64);
     let cached = u
         .get("prompt_tokens_details")
-        .and_then(|d| d["cached_tokens"].as_u64())
-        .unwrap_or(0)
-        .min(prompt);
-    Some(Usage {
+        .and_then(|d| d["cached_tokens"].as_u64());
+    Some(usage_of(
+        count("prompt_tokens").unwrap_or(0),
+        cached,
+        count("completion_tokens").unwrap_or(0),
+    ))
+}
+
+fn usage_of(prompt: u64, cached: Option<u64>, completion: u64) -> Usage {
+    let cached = cached.unwrap_or(0).min(prompt);
+    Usage {
         input: prompt - cached,
-        output: u
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        output: completion,
         cache_read: cached,
         cache_write: 0,
-    })
+    }
 }
 
 // Remove `<think>…</think>` reasoning blocks that local reasoning models
@@ -320,6 +389,120 @@ pub(super) fn flush_think_carry(
     }
 }
 
+// One streamed chunk, with only the fields the parser reads; strings borrow
+// from the line (see `borrowed`). Unknown fields are skipped unparsed.
+#[derive(Deserialize, Default)]
+struct Chunk<'a> {
+    #[serde(default)]
+    error: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    usage: Obj<ChunkUsage>,
+    #[serde(borrow, default)]
+    choices: Option<Vec<Obj<Choice<'a>>>>,
+}
+
+#[derive(Deserialize, Default)]
+struct ChunkUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Obj<TokenDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct TokenDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct Choice<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    finish_reason: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    delta: Obj<Delta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct Delta<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    reasoning_content: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    reasoning: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    content: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    tool_calls: Option<Vec<Obj<CallDelta<'a>>>>,
+}
+
+#[derive(Deserialize, Default)]
+struct CallDelta<'a> {
+    #[serde(default)]
+    index: Option<u64>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    function: Obj<FunctionDelta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+struct FunctionDelta<'a> {
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    name: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "opt_str")]
+    arguments: Option<Cow<'a, str>>,
+}
+
+impl<'a> Chunk<'a> {
+    // The same fields out of a `Value`, for a chunk the typed read refused:
+    // whatever has an unexpected type counts as absent.
+    fn from_value(v: &'a Value) -> Chunk<'a> {
+        let usage = v.get("usage").and_then(Value::as_object).map(|u| {
+            let count = |k: &str| u.get(k).and_then(Value::as_u64);
+            ChunkUsage {
+                prompt_tokens: count("prompt_tokens"),
+                completion_tokens: count("completion_tokens"),
+                prompt_tokens_details: Obj(Some(TokenDetails {
+                    cached_tokens: u
+                        .get("prompt_tokens_details")
+                        .and_then(|d| d["cached_tokens"].as_u64()),
+                })),
+            }
+        });
+        let choice = &v["choices"][0];
+        let delta = &choice["delta"];
+        let tool_calls = delta["tool_calls"].as_array().map(|tcs| {
+            tcs.iter()
+                .map(|tc| {
+                    Obj(Some(CallDelta {
+                        index: tc["index"].as_u64(),
+                        id: value_str(&tc["id"]),
+                        function: Obj(Some(FunctionDelta {
+                            name: value_str(&tc["function"]["name"]),
+                            arguments: value_str(&tc["function"]["arguments"]),
+                        })),
+                    }))
+                })
+                .collect()
+        });
+        Chunk {
+            error: None,
+            usage: Obj(usage),
+            choices: Some(vec![Obj(Some(Choice {
+                finish_reason: value_str(&choice["finish_reason"]),
+                delta: Obj(Some(Delta {
+                    reasoning_content: value_str(&delta["reasoning_content"]),
+                    reasoning: value_str(&delta["reasoning"]),
+                    content: value_str(&delta["content"]),
+                    tool_calls,
+                })),
+            }))]),
+        }
+    }
+}
+
 pub(super) fn openai_stream(
     reader: impl Read,
     on_text: &mut dyn FnMut(&str),
@@ -337,32 +520,50 @@ pub(super) fn openai_stream(
         if data == "[DONE]" {
             return true;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            return false;
+        let tolerant;
+        let chunk = match serde_json::from_str::<Obj<Chunk>>(data) {
+            Ok(Obj(Some(chunk))) if chunk.error.is_none() => chunk,
+            // An {"error": …} chunk, or one with a field of an unexpected
+            // type: read it the tolerant way.
+            _ => {
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    return false;
+                };
+                // vLLM, LiteLLM, OpenRouter and friends report mid-stream
+                // failures as an {"error": …} chunk rather than an HTTP status.
+                if let Some(e) = openai_error(&v) {
+                    stream_err = Some(e);
+                    return true;
+                }
+                tolerant = v;
+                Chunk::from_value(&tolerant)
+            }
         };
-        // vLLM, LiteLLM, OpenRouter and friends report mid-stream failures as
-        // an {"error": …} chunk rather than an HTTP status.
-        if let Some(e) = openai_error(&v) {
-            stream_err = Some(e);
-            return true;
-        }
         // With stream_options.include_usage the final chunk (empty choices)
         // carries the totals; some servers put usage on every chunk instead.
-        if let Some(u) = openai_usage(&v) {
-            usage = u;
+        if let Some(u) = chunk.usage.0 {
+            usage = usage_of(
+                u.prompt_tokens.unwrap_or(0),
+                u.prompt_tokens_details.0.and_then(|d| d.cached_tokens),
+                u.completion_tokens.unwrap_or(0),
+            );
         }
+        let Some(choice) = chunk
+            .choices
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.0)
+        else {
+            return false;
+        };
         // finish_reason rides on the last content-bearing chunk (or one after).
-        if let Some(r) = v["choices"][0]["finish_reason"].as_str() {
+        if let Some(r) = &choice.finish_reason {
             stop_reason = Some(normalize_stop_reason(r));
         }
-        let delta = &v["choices"][0]["delta"];
-        if let Some(r) = delta["reasoning_content"]
-            .as_str()
-            .or_else(|| delta["reasoning"].as_str())
-        {
-            on_thinking(r);
+        let delta = choice.delta.0.unwrap_or_default();
+        if let Some(r) = delta.reasoning_content.or(delta.reasoning) {
+            on_thinking(&r);
         }
-        if let Some(t) = delta["content"].as_str() {
+        if let Some(t) = &delta.content {
             route_openai_content(
                 t,
                 &mut in_think,
@@ -372,26 +573,22 @@ pub(super) fn openai_stream(
                 on_thinking,
             );
         }
-        if let Some(tcs) = delta["tool_calls"].as_array() {
-            for tc in tcs {
-                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                while pending.len() <= idx {
-                    pending.push((String::new(), String::new(), String::new()));
-                }
-                let e = &mut pending[idx];
-                if let Some(id) = tc["id"].as_str() {
-                    if !id.is_empty() {
-                        e.0 = id.to_string();
-                    }
-                }
-                if let Some(name) = tc["function"]["name"].as_str() {
-                    if !name.is_empty() {
-                        e.1 = name.to_string();
-                    }
-                }
-                if let Some(args) = tc["function"]["arguments"].as_str() {
-                    e.2.push_str(args);
-                }
+        for tc in delta.tool_calls.into_iter().flatten() {
+            let tc = tc.0.unwrap_or_default();
+            let idx = tc.index.unwrap_or(0) as usize;
+            while pending.len() <= idx {
+                pending.push((String::new(), String::new(), String::new()));
+            }
+            let e = &mut pending[idx];
+            if let Some(id) = tc.id.filter(|id| !id.is_empty()) {
+                e.0 = id.into_owned();
+            }
+            let function = tc.function.0.unwrap_or_default();
+            if let Some(name) = function.name.filter(|name| !name.is_empty()) {
+                e.1 = name.into_owned();
+            }
+            if let Some(args) = &function.arguments {
+                e.2.push_str(args);
             }
         }
         false

@@ -244,6 +244,15 @@ impl Walk<'_> {
         let Ok(rd) = fs::read_dir(root) else {
             return;
         };
+        // The folder's real path, resolved once for the sensitivity check of
+        // the plain files in it (Unix only: elsewhere each file is resolved).
+        let real_root = (self.skip_sensitive && cfg!(unix))
+            .then(|| fs::canonicalize(root).ok())
+            .flatten();
+        let sensitive = |path: &Path, is_link: bool| match &real_root {
+            Some(real) if !is_link => is_sensitive_entry(path, real),
+            _ => is_sensitive(path),
+        };
         for entry in rd.filter_map(|e| e.ok()) {
             if *self.seen >= MAX_SEARCH_FILES {
                 break;
@@ -271,7 +280,7 @@ impl Walk<'_> {
                 }
             } else if self.files
                 && is_file
-                && !(self.skip_sensitive && is_sensitive(&path))
+                && !(self.skip_sensitive && sensitive(&path, is_link))
                 && !ignores.ignored(&path, false)
             {
                 *self.seen += 1;
