@@ -37,7 +37,7 @@ fn every_alias_points_at_a_canonical_row_for_the_same_tool() {
             );
             assert!(s.mutation != Mutation::Never, "{}", s.name);
         }
-        if s.parallel_safe {
+        if s.parallel != table::Parallel::No {
             assert_eq!(s.mutation, Mutation::Never, "{}", s.name);
         }
     }

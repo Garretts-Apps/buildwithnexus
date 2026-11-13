@@ -133,8 +133,20 @@ pub(crate) struct ToolSpec {
     /// What `accept-edits` lets run without a prompt (is_file_edit).
     pub file_edit: bool,
     pub tracking: Tracking,
-    /// Pure reads that can run alongside each other.
-    pub parallel_safe: bool,
+    /// Whether, and how, the call runs within a batch of pure reads.
+    pub parallel: Parallel,
+}
+
+/// How a call runs when one reply asks for several pure reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Parallel {
+    /// Not a pure read: runs alone, in the order the model gave.
+    No,
+    /// A pure read that costs less than starting a thread for it (one
+    /// local file or folder): runs on the turn's own thread.
+    Inline,
+    /// A pure read worth a thread: a network call, or a walk of the tree.
+    Spawn,
 }
 
 const fn spec(name: &'static str, tool: Tool) -> ToolSpec {
@@ -148,7 +160,7 @@ const fn spec(name: &'static str, tool: Tool) -> ToolSpec {
         confined: false,
         file_edit: false,
         tracking: Tracking::None,
-        parallel_safe: false,
+        parallel: Parallel::No,
     }
 }
 
@@ -185,8 +197,12 @@ impl ToolSpec {
         self.tracking = t;
         self
     }
-    const fn parallel_safe(mut self) -> Self {
-        self.parallel_safe = true;
+    const fn inline(mut self) -> Self {
+        self.parallel = Parallel::Inline;
+        self
+    }
+    const fn spawn(mut self) -> Self {
+        self.parallel = Parallel::Spawn;
         self
     }
 }
@@ -201,7 +217,7 @@ const fn read_file(name: &'static str) -> ToolSpec {
     spec(name, ReadFile)
         .paths(PathArg)
         .tracking(Tracking::Read)
-        .parallel_safe()
+        .inline()
 }
 const fn write_file(name: &'static str, tool: Tool) -> ToolSpec {
     spec(name, tool)
@@ -224,27 +240,25 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     // Reading and searching.
     read_file("read").alias_of("read_file"),
     read_file("read_file"),
-    spec("read_many_files", ReadManyFiles)
-        .paths(Many)
-        .parallel_safe(),
+    spec("read_many_files", ReadManyFiles).paths(Many).inline(),
     spec("list", ListDir)
         .alias_of("list_dir")
         .paths(PathArg)
-        .parallel_safe(),
-    spec("list_dir", ListDir).paths(PathArg).parallel_safe(),
-    spec("list_tree", ListTree).paths(PathArg).parallel_safe(),
-    spec("file_info", FileInfo).paths(PathArg).parallel_safe(),
+        .inline(),
+    spec("list_dir", ListDir).paths(PathArg).inline(),
+    spec("list_tree", ListTree).paths(PathArg).spawn(),
+    spec("file_info", FileInfo).paths(PathArg).inline(),
     spec("glob", FindPaths)
         .alias_of("find_paths")
         .paths(Root)
-        .parallel_safe(),
-    spec("find_paths", FindPaths).paths(Root).parallel_safe(),
-    spec("find_files", FindFiles).paths(Root).parallel_safe(),
+        .spawn(),
+    spec("find_paths", FindPaths).paths(Root).spawn(),
+    spec("find_files", FindFiles).paths(Root).spawn(),
     spec("grep", GrepFiles)
         .alias_of("grep_files")
         .paths(Root)
-        .parallel_safe(),
-    spec("grep_files", GrepFiles).paths(Root).parallel_safe(),
+        .spawn(),
+    spec("grep_files", GrepFiles).paths(Root).spawn(),
     // Changing files.
     write_file("write", WriteFile).alias_of("write_file"),
     write_file("write_file", WriteFile),
@@ -298,15 +312,13 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     spec("webfetch", FetchUrl)
         .alias_of("fetch_url")
         .network(Url)
-        .parallel_safe(),
-    spec("fetch_url", FetchUrl).network(Url).parallel_safe(),
+        .spawn(),
+    spec("fetch_url", FetchUrl).network(Url).spawn(),
     spec("websearch", WebSearch)
         .alias_of("web_search")
         .network(Search)
-        .parallel_safe(),
-    spec("web_search", WebSearch)
-        .network(Search)
-        .parallel_safe(),
+        .spawn(),
+    spec("web_search", WebSearch).network(Search).spawn(),
     spec("headless_browser", HeadlessBrowser).network(Url),
     spec("wait_for_url", WaitForUrl).network(Url),
     spec("screenshot_url", ScreenshotUrl).network(HttpUrl),
@@ -321,7 +333,7 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     spec("skill", LoadSkill).alias_of("load_skill"),
     spec("load_skill", LoadSkill),
     spec("list_skills", ListSkills),
-    spec("kb_query", KbQuery).parallel_safe(),
+    spec("kb_query", KbQuery).inline(),
     spec("kb_record", KbRecord).mutating(),
     spec("rule_check", RuleCheck),
     spec("verify", Verify),

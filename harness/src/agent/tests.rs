@@ -3284,9 +3284,14 @@ fn outcome(s: String) -> tools::Outcome {
 #[test]
 fn side_by_side_outcomes_come_back_in_call_order() {
     for n in [1usize, 2, 4, 7] {
+        // Searches (shared between threads) with reads (run in line)
+        // between them.
         let calls = pending_calls(
             &(0..n)
-                .map(|i| ("read_file", serde_json::json!({"path": format!("f{i}")})))
+                .map(|i| {
+                    let name = ["grep_files", "read_file", "find_files"][i % 3];
+                    (name, serde_json::json!({"path": format!("f{i}")}))
+                })
                 .collect::<Vec<_>>(),
         );
         // Later calls finish first.
@@ -3335,6 +3340,83 @@ fn one_call_or_width_one_runs_on_the_turns_thread() {
         assert_eq!(std::thread::current().id(), me);
         outcome(String::new())
     });
+}
+
+#[test]
+fn cheap_reads_run_on_the_turns_thread_and_start_no_thread() {
+    use serde_json::json;
+    let me = std::thread::current().id();
+    let on_this_thread = |calls: &[PendingCall]| {
+        run_counted(calls, 4, |_| {
+            assert_eq!(std::thread::current().id(), me);
+            outcome(String::new())
+        })
+        .1
+    };
+    // Reads, listings and a knowledge-base query: nothing to share.
+    let reads = pending_calls(&[
+        ("read_file", json!({"path": "a"})),
+        ("read", json!({"path": "b"})),
+        ("read_many_files", json!({"paths": ["a", "b"]})),
+        ("list_dir", json!({})),
+        ("list", json!({})),
+        ("file_info", json!({"path": "a"})),
+        ("kb_query", json!({"query": "q"})),
+    ]);
+    assert_eq!(on_this_thread(&reads), SideBySide::default());
+    // One search or fetch among them has nothing to run beside.
+    for lone in ["grep_files", "fetch_url", "web_search", "list_tree"] {
+        let calls = pending_calls(&[
+            ("read_file", json!({"path": "a"})),
+            (lone, json!({"url": "https://one.example/"})),
+            ("read_file", json!({"path": "b"})),
+        ]);
+        assert_eq!(on_this_thread(&calls), SideBySide::default(), "{lone}");
+    }
+}
+
+#[test]
+fn searches_and_fetches_share_threads_while_reads_stay_in_line() {
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    let me = std::thread::current().id();
+    let calls = pending_calls(&[
+        ("read_file", json!({"path": "a"})),
+        ("grep_files", json!({"pattern": "x"})),
+        ("read_file", json!({"path": "b"})),
+        ("fetch_url", json!({"url": "https://one.example/"})),
+        ("glob", json!({"pattern": "*"})),
+        ("file_info", json!({"path": "a"})),
+        ("websearch", json!({"query": "q"})),
+        ("find_paths", json!({"pattern": "*"})),
+    ]);
+    for (width, threads) in [(2usize, 2usize), (4, 4), (9, 5)] {
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let elsewhere = AtomicUsize::new(0);
+        let (outs, ran) = run_counted(&calls, width, |c| {
+            let in_flight = now.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(in_flight, Ordering::SeqCst);
+            if std::thread::current().id() != me {
+                assert!(tools::is_worth_a_thread(&c.name, &c.input), "{}", c.name);
+                elsewhere.fetch_add(1, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            now.fetch_sub(1, Ordering::SeqCst);
+            outcome(c.id.clone())
+        });
+        let ids: Vec<String> = outs.into_iter().map(|o| o.content).collect();
+        assert_eq!(ids, ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"]);
+        assert_eq!(
+            ran,
+            SideBySide {
+                side_by_side: 5,
+                width: threads
+            }
+        );
+        // The turn's thread is one of the `width`.
+        assert!(peak.load(Ordering::SeqCst) <= width, "width {width}");
+        assert!(elsewhere.load(Ordering::SeqCst) >= 1, "width {width}");
+    }
 }
 
 #[test]
@@ -3391,7 +3473,7 @@ fn side_by_side_fetches_to_one_host_never_overlap() {
 #[test]
 fn only_reads_searches_and_fetches_run_beside_others() {
     use serde_json::json;
-    for name in [
+    let beside = [
         "read",
         "read_file",
         "read_many_files",
@@ -3409,9 +3491,35 @@ fn only_reads_searches_and_fetches_run_beside_others() {
         "fetch_url",
         "websearch",
         "web_search",
-    ] {
+    ];
+    for name in beside {
         assert!(may_run_beside_others(name, &json!({})), "{name}");
     }
+    // Of those, the ones worth a thread: network calls and walks of the
+    // tree. Reading one file or folder is not.
+    let worth: Vec<&str> = beside
+        .into_iter()
+        .filter(|n| tools::is_worth_a_thread(n, &json!({})))
+        .collect();
+    assert_eq!(
+        worth,
+        [
+            "list_tree",
+            "glob",
+            "find_paths",
+            "find_files",
+            "grep",
+            "grep_files",
+            "webfetch",
+            "fetch_url",
+            "websearch",
+            "web_search",
+        ]
+    );
+    assert!(!tools::is_worth_a_thread(
+        "grep_files",
+        &json!({ tools::INVALID_ARGS: "{bad" })
+    ));
     for name in [
         "write_file",
         "edit_file",
@@ -3443,6 +3551,7 @@ fn only_reads_searches_and_fetches_run_beside_others() {
         "no_such_tool",
     ] {
         assert!(!may_run_beside_others(name, &json!({})), "{name}");
+        assert!(!tools::is_worth_a_thread(name, &json!({})), "{name}");
     }
     assert!(!may_run_beside_others(
         "read_file",

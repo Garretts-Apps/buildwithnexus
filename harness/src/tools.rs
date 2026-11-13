@@ -482,7 +482,16 @@ pub fn is_mutating_call(name: &str, input: &Value) -> bool {
 /// web searches. Never an MCP tool, any text-editor command, or a call
 /// whose arguments failed to parse.
 pub fn is_parallel_safe(name: &str, input: &Value) -> bool {
-    input.get(INVALID_ARGS).is_none() && table::lookup(name).is_some_and(|s| s.parallel_safe)
+    input.get(INVALID_ARGS).is_none()
+        && table::lookup(name).is_some_and(|s| s.parallel != table::Parallel::No)
+}
+
+/// Whether a pure read is worth a thread of its own within a batch of them:
+/// a network call or a walk of the tree. Reading one file or folder costs
+/// less than starting the thread, so it runs on the thread that asked.
+pub fn is_worth_a_thread(name: &str, input: &Value) -> bool {
+    input.get(INVALID_ARGS).is_none()
+        && table::lookup(name).is_some_and(|s| s.parallel == table::Parallel::Spawn)
 }
 
 // Shell composition, redirection, substitution, expansion and control
