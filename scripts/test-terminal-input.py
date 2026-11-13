@@ -844,11 +844,17 @@ class FrameTests(TerminalHarness):
         frames = self.output_frames(0)
         with_marker = [f for f in frames if f]
         self.assertTrue(with_marker)
-        # The frame that brought the marker touched one row; the frames
-        # after it (nothing changed) wrote nothing at all.
+        # The frame that brought the marker touched the reply's row, and at
+        # most the "thinking" row above it when the reply's first words land
+        # in the same frame as that line: never the rest of the screen. The
+        # frames after it (nothing changed) wrote nothing at all.
         at = bytes(self.output).index(b"tail-marker")
         last = bytes(self.output)[:at].rsplit(b"\x1b[?2026h\x1b7", 1)[1]
-        self.assertEqual(len(re.findall(rb"\x1b\[\d+;1H", last)), 1, last)
+        rows = [int(r) for r in re.findall(rb"\x1b\[(\d+);1H", last)]
+        self.assertIn(len(rows), (1, 2), last)
+        if len(rows) == 2:
+            self.assertEqual(rows[1], rows[0] + 1, last)
+            self.assertIn(b"thinking", last.split(b"\x1b[%d;1H" % rows[1])[0])
         quiet = len(self.output)
         self.pump(1.0)
         self.assertEqual(self.output_frames(quiet), [])
