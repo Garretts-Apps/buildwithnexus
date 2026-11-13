@@ -1315,22 +1315,17 @@ fn loose_words(cmd: &str) -> Vec<String> {
 /// git's own options (`-C dir`, `-c k=v`, `--git-dir`) taken out before its
 /// subcommand. `git -C . push` and `sudo sh -c 'git push'` both give
 /// `git push`.
-pub fn guard_subjects(cmd: &str) -> std::rc::Rc<[String]> {
-    thread_local! {
-        // Every deny and ask rule checks the same command in turn.
-        static LAST: std::cell::RefCell<Option<(String, std::rc::Rc<[String]>)>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    if let Some(hit) = LAST.with_borrow(|l| {
-        l.as_ref()
-            .filter(|(c, _)| c == cmd)
-            .map(|(_, s)| std::rc::Rc::clone(s))
-    }) {
-        return hit;
-    }
-    let out: std::rc::Rc<[String]> = guard_subjects_for(cmd, cfg!(windows)).into();
-    LAST.set(Some((cmd.to_string(), std::rc::Rc::clone(&out))));
-    out
+pub fn guard_subjects(cmd: &str) -> Vec<String> {
+    #[cfg(test)]
+    GUARD_SUBJECT_RUNS.set(GUARD_SUBJECT_RUNS.get() + 1);
+    guard_subjects_for(cmd, cfg!(windows))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has worked out `guard_subjects`.
+    pub(crate) static GUARD_SUBJECT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn guard_subjects_for(cmd: &str, windows: bool) -> Vec<String> {

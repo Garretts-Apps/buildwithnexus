@@ -1141,6 +1141,61 @@ fn split_rule(rule: &str) -> (&str, Option<&str>) {
     }
 }
 
+// One call as the rules see it. What a pattern is matched against (the
+// commands inside a shell command, the paths a file tool touches) is worked
+// out the first time a rule needs it and kept for the rest of the rules.
+struct RuledCall<'a> {
+    name: &'a str,
+    input: &'a serde_json::Value,
+    cwd: &'a Path,
+    host: Option<&'a str>,
+    guarded: std::cell::OnceCell<Vec<String>>,
+    allowable: std::cell::OnceCell<Option<String>>,
+    paths: std::cell::OnceCell<Vec<PathBuf>>,
+}
+
+impl<'a> RuledCall<'a> {
+    fn new(
+        name: &'a str,
+        input: &'a serde_json::Value,
+        cwd: &'a Path,
+        host: Option<&'a str>,
+    ) -> Self {
+        RuledCall {
+            name,
+            input,
+            cwd,
+            host,
+            guarded: std::cell::OnceCell::new(),
+            allowable: std::cell::OnceCell::new(),
+            paths: std::cell::OnceCell::new(),
+        }
+    }
+
+    // What deny and ask rules see of a command: through wrappers, shells
+    // and git's own options.
+    fn guarded(&self, cmd: &str) -> &[String] {
+        self.guarded.get_or_init(|| tools::guard_subjects(cmd))
+    }
+
+    // What an allow rule may cover: the command exactly as written, and
+    // only one plain command that is safe to run without a prompt.
+    fn allowable(&self, cmd: &str) -> Option<&str> {
+        self.allowable
+            .get_or_init(|| {
+                (tools::is_plain_command(cmd) && tools::skips_prompt_safely(cmd, self.cwd))
+                    .then(|| tools::rule_subjects(cmd).into_iter().next())
+                    .flatten()
+            })
+            .as_deref()
+    }
+
+    fn paths(&self) -> &[PathBuf] {
+        self.paths
+            .get_or_init(|| tools::touched_paths(self.name, self.input, self.cwd))
+    }
+}
+
 // Does a rule cover this call? A network entry matches the host. For a
 // permissions rule the tool part is a hook-style matcher (Claude Code names
 // included) and the pattern is matched against the command for shell tools,
@@ -1148,13 +1203,8 @@ fn split_rule(rule: &str) -> (&str, Option<&str>) {
 // and the touched paths (project-relative, or absolute) for file tools. An
 // allow rule must cover a whole plain command and every path; ask and deny
 // rules match any part of a compound command and any path.
-fn rule_covers(
-    rule: &config::PolicyRule,
-    name: &str,
-    input: &serde_json::Value,
-    cwd: &Path,
-    host: Option<&str>,
-) -> bool {
+fn rule_covers(rule: &config::PolicyRule, call: &RuledCall) -> bool {
+    let (name, input, cwd, host) = (call.name, call.input, call.cwd, call.host);
     if rule.network {
         return host.is_some_and(|h| host_matches(&rule.rule, h));
     }
@@ -1167,18 +1217,11 @@ fn rule_covers(
     let allow = rule.effect == config::RuleEffect::Allow;
     if let Some(cmd) = command_of(name, input) {
         let pat = command_pattern(pat);
-        // An allow rule covers the command exactly as written; deny and ask
-        // rules see through wrappers, shells and git's own options.
         return if allow {
-            tools::is_plain_command(cmd)
-                && tools::skips_prompt_safely(cmd, cwd)
-                && tools::rule_subjects(cmd)
-                    .first()
-                    .is_some_and(|c| hooks::glob_match(&pat, c))
+            call.allowable(cmd)
+                .is_some_and(|c| hooks::glob_match(&pat, c))
         } else {
-            tools::guard_subjects(cmd)
-                .iter()
-                .any(|c| hooks::glob_match(&pat, c))
+            call.guarded(cmd).iter().any(|c| hooks::glob_match(&pat, c))
         };
     }
     if matches!(name, "web_search" | "websearch") {
@@ -1189,7 +1232,7 @@ fn rule_covers(
     if let Some(h) = host {
         return host_matches(pat.strip_prefix("domain:").unwrap_or(pat), h);
     }
-    let paths = tools::touched_paths(name, input, cwd);
+    let paths = call.paths();
     let hit = |p: &PathBuf| path_matches(pat, p, cwd);
     !paths.is_empty()
         && if allow {
@@ -1289,11 +1332,15 @@ fn rule_for<'a>(
     cwd: &Path,
     host: Option<&str>,
 ) -> Option<&'a config::PolicyRule> {
+    let call = RuledCall::new(name, input, cwd, host);
     rules
         .iter()
         .filter(|r| r.effect == effect)
-        .find(|r| rule_covers(r, name, input, cwd, host))
+        .find(|r| rule_covers(r, &call))
 }
+
+#[cfg(test)]
+mod rule_tests;
 
 /// Whether settings allow screenshot_url to open `host`: a `network.allow`
 /// entry or an allow rule for the tool that covers it.
