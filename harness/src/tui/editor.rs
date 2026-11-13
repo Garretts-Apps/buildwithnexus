@@ -749,6 +749,10 @@ pub(super) fn render_suggestions(sug: &[String], sel: usize) {
         .map(|c| str_width(c))
         .max()
         .unwrap_or(0);
+    // Under the render lock: an output frame from the ticker thread saves
+    // and restores the cursor too, and must not land between this save and
+    // its restore.
+    let _frame = render_lock();
     invalidate_inline_pixels();
     let mut out = io::stdout();
     let _ = execute!(out, SavePosition);
@@ -1430,6 +1434,8 @@ fn reverse_search(buf: &mut Vec<char>, cursor: &mut usize, row: u16) -> Option<S
         {
             let mut out = io::stdout();
             if ALT_SCREEN.load(Ordering::Relaxed) {
+                // Drawn over the composer's input row.
+                COMPOSER_PAINTED.store(false, Ordering::Relaxed);
                 queue_composer_box(&mut out);
                 let _ = write!(
                     out,
@@ -1593,7 +1599,7 @@ pub(super) fn read_line_raw_prefill(
             if show < sug_rows {
                 // Popup shrank or closed: repaint the transcript rows it
                 // covered, then restore the composer it clobbers.
-                render_output();
+                repaint_output();
                 redraw(prompt, start, &buf, cursor, &mut scroll);
             }
             if !sug.is_empty() {

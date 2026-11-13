@@ -1,0 +1,75 @@
+[package]
+name = "buildwithnexus"
+version = "0.19.0"
+edition = "2021"
+rust-version = "1.94"
+description = "An agentic AI coding CLI in Rust — remote or local models, full TUI with live autocomplete, clean diffs, multimodal input, hooks, and checkpoints"
+license = "MIT"
+repository = "https://github.com/Garretts-Apps/buildwithnexus"
+homepage = "https://buildwithnexus.dev"
+readme = "../README.md"
+keywords = ["ai", "agent", "cli", "tui", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+default-run = "buildwithnexus"
+build = "build.rs"
+
+# `cargo install buildwithnexus` installs BOTH binaries: the full name and
+# the short `bwn` alias (same entry point).
+[[bin]]
+name = "buildwithnexus"
+path = "src/main.rs"
+
+[[bin]]
+name = "bwn"
+path = "src/bwn.rs"
+# The alias shim collides with the bwn crate's bin in workspace `cargo doc`
+# output paths, and a two-line shim has nothing to document anyway.
+doc = false
+
+[dependencies]
+# Cross-platform terminal control (alt-screen, raw mode) — needed for npm distribution to Windows too.
+crossterm = "0.29"
+# Blocking HTTP — no async runtime, fast cold start. Built without its own
+# TLS: net/http.rs plugs the rustls below in through ureq's connector API,
+# which is outside ureq's semver promise (it changes only in minor
+# releases), hence ~3.5.
+ureq = { version = "~3.5.2", default-features = false, features = ["json", "gzip"] }
+# The one TLS stack, configured in net.rs: the bundled webpki roots plus the
+# OS trust store (or SSL_CERT_FILE), so a TLS-inspecting proxy whose CA IT
+# installed is trusted like curl trusts it.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "1"
+rustls-native-certs = "0.8"
+# net.rs reads each URL's host with it, and requests go out as it spells them.
+url = "2"
+# Already in the tree through rustls; MCP OAuth takes SHA-256 (the PKCE
+# challenge) and the OS random source (verifier and state) from it.
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+# Signal-safe terminal restore: SIGTERM/SIGHUP while in the alternate screen
+# must leave the terminal usable, and a signal handler may only call
+# async-signal-safe functions — raw write(2), tcsetattr(2), _exit(2).
+# Already in the tree transitively via crossterm; this makes it direct.
+libc = "0.2"
+
+# Windows builds embed a version resource and an application manifest, so the
+# .exe names its product, publisher and version like other signed software.
+# build.rs does nothing for other targets.
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+# Performance suite. Drop default features (rayon/plotters/html) but keep the
+# bits `cargo bench` needs to actually run the harness.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# A throwaway CA and server certificate per test run, so no private key is
+# committed as a fixture.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+
+[[bench]]
+name = "perf"
+harness = false
