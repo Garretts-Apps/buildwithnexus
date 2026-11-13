@@ -362,6 +362,20 @@ fn bench_read_large_file(c: &mut Criterion) {
     g.finish();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// The tool table's lookup by name, through `is_parallel_safe` (one lookup
+// and one map probe): the first row, the last row, and names in no row,
+// which scan the whole table.
+fn bench_tool_lookup(c: &mut Criterion) {
+    let input = serde_json::json!({"path": "a"});
+    let mut g = c.benchmark_group("tool_lookup");
+    for name in ["read", "grep_files", "spawn_subagent", "mcp__server__tool"] {
+        g.bench_function(name, |b| {
+            b.iter(|| tools::is_parallel_safe(black_box(name), black_box(&input)))
+        });
+    }
+    g.finish();
+}
 // ── end perf-tools ──────────────────────────────────────────────────────
 
 criterion_group!(
@@ -369,6 +383,7 @@ criterion_group!(
     bench_tool_batch,
     bench_grep_files,
     bench_read_large_file,
+    bench_tool_lookup,
     bench_wrap_cache,
     bench_body_builders,
     bench_cache_pass,
