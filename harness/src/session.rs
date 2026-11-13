@@ -1,8 +1,15 @@
-// Persisted sessions. Each run's transcript is written to
+// Persisted sessions. Each run's transcript is kept in
 // ~/.buildwithnexus/sessions/<id>.json so past work can be listed and resumed
-// (`/resume`, `--continue`, `--resume <id>`). Plain file IO + serde — the
-// transcript types are serializable (see provider::Msg).
+// (`/resume`, `--continue`, `--resume <id>`).
+//
+// The file is a log (JSON Lines, schema 2; docs/VERSIONING.md has the layout):
+// a header line, then one line per message. Saving after a tool round appends
+// the round's messages and fsyncs them; the whole file is written again only
+// when history changed (compaction, /rewind, /rename, a new model or title).
+// Files in the single-object layout of schema 1 still load, and are written
+// in the new layout the next time they are saved.
 
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,9 +20,10 @@ use crate::config;
 use crate::provider::Msg;
 
 /// Layout version of a session file, saved as `schema_version` (see
-/// docs/VERSIONING.md). Files written before 0.15 have none and read as 1:
-/// the layout is the same.
-pub const SCHEMA_VERSION: u32 = 1;
+/// docs/VERSIONING.md). 2 is the log: a header line, then a line per message.
+/// 1 was one JSON object holding every message; files written before 0.15
+/// have no version and read as 1.
+pub const SCHEMA_VERSION: u32 = 2;
 
 fn schema_v1() -> u32 {
     1
@@ -23,8 +31,9 @@ fn schema_v1() -> u32 {
 
 /// Represents a persisted user conversation session.
 ///
-/// Sessions are stored as JSON files in `~/.buildwithnexus/sessions/<id>.json`
-/// and can be resumed across runs via `/resume` or `--continue`.
+/// Sessions are stored in `~/.buildwithnexus/sessions/<id>.json` and can be
+/// resumed across runs via `/resume` or `--continue`. Serialized, this is
+/// the schema 1 file layout, which is still read.
 #[derive(Serialize, Deserialize)]
 pub struct Session {
     #[serde(default = "schema_v1")]
@@ -53,9 +62,10 @@ impl Session {
     }
 }
 
-/// A saved session without its messages, which are counted but never built:
-/// listings and pickers read only this, so a session full of screenshots
-/// costs a scan, not an allocation per message.
+/// A saved session without its messages: listings and pickers read only
+/// this, from the file's header line, so a session full of screenshots costs
+/// one small read. Deserialized, it is a schema 1 file, whose messages are
+/// counted in a scan and never built.
 #[derive(Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -233,16 +243,29 @@ pub fn last_save_ok() -> bool {
     !SAVE_FAILING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Creates or updates a persisted session file for `id` from the provided transcript.
+/// Brings the session file for `id` up to date with the transcript: the
+/// messages it does not hold yet are appended, or the file is written again
+/// when the ones it holds are no longer the transcript's (compaction, a
+/// rewind, a new model). Every message is compared in full.
 ///
-/// Preserves the original creation timestamp across updates. A no-op if `msgs` is empty.
-/// Returns whether the session is on disk; a failure is also shown to the
-/// user once (until a save succeeds again).
+/// Preserves the original creation timestamp and name. A no-op if `msgs` is
+/// empty. Returns whether the session is on disk; a failure is also shown to
+/// the user once (until a save succeeds again).
 pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> bool {
-    if msgs.is_empty() {
-        return true;
-    }
-    let result = save_now(id, cwd, model, msgs);
+    saved(id, save_now(id, cwd, model, msgs, Check::Full))
+}
+
+/// `save` for the end of a tool round, where its cost must not grow with the
+/// conversation: a message saved earlier in this run is taken as unchanged
+/// when its text still sits at the same place in memory with the same length
+/// and the same first and last bytes, and is compared in full only when one
+/// of those moved. `save`, which every turn starts and ends with, compares
+/// everything.
+pub fn save_round(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> bool {
+    saved(id, save_now(id, cwd, model, msgs, Check::Edges))
+}
+
+fn saved(_id: &str, result: Result<(), String>) -> bool {
     let was_failing = SAVE_FAILING.swap(result.is_err(), std::sync::atomic::Ordering::Relaxed);
     match result {
         Ok(()) => true,
@@ -257,57 +280,451 @@ pub fn save(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> bool {
     }
 }
 
-fn save_now(id: &str, cwd: &Path, model: &str, msgs: &[Msg]) -> Result<(), String> {
-    let _ = std::fs::create_dir_all(dir());
-    // Only the header of the previous save is read back, and the messages
-    // are serialized where they lie: this runs after every tool round.
-    let before = load_info(id);
-    // The same fields, in the same order, as `Session`.
-    #[derive(Serialize)]
-    struct Saved<'a> {
-        schema_version: u32,
-        id: &'a str,
-        title: String,
-        cwd: std::borrow::Cow<'a, str>,
-        model: &'a str,
-        created_ms: u128,
-        updated_ms: u128,
-        msgs: &'a [Msg],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-    }
-    let s = Saved {
-        schema_version: SCHEMA_VERSION,
-        id,
-        title: title_of(msgs),
-        cwd: cwd.to_string_lossy(),
-        model,
-        created_ms: before.as_ref().map(|s| s.created_ms).unwrap_or_else(now_ms),
-        updated_ms: now_ms(),
-        msgs,
-        name: before.and_then(|s| s.name),
-    };
-    write(id, &s)
+// ── The file ─────────────────────────────────────────────────────────────────
+
+// Line 1. `updated_ms` and `messages` come last and are padded to a fixed
+// width, so an append can bring them up to date in place: listings read this
+// line and nothing else.
+#[derive(Serialize, Deserialize)]
+struct Header {
+    schema_version: u32,
+    id: String,
+    title: String,
+    cwd: String,
+    model: String,
+    created_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    updated_ms: u128,
+    messages: usize,
 }
 
-fn write(id: &str, s: &impl Serialize) -> Result<(), String> {
-    let text = serde_json::to_string(s).map_err(|e| e.to_string())?;
-    let p = path(id);
+// Every line after the first. An object, so a later version can add other
+// kinds of record; one without `msg` is skipped.
+#[derive(Deserialize)]
+struct Record {
+    #[serde(default)]
+    msg: Option<Msg>,
+}
+
+// The fixed-width end of the header line, newline included.
+fn header_tail(updated_ms: u128, messages: usize) -> String {
+    format!(
+        ",\"updated_ms\":{:>20},\"messages\":{:>10}}}\n",
+        updated_ms.min(99_999_999_999_999_999_999),
+        messages.min(9_999_999_999)
+    )
+}
+
+const HEADER_TAIL_LEN: u64 = 58;
+
+fn header_line(h: &Header) -> Result<String, String> {
+    // The same fields, in the same order, as `Header` up to `name`.
+    #[derive(Serialize)]
+    struct Head<'a> {
+        schema_version: u32,
+        id: &'a str,
+        title: &'a str,
+        cwd: &'a str,
+        model: &'a str,
+        created_ms: u128,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+    }
+    let mut line = serde_json::to_string(&Head {
+        schema_version: h.schema_version,
+        id: &h.id,
+        title: &h.title,
+        cwd: &h.cwd,
+        model: &h.model,
+        created_ms: h.created_ms,
+        name: h.name.as_deref(),
+    })
+    .map_err(|e| e.to_string())?;
+    line.pop(); // the closing brace: the tail has its own
+    line.push_str(&header_tail(h.updated_ms, h.messages));
+    Ok(line)
+}
+
+fn push_record(out: &mut Vec<u8>, m: &Msg) -> Result<(), String> {
+    out.extend_from_slice(b"{\"msg\":");
+    serde_json::to_writer(&mut *out, m).map_err(|e| e.to_string())?;
+    out.extend_from_slice(b"}\n");
+    Ok(())
+}
+
+// What identifies the bytes this process last left in a session file: if any
+// of these differ, something else wrote it (another bwn on the same session,
+// `sessions rm`) and nothing may be appended on the strength of what this
+// process remembers.
+#[derive(Clone, Copy, PartialEq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    inode: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Stamp {
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Stamp {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+        }
+    }
+}
+
+// ── What this process knows is in a session file ─────────────────────────────
+
+// How closely `save` looks at the messages it has already written.
+#[derive(Clone, Copy, PartialEq)]
+enum Check {
+    /// Every byte of every message.
+    Full,
+    /// Where each string is in memory, its length and its first and last
+    /// bytes; every byte only for a message where one of those changed.
+    Edges,
+}
+
+// A session file this process wrote, and what it holds.
+struct Tracked {
+    path: PathBuf,
+    title: String,
+    cwd: String,
+    model: String,
+    created_ms: u128,
+    name: Option<String>,
+    header_len: u64,
+    stamp: Stamp,
+    /// Per message on disk: its edges print and its full print.
+    prints: Vec<(u64, u64)>,
+}
+
+// Newest last. A process saves a handful of sessions (its own, a subagent's,
+// a review's); the oldest is forgotten past this many, and a forgotten
+// session is simply written in full the next time it is saved.
+const TRACKED_MAX: usize = 32;
+static TRACKED: Mutex<Vec<Tracked>> = Mutex::new(Vec::new());
+
+fn take_tracked(path: &Path) -> Option<Tracked> {
+    let mut all = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    let at = all.iter().position(|t| t.path == path)?;
+    Some(all.remove(at))
+}
+
+fn keep_tracked(t: Tracked) {
+    let mut all = TRACKED.lock().unwrap_or_else(|e| e.into_inner());
+    all.retain(|o| o.path != t.path);
+    if all.len() >= TRACKED_MAX {
+        all.remove(0);
+    }
+    all.push(t);
+}
+
+// A fingerprint of a message. `edges` hashes, for each string, its address,
+// its length and up to EDGE bytes from each end; otherwise every byte and no
+// address, so equal messages have equal prints wherever they live.
+struct Print {
+    h: u64,
+    edges: bool,
+}
+
+const EDGE: usize = 64;
+
+impl Print {
+    fn of(m: &Msg, edges: bool) -> u64 {
+        let mut p = Print {
+            h: 0x9e37_79b9_7f4a_7c15,
+            edges,
+        };
+        p.msg(m);
+        p.h
+    }
+
+    fn word(&mut self, w: u64) {
+        self.h = (self.h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn raw(&mut self, b: &[u8]) {
+        let (chunks, rest) = b.as_chunks::<8>();
+        for c in chunks {
+            self.word(u64::from_le_bytes(*c));
+        }
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        self.word(u64::from_le_bytes(last));
+    }
+
+    fn str(&mut self, s: &str) {
+        let b = s.as_bytes();
+        self.word(b.len() as u64);
+        if !self.edges {
+            self.raw(b);
+        } else {
+            self.word(b.as_ptr() as usize as u64);
+            if b.len() <= 2 * EDGE {
+                self.raw(b);
+            } else {
+                self.raw(&b[..EDGE]);
+                self.raw(&b[b.len() - EDGE..]);
+            }
+        }
+    }
+
+    fn images(&mut self, images: &[(String, String)]) {
+        self.word(images.len() as u64);
+        for (kind, data) in images {
+            self.str(kind);
+            self.str(data);
+        }
+    }
+
+    fn json(&mut self, v: &serde_json::Value) {
+        use serde_json::Value;
+        match v {
+            Value::Null => self.word(0),
+            Value::Bool(b) => self.word(1 + u64::from(*b)),
+            Value::Number(n) => {
+                self.word(3);
+                self.word(n.as_f64().map_or(0, f64::to_bits));
+                self.word(n.as_i64().map_or(0, |i| i as u64) ^ n.as_u64().unwrap_or(0));
+            }
+            Value::String(s) => {
+                self.word(4);
+                self.str(s);
+            }
+            Value::Array(a) => {
+                self.word(5);
+                self.word(a.len() as u64);
+                for v in a {
+                    self.json(v);
+                }
+            }
+            Value::Object(o) => {
+                self.word(6);
+                self.word(o.len() as u64);
+                for (k, v) in o {
+                    self.str(k);
+                    self.json(v);
+                }
+            }
+        }
+    }
+
+    fn msg(&mut self, m: &Msg) {
+        match m {
+            Msg::System(t) => {
+                self.word(1);
+                self.str(t);
+            }
+            Msg::User(t) => {
+                self.word(2);
+                self.str(t);
+            }
+            Msg::UserImages { text, images } => {
+                self.word(3);
+                self.str(text);
+                self.images(images);
+            }
+            Msg::Assistant { text, calls } => {
+                self.word(4);
+                self.str(text);
+                self.word(calls.len() as u64);
+                for c in calls {
+                    self.str(&c.id);
+                    self.str(&c.name);
+                    self.json(&c.input);
+                }
+            }
+            Msg::Tool(results) => {
+                self.word(5);
+                self.word(results.len() as u64);
+                for r in results {
+                    self.str(&r.id);
+                    self.str(&r.content);
+                    self.word(u64::from(r.is_error));
+                    self.images(&r.images);
+                }
+            }
+        }
+    }
+}
+
+impl Tracked {
+    // Whether the file's messages are still the first messages of `msgs`.
+    fn still_leads(&mut self, msgs: &[Msg], check: Check) -> bool {
+        if msgs.len() < self.prints.len() {
+            return false;
+        }
+        for (m, (edges, full)) in msgs.iter().zip(&mut self.prints) {
+            let now = Print::of(m, true);
+            if check == Check::Edges && now == *edges {
+                continue;
+            }
+            if Print::of(m, false) != *full {
+                return false;
+            }
+            // Same message at a new address (the transcript was rebuilt).
+            *edges = now;
+        }
+        true
+    }
+
+    // Appends the messages the file does not hold yet: one write for the
+    // records (so two processes on one session never interleave halves),
+    // the header's count and time brought up to date in place, one fsync.
+    fn append(&mut self, msgs: &[Msg]) -> Result<(), String> {
+        let new = &msgs[self.prints.len()..];
+        if new.is_empty() {
+            return Ok(());
+        }
+        let io = |e: std::io::Error| e.to_string();
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(io)?;
+        let mut head = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(io)?;
+        // Both handles must be the file this process left: the header is
+        // patched at an offset that is only right for that file.
+        if Stamp::of(&log.metadata().map_err(io)?) != self.stamp
+            || Stamp::of(&head.metadata().map_err(io)?) != self.stamp
+        {
+            return Err("the session file changed underneath".into());
+        }
+        let tail_at = self.header_len - HEADER_TAIL_LEN;
+        let mut tail = [0u8; HEADER_TAIL_LEN as usize];
+        head.seek(SeekFrom::Start(tail_at)).map_err(io)?;
+        head.read_exact(&mut tail).map_err(io)?;
+        if !tail.starts_with(b",\"updated_ms\":") || !tail.ends_with(b"}\n") {
+            return Err("the session file's header is not the one written".into());
+        }
+
+        let mut records = Vec::new();
+        let mut prints = Vec::with_capacity(new.len());
+        for m in new {
+            push_record(&mut records, m)?;
+            prints.push((Print::of(m, true), Print::of(m, false)));
+        }
+        log.write_all(&records).map_err(io)?;
+        let total = self.prints.len() + new.len();
+        head.seek(SeekFrom::Start(tail_at)).map_err(io)?;
+        head.write_all(header_tail(now_ms(), total).as_bytes())
+            .map_err(io)?;
+        // The records are on disk before this returns, like every save
+        // before the log: a crash loses at most the round being written.
+        log.sync_data().map_err(io)?;
+        self.stamp = Stamp::of(&log.metadata().map_err(io)?);
+        self.prints.extend(prints);
+        Ok(())
+    }
+}
+
+fn save_now(id: &str, cwd: &Path, model: &str, msgs: &[Msg], check: Check) -> Result<(), String> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    let path = path(id);
+    let title = title_of(msgs);
+    let cwd = cwd.to_string_lossy();
+    let mut kept = None;
+    if let Some(mut t) = take_tracked(&path) {
+        if t.title == title
+            && t.cwd == cwd
+            && t.model == model
+            && t.still_leads(msgs, check)
+            && t.append(msgs).is_ok()
+        {
+            keep_tracked(t);
+            return Ok(());
+        }
+        // History changed, the file did, or the append failed part-way:
+        // writing the whole file again puts every one of those right.
+        kept = Some((t.created_ms, t.name));
+    }
+    let _ = std::fs::create_dir_all(dir());
+    // The file's own header wins: another process may have renamed the
+    // session since this one last wrote it.
+    let before = match read_info(&path) {
+        Some(Ok(info)) => Some((info.created_ms, info.name)),
+        _ => kept,
+    };
+    let (created_ms, name) = before.unwrap_or_else(|| (now_ms(), None));
+    let header = Header {
+        schema_version: SCHEMA_VERSION,
+        id: id.to_string(),
+        title,
+        cwd: cwd.into_owned(),
+        model: model.to_string(),
+        created_ms,
+        name,
+        updated_ms: now_ms(),
+        messages: msgs.len(),
+    };
+    write_whole(&path, header, msgs).map(keep_tracked)
+}
+
+// Writes the whole file: to a temp file, flushed, then renamed over the old
+// one, so a crash leaves either the old file or the new one, never a mix
+// (and a schema 1 file is replaced only by a complete schema 2 one).
+fn write_whole(path: &Path, header: Header, msgs: &[Msg]) -> Result<Tracked, String> {
+    let line = header_line(&header)?;
+    let mut text = line.clone().into_bytes();
+    let mut prints = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        push_record(&mut text, m)?;
+        prints.push((Print::of(m, true), Print::of(m, false)));
+    }
     // list() only picks up `.json` files, so the temp file is invisible
     // even if a crash leaves it behind.
-    crate::config::atomic_write(&p, text.as_bytes(), crate::config::Perm::Default)
-        .map_err(|e| format!("could not write {}: {e}", p.display()))
+    crate::config::atomic_write(path, &text, crate::config::Perm::Default)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    let stamp = std::fs::metadata(path)
+        .map(|m| Stamp::of(&m))
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(Tracked {
+        path: path.to_path_buf(),
+        title: header.title,
+        cwd: header.cwd,
+        model: header.model,
+        created_ms: header.created_ms,
+        name: header.name,
+        header_len: line.len() as u64,
+        stamp,
+        prints,
+    })
 }
 
 /// Names a saved session (/rename). The name replaces the first prompt in
 /// listings and survives later saves.
 pub fn rename(id: &str, name: &str) -> Result<(), String> {
-    let Some(mut s) = load(id) else {
+    let Some(s) = load(id) else {
         return Err("nothing to name yet — the session is saved after its first message".into());
     };
     let name = name.trim();
-    s.name = (!name.is_empty()).then(|| name.chars().take(80).collect());
-    write(id, &s)
+    let path = path(id);
+    // The header changes length, so the file is written again; the next
+    // save reads the name back from it.
+    let _ = take_tracked(&path);
+    let header = Header {
+        schema_version: SCHEMA_VERSION,
+        id: s.id,
+        title: s.title,
+        cwd: s.cwd,
+        model: s.model,
+        created_ms: s.created_ms,
+        name: (!name.is_empty()).then(|| name.chars().take(80).collect()),
+        updated_ms: s.updated_ms,
+        messages: s.msgs.len(),
+    };
+    write_whole(&path, header, &s.msgs).map(|_| ())
 }
 
 /// Deletes a saved session; returns it so the caller can say which.
@@ -315,43 +732,140 @@ pub fn remove(id: &str) -> Result<Session, String> {
     let Some(s) = load(id) else {
         return Err(format!("no session '{id}' — bwn sessions lists them"));
     };
+    let _ = take_tracked(&path(id));
     std::fs::remove_file(path(id)).map_err(|e| format!("could not delete {id}: {e}"))?;
     Ok(s)
 }
 
 // A session file that exists but fails to parse is data the user thinks is
 // saved — surface it instead of silently dropping it from /resume listings.
-fn parse_session<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Option<T> {
-    match serde_json::from_str(text) {
+fn warn_corrupt(path: &Path, e: &str) {
+    // tui::line, not eprintln — this runs inside the alt-screen TUI
+    // during /resume and a raw write corrupts the display.
+    crate::tui::line(&crate::tui::yellow(&format!(
+        "  ⚠ skipping corrupt session file {}: {e}",
+        path.display()
+    )));
+}
+
+fn newer_schema(v: u32) -> String {
+    format!(
+        "it was saved by a newer bwn (session schema {v}; this one reads up to {SCHEMA_VERSION})"
+    )
+}
+
+// The whole session from a file's text, in either layout. In the log, a
+// last line that is not a whole record is what a crash mid-append leaves:
+// it is dropped and every record before it kept.
+fn parse_session(text: &str) -> Result<Session, String> {
+    let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
+    let Ok(h) = serde_json::from_str::<Header>(first) else {
+        return serde_json::from_str::<Session>(text).map_err(|e| e.to_string());
+    };
+    if h.schema_version > SCHEMA_VERSION {
+        return Err(newer_schema(h.schema_version));
+    }
+    let mut msgs = Vec::with_capacity(h.messages.min(1 << 16));
+    let mut lines = rest.split('\n').enumerate().peekable();
+    while let Some((i, line)) = lines.next() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(r) => msgs.extend(r.msg),
+            // Nothing but blank lines after it: the torn end of the file.
+            Err(_) if lines.clone().all(|(_, l)| l.is_empty()) => break,
+            Err(e) => return Err(format!("line {}: {e}", i + 2)),
+        }
+    }
+    Ok(Session {
+        schema_version: h.schema_version,
+        id: h.id,
+        title: h.title,
+        cwd: h.cwd,
+        model: h.model,
+        created_ms: h.created_ms,
+        updated_ms: h.updated_ms,
+        msgs,
+        name: h.name,
+    })
+}
+
+/// Loads a persisted session by its ID from disk, if it exists and is valid.
+/// Warns in the transcript if the file exists but cannot be parsed.
+pub fn load(id: &str) -> Option<Session> {
+    let path = path(id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    count_read(text.len());
+    match parse_session(&text) {
         Ok(s) => Some(s),
         Err(e) => {
-            // tui::line, not eprintln — this runs inside the alt-screen TUI
-            // during /resume and a raw write corrupts the display.
-            crate::tui::line(&crate::tui::yellow(&format!(
-                "  ⚠ skipping corrupt session file {}: {e}",
-                path.display()
-            )));
+            warn_corrupt(&path, &e);
             None
         }
     }
 }
 
-/// Loads a persisted session by its ID from disk, if it exists and is valid JSON.
-/// Warns on stderr if the file exists but cannot be parsed.
-pub fn load(id: &str) -> Option<Session> {
-    let path = path(id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    parse_session(&path, &text)
+// Bytes this thread has read from session files, so a test can hold a
+// listing to its headers.
+#[cfg(test)]
+thread_local! {
+    static BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn load_info(id: &str) -> Option<SessionInfo> {
-    let path = path(id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    parse_session(&path, &text)
+fn count_read(_n: usize) {
+    #[cfg(test)]
+    BYTES_READ.with(|b| b.set(b.get() + _n));
+}
+
+// What a listing shows for the session file at `path`, from its header line
+// alone; a schema 1 file is one object and is scanned whole. None when the
+// file cannot be read, Err when it is not a session.
+fn read_info(path: &Path) -> Option<Result<SessionInfo, String>> {
+    // A header is a few hundred bytes: one small read finds its end.
+    const FIRST_READ: usize = 2048;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; FIRST_READ];
+    let mut n = 0;
+    while n < FIRST_READ {
+        match f.read(&mut buf[n..]).ok()? {
+            0 => break,
+            got => n += got,
+        }
+    }
+    buf.truncate(n);
+    count_read(n);
+    let header = |buf: &[u8]| {
+        let end = buf.iter().position(|b| *b == b'\n').unwrap_or(buf.len());
+        serde_json::from_slice::<Header>(&buf[..end]).ok()
+    };
+    let mut found = header(&buf);
+    if found.is_none() && n == FIRST_READ {
+        // A header longer than the first read (a very long folder name),
+        // or a schema 1 file.
+        let more = f.read_to_end(&mut buf).ok()?;
+        count_read(more);
+        found = header(&buf);
+    }
+    Some(match found {
+        Some(h) if h.schema_version > SCHEMA_VERSION => Err(newer_schema(h.schema_version)),
+        Some(h) => Ok(SessionInfo {
+            id: h.id,
+            title: h.title,
+            cwd: h.cwd,
+            model: h.model,
+            created_ms: h.created_ms,
+            updated_ms: h.updated_ms,
+            msg_count: h.messages,
+            name: h.name,
+        }),
+        None => serde_json::from_slice::<SessionInfo>(&buf).map_err(|e| e.to_string()),
+    })
 }
 
 /// Lists all persisted sessions, ordered newest-first by last update timestamp.
-/// Corrupt session files are skipped with a warning on stderr.
+/// Only each file's header line is read. Corrupt session files are skipped
+/// with a warning in the transcript.
 pub fn list() -> Vec<SessionInfo> {
     let mut v: Vec<SessionInfo> = match std::fs::read_dir(dir()) {
         Ok(rd) => rd
@@ -359,8 +873,13 @@ pub fn list() -> Vec<SessionInfo> {
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
             .filter_map(|e| {
                 let path = e.path();
-                let text = std::fs::read_to_string(&path).ok()?;
-                parse_session(&path, &text)
+                match read_info(&path)? {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        warn_corrupt(&path, &e);
+                        None
+                    }
+                }
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -788,8 +1307,10 @@ mod tests {
                 &[Msg::User("v".into())],
             );
             let text = std::fs::read_to_string(path("0000000000000005")).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let header = text.lines().next().unwrap();
+            let v: serde_json::Value = serde_json::from_str(header).unwrap();
             assert_eq!(v["schema_version"], SCHEMA_VERSION);
+            assert_eq!(SCHEMA_VERSION, 2);
             assert_eq!(
                 load("0000000000000005").unwrap().schema_version,
                 SCHEMA_VERSION
@@ -817,6 +1338,454 @@ mod tests {
             let s = load("0000000000000006").unwrap();
             assert_eq!(s.schema_version, SCHEMA_VERSION);
             assert_eq!(s.created_ms, 1, "the original creation time is kept");
+        });
+    }
+
+    // ── The log (schema 2) ──────────────────────────────────────────────────
+
+    fn json(msgs: &[Msg]) -> String {
+        serde_json::to_string(msgs).unwrap()
+    }
+
+    // What a tool round adds: the model's turn and the tools' answer.
+    fn round(i: usize) -> [Msg; 2] {
+        [
+            Msg::Assistant {
+                text: format!("reading module {i}"),
+                calls: vec![crate::provider::ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": format!("src/m{i}.rs"), "limit": 200}),
+                }],
+            },
+            Msg::Tool(vec![crate::provider::ToolResult {
+                id: format!("c{i}"),
+                content: format!("// module {i}\n").repeat(40),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+        ]
+    }
+
+    // As a bwn started later would find the session: nothing remembered.
+    fn new_process(id: &str) {
+        let _ = take_tracked(&path(id));
+    }
+
+    #[cfg(unix)]
+    fn inode(id: &str) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path(id)).unwrap())
+    }
+    #[cfg(not(unix))]
+    fn inode(_id: &str) -> u64 {
+        0
+    }
+
+    fn file(id: &str) -> String {
+        std::fs::read_to_string(path(id)).unwrap()
+    }
+
+    #[test]
+    fn the_header_ends_in_a_tail_of_one_fixed_width() {
+        assert_eq!(header_tail(0, 0).len() as u64, HEADER_TAIL_LEN);
+        assert_eq!(
+            header_tail(1_790_000_000_000, 412).len() as u64,
+            HEADER_TAIL_LEN
+        );
+        assert_eq!(
+            header_tail(u128::MAX, usize::MAX).len() as u64,
+            HEADER_TAIL_LEN
+        );
+        let h = Header {
+            schema_version: SCHEMA_VERSION,
+            id: "i".into(),
+            title: "t \"quoted\"\nline".into(),
+            cwd: "/p".into(),
+            model: "m".into(),
+            created_ms: 7,
+            name: Some("n".into()),
+            updated_ms: 9,
+            messages: 3,
+        };
+        let line = header_line(&h).unwrap();
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+        let back: Header = serde_json::from_str(&line).unwrap();
+        assert_eq!((back.updated_ms, back.messages, back.created_ms), (9, 3, 7));
+        assert_eq!(back.name.as_deref(), Some("n"));
+        assert_eq!(back.title, h.title);
+    }
+
+    #[test]
+    fn a_schema_1_file_loads_lists_and_is_migrated_by_the_next_save() {
+        with_home(|| {
+            let id = "0000000000000020";
+            let _ = std::fs::create_dir_all(dir());
+            // As 0.19 wrote it: one object, every message inside.
+            let old = r#"{"schema_version":1,"id":"0000000000000020","title":"old task","cwd":"/p","model":"m","created_ms":11,"updated_ms":22,"msgs":[{"System":"sys"},{"User":"old task"},{"Assistant":{"text":"done","calls":[]}}],"name":"kept name"}"#;
+            std::fs::write(path(id), old).unwrap();
+
+            let listed = list();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].msg_count, 3);
+            assert_eq!(listed[0].label(), "kept name");
+            let s = load(id).expect("a schema 1 file loads");
+            assert_eq!((s.schema_version, s.msgs.len()), (1, 3));
+            assert_eq!(file(id), old, "reading never rewrites it");
+
+            // Resumed and saved: the same session, in the new layout.
+            let mut msgs = s.msgs;
+            msgs.push(Msg::User("and one more thing".into()));
+            assert!(save(id, Path::new("/p"), "m", &msgs));
+            let text = file(id);
+            assert!(text.starts_with("{\"schema_version\":2,"), "{text}");
+            assert_eq!(
+                text.lines().count(),
+                1 + 4,
+                "a header, then a line a message"
+            );
+            let s = load(id).unwrap();
+            assert_eq!(s.schema_version, 2);
+            assert_eq!(json(&s.msgs), json(&msgs));
+            assert_eq!(s.created_ms, 11, "the creation time is kept");
+            assert_eq!(s.label(), "kept name");
+            assert_eq!(s.title, "old task");
+            assert_eq!(list()[0].msg_count, 4);
+            // Replaced by a rename of a complete file: nothing is left over.
+            let left: Vec<_> = std::fs::read_dir(dir()).unwrap().collect();
+            assert_eq!(left.len(), 1);
+        });
+    }
+
+    #[test]
+    fn a_round_is_appended_and_the_whole_log_loads_back() {
+        with_home(|| {
+            let id = "0000000000000021";
+            let cwd = Path::new("/p");
+            let mut msgs = vec![Msg::System("sys".into()), Msg::User("fix it".into())];
+            assert!(save(id, cwd, "m", &msgs));
+            let (first_inode, mut len) = (inode(id), file(id).len());
+            let created = load(id).unwrap().created_ms;
+            // A screenshot, then forty rounds on top of it.
+            let shot = "QUJD".repeat(50_000);
+            msgs.push(Msg::UserImages {
+                text: "see this".into(),
+                images: vec![("image/png".into(), shot.clone())],
+            });
+            assert!(save_round(id, cwd, "m", &msgs));
+            len = file(id).len().max(len);
+            for i in 0..40 {
+                msgs.extend(round(i));
+                assert!(save_round(id, cwd, "m", &msgs));
+                let now = file(id).len();
+                let mut added = Vec::new();
+                for m in &msgs[msgs.len() - 2..] {
+                    push_record(&mut added, m).unwrap();
+                }
+                assert_eq!(
+                    now - len,
+                    added.len(),
+                    "round {i} wrote its two records only"
+                );
+                len = now;
+            }
+            assert_eq!(
+                inode(id),
+                first_inode,
+                "the file was appended to, never replaced"
+            );
+            let text = file(id);
+            assert_eq!(text.matches(&shot).count(), 1, "the image is on disk once");
+            assert!(text.ends_with("}\n"));
+            assert_eq!(text.lines().count(), 1 + msgs.len());
+
+            let s = load(id).unwrap();
+            assert_eq!(json(&s.msgs), json(&msgs));
+            assert_eq!(s.created_ms, created);
+            assert!(s.updated_ms >= created);
+            // The header was kept up to date in place.
+            let info = &list()[0];
+            assert_eq!(info.msg_count, msgs.len());
+            assert_eq!(info.updated_ms, s.updated_ms);
+            // Nothing new: nothing written.
+            assert!(save_round(id, cwd, "m", &msgs) && save(id, cwd, "m", &msgs));
+            assert_eq!(file(id), text);
+        });
+    }
+
+    #[test]
+    fn a_torn_last_line_is_dropped_and_the_rest_kept() {
+        with_home(|| {
+            let id = "0000000000000022";
+            let cwd = Path::new("/p");
+            let mut msgs = vec![Msg::User("first".into())];
+            save(id, cwd, "m", &msgs);
+            for i in 0..3 {
+                msgs.extend(round(i));
+                save_round(id, cwd, "m", &msgs);
+            }
+            let whole = file(id);
+            // A crash part-way through an append: half a record, no newline.
+            for torn in [
+                format!("{whole}{{\"msg\":{{\"User\":\"half a mess"),
+                whole[..whole.len() - 9].to_string(),
+                format!("{whole}\0\0\0\0\0\0\0\0"),
+            ] {
+                std::fs::write(path(id), &torn).unwrap();
+                let s = load(id).expect("the rest of the log loads");
+                let kept = if torn.len() < whole.len() {
+                    msgs.len() - 1
+                } else {
+                    msgs.len()
+                };
+                assert_eq!(json(&s.msgs), json(&msgs[..kept]));
+                assert_eq!(list().len(), 1, "and it is still listed");
+            }
+            // A broken line with records after it is damage, not a torn end.
+            let mut lines: Vec<&str> = whole.lines().collect();
+            lines[2] = "{\"msg\":{\"User\":\"half";
+            std::fs::write(path(id), lines.join("\n") + "\n").unwrap();
+            assert!(load(id).is_none());
+
+            // Carrying on after a torn append writes the file whole again:
+            // this process, whose stamp no longer matches…
+            std::fs::write(path(id), format!("{whole}{{\"msg\":{{\"Us")).unwrap();
+            msgs.extend(round(9));
+            assert!(save_round(id, cwd, "m", &msgs));
+            assert_eq!(json(&load(id).unwrap().msgs), json(&msgs));
+            assert!(file(id).ends_with("}\n"));
+            // …and a later one, resuming what loaded.
+            let torn = file(id);
+            std::fs::write(path(id), &torn[..torn.len() - 20]).unwrap();
+            new_process(id);
+            let mut resumed = load(id).unwrap().msgs;
+            assert_eq!(resumed.len(), msgs.len() - 1);
+            resumed.push(Msg::User("carry on".into()));
+            assert!(save(id, cwd, "m", &resumed));
+            assert_eq!(json(&load(id).unwrap().msgs), json(&resumed));
+            for line in file(id).lines() {
+                serde_json::from_str::<serde_json::Value>(line).expect("every line is whole");
+            }
+        });
+    }
+
+    #[test]
+    fn rewritten_history_writes_the_file_again() {
+        with_home(|| {
+            let id = "0000000000000023";
+            let cwd = Path::new("/p");
+            let mut msgs = vec![Msg::System("sys".into()), Msg::User("big job".into())];
+            save(id, cwd, "m", &msgs);
+            for i in 0..6 {
+                msgs.extend(round(i));
+                save_round(id, cwd, "m", &msgs);
+            }
+            let created = load(id).unwrap().created_ms;
+
+            // Compaction: the middle of the conversation becomes a summary.
+            let tail = msgs.split_off(msgs.len() - 2);
+            msgs.truncate(1);
+            msgs.push(Msg::User("big job\n\n[summary of earlier work]".into()));
+            msgs.extend(tail);
+            assert!(save_round(id, cwd, "m", &msgs));
+            let s = load(id).unwrap();
+            assert_eq!(json(&s.msgs), json(&msgs));
+            assert_eq!(file(id).lines().count(), 1 + msgs.len());
+            assert_eq!(s.created_ms, created);
+            assert_eq!(list()[0].msg_count, msgs.len());
+
+            // An old tool result cleared where it lies (same count).
+            msgs.extend(round(7));
+            save_round(id, cwd, "m", &msgs);
+            if let Msg::Tool(r) = &mut msgs[3] {
+                r[0].content = "[cleared]".into();
+            }
+            msgs.extend(round(8));
+            assert!(save_round(id, cwd, "m", &msgs));
+            assert_eq!(json(&load(id).unwrap().msgs), json(&msgs));
+
+            // The same messages rebuilt elsewhere in memory are not a
+            // rewrite: the round is appended.
+            let before = inode(id);
+            let mut msgs = msgs.clone();
+            msgs.extend(round(9));
+            assert!(save_round(id, cwd, "m", &msgs));
+            assert_eq!(inode(id), before);
+            assert_eq!(json(&load(id).unwrap().msgs), json(&msgs));
+
+            // A change the round check cannot see (same place, same length,
+            // same edges) is put right by the save every turn ends with.
+            let Msg::System(sys) = &mut msgs[0] else {
+                panic!()
+            };
+            *sys = "s".repeat(400);
+            save(id, cwd, "m", &msgs);
+            let Msg::System(sys) = &mut msgs[0] else {
+                panic!()
+            };
+            sys.replace_range(200..203, "XYZ");
+            assert!(save(id, cwd, "m", &msgs));
+            assert_eq!(json(&load(id).unwrap().msgs), json(&msgs));
+
+            // A rewind drops messages; a new model is a new header.
+            msgs.truncate(3);
+            assert!(save_round(id, cwd, "m", &msgs));
+            assert_eq!(load(id).unwrap().msgs.len(), 3);
+            assert!(save_round(id, cwd, "other-model", &msgs));
+            assert_eq!(load(id).unwrap().model, "other-model");
+            assert_eq!(list()[0].model, "other-model");
+            // A rename mid-session survives the rounds after it.
+            rename(id, "the big job").unwrap();
+            msgs.extend(round(10));
+            assert!(save_round(id, cwd, "other-model", &msgs));
+            let s = load(id).unwrap();
+            assert_eq!(s.label(), "the big job");
+            assert_eq!(json(&s.msgs), json(&msgs));
+            assert_eq!(s.created_ms, created);
+        });
+    }
+
+    #[test]
+    fn a_resumed_session_is_appended_to_again() {
+        with_home(|| {
+            let id = "0000000000000024";
+            let cwd = Path::new("/p");
+            let mut msgs = vec![Msg::User("start".into())];
+            save(id, cwd, "m", &msgs);
+            msgs.extend(round(0));
+            save_round(id, cwd, "m", &msgs);
+            let created = load(id).unwrap().created_ms;
+
+            // Another run: `bwn continue`.
+            new_process(id);
+            let s = load(id).unwrap();
+            let mut msgs = s.msgs;
+            msgs.push(Msg::User("next".into()));
+            assert!(save(id, cwd, "m", &msgs));
+            let after_resume = inode(id);
+            for i in 1..4 {
+                msgs.extend(round(i));
+                assert!(save_round(id, cwd, "m", &msgs));
+            }
+            assert_eq!(inode(id), after_resume, "appended after the first save");
+            let s = load(id).unwrap();
+            assert_eq!(json(&s.msgs), json(&msgs));
+            assert_eq!(s.created_ms, created);
+            assert_eq!(list()[0].msg_count, msgs.len());
+        });
+    }
+
+    #[test]
+    fn two_runs_on_one_session_never_leave_half_a_record() {
+        with_home(|| {
+            let id = "0000000000000025";
+            let cwd = Path::new("/p");
+            let base = vec![Msg::User("shared".into())];
+            save(id, cwd, "m", &base);
+            // The first run's memory of the file, set aside while a second
+            // run (which knows nothing) saves its own continuation.
+            let first = take_tracked(&path(id)).unwrap();
+            let mut theirs = base.clone();
+            theirs.push(Msg::User("from the second run".into()));
+            assert!(save(id, cwd, "m", &theirs));
+            new_process(id);
+            keep_tracked(first);
+            // The first run's next round: the file is not the one it left,
+            // so it writes its own view whole instead of appending.
+            let mut ours = base.clone();
+            ours.extend(round(0));
+            assert!(save_round(id, cwd, "m", &ours));
+            assert_eq!(json(&load(id).unwrap().msgs), json(&ours));
+            for line in file(id).lines() {
+                serde_json::from_str::<serde_json::Value>(line).expect("every line is whole");
+            }
+        });
+    }
+
+    #[test]
+    fn a_failed_append_is_reported_and_not_called_saved() {
+        with_home(|| {
+            let id = "0000000000000026";
+            let cwd = Path::new("/p");
+            let mut msgs = vec![Msg::User("hi".into())];
+            assert!(save(id, cwd, "m", &msgs));
+            // The file goes away and a directory takes its place: neither
+            // the append nor the rewrite can land.
+            std::fs::remove_file(path(id)).unwrap();
+            std::fs::create_dir_all(path(id)).unwrap();
+            msgs.extend(round(0));
+            assert!(!save_round(id, cwd, "m", &msgs));
+            assert!(!last_save_ok());
+            msgs.extend(round(1));
+            assert!(!save_round(id, cwd, "m", &msgs));
+            // Saving works again: everything since is written.
+            std::fs::remove_dir_all(path(id)).unwrap();
+            msgs.extend(round(2));
+            assert!(save_round(id, cwd, "m", &msgs));
+            assert!(last_save_ok());
+            assert_eq!(json(&load(id).unwrap().msgs), json(&msgs));
+        });
+    }
+
+    #[test]
+    fn a_listing_reads_each_header_and_nothing_else() {
+        with_home(|| {
+            let cwd = Path::new("/p");
+            let mut total = 0;
+            for n in 0..3 {
+                let id = format!("000000000000003{n}");
+                let mut msgs = vec![Msg::User(format!("task {n}"))];
+                save(&id, cwd, "m", &msgs);
+                msgs.push(Msg::UserImages {
+                    text: "a screenshot".into(),
+                    images: vec![("image/png".into(), "QUJD".repeat(100_000))],
+                });
+                for i in 0..10 {
+                    msgs.extend(round(i));
+                    save_round(&id, cwd, "m", &msgs);
+                }
+                total += file(&id).len();
+            }
+            assert!(total > 1_200_000, "{total}");
+            BYTES_READ.with(|b| b.set(0));
+            let listed = list_here_first(cwd);
+            let read = BYTES_READ.with(|b| b.get());
+            assert_eq!(listed.len(), 3);
+            assert!(listed.iter().all(|s| s.msg_count == 22 && s.is_in(cwd)));
+            assert!(read <= 3 * 2048, "read {read} bytes of {total}");
+            // Opening one reads that one.
+            BYTES_READ.with(|b| b.set(0));
+            assert_eq!(load("0000000000000031").unwrap().msgs.len(), 22);
+            let read = BYTES_READ.with(|b| b.get());
+            assert!(read > 400_000 && read < total / 2, "{read}");
+        });
+    }
+
+    #[test]
+    fn a_file_from_a_newer_bwn_is_named_as_such() {
+        with_home(|| {
+            let _ = std::fs::create_dir_all(dir());
+            let line = header_line(&Header {
+                schema_version: SCHEMA_VERSION + 1,
+                id: "0000000000000040".into(),
+                title: "t".into(),
+                cwd: "/p".into(),
+                model: "m".into(),
+                created_ms: 1,
+                name: None,
+                updated_ms: 2,
+                messages: 0,
+            })
+            .unwrap();
+            std::fs::write(path("0000000000000040"), &line).unwrap();
+            assert!(parse_session(&line).is_err_and(|e| e.contains("newer bwn")));
+            assert!(load("0000000000000040").is_none());
+            assert!(list().is_empty());
+            // A record kind this version does not know is skipped.
+            let text = format!(
+                "{}{{\"msg\":{{\"User\":\"hi\"}}}}\n{{\"note\":\"later versions\"}}\n",
+                line.replace("\"schema_version\":3", "\"schema_version\":2")
+            );
+            assert!(parse_session(&text).is_ok_and(|s| s.msgs.len() == 1));
         });
     }
 
