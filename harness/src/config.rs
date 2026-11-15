@@ -318,11 +318,27 @@ pub struct Settings {
     /// `~/` is expanded; relative paths resolve against the project cwd.
     #[serde(default)]
     pub skill_dirs: Vec<String>,
-    /// OS-level sandbox for shell commands: "off" (default), "auto" (confine
-    /// when bwrap/sandbox-exec works, else run unsandboxed with a notice), or
-    /// "require" (refuse to run commands without a backend). See sandbox.rs.
+    /// OS-level sandbox for shell commands: "auto" (default since 0.21:
+    /// confine when a backend works, else run unsandboxed with a notice),
+    /// "off" (0.20's default; also `--sandbox off`), or "require" (refuse
+    /// to run commands without a backend). See sandbox.rs.
     #[serde(default = "default_sandbox")]
     pub sandbox: String,
+    /// Git-commit file-tool edits in a repository. Default true since 0.21.
+    /// `"auto_commit": false` or `--no-auto-commit` leaves edits uncommitted,
+    /// which is what 0.20 did.
+    #[serde(default = "default_true")]
+    pub auto_commit: bool,
+    /// Offer the `repo_map` tool. Default true since 0.21. The map is not
+    /// inserted into the prompt. `"repo_map": false` or `--no-repo-map`
+    /// hides the tool.
+    #[serde(default = "default_true")]
+    pub repo_map: bool,
+    /// Where a bare model name starting with `gemini` goes: "native" (the
+    /// Gemini preset; default since 0.21) or "openrouter" (0.20's
+    /// `google/<name>` route). `--route-gemini` overrides one run.
+    #[serde(default = "default_gemini_route")]
+    pub route_gemini: String,
     /// Whether sandboxed commands may reach the network (default true).
     #[serde(default = "default_true")]
     pub sandbox_network: bool,
@@ -430,7 +446,21 @@ fn default_permission() -> String {
 }
 
 fn default_sandbox() -> String {
-    "off".into()
+    "auto".into()
+}
+
+fn default_gemini_route() -> String {
+    "native".into()
+}
+
+/// `native` is the Gemini preset. `openrouter` is the 0.20 route
+/// (`google/<name>`).
+pub fn parse_gemini_route(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "native" | "gemini" => Some(true),
+        "openrouter" | "open-router" => Some(false),
+        _ => None,
+    }
 }
 
 fn default_true() -> bool {
@@ -468,6 +498,9 @@ impl Default for Settings {
             instruction_files: default_instruction_files(),
             skill_dirs: Vec::new(),
             sandbox: default_sandbox(),
+            auto_commit: true,
+            repo_map: true,
+            route_gemini: default_gemini_route(),
             images: default_auto(),
             notify: default_auto(),
             idle_notify_secs: None,
@@ -4019,6 +4052,21 @@ mod tests {
         assert_eq!(s.permission, "ask");
         assert_eq!(s.provider, "anthropic");
         assert!(s.base_url.is_none());
+        assert_eq!(s.sandbox, "auto");
+        assert!(s.auto_commit);
+        assert!(s.repo_map);
+        assert_eq!(s.route_gemini, "native");
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.sandbox, "auto");
+        assert!(old.auto_commit);
+        let off: Settings = serde_json::from_str(
+            r#"{"sandbox":"off","auto_commit":false,"repo_map":false,"route_gemini":"openrouter"}"#,
+        )
+        .unwrap();
+        assert_eq!(off.sandbox, "off");
+        assert!(!off.auto_commit);
+        assert!(!off.repo_map);
+        assert_eq!(parse_gemini_route(&off.route_gemini), Some(false));
     }
 
     #[test]

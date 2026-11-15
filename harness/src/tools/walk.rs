@@ -507,6 +507,34 @@ pub(super) fn collect_tree_in(
     }
 }
 
+const SOURCE_EXT: &[&str] = &[
+    "rs", "py", "go", "js", "jsx", "ts", "tsx", "mjs", "c", "h", "cc", "cpp", "hpp", "java", "kt",
+    "rb", "php", "swift", "cs", "scala", "sh",
+];
+
+/// Source files under `root` for the repo map, gitignore and the usual
+/// dependency folders skipped. Capped at `limit`.
+pub(super) fn source_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    let mut walk = Walk {
+        out: &mut out,
+        seen: &mut seen,
+        dirs: false,
+        files: true,
+        skip_sensitive: true,
+        linked: HashSet::new(),
+    };
+    walk.run(root);
+    out.retain(|p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXT.iter().any(|s| e.eq_ignore_ascii_case(s)))
+    });
+    out.truncate(limit);
+    out
+}
+
 #[cfg(test)]
 mod walker_tests {
     use super::*;

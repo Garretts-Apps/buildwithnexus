@@ -46,6 +46,7 @@ pub(crate) enum Tool {
     ListSkills,
     LoadSkill,
     KbQuery,
+    RepoMap,
     KbRecord,
     RuleCheck,
     Verify,
@@ -334,6 +335,8 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     spec("load_skill", LoadSkill),
     spec("list_skills", ListSkills),
     spec("kb_query", KbQuery).inline(),
+    // A tree walk, so it shares a batch with other searches.
+    spec("repo_map", RepoMap).spawn(),
     spec("kb_record", KbRecord).mutating(),
     spec("rule_check", RuleCheck),
     spec("verify", Verify),

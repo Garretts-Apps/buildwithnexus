@@ -4,13 +4,46 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.21.0] - 2026-11-15
+
+Five behavior changes that were proposed in the competitor analysis and
+approved. Each one has a setting and a flag that restores the 0.20 behavior.
+
+### Breaking changes
+- **The shell sandbox defaults to `auto`.** Commands run confined when a
+  backend works. `"sandbox": "off"` or `--sandbox off` runs them unsandboxed,
+  which was the default. A bad `sandbox` value in settings still warns and
+  leaves the sandbox off, so a typo cannot lock a session.
+- **Linux `auto` and `require` use Landlock and seccomp when bubblewrap is
+  not usable,** including in WSL when the kernel allows Landlock. Bubblewrap
+  is still preferred when it works (private `/tmp`, read-only `.git`).
+  Landlock cannot keep `.git` read-only inside a writable workspace, and it
+  allows writes under `/dev` so commands can open `/dev/null`. Opt out with
+  the same `"sandbox": "off"` / `--sandbox off`.
+- **`repo_map` is a tool, on by default.** The model can ask for a map of
+  files and top-level symbols. The map is not inserted into the prompt.
+  `"repo_map": false` or `--no-repo-map` hides the tool. Small context
+  windows still get the compact tool list, which does not include it.
+- **A model name that starts with `gemini` selects the Gemini preset.** It
+  used to select OpenRouter as `google/<name>`. `"route_gemini":
+  "openrouter"` or `--route-gemini openrouter` restores that.
+  `/model openrouter google/gemini-…` still selects OpenRouter.
+- **File-tool edits are committed when the folder is a git repository.** The
+  subject starts with `bwn:`. Git hooks and fsmonitor are not run. Shell
+  commands are not committed. `"auto_commit": false` or `--no-auto-commit`
+  leaves edits uncommitted, which was the only behavior before. `/commit`
+  still asks before it commits.
+
+### Upgrading
+See Breaking changes. Existing settings that already set `sandbox`, and
+explicit `--sandbox` on a command, keep meaning what they say. A settings
+file that does not mention `sandbox`, `auto_commit`, `repo_map`, or
+`route_gemini` picks up the new defaults.
 
 ### Added
 - **Gemini, xAI, Mistral and DeepSeek are provider presets** (`gemini`,
   `xai`, `mistral`, `deepseek`), each an OpenAI-compatible endpoint with its
-  own API key. Existing provider ids are unchanged. A bare model name that
-  starts with `gemini` still selects OpenRouter. With no settings file, a
+  own API key. Existing provider ids are unchanged. With no settings file, a
   headless run still prefers an Anthropic, OpenAI, OpenRouter, Groq or
   Hugging Face key when one of those is set.
 - **MCP servers can hide tools.** `include_tools` advertises only the named
@@ -1548,7 +1581,8 @@ pipeline. Every finding below is fixed and covered by a test.
   `.env.example`, which described code that no longer exists, and stopped
   tracking the `.omc/` tool state directory.
 
-[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/Garretts-Apps/buildwithnexus/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.20.0
 [0.19.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.19.0
 [0.18.0]: https://github.com/Garretts-Apps/buildwithnexus/releases/tag/v0.18.0

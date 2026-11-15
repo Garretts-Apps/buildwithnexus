@@ -451,6 +451,7 @@ fn defs_for_small_context_keeps_core_tools_and_drops_bulk() {
     for name in [
         "mcp_call",
         "kb_query",
+        "repo_map",
         "kb_record",
         "verify",
         "text_editor_20250124",
@@ -2911,6 +2912,14 @@ fn server_and_python_tool_follow_the_sandbox_policy() {
         None => {
             assert!(server_sandbox(Mode::Require, "npm run dev", &d, &d).is_err());
             assert!(python_tool_command(Mode::Require, &d.join("t.py"), &d).is_err());
+        }
+        Some(crate::sandbox::Backend::Landlock) => {
+            let c = server_sandbox(Mode::Require, "npm run dev", &d, &d)
+                .unwrap()
+                .expect("wrapped");
+            assert_eq!(program(&c), "sh");
+            let c = python_tool_command(Mode::Require, &d.join("t.py"), &d).unwrap();
+            assert_eq!(program(&c), "sh");
         }
         Some(_) => {
             let c = server_sandbox(Mode::Require, "npm run dev", &d, &d)

@@ -96,6 +96,7 @@ fn parallel_safe_exactly_the_pure_reads() {
         "grep",
         "grep_files",
         "kb_query",
+        "repo_map",
         "webfetch",
         "fetch_url",
         "websearch",

@@ -2199,9 +2199,30 @@ pub(super) fn swap_cancelled() {
     tui::line(&tui::dim("  /model cancelled — nothing saved"));
 }
 
+static GEMINI_NATIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `true`: a bare `gemini…` name selects the Gemini preset (the default
+/// since 0.21). `false`: OpenRouter, as `google/<name>`, which is what 0.20
+/// did. `"route_gemini"` or `--route-gemini` sets it.
+pub fn set_gemini_route_native(native: bool) {
+    GEMINI_NATIVE.store(native, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn gemini_route_native() -> bool {
+    GEMINI_NATIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Maps a typed model name to the provider that serves it. Anything
 /// unrecognized stays on the current provider — the swap then validates it.
 pub(super) fn parse_model_pick(pick: &str, current_provider: &str) -> (String, String) {
+    parse_model_pick_with(pick, current_provider, gemini_route_native())
+}
+
+pub(super) fn parse_model_pick_with(
+    pick: &str,
+    current_provider: &str,
+    gemini_native: bool,
+) -> (String, String) {
     // Explicit "<provider> <model>" always wins.
     if let Some((p, m)) = pick.split_once(char::is_whitespace) {
         if config::preset(p.trim()).is_some() {
@@ -2221,10 +2242,12 @@ pub(super) fn parse_model_pick(pick: &str, current_provider: &str) -> (String, S
     if lower.starts_with("gpt") || lower.starts_with("chatgpt") {
         return ("openai".into(), pick.to_string());
     }
-    // A bare "gemini…" name still goes to OpenRouter. The gemini preset is
-    // explicit (`/model gemini <name>`, `--provider gemini`) so an existing
-    // OpenRouter setup is not redirected at Google.
+    // A bare "gemini…" name selects the Gemini preset unless route_gemini
+    // is "openrouter" (0.20 sent it to OpenRouter as google/<name>).
     if lower.starts_with("gemini") {
+        if gemini_native {
+            return ("gemini".into(), pick.to_string());
+        }
         return ("openrouter".into(), format!("google/{lower}"));
     }
     // org/model naming is OpenRouter's scheme — but a URL is not a model

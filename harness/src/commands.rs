@@ -615,6 +615,156 @@ pub(super) fn commit_flow(
     }
 }
 
+static AUTO_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// File-tool edits are committed when this is on (the default since 0.21).
+/// `--no-auto-commit` or `"auto_commit": false` turns it off.
+pub fn set_auto_commit(on: bool) {
+    AUTO_COMMIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn auto_commit_enabled() -> bool {
+    AUTO_COMMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Stage `paths` and commit them when auto-commit is on and `cwd` is a git
+/// work tree. Hooks and fsmonitor are not run. An empty diff is not an error.
+/// Unit tests skip this so a `write_file` test cannot commit the repo; the
+/// binary (integration tests included) does not.
+pub fn auto_commit(
+    cwd: &std::path::Path,
+    paths: &[std::path::PathBuf],
+    tool: &str,
+) -> Result<Option<String>, String> {
+    if cfg!(test) || !auto_commit_enabled() || paths.is_empty() {
+        return Ok(None);
+    }
+    if git_work_tree(cwd).is_none() {
+        return Ok(None);
+    }
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(cwd)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .filter(|p| !p.is_empty() && p != "." && !p.starts_with("../"))
+        .collect();
+    if rels.is_empty() {
+        return Ok(None);
+    }
+    commit_paths(cwd, &rels, tool)
+}
+
+/// Stage and commit, ignoring the auto-commit switch. Tests call this.
+pub(crate) fn commit_paths(
+    cwd: &std::path::Path,
+    rels: &[String],
+    tool: &str,
+) -> Result<Option<String>, String> {
+    let hooks = empty_hooks_dir()?;
+    let git = |args: &[&str]| git_text_with(cwd, &hooks, args);
+    let mut add = vec!["add", "--"];
+    add.extend(rels.iter().map(String::as_str));
+    git(&add)?;
+    if git(&["diff", "--cached", "--quiet"]).is_ok() {
+        return Ok(None);
+    }
+    let subject = commit_subject(tool, rels);
+    git_commit_no_hooks(cwd, &hooks, &format!("{subject}\n")).map(Some)
+}
+
+fn git_work_tree(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = cwd.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn empty_hooks_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join("bwn-empty-git-hooks");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {dir:?}: {e}"))?;
+    Ok(dir)
+}
+
+fn git_text_with(
+    cwd: &std::path::Path,
+    hooks: &std::path::Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let o = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor="])
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            format!("git {} failed", args.first().unwrap_or(&"command"))
+        } else {
+            err
+        });
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn git_commit_no_hooks(
+    cwd: &std::path::Path,
+    hooks: &std::path::Path,
+    msg: &str,
+) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["-c", "core.fsmonitor="])
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .args(["commit", "--no-verify", "-q", "-F", "-"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(msg.as_bytes());
+    }
+    let o = child
+        .wait_with_output()
+        .map_err(|e| format!("git commit: {e}"))?;
+    if !o.status.success() {
+        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        return Err(if err.is_empty() {
+            "git commit failed".into()
+        } else {
+            err
+        });
+    }
+    git_text_with(cwd, hooks, &["log", "-1", "--oneline", "--no-decorate"])
+        .map(|s| s.trim().to_string())
+}
+
+fn commit_subject(tool: &str, rels: &[String]) -> String {
+    let shown = rels.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let more = if rels.len() > 3 {
+        format!(" +{}", rels.len() - 3)
+    } else {
+        String::new()
+    };
+    let subject = format!("bwn: {tool} {shown}{more}");
+    subject.chars().take(72).collect()
+}
+
 pub(super) fn git_commit(cwd: &std::path::Path, msg: &str) -> Result<String, String> {
     use std::io::Write;
     let mut child = std::process::Command::new("git")
@@ -2151,6 +2301,63 @@ pub(super) fn help_lines() -> Vec<String> {
 #[cfg(test)]
 mod terminal_ui_tests {
     use super::*;
+
+    #[test]
+    fn auto_commit_records_only_the_agent_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "bwn-autocommit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?} {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("keep.txt"), "mine\n").unwrap();
+        git(&["add", "keep.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        std::fs::write(dir.join("added.rs"), "fn added() {}\n").unwrap();
+        let summary = commit_paths(&dir, &["added.rs".into()], "write_file")
+            .unwrap()
+            .expect("a commit");
+        assert!(
+            summary.contains("added.rs") || summary.starts_with(|c: char| c.is_ascii_hexdigit()),
+            "{summary}"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let subject = String::from_utf8_lossy(&log.stdout);
+        assert!(subject.contains("bwn: write_file"), "{subject}");
+        assert!(subject.contains("added.rs"), "{subject}");
+        let show = std::process::Command::new("git")
+            .args(["show", "--name-only", "--format=", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&show.stdout);
+        assert!(names.contains("added.rs"), "{names}");
+        assert!(!names.contains("keep.txt"), "{names}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn quitting_names_the_workflows_that_would_wait() {

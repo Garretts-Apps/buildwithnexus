@@ -420,6 +420,11 @@ mcp_call: mut=true canon=mcp_call cmd=None
   view: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="MCP call: ?/?" al="MCP call: ?/?"
   create: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="MCP call: ?/?" al="MCP call: ?/?"
   noread: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="MCP call: ?/?" al="MCP call: ?/?"
+repo_map: mut=false canon=repo_map cmd=None
+  empty: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="repo_map" al="repo_map"
+  view: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="repo_map" al="repo_map"
+  create: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="repo_map" al="repo_map"
+  noread: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="repo_map" al="repo_map"
 task: mut=true canon=spawn_subagent cmd=None
   empty: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="subagent: ?" al="subagent: ?"
   view: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="subagent: look around" al="subagent: look around"
