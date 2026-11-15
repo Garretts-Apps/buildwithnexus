@@ -3558,3 +3558,58 @@ fn only_reads_searches_and_fetches_run_beside_others() {
         &json!({ tools::INVALID_ARGS: "{bad" })
     ));
 }
+
+#[test]
+fn labeled_pieces_join_to_the_prompt_a_turn_sends() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("bwn-pieces-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    std::fs::write(proj.join("AGENTS.md"), "ship small diffs\n").unwrap();
+    std::fs::write(home.join("system.md"), "USER-PIECE\n").unwrap();
+
+    for mode in [
+        PromptMode::Build,
+        PromptMode::Plan,
+        PromptMode::Brainstorm,
+        PromptMode::Chat,
+    ] {
+        for tokens in [200_000usize, 1_024] {
+            let prefix = context_prefix(&proj, tokens);
+            let sent = format!("{}\n\n{prefix}", prompt_layers::mode_contract(mode));
+            assert_eq!(
+                effective_system(&proj, mode, tokens),
+                sent,
+                "{:?} {tokens}",
+                mode
+            );
+        }
+    }
+    let compact = context_prefix(&proj, 1_024);
+    assert!(compact.contains("USER-PIECE"));
+    assert!(!compact.contains("[Available skills"));
+    assert!(!compact.contains("[Operational rules]"));
+    let full = context_prefix(&proj, 200_000);
+    assert!(full.contains("[Operational rules]"));
+    assert!(full.contains("ship small diffs"));
+    let layers: Vec<&str> = context_pieces(&proj, 200_000)
+        .iter()
+        .map(|p| p.layer)
+        .collect();
+    assert_eq!(layers.first().copied(), Some("built-in base"));
+    assert!(layers.contains(&"instructions"));
+    assert!(layers.contains(&"user override"));
+    assert!(
+        layers.iter().position(|l| *l == "instructions")
+            < layers.iter().position(|l| *l == "user override")
+    );
+
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -60,16 +60,7 @@ pub fn plan_turn(
     let mut msgs = transcript.clone();
     use_system(&mut msgs, PLAN_HEAD, || {
         let prefix = context_prefix(cwd, p.context_tokens);
-        let sys = format!(
-        "You are bwn in PLAN mode: an expert software architect and technical lead working out an implementation plan with the user. \
-        You have full read access to inspect the codebase as needed. Do not write files, edit files, apply patches, spawn subagents, or run mutating shell commands while planning. \
-        When the user gives you a high-level or underspecified task (or when key choices like tech stack, exit conditions, or edge case handling are ambiguous): \
-        1. Interrogate the user to resolve design decisions, edge cases, tech stack choices, and requirements. Use the `question` tool or ask clear targeted questions before finalizing the plan. \
-        2. Once requirements and edge cases are clear, call exit_plan or ExitPlanMode with a concise 3-to-5 step implementation plan describing concrete human implementation steps (e.g. 1. Create main.py with stdin loop 2. Handle Ctrl+C and exit keywords 3. Verify with python main.py). \
-        Do not list raw tool names (like read_file or write_file) as plan steps. \
-        If the user makes small talk or greets you, reply naturally without forcing a plan.\n\n{prefix}"
-    );
-        sys
+        format!("{PLAN_CONTRACT}\n\n{prefix}")
     });
     msgs.push(user_msg(task.into(), images.clone()));
     let drafted = draft_plan(p, cwd, task, &mut msgs)?;

@@ -428,6 +428,16 @@ pub const COMMANDS: &[SlashCommand] = &[
     ),
     cmd(
         PROJECT,
+        "/system-prompt",
+        &[],
+        "[show|edit|suggest|reset|path] [goal]",
+        "show the system prompt; e edits, s suggests, reset drops the override",
+        &[
+            "show", "edit", "suggest", "reset", "path", "user", "project",
+        ],
+    ),
+    cmd(
+        PROJECT,
         "/skills",
         &[],
         "",

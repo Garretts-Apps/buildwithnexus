@@ -66,6 +66,7 @@ pub mod sandbox;
 pub mod screenshot;
 pub mod session;
 pub mod sixel;
+mod system_prompt;
 pub mod tools;
 pub mod trace;
 pub mod tui;
@@ -443,7 +444,7 @@ pub fn run() {
     // A mistyped option must not become part of a task (or an interactive
     // prompt): `run --modle big '<task>'` sends nothing and says so.
     // Commands with options of their own check them themselves.
-    let own_options = matches!(cmd, "mcp" | "trust" | "update" | "review");
+    let own_options = matches!(cmd, "mcp" | "trust" | "update" | "review" | "system-prompt");
     // `init --agents-md` is init's one option; any other is still a mistake.
     let command_flags: &[&str] = match cmd {
         "init" | "da-init" | "setup" => &["--agents-md"],
@@ -574,6 +575,17 @@ pub fn run() {
                 std::process::exit(2);
             }
             std::process::exit(acp::serve(&opts))
+        }
+        "system-prompt" => {
+            let code = system_prompt::cli(&args[1..], opts.json, |_, prompt| {
+                let (p, _) = provider_or_onboard(&opts)?;
+                let reply =
+                    provider::complete(&p, &[provider::Msg::User(prompt.to_string())], &[])?;
+                Ok(reply.text)
+            });
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         "mcp" => match mcp::manage(&args[1..], false, &mut |l| println!("  {l}")) {
             Ok(lines) => {
@@ -2500,6 +2512,8 @@ fn usage_text() -> String {
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\
          \x20 buildwithnexus mcp [list|<name>|add|remove|login|logout|reload]  manage MCP servers (mcp help)\n\
+         \x20 buildwithnexus system-prompt show|edit|suggest|reset|path\n\
+         \x20                               the system prompt (--json on show)\n\
          \x20 buildwithnexus acp                Agent Client Protocol server on stdio (Zed, JetBrains, Neovim)\n\
          \x20 buildwithnexus version | help     also -v, -V, --version, -h, --help\n\
          \x20 older spellings still accepted: build, headless, --headless (run); da-init (init)\n\n\

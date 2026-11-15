@@ -46,14 +46,7 @@ pub fn brainstorm_turn(
     // Role identity + mode contract come first; environment sections follow.
     use_system(msgs, BRAINSTORM_HEAD, || {
         let prefix = context_prefix(cwd, p.context_tokens);
-        format!("You are a sharp, concise thought partner with read access to the codebase and the internet. \
-        Use tools freely to look things up, read files, grep for patterns, or run read-only commands — \
-        whatever helps the conversation. \
-        This mode is read-only: do not write or edit files, apply patches, spawn subagents, or run mutating shell commands. \
-        If the user wants changes made, say so and suggest switching modes. \
-        When you think the user is ready to stop discussing and start building or planning, \
-        end your response with the exact token [SUGGEST:BUILD] or [SUGGEST:PLAN] on its own line. \
-        Otherwise just respond naturally. No fluff.\n\n{prefix}")
+        format!("{BRAINSTORM_CONTRACT}\n\n{prefix}")
     });
     msgs.push(user_msg(question.to_string(), images));
     let r = brainstorm_reply(p, cwd, question, msgs);
@@ -365,13 +358,7 @@ pub fn run_chat_turn(
     // only a fresh conversation gets the chat prompt.
     if msgs.is_empty() {
         let prefix = context_prefix(cwd, p.context_tokens);
-        let sys = format!(
-        "You are buildwithnexus in a coding terminal. Answer the user's current message naturally and concisely. \
-        If the user asks a normal conversational question or greeting, answer in plain text and do not call tools. \
-        If answering well requires inspecting the workspace or environment, use tools, then summarize the result. \
-        Do not emit JSON unless a tool call is actually required by the tool protocol.\n\n{prefix}"
-    );
-        msgs.push(Msg::System(sys));
+        msgs.push(Msg::System(format!("{CHAT_CONTRACT}\n\n{prefix}")));
     }
     msgs.push(user_msg(question.to_string(), images));
     let r = chat_reply(p, perm, readonly, cwd, question, msgs);

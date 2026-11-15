@@ -4903,6 +4903,124 @@ fn with_history<R>(f: impl FnOnce(&mut Vec<String>) -> R) -> R {
     screen::with(|s| f(s.composer.history.get_or_insert_with(Vec::new)))
 }
 
+/// A full-screen pane drawn over the session, or the whole terminal when
+/// the command is started from the shell. Dropping it puts the session back.
+pub(crate) struct Overlay {
+    live: bool,
+    entered_alt: bool,
+    enabled_raw: bool,
+    restore_session: bool,
+}
+
+pub(crate) enum OverlayEvent {
+    Key(crossterm::event::KeyEvent),
+    Resize,
+    Closed,
+}
+
+impl Overlay {
+    pub(crate) fn open() -> Self {
+        let live = io::stdout().is_terminal() && io::stdin().is_terminal();
+        if !live {
+            return Self {
+                live: false,
+                entered_alt: false,
+                enabled_raw: false,
+                restore_session: false,
+            };
+        }
+        let restore_session = ALT_SCREEN.load(Ordering::Relaxed);
+        let mut entered_alt = false;
+        let mut enabled_raw = false;
+        if !restore_session {
+            apply_theme_setting();
+            let mut out = io::stdout();
+            let _ = execute!(out, EnterAlternateScreen);
+            let _ = write!(out, "{}\x1b[H\x1b[2J", theme_bg());
+            let _ = out.flush();
+            ALT_SCREEN.store(true, Ordering::Relaxed);
+            entered_alt = true;
+        }
+        if !is_raw() && enable_raw_mode().is_ok() {
+            enabled_raw = true;
+            RAW.store(true, Ordering::Relaxed);
+        }
+        cursor_hide();
+        Self {
+            live: true,
+            entered_alt,
+            enabled_raw,
+            restore_session,
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.live
+    }
+
+    pub(crate) fn size(&self) -> (u16, u16) {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    }
+
+    pub(crate) fn draw(&self, lines: &[String]) {
+        if !self.live {
+            for line in lines {
+                println!("{line}");
+            }
+            return;
+        }
+        let (cols, rows) = self.size();
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?2026h");
+        for row in 0..rows {
+            let _ = queue!(out, MoveTo(0, row), Clear(ClearType::CurrentLine));
+            if let Some(line) = lines.get(row as usize) {
+                let _ = write!(out, "{}", clip_ansi_line(line, cols as usize));
+            }
+        }
+        let _ = write!(out, "\x1b[?2026l");
+        let _ = out.flush();
+    }
+
+    pub(crate) fn read_event(&self) -> OverlayEvent {
+        if !self.live {
+            return OverlayEvent::Closed;
+        }
+        loop {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(k))
+                    if k.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    return OverlayEvent::Key(k);
+                }
+                Ok(crossterm::event::Event::Resize(_, _)) => return OverlayEvent::Resize,
+                Ok(_) => continue,
+                Err(_) => return OverlayEvent::Closed,
+            }
+        }
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if !self.live {
+            return;
+        }
+        cursor_show();
+        if self.entered_alt {
+            ALT_SCREEN.store(false, Ordering::Relaxed);
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+        if self.enabled_raw {
+            let _ = disable_raw_mode();
+            RAW.store(false, Ordering::Relaxed);
+        }
+        if self.restore_session {
+            repaint_output();
+        }
+    }
+}
+
 mod editor;
 #[cfg(test)]
 pub(crate) use editor::builtin_slash_commands;
@@ -4911,6 +5029,8 @@ pub(crate) use editor::completions_for;
 pub(crate) use editor::custom_command_desc;
 use editor::*;
 pub use editor::{find_command, SlashCommand, COMMANDS};
+
+pub(crate) mod system_prompt;
 
 // ── spinner ───────────────────────────────────────────────────────────────────
 pub struct Spinner {

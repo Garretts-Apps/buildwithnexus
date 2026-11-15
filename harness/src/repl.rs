@@ -544,6 +544,10 @@ pub(super) fn repl(
                 handle_context(&transcript, &provider);
                 continue;
             }
+            "/system-prompt" => {
+                handle_system_prompt(&provider, cwd, &mode, "");
+                continue;
+            }
             "/cost" => {
                 handle_cost(&provider);
                 continue;
@@ -711,6 +715,11 @@ pub(super) fn repl(
             } else {
                 continue;
             }
+        }
+
+        if t == "/system-prompt" || t.starts_with("/system-prompt ") {
+            handle_system_prompt(&provider, cwd, &mode, t["/system-prompt".len()..].trim());
+            continue;
         }
 
         if let Some(arg) = t.strip_prefix("/diff ") {
@@ -1013,6 +1022,25 @@ pub(super) fn follow_reported_window(provider: &mut Provider, transcript: &[prov
             tui::context_meter(context_in_use(transcript, n), n);
         }
     }
+}
+
+fn handle_system_prompt(provider: &Provider, cwd: &std::path::Path, mode: &Mode, arg: &str) {
+    let prompt_mode = match mode {
+        Mode::Build => agent::PromptMode::Build,
+        Mode::Plan => agent::PromptMode::Plan,
+        Mode::Brainstorm => agent::PromptMode::Brainstorm,
+    };
+    system_prompt::slash(
+        provider.context_tokens,
+        cwd,
+        prompt_mode,
+        arg,
+        |_, prompt| {
+            let reply =
+                provider::complete(provider, &[provider::Msg::User(prompt.to_string())], &[])?;
+            Ok(reply.text)
+        },
+    );
 }
 
 pub(super) fn mode_label(mode: &Mode) -> &'static str {
