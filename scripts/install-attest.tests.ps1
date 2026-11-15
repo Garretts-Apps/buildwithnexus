@@ -102,8 +102,13 @@ function Invoke-Install {
   param([string[]]$ArgList, [string]$GhDir, [string]$Mode)
   $savedPath = $env:PATH
   $savedMode = $env:GH_MODE
-  $stdout = New-TemporaryFile
-  $stderr = New-TemporaryFile
+  $savedLog = $env:GH_LOG
+  # Local to this function. PowerShell 5.1 turns a native command's stderr into
+  # a terminating NativeCommandError when the preference is Stop, even if the
+  # child exited 0. Continue lets a warning stay data we can assert on.
+  $ErrorActionPreference = 'Continue'
+  $merged = $null
+  $code = 1
   try {
     $basePath = "$psDir;$env:SystemRoot\System32"
     if ($GhDir) {
@@ -115,18 +120,27 @@ function Invoke-Install {
       Remove-Item Env:GH_MODE -ErrorAction SilentlyContinue
       Remove-Item Env:GH_LOG -ErrorAction SilentlyContinue
     }
-    & $psExe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $install @ArgList 1>$stdout 2>$stderr
+    $merged = & $psExe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $install @ArgList 2>&1
     $code = $LASTEXITCODE
   } finally {
     $env:PATH = $savedPath
     if ($null -eq $savedMode) { Remove-Item Env:GH_MODE -ErrorAction SilentlyContinue }
     else { $env:GH_MODE = $savedMode }
+    if ($null -eq $savedLog) { Remove-Item Env:GH_LOG -ErrorAction SilentlyContinue }
+    else { $env:GH_LOG = $savedLog }
   }
-  $outText = ''
-  $errText = ''
-  if (Test-Path -LiteralPath $stdout) { $outText = [IO.File]::ReadAllText($stdout) }
-  if (Test-Path -LiteralPath $stderr) { $errText = [IO.File]::ReadAllText($stderr) }
-  return @{ Code = $code; Out = $outText; Err = $errText }
+  $outLines = @()
+  $errLines = @()
+  if ($null -ne $merged) {
+    foreach ($item in @($merged)) {
+      if ($item -is [System.Management.Automation.ErrorRecord]) {
+        $errLines += [string]$item.Exception.Message
+      } else {
+        $outLines += [string]$item
+      }
+    }
+  }
+  return @{ Code = $code; Out = ($outLines -join "`n"); Err = ($errLines -join "`n") }
 }
 
 $stub = New-Stub
