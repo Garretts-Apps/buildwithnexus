@@ -426,6 +426,10 @@ pub fn on_code(code: crossterm::event::KeyCode, alt: bool) -> bool {
             let mut g = state();
             if let Some((_, d)) = g.diff.as_mut() {
                 d.side_by_side = !d.side_by_side;
+                if d.side_by_side {
+                    let w = DIFF_W.load(Ordering::Relaxed).max(68);
+                    DIFF_W.store(w, Ordering::Relaxed);
+                }
             }
             bump();
             true
@@ -602,19 +606,31 @@ fn paint(term_w: u16, rows: u16) -> Vec<u8> {
             .into_iter()
             .enumerate()
         {
+            let shown = if i == 0 {
+                crate::tui::underline(&line)
+            } else if line.contains('⌞') {
+                crate::tui::bold(&line)
+            } else {
+                line
+            };
             let _ = std::io::Write::write_fmt(
                 &mut out,
-                format_args!("\x1b[{};{}H{}", i + 1, col + 1, fit(&line, w as usize)),
+                format_args!("\x1b[{};{}H{}", i + 1, col + 1, shown),
             );
         }
     }
     if let Some((col, w)) = panes.diff {
-        let side = term_w >= WIDE && w >= 72;
+        let side = term_w >= WIDE && w >= 64;
         for (i, line) in diff_lines(&g, w as usize, rows as usize, side)
             .into_iter()
             .enumerate()
         {
             let shown = color_diff_line(&line, &g);
+            let shown = if i == 0 {
+                crate::tui::underline(&shown)
+            } else {
+                shown
+            };
             let _ = std::io::Write::write_fmt(
                 &mut out,
                 format_args!(
@@ -637,14 +653,14 @@ fn tree_lines(g: &State, width: usize, rows: usize) -> Vec<String> {
     }
     let mut lines = Vec::new();
     let title = if JUMP.load(Ordering::Relaxed) {
-        format!(" tree  jump:{}", g.jump)
+        phrase(width, &[&format!("jump {}", g.jump), "jump"])
     } else {
-        " tree  F2 close  F4 jump  F6 pane".to_string()
+        phrase(width, &["files", "tree"])
     };
     lines.push(fit(&title, width));
     if JUMP.load(Ordering::Relaxed) && !g.jump.is_empty() {
         for hit in fuzzy_walk(&g.root, &g.jump, rows.saturating_sub(1)) {
-            lines.push(fit(&format!("  {hit}"), width));
+            lines.push(fit(&format!("· {hit}"), width));
         }
     } else {
         for (i, (depth, rel, ent)) in flat
@@ -653,13 +669,13 @@ fn tree_lines(g: &State, width: usize, rows: usize) -> Vec<String> {
             .skip(start)
             .take(rows.saturating_sub(1))
         {
-            let cursor = if i == g.cursor { ">" } else { " " };
+            let rail = if i == g.cursor { "⌞" } else { "·" };
             let mark = g.marks.get(rel).copied().unwrap_or(Mark::None).ch();
             let git = g.git.get(rel).map(|s| s.as_str()).unwrap_or("  ");
             let slash = if ent.dir { "/" } else { "" };
-            let indent = "  ".repeat((*depth).min(8));
+            let indent = " ".repeat((*depth).min(6));
             lines.push(fit(
-                &format!("{cursor}{mark}{git} {indent}{}{slash}", ent.name),
+                &format!("{rail}{mark}{git} {indent}{}{slash}", ent.name),
                 width,
             ));
         }
@@ -674,40 +690,30 @@ fn tree_lines(g: &State, width: usize, rows: usize) -> Vec<String> {
 fn diff_lines(g: &State, width: usize, rows: usize, wide_side: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let Some((path, diff)) = &g.diff else {
-        lines.push(fit(" diff  F3 close  open a file", width));
+        lines.push(fit(&phrase(width, &["diff", ""]), width));
         while lines.len() < rows {
             lines.push(fit("", width));
         }
         return lines;
     };
+    let adds = diff.rows.iter().filter(|r| r.kind == b'+').count();
+    let dels = diff.rows.iter().filter(|r| r.kind == b'-').count();
+    let name = path.rsplit('/').next().unwrap_or(path);
     let mode = if diff.vs_git {
-        "git HEAD"
+        "git"
     } else if wide_side && diff.side_by_side {
         "side"
     } else {
         "unified"
     };
-    lines.push(fit(
-        &format!(" diff {path}  {mode}  n/p hunk  x drop  v side  g git"),
-        width,
-    ));
-    let side = diff.side_by_side && (wide_side || width >= 72);
+    let full = format!("{name}  +{adds} -{dels}  {mode}");
+    let short = format!("{name}  +{adds} -{dels}");
+    lines.push(fit(&phrase(width, &[&full, &short, name]), width));
+    let side = diff.side_by_side && (wide_side || width >= 64);
     let body: Vec<String> = if side {
         side_rows(diff, width)
     } else {
-        diff.rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let flag = diff
-                    .hunks
-                    .get(row.hunk as usize)
-                    .map(|h| if h.accepted { " " } else { "x" })
-                    .unwrap_or(" ");
-                let here = if i == g.hunk_cursor { ">" } else { " " };
-                format!("{here}{flag}{}{}", row.kind as char, row.text)
-            })
-            .collect()
+        numbered_rows(diff, g.hunk_cursor)
     };
     let start = g
         .diff_scroll
@@ -764,19 +770,85 @@ fn side_rows(diff: &Diff, width: usize) -> Vec<String> {
     rows
 }
 
-fn color_diff_line(line: &str, g: &State) -> String {
-    let ext = g.diff.as_ref().map(|(_, d)| d.ext.as_str()).unwrap_or("");
-    let Some(lang) = crate::highlight::lang_for(ext) else {
-        return line.to_string();
-    };
-    let prefix = line.chars().take(3).collect::<String>();
-    let code = line.chars().skip(3).collect::<String>();
-    if code.is_empty() {
-        return line.to_string();
+fn phrase(width: usize, options: &[&str]) -> String {
+    options
+        .iter()
+        .copied()
+        .find(|s| s.chars().count() <= width)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn numbered_rows(diff: &Diff, cursor: usize) -> Vec<String> {
+    let mut old_n = 1usize;
+    let mut new_n = 1usize;
+    let mut out = Vec::new();
+    for (i, row) in diff.rows.iter().enumerate() {
+        let (ol, nl) = match row.kind {
+            b'-' => {
+                let o = old_n;
+                old_n += 1;
+                (Some(o), None)
+            }
+            b'+' => {
+                let n = new_n;
+                new_n += 1;
+                (None, Some(n))
+            }
+            _ => {
+                let o = old_n;
+                let n = new_n;
+                old_n += 1;
+                new_n += 1;
+                (Some(o), Some(n))
+            }
+        };
+        let rail = if i == cursor { '⌞' } else { '·' };
+        let flag = diff
+            .hunks
+            .get(row.hunk as usize)
+            .map(|h| if h.accepted { ' ' } else { 'x' })
+            .unwrap_or(' ');
+        let ol = ol
+            .map(|n| format!("{n:>4}"))
+            .unwrap_or_else(|| "    ".into());
+        let nl = nl
+            .map(|n| format!("{n:>4}"))
+            .unwrap_or_else(|| "    ".into());
+        out.push(format!(
+            "{rail}{ol} {nl} {flag}{}{}",
+            row.kind as char, row.text
+        ));
     }
-    let mut st = crate::highlight::State::default();
-    let colored = crate::highlight::highlight_line(lang, &code, &mut st);
-    format!("{prefix}{colored}")
+    out
+}
+
+fn color_diff_line(line: &str, g: &State) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    // Numbered row: rail, 4, space, 4, space, flag, sign, text.
+    const SIGN: usize = 12;
+    let (head, sign, tail) =
+        if chars.len() > SIGN && matches!(chars[0], '·' | '⌞') && matches!(chars[SIGN], '+' | '-')
+        {
+            let head: String = chars.iter().take(SIGN).collect();
+            let tail: String = chars.iter().skip(SIGN + 1).collect();
+            let sign = if chars[SIGN] == '+' {
+                crate::tui::green("+")
+            } else {
+                crate::tui::red("-")
+            };
+            (head, sign, tail)
+        } else {
+            return line.to_string();
+        };
+    let ext = g.diff.as_ref().map(|(_, d)| d.ext.as_str()).unwrap_or("");
+    let code = if let Some(lang) = crate::highlight::lang_for(ext) {
+        let mut st = crate::highlight::State::default();
+        crate::highlight::highlight_line(lang, &tail, &mut st)
+    } else {
+        tail
+    };
+    format!("{head}{sign}{code}")
 }
 
 fn ensure_dir(g: &mut State, rel_dir: &str) {
@@ -1210,6 +1282,9 @@ fn fit_ansi(s: &str, width: usize) -> String {
         return String::new();
     }
     let plain = strip_ansi(s);
+    if plain.chars().count() == width {
+        return s.to_string();
+    }
     let mut out: String = plain.chars().take(width).collect();
     if plain.chars().count() > width && width >= 1 {
         out = plain.chars().take(width - 1).collect();

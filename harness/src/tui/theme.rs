@@ -41,63 +41,66 @@ pub(super) struct Palette {
     pub(super) wordmark: [Col; 4],
 }
 
-// Tokyo Night, painted on its own background. The comment colour (#565f89)
-// measures 2.76:1 there — below the WCAG AA 4.5:1 text minimum — so muted
-// text uses #7e88b3 (4.93:1) from the same blue-violet family.
+// Notch, the dark page. Field #1c1712 is a warm brown-black (hue 28°).
+// Paper, quiet, mark, wait, and cut are documented with their contrast
+// ratios in docs/design/direction.md. The four wordmark stops are the
+// same paper color: the name is not a gradient.
 pub(super) const DARK: Palette = Palette {
     name: "dark",
-    background: Some(Col::Rgb(0x1a, 0x1b, 0x26)),
-    text: Col::Rgb(0xc0, 0xca, 0xf5),
-    accent: Col::Rgb(0xbb, 0x9a, 0xf7),
-    muted: Col::Rgb(0x7e, 0x88, 0xb3),
-    success: Col::Rgb(0x9e, 0xce, 0x6a),
-    warning: Col::Rgb(0xe0, 0xaf, 0x68),
-    error: Col::Rgb(0xf7, 0x76, 0x8e),
-    info: Col::Rgb(0x7d, 0xcf, 0xff),
-    mode_plan: Col::Rgb(0x9e, 0xce, 0x6a),
-    mode_build: Col::Rgb(0x7a, 0xa2, 0xf7),
-    mode_bstorm: Col::Rgb(0xe0, 0xaf, 0x68),
-    diff_add_bg: Col::Rgb(0x1e, 0x31, 0x26),
-    diff_del_bg: Col::Rgb(0x37, 0x22, 0x2c),
-    diff_add_emph_bg: Col::Rgb(0x2c, 0x4d, 0x38),
-    diff_del_emph_bg: Col::Rgb(0x5a, 0x2e, 0x40),
-    selection_bg: Col::Rgb(0x28, 0x34, 0x57),
-    cursor: Some("#bb9af7"),
+    background: Some(Col::Rgb(0x1c, 0x17, 0x12)),
+    text: Col::Rgb(0xf1, 0xea, 0xdf),
+    accent: Col::Rgb(0x44, 0xa7, 0x93),
+    muted: Col::Rgb(0xaa, 0x9e, 0x92),
+    // Bronze and sage are syntax inks, shifted off the mark so a keyword,
+    // a string, and a type are not the same cell. They are not chrome.
+    success: Col::Rgb(0xb0, 0x8a, 0x4e),
+    warning: Col::Rgb(0x77, 0x89, 0x4d),
+    error: Col::Rgb(0xd2, 0x66, 0x56),
+    info: Col::Rgb(0x6e, 0x8f, 0x6a),
+    mode_plan: Col::Rgb(0x44, 0xa7, 0x93),
+    mode_build: Col::Rgb(0xf1, 0xea, 0xdf),
+    mode_bstorm: Col::Rgb(0x77, 0x89, 0x4d),
+    diff_add_bg: Col::Rgb(0x1a, 0x2a, 0x26),
+    diff_del_bg: Col::Rgb(0x2e, 0x1c, 0x18),
+    diff_add_emph_bg: Col::Rgb(0x24, 0x3e, 0x36),
+    diff_del_emph_bg: Col::Rgb(0x4a, 0x28, 0x22),
+    selection_bg: Col::Rgb(0x3a, 0x32, 0x28),
+    cursor: Some("#44a793"),
     wordmark: [
-        Col::Rgb(0x3d, 0x6d, 0xe0),
-        Col::Rgb(0x7a, 0xa2, 0xf7),
-        Col::Rgb(0x9e, 0xc9, 0xff),
-        Col::Rgb(0xcf, 0xe5, 0xff),
+        Col::Rgb(0xf1, 0xea, 0xdf),
+        Col::Rgb(0xf1, 0xea, 0xdf),
+        Col::Rgb(0xf1, 0xea, 0xdf),
+        Col::Rgb(0xf1, 0xea, 0xdf),
     ],
 };
 
-// For light terminals, on the terminal's own background: every foreground
-// is at least 4.5:1 against white, Solarized Light (#fdf6e3), #eeeeee and
-// the diff tints (see the contrast test).
+// Notch on a light page. Same hues as the dark field, darkened until every
+// foreground clears 4.5:1 on white, Solarized Light, #eeeeee, and the tints
+// below (see the contrast test). No blue-violet accent.
 pub(super) const LIGHT: Palette = Palette {
     name: "light",
     background: None,
-    text: Col::Rgb(0x34, 0x3b, 0x58),
-    accent: Col::Rgb(0x71, 0x40, 0xb8),
-    muted: Col::Rgb(0x5a, 0x60, 0x7a),
-    success: Col::Rgb(0x2d, 0x6a, 0x1f),
-    warning: Col::Rgb(0x8a, 0x51, 0x00),
-    error: Col::Rgb(0xb3, 0x26, 0x1e),
-    info: Col::Rgb(0x0f, 0x5f, 0x8f),
-    mode_plan: Col::Rgb(0x2d, 0x6a, 0x1f),
-    mode_build: Col::Rgb(0x2e, 0x5c, 0xb8),
-    mode_bstorm: Col::Rgb(0x8a, 0x51, 0x00),
-    diff_add_bg: Col::Rgb(0xdc, 0xf5, 0xe3),
-    diff_del_bg: Col::Rgb(0xfb, 0xe0, 0xe3),
-    diff_add_emph_bg: Col::Rgb(0xb4, 0xe6, 0xc2),
-    diff_del_emph_bg: Col::Rgb(0xf5, 0xbd, 0xc4),
-    selection_bg: Col::Rgb(0xc8, 0xd3, 0xf5),
-    cursor: Some("#7140b8"),
+    text: Col::Rgb(0x28, 0x1e, 0x15),
+    accent: Col::Rgb(0x1e, 0x67, 0x58),
+    muted: Col::Rgb(0x67, 0x5c, 0x51),
+    success: Col::Rgb(0x6a, 0x48, 0x14),
+    warning: Col::Rgb(0x4d, 0x5d, 0x28),
+    error: Col::Rgb(0x8b, 0x28, 0x18),
+    info: Col::Rgb(0x3d, 0x52, 0x28),
+    mode_plan: Col::Rgb(0x1e, 0x67, 0x58),
+    mode_build: Col::Rgb(0x28, 0x1e, 0x15),
+    mode_bstorm: Col::Rgb(0x4d, 0x5d, 0x28),
+    diff_add_bg: Col::Rgb(0xe7, 0xf0, 0xea),
+    diff_del_bg: Col::Rgb(0xf6, 0xe8, 0xe4),
+    diff_add_emph_bg: Col::Rgb(0xd5, 0xe6, 0xdb),
+    diff_del_emph_bg: Col::Rgb(0xf0, 0xd4, 0xcc),
+    selection_bg: Col::Rgb(0xe4, 0xdd, 0xd2),
+    cursor: Some("#1e6758"),
     wordmark: [
-        Col::Rgb(0x1d, 0x3a, 0x8a),
-        Col::Rgb(0x2e, 0x5c, 0xb8),
-        Col::Rgb(0x31, 0x5a, 0xa8),
-        Col::Rgb(0x0f, 0x5f, 0x8f),
+        Col::Rgb(0x28, 0x1e, 0x15),
+        Col::Rgb(0x28, 0x1e, 0x15),
+        Col::Rgb(0x28, 0x1e, 0x15),
+        Col::Rgb(0x28, 0x1e, 0x15),
     ],
 };
 
@@ -122,7 +125,7 @@ pub(super) const ANSI: Palette = Palette {
     diff_del_emph_bg: Col::Ansi(31),
     selection_bg: Col::Ansi(36),
     cursor: None,
-    wordmark: [Col::Ansi(34), Col::Ansi(34), Col::Ansi(36), Col::Ansi(36)],
+    wordmark: [Col::Default, Col::Default, Col::Default, Col::Default],
 };
 
 /// The themes `/theme` and the `theme` setting offer, besides "auto".

@@ -1159,28 +1159,51 @@ fn scroll_lines(mut lines: Vec<String>, scroll: usize, height: usize) -> Vec<Str
     lines
 }
 
-fn strip_line(view: &View) -> String {
-    let snap = usage_line(view);
-    format!(
-        " debug {}  turn {}  {}  frame {}us  in->paint {}us  allocs {}  cpu {:.1}%  {}  F12",
-        view.phase.label(),
-        view.turns,
-        snap,
+fn perf_sample(view: &View) -> (u64, u64, String) {
+    (
         view.frames_us.last().copied().unwrap_or(0),
-        view.last_input_us,
         view.last_allocs,
-        view.cpu_pct,
-        mem_label(view),
+        spark(&view.frames_us),
     )
 }
 
-fn usage_line(view: &View) -> String {
-    let model = if view.model.is_empty() {
-        "no model".to_string()
+fn spark(samples: &[u64]) -> String {
+    const BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if samples.is_empty() {
+        return String::new();
+    }
+    let max = samples.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = String::new();
+    for s in samples
+        .iter()
+        .rev()
+        .take(24)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let idx = ((*s as u128 * (BLOCKS.len() as u128 - 1)) / max as u128) as usize;
+        out.push(BLOCKS[idx]);
+    }
+    out
+}
+
+fn strip_line(view: &View) -> String {
+    let (frame, allocs, sparkline) = perf_sample(view);
+    let spark = if sparkline.is_empty() {
+        String::new()
     } else {
-        view.model.clone()
+        format!("  {sparkline}")
     };
-    format!("{model} in {} out {}", view.last_in, view.last_out)
+    format!(
+        " ⌞ {}  t{}  {}us  a{}  {:.0}%{}",
+        view.phase.label(),
+        view.turns,
+        frame,
+        allocs,
+        view.cpu_pct,
+        spark,
+    )
 }
 
 fn mem_label(view: &View) -> String {
@@ -1204,22 +1227,21 @@ const SECTIONS: [&str; SECTION_COUNT] = [
 
 fn panel_lines(view: &View, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!(
-        " debug  {}  F12 cycle  F8 break  F10 step  F5 run  Esc strip",
-        view.phase.label()
-    ));
+    // Short enough for the 46-column side panel. Keys live in the hint,
+    // which is omitted when the column cannot hold a whole phrase.
+    lines.push(format!(" ⌞ {}", view.phase.label()));
     for (i, name) in SECTIONS.iter().enumerate() {
-        let mark = if view.focus == i { ">" } else { " " };
-        let flag = if view.open[i] { "-" } else { "+" };
-        lines.push(format!("{mark}[{flag}] {name}{}", section_summary(view, i)));
+        let mark = if view.focus == i { "⌞" } else { " " };
+        lines.push(format!(" {mark} {name}{}", section_summary(view, i)));
         if view.open[i] {
             for body in section_body(view, i) {
                 lines.push(format!("    {body}"));
             }
         }
     }
-    lines.push(" up/down section  left/right fold  enter expand".into());
-    let _ = width;
+    if width >= 40 {
+        lines.push(" up down   left right   enter".into());
+    }
     lines
 }
 
@@ -1227,12 +1249,11 @@ fn section_summary(view: &View, i: usize) -> String {
     match i {
         0 => format!("  {}", view.phase.label()),
         1 => {
-            let who = if view.model.is_empty() {
-                "no request yet".to_string()
+            if view.model.is_empty() {
+                "  no request yet".to_string()
             } else {
-                format!("{} {}", view.protocol, view.model)
-            };
-            format!("  {who}")
+                format!("  {}", view.model)
+            }
         }
         2 => format!("  {}", view.tools.len()),
         3 => format!("  {}", view.files.len()),
@@ -1323,11 +1344,7 @@ fn model_body(view: &View) -> Vec<String> {
         let used = crate::usage::last_context_tokens().unwrap_or(0);
         format!("ctx {used}/{}", view.context_tokens)
     };
-    let flight = if view.inflight {
-        "request in flight"
-    } else {
-        "idle"
-    };
+    let flight = if view.inflight { "in flight" } else { "idle" };
     let ttft = view
         .ttft_ms
         .map(|n| format!("{n}ms"))
@@ -1336,13 +1353,14 @@ fn model_body(view: &View) -> Vec<String> {
         .latency_ms
         .map(|n| format!("{n}ms"))
         .unwrap_or_else(|| "-".into());
+    // The model name is already the section summary. Repeating it here is
+    // the duplicate row the panel used to show.
     let mut lines = vec![
-        format!("{} {}  {flight}", view.protocol, view.model),
+        format!("{flight}  {window}  {cost}"),
         format!(
-            "in {} out {}  {window}  {cost}",
-            snap.totals.input, snap.totals.output
+            "in {} out {}  latency {lat}  ttft {ttft}  retries {}",
+            snap.totals.input, snap.totals.output, view.retries
         ),
-        format!("latency {lat}  ttft {ttft}  retries {}", view.retries),
     ];
     if view.prompt.is_empty() {
         lines.push("prompt: not captured".into());
@@ -1401,38 +1419,20 @@ fn tool_body(view: &View) -> Vec<String> {
 }
 
 fn perf_body(view: &View) -> Vec<String> {
+    let (frame, allocs, sparkline) = perf_sample(view);
     vec![
         format!(
-            "frame {}us  in->paint {}us  allocs {}  cpu {:.1}%  {}",
-            view.frames_us.last().copied().unwrap_or(0),
+            "frame {frame}us  in->paint {}us  allocs {allocs}  cpu {:.1}%  {}",
             view.last_input_us,
-            view.last_allocs,
             view.cpu_pct,
             mem_label(view)
         ),
-        graph(&view.frames_us),
+        if sparkline.is_empty() {
+            "graph".to_string()
+        } else {
+            format!("graph {sparkline}")
+        },
     ]
-}
-
-fn graph(samples: &[u64]) -> String {
-    const RAMP: &[u8] = b" .:-=+*#";
-    if samples.is_empty() {
-        return "graph (no frames yet)".into();
-    }
-    let max = samples.iter().copied().max().unwrap_or(1).max(1);
-    let mut out = String::from("graph ");
-    for s in samples
-        .iter()
-        .rev()
-        .take(32)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let idx = ((*s as u128 * (RAMP.len() as u128 - 1)) / max as u128) as usize;
-        out.push(RAMP[idx] as char);
-    }
-    out
 }
 
 pub fn append_overlay(out: &mut Vec<u8>, width: u16, rows: u16, force: bool) {
@@ -1472,7 +1472,12 @@ pub fn append_overlay(out: &mut Vec<u8>, width: u16, rows: u16, force: bool) {
 fn placements_bytes(placed: &[Placement]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in placed {
-        let _ = write!(out, "\x1b[{};{}H{}", p.row + 1, p.col + 1, p.text);
+        let text = if p.text.contains('⌞') {
+            crate::tui::accent(&p.text)
+        } else {
+            crate::tui::dim(&p.text)
+        };
+        let _ = write!(out, "\x1b[{};{}H{text}", p.row + 1, p.col + 1);
     }
     out
 }
@@ -1806,13 +1811,28 @@ fn fit(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let mut out: String = s.chars().take(width).collect();
-    if s.chars().count() > width && width >= 1 {
-        out = s.chars().take(width - 1).collect();
-        out.push('…');
-    }
+    let count = s.chars().count();
+    let mut out = if count <= width {
+        s.to_string()
+    } else if width == 1 {
+        "…".to_string()
+    } else {
+        let prefix: String = s.chars().take(width - 1).collect();
+        let end = prefix.rfind(' ').unwrap_or(prefix.len());
+        let mut clipped = prefix[..end].trim_end().to_string();
+        if clipped.is_empty() {
+            clipped = prefix;
+        }
+        clipped.push('…');
+        clipped
+    };
     while out.chars().count() < width {
         out.push(' ');
+    }
+    // A word-boundary cut can still be one cell short of `width` after the
+    // ellipsis, which is what we want. Never past it.
+    if out.chars().count() > width {
+        out = out.chars().take(width).collect();
     }
     out
 }
@@ -2018,6 +2038,9 @@ mod tests {
         let lines = render_lines(&sample(), Mode::Strip, 80, 24);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("thinking"), "{}", lines[0]);
+        let spark = spark(&sample().frames_us);
+        assert!(lines[0].contains(&spark), "{}", lines[0]);
+        assert!(perf_body(&sample())[1].contains(&spark));
         assert!(
             lines[0].chars().count() <= 80,
             "{}",

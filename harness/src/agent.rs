@@ -790,7 +790,7 @@ fn confirm_with(
     if !report::header_is_just_above(label) {
         tui::line(&format!(
             "  {} {}",
-            tui::yellow("➤"),
+            tui::accent("⌞"),
             tui::bold(&tui::sanitize_terminal(label))
         ));
     }
@@ -803,9 +803,9 @@ fn confirm_with(
         format!(" `{shown_key}`")
     };
     tui::line(&tui::dim(&format!(
-        "    y yes · n no · s allow{scope} this session · a always in this project · d <reason> deny"
+        "  Y yes   N no   S allow{scope}   A always   D deny"
     )));
-    let q = format!("  {} ", tui::yellow("allow?"));
+    let q = format!("  {} ", tui::accent("ASK"));
     let Some(ans) = ask(&q) else {
         // Esc or Ctrl+C: refuse this call and stop the turn, instead of
         // handing the refusal back to the model to try something else.
