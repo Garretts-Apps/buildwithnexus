@@ -17,8 +17,9 @@ name: release
 # never exists without binaries. v0.14.9 was public for about three minutes
 # with none, and a first run in that window got a 404. After that the npm
 # tarball packed from the public release is installed in clean containers
-# (`tarball-gate`), and crates.io is published last, so nothing reaches a
-# registry before the package has been seen to install.
+# (`tarball-gate`) and, on windows-2022, through the npm shim against the
+# Windows exe (`tarball-gate-windows`). crates.io is published last, so
+# nothing reaches a registry before the package has been seen to install.
 on:
   push:
     tags: ["v*"]
@@ -215,7 +216,10 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          # windows-2022, not windows-latest (Server 2025): the same image
+          # ci.yml and field.yml test, so the release exe is built and
+          # started on the Windows this project supports.
+          - os: windows-2022
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
@@ -556,6 +560,80 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # The Windows cell installs this exact tarball. It is the one
+      # publish.yml packs again; a failure here stops crates.io and, because
+      # publish.yml waits for this workflow, npm.
+      - name: Hand the tarball to the Windows cell
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-tarball
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  # Install the packed tarball on Windows Server 2022 the way a user does,
+  # pointed at the exe this release just built (BWN_BIN). `bwn version` must
+  # print this version; `bwn doctor` must start and report. A broken shim or
+  # exe fails the release before crates.io and before npm publish.
+  tarball-gate-windows:
+    needs: [gate, tarball-gate]
+    if: needs.gate.outputs.release == 'true' && needs.tarball-gate.result == 'success'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-tarball
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: asset-x86_64-pc-windows-msvc
+          path: asset
+
+      - name: Install the tarball and run bwn
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tarball = Get-ChildItem -Path dist -Filter '*.tgz' | Select-Object -First 1
+          if (-not $tarball) { throw 'no npm tarball' }
+          # npm.cmd, not npm.ps1: the ps1 shim needs an execution policy.
+          & npm.cmd install -g $tarball.FullName
+          if ($LASTEXITCODE -ne 0) { throw "npm install -g failed with exit $LASTEXITCODE" }
+          $bwn = (Get-Command bwn.cmd -ErrorAction Stop).Source
+          $exe = Get-ChildItem -Path asset -Filter 'buildwithnexus-*.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'no Windows exe in the release asset' }
+          $env:BWN_BIN = $exe.FullName
+          $v = node -p "require('./package.json').version"
+          # Same capture as field.yml, which runs on this image under
+          # Windows PowerShell 5.1. 5.1 wraps native stderr as ErrorRecords.
+          function Run([scriptblock]$cmd) {
+            $out = & $cmd 2>&1 | ForEach-Object { "$_" }
+            [pscustomobject]@{ Out = ($out -join "`n"); Code = $LASTEXITCODE }
+          }
+          $ver = Run { & $bwn version }
+          Write-Output $ver.Out
+          if ($ver.Code -ne 0) { throw "bwn version exited $($ver.Code): $($ver.Out)" }
+          if ($ver.Out -notmatch [regex]::Escape("buildwithnexus $v")) {
+            throw "bwn version printed '$($ver.Out)', expected 'buildwithnexus $v'"
+          }
+          $doc = Run { & $bwn doctor }
+          Write-Output $doc.Out
+          if ($null -eq $doc.Code) { throw 'bwn doctor did not run' }
+          if ($doc.Code -ne 0 -and $doc.Code -ne 1) {
+            throw "bwn doctor exited $($doc.Code): $($doc.Out)"
+          }
+          if ($doc.Out -notmatch 'doctor') { throw "bwn doctor produced no report: $($doc.Out)" }
+          if ($doc.Out -match 'native binary not found') { throw $doc.Out }
 
   # crates.io publishing lives HERE, not in publish.yml: crates.io Trusted
   # Publishing refuses OIDC tokens for workflow_run-triggered jobs, and
@@ -572,13 +650,14 @@ jobs:
   # Last job of the release: a crate version can be yanked but never
   # replaced, so it goes out only after the GitHub release is public and the
   # npm tarball built from it has installed and run in clean containers
-  # (`tarball-gate`). publish.yml, which chains on this workflow succeeding,
-  # then sends that tarball to npm.
+  # (`tarball-gate`) and on windows-2022 (`tarball-gate-windows`).
+  # publish.yml, which chains on this workflow succeeding, then sends that
+  # tarball to npm.
   crates:
-    needs: [gate, tarball-gate]
+    needs: [gate, tarball-gate, tarball-gate-windows]
     if: >-
       ${{ !cancelled() &&
-          ((needs.gate.outputs.release == 'true' && needs.tarball-gate.result == 'success') ||
+          ((needs.gate.outputs.release == 'true' && needs.tarball-gate.result == 'success' && needs.tarball-gate-windows.result == 'success') ||
            needs.gate.outputs.crates_retry == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

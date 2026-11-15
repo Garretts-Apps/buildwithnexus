@@ -2649,6 +2649,8 @@ mod terminal_ui_tests {
             "/home/me/shot.png what is in this screenshot"
         ));
         assert!(starts_with_path("/home/me/my\\ shot.png what is this"));
+        // `/tmp` counts because that directory exists. Windows has no such path.
+        #[cfg(unix)]
         assert!(starts_with_path("/tmp"));
         assert!(!starts_with_path("/help"));
         assert!(!starts_with_path("/frobnicate now"));

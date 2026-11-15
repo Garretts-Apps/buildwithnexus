@@ -3803,22 +3803,38 @@ fn python_tool_command(
     Ok(command)
 }
 
+// Does `bin --version` start and succeed? A Microsoft Store alias stub
+// spawns and then exits non-zero, which is not a usable interpreter.
+fn interpreter_runs(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn python3_invokes() -> bool {
+    interpreter_runs("python3")
+}
+
+// `python3` everywhere it runs. On Windows, `python` when it does not: that
+// is the name the python.org installer provides, and `python3` there is often
+// a Store alias that opens the Store instead of running.
+fn python_interpreter_name(python3_ok: bool) -> &'static str {
+    if cfg!(windows) && !python3_ok {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
 fn python_interpreter() -> &'static str {
     static PY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    PY.get_or_init(|| {
-        if cfg!(windows) {
-            let ok = Command::new("python3")
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            if !ok {
-                return "python";
-            }
-        }
-        "python3"
-    })
+    // On Unix `!cfg!(windows)` is true, so this selects python3 and never
+    // probes PATH. On Windows the probe runs, and a failing python3 selects
+    // `python`.
+    PY.get_or_init(|| python_interpreter_name(!cfg!(windows) || python3_invokes()))
 }
 
 fn list_python_tools(cwd: &Path) -> Vec<String> {

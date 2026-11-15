@@ -1544,7 +1544,13 @@ mod tests {
         assert_eq!(call[0]["sessionUpdate"], "tool_call");
         assert_eq!(call[0]["kind"], "edit");
         assert_eq!(call[0]["title"], "edit a.txt");
-        assert_eq!(call[0]["locations"][0]["path"], "/w/a.txt");
+        assert_eq!(
+            call[0]["locations"][0]["path"]
+                .as_str()
+                .unwrap()
+                .replace('\\', "/"),
+            "/w/a.txt"
+        );
         let id = call[0]["toolCallId"].clone();
         let diff = updates_for(
             &ev(json!({"type": "diff", "path": "/w/a.txt", "old_text": "x\n", "new_text": "y\n"})),

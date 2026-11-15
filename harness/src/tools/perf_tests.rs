@@ -198,6 +198,11 @@ fn grep_whole_buffer_search_prints_what_the_line_search_printed() {
         ("needle.txt", b"the file name matches but only this line: NEEDLE\n"),
     ];
     for (name, bytes) in files {
+        // A carriage return in a file name is a legal Unix name and an
+        // illegal Windows one. Both searches then see the same tree.
+        if cfg!(windows) && name.chars().any(|c| c.is_control()) {
+            continue;
+        }
         let path = d.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();

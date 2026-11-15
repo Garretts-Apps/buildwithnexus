@@ -32,6 +32,13 @@ Works on native Windows:
   an error naming the missing interpreter instead of a silent `sh` spawn
   failure. Shell-string hooks and the `bash`/`run_command` tools run under
   `cmd /C`.
+- Hook scripts dropped in `~/.buildwithnexus/hooks/<Event>/` are
+  auto-discovered, including `.ps1`, `.cmd` and `.bat`. They do not have to
+  be listed in `settings.json`.
+- `python_tool` runs `python3` when that command succeeds, and falls back to
+  `python` when it does not. A stock Windows install's `python3` is often a
+  Microsoft Store alias that does not run; the python.org installer provides
+  `python`.
 - `~` and `~/…` (also `~\…`) resolve against `%USERPROFILE%` when `HOME` is
   unset. Temp files use the system temp directory everywhere.
 
@@ -42,10 +49,6 @@ Still Unix-only:
   platform; the extra `clip.exe` / `pbcopy` fallback only runs on WSL and
   macOS, so on native Windows it relies on the terminal honouring OSC 52
   (Windows Terminal does).
-- Auto-discovery of `~/.buildwithnexus/hooks/<Event>/` scripts still looks
-  for `.sh`/`.bash`/`.py`/`.rs` only; `.ps1`/`.cmd`/`.bat` hooks must be
-  listed in `settings.json` as `type: "script"`.
-- The `python_tool` runner always invokes `python3`.
 - `xdg-open`-style helpers, `/proc`-based WSL detection and Unix signal
   handling (`SIGTERM`/`SIGHUP`) have no Windows equivalent beyond the above.
 

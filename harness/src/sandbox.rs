@@ -807,6 +807,9 @@ mod tests {
         );
     }
 
+    // bwrap's argv is a Linux path list. On Windows `Path` renders `\`, so
+    // these fixtures only run where bwrap itself runs.
+    #[cfg(unix)]
     #[test]
     fn bwrap_argv_binds_only_the_workspace_rw() {
         let a = bwrap_args("echo hi", Path::new("/work/proj"), true);
@@ -825,6 +828,7 @@ mod tests {
         assert_eq!(off.len(), a.len() - 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn added_folders_are_bound_writable_with_their_git_read_only() {
         let extra = [PathBuf::from("/work/lib"), PathBuf::from("/srv/data")];
@@ -854,6 +858,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn nested_repositories_stay_read_only_too() {
         let ws = std::env::temp_dir().join(format!("bwn-sandbox-nested-{}", std::process::id()));
@@ -892,6 +897,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bwrap_argv_keeps_git_and_settings_read_only() {
         let ws = std::env::temp_dir().join(format!("bwn-sandbox-ro-{}", std::process::id()));
@@ -1050,6 +1056,7 @@ mod tests {
         assert!(unset.contains(&"TMUX_ONLY_TOKEN".to_string()), "{unset:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn seatbelt_profile_denies_writes_except_workspace_and_tmp() {
         let p = seatbelt_profile(

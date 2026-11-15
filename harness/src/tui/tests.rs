@@ -376,6 +376,9 @@ fn path_candidates_matches_prefix_and_marks_dirs() {
     let _ = fs::remove_dir_all(&d);
 }
 
+// The names under test (`ESC` and a bidi override) cannot be created on
+// Windows: the filesystem rejects them.
+#[cfg(unix)]
 #[test]
 fn completion_skips_names_with_escapes_or_bidi() {
     use std::fs;
@@ -818,8 +821,10 @@ fn pasted_media_paths_become_tokens() {
     assert!(pasted_media_path("just some words about a .png file").is_none());
     assert!(pasted_media_path(&format!("{p}\nsecond line")).is_none());
     assert!(pasted_media_path(&dir.join("missing.png").display().to_string()).is_none());
-    // Token quoting: spaces get double quotes, plain paths don't.
-    assert_eq!(attachment_token(&img), format!("@\"{p}\" "));
+    // Token quoting: spaces get double quotes, and `\` is escaped so the
+    // token round-trips. Plain paths don't.
+    let shown = p.replace('\\', "\\\\");
+    assert_eq!(attachment_token(&img), format!("@\"{shown}\" "));
     let plain = std::path::Path::new("/tmp/a.png");
     assert_eq!(attachment_token(plain), "@/tmp/a.png ");
     std::fs::remove_dir_all(&dir).unwrap();

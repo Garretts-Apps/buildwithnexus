@@ -117,16 +117,18 @@ jobs:
         run: scripts/check-glibc-floor.sh target/x86_64-unknown-linux-gnu/release/buildwithnexus
 
   # The other release platforms. The `rust` job above is the Linux leg (and
-  # keeps its check name). macOS runs the full suite. On Windows the tests
-  # only compile: many of them drive `run_command` with POSIX shell syntax
-  # (`printf`, `while true; do …`) and call `python3`, which native Windows
-  # runs under `cmd /C`, so running them there would test the fixtures, not
-  # the code. Compiling still catches cfg(unix)/cfg(windows) breakage before
-  # a release build does.
+  # keeps its check name). macOS runs the full suite. Windows Server 2022
+  # (not windows-latest, which is Server 2025) runs the library tests,
+  # including cmd /C, hook discovery, the python fallback, CRLF edits,
+  # icacls and start_server/taskkill. POSIX-only fixtures are cfg(unix) or
+  # skipped when their interpreter is missing, instead of `cargo test
+  # --no-run` compiling the suite and executing nothing. The integration
+  # suite stays on Linux and macOS: it drives the agent with POSIX shell
+  # (`printf`, `sh`, `touch`), which cmd.exe would be executing as fixtures.
   rust-os:
     name: Rust test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: harness
@@ -135,9 +137,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, windows-latest]
+        os: [macos-15, windows-2022]
 
     steps:
+      # Git for Windows defaults to core.autocrlf=true, which rewrites
+      # fixtures before the tests read them. Set it before checkout.
+      - name: Keep LF line endings
+        if: runner.os == 'Windows'
+        working-directory: ${{ runner.temp }}
+        shell: powershell
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -151,12 +161,19 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --locked
 
-      - name: Compile tests
+      # Library and bin tests actually run. POSIX-only cases are cfg(unix).
+      - name: Test
         if: runner.os == 'Windows'
-        run: cargo test --locked --no-run
+        run: cargo test --locked --lib --bins
 
-      # The integration tests build the exe too. It must not need the Visual
-      # C++ Redistributable; release.yml checks the release exe the same way.
+      # The PE and console checks need the debug exe. `cargo test --lib`
+      # does not build it; the integration suite, which does, stays on Unix.
+      - name: Build the debug exe
+        if: runner.os == 'Windows'
+        run: cargo build --locked --bin buildwithnexus
+
+      # It must not need the Visual C++ Redistributable; release.yml checks
+      # the release exe the same way.
       - name: Check the exe needs no Visual C++ runtime
         if: runner.os == 'Windows'
         run: node ../scripts/check-pe-imports.js ../target/debug/buildwithnexus.exe
