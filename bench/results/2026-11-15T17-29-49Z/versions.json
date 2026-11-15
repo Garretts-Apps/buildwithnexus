@@ -1,0 +1,22 @@
+{
+  "tools": [
+    {
+      "id": "bwn-npm",
+      "display": "bwn (npm)",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+      "exit_code": 0,
+      "version_text": "buildwithnexus 0.21.0",
+      "expect": "buildwithnexus 0.21.0",
+      "ok": true
+    },
+    {
+      "id": "bwn-native",
+      "display": "bwn native",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus",
+      "exit_code": 0,
+      "version_text": "buildwithnexus 0.21.0",
+      "expect": "buildwithnexus 0.21.0",
+      "ok": true
+    }
+  ]
+}

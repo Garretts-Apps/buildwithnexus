@@ -32,11 +32,18 @@ shell's own startup out of the number.
 Two bwn rows are measured on purpose:
 
 - **bwn native** is the release binary, invoked directly. That is what
-  `cargo install` runs, and what the npm launcher execs after the first run.
+  `cargo install` and the native install scripts run.
 - **bwn (npm)** is the `bwn` command from `npm install -g buildwithnexus`.
-  It starts Node, then the binary. `--version` is timed with the binary
-  already installed. The first-run download is in the download size, not in
-  the startup time.
+  The first run copies the release binary and points that command at the
+  copy. Later runs start the copy and do not start Node. `--version` is
+  timed after that copy is in place. The download itself is in the download
+  size, not in the startup time. The run `2026-11-15T16-29-28Z` measured the
+  launcher before this handoff (registry `buildwithnexus@0.21.0`, warm
+  `--version` median 21.236 ms). `2026-11-15T17-29-49Z` re-measured the npm
+  command from this checkout with `python3 bench/run.py --npm-handoff`.
+  `hardware.json` in that directory records `git_dirty: true` because the
+  pack included `scripts/native-handoff.js`, which `package.json` `files`
+  did not list until this change. The registry tarball still does not.
 
 GNU time reports the top-level process. For a Node launcher that is the Node
 process, not a child binary.

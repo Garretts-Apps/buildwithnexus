@@ -1,0 +1,35 @@
+{
+  "bwn-npm": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+    "command": [
+      "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+      "--provider",
+      "custom",
+      "--base-url",
+      "http://127.0.0.1:38545/v1",
+      "--model",
+      "bench",
+      "--permission-mode",
+      "readonly",
+      "--sandbox",
+      "off",
+      "--no-auto-commit",
+      "--no-repo-map",
+      "run",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      0.06093901000076585,
+      0.05741401000068436,
+      0.058215831999405054,
+      0.05683534099989629,
+      0.06184566599949903
+    ],
+    "median_s": 0.058215831999405054,
+    "mean_s": 0.059049971800050116,
+    "mock_requests_total": 20,
+    "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:38545) \u00b7 bench\n  cwd    /agent/repos/buildwithnexus/bench/.tools/task-work-handoff/bwn-npm\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 12.79ms\n"
+  }
+}

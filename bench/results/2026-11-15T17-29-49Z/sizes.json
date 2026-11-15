@@ -1,0 +1,59 @@
+{
+  "bwn-npm": {
+    "package_bytes": 6547655,
+    "package_url": "/agent/repos/buildwithnexus/bench/.tools/downloads/local-pack/buildwithnexus-0.21.0.tgz",
+    "download_bytes": 6547655,
+    "download_parts": [
+      {
+        "package": "buildwithnexus",
+        "version": "0.21.0",
+        "bytes": 55279,
+        "url": "/agent/repos/buildwithnexus/bench/.tools/downloads/local-pack/buildwithnexus-0.21.0.tgz",
+        "kind": "local-npm-pack"
+      },
+      {
+        "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+        "version": "0.21.0",
+        "bytes": 6492376,
+        "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "kind": "github-release-asset"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 6643749,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+    "entrypoint_bytes": 6939,
+    "notes": [
+      "package_bytes and download_bytes are this checkout's npm pack plus the GitHub release asset the launcher downloaded.",
+      "The registry tarball buildwithnexus@0.21.0 predates the handoff and is not the package measured here.",
+      "install_bytes is the npm prefix plus the checksum-verified binary under NEXUS_HOME. The extra copy the handoff places on PATH is recorded separately and is not added again."
+    ],
+    "binary_bytes": 6492376,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus"
+  },
+  "bwn-native": {
+    "package_bytes": 6492376,
+    "package_url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+    "download_bytes": 6492376,
+    "download_parts": [
+      {
+        "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+        "bytes": 6492376,
+        "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "kind": "github-release-asset"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 6492376,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus",
+    "entrypoint_bytes": 6492376,
+    "binary_bytes": 6492376,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus",
+    "notes": [
+      "This row is the release binary invoked directly (the cargo-install / prebuilt entry), not the npm launcher.",
+      "download_bytes is the GitHub release asset. cargo install builds from source instead of downloading this file; the asset is what the npm launcher downloads on first run."
+    ]
+  }
+}

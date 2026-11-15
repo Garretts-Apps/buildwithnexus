@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
 
-from bench.suite import execute  # noqa: E402
+from bench.suite import execute, execute_npm_handoff  # noqa: E402
 
 
 def main() -> None:
@@ -24,6 +24,11 @@ def main() -> None:
         "--only",
         help="Comma-separated subset: startup,memory,prompt,task. Default runs every metric.",
     )
+    parser.add_argument(
+        "--npm-handoff",
+        action="store_true",
+        help="Re-measure only the npm bwn command from a pack of this checkout (the post-handoff launcher). Also records one paired native warm --version.",
+    )
     args = parser.parse_args()
     if args.results:
         results = args.results
@@ -35,7 +40,10 @@ def main() -> None:
     only = None
     if args.only:
         only = {part.strip() for part in args.only.split(",") if part.strip()}
-    summary = execute(results, only)
+    if args.npm_handoff:
+        summary = execute_npm_handoff(results, only)
+    else:
+        summary = execute(results, only)
     print(f"wrote {results}")
     print(f"complete={summary.get('complete')}")
 

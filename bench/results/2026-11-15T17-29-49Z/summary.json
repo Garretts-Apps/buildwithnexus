@@ -1,0 +1,570 @@
+{
+  "run_id": "2026-11-15T17-29-49Z",
+  "scope": "npm handoff rerun",
+  "baseline_run": "2026-11-15T16-29-28Z",
+  "hardware": {
+    "timestamp_utc": "2026-11-15T17:29:49Z",
+    "date_utc": "2026-11-15",
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "6.12.113+",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "bogomips": 4800.0,
+    "hypervisor": "KVM",
+    "mem_total_bytes": 16780623872,
+    "hyperfine": "hyperfine 1.18.0",
+    "gnu_time": "time (GNU Time) UNKNOWN",
+    "node": "v22.23.4",
+    "python": "3.12.3",
+    "git_commit": "04a060e3574d38cf9d28a4d6bf58b4adafedd4c2",
+    "git_dirty": true
+  },
+  "pins": {
+    "installs": [
+      {
+        "id": "bwn",
+        "manager": "npm",
+        "package": "buildwithnexus",
+        "version": "0.21.0",
+        "bins": [
+          "bwn",
+          "buildwithnexus"
+        ],
+        "bootstrap_release_binary": true
+      }
+    ],
+    "startup_runs": 20
+  },
+  "methodology": {
+    "startup": "hyperfine --shell=none, 3 warmup runs then 20 measured runs (warm), or 20 measured runs each prepared with sync and echo 3 > /proc/sys/vm/drop_caches (cold). Mean, median and stddev are hyperfine's.",
+    "npm_handoff": "The package is an npm pack of this checkout, installed into an empty prefix and an empty NEXUS_HOME. The first run is `bwn --bootstrap --help`: it downloads the release binary, copies it, and points the npm shim at that copy. Every timed run is after that. Registry buildwithnexus@0.21.0 is not this package.",
+    "native_control": "One warm --version of the release binary, same hyperfine settings, same machine, so the npm median can be compared without mixing runs.",
+    "memory": "/usr/bin/time -v on --version, 5 runs, median of Maximum resident set size (kbytes). Top-level process only. After the handoff the top-level process is the native binary.",
+    "prompt": "PTY 80x24. Timed only when a pinned transcript pattern appears.",
+    "task": "Local mock OpenAI server (bench/mock_openai.py) returns BENCHMARK_OK. A published time exited 0 and printed BENCHMARK_OK."
+  },
+  "tools": {
+    "bwn-npm": {
+      "id": "bwn-npm",
+      "display": "bwn (npm)",
+      "version_text": "buildwithnexus 0.21.0",
+      "sizes": {
+        "package_bytes": 6547655,
+        "package_url": "/agent/repos/buildwithnexus/bench/.tools/downloads/local-pack/buildwithnexus-0.21.0.tgz",
+        "download_bytes": 6547655,
+        "download_parts": [
+          {
+            "package": "buildwithnexus",
+            "version": "0.21.0",
+            "bytes": 55279,
+            "url": "/agent/repos/buildwithnexus/bench/.tools/downloads/local-pack/buildwithnexus-0.21.0.tgz",
+            "kind": "local-npm-pack"
+          },
+          {
+            "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+            "version": "0.21.0",
+            "bytes": 6492376,
+            "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+            "kind": "github-release-asset"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 6643749,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+        "entrypoint_bytes": 6939,
+        "notes": [
+          "package_bytes and download_bytes are this checkout's npm pack plus the GitHub release asset the launcher downloaded.",
+          "The registry tarball buildwithnexus@0.21.0 predates the handoff and is not the package measured here.",
+          "install_bytes is the npm prefix plus the checksum-verified binary under NEXUS_HOME. The extra copy the handoff places on PATH is recorded separately and is not added again."
+        ],
+        "binary_bytes": 6492376,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus"
+      },
+      "handoff": {
+        "shim_before_bootstrap": {
+          "path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+          "exists": true,
+          "is_symlink": true,
+          "link": "../lib/node_modules/buildwithnexus/bin/buildwithnexus.js",
+          "resolved": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/lib/node_modules/buildwithnexus/bin/buildwithnexus.js",
+          "resolved_bytes": 6939,
+          "elf": false,
+          "head": "#!/usr/bin/env node\n'use strict';\n// Thin launcher: resolve the platform binary and hand off with stdio inherited\n// so the alternate-screen TUI works exactly as if it were invoked"
+        },
+        "shim_after_bootstrap": {
+          "path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+          "exists": true,
+          "is_symlink": true,
+          "link": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved_bytes": 6492376,
+          "elf": true
+        },
+        "native_copy": {
+          "path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "exists": true,
+          "is_symlink": false,
+          "resolved": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved_bytes": 6492376,
+          "elf": true
+        },
+        "native_copy_bytes": 6492376,
+        "bootstrap_stderr": "buildwithnexus: the next `bwn` starts the native binary, without Node.\n  Native install: curl -fsSL https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.sh | sh\n",
+        "note": "Bootstrap is the first run of the npm command. It downloads the release binary when NEXUS_HOME is empty, copies that binary, and points the npm shim at the copy. Timed runs happen after this.",
+        "shim_before_timings": {
+          "path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+          "exists": true,
+          "is_symlink": true,
+          "link": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved_bytes": 6492376,
+          "elf": true
+        },
+        "shim_after_timings": {
+          "path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+          "exists": true,
+          "is_symlink": true,
+          "link": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/.local/bin/bwn",
+          "resolved_bytes": 6492376,
+          "elf": true
+        }
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.0005803664,
+          "median_s": 0.000534615,
+          "stddev_s": 0.00010447305721139177,
+          "min_s": 0.000514252,
+          "max_s": 0.0008514470000000001,
+          "times_s": [
+            0.000562075,
+            0.000548968,
+            0.000529573,
+            0.00052859,
+            0.0005418490000000001,
+            0.0005296070000000001,
+            0.000525121,
+            0.0005330210000000001,
+            0.000524169,
+            0.000514252,
+            0.0005211790000000001,
+            0.0005197260000000001,
+            0.000558198,
+            0.0008514470000000001,
+            0.0007914230000000001,
+            0.000601623,
+            0.000548883,
+            0.00053197,
+            0.0005362090000000001,
+            0.000809445
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version\n  Time (mean \u00b1 \u03c3):     580.4 \u00b5s \u00b1 104.5 \u00b5s    [User: 499.2 \u00b5s, System: 51.5 \u00b5s]\n  Range (min \u2026 max):   514.3 \u00b5s \u2026 851.4 \u00b5s    20 runs\n \n",
+          "hyperfine_stderr": " \n  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.\n",
+          "export": "startup-bwn-npm-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.005133380850000001,
+          "median_s": 0.005546241,
+          "stddev_s": 0.0017671818399451196,
+          "min_s": 0.0025724230000000003,
+          "max_s": 0.008529599,
+          "times_s": [
+            0.0030799060000000003,
+            0.007405618,
+            0.0040900450000000005,
+            0.003112994,
+            0.003729913,
+            0.0025724230000000003,
+            0.002925951,
+            0.0031566600000000004,
+            0.006138715,
+            0.005679544000000001,
+            0.005870766,
+            0.007698385,
+            0.004775279,
+            0.0036347890000000002,
+            0.005412938,
+            0.006082615,
+            0.008529599,
+            0.006100694,
+            0.00592788,
+            0.006742903000000001
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version\n  Time (mean \u00b1 \u03c3):       5.1 ms \u00b1   1.8 ms    [User: 1.1 ms, System: 0.6 ms]\n  Range (min \u2026 max):     2.6 ms \u2026   8.5 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.0006683592500000002,
+          "median_s": 0.0005695615000000001,
+          "stddev_s": 0.00015224215964943378,
+          "min_s": 0.000548296,
+          "max_s": 0.0009540530000000001,
+          "times_s": [
+            0.0005916480000000001,
+            0.000566228,
+            0.000561009,
+            0.0005689870000000001,
+            0.0009540530000000001,
+            0.000837258,
+            0.000623374,
+            0.0005632920000000001,
+            0.000564833,
+            0.000548296,
+            0.000569458,
+            0.00056309,
+            0.000906573,
+            0.000595675,
+            0.000569665,
+            0.000568989,
+            0.0005632090000000001,
+            0.000878911,
+            0.0008597650000000001,
+            0.000912872
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --help\n  Time (mean \u00b1 \u03c3):     668.4 \u00b5s \u00b1 152.2 \u00b5s    [User: 612.1 \u00b5s, System: 26.8 \u00b5s]\n  Range (min \u2026 max):   548.3 \u00b5s \u2026 954.1 \u00b5s    20 runs\n \n",
+          "hyperfine_stderr": " \n  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.\n",
+          "export": "startup-bwn-npm-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.005817473,
+          "median_s": 0.005988005,
+          "stddev_s": 0.0012989489024106337,
+          "min_s": 0.0034899320000000003,
+          "max_s": 0.008359364000000001,
+          "times_s": [
+            0.007101289,
+            0.005954578,
+            0.006694905,
+            0.007031904,
+            0.004072926,
+            0.008359364000000001,
+            0.005181008,
+            0.006196995,
+            0.0034899320000000003,
+            0.006604195,
+            0.0057437750000000004,
+            0.003933023,
+            0.004992544000000001,
+            0.004688903,
+            0.006250425,
+            0.005876692,
+            0.006021432,
+            0.006569757000000001,
+            0.007487866,
+            0.004097947
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --help\n  Time (mean \u00b1 \u03c3):       5.8 ms \u00b1   1.3 ms    [User: 1.1 ms, System: 0.7 ms]\n  Range (min \u2026 max):     3.5 ms \u2026   8.4 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          3444,
+          3464,
+          3572,
+          3480,
+          3460
+        ],
+        "median_kib": 3464.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "permission:",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          0.2544895689998157,
+          0.25020410099932633,
+          0.2506234590000531,
+          0.25026864599931287,
+          0.2503188569999111
+        ],
+        "median_s": 0.2503188569999111,
+        "mean_s": 0.2511809263996838,
+        "transcript_last": "11;?\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\u2502 \u2502\u001b7permission: ask \u00b7 /permissions \u00b7 wheel/PgUp \u00b7 /mouse\u001b8"
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn",
+          "--provider",
+          "custom",
+          "--base-url",
+          "http://127.0.0.1:38545/v1",
+          "--model",
+          "bench",
+          "--permission-mode",
+          "readonly",
+          "--sandbox",
+          "off",
+          "--no-auto-commit",
+          "--no-repo-map",
+          "run",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          0.06093901000076585,
+          0.05741401000068436,
+          0.058215831999405054,
+          0.05683534099989629,
+          0.06184566599949903
+        ],
+        "median_s": 0.058215831999405054,
+        "mean_s": 0.059049971800050116,
+        "mock_requests_total": 20,
+        "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:38545) \u00b7 bench\n  cwd    /agent/repos/buildwithnexus/bench/.tools/task-work-handoff/bwn-npm\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 12.79ms\n"
+      }
+    },
+    "bwn-native": {
+      "id": "bwn-native",
+      "display": "bwn native",
+      "version_text": "buildwithnexus 0.21.0",
+      "sizes": {
+        "package_bytes": 6492376,
+        "package_url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "download_bytes": 6492376,
+        "download_parts": [
+          {
+            "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+            "bytes": 6492376,
+            "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+            "kind": "github-release-asset"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 6492376,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus",
+        "entrypoint_bytes": 6492376,
+        "binary_bytes": 6492376,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus",
+        "notes": [
+          "This row is the release binary invoked directly (the cargo-install / prebuilt entry), not the npm launcher.",
+          "download_bytes is the GitHub release asset. cargo install builds from source instead of downloading this file; the asset is what the npm launcher downloads on first run."
+        ]
+      },
+      "paired_control": "warm --version only, same binary and machine as the npm timings",
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.0006573346000000002,
+          "median_s": 0.0005880835,
+          "stddev_s": 0.00012976055354358212,
+          "min_s": 0.00052391,
+          "max_s": 0.000876882,
+          "times_s": [
+            0.000598965,
+            0.000848972,
+            0.0005772020000000001,
+            0.00055356,
+            0.00052391,
+            0.000683587,
+            0.000837341,
+            0.0008203440000000001,
+            0.0005662060000000001,
+            0.0005416990000000001,
+            0.0005407480000000001,
+            0.000876882,
+            0.000688607,
+            0.0006358700000000001,
+            0.000560514,
+            0.000560912,
+            0.0005548780000000001,
+            0.000533418,
+            0.0008513040000000001,
+            0.0007917730000000001
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/homes/bwn-handoff/bin/0.21.0/buildwithnexus --version\n  Time (mean \u00b1 \u03c3):     657.3 \u00b5s \u00b1 129.8 \u00b5s    [User: 545.8 \u00b5s, System: 61.1 \u00b5s]\n  Range (min \u2026 max):   523.9 \u00b5s \u2026 876.9 \u00b5s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-native-version-warm.json"
+        }
+      }
+    }
+  },
+  "rankings": {
+    "startup_version_warm_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.000534615
+        },
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.0005880835
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "startup_version_cold_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.005546241
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "startup_help_warm_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.0005695615000000001
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "startup_help_cold_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.005988005
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "memory_median_kib": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 3464.0
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "install_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6643749
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "download_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6547655
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "binary_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "package_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6547655
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "prompt_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.2503188569999111
+        }
+      ],
+      "fastest": "bwn-npm"
+    },
+    "task_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.058215831999405054
+        }
+      ],
+      "fastest": "bwn-npm"
+    }
+  },
+  "complete": true
+}
