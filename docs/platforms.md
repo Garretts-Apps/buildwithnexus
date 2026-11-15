@@ -8,6 +8,32 @@ here needs extra dependencies — Windows integration shells out to the
 built-in tools (`powershell.exe`, `cmd.exe`, `icacls`, `tasklist`,
 `taskkill`).
 
+## Install on Windows
+
+Install with npm (Node.js 18 or later). That is the supported install. The
+first run downloads the Windows `.exe` and checks its SHA-256 before running
+it. Do not install by downloading the `.exe` from GitHub Releases.
+
+```powershell
+npm install -g buildwithnexus
+bwn version
+```
+
+The `.exe` is unsigned: it has no Authenticode signature. It does have a
+GitHub build-provenance attestation, which ties the file to the release
+workflow that built it. After `bwn version` has printed
+`buildwithnexus VERSION`, the file is
+`%USERPROFILE%\.buildwithnexus\bin\VERSION\buildwithnexus.exe`. Replace
+`VERSION` with that number and verify the copy:
+
+```powershell
+gh attestation verify "$env:USERPROFILE\.buildwithnexus\bin\VERSION\buildwithnexus.exe" --repo Garretts-Apps/buildwithnexus
+```
+
+The same command checks the checksum file
+(`buildwithnexus-x86_64-pc-windows-msvc.exe.sha256`) or any other platform's
+binary.
+
 Works on native Windows:
 
 - The full TUI (alternate screen, raw mode, mouse, bracketed paste) via
@@ -56,8 +82,9 @@ Still Unix-only:
 
 Endpoint protection such as CrowdStrike Falcon or Microsoft Defender may
 block or quarantine the Windows binary: it is new, has few installs, and the
-npm launcher downloads it on first run and then executes it. The file itself
-matches the release checksum and attestation. On a managed machine, ask IT to
+npm launcher downloads it on first run and then executes it. The file is
+unsigned and matches the release checksum and build-provenance attestation.
+On a managed machine, ask IT to
 allowlist it. When a blocked binary cannot start, the launcher prints its path
 and SHA-256 and names the endpoint product it finds, and it does not download
 the binary again on its own. [SECURITY.md](../SECURITY.md#for-it-and-security-teams) lists what
