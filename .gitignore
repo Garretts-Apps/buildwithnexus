@@ -19,6 +19,8 @@ harness/.cargo/
 
 # Competitor benchmark installs (the JSON under bench/results is committed)
 /bench/.tools/
+**/__pycache__/
+*.pyc
 
 # Local runtime artifacts
 .buildwithnexus/artifacts/
