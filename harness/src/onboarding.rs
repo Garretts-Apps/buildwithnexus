@@ -683,6 +683,10 @@ fn key_page(provider: &str) -> Option<&'static str> {
         "openrouter" => "https://openrouter.ai/keys",
         "groq" => "https://console.groq.com/keys",
         "huggingface" => "https://huggingface.co/settings/tokens",
+        "gemini" => "https://aistudio.google.com/apikey",
+        "xai" => "https://console.x.ai/",
+        "mistral" => "https://console.mistral.ai/api-keys",
+        "deepseek" => "https://platform.deepseek.com/api_keys",
         _ => return None,
     })
 }

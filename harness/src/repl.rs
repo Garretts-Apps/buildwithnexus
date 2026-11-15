@@ -459,6 +459,16 @@ pub(super) fn repl(
                 trace::set_session(&sid);
                 continue;
             }
+            _ if t == "/fork" || t.starts_with("/fork ") => {
+                handle_fork(
+                    &mut sid,
+                    cwd,
+                    &provider.model,
+                    &transcript,
+                    t["/fork".len()..].trim(),
+                );
+                continue;
+            }
             "/trace" => {
                 trace::render_list(30);
                 continue;
@@ -1434,6 +1444,34 @@ pub(super) fn handle_rename(sid: &str, name: &str) {
     }
 }
 
+/// `/fork [name]`: the same conversation under a new session id. The previous
+/// file stays where it is, so `/resume` can open it.
+pub(super) fn handle_fork(
+    sid: &mut String,
+    cwd: &std::path::Path,
+    model: &str,
+    transcript: &[provider::Msg],
+    name: &str,
+) {
+    match session::fork(sid, cwd, model, transcript, name) {
+        Ok(id) => {
+            let previous = sid.clone();
+            *sid = id.clone();
+            session::set_current(&id);
+            trace::set_session(&id);
+            tui::line(&tui::green(&format!(
+                "  ✓ forked into {}",
+                tui::sanitize_terminal(&id)
+            )));
+            tui::line(&tui::dim(&format!(
+                "  the previous session is still saved as {} — /resume opens it",
+                tui::sanitize_terminal(&previous)
+            )));
+        }
+        Err(e) => tui::line(&tui::yellow(&format!("  {e}"))),
+    }
+}
+
 // `bwn sessions [rm <id>]`.
 pub(super) fn sessions_command(args: &[String]) {
     match args.first().map(String::as_str) {
@@ -2183,7 +2221,9 @@ pub(super) fn parse_model_pick(pick: &str, current_provider: &str) -> (String, S
     if lower.starts_with("gpt") || lower.starts_with("chatgpt") {
         return ("openai".into(), pick.to_string());
     }
-    // Gemini has no native preset — OpenRouter serves it.
+    // A bare "gemini…" name still goes to OpenRouter. The gemini preset is
+    // explicit (`/model gemini <name>`, `--provider gemini`) so an existing
+    // OpenRouter setup is not redirected at Google.
     if lower.starts_with("gemini") {
         return ("openrouter".into(), format!("google/{lower}"));
     }

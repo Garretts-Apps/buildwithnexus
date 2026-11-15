@@ -13,6 +13,16 @@ fn startup_tips_fit_one_line_and_stay_in_character() {
 }
 
 #[test]
+fn unattended_setup_keeps_the_original_key_order() {
+    let both = unattended_settings(None, |k| k == "OPENAI_API_KEY" || k == "GEMINI_API_KEY")
+        .expect("a key is set");
+    assert_eq!(both.provider, "openai");
+    let only = unattended_settings(None, |k| k == "DEEPSEEK_API_KEY").expect("deepseek key");
+    assert_eq!(only.provider, "deepseek");
+    assert!(unattended_settings(None, |_| false).is_none());
+}
+
+#[test]
 fn model_pick_routes_to_serving_provider() {
     let p = |s: &str| parse_model_pick(s, "anthropic");
     assert_eq!(
@@ -28,10 +38,14 @@ fn model_pick_routes_to_serving_provider() {
         p("local/phi-4.gguf"),
         ("llamacpp".into(), "phi-4.gguf".into())
     );
-    // Gemini has no native preset — routed through OpenRouter's naming.
+    // A bare gemini name still goes to OpenRouter. The preset is explicit.
     assert_eq!(
         p("gemini-2.5-pro"),
         ("openrouter".into(), "google/gemini-2.5-pro".into())
+    );
+    assert_eq!(
+        p("gemini gemini-4-hydrogen"),
+        ("gemini".into(), "gemini-4-hydrogen".into())
     );
     // org/model naming is OpenRouter's scheme.
     assert_eq!(

@@ -219,6 +219,15 @@ pub fn claim_or_new() -> String {
     }
 }
 
+// A turn the person sent. An image with no caption still counts.
+fn user_turn(m: &Msg) -> bool {
+    match m {
+        Msg::User(t) => !t.trim().is_empty(),
+        Msg::UserImages { text, images } => !text.trim().is_empty() || !images.is_empty(),
+        _ => false,
+    }
+}
+
 // First non-empty user message, truncated — the human-readable label.
 fn title_of(msgs: &[Msg]) -> String {
     for m in msgs {
@@ -711,6 +720,45 @@ fn write_whole(path: &Path, header: Header, msgs: &[Msg]) -> Result<Tracked, Str
     })
 }
 
+/// Copies `msgs` into a new session and returns its id. `from` is saved
+/// first, so both files hold this conversation and later edits to the fork
+/// do not change the original. `name` empty means `fork of <the original's
+/// label>`. An empty conversation is refused and nothing is written.
+pub fn fork(
+    from: &str,
+    cwd: &Path,
+    model: &str,
+    msgs: &[Msg],
+    name: &str,
+) -> Result<String, String> {
+    if !msgs.iter().any(user_turn) {
+        return Err("nothing to fork yet — send a message first".into());
+    }
+    if !save(from, cwd, model, msgs) {
+        return Err("could not save this session, so it was not forked".into());
+    }
+    let source_label = load(from)
+        .map(|s| s.label().to_string())
+        .unwrap_or_else(|| "this session".into());
+    let id = new_id();
+    if !save(&id, cwd, model, msgs) {
+        return Err("could not save the forked session".into());
+    }
+    let label = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            format!("fork of {source_label}")
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if let Err(e) = rename(&id, &label) {
+        let _ = remove(&id);
+        return Err(e);
+    }
+    Ok(id)
+}
+
 /// Names a saved session (/rename). The name replaces the first prompt in
 /// listings and survives later saves.
 pub fn rename(id: &str, name: &str) -> Result<(), String> {
@@ -1060,6 +1108,40 @@ mod tests {
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
         r
+    }
+
+    #[test]
+    fn fork_keeps_the_original_and_names_the_copy() {
+        with_home(|| {
+            let cwd = Path::new("/proj");
+            let msgs = vec![Msg::User("fix the parser".into())];
+            let from = "0000000000000001";
+            assert!(save(from, cwd, "m", &msgs));
+            rename(from, "parser").unwrap();
+            let id = fork(from, cwd, "m", &msgs, "").unwrap();
+            assert_ne!(id, from);
+            let orig = load(from).unwrap();
+            assert_eq!(orig.label(), "parser");
+            assert_eq!(orig.msgs.len(), 1);
+            let copy = load(&id).unwrap();
+            assert_eq!(copy.label(), "fork of parser");
+            assert_eq!(copy.msgs.len(), 1);
+            assert_eq!(copy.model, "m");
+            assert_eq!(copy.cwd, "/proj");
+            let named = fork(from, cwd, "m", &msgs, "try tests").unwrap();
+            assert_eq!(load(&named).unwrap().label(), "try tests");
+            // The original is still the one that was named, not a second fork.
+            assert_eq!(load(from).unwrap().label(), "parser");
+            assert!(fork(from, cwd, "m", &[], "x").is_err());
+            assert!(fork(
+                from,
+                cwd,
+                "m",
+                &[Msg::System("only a system turn".into())],
+                ""
+            )
+            .is_err());
+        });
     }
 
     #[test]
