@@ -10,9 +10,16 @@ built-in tools (`powershell.exe`, `cmd.exe`, `icacls`, `tasklist`,
 
 ## Install on Windows
 
-Install with npm (Node.js 18 or later). That is the supported install. The
-first run downloads the Windows `.exe` and checks its SHA-256 before running
-it. Do not install by downloading the `.exe` from GitHub Releases.
+The native installer is the one to use. It downloads the `.exe`, checks its
+SHA-256, and puts it in `%LOCALAPPDATA%\Programs\bwn`. No elevation.
+
+```powershell
+irm https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.ps1 | iex
+bwn version
+```
+
+npm is the alternative. Its first run still downloads the same `.exe`; the
+next `bwn` is that file, not Node.
 
 ```powershell
 npm install -g buildwithnexus
@@ -21,13 +28,15 @@ bwn version
 
 The `.exe` is unsigned: it has no Authenticode signature. It does have a
 GitHub build-provenance attestation, which ties the file to the release
-workflow that built it. After `bwn version` has printed
-`buildwithnexus VERSION`, the file is
-`%USERPROFILE%\.buildwithnexus\bin\VERSION\buildwithnexus.exe`. Replace
-`VERSION` with that number and verify the copy:
+workflow that built it. Do not install by downloading the `.exe` from GitHub
+Releases. After `bwn version` has printed `buildwithnexus VERSION`, a copy
+from npm is `%USERPROFILE%\.buildwithnexus\bin\VERSION\buildwithnexus.exe`,
+and the native installer writes
+`%LOCALAPPDATA%\Programs\bwn\bwn.exe`. Replace `VERSION` with that number
+and verify the copy:
 
 ```powershell
-gh attestation verify "$env:USERPROFILE\.buildwithnexus\bin\VERSION\buildwithnexus.exe" --repo Garretts-Apps/buildwithnexus
+gh attestation verify "$env:LOCALAPPDATA\Programs\bwn\bwn.exe" --repo Garretts-Apps/buildwithnexus
 ```
 
 The same command checks the checksum file

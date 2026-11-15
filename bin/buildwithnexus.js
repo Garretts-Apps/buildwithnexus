@@ -96,6 +96,18 @@ if (!bin) {
   process.exit(1);
 }
 
+// The checksum-verified copy is what npm downloaded. Point `bwn` at it so the
+// next launch does not start Node. BWN_BIN and the test skip leave shims alone.
+if (process.env.BWN_SKIP_HANDOFF !== '1' && !process.env.BWN_BIN && bin === installedBinary()) {
+  try {
+    const hand = require('../scripts/native-handoff.js');
+    const note = hand.tip(hand.handoff(bin));
+    if (note) process.stderr.write(note);
+  } catch {
+    // This run still starts the binary below.
+  }
+}
+
 // Not spawnSync: a SIGTERM or SIGHUP sent to this process (a timeout, a
 // supervisor, a cancelled CI job, a closed terminal) must reach the binary
 // too, or the agent keeps running with no parent. Ctrl+C reaches both through

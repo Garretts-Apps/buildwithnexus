@@ -3,18 +3,39 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md); about 27 ms through the npm launcher, which starts Node first). Remote models via
+An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md)). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands. By default it asks before each change; accept-edits, auto and
-readonly modes let you choose. It ships as one self-contained binary with
-10 direct dependencies. The terminal UI has live autocomplete, inline diffs,
-clickable files and links, and image paste from the clipboard.
+commands. By default it asks before each change. It ships as one self-contained binary with
+10 dependencies. The terminal UI has live autocomplete, inline diffs,
+clickable files and links, and image paste.
 
 ```bash
-npm install -g buildwithnexus     # fetches the checksum-verified binary on first run
-# or, with a Rust toolchain:
-cargo install buildwithnexus --locked   # installs `buildwithnexus` + the `bwn` alias
-buildwithnexus
+curl -fsSL https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+bwn version
+```
+
+```powershell
+irm https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.ps1 | iex
+bwn version
+```
+
+```bash
+brew tap Garretts-Apps/buildwithnexus https://github.com/Garretts-Apps/buildwithnexus
+brew install buildwithnexus
+bwn version
+```
+
+```bash
+cargo install buildwithnexus --locked
+bwn version
+```
+
+npm still works. After the first run, `bwn` is the native binary.
+
+```bash
+npm install -g buildwithnexus
+bwn version
 ```
 
 The first launch walks you through choosing a model, and setup finishes only
@@ -28,13 +49,12 @@ when one is available). Set `auto_update: "install"` in settings to apply
 patch releases automatically (a new minor version is announced, not
 installed; `"install-any"` installs those too), or `"off"` to silence the
 check. The check reads `BWN_UPDATE_REGISTRY`, else npm's
-`npm_config_registry`, else the public registry. The npm launcher keeps the
-downloaded binary in `~/.buildwithnexus/bin/<version>/` (under `NEXUS_HOME`
-if set), outside the npm package, so `npm update` does not delete it.
+`npm_config_registry`, else the public registry.
 
 ## Uninstall
 
 ```bash
+rm -f ~/.local/bin/bwn ~/.local/bin/buildwithnexus
 npm uninstall -g buildwithnexus      # or: cargo uninstall buildwithnexus
 rm -rf ~/.buildwithnexus             # or $NEXUS_HOME, if you set it
 ```
@@ -161,9 +181,7 @@ dependencies** — never at the cost of the UX. Enums and `match` over trait
 objects; flat data tables over registries; one pooled HTTP connection reused
 across every step of the agent loop.
 
-The speed is measured: 1.2 ms for the native binary to run `--version`
-(about 27 ms through the npm launcher, which starts Node first, so that is
-what an npm install gets), a 9 MiB resident TUI, 2.8 µs to render a streamed
+The speed is measured: 1.2 ms for `--version`, a 9 MiB resident TUI, 2.8 µs to render a streamed
 chunk into a 2,000-line transcript, and no terminal-size checks or
 full-screen repaints per keystroke. Every number and how to regenerate it:
 [BENCHMARKS.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md).

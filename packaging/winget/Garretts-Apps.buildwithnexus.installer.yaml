@@ -1,0 +1,12 @@
+PackageIdentifier: Garretts-Apps.buildwithnexus
+PackageVersion: 0.21.0
+Installers:
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-pc-windows-msvc.exe
+    InstallerSha256: 00af007193c1f273d9e45ae9c6dfae31cef8a8f54206fb5a6bfc1bd0c592ca2d
+    Commands:
+      - bwn
+      - buildwithnexus
+ManifestType: installer
+ManifestVersion: 1.6.0
