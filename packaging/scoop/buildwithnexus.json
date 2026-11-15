@@ -1,0 +1,19 @@
+{
+  "version": "0.21.0",
+  "description": "Agentic AI coding CLI",
+  "homepage": "https://buildwithnexus.dev",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-pc-windows-msvc.exe",
+      "hash": "00af007193c1f273d9e45ae9c6dfae31cef8a8f54206fb5a6bfc1bd0c592ca2d"
+    }
+  },
+  "bin": [
+    [
+      "buildwithnexus.exe",
+      "bwn"
+    ],
+    "buildwithnexus.exe"
+  ]
+}

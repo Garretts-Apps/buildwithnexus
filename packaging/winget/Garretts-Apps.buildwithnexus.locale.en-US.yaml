@@ -1,0 +1,9 @@
+PackageIdentifier: Garretts-Apps.buildwithnexus
+PackageVersion: 0.21.0
+PackageLocale: en-US
+Publisher: Garretts-Apps
+PackageName: buildwithnexus
+License: MIT
+ShortDescription: Agentic AI coding CLI
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

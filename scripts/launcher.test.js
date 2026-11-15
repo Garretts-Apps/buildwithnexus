@@ -55,7 +55,7 @@ function tempPackage(t, { home = tempHome(t), version = VERSION } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bwn-launcher-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const f of ['package.json', 'bin/buildwithnexus.js', 'scripts/resolve-binary.js',
-    'scripts/bootstrap.js', 'scripts/diagnose.js']) {
+    'scripts/bootstrap.js', 'scripts/diagnose.js', 'scripts/native-handoff.js']) {
     fs.mkdirSync(path.join(root, path.dirname(f)), { recursive: true });
     fs.copyFileSync(path.join(REPO, f), path.join(root, f));
   }
@@ -82,7 +82,7 @@ function launch(pkg, args, env = {}, preload = []) {
   return spawnSync(process.execPath,
     [...preload.flatMap((p) => ['-r', p]), path.join(pkg.root, 'bin', 'buildwithnexus.js'), ...args], {
       encoding: 'utf8',
-      env: { ...clean, NEXUS_HOME: pkg.home, ...env },
+      env: { ...clean, NEXUS_HOME: pkg.home, BWN_SKIP_HANDOFF: '1', ...env },
       timeout: 60000,
     });
 }
