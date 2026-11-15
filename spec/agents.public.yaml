@@ -433,7 +433,7 @@ agents:
     spawns_sdk: true
 
   consultant:
-    name: Casey
+    name: Morgan
     title: Executive Consultant
     model: opus
     layer: consultant

@@ -1,5 +1,5 @@
 // The tool surface the agent can call. Definitions are data; execution is a
-// single `match` — no registry, no dyn dispatch (Casey: don't build the plugin
+// single `match` — no registry, no dyn dispatch (do not build the plugin
 // system before there are plugins).
 
 use std::collections::HashSet;
