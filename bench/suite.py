@@ -629,8 +629,9 @@ def measure_prompt_once(argv: list[str], env: dict, pattern: str | None, timeout
                 if not chunk:
                     break
                 buf += chunk
-                if pattern and matched_at is None and pattern in strip_ansi(buf):
-                    matched_at = now - start
+            if pattern and matched_at is None and pattern in strip_ansi(buf):
+                matched_at = now - start
+                break
             if len(buf) > 200_000:
                 break
     finally:
