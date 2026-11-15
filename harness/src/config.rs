@@ -4670,7 +4670,7 @@ mod tests {
         assert!(!bodies.iter().any(|b| b.contains("## Roles")));
         assert!(files.iter().all(|f| !f.truncated));
 
-        let notice = instructions_notice(&files).unwrap();
+        let notice = instructions_notice(&files).unwrap().replace('\\', "/");
         assert!(notice.starts_with("instructions: "));
         assert!(notice.ends_with(
             "AGENTS.md, sub/CLAUDE.md, sub/leaf/AGENTS.md, sub/leaf/.buildwithnexus/AGENTS.md"
