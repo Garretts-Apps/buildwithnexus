@@ -7,6 +7,12 @@ description = "An agentic AI coding CLI in Rust — remote or local models, full
 license = "MIT"
 repository = "https://github.com/Garretts-Apps/buildwithnexus"
 homepage = "https://buildwithnexus.dev"
+# The repository README. On publish, cargo copies it into this crate and
+# crates.io resolves relative links from harness/, so a link like
+# BENCHMARKS.md becomes harness/BENCHMARKS.md and 404s. File links in that
+# README are absolute GitHub URLs. scripts/check-published-readme.mjs keeps
+# them that way, and keeps the file short enough that npm shows all of it
+# (the registry cuts a readme at 65536 UTF-16 code units).
 readme = "../README.md"
 keywords = ["ai", "agent", "cli", "tui", "llm"]
 categories = ["command-line-utilities", "development-tools"]

@@ -7,6 +7,9 @@ description = "bwn — short-name alias crate for the buildwithnexus agentic AI 
 license = "MIT"
 repository = "https://github.com/Garretts-Apps/buildwithnexus"
 homepage = "https://buildwithnexus.dev"
+# docs.rs runs `cargo rustdoc --lib` and fails a binary-only crate with
+# "no library targets found" (bwn 0.20.0's build did). src/lib.rs is that
+# target; the page points at the product site.
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "tui", "llm"]
 categories = ["command-line-utilities", "development-tools"]

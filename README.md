@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/buildwithnexus?style=flat-square&color=blue)](https://www.npmjs.com/package/buildwithnexus)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
-An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](BENCHMARKS.md); about 27 ms through the npm launcher, which starts Node first). Remote models via
+An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md); about 27 ms through the npm launcher, which starts Node first). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
 commands. By default it asks before each change; accept-edits, auto and
 readonly modes let you choose. It ships as one self-contained binary with
@@ -161,7 +161,7 @@ The speed is measured: 1.2 ms for the native binary to run `--version`
 what an npm install gets), a 9 MiB resident TUI, 2.8 µs to render a streamed
 chunk into a 2,000-line transcript, and no terminal-size checks or
 full-screen repaints per keystroke. Every number and how to regenerate it:
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md).
 
 ### Package history
 
@@ -412,7 +412,7 @@ comes back in the input box to edit and send again. `/diff` lists every changed 
 with one summary line and shows a chosen file's diff; `/diff turn` shows what
 the last turn changed. `/commit` drafts a message and commits only when you
 answer `c` (`[c]ommit · [e]dit · [n]o`). Each folder keeps its newest 500
-checkpoints. [RECOVERY.md](RECOVERY.md) has the details.
+checkpoints. [RECOVERY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/RECOVERY.md) has the details.
 
 ## Headless and CI
 
@@ -504,7 +504,7 @@ that is not trusted exits 2 and says how to trust it.
 
 Each `--json` event has a `schema_version` (now `1`). What may change in a
 minor or a patch release (flags, settings keys, events, session files, exit
-codes) is in [docs/VERSIONING.md](./docs/VERSIONING.md).
+codes) is in [docs/VERSIONING.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/VERSIONING.md).
 
 ```bash
 ANTHROPIC_API_KEY=... bwn run --permission-mode auto --json "fix the failing test"
@@ -518,7 +518,7 @@ npm, runs `run` or `review` with `--json`, turns the outcome into the step's
 result with annotations (review findings land on their lines), uploads the
 event log as an artifact and, with `comment: true`, posts the summary on the
 pull request, updating the same comment on later pushes.
-[examples/github/bwn-review.yml](./examples/github/bwn-review.yml) reviews
+[examples/github/bwn-review.yml](https://github.com/Garretts-Apps/buildwithnexus/blob/main/examples/github/bwn-review.yml) reviews
 every pull request:
 
 ```yaml
@@ -542,7 +542,7 @@ which makes it a warning. The outputs are `outcome`, `exit-code`, `passed`,
 (empty: the action's own version), and `BWN_BIN` in the step's environment
 runs a binary you built instead. Inputs reach the scripts as environment
 variables, never as script text, and the token is passed only to the comment
-step. All inputs are in [action.yml](./action.yml).
+step. All inputs are in [action.yml](https://github.com/Garretts-Apps/buildwithnexus/blob/main/action.yml).
 
 ## Permissions
 
@@ -731,325 +731,103 @@ be confined. To escape for one command, switch with `/sandbox off` and back.
 
 ## Inline images
 
-Attach an image three ways — `Ctrl+V` with a screenshot on the clipboard,
-drag a file onto the terminal (or paste its path), or type `@shot.png` — and
-it is drawn inside the transcript, above the composer, before you send it:
-
-| Terminal | What you see |
-|---|---|
-| kitty ≥ 0.28, Ghostty, WezTerm (placeholder support) | the real pixels, at up to the full width of the window, scrolling with the text; works inside tmux with `set -g allow-passthrough on` |
-| Sixel terminals: Windows Terminal 1.22+, WezTerm, foot, mlterm, xterm `-ti vt340` | the real pixels, detected at startup; needs `ffmpeg` on PATH |
-| any other truecolor terminal (iTerm2, Alacritty, older Windows Terminal, VS Code…) | half-block art (needs `ffmpeg` on PATH to decode) |
-| `NO_COLOR`, non-truecolor | no preview, never garbage |
-
-A pasted PNG needs no external tool at all. JPEG, WebP, GIF and a video's
-first frame are converted with ffmpeg when it is installed. Control it with
-the `images` settings key (`"auto"` default, `"kitty"`, `"sixel"`, `"blocks"`,
-`"off"`) or `BWN_IMAGES=…` for one run. Sixel and block previews take at most
-half the window's width and a third of its height, and re-fit when the
-window is resized. Uploads are freed when you `/clear` or exit.
-
-### Pictures, PDFs and screenshots the agent reads
-
-The model can look at pictures too, when it takes images (see `vision` under
-[Models](#models)). `read_file` on a PNG, JPEG, GIF or WebP (up to 5 MB)
-returns the picture: Anthropic gets it inside the tool result, and
-OpenAI-compatible servers and Ollama get it in a user message right after
-the tool results. A text-only model is told why it sees none, and the
-transcript shows what the picture was (`image shot.png (image/png,
-1280x800, …)`). `read_file` on a PDF returns its text through
-`pdftotext` from poppler when that is installed (`apt install
-poppler-utils`, `brew install poppler`), and otherwise says what to install;
-a line range works as for any file.
-
-`screenshot_url` opens a page served on this machine
-(`http://localhost:3000`, a dev server the agent started) in a local
-headless Chrome, Chromium or Edge and shows the model the picture (`width`
-and `height` optional, default 1280×800). The browser is `BWN_CHROME` when
-set, else one found on PATH, in the usual install folders, or a Playwright
-build. It runs with a throwaway profile and without provider keys in its
-environment. Only loopback addresses are opened unless `network.allow` (or
-an allow rule for `screenshot_url`) names the host, and outside `auto` each
-host is approved like a fetch. Every request the page or the browser makes
-to any other host, link-local and cloud-metadata addresses included, goes to
-a local proxy that refuses it, and the result lists the hosts the page
-tried. The tool is offered only to models that take images.
-
-`"vision": false` in settings.json makes bwn treat the model as text-only:
-`read_file` then returns a notice instead of a picture and `screenshot_url`
-is not offered. Pictures a tool returned are kept in the session file, like
-attached images.
-
-A related setting: `notify` (`"auto"` — desktop notification when a turn of
-8 s or longer ends, or an approval or a question is waiting, while the window
-is unfocused; `"always"`; `"off"`).
+`Ctrl+V`, a dropped file, or `@shot.png` draws the picture in the transcript
+before you send it: real pixels on kitty, Ghostty, WezTerm and Sixel
+terminals, half-block art elsewhere, and nothing (never garbage) when color
+is off. A pasted PNG needs no extra tool; JPEG, WebP, GIF and a video frame
+use ffmpeg. `read_file` shows a picture to a model that takes images (up to
+5 MB) and a PDF's text when `pdftotext` is installed. `screenshot_url` opens
+a page on this machine in a throwaway browser; other hosts the page contacts
+are refused. `"vision": false` keeps pictures out. `notify` is `"auto"`,
+`"always"` or `"off"`. Terminals, sizes and the screenshot rules are in
+[Inline images](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/images.md).
 
 ## Hooks
 
-Run your own commands at the same lifecycle points as Claude Code, configured in
-`~/.buildwithnexus/settings.json` (user) and/or `.buildwithnexus/settings.json`
-(project). User hooks are always active; **project hooks run only after you trust
-that folder** (you're prompted once, and a project hook may *deny* a tool but
-never *grant* one — so cloning a hostile repo can't run or unlock anything).
-The prompt shows each hook's command line and each project MCP server's
-command and arguments. Trusting also pins the project files those commands
-run: scripts they name (`./x.sh`, or a bare `setup` that `sh` or `cmd.exe`
-would find in the folder), and `package.json` or the `Makefile` when they
-call `npm`, `make` and the like, in the project root or in a folder the
-command names (`make -C sub`, `cd web && npm test`). Editing one of those
-asks again, and the check is repeated before every run of a project hook: a
-script that changed since you trusted it is asked about
-(`scripts/fmt.sh changed since you trusted it — run it?`), or skipped with a
-warning in a headless run. The prompt is one screen with one question; when
-the project sets `base_url` (where your requests and key go) or `permission`,
-`e` trusts everything except those. A later prompt names the file that
-changed since you trusted the folder.
-For CI, see *Trusting a repository in CI* under [Headless and CI](#headless-and-ci).
-Events: `SessionStart` / `SessionEnd` (once per process), `UserPromptSubmit`,
-`PrePrompt` (before each model request in a BUILD turn), `PreToolUse`,
-`PermissionRequest` (where bwn is about to ask you to approve a call),
-`PostToolUse`, `PostResponse`, `OnError`, `Stop` (after every BUILD, PLAN,
-BRAINSTORM, or chat response), `SubagentStop` (when a `spawn_subagent` call
-returns; its payload carries the subagent's `tool_input`), `PreCompact` (before
-the conversation is summarized; `trigger` is `auto`, or `manual` for
-`/compact`), and `Notification` (where bwn raises a desktop notification,
-whatever the `notify` setting and window focus; `notification_type` is
-`permission_prompt`, `question`, `done` when a turn ends, or `idle_prompt` when
-the prompt has waited `idle_notify_secs`, default 60, `0` for never). A
-`PreCompact` or `Notification` matcher matches the trigger or the type. Each
-hook receives the event as JSON on stdin with Claude Code's field names:
-`hook_event_name`, `session_id` (the id the transcript is saved under),
-`transcript_path` (a JSON Lines file since 0.20: a header line, then one
-`{"msg": …}` line per message; see [docs/VERSIONING.md](docs/VERSIONING.md)), `permission_mode` (`ask` | `accept-edits` | `auto` | `readonly`), `cwd`, plus
-the event's own fields (`tool_name`, `tool_input`, `tool_response`, `prompt`,
-`stop_hook_active`, `trigger`, `notification_type`, `message`).
+bwn runs your own commands at the same lifecycle points as Claude Code, from
+`~/.buildwithnexus/settings.json` and, once you trust the folder, from
+`.buildwithnexus/settings.json`. A project hook may deny a tool and may not
+grant one, so cloning a repository cannot run code or unlock a tool. Exit
+code 2 from `PreToolUse` blocks the call, including in `auto`. A hook that
+does not answer, times out or cannot start also blocks that one call.
 
-`PreToolUse` can gate a tool: exit code **2** (or a JSON
-`permissionDecision: "deny"`) blocks it — even under `auto`. `"allow"` skips the
-prompt; otherwise the normal gate applies. A `PreToolUse` hook that gives no
-answer also blocks the call, with a message naming it: one that times out
-(`"timeout"` in seconds, default 10), cannot start (missing script or
-interpreter, not executable, a `.rs` hook that does not compile) or is killed by
-a signal. Any other non-zero exit is shown with the end of its stderr and
-does not block, unless the hook sets `"on_error": "deny"`, which makes a
-crashing guard block the call. Other events never block on a failed hook, but
-the failure is shown. Matchers are `*`, an exact tool name, or a
-`|`-separated list; each segment may use `*` and `?` wildcards (`"*_file"`,
-`"mcp__*"`, or Claude Code's `"mcp__.*"`). Claude Code tool names stand for
-the bwn tools that do the same thing: `Bash` (`run_command`, `bash`,
-`start_server`), `Edit`, `MultiEdit`, `Write`, `Read`, `Grep`, `Glob`, `LS`,
-`WebFetch`, `WebSearch`, `Task` and `TodoWrite`, so a matcher copied from a
-Claude Code settings file guards the same calls. `Edit` and `Write` also cover
-`multi_edit`, `remove_path`, `move_path` and `create_dir`, and a matcher
-naming the shell (`Bash`, `run_command`, `bash`) also runs for `check_work`
-and `start_server` calls that carry a command. `tool_input` carries Claude
-Code's field names beside bwn's, with the values the tool will use:
-`file_path` (absolute), `old_string`, `new_string`, `content`, `prompt`,
-`subagent_type`, `glob`, `path` and `todos`. A call that touches several
-files (`move_path`, `read_many_files`, `apply_patch`) is shown to
-`PreToolUse` once per file, and `PostToolUse` sees a move's destination. The
-legacy `mcp_call` tool is matched, ruled and approved as the
-`mcp__<server>__<tool>` it calls. A `*` or empty matcher does
-not run on `finish` and `exit_plan`; name them to guard them. A hook under an
-event bwn does not fire, of an unknown `type`, or without its command is
-reported at startup and by `doctor` instead of being ignored. See
-[`examples/settings.json`](./examples/settings.json).
-
-Other events answer as Claude Code's do. What a `PostToolUse` hook says
-reaches the model with the call's result (the call already ran):
-`{"decision": "block", "reason": …}`,
-`{"hookSpecificOutput": {"additionalContext": …}}`, or its stderr with exit 2.
-A `Stop` or `SubagentStop` hook that exits 2 or answers
-`{"decision": "block", "reason": …}` keeps the agent (or the helper) going,
-with the reason as the next message, at most 3 rounds in a row;
-`stop_hook_active` is true while it does. It never sends on a turn you
-stopped, and in PLAN the plan waits for your approval instead.
-`PermissionRequest` may answer for you with
-`{"hookSpecificOutput": {"decision": {"behavior": "allow" | "deny" | "ask", "message": …}}}`
-(or `{"decision": …}`), and exit 2 denies. It also runs in headless runs,
-where nobody could answer the prompt; only your own hooks can allow.
-
-A hook's `type` is `command` (a shell command line), `python` or `script` (a
-file; the interpreter follows the extension), or `http`:
-`{"type": "http", "url": "https://…", "headers": {"Authorization": "…"}}`
-POSTs the payload as JSON through bwn's HTTP client (proxy and certificate
-settings apply) within the hook's `timeout`, following no redirects. The
-response body counts as the hook's output, and a status outside 2xx as a
-failed hook (reported as `answered HTTP <status>`). A host that `network.deny`
-names is refused. The trust prompt shows a project's http hook URLs (header
-names only). A header value can take a secret from the environment:
-`"Authorization": "Bearer $HOOK_TOKEN"` with `"allowed_env_vars": ["HOOK_TOKEN"]`
-fills in only the variables that list names, so a repository's settings cannot
-read the rest of your environment.
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "matcher": "run_command",
-        "hooks": [{ "type": "command", "command": "echo 'no shell on main' >&2; exit 2" }] },
-      { "matcher": "Edit|Write",
-        "hooks": [{ "type": "command", "command": "./scripts/guard.sh", "on_error": "deny" }] }
-    ]
-  }
-}
-```
+Events, the JSON on stdin, matchers (including Claude Code tool names), http
+hooks and the settings shape are in [Hooks](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/hooks.md).
 
 ## Project instructions (AGENTS.md / CLAUDE.md)
 
-The same instruction files other coding agents read are loaded into every
-system prompt — BUILD, PLAN, BRAINSTORM, quick chat replies, sub-agents, and
-headless `--json` runs. Discovery order (most general first, later files take
-precedence):
-
-1. `~/.buildwithnexus/AGENTS.md` (global, optional)
-2. every directory from the git root (or filesystem root) down to the cwd:
-   `AGENTS.md`, else `CLAUDE.md` (so a repo shipping both isn't loaded twice),
-   then `.buildwithnexus/AGENTS.md`
-
-Each file is capped at 32 KiB (cut with a visible marker) and 96 KiB in
-total. A dim line at startup lists what was found. The repository's own files
-are asked about once per folder and content: `instructions from this repo:
-AGENTS.md, src/AGENTS.md`, then `use them? y yes · n no · r review [N]`. Only
-`y` uses them (and is remembered); Enter, `n` or Esc keeps them out of the
-prompt for this session and asks again next launch, and `r` shows them. A task
-typed while the question is up is not an answer: it waits in the input box.
-After a `y` the line just names them, until a file changes. A headless run, or a session with prompts piped in, cannot ask, so until
-then it prints one line (a headless run on stderr): `instructions from this repo: AGENTS.md (not reviewed — …)`.
-`/init` offers to write `AGENTS.md` from the repository's own build and test
-files (or to improve the one there), shown as a diff you approve;
-`buildwithnexus init --agents-md` does the same headless.
-The `instruction_files` settings key changes which names are looked up
-(default `["AGENTS.md", "CLAUDE.md"]`; add `"GEMINI.md"`, or `[]` to disable).
-
-The mixed-case `.buildwithnexus/Agents.md` is different: it defines agent
-roles/capabilities (`/agents` shows it) and is loaded after the instructions.
-
-`~/.buildwithnexus/system.md` adds your own text to every system prompt. A
-project's `.buildwithnexus/system.md` is used only once you trust that folder
-(it is listed in the same prompt as project hooks), and it is added after
-yours, not in place of it. Set `"project_system_prompt": "replace"` in
-`~/.buildwithnexus/settings.json` to let a trusted project's file replace yours.
+`AGENTS.md` (or `CLAUDE.md`) from your home folder and from each directory
+down from the git root is added to the system prompt. A repository's own
+files are asked about once per folder and content (`use them? y yes · n no ·
+r review`); only `y` is remembered. Enter, `n` or Esc leaves them out for
+this session. A headless run cannot ask, so it names them as not reviewed
+and leaves them out. `/init` and `buildwithnexus init --agents-md` draft one.
+`~/.buildwithnexus/system.md` is always yours; a project's `system.md` is
+added after it only once you trust the folder (`"project_system_prompt":
+"replace"` lets a trusted project replace yours). Discovery order, the size
+caps and `instruction_files` are in
+[Project instructions](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/instructions.md).
 
 ## Skills
 
-Skills are markdown instructions loaded on demand: the system prompt carries
-only each skill's name and description, and the full body is loaded by
-`/<name>`, the `load_skill` tool (alias `skill`), or `list_skills` → `load_skill`.
-Two layouts are supported, from any of these roots:
-
-```
-~/.buildwithnexus/skills/   ./.buildwithnexus/skills/    (source: user / project)
-~/.claude/skills/           ./.claude/skills/            (source: claude)
-~/.agents/skills/           ./.agents/skills/            (source: agents)
-```
-
-- **`<name>/SKILL.md`** folders (the Agent Skills open standard) with YAML
-  frontmatter — `name` (defaults to the folder name) and `description`
-  (required for a useful listing; a missing one shows as `(no description)`
-  with a one-time warning). Unknown keys are ignored. When loaded, the skill
-  reports its directory so `scripts/` or `references/` inside it can be read
-  with the file tools.
-- **`<name>.md`** flat files, where the first prose line is the description.
-
-On a name collision a `SKILL.md` folder beats a flat file of the same name,
-and your own skills beat bundled ones. A skill from the project (the `./`
-roots above, a relative `skill_dirs` entry, or any `skill_dirs` entry a
-project settings file adds) loads only once you trust the folder (see
-*Project commands, skills and agents* below), and never replaces a bundled or
-user skill: it loads as `/project:<name>` instead, with a notice at startup.
-Set `"project_skills_override": true` in `~/.buildwithnexus/settings.json` to
-let project skills replace them, as before 0.15. Add more roots with the
-`skill_dirs` settings key (`["~/my-skills", "tools/skills"]`).
-`/skills` lists every skill with its source and description.
+Skills are markdown instructions loaded on demand. The system prompt carries
+only each skill's name and description; `/<name>`, the `load_skill` tool
+(alias `skill`), or `list_skills` loads the body. Roots are
+`~/.buildwithnexus/skills/`, `~/.claude/skills/`, `~/.agents/skills/` and the
+same folders in the project. A `SKILL.md` folder (the Agent Skills standard,
+with `name` and `description`) beats a flat `<name>.md` file. Your own skills
+beat bundled ones. A project skill loads only after you trust the folder, and
+as `/project:<name>` so it does not replace a bundled or user skill unless
+`"project_skills_override": true` is set in your own settings. `/skills` lists
+them. Layout, frontmatter and `skill_dirs` are in [Skills](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/skills.md).
 
 ### Custom commands
 
-A Markdown file in a commands folder is a slash command named after the file:
-`deploy.md` is `/deploy`. Its body, with the YAML frontmatter stripped, is the
-prompt; `description` in the frontmatter is what the command popup shows.
-`$ARGUMENTS` in the body is replaced by everything typed after the command,
-and `$1`…`$9` by single words (quotes group words), so `/deploy staging` fills
-in `staging`. A body with no placeholder gets the arguments added after it.
-A `.sh`, `.bash` or `.py` file runs as a command instead, through the same
-hooks and permission gate as `run_command`.
-
-Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
-and, once you trust them, from the project's `.buildwithnexus/commands/`
-and `.claude/commands/`. Skills and commands work headless too:
-`bwn run '/deploy staging'`.
-
-```markdown
----
-description: Deploy to an environment
----
-Run the deploy for $ARGUMENTS, then check the health endpoint.
-```
+A Markdown file in a commands folder is a slash command: `deploy.md` is
+`/deploy`. `$ARGUMENTS` and `$1`…`$9` fill in what you type after it, and a
+`.sh`, `.bash` or `.py` file runs through the same permission gate as
+`run_command`. Commands load from `~/.buildwithnexus/commands/` and
+`~/.claude/commands/`, and from the project's copies once you trust them.
+`bwn run '/deploy staging'` runs one headless. The file shape is in
+[Skills](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/skills.md#custom-commands).
 
 ### Helper agents
 
-The model can hand a subtask to a helper with the `task` (or
-`spawn_subagent`) tool, as the built-in `engineer` or `researcher` role or as
-a helper you define. An agent file is `<name>.md` with `name`, `description`
-and `tools` frontmatter and the helper's instructions as the body; `tools`
-limits what it may use, and Claude Code's tool names work (`Read`, `Grep`,
-`Bash`, …). A helper with a `tools` list can never delegate further (`task`
-and `spawn_subagent` are left out), and a call naming an unknown role fails
-with the list of roles. `/agents` lists the helpers.
+The model can hand a subtask to the `task` tool (alias `spawn_subagent`): a
+built-in `engineer` or `researcher`, or a helper from an agent file (`name`,
+`description`, `tools`). A helper with a `tools` list cannot delegate further.
+`read_only: true` (or a tools list that only reads) never writes. Read-only
+helpers, and isolated ones (`isolate: true`), that start in the same reply run
+together, up to `max_parallel_helpers` (default 3; `1` runs them in order).
+On a local server the default is one at a time, or as many as the server says
+it can answer at once. Isolated helpers take turns while `--add-dir` folders
+are in use. Helpers that write in your folder always run one after another.
+Esc or Ctrl+C stops them all. Their tokens count toward the session.
 
-```markdown
----
-name: test-writer
-description: Writes focused unit tests for one module
-tools: Read, Grep, Glob, Write
----
-Write tests for the module you are given. Do not change the module itself.
-```
-
-A helper started with `read_only: true`, or from an agent file with
-`read_only: true` or a `tools` list that only reads (`Read, Grep, Glob`),
-can read and search but never change anything. Read-only helpers and
-isolated ones (`isolate: true`) that the model starts in the same reply run
-at the same time, up to `max_parallel_helpers` at once (default 3; `1`
-runs them one after another). On a local server the default is one at a
-time, or as many as the server reports it answers at once (llama.cpp's
-slots): a server with one slot queues the others until they time out. Isolated helpers take turns while folders
-added with `--add-dir` are in use: a worktree does not cover those, and each
-helper may write there. Each shows its work in one labelled block
-when it finishes, a helper that needs an approval says which one it is,
-and Esc or Ctrl+C stops them all. Helpers that write in your folder always
-run one after another. Their tokens and cost count toward the session.
-
-Searches, tree walks and network calls that the model makes in a row in one
-reply (`grep_files`, `find_paths`, `find_files`, `list_tree`, `fetch_url`,
-`web_search`) run at the same time, up to `max_parallel_tools` at once
-(default 4; `1` runs every call one after another). File reads and folder
-listings in the same run are quick enough that they run in line. Each call is still
-checked, approved and shown in order before any of them runs, the model
-gets the results in the order it asked, and at most one call per website
-is in flight. Anything that writes, commands, questions, helpers, MCP and
-browser tools, and any call a PostToolUse hook matches, run one at a time
-as before.
+Searches, tree walks and network calls the model makes in a row in one reply
+(`grep_files`, `find_paths`, `find_files`, `list_tree`, `fetch_url`,
+`web_search`) run at the same time, up to `max_parallel_tools` (default 4;
+`1` is one at a time). File reads and folder listings in that run are quick
+enough to run in line. Each call is still checked, approved and shown in
+order before any of them runs, results come back in the order asked, and at
+most one call per website is in flight. Writes, commands, questions, helpers,
+MCP, browser tools, and any call a PostToolUse hook matches, stay one at a
+time.
 
 Agent files load from `~/.buildwithnexus/agents/` and `~/.claude/agents/`,
-and, once you trust them, from the project's `.buildwithnexus/agents/`
-and `.claude/agents/`. A helper that runs isolated in a git worktree shows
-its branch and the merge command when it finishes (a `subagent_result` event
-in `--json` mode), and commits with your git identity. To run a whole session
-on its own branch, start it with `--worktree <name>`.
+and from the project's copies once you trust them. An isolated helper shows
+its branch and the merge command when it finishes. `--worktree <name>` runs
+the whole session on its own branch. The agent-file shape is in
+[Skills](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/skills.md#helper-agents).
 
 ### Project commands, skills and agents
 
-A repository's command files speak to the model in your name, its skills
-and agents steer it, and a script command runs code, so they stay off until
-you trust them. The folder trust prompt lists each one with its file
-(`command /deploy (.claude/commands/deploy.md)`), also when the repository
-has nothing else to trust, and trusting pins their contents: adding, editing
-or removing one asks again at the next start. Until then a startup notice
-names them and how to trust, and typing one says it is off. A file linked to
-somewhere outside its folder never loads. `buildwithnexus trust --print`
-lists them for CI. Run from your home folder, these folders are your own and
-load as such.
+A repository's commands, skills and agents stay off until you trust them.
+The trust prompt lists each file, and trusting pins the contents: adding,
+editing or removing one asks again. Until then a startup notice names them,
+typing one says it is off, and a file that links outside its folder never
+loads. `buildwithnexus trust --print` lists them for CI. Run from your home
+folder, these folders are your own and load as such.
 
 ## MCP servers
 
@@ -1136,9 +914,8 @@ is left as configured.
 
 `buildwithnexus acp` speaks the [Agent Client Protocol](https://agentclientprotocol.com)
 (version 1) on stdin and stdout, so Zed, JetBrains IDEs and Neovim plugins
-that run ACP agents can drive bwn: the editor shows the streamed reply, each
-tool call with its diff, the plan, and the approval questions. In Zed, add it
-to `settings.json`, then pick it from the Agent Panel's new-thread menu:
+that run ACP agents can drive bwn. In Zed, add it to `settings.json`, then
+pick it from the Agent Panel's new-thread menu:
 
 ```json
 {
@@ -1153,45 +930,11 @@ to `settings.json`, then pick it from the Agent Panel's new-thread menu:
 }
 ```
 
-Other ACP clients take the same command and arguments. bwn uses the provider,
-model and key you set up in the terminal (`~/.buildwithnexus`); put an API key
-or `NEXUS_HOME` in `env` to use others, and the options of
-[Headless and CI](#headless-and-ci) in `args` (for example
-`["acp", "--permission-mode", "accept-edits"]`). If the editor cannot find
-`bwn`, give the full path that `command -v bwn` prints.
-
-What carries over from the terminal:
-
-- **Approvals.** Every approval the terminal would ask for is asked in the
-  editor with *Allow once*, *Always allow* (the terminal's `a`: remembered for
-  this project in your settings) and *Reject* (told to the model as a
-  denial). Permission modes, allow/ask/deny rules, hooks and the sandbox apply
-  as in the terminal. The model's `question` tool gets no answer.
-- **Folder trust.** A project's `.buildwithnexus` settings are asked about
-  in the editor at the first prompt, with the same questions; a yes is
-  remembered as in the terminal, and `--trust-project` works too. A project
-  hook whose script changed since you trusted it is skipped with a warning,
-  as in headless runs.
-- **Modes.** Build, Plan and Brainstorm are the session's modes. In Plan the
-  plan arrives as the editor's plan, and building it is a question of its own;
-  approving it switches the session to Build.
-- **Files.** When the editor offers it, `read_file`, `write_file`,
-  `edit_file` and `multi_edit` read and write through the editor, so they see
-  unsaved changes and the editor tracks each edit. Commands run in bwn's own
-  shell.
-- **Sessions.** Each editor thread is a bwn session saved like any other;
-  the editor can reopen one (`session/load` replays it), and `bwn resume`
-  continues it in the terminal.
-- **Cancel** stops the turn at once, including an open question.
-- **MCP servers** the editor passes (stdio or HTTP) join the ones in your
-  settings; SSE servers are skipped.
-
-One `bwn acp` process serves one folder, and runs one prompt at a time;
-helpers a reply starts run one after another, so the editor can show each
-one's calls under it.
-Everything bwn prints besides the protocol goes to stderr, which the editor
-keeps as the agent's log. Images and embedded files in a prompt are sent to
-the model (images only when it takes them); audio is not.
+Other clients take the same command and arguments. bwn uses the provider,
+model and key from `~/.buildwithnexus`; put an API key or `NEXUS_HOME` in
+`env` to use others. Approvals, folder trust, Build/Plan/Brainstorm, file
+reads and writes through the editor, and saved sessions carry over. One
+process serves one folder. The rest is in [Editors](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/editors.md).
 
 ## Build from source
 
@@ -1211,102 +954,34 @@ packages, and 0.12.1-0.14.2, which reference them, should not be installed. Non-
 ## Platform support
 
 Linux and macOS are the primary targets. Native Windows (PowerShell, cmd,
-Windows Terminal) and WSL are supported with the differences below. Nothing
-here needs extra dependencies — Windows integration shells out to the
-built-in tools (`powershell.exe`, `cmd.exe`, `icacls`, `tasklist`,
-`taskkill`).
-
-Works on native Windows:
-
-- The full TUI (alternate screen, raw mode, mouse, bracketed paste) via
-  crossterm. Ctrl+Break, closing the console window, logoff and shutdown
-  restore the terminal before the process ends; panics restore it too.
-- Ctrl+V paste of a clipboard **image** (PNG via `powershell.exe`
-  `Get-Clipboard -Format Image`) and clipboard text (`Get-Clipboard -Raw`).
-  WSL uses the same PowerShell path with a base64 round-trip. Windows
-  Terminal shows the half-block preview and the OSC 9;4 taskbar progress.
-- `~/.buildwithnexus/.env.keys` and `settings.json` are restricted to the
-  current user with `icacls /inheritance:r /grant:r` — the ACL equivalent of
-  the `0600` mode used on Unix. A failure is reported as a dim warning and
-  never blocks the save.
-- Background dev servers (`start_server` / `list_servers` / `stop_server`)
-  without tmux: liveness via `tasklist /FI "PID eq <pid>"`, shutdown via
-  `taskkill /PID <pid> /T /F` (the recorded pid is the `cmd /C` wrapper;
-  `/T` takes its children down with it).
-- Hook scripts by extension: `.ps1` → `powershell.exe -NoProfile
-  -ExecutionPolicy Bypass -File`, `.cmd`/`.bat` → `cmd.exe /C`, `.py` →
-  `python3` if it runs, else `python`. `.sh`/`.bash` run with `sh`/`bash`
-  from PATH (Git for Windows provides both); without them the hook fails with
-  an error naming the missing interpreter instead of a silent `sh` spawn
-  failure. Shell-string hooks and the `bash`/`run_command` tools run under
-  `cmd /C`.
-- `~` and `~/…` (also `~\…`) resolve against `%USERPROFILE%` when `HOME` is
-  unset. Temp files use the system temp directory everywhere.
-
-Still Unix-only:
-
-- tmux-backed dev servers (Windows uses the plain background-process path).
-- Copy-to-clipboard from the transcript is emitted as OSC 52 on every
-  platform; the extra `clip.exe` / `pbcopy` fallback only runs on WSL and
-  macOS, so on native Windows it relies on the terminal honouring OSC 52
-  (Windows Terminal does).
-- Auto-discovery of `~/.buildwithnexus/hooks/<Event>/` scripts still looks
-  for `.sh`/`.bash`/`.py`/`.rs` only; `.ps1`/`.cmd`/`.bat` hooks must be
-  listed in `settings.json` as `type: "script"`.
-- The `python_tool` runner always invokes `python3`.
-- `xdg-open`-style helpers, `/proc`-based WSL detection and Unix signal
-  handling (`SIGTERM`/`SIGHUP`) have no Windows equivalent beyond the above.
+Windows Terminal) and WSL are supported: the full TUI, clipboard images,
+per-user ACLs on the key file, and `~` via `%USERPROFILE%` when `HOME` is unset.
+Hook scripts run by
+extension (`.ps1`, `.cmd`, `.bat`, `.py`, `.sh`). Still Unix-only: tmux-backed
+dev servers, auto-discovery of `.ps1`/`.cmd`/`.bat` hooks (list those in
+settings), the `python_tool` runner's `python3`, and the `clip.exe` / `pbcopy`
+fallback beside OSC 52. The full list is in
+[Platform support](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/platforms.md).
 
 ### Managed and corporate machines
 
-Endpoint protection such as CrowdStrike Falcon or Microsoft Defender may
-block or quarantine the Windows binary: it is new, has few installs, and the
-npm launcher downloads it on first run and then executes it. The file itself
-matches the release checksum and attestation. On a managed machine, ask IT to
-allowlist it. When a blocked binary cannot start, the launcher prints its path
-and SHA-256 and names the endpoint product it finds, and it does not download
-the binary again on its own. [SECURITY.md](SECURITY.md#for-it-and-security-teams) lists what
-bwn runs, which hosts it connects to and which files it writes, explains how
-to verify a release, and includes a request you can send. Each Windows `.exe`
-carries a version resource and an `asInvoker` manifest, and each release has
-a CycloneDX SBOM (`buildwithnexus.cdx.json`).
+Endpoint protection may quarantine the Windows binary: it is new, and the
+launcher downloads it and then runs it. The file matches the release checksum
+and attestation. When a blocked binary cannot start, the launcher prints its
+path and SHA-256, names the product it finds, and does not download it again.
+[SECURITY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#for-it-and-security-teams)
+is the note for IT: what bwn runs, and how to verify a release.
 
 ### Behind a proxy
 
-bwn's own connections (model providers, the web tools, MCP servers over
-HTTP, the update check) use the standard proxy variables: `HTTPS_PROXY`,
-`HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, in either case. `NO_PROXY` takes
-host names (`corp.example` also covers its subdomains; `.corp.example` and
-`*.corp.example` mean the same), IP addresses, CIDR blocks such as
-`10.0.0.0/8`, and `*`. The proxy URL must be `http://`, optionally with
-`user:password@`; an `https://` proxy URL fails at once. Local model servers
-on `localhost`, `127.0.0.1`, `::1` or `0.0.0.0` are always reached directly,
-and so are model servers on private, link-local, CGNAT (100.64/10) or IPv6
-unique-local addresses, or host names that resolve only to them, as they were
-before 0.15 (`BWN_PROXY_PRIVATE=1` sends those through the proxy). A proxy
-failure names the proxy and its variable: not answering, 407, rejected
-credentials, or a refused tunnel.
-
-HTTPS is checked against bwn's bundled roots plus the operating system's
-certificate store, so a TLS-inspecting proxy whose root certificate IT
-installed works without extra steps. If the root is not in the OS store, set
-`SSL_CERT_FILE` to a PEM file holding it (or `SSL_CERT_DIR` to a directory
-of them); these replace the OS store, and the bundled roots still apply. An
-untrusted certificate fails at once with `UnknownIssuer` and names these
-settings.
-
-To connect as bwn 0.14 did, run it with `NO_PROXY='*'` (no proxy) and
-`BWN_TLS_ROOTS=bundled` (bundled roots only).
-
-The npm launcher's first-run download uses the same variables on every
-supported Node (18 and later): `HTTPS_PROXY` or `HTTP_PROXY` (an `http://`
-URL, optionally with `user:password@`, percent-encoded), and `NO_PROXY` with
-`*`, domains (which also cover their subdomains) and `host:port`. It tunnels
-through the proxy to GitHub, and TLS is checked against GitHub's certificate
-as on a direct connection: if the proxy inspects TLS, point
-`NODE_EXTRA_CA_CERTS` at its root certificate (a PEM file). A failed download
-names the proxy and says whether it needed credentials, refused the tunnel or
-did not answer, and `bwn --bootstrap` tries again.
+bwn's own connections use `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and
+`NO_PROXY` (either case). The proxy URL must be `http://`. Local and private
+model servers are reached directly (`BWN_PROXY_PRIVATE=1` sends those through
+the proxy). HTTPS is checked against the bundled roots plus the OS certificate
+store; `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces the OS store. The npm
+launcher's first download uses `HTTPS_PROXY` / `HTTP_PROXY` and `NO_PROXY` on
+Node 18 and later, tunnels to GitHub, and checks TLS against GitHub's
+certificate; a TLS-inspecting proxy needs its root in `NODE_EXTRA_CA_CERTS`.
 
 ## Safety
 
@@ -1338,7 +1013,7 @@ did not answer, and `bwn --bootstrap` tries again.
   shell commands are not checkpointed. Bare `/undo` reverts the
   whole last agent turn and asks before overwriting your own later edits.
   Failure modes, checkpoint mechanics, and what is deliberately **not**
-  protected: [RECOVERY.md](RECOVERY.md).
+  protected: [RECOVERY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/RECOVERY.md).
 
 ## License
 
