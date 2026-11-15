@@ -13,7 +13,7 @@ from that binary on this machine. They are not the 2026-11-13 figures in
 `BENCHMARKS.md` (that box reported `--version` p50 1.2 ms).
 
 The program is already closer to Handmade Hero than almost any Rust agent
-CLI. Eight direct runtime crates (`crossterm`, `ureq`, `rustls`,
+CLI. Eleven direct crates (`crossterm`, `ureq`, `rustls`,
 `webpki-roots`, `rustls-native-certs`, `url`, `ring`, `serde` / `serde_json`,
 `shlex`, `libc`). No tokio, no ratatui, no regex in the normal tree (regex
 1.12 is pulled by the criterion dev-dependency only). The tool table is a
