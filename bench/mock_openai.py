@@ -167,11 +167,13 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
         for obj in chunks:
             self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+        self.close_connection = True
 
     def _stream_responses(self) -> None:
         full = _response_body()
@@ -239,10 +241,12 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
         for name, obj in events:
             self.wfile.write(f"event: {name}\ndata: {json.dumps(obj)}\n\n".encode())
         self.wfile.flush()
+        self.close_connection = True
 
 
 class MockServer(ThreadingHTTPServer):

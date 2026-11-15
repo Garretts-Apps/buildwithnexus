@@ -82,6 +82,14 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def as_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
 def write_json(path: Path, obj: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, sort_keys=False) + "\n")
@@ -794,7 +802,7 @@ def measure_task(cmd: dict, installs: dict, base_url: str, work: Path, mock_requ
             timed_out = False
         except subprocess.TimeoutExpired as exc:
             elapsed = time.perf_counter() - t0
-            proc = subprocess.CompletedProcess(argv, 124, exc.stdout or "", exc.stderr or "")
+            proc = subprocess.CompletedProcess(argv, 124, as_text(exc.stdout), as_text(exc.stderr))
             timed_out = True
         new_requests = mock_requests[start_n:]
         ok = (not timed_out) and task_succeeded(proc, out_file, new_requests)
@@ -805,8 +813,8 @@ def measure_task(cmd: dict, installs: dict, base_url: str, work: Path, mock_requ
                 "elapsed_s": elapsed,
                 "exit_code": proc.returncode,
                 "timed_out": timed_out,
-                "stdout": (proc.stdout or "")[-1500:],
-                "stderr": (proc.stderr or "")[-1500:],
+                "stdout": as_text(proc.stdout)[-1500:],
+                "stderr": as_text(proc.stderr)[-1500:],
                 "mock_requests": new_requests,
             }
         )
