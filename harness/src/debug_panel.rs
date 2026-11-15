@@ -899,24 +899,27 @@ pub fn command(arg: &str) {
             Ok(p) => crate::tui::line(&format!("  debug export {}", p.display())),
             Err(e) => crate::tui::line(&crate::tui::red(&format!("  debug export: {e}"))),
         },
-        other if let Some(path) = other.strip_prefix("export ") => {
-            match export_to(Path::new(path.trim())) {
-                Ok(p) => crate::tui::line(&format!("  debug export {}", p.display())),
-                Err(e) => crate::tui::line(&crate::tui::red(&format!("  debug export: {e}"))),
-            }
-        }
-        other if let Some(path) = other.strip_prefix("replay ") => {
-            match load_replay(Path::new(path.trim())) {
-                Ok(n) => {
-                    set_mode(Mode::Full);
-                    crate::tui::line(&format!("  debug replay: {n} records"));
+        other => {
+            // `if let` in a match guard is unstable on rust-version 1.94.
+            if let Some(path) = other.strip_prefix("export ") {
+                match export_to(Path::new(path.trim())) {
+                    Ok(p) => crate::tui::line(&format!("  debug export {}", p.display())),
+                    Err(e) => crate::tui::line(&crate::tui::red(&format!("  debug export: {e}"))),
                 }
-                Err(e) => crate::tui::line(&crate::tui::red(&format!("  debug replay: {e}"))),
+            } else if let Some(path) = other.strip_prefix("replay ") {
+                match load_replay(Path::new(path.trim())) {
+                    Ok(n) => {
+                        set_mode(Mode::Full);
+                        crate::tui::line(&format!("  debug replay: {n} records"));
+                    }
+                    Err(e) => crate::tui::line(&crate::tui::red(&format!("  debug replay: {e}"))),
+                }
+            } else {
+                crate::tui::line(&crate::tui::red(&format!(
+                    "  unknown /debug {other} — try: export, pause, step, continue, replay <file>"
+                )));
             }
         }
-        other => crate::tui::line(&crate::tui::red(&format!(
-            "  unknown /debug {other} — try: export, pause, step, continue, replay <file>"
-        ))),
     }
 }
 

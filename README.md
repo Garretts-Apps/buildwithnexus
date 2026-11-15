@@ -7,22 +7,10 @@ An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`
 API key, or local models on your machine. It plans, edits files, and runs
 commands. By default it asks before each change; accept-edits, auto and
 readonly modes let you choose. It ships as one self-contained binary with
-10 direct dependencies. The terminal UI has live autocomplete, inline diffs,
-clickable files and links, and image paste from the clipboard.
-Press **F12** (or type `/debug`) for the debug panel: agent phase, the
-prompt that was sent, tool calls, files, permissions, hooks, and a
-frame-time graph. F12 cycles a one-line strip, a panel, and fullscreen.
-F8 breaks before the next model request or tool call, F10 steps, F5
-continues. Enter on a file in that panel opens it in the diff pane.
-**F2** is the project tree, **F3** the diff, **F4** fuzzy jump, **F6**
-the focused pane. At 120 columns the tree, the conversation and the diff
-sit side by side; narrower terminals show one pane at a time. Alt+[ and
-Alt+] resize the tree. In the diff, n/p move between hunks, x drops the
-hunk under the cursor before you answer the permission prompt, v toggles
-side-by-side, g switches between the session and git HEAD. Both views
-do no per-frame work while they are closed. `bwn debug export [file.jsonl]`
-writes a trace and `bwn debug replay <file.jsonl>` steps through it.
-`/doctor` still diagnoses setup.
+10 direct dependencies. The terminal UI has live autocomplete, clickable files and links, and image paste.
+**F12** or `/debug` opens the debug panel. F8 breaks, F10 steps,
+F5 continues. **F2** tree, **F3** diff, **F4** jump, **F6** pane.
+`bwn debug export` and `bwn debug replay`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.sh | sh
