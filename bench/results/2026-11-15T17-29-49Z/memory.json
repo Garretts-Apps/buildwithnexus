@@ -1,0 +1,18 @@
+{
+  "bwn-npm": {
+    "ok": true,
+    "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn-handoff/bin/bwn --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      3444,
+      3464,
+      3572,
+      3480,
+      3460
+    ],
+    "median_kib": 3464.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  }
+}

@@ -14,6 +14,7 @@
     "scripts/resolve-binary.js",
     "scripts/bootstrap.js",
     "scripts/diagnose.js",
+    "scripts/native-handoff.js",
     "checksums.json",
     "README.md",
     "LICENSE",

@@ -291,12 +291,18 @@ def install_npm(layout: Layout, spec: dict) -> dict:
     return info
 
 
-def bootstrap_bwn(layout: Layout, spec: dict, bwn: str) -> dict:
+def bootstrap_bwn(layout: Layout, spec: dict, bwn: str, extra_env: dict | None = None) -> dict:
     home = layout.home(spec["id"])
     binary = home / "bin" / spec["version"] / "buildwithnexus"
+    boot: dict = {}
     if not binary.is_file():
-        env = base_env(home, {"NEXUS_HOME": str(home), "BWN_ALLOW_BOOTSTRAP": "1"})
+        env = base_env(home, {"NEXUS_HOME": str(home), "BWN_ALLOW_BOOTSTRAP": "1", **(extra_env or {})})
         proc = run([bwn, "--bootstrap", "--help"], env=env, capture_output=True, timeout=180)
+        boot = {
+            "bootstrap_exit_code": proc.returncode,
+            "bootstrap_stdout": (proc.stdout or "")[-2000:],
+            "bootstrap_stderr": (proc.stderr or "")[-2000:],
+        }
         if proc.returncode != 0 or not binary.is_file():
             raise SystemExit(
                 "bwn bootstrap failed\n"
@@ -315,6 +321,7 @@ def bootstrap_bwn(layout: Layout, spec: dict, bwn: str) -> dict:
         "release_asset": asset,
         "release_asset_url": url,
         "release_asset_bytes": asset_bytes,
+        **boot,
     }
 
 
@@ -1284,4 +1291,287 @@ def execute(results: Path, only: set[str] | None = None) -> dict:
     (results / "summary.md").write_text(render_summary_md(summary))
     if not required_ok and only is None:
         raise SystemExit("required measurements failed; see summary.json")
+    return summary
+
+
+def describe_file(path: Path) -> dict:
+    """What an npm shim points at, recorded so a handoff is evidence rather than a guess."""
+    info: dict = {"path": str(path), "exists": path.exists() or path.is_symlink()}
+    if not info["exists"]:
+        return info
+    info["is_symlink"] = path.is_symlink()
+    if path.is_symlink():
+        info["link"] = os.readlink(path)
+    try:
+        resolved = path.resolve()
+        info["resolved"] = str(resolved)
+        info["resolved_bytes"] = resolved.stat().st_size
+        with resolved.open("rb") as fh:
+            magic = fh.read(4)
+        info["elf"] = magic == b"\x7fELF"
+        if not info["elf"]:
+            info["head"] = resolved.read_text(encoding="utf-8", errors="replace")[:180]
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def pack_repo(repo: Path, dest: Path) -> Path:
+    dest.mkdir(parents=True, exist_ok=True)
+    proc = check(
+        ["npm", "pack", "--ignore-scripts", "--json", "--pack-destination", str(dest)],
+        cwd=repo,
+        capture_output=True,
+        env={**os.environ, "NPM_CONFIG_UPDATE_NOTIFIER": "false", "npm_config_update_notifier": "false"},
+    )
+    try:
+        packed = json.loads(proc.stdout)
+        filename = packed[0]["filename"]
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+        raise SystemExit(f"npm pack did not return a filename: {exc}\n{proc.stdout}\n{proc.stderr}") from exc
+    tarball = dest / filename
+    if not tarball.is_file():
+        raise SystemExit(f"npm pack did not write {tarball}")
+    return tarball
+
+
+def install_packed_bwn(layout: Layout, tarball: Path) -> tuple[dict, dict]:
+    """Install a local pack into a fresh prefix. Returns (install info, handoff evidence)."""
+    spec = next(item for item in PINS["installs"] if item["id"] == "bwn")
+    prefix = layout.prefix("bwn-handoff")
+    if prefix.exists():
+        shutil.rmtree(prefix)
+    prefix.mkdir(parents=True)
+    check(
+        [
+            "npm",
+            "install",
+            "--global",
+            "--prefix",
+            str(prefix),
+            "--no-audit",
+            "--no-fund",
+            str(tarball),
+        ],
+        env={**os.environ, "NPM_CONFIG_UPDATE_NOTIFIER": "false"},
+    )
+    script = prefix / "lib" / "node_modules" / "buildwithnexus" / "scripts" / "native-handoff.js"
+    if not script.is_file():
+        raise SystemExit(f"packed launcher is missing {script}; the npm path cannot hand off")
+    bins = {}
+    for name in spec["bins"]:
+        path = prefix / "bin" / name
+        if not path.exists() and not path.is_symlink():
+            raise SystemExit(f"missing bin {path}")
+        bins[name] = str(path)
+    home = layout.home("bwn-handoff")
+    if home.exists():
+        shutil.rmtree(home)
+    home.mkdir(parents=True)
+    shim = prefix / "bin" / "bwn"
+    before = describe_file(shim)
+    spec = {**spec, "id": "bwn-handoff"}
+    # bootstrap_bwn keys the home off spec id. Point it at the fresh home, then
+    # publish the install under the pin id the commands expect.
+    # PATH includes the prefix so this first run can rewrite the npm shim.
+    boot = bootstrap_bwn(
+        layout,
+        spec,
+        bins["bwn"],
+        extra_env={
+            "PATH": str(prefix / "bin") + ":" + tool_path(),
+            "npm_config_prefix": str(prefix),
+        },
+    )
+    after = describe_file(shim)
+    copy = Path(home) / ".local" / "bin" / "bwn"
+    info = {
+        "id": "bwn",
+        "manager": "npm",
+        "package": spec["package"],
+        "version": spec["version"],
+        "prefix": str(prefix),
+        "bins": bins,
+        "home": str(home),
+        "source": "local npm pack of this checkout, not registry buildwithnexus@0.21.0",
+        "tarball": tarball.name,
+        "tarball_bytes": tarball.stat().st_size,
+        **boot,
+    }
+    tarball_bytes = tarball.stat().st_size
+    release_bytes = info["release_asset_bytes"]
+    entry = prefix / "bin" / "bwn"
+    info["sizes"] = {
+        "package_bytes": tarball_bytes + release_bytes,
+        "package_url": str(tarball),
+        "download_bytes": tarball_bytes + release_bytes,
+        "download_parts": [
+            {
+                "package": "buildwithnexus",
+                "version": spec["version"],
+                "bytes": tarball_bytes,
+                "url": str(tarball),
+                "kind": "local-npm-pack",
+            },
+            {
+                "package": info["release_asset"],
+                "version": spec["version"],
+                "bytes": release_bytes,
+                "url": info["release_asset_url"],
+                "kind": "github-release-asset",
+            },
+        ],
+        "download_unresolved": [],
+        "install_bytes": du_bytes(prefix) + info["native_binary_bytes"],
+        "entrypoint": str(entry),
+        "entrypoint_bytes": before.get("resolved_bytes"),
+        "notes": [
+            "package_bytes and download_bytes are this checkout's npm pack plus the GitHub release asset the launcher downloaded.",
+            "The registry tarball buildwithnexus@0.21.0 predates the handoff and is not the package measured here.",
+            "install_bytes is the npm prefix plus the checksum-verified binary under NEXUS_HOME. The extra copy the handoff places on PATH is recorded separately and is not added again.",
+        ],
+    }
+    evidence = {
+        "shim_before_bootstrap": before,
+        "shim_after_bootstrap": after,
+        "native_copy": describe_file(copy),
+        "native_copy_bytes": copy.stat().st_size if copy.exists() else None,
+        "bootstrap_stderr": info.get("bootstrap_stderr"),
+        "note": (
+            "Bootstrap is the first run of the npm command. It downloads the release binary when NEXUS_HOME is empty, "
+            "copies that binary, and points the npm shim at the copy. Timed runs happen after this."
+        ),
+    }
+    return info, evidence
+
+
+def execute_npm_handoff(results: Path, only: set[str] | None = None) -> dict:
+    """Re-measure the npm `bwn` command from a pack of this checkout.
+
+    Registry 0.21.0 does not contain the handoff. This run packs the working tree,
+    installs that tarball, and times the same metrics as the full suite for that
+    one command. One paired native warm `--version` is recorded on the same binary.
+    """
+
+    def want(name: str) -> bool:
+        return only is None or name in only
+
+    results.mkdir(parents=True, exist_ok=True)
+    (results / "raw").mkdir(exist_ok=True)
+    hardware = collect_hardware()
+    rev = run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True)
+    status = run(["git", "status", "--porcelain"], cwd=REPO, capture_output=True)
+    hardware["git_commit"] = (rev.stdout or "").strip()
+    hardware["git_dirty"] = bool((status.stdout or "").strip())
+    write_json(results / "hardware.json", hardware)
+
+    layout = Layout(ROOT / ".tools")
+    tarball = pack_repo(REPO, layout.cache / "local-pack")
+    info, evidence = install_packed_bwn(layout, tarball)
+    installs = {"bwn": info}
+    npm_cmd = next(cmd for cmd in PINS["commands"] if cmd["id"] == "bwn-npm")
+    native_cmd = next(cmd for cmd in PINS["commands"] if cmd["id"] == "bwn-native")
+    versions = [capture_version(npm_cmd, installs), capture_version(native_cmd, installs)]
+    write_json(results / "versions.json", {"tools": versions})
+    bad = [v for v in versions if not v["ok"]]
+    if bad:
+        raise SystemExit("version pin mismatch: " + json.dumps(bad, indent=2))
+
+    npm = {
+        "id": "bwn-npm",
+        "display": npm_cmd["display"],
+        "version_text": versions[0]["version_text"],
+        "sizes": size_row(npm_cmd, installs),
+        "handoff": evidence,
+    }
+    native = {
+        "id": "bwn-native",
+        "display": native_cmd["display"],
+        "version_text": versions[1]["version_text"],
+        "sizes": size_row(native_cmd, installs),
+        "paired_control": "warm --version only, same binary and machine as the npm timings",
+    }
+    # size_row for the native launch replaces sizes with the release asset.
+    # The packed-tarball sizes on the npm row are the ones install_packed_bwn recorded;
+    # size_row recomputes them from the prefix and may call npm view. Keep the pack sizes.
+    npm["sizes"] = info["sizes"]
+    npm["sizes"]["binary_bytes"] = info["native_binary_bytes"]
+    npm["sizes"]["binary_kind"] = "native"
+    npm["sizes"]["binary_path"] = info["native_binary"]
+    npm["handoff"]["shim_before_timings"] = describe_file(Path(info["bins"]["bwn"]))
+
+    if want("startup"):
+        log("startup bwn-npm")
+        npm["startup"] = measure_startup(npm_cmd, installs, results, PINS["startup_runs"])
+        argv, env = command_argv(native_cmd, installs)
+        prime(argv, env)
+        native["startup"] = {
+            "version_warm": hyperfine(
+                argv + ["--version"],
+                env,
+                results / "raw" / "startup-bwn-native-version-warm.json",
+                cold=False,
+                runs=PINS["startup_runs"],
+            )
+        }
+        write_json(
+            results / "startup.json",
+            {"bwn-npm": npm["startup"], "bwn-native": native["startup"]},
+        )
+    if want("memory"):
+        log("memory bwn-npm")
+        npm["memory"] = measure_memory(npm_cmd, installs, PINS["memory_runs"])
+        write_json(results / "memory.json", {"bwn-npm": npm["memory"]})
+    if want("prompt"):
+        npm["prompt"] = measure_prompt(npm_cmd, installs)
+        write_json(results / "prompt.json", {"bwn-npm": npm["prompt"]})
+    if want("task"):
+        from bench.mock_openai import start
+
+        server, base = start()
+        log(f"mock {base}")
+        try:
+            work = layout.tools / "task-work-handoff"
+            server.requests.clear()
+            npm["task"] = measure_task(npm_cmd, installs, base, work, server.requests)
+            write_json(results / "task.json", {"bwn-npm": npm["task"]})
+        finally:
+            server.shutdown()
+
+    npm["handoff"]["shim_after_timings"] = describe_file(Path(info["bins"]["bwn"]))
+    write_json(results / "sizes.json", {"bwn-npm": npm["sizes"], "bwn-native": native["sizes"]})
+    tools = {"bwn-npm": npm, "bwn-native": native}
+    summary = {
+        "run_id": hardware["timestamp_utc"].replace(":", "-"),
+        "scope": "npm handoff rerun",
+        "baseline_run": "2026-11-15T16-29-28Z",
+        "hardware": hardware,
+        "pins": {"installs": [next(item for item in PINS["installs"] if item["id"] == "bwn")], "startup_runs": PINS["startup_runs"]},
+        "methodology": {
+            "startup": "hyperfine --shell=none, 3 warmup runs then 20 measured runs (warm), or 20 measured runs each prepared with sync and echo 3 > /proc/sys/vm/drop_caches (cold). Mean, median and stddev are hyperfine's.",
+            "npm_handoff": "The package is an npm pack of this checkout, installed into an empty prefix and an empty NEXUS_HOME. The first run is `bwn --bootstrap --help`: it downloads the release binary, copies it, and points the npm shim at that copy. Every timed run is after that. Registry buildwithnexus@0.21.0 is not this package.",
+            "native_control": "One warm --version of the release binary, same hyperfine settings, same machine, so the npm median can be compared without mixing runs.",
+            "memory": "/usr/bin/time -v on --version, 5 runs, median of Maximum resident set size (kbytes). Top-level process only. After the handoff the top-level process is the native binary.",
+            "prompt": "PTY 80x24. Timed only when a pinned transcript pattern appears.",
+            "task": "Local mock OpenAI server (bench/mock_openai.py) returns BENCHMARK_OK. A published time exited 0 and printed BENCHMARK_OK.",
+        },
+        "tools": tools,
+    }
+    summary["rankings"] = rankings(tools)
+    startup = npm.get("startup") or {}
+    required_ok = all((startup.get(key) or {}).get("ok") for key in ("version_warm", "version_cold", "help_warm", "help_cold"))
+    required_ok = required_ok and bool((npm.get("memory") or {}).get("ok"))
+    required_ok = required_ok and bool(npm.get("sizes", {}).get("download_bytes"))
+    if want("prompt"):
+        required_ok = required_ok and bool((npm.get("prompt") or {}).get("ok"))
+    if want("task"):
+        required_ok = required_ok and bool((npm.get("task") or {}).get("ok"))
+    native_warm = ((native.get("startup") or {}).get("version_warm") or {})
+    required_ok = required_ok and bool(native_warm.get("ok"))
+    # Complete for this scope: the npm path and the paired native control. Other tools were not re-run.
+    summary["complete"] = required_ok and only is None
+    write_json(results / "summary.json", summary)
+    (results / "summary.md").write_text(render_summary_md(summary))
+    if not summary["complete"]:
+        raise SystemExit("npm handoff measurements failed; see summary.json")
     return summary

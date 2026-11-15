@@ -180,7 +180,7 @@ chunk into a 2,000-line transcript, and no terminal-size checks or
 full-screen repaints per keystroke. Every number and how to regenerate it:
 [BENCHMARKS.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md).
 
-On one recorded run the native `--version` was 0.557 ms. npm `bwn` was 21.236 ms, slower than Claude Code, and Aider's package is smaller than the release binary. [Benchmarks](https://buildwithnexus.dev/docs/benchmarks).
+On one recorded run the native `--version` was 0.557 ms, 11.63× Claude Code. After the npm handoff, later `bwn` runs were 0.535 ms. Aider's package is smaller than the release binary. [Benchmarks](https://buildwithnexus.dev/docs/benchmarks).
 
 ### Package history
 
