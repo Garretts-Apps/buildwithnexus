@@ -130,6 +130,7 @@ def curl_bytes(url: str, dest: Path) -> int:
 def npm_tarball(package: str, version: str, cache: Path) -> tuple[int, str]:
     proc = check(
         ["npm", "view", f"{package}@{version}", "dist.tarball", "--json"],
+        capture_output=True,
         env={**os.environ, "NPM_CONFIG_UPDATE_NOTIFIER": "false", "npm_config_update_notifier": "false"},
     )
     raw = proc.stdout.strip()
