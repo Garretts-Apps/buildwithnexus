@@ -1,0 +1,2645 @@
+{
+  "run_id": "2026-11-15T16-29-28Z",
+  "hardware": {
+    "timestamp_utc": "2026-11-15T16:29:28Z",
+    "date_utc": "2026-11-15",
+    "os": "Ubuntu 24.04.5 LTS",
+    "kernel": "6.12.113+",
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Processor",
+    "cpu_count": 4,
+    "bogomips": 4800.0,
+    "hypervisor": "KVM",
+    "mem_total_bytes": 16780623872,
+    "hyperfine": "hyperfine 1.18.0",
+    "gnu_time": "time (GNU Time) UNKNOWN",
+    "node": "v22.23.4",
+    "python": "3.12.3"
+  },
+  "pins": {
+    "installs": [
+      {
+        "id": "bwn",
+        "manager": "npm",
+        "package": "buildwithnexus",
+        "version": "0.21.0",
+        "bins": [
+          "bwn",
+          "buildwithnexus"
+        ],
+        "bootstrap_release_binary": true
+      },
+      {
+        "id": "claude",
+        "manager": "npm",
+        "package": "@anthropic-ai/claude-code",
+        "version": "2.1.325",
+        "bins": [
+          "claude"
+        ]
+      },
+      {
+        "id": "codex",
+        "manager": "npm",
+        "package": "@openai/codex",
+        "version": "0.169.0",
+        "bins": [
+          "codex"
+        ]
+      },
+      {
+        "id": "gemini",
+        "manager": "npm",
+        "package": "@google/gemini-cli",
+        "version": "0.68.0",
+        "bins": [
+          "gemini"
+        ]
+      },
+      {
+        "id": "opencode",
+        "manager": "npm",
+        "package": "opencode-ai",
+        "version": "1.19.5",
+        "repository": "https://github.com/sst/opencode",
+        "bins": [
+          "opencode"
+        ]
+      },
+      {
+        "id": "aider",
+        "manager": "pip",
+        "package": "aider-chat",
+        "version": "0.86.2",
+        "bins": [
+          "aider"
+        ]
+      }
+    ],
+    "startup_runs": 20
+  },
+  "methodology": {
+    "startup": "hyperfine --shell=none, 3 warmup runs then 20 measured runs (warm), or 20 measured runs each prepared with sync and echo 3 > /proc/sys/vm/drop_caches (cold). Mean, median and stddev are hyperfine's. One untimed --version primes each tool's empty HOME before the timed runs.",
+    "memory": "/usr/bin/time -v on --version, 5 runs, median of Maximum resident set size (kbytes). Top-level process only.",
+    "sizes": "download_bytes are files this run fetched (npm tarballs, the GitHub release asset, pip wheels). install_bytes is the byte size of the installed tree. package_bytes is the tool's own published artifacts (top-level package plus its platform package, or the aider wheel alone), not third-party dependencies. binary_bytes is the native ELF the command runs. A tool with only a script entrypoint is marked binary_kind=script and is left out of the native-binary ranking.",
+    "prompt": "PTY 80x24. Timed only when a pinned transcript pattern appears. bwn is given a settings file so it does not stop in onboarding, with auto-update off.",
+    "task": "Local mock OpenAI server (bench/mock_openai.py) returns BENCHMARK_OK for chat completions and the Responses API. Tools that cannot be pointed at that protocol are skipped. Each published time exited 0 and printed BENCHMARK_OK.",
+    "environment": "Clean HOME per tool, no API keys except the dummy key used for the mock. PATH starts with that tool's install prefix."
+  },
+  "tools": {
+    "bwn-native": {
+      "id": "bwn-native",
+      "display": "bwn native",
+      "version_text": "buildwithnexus 0.21.0",
+      "sizes": {
+        "package_bytes": 6492376,
+        "package_url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "download_bytes": 6492376,
+        "download_parts": [
+          {
+            "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+            "bytes": 6492376,
+            "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+            "kind": "github-release-asset"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 6492376,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+        "entrypoint_bytes": 6492376,
+        "binary_bytes": 6492376,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+        "notes": [
+          "This row is the release binary invoked directly (the cargo-install / prebuilt entry), not the npm launcher.",
+          "download_bytes is the GitHub release asset. cargo install builds from source instead of downloading this file; the asset is what the npm launcher downloads on first run."
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.0006392084000000001,
+          "median_s": 0.000556568,
+          "stddev_s": 0.00013736449939960932,
+          "min_s": 0.000514993,
+          "max_s": 0.0009055500000000001,
+          "times_s": [
+            0.000863895,
+            0.0009055500000000001,
+            0.00071513,
+            0.000802473,
+            0.000808529,
+            0.000593477,
+            0.000550827,
+            0.000561051,
+            0.000534142,
+            0.000782173,
+            0.0008122730000000001,
+            0.000623635,
+            0.000537513,
+            0.0005277330000000001,
+            0.000552085,
+            0.000525727,
+            0.000514993,
+            0.00052908,
+            0.0005250340000000001,
+            0.000518848
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version\n  Time (mean \u00b1 \u03c3):     639.2 \u00b5s \u00b1 137.4 \u00b5s    [User: 518.2 \u00b5s, System: 79.1 \u00b5s]\n  Range (min \u2026 max):   515.0 \u00b5s \u2026 905.6 \u00b5s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-native-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.00486606665,
+          "median_s": 0.0048717865,
+          "stddev_s": 0.0013016302363499186,
+          "min_s": 0.002412151,
+          "max_s": 0.007088037,
+          "times_s": [
+            0.004906416,
+            0.0067481880000000004,
+            0.0034671750000000003,
+            0.0033400590000000003,
+            0.005718404000000001,
+            0.005588456,
+            0.005832373,
+            0.004740961,
+            0.007088037,
+            0.003489785,
+            0.0053334720000000006,
+            0.002412151,
+            0.003975833000000001,
+            0.004481817,
+            0.003983956,
+            0.005384671000000001,
+            0.0063737740000000005,
+            0.004837157,
+            0.003256248,
+            0.006362400000000001
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version\n  Time (mean \u00b1 \u03c3):       4.9 ms \u00b1   1.3 ms    [User: 1.1 ms, System: 0.6 ms]\n  Range (min \u2026 max):     2.4 ms \u2026   7.1 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-native-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.00068652645,
+          "median_s": 0.0006043185000000001,
+          "stddev_s": 0.00013265545958192639,
+          "min_s": 0.0005644080000000001,
+          "max_s": 0.0009146120000000001,
+          "times_s": [
+            0.0009146120000000001,
+            0.0005955530000000001,
+            0.0005893070000000001,
+            0.0007868920000000001,
+            0.0008788260000000001,
+            0.0008483560000000001,
+            0.000588101,
+            0.000580303,
+            0.0006767030000000001,
+            0.0008528990000000001,
+            0.0006458330000000001,
+            0.0006130840000000001,
+            0.0005723880000000001,
+            0.00057268,
+            0.0005674860000000001,
+            0.0008805620000000001,
+            0.000834332,
+            0.000586647,
+            0.0005644080000000001,
+            0.000581557
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --help\n  Time (mean \u00b1 \u03c3):     686.5 \u00b5s \u00b1 132.7 \u00b5s    [User: 623.6 \u00b5s, System: 27.8 \u00b5s]\n  Range (min \u2026 max):   564.4 \u00b5s \u2026 914.6 \u00b5s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-native-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.003787287050000001,
+          "median_s": 0.0035676015000000003,
+          "stddev_s": 0.0009053421624827808,
+          "min_s": 0.00281752,
+          "max_s": 0.005608902000000001,
+          "times_s": [
+            0.003057554,
+            0.003077578,
+            0.003034564,
+            0.002972742,
+            0.003422674,
+            0.0037125290000000004,
+            0.0040783930000000005,
+            0.003864141,
+            0.005608902000000001,
+            0.004985884,
+            0.0028273160000000003,
+            0.004780039000000001,
+            0.004070258,
+            0.0028725070000000003,
+            0.0030562920000000004,
+            0.00281752,
+            0.005021014000000001,
+            0.004935734000000001,
+            0.003006036,
+            0.0045440640000000004
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --help\n  Time (mean \u00b1 \u03c3):       3.8 ms \u00b1   0.9 ms    [User: 0.9 ms, System: 0.8 ms]\n  Range (min \u2026 max):     2.8 ms \u2026   5.6 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-native-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          3564,
+          3440,
+          3556,
+          3456,
+          3412
+        ],
+        "median_kib": 3456.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "permission:",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          0.2710501749998002,
+          0.2503783269999076,
+          0.2504953080001542,
+          0.2503434750001361,
+          0.2503930549996767
+        ],
+        "median_s": 0.2503930549996767,
+        "mean_s": 0.25453206799993494,
+        "transcript_last": "11;?\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\u2502 \u2502\u001b7permission: ask \u00b7 /permissions \u00b7 wheel/PgUp \u00b7 /mouse\u001b8"
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+          "--provider",
+          "custom",
+          "--base-url",
+          "http://127.0.0.1:44535/v1",
+          "--model",
+          "bench",
+          "--permission-mode",
+          "readonly",
+          "--sandbox",
+          "off",
+          "--no-auto-commit",
+          "--no-repo-map",
+          "run",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          0.06480318900003113,
+          0.0567824270001438,
+          0.05502065800010314,
+          0.059220508000180416,
+          0.057563758000014786
+        ],
+        "median_s": 0.057563758000014786,
+        "mean_s": 0.05867810800009465,
+        "mock_requests_total": 20,
+        "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:44535) \u00b7 bench\n  cwd    /agent/repos/buildwithnexus/bench/.tools/task-work/bwn-native\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 13.13ms\n"
+      }
+    },
+    "bwn-npm": {
+      "id": "bwn-npm",
+      "display": "bwn (npm)",
+      "version_text": "buildwithnexus 0.21.0",
+      "sizes": {
+        "package_bytes": 6546740,
+        "package_url": "https://registry.npmjs.org/buildwithnexus/-/buildwithnexus-0.21.0.tgz",
+        "download_bytes": 6546740,
+        "download_parts": [
+          {
+            "package": "buildwithnexus",
+            "version": "0.21.0",
+            "bytes": 54364,
+            "url": "https://registry.npmjs.org/buildwithnexus/-/buildwithnexus-0.21.0.tgz"
+          },
+          {
+            "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+            "version": "0.21.0",
+            "bytes": 6492376,
+            "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+            "kind": "github-release-asset"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 6639839,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn",
+        "entrypoint_bytes": 6462,
+        "notes": [
+          "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball.",
+          "The npm package does not contain the native binary. First run downloads the GitHub release asset; that asset's byte size is included in download_bytes and the installed binary is included in install_bytes."
+        ],
+        "binary_bytes": 6492376,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+        "package_parts": [
+          "buildwithnexus",
+          "buildwithnexus-x86_64-unknown-linux-gnu"
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.021677305550000005,
+          "median_s": 0.021236468,
+          "stddev_s": 0.0014044673660453884,
+          "min_s": 0.020020007000000003,
+          "max_s": 0.024971758,
+          "times_s": [
+            0.021947525000000002,
+            0.023727162000000003,
+            0.024971758,
+            0.021767121,
+            0.020511544,
+            0.021113820000000002,
+            0.020376363,
+            0.023168524000000003,
+            0.023346875000000003,
+            0.020838147,
+            0.020020007000000003,
+            0.022937129,
+            0.020383357,
+            0.020431844,
+            0.020552820000000003,
+            0.023236585,
+            0.020838928,
+            0.021398689000000002,
+            0.021359116,
+            0.020618797
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version\n  Time (mean \u00b1 \u03c3):      21.7 ms \u00b1   1.4 ms    [User: 16.4 ms, System: 5.5 ms]\n  Range (min \u2026 max):    20.0 ms \u2026  25.0 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.031089768,
+          "median_s": 0.030638738500000002,
+          "stddev_s": 0.0027515380792039897,
+          "min_s": 0.025615034000000002,
+          "max_s": 0.036697469,
+          "times_s": [
+            0.034253718,
+            0.029286547000000003,
+            0.036697469,
+            0.03306871,
+            0.030443342,
+            0.030550125,
+            0.027558496000000002,
+            0.027807179,
+            0.030727352000000003,
+            0.027800887000000003,
+            0.034734615,
+            0.032658973,
+            0.032531382000000005,
+            0.033060165,
+            0.025615034000000002,
+            0.032445311000000004,
+            0.030506036,
+            0.02981618,
+            0.029561502000000003,
+            0.032672337
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version\n  Time (mean \u00b1 \u03c3):      31.1 ms \u00b1   2.8 ms    [User: 16.8 ms, System: 6.9 ms]\n  Range (min \u2026 max):    25.6 ms \u2026  36.7 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.02224522465,
+          "median_s": 0.021759656000000002,
+          "stddev_s": 0.001305063516191505,
+          "min_s": 0.019771297,
+          "max_s": 0.02421038,
+          "times_s": [
+            0.021666618000000002,
+            0.021144958000000002,
+            0.023458286000000002,
+            0.021416294000000002,
+            0.021696685,
+            0.023901014,
+            0.021430919,
+            0.021756555,
+            0.020488691,
+            0.019771297,
+            0.023879482,
+            0.022782924000000003,
+            0.023545577,
+            0.021762757,
+            0.023279131,
+            0.02421038,
+            0.022168386,
+            0.020903574,
+            0.021550783,
+            0.024090182
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --help\n  Time (mean \u00b1 \u03c3):      22.2 ms \u00b1   1.3 ms    [User: 16.3 ms, System: 6.2 ms]\n  Range (min \u2026 max):    19.8 ms \u2026  24.2 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.035455818349999994,
+          "median_s": 0.035072918,
+          "stddev_s": 0.0038974077774103872,
+          "min_s": 0.03039704,
+          "max_s": 0.047252254,
+          "times_s": [
+            0.033972136,
+            0.035362591,
+            0.032932611,
+            0.03267693,
+            0.033817447,
+            0.03685716,
+            0.035907648,
+            0.030402056,
+            0.033728626000000005,
+            0.047252254,
+            0.036032520000000005,
+            0.03619245,
+            0.037611271,
+            0.034967943,
+            0.033347446,
+            0.035177893,
+            0.040619266,
+            0.03039704,
+            0.040219511,
+            0.031641568
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --help\n  Time (mean \u00b1 \u03c3):      35.5 ms \u00b1   3.9 ms    [User: 16.3 ms, System: 10.1 ms]\n  Range (min \u2026 max):    30.4 ms \u2026  47.3 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-bwn-npm-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          45876,
+          45848,
+          45840,
+          45824,
+          45728
+        ],
+        "median_kib": 45840.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "permission:",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          0.2717106490003971,
+          0.2711197839998931,
+          0.27308233700023266,
+          0.2720105839998723,
+          0.2699453559998801
+        ],
+        "median_s": 0.2717106490003971,
+        "mean_s": 0.2715737420000551,
+        "transcript_last": "11;?\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\u2502 \u2502\u001b7permission: ask \u00b7 /permissions \u00b7 wheel/PgUp \u00b7 /mouse\u001b8"
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn",
+          "--provider",
+          "custom",
+          "--base-url",
+          "http://127.0.0.1:44535/v1",
+          "--model",
+          "bench",
+          "--permission-mode",
+          "readonly",
+          "--sandbox",
+          "off",
+          "--no-auto-commit",
+          "--no-repo-map",
+          "run",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          0.08012791500004823,
+          0.0799259450000136,
+          0.07668919199977609,
+          0.07696836400009488,
+          0.07625952599983066
+        ],
+        "median_s": 0.07696836400009488,
+        "mean_s": 0.07799418839995269,
+        "mock_requests_total": 20,
+        "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:44535) \u00b7 bench\n  cwd    /agent/repos/buildwithnexus/bench/.tools/task-work/bwn-npm\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 12.35ms\n"
+      }
+    },
+    "claude": {
+      "id": "claude",
+      "display": "Claude Code",
+      "version_text": "2.1.325 (Claude Code)",
+      "sizes": {
+        "package_bytes": 169382845,
+        "package_url": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.325.tgz",
+        "download_bytes": 169382845,
+        "download_parts": [
+          {
+            "package": "@anthropic-ai/claude-code",
+            "version": "2.1.325",
+            "bytes": 31964,
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.325.tgz"
+          },
+          {
+            "package": "@anthropic-ai/claude-code-linux-x64",
+            "version": "2.1.325",
+            "bytes": 169350881,
+            "url": "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.325.tgz"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 731894792,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude",
+        "entrypoint_bytes": 365842960,
+        "notes": [
+          "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+        ],
+        "binary_bytes": 365842960,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude",
+        "package_parts": [
+          "@anthropic-ai/claude-code",
+          "@anthropic-ai/claude-code-linux-x64"
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.0065449520000000014,
+          "median_s": 0.006472312000000001,
+          "stddev_s": 0.0005155822204361732,
+          "min_s": 0.005840069000000001,
+          "max_s": 0.008180437,
+          "times_s": [
+            0.006710293,
+            0.008180437,
+            0.006442937,
+            0.0059465460000000005,
+            0.006735876,
+            0.0060380600000000005,
+            0.006938089000000001,
+            0.006179156000000001,
+            0.006448429,
+            0.005840069000000001,
+            0.006633684000000001,
+            0.0068037900000000005,
+            0.006717075,
+            0.0069583150000000005,
+            0.006235818000000001,
+            0.006078636,
+            0.006404911,
+            0.006180187,
+            0.006496195000000001,
+            0.0069305370000000005
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version\n  Time (mean \u00b1 \u03c3):       6.5 ms \u00b1   0.5 ms    [User: 3.7 ms, System: 2.9 ms]\n  Range (min \u2026 max):     5.8 ms \u2026   8.2 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-claude-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.04315414289999999,
+          "median_s": 0.0426750705,
+          "stddev_s": 0.004115926741382386,
+          "min_s": 0.033417016,
+          "max_s": 0.050743886,
+          "times_s": [
+            0.047645244,
+            0.042443127000000004,
+            0.04542836,
+            0.050743886,
+            0.042734415000000005,
+            0.045476068,
+            0.038630551,
+            0.042074366,
+            0.043830588000000004,
+            0.042615726,
+            0.039475293,
+            0.033417016,
+            0.046679622000000004,
+            0.039411048000000004,
+            0.040773834,
+            0.047788866000000006,
+            0.039617281000000004,
+            0.040429922,
+            0.047085536000000004,
+            0.046782109
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version\n  Time (mean \u00b1 \u03c3):      43.2 ms \u00b1   4.1 ms    [User: 4.5 ms, System: 24.6 ms]\n  Range (min \u2026 max):    33.4 ms \u2026  50.7 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-claude-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.08732540209999999,
+          "median_s": 0.08741799850000001,
+          "stddev_s": 0.002006578841822355,
+          "min_s": 0.083703408,
+          "max_s": 0.089769476,
+          "times_s": [
+            0.08603708800000001,
+            0.08711568600000001,
+            0.08942725500000001,
+            0.08870337,
+            0.08810820300000001,
+            0.08772031100000001,
+            0.086953824,
+            0.085761734,
+            0.08554373600000001,
+            0.08521827900000001,
+            0.083703408,
+            0.08389521000000001,
+            0.08962199000000001,
+            0.08967522700000001,
+            0.089769476,
+            0.089374511,
+            0.089302351,
+            0.088737967,
+            0.084969863,
+            0.086868553
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --help\n  Time (mean \u00b1 \u03c3):      87.3 ms \u00b1   2.0 ms    [User: 70.8 ms, System: 24.6 ms]\n  Range (min \u2026 max):    83.7 ms \u2026  89.8 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-claude-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.15552320665000002,
+          "median_s": 0.156073342,
+          "stddev_s": 0.008408753829042897,
+          "min_s": 0.136627031,
+          "max_s": 0.16873696300000002,
+          "times_s": [
+            0.136627031,
+            0.142744391,
+            0.150956797,
+            0.145945881,
+            0.150155025,
+            0.15787668200000002,
+            0.15529674000000002,
+            0.147476816,
+            0.15176909000000002,
+            0.159939136,
+            0.15314774,
+            0.158610037,
+            0.15482247400000002,
+            0.164886309,
+            0.16873696300000002,
+            0.16626153700000001,
+            0.160383657,
+            0.161179815,
+            0.15684994400000002,
+            0.16679806800000002
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --help\n  Time (mean \u00b1 \u03c3):     155.5 ms \u00b1   8.4 ms    [User: 73.5 ms, System: 53.3 ms]\n  Range (min \u2026 max):   136.6 ms \u2026 168.7 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-claude-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          23108,
+          23108,
+          22728,
+          22984,
+          22856
+        ],
+        "median_kib": 22984.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": false,
+        "status": "not_measured",
+        "reason": "No ready-prompt pattern is pinned for this tool. A pattern is only timed after it has been seen in that tool's own PTY transcript.",
+        "process_exited": true,
+        "transcript": "\u001b7\u001b8WelcometoClaudeCodev2.1.325\r\r\n\r\r\n7501;?\u0007Let'sgetstarted.\r\r\n\r\r\nChoosethetextstylethatlooksbestwithyourterminal\r\r\nTochangethislater,run/theme\r\r\n\r\r\nAuto(matchterminal)\r\r\n\u276f\u2714Darkmode\r\r\nLightmode\r\r\nDarkmode(colorblind-friendly)\r\r\nLightmode(colorblind-friendly)\r\r\nDarkmode(ANSIcolorsonly)\r\r\nLightmode(ANSIcolorsonly)\r\r\n\r\r\n\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\r\r\n 1 function greet(){\r\r\n 2 -  console.log(\"Hello, World!\");                                       \r\r\n 2 +  console.log(\"Hello, Claude!\");                                      \r\r\n 3 }\r\r\n\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\u254c\r\r\n Syntaxtheme:MonokaiExtended(ctrl+ttodisable)\r\r\n"
+      },
+      "task": {
+        "ok": false,
+        "status": "skipped",
+        "reason": "Claude Code speaks the Anthropic Messages API (ANTHROPIC_BASE_URL). It cannot be pointed at an OpenAI-compatible chat or responses endpoint, so it is not given a fake time."
+      }
+    },
+    "codex": {
+      "id": "codex",
+      "display": "Codex CLI",
+      "version_text": "codex-cli 0.169.0",
+      "sizes": {
+        "package_bytes": 167006502,
+        "package_url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0.tgz",
+        "download_bytes": 167006502,
+        "download_parts": [
+          {
+            "package": "@openai/codex",
+            "version": "0.169.0",
+            "bytes": 4993,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0.tgz"
+          },
+          {
+            "package": "@openai/codex",
+            "version": "0.169.0-linux-x64",
+            "bytes": 167001509,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0-linux-x64.tgz"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 422680010,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex",
+        "entrypoint_bytes": 9154,
+        "notes": [
+          "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+        ],
+        "binary_bytes": 294277432,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+        "package_parts": [
+          "@openai/codex",
+          "@openai/codex"
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.02821200745,
+          "median_s": 0.028316297,
+          "stddev_s": 0.0011542590025864384,
+          "min_s": 0.026426883,
+          "max_s": 0.03103438,
+          "times_s": [
+            0.028496728000000002,
+            0.028181562,
+            0.028485662000000002,
+            0.028478362,
+            0.028294915,
+            0.026426883,
+            0.027665473000000003,
+            0.027651557,
+            0.029054444000000002,
+            0.030088175,
+            0.028337679,
+            0.027273737000000003,
+            0.028942969000000002,
+            0.026918581,
+            0.028777628000000003,
+            0.026617478,
+            0.029176189,
+            0.03103438,
+            0.027248073,
+            0.027089674
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version\n  Time (mean \u00b1 \u03c3):      28.2 ms \u00b1   1.2 ms    [User: 20.4 ms, System: 9.3 ms]\n  Range (min \u2026 max):    26.4 ms \u2026  31.0 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-codex-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.054473172800000004,
+          "median_s": 0.0545052865,
+          "stddev_s": 0.004777915411293866,
+          "min_s": 0.047859658000000006,
+          "max_s": 0.06637178,
+          "times_s": [
+            0.048951198,
+            0.047859658000000006,
+            0.060672043,
+            0.06637178,
+            0.049193733,
+            0.05064064,
+            0.05093948500000001,
+            0.05699242400000001,
+            0.048748058000000004,
+            0.051526816,
+            0.054254501000000004,
+            0.05598344500000001,
+            0.054756072,
+            0.053199485000000005,
+            0.055502949,
+            0.060006781,
+            0.059292201,
+            0.057686537,
+            0.051819434000000004,
+            0.055066216
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version\n  Time (mean \u00b1 \u03c3):      54.5 ms \u00b1   4.8 ms    [User: 22.9 ms, System: 15.9 ms]\n  Range (min \u2026 max):    47.9 ms \u2026  66.4 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-codex-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.027869209050000003,
+          "median_s": 0.02800576,
+          "stddev_s": 0.0012766715192369105,
+          "min_s": 0.025660226,
+          "max_s": 0.030130435,
+          "times_s": [
+            0.028301333,
+            0.029535338,
+            0.028211200000000002,
+            0.028129291,
+            0.028915891000000003,
+            0.027584698,
+            0.029794893000000003,
+            0.029047551,
+            0.026971277000000002,
+            0.026053897000000003,
+            0.026417294,
+            0.027882229,
+            0.0268811,
+            0.027150219000000003,
+            0.028446387,
+            0.027850081000000002,
+            0.025660226,
+            0.030130435,
+            0.028361492000000002,
+            0.026059349000000002
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --help\n  Time (mean \u00b1 \u03c3):      27.9 ms \u00b1   1.3 ms    [User: 20.5 ms, System: 8.9 ms]\n  Range (min \u2026 max):    25.7 ms \u2026  30.1 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-codex-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.05320505605,
+          "median_s": 0.0532408365,
+          "stddev_s": 0.0033450402012705706,
+          "min_s": 0.046955052000000004,
+          "max_s": 0.058896268,
+          "times_s": [
+            0.05363955,
+            0.053441966,
+            0.052967219,
+            0.058051636000000004,
+            0.054517962,
+            0.054336408,
+            0.052840688000000004,
+            0.053039707000000005,
+            0.056092223000000004,
+            0.057411448000000004,
+            0.056315726,
+            0.049850997,
+            0.051237416,
+            0.051666460000000004,
+            0.048902164000000005,
+            0.046958242000000004,
+            0.052206393000000004,
+            0.046955052000000004,
+            0.058896268,
+            0.054773596
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --help\n  Time (mean \u00b1 \u03c3):      53.2 ms \u00b1   3.3 ms    [User: 22.7 ms, System: 15.5 ms]\n  Range (min \u2026 max):    47.0 ms \u2026  58.9 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-codex-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          53384,
+          52880,
+          52888,
+          52884,
+          52868
+        ],
+        "median_kib": 52884.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "Ask Codex to do anything",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          0.4866442279999319,
+          0.2841935450001074,
+          0.28658710500030793,
+          0.2842594620001364,
+          0.28279653299978236
+        ],
+        "median_s": 0.2842594620001364,
+        "mean_s": 0.3248961746000532,
+        "transcript_last": "10;?11;?   >_ OpenAI Codex (v0.169.0)     loading                  \u203a Ask Codex to do anything   ? for shortcuts "
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Codex 0.169 rejects wire_api=chat, so the mock's Responses API is used (wire_api=responses), which is the OpenAI endpoint this CLI can be pointed at.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex",
+          "exec",
+          "--skip-git-repo-check",
+          "--color",
+          "never",
+          "--dangerously-bypass-approvals-and-sandbox",
+          "-o",
+          "/agent/repos/buildwithnexus/bench/.tools/homes/codex/codex-task/last.txt",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          0.8057641969999167,
+          0.2332190229999469,
+          0.24649468300003718,
+          0.2687390559999585,
+          0.2320987849998346
+        ],
+        "median_s": 0.24649468300003718,
+        "mean_s": 0.3572631487999388,
+        "mock_requests_total": 5,
+        "last_stdout": "BENCHMARK_OK\n"
+      }
+    },
+    "gemini": {
+      "id": "gemini",
+      "display": "Gemini CLI",
+      "version_text": "0.68.0",
+      "sizes": {
+        "package_bytes": 20975501,
+        "package_url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz",
+        "download_bytes": 21942165,
+        "download_parts": [
+          {
+            "package": "@github/keytar",
+            "version": "7.10.6",
+            "bytes": 529744,
+            "url": "https://registry.npmjs.org/@github/keytar/-/keytar-7.10.6.tgz"
+          },
+          {
+            "package": "@google/gemini-cli",
+            "version": "0.68.0",
+            "bytes": 20975501,
+            "url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz"
+          },
+          {
+            "package": "@lydell/node-pty",
+            "version": "1.1.0",
+            "bytes": 14504,
+            "url": "https://registry.npmjs.org/@lydell/node-pty/-/node-pty-1.1.0.tgz"
+          },
+          {
+            "package": "@lydell/node-pty-linux-x64",
+            "version": "1.1.0",
+            "bytes": 27201,
+            "url": "https://registry.npmjs.org/@lydell/node-pty-linux-x64/-/node-pty-linux-x64-1.1.0.tgz"
+          },
+          {
+            "package": "nan",
+            "version": "2.30.0",
+            "bytes": 82109,
+            "url": "https://registry.npmjs.org/nan/-/nan-2.30.0.tgz"
+          },
+          {
+            "package": "node-addon-api",
+            "version": "8.9.2",
+            "bytes": 62490,
+            "url": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-8.9.2.tgz"
+          },
+          {
+            "package": "node-pty",
+            "version": "1.0.0",
+            "bytes": 250616,
+            "url": "https://registry.npmjs.org/node-pty/-/node-pty-1.0.0.tgz"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 102977281,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini",
+        "entrypoint_bytes": 5152,
+        "notes": [
+          "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+        ],
+        "binary_bytes": 5152,
+        "binary_kind": "script",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini",
+        "package_parts": [
+          "@google/gemini-cli"
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 1.0929282908,
+          "median_s": 1.0879247405,
+          "stddev_s": 0.020421907340737712,
+          "min_s": 1.054438332,
+          "max_s": 1.1371394989999999,
+          "times_s": [
+            1.080479221,
+            1.08295475,
+            1.086235302,
+            1.097632539,
+            1.088123889,
+            1.136428974,
+            1.117020878,
+            1.096080053,
+            1.1371394989999999,
+            1.087617166,
+            1.101932898,
+            1.079477671,
+            1.087725592,
+            1.091728481,
+            1.059839494,
+            1.102933444,
+            1.086341546,
+            1.054438332,
+            1.085052662,
+            1.099383425
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version\n  Time (mean \u00b1 \u03c3):      1.093 s \u00b1  0.020 s    [User: 1.128 s, System: 0.145 s]\n  Range (min \u2026 max):    1.054 s \u2026  1.137 s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-gemini-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 1.1000358168499997,
+          "median_s": 1.099182077,
+          "stddev_s": 0.010485061880666705,
+          "min_s": 1.080840241,
+          "max_s": 1.115948024,
+          "times_s": [
+            1.104314205,
+            1.081486296,
+            1.096838724,
+            1.102144509,
+            1.110745956,
+            1.114046235,
+            1.098521861,
+            1.115295577,
+            1.094842638,
+            1.099842293,
+            1.093828882,
+            1.109395109,
+            1.090010259,
+            1.115948024,
+            1.107625298,
+            1.080840241,
+            1.107052258,
+            1.093717184,
+            1.089119098,
+            1.09510169
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version\n  Time (mean \u00b1 \u03c3):      1.100 s \u00b1  0.010 s    [User: 1.103 s, System: 0.150 s]\n  Range (min \u2026 max):    1.081 s \u2026  1.116 s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-gemini-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 1.07416208395,
+          "median_s": 1.073645373,
+          "stddev_s": 0.010713428949418432,
+          "min_s": 1.055733564,
+          "max_s": 1.096091187,
+          "times_s": [
+            1.088535128,
+            1.072539906,
+            1.072264422,
+            1.060360602,
+            1.073660989,
+            1.0739284,
+            1.082246502,
+            1.068447232,
+            1.066789095,
+            1.055733564,
+            1.066729673,
+            1.078292912,
+            1.06021678,
+            1.065602758,
+            1.073629757,
+            1.076511942,
+            1.074460193,
+            1.084048479,
+            1.096091187,
+            1.093152158
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --help\n  Time (mean \u00b1 \u03c3):      1.074 s \u00b1  0.011 s    [User: 1.104 s, System: 0.143 s]\n  Range (min \u2026 max):    1.056 s \u2026  1.096 s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-gemini-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 1.0977855979500002,
+          "median_s": 1.0985919805000002,
+          "stddev_s": 0.015501223066265028,
+          "min_s": 1.075098218,
+          "max_s": 1.126751773,
+          "times_s": [
+            1.12120692,
+            1.087601278,
+            1.101182753,
+            1.107869702,
+            1.112864704,
+            1.116186659,
+            1.126751773,
+            1.109205267,
+            1.096560175,
+            1.095714056,
+            1.101436681,
+            1.100623786,
+            1.107689587,
+            1.092754717,
+            1.088609405,
+            1.075939384,
+            1.076295114,
+            1.078187874,
+            1.083933906,
+            1.075098218
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --help\n  Time (mean \u00b1 \u03c3):      1.098 s \u00b1  0.016 s    [User: 1.111 s, System: 0.143 s]\n  Range (min \u2026 max):    1.075 s \u2026  1.127 s    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-gemini-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          215468,
+          215320,
+          206096,
+          214972,
+          214944
+        ],
+        "median_kib": 214972.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": false,
+        "status": "not_measured",
+        "reason": "No ready-prompt pattern is pinned for this tool. A pattern is only timed after it has been seen in that tool's own PTY transcript.",
+        "process_exited": true,
+        "transcript": "11;?\r\u2500\r0;\u25c7  Ready (empty-cwd)                                                            \u0007\r\n\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\r\n\u2502                                                                              \u2502\r\n\u2502 \u280b Waiting for authentication... (Press Esc or Ctrl+C to cancel)              \u2502\r\n\u2502                                                                              \u2502\r\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\r\n0;\u25c7  Ready (empty-cwd)                                                            \u0007\r\n \u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\r\n \u2502                                                                            \u2502\r\n \u2502 Do you trust the files in this folder?                                     \u2502\r\n \u2502                                                                            \u2502\r\n \u2502 Trusting a folder allows Gemini CLI to load its local configurations,      \u2502\r\n \u2502 including custom commands, hooks, MCP servers, agent skills, and settings. \u2502\r\n \u2502 These configurations could execute code on your behalf or change the       \u2502\r\n \u2502 behavior of the CLI.                                                       \u2502\r\n \u2502                                                                            \u2502\r\n \u2502                                                                            \u2502\r\n \u2502 \u25cf 1. Trust folder (empty-cwd)                                              \u2502\r\n \u2502   2. Trust parent folder (gemini)                                          \u2502\r\n \u2502   3. Don't trust                                                           \u2502\r\n \u2502                                                                            \u2502\r\n \u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\r\n\r\n\r\n \u259d\u259c\u2584      \u2597\u2588\u2580\u2580\u259c\u2599\u259d\u2588\u259b\u2580\u2580\u258c\u259c\u2588\u2588\u2596\u259f\u2588\u2588\u2598\u259c\u2588\u2598\u259c\u2588\u2588\u2596\u259d\u2588\u259b\u259d\u2588\u259b\r\n   \u259d\u259c\u2584    \u2588\u258c     \u2588\u2599\u259f  \u2590\u2588\u259d\u2588\u259b\u2590\u2588 \u2590\u2588 \u2590\u2588\u259d\u2588\u2596\u2588\u258c \u2588\u258c\r\n  \u2597\u259f\u2580     \u259c\u2599 \u259d\u2588\u259b \u2588\u258c\u259d \u2596\u2590\u2588   \u2590\u2588 \u2590\u2588 \u2590\u2588 \u259d\u2588\u2588\u258c \u2588\u258c\r\n \u259d\u2580        \u2580\u2580\u2580\u2580\u2598\u259d\u2580\u2580\u2580\u2580\u2598\u2580\u2580\u2598  \u2580\u2580\u2598\u2580\u2580\u2598\u2580\u2580\u2598 \u259d\u2580\u2580\u259d\u2580\u2580\r\n\r\n Gemini CLI v0.68.0\r\n\r\n\r\n\r\nTips for getting started:\r\n1. Create GEMINI.md files to customize your interactions\r\n2. /help for more information\r\n3. Ask coding questions, edit code or run commands\r\n4. Be specific for the best results\r\n\r\n\u2139 Skipping project agents due to untrusted folder. To enable, ensure that the\r\n  project root is trusted.\r\n\r\n \u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\r\n \u2502                                                                            \u2502\r\n \u2502 Do you trust the files in this folder?                                     \u2502\r\n \u2502                                                                            \u2502\r\n \u2502 Trusting a folder allows Gemini CLI to load its local configurations,      \u2502\r\n \u2502 including custom commands, hooks, MCP servers, agent skills, and settings. \u2502\r\n \u2502 These configurations could execute code on your behalf or change the       \u2502\r\n \u2502 behavior of the CLI.                                                       \u2502\r\n \u2502                                                                            \u2502\r\n \u2502                                                                            \u2502\r\n \u2502 \u25cf 1. Trust folder (empty-cwd)                                              \u2502\r\n \u2502   2. Trust parent folder (gemini)                                          \u2502\r\n \u2502   3. Don't trust                                                           \u2502\r\n \u2502                                                                            \u2502\r\n \u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\r\n\r\n"
+      },
+      "task": {
+        "ok": false,
+        "status": "skipped",
+        "reason": "Gemini CLI's GOOGLE_GEMINI_BASE_URL is the Gemini API base (generateContent), not an OpenAI-compatible chat or responses URL. It is not given a fake time."
+      }
+    },
+    "opencode": {
+      "id": "opencode",
+      "display": "OpenCode",
+      "version_text": "1.19.5",
+      "sizes": {
+        "package_bytes": 158275448,
+        "package_url": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.19.5.tgz",
+        "download_bytes": 158275448,
+        "download_parts": [
+          {
+            "package": "opencode-ai",
+            "version": "1.19.5",
+            "bytes": 3041,
+            "url": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.19.5.tgz"
+          },
+          {
+            "package": "opencode-linux-x64",
+            "version": "1.19.5",
+            "bytes": 79136190,
+            "url": "https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.19.5.tgz"
+          },
+          {
+            "package": "opencode-linux-x64-baseline",
+            "version": "1.19.5",
+            "bytes": 79136217,
+            "url": "https://registry.npmjs.org/opencode-linux-x64-baseline/-/opencode-linux-x64-baseline-1.19.5.tgz"
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 643168267,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode",
+        "entrypoint_bytes": 214386864,
+        "notes": [
+          "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+        ],
+        "binary_bytes": 214386864,
+        "binary_kind": "native",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode",
+        "package_parts": [
+          "opencode-ai",
+          "opencode-linux-x64",
+          "opencode-linux-x64-baseline"
+        ]
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.3195741352,
+          "median_s": 0.320927359,
+          "stddev_s": 0.0032877871308007105,
+          "min_s": 0.314555544,
+          "max_s": 0.324164169,
+          "times_s": [
+            0.314721099,
+            0.314787837,
+            0.31738767,
+            0.31561735,
+            0.314555544,
+            0.31730403100000004,
+            0.320962426,
+            0.320948127,
+            0.323034523,
+            0.32214541700000004,
+            0.320906591,
+            0.321275494,
+            0.323363809,
+            0.322551749,
+            0.322714489,
+            0.31512199900000004,
+            0.31806305900000004,
+            0.320173382,
+            0.32168393900000003,
+            0.324164169
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version\n  Time (mean \u00b1 \u03c3):     319.6 ms \u00b1   3.3 ms    [User: 381.7 ms, System: 36.9 ms]\n  Range (min \u2026 max):   314.6 ms \u2026 324.2 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-opencode-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.38596024165,
+          "median_s": 0.3856811135,
+          "stddev_s": 0.006562399237485346,
+          "min_s": 0.369070995,
+          "max_s": 0.396192863,
+          "times_s": [
+            0.39118515800000003,
+            0.39304222400000005,
+            0.384751033,
+            0.386811838,
+            0.394905832,
+            0.389295449,
+            0.396192863,
+            0.384977915,
+            0.38402262800000003,
+            0.39204141800000003,
+            0.386384312,
+            0.381754166,
+            0.39137188300000003,
+            0.38348848300000005,
+            0.37617358300000003,
+            0.38108667500000004,
+            0.388929114,
+            0.38238577700000004,
+            0.381333487,
+            0.369070995
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version\n  Time (mean \u00b1 \u03c3):     386.0 ms \u00b1   6.6 ms    [User: 389.7 ms, System: 55.2 ms]\n  Range (min \u2026 max):   369.1 ms \u2026 396.2 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-opencode-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.33091165255000005,
+          "median_s": 0.32938567950000003,
+          "stddev_s": 0.006692057117839909,
+          "min_s": 0.323145157,
+          "max_s": 0.351949483,
+          "times_s": [
+            0.334001015,
+            0.331279337,
+            0.330447983,
+            0.32938050900000004,
+            0.329775961,
+            0.32939085,
+            0.32798169600000004,
+            0.32707750700000005,
+            0.33078724000000004,
+            0.330046391,
+            0.327667798,
+            0.32669689100000004,
+            0.329229421,
+            0.345969104,
+            0.351949483,
+            0.327509062,
+            0.323145157,
+            0.32493309000000004,
+            0.329351744,
+            0.33161281200000003
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --help\n  Time (mean \u00b1 \u03c3):     330.9 ms \u00b1   6.7 ms    [User: 399.8 ms, System: 40.1 ms]\n  Range (min \u2026 max):   323.1 ms \u2026 351.9 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-opencode-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.39886706265000005,
+          "median_s": 0.3969387835,
+          "stddev_s": 0.014657432899905787,
+          "min_s": 0.386579186,
+          "max_s": 0.45428517900000004,
+          "times_s": [
+            0.41054347900000004,
+            0.39853809300000004,
+            0.38917566400000003,
+            0.38834498300000003,
+            0.397652424,
+            0.394289669,
+            0.40068452800000004,
+            0.39061531000000005,
+            0.45428517900000004,
+            0.39916104300000005,
+            0.408406955,
+            0.39231031200000005,
+            0.39099373600000004,
+            0.396225143,
+            0.402822952,
+            0.386579186,
+            0.38853216,
+            0.388985835,
+            0.40018029000000005,
+            0.39901431200000004
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --help\n  Time (mean \u00b1 \u03c3):     398.9 ms \u00b1  14.7 ms    [User: 407.5 ms, System: 60.2 ms]\n  Range (min \u2026 max):   386.6 ms \u2026 454.3 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-opencode-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          131008,
+          130804,
+          131016,
+          130700,
+          130644
+        ],
+        "median_kib": 130804.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "Ask anything",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          2.656338886999947,
+          2.561094647000118,
+          2.5855952560000333,
+          2.616048324000076,
+          2.5802238739997847
+        ],
+        "median_s": 2.5855952560000333,
+        "mean_s": 2.599860197599992,
+        "transcript_last": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          0;OpenCode\u0007                                \u2584     \u2588\u2580\u2580\u2588 \u2588\u2580\u2580\u2588 \u2588\u2580\u2580\u2588 \u2588\u2580\u2580\u2584\u2588\u2580\u2580\u2580 \u2588\u2580\u2580\u2588 \u2588\u2580\u2580\u2588 \u2588\u2580\u2580\u2588\u2588  \u2588 \u2588  \u2588 \u2588\u2580\u2580\u2580 \u2588  \u2588\u2588    \u2588  \u2588 \u2588  \u2588 \u2588\u2580\u2580\u2580\u2580\u2580\u2580\u2580 \u2588\u2580\u2580\u2580 \u2580\u2580\u2580\u2580 \u2580\u2580\u2580\u2580\u2580\u2580\u2580\u2580 \u2580\u2580\u2580\u2580 \u2580\u2580\u2580\u2580 \u2580\u2580\u2580\u2580/\u2503                                                                          \u2503  Ask anything\u2026 \"Fix a TODO in the codebase\"                              \u2503                                                                          \u2503  Build \u00b7 Big Pickle OpenCode\u001b[4"
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode",
+          "run",
+          "--pure",
+          "--model",
+          "openai/gpt-4o-mini",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          1.4571273940000538,
+          1.4651587520002067,
+          1.4188977519997934,
+          1.4411752940000042,
+          1.42445084100018
+        ],
+        "median_s": 1.4411752940000042,
+        "mean_s": 1.4413620066000477,
+        "mock_requests_total": 10,
+        "last_stdout": "BENCHMARK_OK\n"
+      }
+    },
+    "aider": {
+      "id": "aider",
+      "display": "Aider",
+      "version_text": "aider 0.86.2",
+      "sizes": {
+        "package_bytes": 377009,
+        "package_url": "aider_chat-0.86.2-py3-none-any.whl",
+        "download_bytes": 125519775,
+        "download_parts": [
+          {
+            "file": "aider_chat-0.86.2-py3-none-any.whl",
+            "bytes": 377009
+          },
+          {
+            "file": "aiohappyeyeballs-2.6.1-py3-none-any.whl",
+            "bytes": 15265
+          },
+          {
+            "file": "aiohttp-3.13.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 1755181
+          },
+          {
+            "file": "aiosignal-1.4.0-py3-none-any.whl",
+            "bytes": 7490
+          },
+          {
+            "file": "annotated_doc-0.0.4-py3-none-any.whl",
+            "bytes": 5303
+          },
+          {
+            "file": "annotated_types-0.7.0-py3-none-any.whl",
+            "bytes": 13643
+          },
+          {
+            "file": "anyio-4.12.1-py3-none-any.whl",
+            "bytes": 113592
+          },
+          {
+            "file": "asgiref-3.11.1-py3-none-any.whl",
+            "bytes": 24345
+          },
+          {
+            "file": "attrs-25.4.0-py3-none-any.whl",
+            "bytes": 67615
+          },
+          {
+            "file": "backoff-2.2.1-py3-none-any.whl",
+            "bytes": 15148
+          },
+          {
+            "file": "beautifulsoup4-4.14.3-py3-none-any.whl",
+            "bytes": 107721
+          },
+          {
+            "file": "certifi-2026.1.4-py3-none-any.whl",
+            "bytes": 152900
+          },
+          {
+            "file": "cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            "bytes": 219572
+          },
+          {
+            "file": "charset_normalizer-3.4.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 153471
+          },
+          {
+            "file": "click-8.3.1-py3-none-any.whl",
+            "bytes": 108274
+          },
+          {
+            "file": "configargparse-1.7.1-py3-none-any.whl",
+            "bytes": 25607
+          },
+          {
+            "file": "diff_match_patch-20241021-py3-none-any.whl",
+            "bytes": 43252
+          },
+          {
+            "file": "diskcache-5.6.3-py3-none-any.whl",
+            "bytes": 45550
+          },
+          {
+            "file": "distro-1.9.0-py3-none-any.whl",
+            "bytes": 20277
+          },
+          {
+            "file": "fastapi-0.128.8-py3-none-any.whl",
+            "bytes": 103630
+          },
+          {
+            "file": "fastuuid-0.14.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 278105
+          },
+          {
+            "file": "filelock-3.20.3-py3-none-any.whl",
+            "bytes": 16701
+          },
+          {
+            "file": "flake8-7.3.0-py2.py3-none-any.whl",
+            "bytes": 57922
+          },
+          {
+            "file": "frozenlist-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+            "bytes": 242411
+          },
+          {
+            "file": "fsspec-2026.2.0-py3-none-any.whl",
+            "bytes": 202505
+          },
+          {
+            "file": "gitdb-4.0.12-py3-none-any.whl",
+            "bytes": 62794
+          },
+          {
+            "file": "gitpython-3.1.46-py3-none-any.whl",
+            "bytes": 208620
+          },
+          {
+            "file": "grep_ast-0.9.0-py3-none-any.whl",
+            "bytes": 13918
+          },
+          {
+            "file": "h11-0.16.0-py3-none-any.whl",
+            "bytes": 37515
+          },
+          {
+            "file": "hf_xet-1.2.0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 3320214
+          },
+          {
+            "file": "httpcore-1.0.9-py3-none-any.whl",
+            "bytes": 78784
+          },
+          {
+            "file": "httpx-0.28.1-py3-none-any.whl",
+            "bytes": 73517
+          },
+          {
+            "file": "huggingface_hub-1.4.1-py3-none-any.whl",
+            "bytes": 553326
+          },
+          {
+            "file": "idna-3.11-py3-none-any.whl",
+            "bytes": 71008
+          },
+          {
+            "file": "importlib_metadata-7.2.1-py3-none-any.whl",
+            "bytes": 25037
+          },
+          {
+            "file": "importlib_resources-6.5.2-py3-none-any.whl",
+            "bytes": 37461
+          },
+          {
+            "file": "jinja2-3.1.6-py3-none-any.whl",
+            "bytes": 134899
+          },
+          {
+            "file": "jiter-0.13.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 360735
+          },
+          {
+            "file": "json5-0.13.0-py3-none-any.whl",
+            "bytes": 36163
+          },
+          {
+            "file": "jsonschema-4.26.0-py3-none-any.whl",
+            "bytes": 90630
+          },
+          {
+            "file": "jsonschema_specifications-2025.9.1-py3-none-any.whl",
+            "bytes": 18437
+          },
+          {
+            "file": "litellm-1.81.10-py3-none-any.whl",
+            "bytes": 14457931
+          },
+          {
+            "file": "markdown_it_py-4.0.0-py3-none-any.whl",
+            "bytes": 87321
+          },
+          {
+            "file": "markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 22947
+          },
+          {
+            "file": "mccabe-0.7.0-py2.py3-none-any.whl",
+            "bytes": 7350
+          },
+          {
+            "file": "mdurl-0.1.2-py3-none-any.whl",
+            "bytes": 9979
+          },
+          {
+            "file": "mixpanel-5.0.0-py3-none-any.whl",
+            "bytes": 23848
+          },
+          {
+            "file": "mslex-1.3.0-py3-none-any.whl",
+            "bytes": 7820
+          },
+          {
+            "file": "multidict-6.7.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 256322
+          },
+          {
+            "file": "networkx-3.4.2-py3-none-any.whl",
+            "bytes": 1723263
+          },
+          {
+            "file": "numpy-1.26.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 17950613
+          },
+          {
+            "file": "openai-2.20.0-py3-none-any.whl",
+            "bytes": 1098479
+          },
+          {
+            "file": "orjson-3.11.7-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 133440
+          },
+          {
+            "file": "oslex-0.1.3-py3-none-any.whl",
+            "bytes": 3546
+          },
+          {
+            "file": "packaging-26.0-py3-none-any.whl",
+            "bytes": 74366
+          },
+          {
+            "file": "pathspec-1.0.4-py3-none-any.whl",
+            "bytes": 55206
+          },
+          {
+            "file": "pexpect-4.9.0-py2.py3-none-any.whl",
+            "bytes": 63772
+          },
+          {
+            "file": "pillow-12.1.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 7041540
+          },
+          {
+            "file": "posthog-7.8.6-py3-none-any.whl",
+            "bytes": 194801
+          },
+          {
+            "file": "prompt_toolkit-3.0.52-py3-none-any.whl",
+            "bytes": 391431
+          },
+          {
+            "file": "propcache-0.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 221575
+          },
+          {
+            "file": "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 155560
+          },
+          {
+            "file": "ptyprocess-0.7.0-py2.py3-none-any.whl",
+            "bytes": 13993
+          },
+          {
+            "file": "pycodestyle-2.14.0-py2.py3-none-any.whl",
+            "bytes": 31594
+          },
+          {
+            "file": "pycparser-3.0-py3-none-any.whl",
+            "bytes": 48172
+          },
+          {
+            "file": "pydantic-2.12.5-py3-none-any.whl",
+            "bytes": 463580
+          },
+          {
+            "file": "pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 2075366
+          },
+          {
+            "file": "pydub-0.25.1-py2.py3-none-any.whl",
+            "bytes": 32327
+          },
+          {
+            "file": "pyflakes-3.4.0-py2.py3-none-any.whl",
+            "bytes": 63551
+          },
+          {
+            "file": "pygments-2.19.2-py3-none-any.whl",
+            "bytes": 1225217
+          },
+          {
+            "file": "pypandoc-1.16.2-py3-none-any.whl",
+            "bytes": 19451
+          },
+          {
+            "file": "pyperclip-1.11.0-py3-none-any.whl",
+            "bytes": 11063
+          },
+          {
+            "file": "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+            "bytes": 229892
+          },
+          {
+            "file": "python_dotenv-1.2.1-py3-none-any.whl",
+            "bytes": 21230
+          },
+          {
+            "file": "pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 807870
+          },
+          {
+            "file": "referencing-0.37.0-py3-none-any.whl",
+            "bytes": 26766
+          },
+          {
+            "file": "regex-2026.1.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 803589
+          },
+          {
+            "file": "requests-2.32.5-py3-none-any.whl",
+            "bytes": 64738
+          },
+          {
+            "file": "rich-14.3.2-py3-none-any.whl",
+            "bytes": 309963
+          },
+          {
+            "file": "rpds_py-0.30.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 394080
+          },
+          {
+            "file": "scipy-1.15.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 37309455
+          },
+          {
+            "file": "shellingham-1.5.4-py2.py3-none-any.whl",
+            "bytes": 9755
+          },
+          {
+            "file": "shtab-1.8.0-py3-none-any.whl",
+            "bytes": 14457
+          },
+          {
+            "file": "six-1.17.0-py2.py3-none-any.whl",
+            "bytes": 11050
+          },
+          {
+            "file": "smmap-5.0.2-py3-none-any.whl",
+            "bytes": 24303
+          },
+          {
+            "file": "sniffio-1.3.1-py3-none-any.whl",
+            "bytes": 10235
+          },
+          {
+            "file": "socksio-1.0.0-py3-none-any.whl",
+            "bytes": 12763
+          },
+          {
+            "file": "sounddevice-0.5.5-py3-none-any.whl",
+            "bytes": 32807
+          },
+          {
+            "file": "soundfile-0.13.1-py2.py3-none-manylinux_2_28_x86_64.whl",
+            "bytes": 1313646
+          },
+          {
+            "file": "soupsieve-2.8.3-py3-none-any.whl",
+            "bytes": 37016
+          },
+          {
+            "file": "starlette-0.52.1-py3-none-any.whl",
+            "bytes": 74272
+          },
+          {
+            "file": "tiktoken-0.12.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+            "bytes": 1152665
+          },
+          {
+            "file": "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 3274982
+          },
+          {
+            "file": "tqdm-4.67.3-py3-none-any.whl",
+            "bytes": 78374
+          },
+          {
+            "file": "tree_sitter-0.25.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 635418
+          },
+          {
+            "file": "tree_sitter_c_sharp-0.23.1-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+            "bytes": 358331
+          },
+          {
+            "file": "tree_sitter_embedded_template-0.25.0-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+            "bytes": 18268
+          },
+          {
+            "file": "tree_sitter_language_pack-0.13.0-cp310-abi3-manylinux2014_x86_64.whl",
+            "bytes": 19952029
+          },
+          {
+            "file": "tree_sitter_yaml-0.7.2-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+            "bytes": 91430
+          },
+          {
+            "file": "typer-0.23.0-py3-none-any.whl",
+            "bytes": 56668
+          },
+          {
+            "file": "typer_slim-0.23.0-py3-none-any.whl",
+            "bytes": 3399
+          },
+          {
+            "file": "typing_extensions-4.15.0-py3-none-any.whl",
+            "bytes": 44614
+          },
+          {
+            "file": "typing_inspection-0.4.2-py3-none-any.whl",
+            "bytes": 14611
+          },
+          {
+            "file": "urllib3-2.6.3-py3-none-any.whl",
+            "bytes": 131584
+          },
+          {
+            "file": "watchfiles-1.1.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+            "bytes": 456812
+          },
+          {
+            "file": "wcwidth-0.6.0-py3-none-any.whl",
+            "bytes": 94189
+          },
+          {
+            "file": "yarl-1.22.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+            "bytes": 377267
+          },
+          {
+            "file": "zipp-3.23.0-py3-none-any.whl",
+            "bytes": 10276
+          }
+        ],
+        "download_unresolved": [],
+        "install_bytes": 645560252,
+        "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider",
+        "entrypoint_bytes": 259,
+        "notes": [
+          "package_bytes is the aider-chat wheel alone (pip download --no-deps).",
+          "download_bytes is every wheel pip download fetches for that pin, including dependencies.",
+          "install_bytes is the virtualenv on disk after pip install, including pip itself."
+        ],
+        "binary_bytes": 259,
+        "binary_kind": "script",
+        "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider"
+      },
+      "startup": {
+        "version_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.49376241635000007,
+          "median_s": 0.494167911,
+          "stddev_s": 0.007231927885752193,
+          "min_s": 0.48093376800000004,
+          "max_s": 0.506480777,
+          "times_s": [
+            0.485724539,
+            0.506480777,
+            0.495332843,
+            0.49542938900000005,
+            0.502310994,
+            0.49637139500000005,
+            0.492830947,
+            0.49433748400000005,
+            0.493791884,
+            0.48741355300000005,
+            0.5014534500000001,
+            0.49845458200000003,
+            0.504890275,
+            0.488753578,
+            0.498016334,
+            0.484281216,
+            0.49399833800000004,
+            0.48093376800000004,
+            0.49234208700000004,
+            0.48210089400000006
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version\n  Time (mean \u00b1 \u03c3):     493.8 ms \u00b1   7.2 ms    [User: 462.5 ms, System: 31.1 ms]\n  Range (min \u2026 max):   480.9 ms \u2026 506.5 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-aider-version-warm.json"
+        },
+        "version_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.6903709178999999,
+          "median_s": 0.6911030035000001,
+          "stddev_s": 0.030738171718967186,
+          "min_s": 0.620345,
+          "max_s": 0.740138457,
+          "times_s": [
+            0.7277003390000001,
+            0.707089602,
+            0.7177325200000001,
+            0.735396496,
+            0.740138457,
+            0.71825231,
+            0.698503098,
+            0.6908348440000001,
+            0.691371163,
+            0.683507211,
+            0.682176876,
+            0.620345,
+            0.7021522570000001,
+            0.6731049100000001,
+            0.6334270550000001,
+            0.6947927190000001,
+            0.6795115540000001,
+            0.672381242,
+            0.678209908,
+            0.6607907970000001
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version\n  Time (mean \u00b1 \u03c3):     690.4 ms \u00b1  30.7 ms    [User: 476.6 ms, System: 70.4 ms]\n  Range (min \u2026 max):   620.3 ms \u2026 740.1 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-aider-version-cold.json"
+        },
+        "help_warm": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --help",
+          "cold": false,
+          "runs": 20,
+          "mean_s": 0.5027801617,
+          "median_s": 0.4954276475,
+          "stddev_s": 0.018844322904171804,
+          "min_s": 0.48808067200000005,
+          "max_s": 0.56882409,
+          "times_s": [
+            0.509264819,
+            0.507322225,
+            0.496318929,
+            0.504713473,
+            0.491392174,
+            0.492225157,
+            0.494536366,
+            0.5062838070000001,
+            0.48959214900000003,
+            0.49318033800000005,
+            0.48808067200000005,
+            0.49218285500000003,
+            0.49162788700000004,
+            0.5096594050000001,
+            0.492914436,
+            0.5029641770000001,
+            0.497782736,
+            0.49283792200000004,
+            0.56882409,
+            0.533899617
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --help\n  Time (mean \u00b1 \u03c3):     502.8 ms \u00b1  18.8 ms    [User: 467.1 ms, System: 35.4 ms]\n  Range (min \u2026 max):   488.1 ms \u2026 568.8 ms    20 runs\n \n",
+          "hyperfine_stderr": " \n  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.\n",
+          "export": "startup-aider-help-warm.json"
+        },
+        "help_cold": {
+          "ok": true,
+          "exit_code": 0,
+          "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --help",
+          "cold": true,
+          "runs": 20,
+          "mean_s": 0.7454290503000001,
+          "median_s": 0.748208901,
+          "stddev_s": 0.032111431196190435,
+          "min_s": 0.6834138550000001,
+          "max_s": 0.803643745,
+          "times_s": [
+            0.6834138550000001,
+            0.70448955,
+            0.786049956,
+            0.687641695,
+            0.7156338760000001,
+            0.803643745,
+            0.7587134560000001,
+            0.7536434270000001,
+            0.774174138,
+            0.7444770070000001,
+            0.769960504,
+            0.742654547,
+            0.7511266710000001,
+            0.7857588390000001,
+            0.7640283130000001,
+            0.740985203,
+            0.726393972,
+            0.751511711,
+            0.745291131,
+            0.71898941
+          ],
+          "hyperfine_stdout": "Benchmark 1: /agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --help\n  Time (mean \u00b1 \u03c3):     745.4 ms \u00b1  32.1 ms    [User: 509.0 ms, System: 72.0 ms]\n  Range (min \u2026 max):   683.4 ms \u2026 803.6 ms    20 runs\n \n",
+          "hyperfine_stderr": "",
+          "export": "startup-aider-help-cold.json"
+        }
+      },
+      "memory": {
+        "ok": true,
+        "command": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version",
+        "tool": "/usr/bin/time -v",
+        "field": "Maximum resident set size (kbytes)",
+        "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+        "samples_kib": [
+          73476,
+          73480,
+          73488,
+          73752,
+          73800
+        ],
+        "median_kib": 73488.0,
+        "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+      },
+      "prompt": {
+        "ok": true,
+        "status": "measured",
+        "pattern": "\n> ",
+        "definition": "Seconds from process start until the PTY transcript contains the pattern. The process is still running (it was killed after the match). Started in an empty HOME, 80x24.",
+        "runs_s": [
+          0.6195269599998028,
+          0.603281786000025,
+          0.5988781500000186,
+          0.6103571869998632,
+          0.6088108210001337
+        ],
+        "median_s": 0.6088108210001337,
+        "mean_s": 0.6081709807999687,
+        "transcript_last": "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\nAider v0.86.2\r\nModel: openai/gpt-4o-mini with whole edit format\r\nGit repo: none\r\nRepo-map: disabled\r\nNote: in-chat filenames are always relative to the git working dir, not the \r\ncurrent working dir.\r\nCur working dir: /agent/repos/buildwithnexus/bench/.tools/homes/aider/empty-cwd\r\nGit working dir: /agent/repos/buildwithnexus\r\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\r\n> "
+      },
+      "task": {
+        "ok": true,
+        "status": "measured",
+        "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. The model name is a label Aider already accepts; the completion bytes come from --openai-api-base, the mock.",
+        "command": [
+          "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider",
+          "--model",
+          "openai/gpt-4o-mini",
+          "--openai-api-base",
+          "http://127.0.0.1:44535/v1",
+          "--openai-api-key",
+          "sk-bench",
+          "--no-git",
+          "--no-stream",
+          "--no-pretty",
+          "--no-check-update",
+          "--no-analytics",
+          "--no-show-model-warnings",
+          "--yes-always",
+          "--message",
+          "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+        ],
+        "runs_s": [
+          3.18987125700005,
+          2.2118270999999368,
+          2.209675186000368,
+          2.200821688999895,
+          2.194593723000253
+        ],
+        "median_s": 2.209675186000368,
+        "mean_s": 2.4013577910001005,
+        "mock_requests_total": 5,
+        "last_stdout": "\nAider v0.86.2\nModel: openai/gpt-4o-mini with whole edit format\nGit repo: none\nRepo-map: disabled\n\nBENCHMARK_OK\n\nTokens: 1 sent, 1 received. Cost: $0.00000075 message, $0.00000075 session.\n"
+      }
+    }
+  },
+  "rankings": {
+    "startup_version_warm_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.000556568
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 0.006472312000000001
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.021236468
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.028316297
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 0.320927359
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 0.494167911
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 1.0879247405
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "startup_version_cold_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.0048717865
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.030638738500000002
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 0.0426750705
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.0545052865
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 0.3856811135
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 0.6911030035000001
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 1.099182077
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "startup_help_warm_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.0006043185000000001
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.021759656000000002
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.02800576
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 0.08741799850000001
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 0.32938567950000003
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 0.4954276475
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 1.073645373
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "startup_help_cold_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.0035676015000000003
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.035072918
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.0532408365
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 0.156073342
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 0.3969387835
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 0.748208901
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 1.0985919805000002
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "memory_median_kib": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 3456.0
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 22984.0
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 45840.0
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 52884.0
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 73488.0
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 130804.0
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 214972.0
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "install_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6639839
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 102977281
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 422680010
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 643168267
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 645560252
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 731894792
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "download_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6546740
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 21942165
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 125519775
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 158275448
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 167006502
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 169382845
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "binary_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6492376
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 214386864
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 294277432
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 365842960
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "package_bytes": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 377009
+        },
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 6492376
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 6546740
+        },
+        {
+          "id": "gemini",
+          "display": "Gemini CLI",
+          "value": 20975501
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 158275448
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 167006502
+        },
+        {
+          "id": "claude",
+          "display": "Claude Code",
+          "value": 169382845
+        }
+      ],
+      "fastest": "aider"
+    },
+    "prompt_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.2503930549996767
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.2717106490003971
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.2842594620001364
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 0.6088108210001337
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 2.5855952560000333
+        }
+      ],
+      "fastest": "bwn-native"
+    },
+    "task_median_s": {
+      "lower_is_better": true,
+      "order": [
+        {
+          "id": "bwn-native",
+          "display": "bwn native",
+          "value": 0.057563758000014786
+        },
+        {
+          "id": "bwn-npm",
+          "display": "bwn (npm)",
+          "value": 0.07696836400009488
+        },
+        {
+          "id": "codex",
+          "display": "Codex CLI",
+          "value": 0.24649468300003718
+        },
+        {
+          "id": "opencode",
+          "display": "OpenCode",
+          "value": 1.4411752940000042
+        },
+        {
+          "id": "aider",
+          "display": "Aider",
+          "value": 2.209675186000368
+        }
+      ],
+      "fastest": "bwn-native"
+    }
+  },
+  "complete": true
+}

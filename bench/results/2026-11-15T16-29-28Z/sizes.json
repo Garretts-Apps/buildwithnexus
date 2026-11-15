@@ -1,0 +1,680 @@
+{
+  "bwn-native": {
+    "package_bytes": 6492376,
+    "package_url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+    "download_bytes": 6492376,
+    "download_parts": [
+      {
+        "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+        "bytes": 6492376,
+        "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "kind": "github-release-asset"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 6492376,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+    "entrypoint_bytes": 6492376,
+    "binary_bytes": 6492376,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+    "notes": [
+      "This row is the release binary invoked directly (the cargo-install / prebuilt entry), not the npm launcher.",
+      "download_bytes is the GitHub release asset. cargo install builds from source instead of downloading this file; the asset is what the npm launcher downloads on first run."
+    ]
+  },
+  "bwn-npm": {
+    "package_bytes": 6546740,
+    "package_url": "https://registry.npmjs.org/buildwithnexus/-/buildwithnexus-0.21.0.tgz",
+    "download_bytes": 6546740,
+    "download_parts": [
+      {
+        "package": "buildwithnexus",
+        "version": "0.21.0",
+        "bytes": 54364,
+        "url": "https://registry.npmjs.org/buildwithnexus/-/buildwithnexus-0.21.0.tgz"
+      },
+      {
+        "package": "buildwithnexus-x86_64-unknown-linux-gnu",
+        "version": "0.21.0",
+        "bytes": 6492376,
+        "url": "https://github.com/Garretts-Apps/buildwithnexus/releases/download/v0.21.0/buildwithnexus-x86_64-unknown-linux-gnu",
+        "kind": "github-release-asset"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 6639839,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn",
+    "entrypoint_bytes": 6462,
+    "notes": [
+      "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball.",
+      "The npm package does not contain the native binary. First run downloads the GitHub release asset; that asset's byte size is included in download_bytes and the installed binary is included in install_bytes."
+    ],
+    "binary_bytes": 6492376,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+    "package_parts": [
+      "buildwithnexus",
+      "buildwithnexus-x86_64-unknown-linux-gnu"
+    ]
+  },
+  "claude": {
+    "package_bytes": 169382845,
+    "package_url": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.325.tgz",
+    "download_bytes": 169382845,
+    "download_parts": [
+      {
+        "package": "@anthropic-ai/claude-code",
+        "version": "2.1.325",
+        "bytes": 31964,
+        "url": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.325.tgz"
+      },
+      {
+        "package": "@anthropic-ai/claude-code-linux-x64",
+        "version": "2.1.325",
+        "bytes": 169350881,
+        "url": "https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.325.tgz"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 731894792,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude",
+    "entrypoint_bytes": 365842960,
+    "notes": [
+      "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+    ],
+    "binary_bytes": 365842960,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude",
+    "package_parts": [
+      "@anthropic-ai/claude-code",
+      "@anthropic-ai/claude-code-linux-x64"
+    ]
+  },
+  "codex": {
+    "package_bytes": 167006502,
+    "package_url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0.tgz",
+    "download_bytes": 167006502,
+    "download_parts": [
+      {
+        "package": "@openai/codex",
+        "version": "0.169.0",
+        "bytes": 4993,
+        "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0.tgz"
+      },
+      {
+        "package": "@openai/codex",
+        "version": "0.169.0-linux-x64",
+        "bytes": 167001509,
+        "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.169.0-linux-x64.tgz"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 422680010,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex",
+    "entrypoint_bytes": 9154,
+    "notes": [
+      "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+    ],
+    "binary_bytes": 294277432,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
+    "package_parts": [
+      "@openai/codex",
+      "@openai/codex"
+    ]
+  },
+  "gemini": {
+    "package_bytes": 20975501,
+    "package_url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz",
+    "download_bytes": 21942165,
+    "download_parts": [
+      {
+        "package": "@github/keytar",
+        "version": "7.10.6",
+        "bytes": 529744,
+        "url": "https://registry.npmjs.org/@github/keytar/-/keytar-7.10.6.tgz"
+      },
+      {
+        "package": "@google/gemini-cli",
+        "version": "0.68.0",
+        "bytes": 20975501,
+        "url": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.68.0.tgz"
+      },
+      {
+        "package": "@lydell/node-pty",
+        "version": "1.1.0",
+        "bytes": 14504,
+        "url": "https://registry.npmjs.org/@lydell/node-pty/-/node-pty-1.1.0.tgz"
+      },
+      {
+        "package": "@lydell/node-pty-linux-x64",
+        "version": "1.1.0",
+        "bytes": 27201,
+        "url": "https://registry.npmjs.org/@lydell/node-pty-linux-x64/-/node-pty-linux-x64-1.1.0.tgz"
+      },
+      {
+        "package": "nan",
+        "version": "2.30.0",
+        "bytes": 82109,
+        "url": "https://registry.npmjs.org/nan/-/nan-2.30.0.tgz"
+      },
+      {
+        "package": "node-addon-api",
+        "version": "8.9.2",
+        "bytes": 62490,
+        "url": "https://registry.npmjs.org/node-addon-api/-/node-addon-api-8.9.2.tgz"
+      },
+      {
+        "package": "node-pty",
+        "version": "1.0.0",
+        "bytes": 250616,
+        "url": "https://registry.npmjs.org/node-pty/-/node-pty-1.0.0.tgz"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 102977281,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini",
+    "entrypoint_bytes": 5152,
+    "notes": [
+      "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+    ],
+    "binary_bytes": 5152,
+    "binary_kind": "script",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini",
+    "package_parts": [
+      "@google/gemini-cli"
+    ]
+  },
+  "opencode": {
+    "package_bytes": 158275448,
+    "package_url": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.19.5.tgz",
+    "download_bytes": 158275448,
+    "download_parts": [
+      {
+        "package": "opencode-ai",
+        "version": "1.19.5",
+        "bytes": 3041,
+        "url": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.19.5.tgz"
+      },
+      {
+        "package": "opencode-linux-x64",
+        "version": "1.19.5",
+        "bytes": 79136190,
+        "url": "https://registry.npmjs.org/opencode-linux-x64/-/opencode-linux-x64-1.19.5.tgz"
+      },
+      {
+        "package": "opencode-linux-x64-baseline",
+        "version": "1.19.5",
+        "bytes": 79136217,
+        "url": "https://registry.npmjs.org/opencode-linux-x64-baseline/-/opencode-linux-x64-baseline-1.19.5.tgz"
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 643168267,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode",
+    "entrypoint_bytes": 214386864,
+    "notes": [
+      "download_bytes is the sum of the npm tarballs for every package actually installed under this prefix, measured by downloading each tarball."
+    ],
+    "binary_bytes": 214386864,
+    "binary_kind": "native",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode",
+    "package_parts": [
+      "opencode-ai",
+      "opencode-linux-x64",
+      "opencode-linux-x64-baseline"
+    ]
+  },
+  "aider": {
+    "package_bytes": 377009,
+    "package_url": "aider_chat-0.86.2-py3-none-any.whl",
+    "download_bytes": 125519775,
+    "download_parts": [
+      {
+        "file": "aider_chat-0.86.2-py3-none-any.whl",
+        "bytes": 377009
+      },
+      {
+        "file": "aiohappyeyeballs-2.6.1-py3-none-any.whl",
+        "bytes": 15265
+      },
+      {
+        "file": "aiohttp-3.13.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 1755181
+      },
+      {
+        "file": "aiosignal-1.4.0-py3-none-any.whl",
+        "bytes": 7490
+      },
+      {
+        "file": "annotated_doc-0.0.4-py3-none-any.whl",
+        "bytes": 5303
+      },
+      {
+        "file": "annotated_types-0.7.0-py3-none-any.whl",
+        "bytes": 13643
+      },
+      {
+        "file": "anyio-4.12.1-py3-none-any.whl",
+        "bytes": 113592
+      },
+      {
+        "file": "asgiref-3.11.1-py3-none-any.whl",
+        "bytes": 24345
+      },
+      {
+        "file": "attrs-25.4.0-py3-none-any.whl",
+        "bytes": 67615
+      },
+      {
+        "file": "backoff-2.2.1-py3-none-any.whl",
+        "bytes": 15148
+      },
+      {
+        "file": "beautifulsoup4-4.14.3-py3-none-any.whl",
+        "bytes": 107721
+      },
+      {
+        "file": "certifi-2026.1.4-py3-none-any.whl",
+        "bytes": 152900
+      },
+      {
+        "file": "cffi-2.0.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+        "bytes": 219572
+      },
+      {
+        "file": "charset_normalizer-3.4.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 153471
+      },
+      {
+        "file": "click-8.3.1-py3-none-any.whl",
+        "bytes": 108274
+      },
+      {
+        "file": "configargparse-1.7.1-py3-none-any.whl",
+        "bytes": 25607
+      },
+      {
+        "file": "diff_match_patch-20241021-py3-none-any.whl",
+        "bytes": 43252
+      },
+      {
+        "file": "diskcache-5.6.3-py3-none-any.whl",
+        "bytes": 45550
+      },
+      {
+        "file": "distro-1.9.0-py3-none-any.whl",
+        "bytes": 20277
+      },
+      {
+        "file": "fastapi-0.128.8-py3-none-any.whl",
+        "bytes": 103630
+      },
+      {
+        "file": "fastuuid-0.14.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 278105
+      },
+      {
+        "file": "filelock-3.20.3-py3-none-any.whl",
+        "bytes": 16701
+      },
+      {
+        "file": "flake8-7.3.0-py2.py3-none-any.whl",
+        "bytes": 57922
+      },
+      {
+        "file": "frozenlist-1.8.0-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "bytes": 242411
+      },
+      {
+        "file": "fsspec-2026.2.0-py3-none-any.whl",
+        "bytes": 202505
+      },
+      {
+        "file": "gitdb-4.0.12-py3-none-any.whl",
+        "bytes": 62794
+      },
+      {
+        "file": "gitpython-3.1.46-py3-none-any.whl",
+        "bytes": 208620
+      },
+      {
+        "file": "grep_ast-0.9.0-py3-none-any.whl",
+        "bytes": 13918
+      },
+      {
+        "file": "h11-0.16.0-py3-none-any.whl",
+        "bytes": 37515
+      },
+      {
+        "file": "hf_xet-1.2.0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 3320214
+      },
+      {
+        "file": "httpcore-1.0.9-py3-none-any.whl",
+        "bytes": 78784
+      },
+      {
+        "file": "httpx-0.28.1-py3-none-any.whl",
+        "bytes": 73517
+      },
+      {
+        "file": "huggingface_hub-1.4.1-py3-none-any.whl",
+        "bytes": 553326
+      },
+      {
+        "file": "idna-3.11-py3-none-any.whl",
+        "bytes": 71008
+      },
+      {
+        "file": "importlib_metadata-7.2.1-py3-none-any.whl",
+        "bytes": 25037
+      },
+      {
+        "file": "importlib_resources-6.5.2-py3-none-any.whl",
+        "bytes": 37461
+      },
+      {
+        "file": "jinja2-3.1.6-py3-none-any.whl",
+        "bytes": 134899
+      },
+      {
+        "file": "jiter-0.13.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 360735
+      },
+      {
+        "file": "json5-0.13.0-py3-none-any.whl",
+        "bytes": 36163
+      },
+      {
+        "file": "jsonschema-4.26.0-py3-none-any.whl",
+        "bytes": 90630
+      },
+      {
+        "file": "jsonschema_specifications-2025.9.1-py3-none-any.whl",
+        "bytes": 18437
+      },
+      {
+        "file": "litellm-1.81.10-py3-none-any.whl",
+        "bytes": 14457931
+      },
+      {
+        "file": "markdown_it_py-4.0.0-py3-none-any.whl",
+        "bytes": 87321
+      },
+      {
+        "file": "markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 22947
+      },
+      {
+        "file": "mccabe-0.7.0-py2.py3-none-any.whl",
+        "bytes": 7350
+      },
+      {
+        "file": "mdurl-0.1.2-py3-none-any.whl",
+        "bytes": 9979
+      },
+      {
+        "file": "mixpanel-5.0.0-py3-none-any.whl",
+        "bytes": 23848
+      },
+      {
+        "file": "mslex-1.3.0-py3-none-any.whl",
+        "bytes": 7820
+      },
+      {
+        "file": "multidict-6.7.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 256322
+      },
+      {
+        "file": "networkx-3.4.2-py3-none-any.whl",
+        "bytes": 1723263
+      },
+      {
+        "file": "numpy-1.26.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 17950613
+      },
+      {
+        "file": "openai-2.20.0-py3-none-any.whl",
+        "bytes": 1098479
+      },
+      {
+        "file": "orjson-3.11.7-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 133440
+      },
+      {
+        "file": "oslex-0.1.3-py3-none-any.whl",
+        "bytes": 3546
+      },
+      {
+        "file": "packaging-26.0-py3-none-any.whl",
+        "bytes": 74366
+      },
+      {
+        "file": "pathspec-1.0.4-py3-none-any.whl",
+        "bytes": 55206
+      },
+      {
+        "file": "pexpect-4.9.0-py2.py3-none-any.whl",
+        "bytes": 63772
+      },
+      {
+        "file": "pillow-12.1.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 7041540
+      },
+      {
+        "file": "posthog-7.8.6-py3-none-any.whl",
+        "bytes": 194801
+      },
+      {
+        "file": "prompt_toolkit-3.0.52-py3-none-any.whl",
+        "bytes": 391431
+      },
+      {
+        "file": "propcache-0.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 221575
+      },
+      {
+        "file": "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 155560
+      },
+      {
+        "file": "ptyprocess-0.7.0-py2.py3-none-any.whl",
+        "bytes": 13993
+      },
+      {
+        "file": "pycodestyle-2.14.0-py2.py3-none-any.whl",
+        "bytes": 31594
+      },
+      {
+        "file": "pycparser-3.0-py3-none-any.whl",
+        "bytes": 48172
+      },
+      {
+        "file": "pydantic-2.12.5-py3-none-any.whl",
+        "bytes": 463580
+      },
+      {
+        "file": "pydantic_core-2.41.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 2075366
+      },
+      {
+        "file": "pydub-0.25.1-py2.py3-none-any.whl",
+        "bytes": 32327
+      },
+      {
+        "file": "pyflakes-3.4.0-py2.py3-none-any.whl",
+        "bytes": 63551
+      },
+      {
+        "file": "pygments-2.19.2-py3-none-any.whl",
+        "bytes": 1225217
+      },
+      {
+        "file": "pypandoc-1.16.2-py3-none-any.whl",
+        "bytes": 19451
+      },
+      {
+        "file": "pyperclip-1.11.0-py3-none-any.whl",
+        "bytes": 11063
+      },
+      {
+        "file": "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+        "bytes": 229892
+      },
+      {
+        "file": "python_dotenv-1.2.1-py3-none-any.whl",
+        "bytes": 21230
+      },
+      {
+        "file": "pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 807870
+      },
+      {
+        "file": "referencing-0.37.0-py3-none-any.whl",
+        "bytes": 26766
+      },
+      {
+        "file": "regex-2026.1.15-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 803589
+      },
+      {
+        "file": "requests-2.32.5-py3-none-any.whl",
+        "bytes": 64738
+      },
+      {
+        "file": "rich-14.3.2-py3-none-any.whl",
+        "bytes": 309963
+      },
+      {
+        "file": "rpds_py-0.30.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 394080
+      },
+      {
+        "file": "scipy-1.15.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 37309455
+      },
+      {
+        "file": "shellingham-1.5.4-py2.py3-none-any.whl",
+        "bytes": 9755
+      },
+      {
+        "file": "shtab-1.8.0-py3-none-any.whl",
+        "bytes": 14457
+      },
+      {
+        "file": "six-1.17.0-py2.py3-none-any.whl",
+        "bytes": 11050
+      },
+      {
+        "file": "smmap-5.0.2-py3-none-any.whl",
+        "bytes": 24303
+      },
+      {
+        "file": "sniffio-1.3.1-py3-none-any.whl",
+        "bytes": 10235
+      },
+      {
+        "file": "socksio-1.0.0-py3-none-any.whl",
+        "bytes": 12763
+      },
+      {
+        "file": "sounddevice-0.5.5-py3-none-any.whl",
+        "bytes": 32807
+      },
+      {
+        "file": "soundfile-0.13.1-py2.py3-none-manylinux_2_28_x86_64.whl",
+        "bytes": 1313646
+      },
+      {
+        "file": "soupsieve-2.8.3-py3-none-any.whl",
+        "bytes": 37016
+      },
+      {
+        "file": "starlette-0.52.1-py3-none-any.whl",
+        "bytes": 74272
+      },
+      {
+        "file": "tiktoken-0.12.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "bytes": 1152665
+      },
+      {
+        "file": "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 3274982
+      },
+      {
+        "file": "tqdm-4.67.3-py3-none-any.whl",
+        "bytes": 78374
+      },
+      {
+        "file": "tree_sitter-0.25.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 635418
+      },
+      {
+        "file": "tree_sitter_c_sharp-0.23.1-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "bytes": 358331
+      },
+      {
+        "file": "tree_sitter_embedded_template-0.25.0-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "bytes": 18268
+      },
+      {
+        "file": "tree_sitter_language_pack-0.13.0-cp310-abi3-manylinux2014_x86_64.whl",
+        "bytes": 19952029
+      },
+      {
+        "file": "tree_sitter_yaml-0.7.2-cp310-abi3-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl",
+        "bytes": 91430
+      },
+      {
+        "file": "typer-0.23.0-py3-none-any.whl",
+        "bytes": 56668
+      },
+      {
+        "file": "typer_slim-0.23.0-py3-none-any.whl",
+        "bytes": 3399
+      },
+      {
+        "file": "typing_extensions-4.15.0-py3-none-any.whl",
+        "bytes": 44614
+      },
+      {
+        "file": "typing_inspection-0.4.2-py3-none-any.whl",
+        "bytes": 14611
+      },
+      {
+        "file": "urllib3-2.6.3-py3-none-any.whl",
+        "bytes": 131584
+      },
+      {
+        "file": "watchfiles-1.1.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "bytes": 456812
+      },
+      {
+        "file": "wcwidth-0.6.0-py3-none-any.whl",
+        "bytes": 94189
+      },
+      {
+        "file": "yarl-1.22.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "bytes": 377267
+      },
+      {
+        "file": "zipp-3.23.0-py3-none-any.whl",
+        "bytes": 10276
+      }
+    ],
+    "download_unresolved": [],
+    "install_bytes": 645560252,
+    "entrypoint": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider",
+    "entrypoint_bytes": 259,
+    "notes": [
+      "package_bytes is the aider-chat wheel alone (pip download --no-deps).",
+      "download_bytes is every wheel pip download fetches for that pin, including dependencies.",
+      "install_bytes is the virtualenv on disk after pip install, including pip itself."
+    ],
+    "binary_bytes": 259,
+    "binary_kind": "script",
+    "binary_path": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider"
+  }
+}

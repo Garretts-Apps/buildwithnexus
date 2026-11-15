@@ -163,6 +163,15 @@ chunk into a 2,000-line transcript, and no terminal-size checks or
 full-screen repaints per keystroke. Every number and how to regenerate it:
 [BENCHMARKS.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md).
 
+Against other terminal coding agents, on the machine recorded in
+[bench/](bench/README.md), the native binary's warm `--version` median was
+0.557 ms and its warm `--help` median was 0.604 ms. The `bwn` command from
+npm was 21.236 ms for a warm `--version`, slower than the native binary and
+slower than Claude Code on that one metric, because the command starts Node
+first. Aider's package file is smaller than the release binary (377,009
+bytes versus 6,492,376). The comparison, including where bwn is not first,
+is on the [benchmarks page](https://buildwithnexus.dev/docs/benchmarks).
+
 ### Package history
 
 If you browse the npm version history you'll see the same name carrying

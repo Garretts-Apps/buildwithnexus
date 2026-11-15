@@ -1,0 +1,67 @@
+{
+  "tools": [
+    {
+      "id": "bwn-native",
+      "display": "bwn native",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+      "exit_code": 0,
+      "version_text": "buildwithnexus 0.21.0",
+      "expect": "buildwithnexus 0.21.0",
+      "ok": true
+    },
+    {
+      "id": "bwn-npm",
+      "display": "bwn (npm)",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn",
+      "exit_code": 0,
+      "version_text": "buildwithnexus 0.21.0",
+      "expect": "buildwithnexus 0.21.0",
+      "ok": true
+    },
+    {
+      "id": "claude",
+      "display": "Claude Code",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/claude/bin/claude",
+      "exit_code": 0,
+      "version_text": "2.1.325 (Claude Code)",
+      "expect": "2.1.325",
+      "ok": true
+    },
+    {
+      "id": "codex",
+      "display": "Codex CLI",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/codex/bin/codex",
+      "exit_code": 0,
+      "version_text": "codex-cli 0.169.0",
+      "expect": "0.169.0",
+      "ok": true
+    },
+    {
+      "id": "gemini",
+      "display": "Gemini CLI",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini",
+      "exit_code": 0,
+      "version_text": "0.68.0",
+      "expect": "0.68.0",
+      "ok": true
+    },
+    {
+      "id": "opencode",
+      "display": "OpenCode",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode",
+      "exit_code": 0,
+      "version_text": "1.19.5",
+      "expect": "1.19.5",
+      "ok": true
+    },
+    {
+      "id": "aider",
+      "display": "Aider",
+      "argv0": "/agent/repos/buildwithnexus/bench/.tools/prefixes/aider/bin/aider",
+      "exit_code": 0,
+      "version_text": "aider 0.86.2",
+      "expect": "0.86.2",
+      "ok": true
+    }
+  ]
+}
