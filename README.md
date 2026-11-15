@@ -98,15 +98,9 @@ to let it work on the current folder.
   changes.
 - **Clickable paths and links** — file paths and links are OSC 8 hyperlinks: click
   a path in an edit header and it opens in your OS default app.
-- **Inline images** — `Ctrl+V` pastes a clipboard screenshot
-  and it appears in the transcript before you send it: at real
-  pixel resolution on kitty, Ghostty and WezTerm (kitty graphics protocol,
-  Unicode placeholders — works through tmux), over Sixel on Windows
-  Terminal 1.22+, foot, mlterm and xterm, as half-block art everywhere else.
-  Previews re-fit when you resize the window. Drop a file onto the terminal and its path becomes an
-  `@attachment` with the same preview. `@clip.mp4` runs ffmpeg to sample
-  frames + metadata for vision models (text-only models get a clear "not
-  multimodal" notice instead of silent drops).
+- **Inline images** — `Ctrl+V` pastes a screenshot into the transcript
+  (kitty graphics, Sixel, or half-block art). A dropped file is an
+  `@attachment`. `@clip.mp4` samples frames with ffmpeg.
 - **Code and tables** — fenced blocks are syntax-highlighted for 20+
   languages by a zero-dependency lexer; markdown tables are drawn aligned,
   with header rules and column alignment; `---`, task lists and
@@ -163,14 +157,7 @@ chunk into a 2,000-line transcript, and no terminal-size checks or
 full-screen repaints per keystroke. Every number and how to regenerate it:
 [BENCHMARKS.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md).
 
-Against other terminal coding agents, on the machine recorded in
-[bench/](bench/README.md), the native binary's warm `--version` median was
-0.557 ms and its warm `--help` median was 0.604 ms. The `bwn` command from
-npm was 21.236 ms for a warm `--version`, slower than the native binary and
-slower than Claude Code on that one metric, because the command starts Node
-first. Aider's package file is smaller than the release binary (377,009
-bytes versus 6,492,376). The comparison, including where bwn is not first,
-is on the [benchmarks page](https://buildwithnexus.dev/docs/benchmarks).
+On one recorded run the native `--version` was 0.557 ms. npm `bwn` was 21.236 ms, slower than Claude Code, and Aider's package is smaller than the release binary. [Benchmarks](https://buildwithnexus.dev/docs/benchmarks).
 
 ### Package history
 
