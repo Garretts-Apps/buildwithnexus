@@ -399,24 +399,25 @@ def install_pip(layout: Layout, spec: dict) -> dict:
         )
         marker.write_text(want + "\n")
     wheel_dir = layout.cache / f"pip-{spec['id']}"
-    if wheel_dir.exists():
-        shutil.rmtree(wheel_dir)
-    wheel_dir.mkdir(parents=True)
     pkg_dir = wheel_dir / "package"
     all_dir = wheel_dir / "all"
-    pkg_dir.mkdir()
-    all_dir.mkdir()
-    pip = str(prefix / "bin" / "pip")
-    check(
-        [pip, "download", "--disable-pip-version-check", "--no-deps", "-d", str(pkg_dir), want],
-        timeout=180,
-        capture_output=True,
-    )
-    check(
-        [pip, "download", "--disable-pip-version-check", "-d", str(all_dir), want],
-        timeout=300,
-        capture_output=True,
-    )
+    have = pkg_dir.is_dir() and all_dir.is_dir() and any(pkg_dir.iterdir()) and any(all_dir.iterdir())
+    if not have:
+        if wheel_dir.exists():
+            shutil.rmtree(wheel_dir)
+        pkg_dir.mkdir(parents=True)
+        all_dir.mkdir(parents=True)
+        pip = str(prefix / "bin" / "pip")
+        check(
+            [pip, "download", "--disable-pip-version-check", "--no-deps", "-d", str(pkg_dir), want],
+            timeout=180,
+            capture_output=True,
+        )
+        check(
+            [pip, "download", "--disable-pip-version-check", "-d", str(all_dir), want],
+            timeout=300,
+            capture_output=True,
+        )
     pkg_files = [p for p in pkg_dir.iterdir() if p.is_file()]
     all_files = [p for p in all_dir.iterdir() if p.is_file()]
     if len(pkg_files) != 1:
