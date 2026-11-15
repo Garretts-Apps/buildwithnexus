@@ -14,11 +14,12 @@ function homeOf(env) {
 
 function nativeDir(env = process.env) {
   if (env.BWN_NATIVE_BIN) return env.BWN_NATIVE_BIN;
+  const home = env.HOME || env.USERPROFILE || os.homedir();
   if (process.platform === 'win32') {
-    const base = env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    const base = env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
     return path.join(base, 'Programs', 'bwn');
   }
-  return path.join(os.homedir(), '.local', 'bin');
+  return path.join(home, '.local', 'bin');
 }
 
 function copyNative(bin, dir) {
@@ -42,21 +43,20 @@ function looksLikeOurShim(textOrTarget) {
 }
 
 function rewriteUnixShim(shim, dest) {
-  if (!fs.existsSync(shim)) return false;
-  const st = fs.lstatSync(shim);
   let owned = false;
-  if (st.isSymbolicLink()) owned = looksLikeOurShim(fs.readlinkSync(shim));
-  else {
-    try { owned = looksLikeOurShim(fs.readFileSync(shim, 'utf8')); } catch { owned = false; }
+  try {
+    owned = looksLikeOurShim(fs.readlinkSync(shim));
+  } catch (err) {
+    if (!err || err.code !== 'EINVAL') return false;
+    try { owned = looksLikeOurShim(fs.readFileSync(shim, 'utf8')); } catch { return false; }
   }
   if (!owned) return false;
-  fs.rmSync(shim, { force: true });
+  try { fs.rmSync(shim); } catch { return false; }
   fs.symlinkSync(dest, shim);
   return true;
 }
 
 function rewriteCmd(shim, dest) {
-  if (!fs.existsSync(shim)) return false;
   let text = '';
   try { text = fs.readFileSync(shim, 'utf8'); } catch { return false; }
   if (!looksLikeOurShim(text)) return false;
@@ -104,11 +104,9 @@ function handoff(bin, env = process.env) {
   const tip = path.join(homeOf(env), 'native-handoff');
   let first = false;
   try {
-    if (!fs.existsSync(tip)) {
-      fs.mkdirSync(path.dirname(tip), { recursive: true });
-      fs.writeFileSync(tip, '1\n');
-      first = true;
-    }
+    fs.mkdirSync(path.dirname(tip), { recursive: true });
+    fs.writeFileSync(tip, '1\n', { flag: 'wx' });
+    first = true;
   } catch {}
   return { dest, rewrote, first };
 }

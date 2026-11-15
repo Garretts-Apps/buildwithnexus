@@ -7,12 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { formula, handoff } = (() => {
-  return {
-    formula: require('./update-install-manifests.js').formula,
-    handoff: null,
-  };
-})();
+const { formula } = require('./update-install-manifests.js');
 const native = require('./native-handoff.js');
 
 const WIN = process.platform === 'win32';
