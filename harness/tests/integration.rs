@@ -6600,6 +6600,83 @@ fn serve_git_dir(root: PathBuf) -> u16 {
     port
 }
 
+// Auto-commit is the agent's own git, not a sandboxed shell command, so it
+// still records a file edit while sandbox=auto.
+#[test]
+fn auto_commit_succeeds_while_the_sandbox_is_on() {
+    let home = tmp("home");
+    let cwd = git_repo();
+    git(&cwd, &["config", "user.name", "dev"]);
+    git(&cwd, &["config", "user.email", "dev@example.test"]);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "added.txt", "content": "from the agent\n"}),
+        ),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama",
+            "model": "test-model",
+            "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "auto",
+            "auto_commit": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "add a file");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("added.txt")).unwrap(),
+        "from the agent\n"
+    );
+    let subject = git(&cwd, &["log", "-1", "--format=%s"]);
+    assert!(
+        subject.contains("bwn: write_file"),
+        "auto-commit did not run outside the sandbox: {subject}"
+    );
+    let files = git(&cwd, &["show", "--name-only", "--format=", "HEAD"]);
+    assert!(files.contains("added.txt"), "{files}");
+
+    // A shell command that writes .git is still confined. Where the backend
+    // can keep .git read-only, the model is told why and how to opt out.
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "run_command",
+            json!({"command": "echo x > .git/FETCH_HEAD"}),
+        ),
+        finish("done"),
+    ]);
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama",
+            "model": "test-model",
+            "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "auto",
+            "auto_commit": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "touch fetch head");
+    let result = r.text_of("tool_result");
+    if result.contains("[exit 0]") {
+        return;
+    }
+    assert!(
+        result.contains("--sandbox off") && result.contains(".git"),
+        "sandboxed .git write did not explain the opt-out: {result}"
+    );
+}
+
 // http.cookieFile with http.saveCookies has git write the file the
 // repository names on its next fetch, so a saved `git fetch` approval
 // must ask in such a repository.

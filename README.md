@@ -731,8 +731,8 @@ An OS-level layer *under* the permission gate for shell commands
 
 Linux uses `bwrap` when it works, otherwise built-in Landlock and seccomp
 (also in WSL, when the kernel allows it). macOS uses `sandbox-exec`.
-Windows has none. Landlock cannot keep `.git` read-only inside the
-workspace; bubblewrap can, and is preferred when it is installed.
+Windows has none. Sandboxed shell commands cannot write `.git`; the tool
+result names `--sandbox off`. Auto-commit of file edits runs outside it.
 
 **Confined:** writes outside the working directory and the temp dirs. With
 bubblewrap, `/tmp` is a private tmpfs (`TMPDIR=/tmp`) discarded on exit.

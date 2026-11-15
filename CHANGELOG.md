@@ -14,6 +14,13 @@ approved. Each one has a setting and a flag that restores the 0.20 behavior.
   backend works. `"sandbox": "off"` or `--sandbox off` runs them unsandboxed,
   which was the default. A bad `sandbox` value in settings still warns and
   leaves the sandbox off, so a typo cannot lock a session.
+- **Sandboxed git writes are blocked.** A sandboxed shell command cannot
+  write `.git`, so it cannot plant a hook or a git config that would run
+  later outside the sandbox. `git fetch`, `git pull`, and `git commit` from
+  the shell fail, and the tool result says why and names `--sandbox off`.
+  bwn's own auto-commit of file edits runs outside the sandbox and still
+  succeeds while the sandbox is on. Landlock, used only when bubblewrap is
+  missing, cannot keep `.git` read-only.
 - **Linux `auto` and `require` use Landlock and seccomp when bubblewrap is
   not usable,** including in WSL when the kernel allows Landlock. Bubblewrap
   is still preferred when it works (private `/tmp`, read-only `.git`).

@@ -4112,6 +4112,12 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         };
     }
     let code = cap.code.unwrap_or(-1);
+    if code != 0 && crate::sandbox::would_confine() {
+        if let Some(note) = crate::sandbox::git_write_blocked_note(&s) {
+            s.push('\n');
+            s.push_str(note);
+        }
+    }
     s.push_str(&format!("\n[exit {code}]"));
     Outcome {
         content: truncate_head_tail_omitting(s, MAX_OUT, cap.omitted),

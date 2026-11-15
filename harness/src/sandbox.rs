@@ -662,6 +662,30 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
     }
 }
 
+/// Appended to a sandboxed command's output when it died writing `.git`.
+pub const GIT_WRITE_BLOCKED: &str = "\
+sandboxed commands cannot write .git, so a hook or git config they plant \
+cannot run later outside the sandbox. git fetch, git pull, and git commit \
+from the shell fail for that reason. bwn still commits its own file edits \
+outside the sandbox when auto_commit is on. To let this command update .git, \
+turn the sandbox off: --sandbox off, \"sandbox\": \"off\" in settings.json, \
+or /sandbox off.";
+
+/// Why a failed sandboxed command could not update `.git`, when the output
+/// says so. `None` when this does not look like that denial.
+pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
+    let l = output.to_ascii_lowercase();
+    let denied = l.contains("operation not permitted")
+        || l.contains("read-only file system")
+        || l.contains("readonly file system")
+        || l.contains("permission denied");
+    if denied && l.contains(".git") {
+        Some(GIT_WRITE_BLOCKED)
+    } else {
+        None
+    }
+}
+
 /// True when the next shell command would run confined — drives the
 /// `[sandboxed]` marker on the tool header.
 pub fn would_confine() -> bool {
@@ -769,6 +793,14 @@ mod tests {
             Decision::Sandboxed(Backend::SandboxExec)
         );
         assert_eq!(decide(Mode::Require, None), Decision::Refused);
+        let note = git_write_blocked_note(
+            "fatal: could not open '.git/FETCH_HEAD': Operation not permitted",
+        );
+        assert!(note.unwrap().contains("--sandbox off"));
+        assert!(note.unwrap().contains("auto_commit"));
+        assert!(git_write_blocked_note("Read-only file system: .git/refs/heads/main").is_some());
+        assert!(git_write_blocked_note("cargo: permission denied").is_none());
+        assert!(git_write_blocked_note("updated .git/refs/heads/main").is_none());
         assert_eq!(
             decide(Mode::Auto, Some(Backend::Landlock)),
             Decision::Sandboxed(Backend::Landlock)
