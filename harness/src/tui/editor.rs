@@ -517,7 +517,15 @@ pub const COMMANDS: &[SlashCommand] = &[
         "replace the API key, checked before it is saved",
         &[],
     ),
-    cmd(SETUP, "/doctor", &["/debug"], "", "diagnose setup", &[]),
+    cmd(SETUP, "/doctor", &[], "", "diagnose setup", &[]),
+    cmd(
+        SETUP,
+        "/debug",
+        &[],
+        "[export|pause|step|continue|replay <file>]",
+        "debug panel: agent, tools, perf (F12)",
+        &["export", "pause", "step", "continue", "replay"],
+    ),
     cmd(
         SETUP,
         "/voice",
@@ -1749,6 +1757,25 @@ pub(super) fn read_line_raw_prefill(
         };
         let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
         let alt = ev.modifiers.contains(KeyModifiers::ALT);
+        if let Some(key) = crate::debug_panel::DebugKey::from_code(ev.code) {
+            if crate::debug_panel::on_key(key) {
+                if crate::debug_panel::visible() {
+                    crate::debug_panel::mark_input();
+                }
+                render_output();
+                redraw(prompt, start, &buf, cursor, &mut scroll);
+                continue;
+            }
+        }
+        if crate::workspace::on_code(ev.code, alt) {
+            screen::with(|s| s.transcript.forget_painted());
+            render_output();
+            redraw(prompt, start, &buf, cursor, &mut scroll);
+            continue;
+        }
+        if crate::debug_panel::visible() {
+            crate::debug_panel::mark_input();
+        }
         if !(ctrl && ev.code == KeyCode::Char('c')) {
             quit_armed_at = None;
         }

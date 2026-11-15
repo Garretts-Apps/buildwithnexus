@@ -199,6 +199,7 @@ pub(super) fn numbered_plan(steps: &[String]) -> String {
 // The plan above the approval selector. The selector draws over the rows
 // just above the composer, so blank rows keep the plan in view under it.
 pub(super) fn show_plan(steps: &[String], selector_items: usize) {
+    crate::debug_panel::set_plan(steps);
     tui::line("");
     tui::line(&tui::accent("  Plan"));
     // Steps are the model's plan text.

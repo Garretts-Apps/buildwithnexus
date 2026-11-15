@@ -53,6 +53,10 @@ pub fn set_model_label(model: &str) {
     render_footer();
 }
 
+pub(crate) fn model_label() -> String {
+    screen::with(|s| s.status.model.clone())
+}
+
 /// Apply the `images` and `notify` settings keys.
 pub fn configure_ui(images: &str, notify: &str) {
     let images_mode = match images.trim().to_ascii_lowercase().as_str() {
@@ -363,9 +367,9 @@ pub use theme::{
 pub(crate) use theme::{no_color, span_paint, SpanPaint};
 
 // ── diff paint helpers ───────────────────────────────────────────────────────
-// Used by report's diff renderer: background-tinted spans in the GitHub /
-// opencode style. The bg is restored to the theme background (alt-screen) or
-// terminal default afterwards, mirroring reset_fg()'s approach.
+// Used by report's diff renderer: a background tint behind added and
+// removed spans. The bg is restored to the theme background (alt-screen)
+// or the terminal default afterwards, the same way reset_fg() works.
 
 fn reset_bg() -> String {
     if no_color() {
@@ -685,11 +689,39 @@ fn drain_typeahead() -> bool {
 // Applies one terminal event read by poll_typeahead: Ctrl-C/Esc raise the
 // interrupt flag, everything else edits the type-ahead buffer. Split out so
 // the buffering is testable without a terminal.
+pub(crate) fn paint_debug() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) || !crate::debug_panel::visible() {
+        return;
+    }
+    let _frame = render_lock();
+    let (width, height) = term_size();
+    let rows = height.saturating_sub(reserved_rows());
+    let mut out = Vec::new();
+    crate::debug_panel::append_overlay(&mut out, width, rows, false);
+    if !out.is_empty() {
+        write_frame(&out);
+    }
+}
+
 fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
     let mut raised = InterruptKind::None;
     match ev {
         Event::Key(k) => {
             if k.kind == KeyEventKind::Release {
+                return raised;
+            }
+            if let Some(key) = crate::debug_panel::DebugKey::from_code(k.code) {
+                if crate::debug_panel::on_key(key) {
+                    if crate::debug_panel::visible() {
+                        crate::debug_panel::mark_input();
+                    }
+                    render_output();
+                    return raised;
+                }
+            }
+            if crate::workspace::on_code(k.code, k.modifiers.contains(KeyModifiers::ALT)) {
+                screen::with(|s| s.transcript.forget_painted());
+                render_output();
                 return raised;
             }
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1158,11 +1190,11 @@ fn term_size() -> (u16, u16) {
     }
 }
 
-// Alt-screen bottom chrome: a 3-row bordered composer box plus the footer.
-//   h-4  ╭───────────────────╮   composer_top()
-//   h-3  │ › input text      │   composer_row()
-//   h-2  ╰───────────────────╯   composer_bottom()
-//   h-1  permission: ask · …     footer_row()
+// Alt-screen bottom chrome: a hairline, the input row, a hairline, the footer.
+//   h-4  ───────────────   composer_top()
+//   h-3    input text      composer_row()
+//   h-2  ───────────────   composer_bottom()
+//   h-1  ASK               footer_row()
 // Queued messages stack directly above the box.
 fn reserved_rows() -> u16 {
     let q_len = screen::with(|s| s.composer.queue.len()) as u16;
@@ -1665,9 +1697,6 @@ fn eat_escape(chars: &mut std::iter::Peekable<std::str::Chars>, mut out: Option<
     }
 }
 
-/// The braille spinner every progress indicator cycles through.
-pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars().peekable();
@@ -1880,8 +1909,8 @@ fn clear_composer() {
 fn queue_composer_borders(out: &mut impl Write) {
     let (width, _) = term_size();
     let w = width as usize;
-    let top = format!("╭{}╮", "─".repeat(w.saturating_sub(2)));
-    let bottom = format!("╰{}╯", "─".repeat(w.saturating_sub(2)));
+    let top = "─".repeat(w);
+    let bottom = "─".repeat(w);
     let _ = queue!(
         out,
         MoveTo(0, composer_top()),
@@ -1904,7 +1933,7 @@ fn queue_composer_row_start(out: &mut impl Write) {
         MoveTo(0, composer_row()),
         Clear(ClearType::CurrentLine)
     );
-    let _ = write!(out, "{} ", dim("│"));
+    let _ = write!(out, "  ");
 }
 
 // Draw the composer box borders and return with the cursor ready at the
@@ -1916,11 +1945,7 @@ fn queue_composer_box(out: &mut impl Write) {
 
 // Close the input row with the right-hand border, clipping anything that
 // would collide with it.
-fn queue_composer_right_border(out: &mut impl Write) {
-    let (width, _) = term_size();
-    let _ = queue!(out, MoveTo(width.saturating_sub(1), composer_row()));
-    let _ = write!(out, "{}", dim("│"));
-}
+fn queue_composer_right_border(_out: &mut impl Write) {}
 
 // The chrome around the input row — the box borders and the footer — queued
 // only where it differs from what was last painted: typing a character
@@ -1966,62 +1991,52 @@ fn queue_footer(out: &mut impl Write) {
         format!("{} ", dim(&model))
     };
     let base_text = if is_agent_running() {
-        // Live readout: braille spinner, elapsed, streamed tokens/s.
+        // Live readout: a still word and the elapsed clock.
         let elapsed_ms = now_ms().saturating_sub(started).max(1);
         let secs = elapsed_ms / 1000;
-        let frames = SPINNER_FRAMES;
-        let frame = frames[((elapsed_ms / 100) % frames.len() as u64) as usize];
         let chars = STREAM_CHARS.load(Ordering::Relaxed);
         let tps = if chars > 0 && elapsed_ms >= 500 {
             format!(
-                " · {:.0} tok/s",
+                "  {:.0}/s",
                 (chars as f64 / 4.0) / (elapsed_ms as f64 / 1000.0)
             )
         } else {
             String::new()
         };
         let clock = if secs >= 60 {
-            format!("{}m {:02}s", secs / 60, secs % 60)
+            format!("{}m{:02}s", secs / 60, secs % 60)
         } else {
             format!("{secs}s")
         };
+        // A still word. The seconds count is the motion, and only because
+        // the elapsed time changed.
         format!(
-            "{}{} {} {}",
+            "{}{}  {}{}",
             model_badge,
-            accent(frame),
-            bold("working"),
-            dim(&format!("· {clock}{tps} · Esc to interrupt"))
+            bold("WORK"),
+            dim(&clock),
+            dim(&tps)
         )
     } else if footer.is_empty() {
-        format!(
-            "{}{} {} {}",
-            model_badge,
-            dim("permission:"),
-            bold("ask"),
-            dim("· /permissions · wheel/PgUp · /mouse")
-        )
+        format!("{}{}", model_badge, bold("ASK"))
     } else {
         format!("{model_badge}{footer}")
     };
 
     let ctx_badge = if let Some(raw_pct) = (used * 100).checked_div(total) {
         let pct = raw_pct.min(100);
-        let bar_width = 8usize;
-        let filled = (pct * bar_width / 100).min(bar_width);
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-        let colored_bar = if pct >= 80 {
-            red(&bar)
+        let tone = if pct >= 80 {
+            red(&format!("{pct}%"))
         } else if pct >= 60 {
-            yellow(&bar)
+            yellow(&format!("{pct}%"))
         } else {
-            green(&bar)
+            dim(&format!("{pct}%"))
         };
         format!(
-            " {} [{}] {}",
-            dim("ctx:"),
-            colored_bar,
+            "  {} {tone} {}",
+            dim("CTX"),
             dim(&format!(
-                "{pct}% {}/{}",
+                "{}/{}",
                 crate::provider::short_tokens(used),
                 crate::provider::short_tokens(total)
             ))
@@ -2193,12 +2208,7 @@ pub fn cursor_show() {
 }
 
 pub fn set_permission_mode(mode: &str) {
-    let footer = format!(
-        "{} {} {}",
-        dim("permission:"),
-        bold(mode),
-        dim("· /permissions · wheel/PgUp · drag-copy · /mouse")
-    );
+    let footer = format!("{}  {}", bold(&mode.to_ascii_uppercase()), dim("F12 debug"));
     screen::with(|s| s.status.footer = footer);
     render_footer();
 }
@@ -2220,6 +2230,7 @@ fn build_output_frame(
     (width, height): (usize, usize),
     rows: usize,
     bg: &str,
+    origin_x: u16,
 ) -> (Vec<Placement>, Vec<Placement>, bool) {
     let sel = s.selection.current;
     let drawn_over = std::mem::replace(&mut s.images.dirty, false);
@@ -2297,7 +2308,7 @@ fn build_output_frame(
         if !full && !under_image && painted[row] == buf {
             continue;
         }
-        let _ = queue!(out, MoveTo(0, row as u16));
+        let _ = queue!(out, MoveTo(origin_x, row as u16));
         out.extend_from_slice(buf.as_bytes());
         visible_rows[row] = match line {
             Some(line) if !image_row => plain.unwrap_or_else(|| strip_ansi(line)),
@@ -2326,6 +2337,8 @@ fn render_output() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    // Hidden panel: one atomic load, then nothing else from the debugger.
+    let _watch = crate::debug_panel::FrameWatch::start();
     // Cleared before the transcript is read: a line landing from here on
     // asks for its own frame.
     OUTPUT_DIRTY.store(false, Ordering::Relaxed);
@@ -2333,8 +2346,10 @@ fn render_output() {
     // Keep the scroll region matched to the current reserved rows before we
     // repaint — a just-queued prompt must not be scrolled over.
     let region_moved = ensure_output_region();
-    let (width, height) = term_size();
-    let width = width as usize;
+    let (term_w, height) = term_size();
+    let (origin_x, content_w) = crate::workspace::content_box(term_w);
+    let cover = crate::workspace::covers_output(term_w);
+    let width = if cover { 0 } else { content_w as usize };
     let rows = height.saturating_sub(reserved_rows()) as usize;
     let mut out: Vec<u8> = Vec::with_capacity(256);
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
@@ -2350,8 +2365,13 @@ fn render_output() {
     let bg = reset_all();
     // The frame is built from the transcript under the screen lock; nothing
     // in here writes to the terminal or takes the lock again.
-    let (placements, kept, full) =
-        screen::with(|s| build_output_frame(s, &mut out, (width, height as usize), rows, &bg));
+    let (placements, kept, full) = if cover {
+        (Vec::new(), Vec::new(), true)
+    } else {
+        screen::with(|s| {
+            build_output_frame(s, &mut out, (width, height as usize), rows, &bg, origin_x)
+        })
+    };
     // Drawing a Sixel leaves the cursor on the row below the image; with the
     // scroll region's bottom margin there, the terminal would scroll the
     // transcript. The margins are lifted while images are drawn: the rows
@@ -2379,6 +2399,9 @@ fn render_output() {
     }
     drop(redraw);
     screen::with(|s| s.images.drawn = placements);
+    let transcript_wrote = out.len() > head;
+    crate::workspace::append_overlay(&mut out, term_w, rows as u16, transcript_wrote);
+    crate::debug_panel::append_overlay(&mut out, term_w, rows as u16, transcript_wrote);
     if out.len() > head {
         let _ = write!(out, "\x1b8\x1b[?2026l");
         write_frame(&out);
@@ -2765,6 +2788,9 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     queue_composer_row(&mut out, prompt, buf, cursor, scroll);
     COMPOSER_PAINTED.store(false, Ordering::Relaxed);
     write_frame(&out);
+    if crate::debug_panel::visible() {
+        crate::debug_panel::mark_paint();
+    }
 }
 
 fn echo_submitted(prompt: &str, text: &str) {
@@ -2778,35 +2804,12 @@ fn echo_submitted(prompt: &str, text: &str) {
     }
 }
 
-// ── startup banner ───────────────────────────────────────────────────────────
-// Gradient wordmark: each letter of "buildwithnexus" shifts across purple→cyan→green.
+// The name is one weight. The four palette stops exist so older callers
+// still compile; they are the same color, and this function does not blend them.
 fn wordmark() -> String {
-    if no_color() {
-        return "buildwithnexus".to_string();
-    }
-    // Gradient across the theme's stops (a blue ramp, deep → pale). The
-    // 16-colour theme has no ramp to blend: each letter takes its stop.
-    let stops = pal().wordmark;
-    let word = "buildwithnexus";
-    let n = word.len();
-    word.chars()
-        .enumerate()
-        .map(|(i, c)| {
-            let t = i as f32 / (n - 1) as f32;
-            let seg = (t * (stops.len() - 1) as f32) as usize;
-            let seg = seg.min(stops.len() - 2);
-            let local = t * (stops.len() - 1) as f32 - seg as f32;
-            let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * local) as u8;
-            let col = match (stops[seg], stops[seg + 1]) {
-                (Col::Rgb(r1, g1, b1), Col::Rgb(r2, g2, b2)) => {
-                    Col::Rgb(lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
-                }
-                (a, _) => a,
-            };
-            paint(col, &c.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    // One stop, not a blend. The other three stops are the same color so a
+    // reader of the palette cannot mistake the name for a gradient.
+    paint(pal().wordmark[0], "BUILDWITHNEXUS")
 }
 
 // Print a rich full-screen-style header that establishes visual context without
@@ -2816,15 +2819,16 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
     let w = term_size().0 as usize;
 
     line("");
-    // Wordmark row — gradient "buildwithnexus" + version.
+    // One weight, then a hairline of fixed length so a narrower column
+    // cannot wrap it into a stack of rules.
     line(&ellipsize_ansi_line(
-        &format!("  {}  {}", bold(&wordmark()), dim(crate::VERSION),),
+        &format!("  {}  {}", bold(&wordmark()), dim(crate::VERSION)),
         w,
     ));
-    line(&dim(&format!("  {}", "─".repeat(w.saturating_sub(4)))));
+    line(&dim("  ────────────────"));
     // Aligned key/value context rows: dim keys, plain values.
     line(&ellipsize_ansi_line(
-        &format!("  {}  {provider} · {model}", dim("model")),
+        &format!("  {}{provider}  {model}", dim(&format!("{:<6}", "MODEL"))),
         w,
     ));
     // The folder name comes from whoever made the checkout.
@@ -2843,21 +2847,20 @@ pub fn show_banner(provider: &str, model: &str, mode: &str, cwd: &str) {
         cwd.to_string()
     };
     line(&ellipsize_ansi_line(
-        &format!("  {}    {}", dim("cwd"), dim(&cwd_label)),
+        &format!("  {}{}", dim(&format!("{:<6}", "DIR")), dim(&cwd_label)),
         w,
     ));
     line(&banner_mode_row(mode, w));
     line("");
 }
 
+fn is_mode_row(line: &str) -> bool {
+    strip_ansi(line).split_whitespace().next() == Some("MODE")
+}
+
 fn banner_mode_row(mode: &str, width: usize) -> String {
     ellipsize_ansi_line(
-        &format!(
-            "  {}   {}   {}",
-            dim("mode"),
-            mode_badge(mode),
-            dim("Shift+Tab cycle · /help commands"),
-        ),
+        &format!("  {}{}", dim(&format!("{:<6}", "MODE")), mode_badge(mode)),
         width,
     )
 }
@@ -2868,14 +2871,12 @@ fn refresh_banner_mode(mode: &str) {
     }
     let width = term_size().0 as usize;
     let row = banner_mode_row(mode, width);
-    // "Shift+Tab cycle" is unique to the banner's mode row (the REPL hint
-    // line says "Shift+Tab to change mode").
+    // The banner's mode row is the line whose first word is MODE.
+    // MODEL shares those four letters, so a prefix check would repaint
+    // the model row and leave the old mode badge behind.
     screen::with(|s| {
         let t = &mut s.transcript.text;
-        let idx = t
-            .lines
-            .iter()
-            .position(|l| strip_ansi(l).contains("Shift+Tab cycle"));
+        let idx = t.lines.iter().position(|l| is_mode_row(l));
         if let Some(i) = idx {
             t.set(i, row);
         }
@@ -3709,6 +3710,10 @@ fn start_typeahead_thread() {
     STARTED.get_or_init(|| {
         std::thread::spawn(|| loop {
             paint_if_due();
+            if crate::debug_panel::visible() {
+                crate::debug_panel::sample_host();
+                paint_debug();
+            }
             if is_raw() && is_agent_running() {
                 poll_typeahead();
                 // Elapsed-time / tokens-per-second readout: repaint the
@@ -4371,7 +4376,28 @@ mod theme_tests {
         let dark_bg = DARK.background.unwrap();
         assert!(contrast(DARK.text, dark_bg) >= 4.5);
         assert!(contrast(DARK.muted, dark_bg) >= 4.5);
+        assert!(contrast(DARK.accent, dark_bg) >= 4.5);
+        assert!(contrast(DARK.error, dark_bg) >= 4.5);
+        assert!(contrast(DARK.warning, dark_bg) >= 4.5);
+        assert!(contrast(DARK.success, dark_bg) >= 4.5);
+        assert!(contrast(DARK.info, dark_bg) >= 4.5);
         assert!(LIGHT.background.is_none() && ANSI.background.is_none());
+    }
+
+    #[test]
+    fn notch_chrome_is_a_hairline_and_a_word() {
+        assert_eq!(strip_ansi(&wordmark()), "BUILDWITHNEXUS");
+        let row = strip_ansi(&banner_mode_row("plan", 80));
+        assert!(row.trim_start().starts_with("MODE"), "{row}");
+        assert!(is_mode_row(&banner_mode_row("plan", 80)));
+        assert!(!is_mode_row("  MODEL  llama.cpp  demo"));
+        assert!(!row.contains('╭'));
+        let mut buf = Vec::new();
+        queue_composer_borders(&mut buf);
+        let plain = strip_ansi(&String::from_utf8_lossy(&buf));
+        assert!(plain.contains('─'), "{plain}");
+        assert!(!plain.contains('╭') && !plain.contains('╰') && !plain.contains('│'));
+        assert!(!plain.contains('⠋'));
     }
 
     #[test]
@@ -5046,35 +5072,24 @@ pub fn spinner_start(label: &str) -> Spinner {
     let r2 = running.clone();
     let label = label.to_string();
     let handle = thread::spawn(move || {
-        let frames = SPINNER_FRAMES;
         let started = std::time::Instant::now();
-        let mut i = 0usize;
         while r2.load(Ordering::Relaxed) {
+            let clock = format!("{}s", started.elapsed().as_secs());
             if ALT_SCREEN.load(Ordering::Relaxed) {
                 let _frame = render_lock();
                 COMPOSER_PAINTED.store(false, Ordering::Relaxed);
                 let mut out = io::stdout();
                 let _ = execute!(out, SavePosition);
                 queue_composer_box(&mut out);
-                let _ = write!(
-                    out,
-                    "{} {} {}",
-                    accent(frames[i % frames.len()]),
-                    dim(&label),
-                    dim(&format!(
-                        "· {}s · Esc to interrupt",
-                        started.elapsed().as_secs()
-                    ))
-                );
+                let _ = write!(out, "{}  {}  {}", bold("WORK"), dim(&label), dim(&clock));
                 queue_composer_right_border(&mut out);
                 let _ = execute!(out, RestorePosition);
                 let _ = out.flush();
             } else if !line_mode() {
-                print!("\r{} {}", accent(frames[i % frames.len()]), dim(&label));
+                print!("\r{}  {}", bold("WORK"), dim(&label));
                 flush();
             }
-            i += 1;
-            for _ in 0..8 {
+            for _ in 0..20 {
                 if !r2.load(Ordering::Relaxed) {
                     break;
                 }

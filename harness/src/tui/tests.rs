@@ -1307,7 +1307,7 @@ fn frame_screen(width: usize, height: usize) -> screen::Screen {
 // (1-based, as addressed) it repainted.
 fn frame(s: &mut screen::Screen, width: usize, rows: usize) -> (String, Vec<usize>, bool) {
     let mut out = Vec::new();
-    let (placements, _kept, full) = build_output_frame(s, &mut out, (width, 10), rows, "");
+    let (placements, _kept, full) = build_output_frame(s, &mut out, (width, 10), rows, "", 0);
     s.images.drawn = placements;
     let text = String::from_utf8(out).unwrap();
     let painted = text
@@ -1675,7 +1675,7 @@ fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
     s.transcript.push_lines("\x1b[31mred, never closed\nplain");
     let paint = |s: &mut screen::Screen, row_start: &str| {
         let mut out = Vec::new();
-        build_output_frame(s, &mut out, (20, 10), 3, row_start);
+        build_output_frame(s, &mut out, (20, 10), 3, row_start, 0);
         String::from_utf8(out).unwrap()
     };
     let first = paint(&mut s, "\x1b[0m");

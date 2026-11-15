@@ -532,11 +532,14 @@ fn confirm_call(
     tool_key: &str,
     cwd: &Path,
 ) -> Option<String> {
-    match hooks::permission_request(name, input, label, cwd) {
+    let watching = crate::debug_panel::enter_permission(label);
+    let decided = match hooks::permission_request(name, input, label, cwd) {
         PreDecision::Allow => None,
         PreDecision::Deny(r) => Some(r),
         PreDecision::Continue => confirm_tool(label, tool_key, cwd),
-    }
+    };
+    crate::debug_panel::leave_permission(watching);
+    decided
 }
 
 /// A question for the person at the other end of `bwn acp`, asked in their
@@ -651,7 +654,7 @@ fn confirm_with(
     if !report::header_is_just_above(label) {
         tui::line(&format!(
             "  {} {}",
-            tui::yellow("➤"),
+            tui::accent("⌞"),
             tui::bold(&tui::sanitize_terminal(label))
         ));
     }
@@ -664,9 +667,9 @@ fn confirm_with(
         format!(" `{shown_key}`")
     };
     tui::line(&tui::dim(&format!(
-        "    y yes · n no · s allow{scope} this session · a always in this project · d <reason> deny"
+        "  Y yes   N no   S allow{scope} this session   A always   D deny"
     )));
-    let q = format!("  {} ", tui::yellow("allow?"));
+    let q = format!("  {} ", tui::accent("ASK"));
     let Some(ans) = ask(&q) else {
         // Esc or Ctrl+C: refuse this call and stop the turn, instead of
         // handing the refusal back to the model to try something else.
@@ -1378,7 +1381,7 @@ fn gate_after_hook(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
-    match decision {
+    let reason = match decision {
         PreDecision::Deny(r) => Some(r),
         // A hook's allow skips the prompts, never a deny rule.
         PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => {
@@ -1392,7 +1395,11 @@ fn gate_after_hook(
             )
         }
         _ => gate(perm, name, input, cwd),
+    };
+    if crate::debug_panel::armed() {
+        crate::debug_panel::permission(name, reason.as_deref());
     }
+    reason
 }
 
 // Public compact helper for the /compact REPL command.
@@ -1881,6 +1888,7 @@ fn build_turn(
     if depth == 0 && !continuing {
         checkpoint::mark_turn_start();
         report::mark_turn_denials();
+        crate::debug_panel::begin_turn();
     }
     let task = match hooks::user_prompt_submit(task, cwd) {
         _ if continuing => task.to_string(),

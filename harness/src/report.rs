@@ -191,6 +191,11 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         return;
     }
     take_held_preview();
+    crate::workspace::note_pending(
+        name,
+        input,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
     // `finish` and `exit_plan` are internal control signals — don't double up with a header line.
     if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
@@ -203,9 +208,9 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "webfetch" | "websearch" | "fetch_url" | "web_search"
         | "headless_browser" | "list_servers" | "read_server_log" | "wait_for_url"
-        | "list_python_tools" => ("◈", tui::cyan(preview)),
+        | "list_python_tools" => ("RD", tui::accent(preview)),
         "write" | "write_file" | "edit" | "edit_file" | "patch" | "apply_patch" => {
-            ("✦", tui::yellow(preview))
+            ("WR", tui::yellow(preview))
         }
         // The .docx path is an OSC 8 file:// link — click opens the document
         // in Word / the OS default app on supporting terminals.
@@ -221,16 +226,16 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         ),
         // The OS sandbox (sandbox.rs) confines this one — say so on the header.
         "bash" | "run_command" if crate::sandbox::would_confine() => (
-            "⚡",
-            format!("{} {}", tui::blue(preview), tui::dim("[sandboxed]")),
+            "SH",
+            format!("{} {}", tui::accent(preview), tui::dim("sandboxed")),
         ),
         "bash" | "run_command" | "python_tool" | "start_server" | "stop_server" => {
-            ("⚡", tui::blue(preview))
+            ("SH", tui::accent(preview))
         }
-        "open_browser" => ("↗", tui::accent(preview)),
-        "task" | "spawn_subagent" => ("❖", tui::accent(preview)),
-        "question" => ("?", tui::yellow(preview)),
-        _ => ("•", tui::dim(preview)),
+        "open_browser" => ("GO", tui::accent(preview)),
+        "task" | "spawn_subagent" => ("GO", tui::accent(preview)),
+        "question" => ("ASK", tui::yellow(preview)),
+        _ => ("--", tui::dim(preview)),
     };
     tui::line(&format!("  {} {}", tui::accent(icon), head));
     LAST_HEADER.set(Some(preview.to_string()));
@@ -779,6 +784,7 @@ pub fn finish(summary: &str) {
 // orchestrator can see what will run before execution starts. Human mode
 // already renders the numbered plan.
 pub fn plan(steps: &[String]) {
+    crate::debug_panel::set_plan(steps);
     if mode() == Mode::Json {
         emit(json!({"type": "plan", "steps": steps}));
     }

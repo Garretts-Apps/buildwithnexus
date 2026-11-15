@@ -5,9 +5,12 @@
 
 An **agentic AI CLI** written in Rust. The native binary starts in about 1 ms (`--version`, [measured](https://github.com/Garretts-Apps/buildwithnexus/blob/main/BENCHMARKS.md)). Remote models via
 API key, or local models on your machine. It plans, edits files, and runs
-commands. By default it asks before each change. It ships as one self-contained binary with
-10 dependencies. The terminal UI has live autocomplete, inline diffs,
-clickable files and links, and image paste.
+commands. By default it asks before each change; accept-edits, auto and
+readonly modes let you choose. It ships as one self-contained binary with
+10 direct dependencies. The terminal UI has live autocomplete, clickable files and links, and image paste.
+**F12** or `/debug` opens the debug panel. F8 breaks, F10 steps,
+F5 continues. **F2** tree, **F3** diff, **F4** jump, **F6** pane.
+`bwn debug export` and `bwn debug replay`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Garretts-Apps/buildwithnexus/main/scripts/install.sh | sh

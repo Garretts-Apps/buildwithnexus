@@ -33,10 +33,20 @@ pub(super) fn repl(
         mode_name,
         &cwd.display().to_string(),
     );
-    tui::line(&tui::dim(
-        "  describe a task · /help for all commands · !<cmd> for shell · Shift+Tab to change mode",
-    ));
-    tui::line(&tui::dim(&format!("  {}", startup_tip())));
+    tui::line(&tui::dim("  task   /help   !shell   Shift+Tab mode"));
+    let cols = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let room = cols.saturating_sub(2);
+    let tip = startup_tip();
+    let tip = if tip.chars().count() <= room {
+        tip.to_string()
+    } else {
+        let mut cut: String = tip.chars().take(room.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    };
+    tui::line(&tui::dim(&format!("  {tip}")));
     // Skill names and paths come from files in the checkout.
     for note in config::startup_context_notices(cwd) {
         let note = tui::sanitize_terminal(&note);
@@ -287,6 +297,17 @@ pub(super) fn repl(
             continue;
         }
 
+        // /debug export|pause|step|continue|replay — the panel itself is F12.
+        if let Some(arg) = t.strip_prefix("/debug ") {
+            crate::debug_panel::note_session(
+                &provider.protocol.to_string(),
+                &provider.model,
+                provider.context_tokens,
+            );
+            crate::debug_panel::command(arg.trim());
+            continue;
+        }
+
         // /mouse or /scroll on|off — wheel transcript scrolling is on by
         // default; off restores terminal-native text selection.
         if let Some(mouse_arg) = t.strip_prefix("/mouse ") {
@@ -532,8 +553,17 @@ pub(super) fn repl(
                 handle_workflows();
                 continue;
             }
-            "/doctor" | "/debug" => {
+            "/doctor" => {
                 handle_doctor_tui(&provider);
+                continue;
+            }
+            "/debug" => {
+                crate::debug_panel::note_session(
+                    &provider.protocol.to_string(),
+                    &provider.model,
+                    provider.context_tokens,
+                );
+                crate::debug_panel::command("");
                 continue;
             }
             "/diff" => {

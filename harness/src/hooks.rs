@@ -3066,6 +3066,9 @@ fn fire(event: &str, about: Option<(&str, &str)>, cwd: &Path, extra: Value) {
     }
     let payload = with_fields(base_payload(event, cwd), extra);
     for s in &cmds {
+        if crate::debug_panel::armed() {
+            crate::debug_panel::hook_fired(event, &cmd_label(&s.cmd));
+        }
         if let Some(run) = run_selected(event, about, s, &payload, cwd) {
             report_problem(event, s.source, &s.cmd, &run);
         }
