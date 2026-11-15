@@ -994,6 +994,33 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
     return {"ok": False, "status": "skipped", "reason": f"No mock invocation is defined for {cmd['id']}."}
 
 
+def program_elf(root: Path, names: set[str]) -> tuple[int, str] | None:
+    """Largest ELF in `root` whose file name is one of `names` (or that name plus .exe)."""
+    best: tuple[int, str] | None = None
+    if not root.is_dir():
+        return None
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+        for name in filenames:
+            stem = name[:-4] if name.endswith(".exe") else name
+            if name not in names and stem not in names:
+                continue
+            fp = Path(dirpath) / name
+            if fp.is_symlink():
+                continue
+            try:
+                with fp.open("rb") as fh:
+                    magic = fh.read(4)
+                if magic != b"\x7fELF":
+                    continue
+                size = fp.stat().st_size
+            except OSError:
+                continue
+            if best is None or size > best[0]:
+                best = (size, str(fp))
+    return best
+
+
 def size_row(cmd: dict, installs: dict) -> dict:
     inst = installs[cmd["install"]]
     sizes = dict(inst["sizes"])
@@ -1017,14 +1044,38 @@ def size_row(cmd: dict, installs: dict) -> dict:
             "entrypoint": inst.get("native_binary"),
             "entrypoint_bytes": native,
             "binary_bytes": native,
+            "binary_kind": "native",
+            "binary_path": inst.get("native_binary"),
             "notes": [
                 "This row is the release binary invoked directly (the cargo-install / prebuilt entry), not the npm launcher.",
                 "download_bytes is the GitHub release asset. cargo install builds from source instead of downloading this file; the asset is what the npm launcher downloads on first run.",
             ],
         }
     else:
-        sizes["binary_bytes"] = native or sizes.get("entrypoint_bytes")
-    sizes["binary_bytes"] = sizes.get("binary_bytes")
+        want = {cmd["bin"]} if cmd.get("bin") else set()
+        if cmd["install"] == "bwn":
+            want.add("buildwithnexus")
+        elf = program_elf(Path(inst["prefix"]), want)
+        if native:
+            sizes["binary_bytes"] = native
+            sizes["binary_kind"] = "native"
+            sizes["binary_path"] = inst.get("native_binary")
+        elif elf:
+            sizes["binary_bytes"] = elf[0]
+            sizes["binary_kind"] = "native"
+            sizes["binary_path"] = elf[1]
+        else:
+            sizes["binary_bytes"] = sizes.get("entrypoint_bytes")
+            sizes["binary_kind"] = "script"
+            sizes["binary_path"] = sizes.get("entrypoint")
+        if inst.get("manager") == "npm":
+            # The top-level npm tarball is often a stub. The package is that
+            # tarball plus the platform package npm installs for it.
+            key = inst["package"].split("/")[-1].split("-")[0]
+            own = [p for p in sizes.get("download_parts") or [] if key in (p.get("package") or "")]
+            if own:
+                sizes["package_bytes"] = sum(p["bytes"] for p in own)
+                sizes["package_parts"] = [p.get("package") for p in own]
     return sizes
 
 
@@ -1048,7 +1099,9 @@ def rankings(summary_tools: dict) -> dict:
         "memory_median_kib": lambda t: (t.get("memory") or {}).get("median_kib"),
         "install_bytes": lambda t: (t.get("sizes") or {}).get("install_bytes"),
         "download_bytes": lambda t: (t.get("sizes") or {}).get("download_bytes"),
-        "binary_bytes": lambda t: (t.get("sizes") or {}).get("binary_bytes"),
+        "binary_bytes": lambda t: (t.get("sizes") or {}).get("binary_bytes")
+        if (t.get("sizes") or {}).get("binary_kind") == "native"
+        else None,
         "package_bytes": lambda t: (t.get("sizes") or {}).get("package_bytes"),
         "prompt_median_s": lambda t: (t.get("prompt") or {}).get("median_s") if (t.get("prompt") or {}).get("ok") else None,
         "task_median_s": lambda t: (t.get("task") or {}).get("median_s") if (t.get("task") or {}).get("ok") else None,
@@ -1105,7 +1158,7 @@ def render_summary_md(summary: dict) -> str:
                 rss=num(mem.get("median_kib")),
                 inst=num(sz.get("install_bytes")),
                 down=num(sz.get("download_bytes")),
-                bin=num(sz.get("binary_bytes")),
+                bin=(num(sz.get("binary_bytes")) + (" script" if sz.get("binary_kind") == "script" else "")),
             )
         )
     lines.append("")
@@ -1207,7 +1260,7 @@ def execute(results: Path, only: set[str] | None = None) -> dict:
         "methodology": {
             "startup": "hyperfine --shell=none, 3 warmup runs then 20 measured runs (warm), or 20 measured runs each prepared with sync and echo 3 > /proc/sys/vm/drop_caches (cold). Mean, median and stddev are hyperfine's. One untimed --version primes each tool's empty HOME before the timed runs.",
             "memory": "/usr/bin/time -v on --version, 5 runs, median of Maximum resident set size (kbytes). Top-level process only.",
-            "sizes": "download_bytes are files this run fetched (npm tarballs, the GitHub release asset, pip wheels). install_bytes is the byte size of the installed tree. package_bytes is the published package artifact. binary_bytes is the native executable when the tool has one, else the entrypoint script.",
+            "sizes": "download_bytes are files this run fetched (npm tarballs, the GitHub release asset, pip wheels). install_bytes is the byte size of the installed tree. package_bytes is the tool's own published artifacts (top-level package plus its platform package, or the aider wheel alone), not third-party dependencies. binary_bytes is the native ELF the command runs. A tool with only a script entrypoint is marked binary_kind=script and is left out of the native-binary ranking.",
             "prompt": "PTY 80x24. Timed only when a pinned transcript pattern appears. bwn is given a settings file so it does not stop in onboarding, with auto-update off.",
             "task": "Local mock OpenAI server (bench/mock_openai.py) returns BENCHMARK_OK for chat completions and the Responses API. Tools that cannot be pointed at that protocol are skipped. Each published time exited 0 and printed BENCHMARK_OK.",
             "environment": "Clean HOME per tool, no API keys except the dummy key used for the mock. PATH starts with that tool's install prefix.",

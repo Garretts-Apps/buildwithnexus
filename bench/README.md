@@ -19,7 +19,7 @@ number out.
 | Download size | the bytes of each npm tarball, the GitHub release asset, or the pip wheels this run actually downloaded | |
 | Install size | byte size of the installed tree | |
 | Package size | the published package artifact (npm tarball, release binary, or the aider wheel alone) | |
-| Binary size | the native executable, or the entry script when there is no native executable | |
+| Binary size | the native executable the command runs. A Python or JavaScript entry script is recorded as a script and is not ranked against native binaries | |
 | Ready prompt | a PTY, only when `pins.json` has a transcript pattern that this tool actually prints | 5 |
 | Fixed task | a local OpenAI-compatible mock (`mock_openai.py`) that replies `BENCHMARK_OK` | 5 |
 
