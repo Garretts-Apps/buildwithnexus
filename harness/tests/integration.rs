@@ -154,11 +154,16 @@ fn text(reply: &str) -> String {
 
 // ── harness: write config, run the binary, parse events ─────────────────────
 fn write_config(home: &Path, provider: &str, permission: &str, port: u16) {
+    // sandbox off and auto_commit off: these tests drive the model loop.
+    // The 0.21 defaults would confine shell commands (so git cannot write
+    // .git) and commit file edits before a later step can review them.
     let cfg = json!({
         "provider": provider,
         "model": "test-model",
         "permission": permission,
         "base_url": format!("http://127.0.0.1:{port}/v1"),
+        "sandbox": "off",
+        "auto_commit": false,
     });
     std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
 }

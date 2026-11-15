@@ -330,6 +330,11 @@ jobs:
           echo seed > README
           git add README
           git commit -qm seed
+          # 0.21 commits file edits and sandboxes shell commands. This job
+          # checks the action's outcomes, and the review step needs the
+          # file the first run writes to still be uncommitted.
+          mkdir -p "$RUNNER_TEMP/nexus-home"
+          printf '%s\n' '{"auto_commit":false,"sandbox":"off"}' > "$RUNNER_TEMP/nexus-home/settings.json"
 
       - name: Run the action (a change, in auto)
         id: change

@@ -364,17 +364,19 @@ mod tests {
         if available().is_err() {
             return;
         }
-        // An absolute path that is not under /tmp (a writable root) and does
-        // not follow another test's set_current_dir. A sibling of the
-        // workspace must stay unwritable.
-        let base = PathBuf::from("/agent/repos/buildwithnexus/target").join(format!(
-            "bwn-landlock-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Under the crate's target dir, not /tmp (a writable root) and not
+        // a path that only exists on one machine. A sibling of the workspace
+        // must stay unwritable.
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "bwn-landlock-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let dir = base.join("ws");
         let outside = base.join("out.txt");
         let _ = std::fs::remove_dir_all(&base);
