@@ -975,8 +975,7 @@ bash scripts/vendor.sh                                      # vendor deps for of
 ```
 
 The npm package has **no install scripts**. The binary is not in the tarball:
-on first run `scripts/bootstrap.js` downloads it and checks its SHA-256.
-Assets carry a build-provenance attestation (`gh attestation verify`). Do not
+on first run `scripts/bootstrap.js` downloads it and checks its SHA-256. Do not
 install `buildwithnexus-<os>-<cpu>` packages (0.12.1–0.14.2 reference them).
 Non-interactive runs opt in with `bwn --bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`,
 or set `BWN_BIN` to a binary you built.
@@ -995,10 +994,10 @@ and the `clip.exe` / `pbcopy` fallback beside OSC 52. The full list is in
 
 ### Managed and corporate machines
 
-Endpoint protection may quarantine the Windows binary: it is new, and the
-launcher downloads it and then runs it. The file matches the release checksum
-and attestation. When a blocked binary cannot start, the launcher prints its
-path and SHA-256, names the product it finds, and does not download it again.
+On Windows, install with `npm install -g buildwithnexus`. The `.exe` is
+unsigned and has build provenance. Verify: `gh attestation verify buildwithnexus-x86_64-pc-windows-msvc.exe --repo Garretts-Apps/buildwithnexus`.
+Do not download the exe from Releases. Endpoint protection may quarantine it;
+a blocked file is named with its SHA-256 and is not downloaded again.
 [SECURITY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#for-it-and-security-teams)
 is the note for IT: what bwn runs, and how to verify a release.
 

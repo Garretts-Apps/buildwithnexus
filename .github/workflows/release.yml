@@ -420,15 +420,23 @@ jobs:
             sha256sum -c "buildwithnexus-$t$ext.sha256"
           done
 
+      # Every release binary, including the unsigned Windows exe, and the
+      # .sha256 published next to it. id-token and attestations are granted
+      # on this job above.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/buildwithnexus-x86_64-unknown-linux-gnu
+            dist/buildwithnexus-x86_64-unknown-linux-gnu.sha256
             dist/buildwithnexus-aarch64-unknown-linux-gnu
+            dist/buildwithnexus-aarch64-unknown-linux-gnu.sha256
             dist/buildwithnexus-x86_64-apple-darwin
+            dist/buildwithnexus-x86_64-apple-darwin.sha256
             dist/buildwithnexus-aarch64-apple-darwin
+            dist/buildwithnexus-aarch64-apple-darwin.sha256
             dist/buildwithnexus-x86_64-pc-windows-msvc.exe
+            dist/buildwithnexus-x86_64-pc-windows-msvc.exe.sha256
 
       # Asset upload only — the `release` job created the release and owns
       # the body (softprops leaves unspecified fields untouched).
