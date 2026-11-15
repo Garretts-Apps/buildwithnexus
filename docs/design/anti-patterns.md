@@ -124,6 +124,58 @@ shadcn typefaces were Geist or Inter. A terminal cannot ship those
 faces, but it can imitate their even, low-contrast grey. Hierarchy then
 disappears.
 
+## T3 Code
+
+Official product: [t3.codes](https://t3.codes/). Official repository:
+[pingdotgg/t3code](https://github.com/pingdotgg/t3code). The screenshot
+on the repository front page is linked, not copied:
+[hero.webp](https://github.com/pingdotgg/t3code/blob/main/.github/readme/hero.webp)
+(desktop thread beside a phone approval).
+
+**Layout.** A server plus desktop, web, and phone clients. The hero is
+two surfaces at once. The review UI is a diff pane, a commit list, and
+pull-request lists
+([source control](https://github.com/pingdotgg/t3code/blob/main/docs/user/source-control.md)).
+bwn's page is one terminal. Tree, log, and diff are columns, and under
+120 columns only one column is showing.
+
+**Density.** T3 Code spends the width on panes, lists, and a command
+palette (`Cmd/Ctrl+K` for a new project or a clone). bwn spends the
+width on the log. A diff row is line numbers and a sign. A tool event
+is a three-letter stamp.
+
+**Diff and tree.** T3 Code gives each thread its own worktree, and a
+turn's file list omits files that arrived only because the turn pulled,
+merged, or rebased. That isolation is a real property of the product.
+bwn diffs the file you opened, against the session baseline or git
+HEAD, inside the column. It does not grow a second app to hold the
+tree.
+
+**Agent visibility.** The README's promise is every agent in one thread,
+including handing a task from one to another. The server starts those
+CLIs as subprocesses
+([AGENTS.md](https://github.com/pingdotgg/t3code/blob/main/AGENTS.md)).
+bwn is the agent. The stamp on the log is the tool call. F12 is the
+same process, and it records nothing while it is hidden.
+
+**What it does well.** It drives the subscription you already have. It
+keeps a thread's dirty tree off the next thread. It refuses to present
+a merge's files as the turn's own edit. The README says a dropped frame
+is a bug. Those are operating rules, and they do not require this
+terminal to look like that application.
+
+**What is generic.** The terminal fallback is cool blue-black
+`rgb(14, 18, 24)`, cool text `rgb(237, 241, 247)`, and a blue cursor
+`rgb(180, 203, 255)`
+([ThreadTerminalDrawer.tsx](https://github.com/pingdotgg/t3code/blob/main/apps/web/src/components/ThreadTerminalDrawer.tsx)).
+The default sans stack names `"Inter Variable"` first
+([appearanceFonts.ts](https://github.com/pingdotgg/t3code/blob/main/apps/web/src/appearanceFonts.ts)).
+A command palette over rounded panes is the desktop kit described in
+the essays above. bwn does not take that kit.
+
+Numbers for startup, memory, and install size are in
+[comparison.md](comparison.md). They are not a palette.
+
 ## What "do not copy" means here
 
 T3 Code, Claude Code, Codex, OpenCode, Warp, Cursor, and Gemini CLI are

@@ -199,10 +199,51 @@ could be mistaken for that product has to be redone.
 | OpenCode | Sidebar plus message bubbles. Notch's margins are a column of `·` and a title, and the page is a log, not bubbles. | Product theme, not published as these hexes. | Bubbles separate turns. Notch separates turns with a stamp (`RD`, `WR`) in the mark color. | Streaming is their animation. Notch coalesces frames and does not add a throb. |
 | Warp | Block UI, prompts as cards. Notch is one page and a margin. | Their blocks use a modern dark grey. Field is `#1c1712`, warm. | Blocks have fill. Notch's columns have no fill. | Block transitions. Notch has none. |
 | Cursor | Chat column beside the editor, cool dark UI. Notch does not center a chat and does not use a blue-violet accent. | The product sits in the indigo family Notch's first constraint forbids. | Editor chrome. Notch has no editor chrome. | Inline AI decorations. Notch does not decorate a token. |
-| T3 Code | Cool field `#0e1218`, cool text `#edf1f7`, blue cursor `#b4cbff`, Inter on Windows. | Field is 16 RGB units from `#0e1218` and warm, not cool. Text is `#f1eadf`, not `#edf1f7`. No blue cursor: the cursor is the mark `#44a793`. | They use a radius scale and 1.75px icons. Notch has no radius and no icons. | Hover brightening. A terminal row does not hover. |
+| T3 Code | A desktop, a phone, and a diff pane around a thread ([hero](https://github.com/pingdotgg/t3code/blob/main/.github/readme/hero.webp), [source control](https://github.com/pingdotgg/t3code/blob/main/docs/user/source-control.md)). Notch is one terminal page: margin, log, diff. | The terminal fallback is `rgb(14, 18, 24)` behind `rgb(237, 241, 247)`, cursor `rgb(180, 203, 255)` ([ThreadTerminalDrawer.tsx](https://github.com/pingdotgg/t3code/blob/main/apps/web/src/components/ThreadTerminalDrawer.tsx)). Notch's field is `#1c1712` and the mark is `#44a793`. | The default sans stack names `"Inter Variable"` first ([appearanceFonts.ts](https://github.com/pingdotgg/t3code/blob/main/apps/web/src/appearanceFonts.ts)). Notch has one terminal face, and weight plus the notch. | Hovering a comment link previews it (source control doc). Notch changes a cell only when the number or the state changes. |
 
-The comparison table of timings in the performance review is a list of
-numbers. It does not pick colors.
+The numbers in [comparison.md](comparison.md) are timings and sizes.
+They do not pick colors.
+
+## T3 Code, beside this page
+
+T3 Code ([t3.codes](https://t3.codes/), [pingdotgg/t3code](https://github.com/pingdotgg/t3code))
+is a control plane: one server, and desktop, web, and phone clients on
+the same threads. The official hero is a finished thread on a desktop
+next to a phone asking to approve a command
+([hero.webp](https://github.com/pingdotgg/t3code/blob/main/.github/readme/hero.webp)).
+That layout is a product of panes. Notch is a product of columns in a
+character grid.
+
+Density follows from that. T3 Code's review surface is a diff pane with
+a source picker, a commit list (the newest 100 in the branch
+comparison), and pull-request lists that span a desktop width
+([source control](https://github.com/pingdotgg/t3code/blob/main/docs/user/source-control.md)).
+Notch's diff is a listing: old line, new line, `+` or `-`, and a title
+that is the path plus `+N -M`. The tree is one column of names. At
+under 120 columns only one of those columns is the page.
+
+The diff behavior worth naming: a turn's file list leaves out files a
+pull, merge, or rebase brought in, unless the turn also edited them.
+Each thread can work in its own worktree. Those are good facts about
+isolating a change. Notch's diff is the file you opened, against the
+session or against git HEAD, because the session is already one
+terminal in one directory.
+
+Agent visibility is the thread. The README says you can change models
+in the middle of a thread and let one agent hand a task to another.
+The server runs the provider CLIs as subprocesses
+([AGENTS.md](https://github.com/pingdotgg/t3code/blob/main/AGENTS.md)).
+Notch's agent is the process you are looking at. A tool event is a
+stamp on the log. The debug panel is the same process, opened with F12,
+and it is empty of work while it is closed.
+
+What T3 Code does well is the part that is not a color: one subscription
+you already have, a worktree per thread, a diff that refuses unrelated
+merge files, and a stated rule that a dropped frame is a bug. What
+reads as generic is the terminal fallback above, the `"Inter Variable"`
+sans stack, and a command palette on `Cmd/Ctrl+K` opening projects and
+clones. Those are the current desktop kit. They are cited so this
+terminal does not grow a copy of them.
 
 ## What would fail this check
 
