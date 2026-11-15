@@ -1,7 +1,7 @@
-# Muratori review of buildwithnexus 0.21.0
+# Performance review of buildwithnexus 0.21.0
 
-Reviewed the way Casey Muratori reviews a program: measure the machine, then
-talk about the code the measurements point at. Principles applied: performance
+Reviewed by measuring the machine first, then talking about the code the
+measurements point at. Principles applied: performance
 aware programming, non-pessimization, semantic compression, the immediate-mode
 frame, a short dependency list, and a debug surface you can read while the
 program runs.
@@ -12,8 +12,8 @@ Binary: `target/release/buildwithnexus`, 6,442,992 bytes. Numbers below are
 from that binary on this machine. They are not the 2026-11-13 figures in
 `BENCHMARKS.md` (that box reported `--version` p50 1.2 ms).
 
-The program is already closer to Handmade Hero than almost any Rust agent
-CLI. Eleven direct crates (`crossterm`, `ureq`, `rustls`,
+The program is already closer to a small, direct program than almost any
+Rust agent CLI. Eleven direct crates (`crossterm`, `ureq`, `rustls`,
 `webpki-roots`, `rustls-native-certs`, `url`, `ring`, `serde` / `serde_json`,
 `shlex`, `libc`). No tokio, no ratatui, no regex in the normal tree (regex
 1.12 is pulled by the criterion dev-dependency only). The tool table is a
@@ -168,7 +168,7 @@ above is with the agent stopped, and that branch is inside
 `trace::record` (`harness/src/trace.rs` 48) keeps 500 events and appends each
 one to `traces/<session>.jsonl` immediately (`persist`, 189). `/trace` prints
 them. Nothing on screen shows frame time, input-to-paint, allocations, or
-whether the ticker is sleeping. Handmade Hero's debug overlay is how you
+whether the ticker is sleeping. A game-engine debug overlay is how you
 notice finding 1 the next time someone adds a `format!` to the footer.
 The overlay has to be off by default: one atomic load on the frame path,
 no allocation and no `/proc` read while it is hidden. Turning it on is the
