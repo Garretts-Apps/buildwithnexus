@@ -261,6 +261,12 @@ def install_npm(layout: Layout, spec: dict) -> dict:
         if not path.exists():
             raise SystemExit(f"missing bin {path}")
         bins[name] = str(path)
+    size_cache = prefix / ".sizes.json"
+    if size_cache.is_file() and marker.is_file() and marker.read_text().strip() == want:
+        cached = json.loads(size_cache.read_text())
+        cached["bins"] = bins
+        log(f"  sizes cached for {spec['id']}")
+        return cached
     info = {
         "id": spec["id"],
         "manager": "npm",
@@ -273,6 +279,7 @@ def install_npm(layout: Layout, spec: dict) -> dict:
     if spec.get("bootstrap_release_binary"):
         info.update(bootstrap_bwn(layout, spec, bins["bwn"]))
     info["sizes"] = measure_npm_sizes(layout, spec, prefix, info)
+    size_cache.write_text(json.dumps(info))
     return info
 
 
@@ -671,6 +678,33 @@ def measure_prompt(cmd: dict, installs: dict) -> dict:
         seed_bwn_settings(Path(env["NEXUS_HOME"]))
         env["CUSTOM_API_KEY"] = "sk-bench"
         env["BWN_NO_AUTO_UPDATE"] = "1"
+    extra = (PINS.get("prompts") or {}).get(cmd["id"]) or {}
+    argv = argv + list(extra.get("args") or [])
+    if cmd["id"] == "aider":
+        env["OPENAI_API_KEY"] = "sk-bench"
+    if cmd["id"] == "codex":
+        codex_home = Path(env["HOME"]) / "codex-prompt"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "config.toml").write_text(
+            "\n".join(
+                [
+                    'model = "bench"',
+                    'model_provider = "bench"',
+                    'approval_policy = "never"',
+                    'sandbox_mode = "read-only"',
+                    "",
+                    "[model_providers.bench]",
+                    'name = "bench"',
+                    'base_url = "http://127.0.0.1:9/v1"',
+                    'env_key = "OPENAI_API_KEY"',
+                    'wire_api = "responses"',
+                    "requires_openai_auth = false",
+                    "",
+                ]
+            )
+        )
+        env["CODEX_HOME"] = str(codex_home)
+        env["OPENAI_API_KEY"] = "sk-bench"
     log(f"prompt {cmd['id']}")
     if not pattern:
         # One look, so the result records what the screen actually did.
@@ -906,10 +940,7 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
                 "--skip-git-repo-check",
                 "--color",
                 "never",
-                "-s",
-                "read-only",
-                "-a",
-                "never",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "-o",
                 str(out_file),
                 TASK_TEXT,

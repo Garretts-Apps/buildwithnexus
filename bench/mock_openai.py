@@ -63,6 +63,12 @@ def _models() -> dict:
 class MockHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            return
+
     def log_message(self, fmt: str, *args) -> None:
         server = self.server
         if getattr(server, "access_log", None):
@@ -87,11 +93,17 @@ class MockHandler(BaseHTTPRequestHandler):
         if rec is None:
             return
         text = body.decode("utf-8", "replace")[:2000]
+        stream = None
+        try:
+            stream = bool(json.loads(body.decode() or "{}").get("stream")) if body else None
+        except json.JSONDecodeError:
+            stream = None
         rec.append(
             {
                 "method": self.command,
                 "path": self.path.split("?", 1)[0],
                 "bytes": len(body),
+                "stream": stream,
                 "body_prefix": text,
             }
         )
@@ -163,10 +175,30 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def _stream_responses(self) -> None:
         full = _response_body()
+        message = full["output"][0]
+        part = message["content"][0]
         events = [
             (
                 "response.created",
                 {"type": "response.created", "response": {**full, "status": "in_progress", "output": []}},
+            ),
+            (
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {**message, "status": "in_progress", "content": []},
+                },
+            ),
+            (
+                "response.content_part.added",
+                {
+                    "type": "response.content_part.added",
+                    "item_id": "msg_bench",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                },
             ),
             (
                 "response.output_text.delta",
@@ -187,6 +219,20 @@ class MockHandler(BaseHTTPRequestHandler):
                     "content_index": 0,
                     "text": CANNED,
                 },
+            ),
+            (
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "item_id": "msg_bench",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": part,
+                },
+            ),
+            (
+                "response.output_item.done",
+                {"type": "response.output_item.done", "output_index": 0, "item": message},
             ),
             ("response.completed", {"type": "response.completed", "response": full}),
         ]

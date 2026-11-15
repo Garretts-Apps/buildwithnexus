@@ -101,16 +101,31 @@
   "memory_runs": 5,
   "prompt_runs": 5,
   "task_runs": 5,
-  "prompt_timeout_s": 12,
+  "prompt_timeout_s": 20,
   "task_timeout_s": 90,
   "task_text": "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.",
   "prompts": {
     "bwn-native": {"pattern": "permission:"},
     "bwn-npm": {"pattern": "permission:"},
     "claude": {"pattern": null},
-    "codex": {"pattern": null},
+    "codex": {"pattern": "Ask Codex to do anything"},
     "gemini": {"pattern": null},
-    "opencode": {"pattern": null},
-    "aider": {"pattern": null}
+    "opencode": {"pattern": "Ask anything"},
+    "aider": {
+      "pattern": "\n> ",
+      "args": [
+        "--model", "openai/gpt-4o-mini",
+        "--openai-api-base", "http://127.0.0.1:9/v1",
+        "--openai-api-key", "sk-bench",
+        "--no-git",
+        "--no-gitignore",
+        "--no-check-update",
+        "--no-analytics",
+        "--no-show-model-warnings",
+        "--no-show-release-notes",
+        "--no-stream",
+        "--no-fancy-input"
+      ]
+    }
   }
 }

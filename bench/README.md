@@ -65,10 +65,18 @@ Approval flags (`--permission-mode readonly`, Aider `--yes-always`, Codex
 `-a never`) are there so the run cannot stop on a question. They are named
 in `summary.json`.
 
-The ready-prompt pattern for bwn is the footer text `permission:`, after a
-settings file has selected a provider (so setup does not run) and with
-auto-update off. Other tools stay untimed until a pattern from their own
-transcript is added to `pins.json`.
+Ready-prompt patterns in `pins.json` come from each tool's own PTY transcript:
+
+- bwn: the footer text `permission:`, after a settings file has selected a
+  provider (so setup does not run) and with auto-update off.
+- Codex: `Ask Codex to do anything`, after `CODEX_HOME` points at a local
+  Responses provider so the sign-in screen is not the first screen.
+- OpenCode: `Ask anything`.
+- Aider: the `>` input line, with the release-notes and analytics questions
+  turned off and `--openai-api-base` set to a closed local port so it does
+  not wait on a browser login.
+- Claude Code's first screen is a theme picker. Gemini CLI's first screen
+  waits on authentication. Those two are not given a prompt time.
 
 ## Reproduce
 
