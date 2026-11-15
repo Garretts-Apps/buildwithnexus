@@ -51,6 +51,8 @@ pub mod graphics;
 pub mod highlight;
 pub mod hooks;
 pub mod knowledge;
+#[cfg(target_os = "linux")]
+mod landlock;
 pub mod local;
 pub mod mcp;
 pub mod mcp_auth;
@@ -122,6 +124,12 @@ struct CliOptions {
     worktree: Option<String>,
     /// `--add-dir <path>`, repeatable: more folders to work in.
     add_dirs: Vec<String>,
+    /// `--repo-map` / `--no-repo-map`. None keeps the settings value.
+    repo_map: Option<bool>,
+    /// `--auto-commit` / `--no-auto-commit`. None keeps the settings value.
+    auto_commit: Option<bool>,
+    /// `--route-gemini native|openrouter`.
+    route_gemini: Option<String>,
 }
 
 /// Every option `parse_cli_options` knows, for "did you mean" hints.
@@ -132,6 +140,11 @@ const CLI_OPTIONS: &[&str] = &[
     "--permission-mode",
     "--permission",
     "--sandbox",
+    "--no-auto-commit",
+    "--auto-commit",
+    "--no-repo-map",
+    "--repo-map",
+    "--route-gemini",
     "--prompt",
     "--effort",
     "--max-budget-usd",
@@ -201,6 +214,22 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             tui::set_line_mode(true);
             continue;
         }
+        if arg == "--no-repo-map" {
+            opts.repo_map = Some(false);
+            continue;
+        }
+        if arg == "--repo-map" {
+            opts.repo_map = Some(true);
+            continue;
+        }
+        if arg == "--no-auto-commit" {
+            opts.auto_commit = Some(false);
+            continue;
+        }
+        if arg == "--auto-commit" {
+            opts.auto_commit = Some(true);
+            continue;
+        }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
@@ -218,6 +247,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--model" => &mut opts.model,
             "--permission-mode" | "--permission" => &mut opts.permission_mode,
             "--sandbox" => &mut opts.sandbox,
+            "--route-gemini" => &mut opts.route_gemini,
             "--prompt" => &mut opts.prompt,
             "--effort" => &mut opts.effort,
             "--max-budget-usd" => &mut budget_raw,
@@ -797,6 +827,29 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
             return Err(e);
         }
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
+    }
+    tools::set_repo_map(opts.repo_map.unwrap_or(settings.repo_map));
+    commands::set_auto_commit(opts.auto_commit.unwrap_or(settings.auto_commit));
+    let route = opts
+        .route_gemini
+        .as_deref()
+        .unwrap_or(settings.route_gemini.as_str());
+    match config::parse_gemini_route(route) {
+        Some(native) => repl::set_gemini_route_native(native),
+        None if opts.route_gemini.is_some() => {
+            return Err(format!(
+                "--route-gemini must be native or openrouter (got '{route}')"
+            ));
+        }
+        None => {
+            eprintln!(
+                "{}",
+                tui::yellow(&format!(
+                    "buildwithnexus: warning: route_gemini '{route}' is not native or openrouter — using native"
+                ))
+            );
+            repl::set_gemini_route_native(true);
+        }
     }
     let local = config::preset(&settings.provider).is_some_and(|p| p.local)
         || is_loopback_url(&provider.base_url);
@@ -2457,7 +2510,14 @@ fn usage_text() -> String {
          \x20                               reads CUSTOM_API_KEY from the environment)\n\
          \x20 --permission-mode <mode>      ask, accept-edits, auto, or readonly (plan reads as\n\
          \x20                               readonly); also --permission\n\
-         \x20 --sandbox <mode>              off, auto, or require (OS sandbox for shell commands)\n\
+         \x20 --sandbox <mode>              auto (default), off, or require (OS sandbox for\n\
+         \x20                               shell commands; off is the 0.20 default)\n\
+         \x20 --auto-commit                 git-commit file edits (the default)\n\
+         \x20 --no-auto-commit              leave file edits uncommitted\n\
+         \x20 --repo-map                    offer the repo_map tool (the default)\n\
+         \x20 --no-repo-map                 hide the repo_map tool\n\
+         \x20 --route-gemini <where>        native (default) or openrouter, for a bare\n\
+         \x20                               gemini… model name\n\
          \x20 --worktree <name>             work in .bwn/worktrees/<name> on branch bwn/<name>\n\
          \x20 --add-dir <path>              also read and change files in <path> (repeatable)\n\
          \x20 --prompt <text>               initial interactive prompt\n\

@@ -72,6 +72,19 @@ pub mod bench {
     }
 }
 
+static REPO_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the `repo_map` tool is offered. On by default since 0.21.
+/// `--no-repo-map` or `"repo_map": false` turns it off. The map is never
+/// pasted into the prompt either way.
+pub fn set_repo_map(on: bool) {
+    REPO_MAP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn repo_map_enabled() -> bool {
+    REPO_MAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
     let mut v = vec![
         ToolDef { name: "bash", description: "Common coding-agent alias: run a shell command in the project environment. Prefer glob/grep/read/list for simple navigation.",
@@ -285,6 +298,13 @@ pub fn defs(include_subagent: bool) -> Vec<ToolDef> {
         ToolDef { name: "mcp_call", description: "Call a tool or query a resource on an enterprise Model Context Protocol (MCP) server configured in settings.json.",
             schema: json!({"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}},"required":["server","tool"]}) },
     ];
+    if repo_map_enabled() {
+        v.push(ToolDef {
+            name: "repo_map",
+            description: "Map this repository: files and their top-level symbols, ranked toward `focus` when you pass one. Call this before guessing where code lives. It does not change files.",
+            schema: json!({"type":"object","properties":{"focus":{"type":"string","description":"words or a path to rank higher"},"max_chars":{"type":"integer","minimum":500,"maximum":20000}}}),
+        });
+    }
     if include_subagent {
         // The built-in roles, then every agent file (see config::load_agent_defs).
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -437,6 +457,7 @@ pub fn defs_readonly() -> Vec<ToolDef> {
                         | "list_skills"
                         | "load_skill"
                         | "kb_query"
+                        | "repo_map"
                         | "rule_check"
                         | "verify"
                 )
@@ -3581,6 +3602,7 @@ pub fn command_touches_wsl_mount(cmd: &str) -> bool {
     })
 }
 
+mod repo_map;
 mod web_search;
 use web_search::*;
 
@@ -4090,6 +4112,12 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         };
     }
     let code = cap.code.unwrap_or(-1);
+    if code != 0 && crate::sandbox::would_confine() {
+        if let Some(note) = crate::sandbox::git_write_blocked_note(&s) {
+            s.push('\n');
+            s.push_str(note);
+        }
+    }
     s.push_str(&format!("\n[exit {code}]"));
     Outcome {
         content: truncate_head_tail_omitting(s, MAX_OUT, cap.omitted),
@@ -4856,6 +4884,35 @@ fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
 }
 
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
+    let outcome = run_tool(name, input, cwd);
+    if !outcome.is_error {
+        maybe_auto_commit(name, input, cwd);
+    }
+    outcome
+}
+
+fn maybe_auto_commit(name: &str, input: &Value, cwd: &Path) {
+    let Some(spec) = table::lookup(name) else {
+        return;
+    };
+    let commits = spec.file_edit
+        || matches!(
+            spec.tool,
+            table::Tool::RemovePath | table::Tool::CreateDocx | table::Tool::Artifact
+        );
+    if !commits {
+        return;
+    }
+    let paths = touched_paths(name, input, cwd);
+    if paths.is_empty() {
+        return;
+    }
+    if let Err(e) = crate::commands::auto_commit(cwd, &paths, spec.canonical) {
+        crate::report::notice(&format!("auto-commit skipped: {e}"));
+    }
+}
+
+fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
     // Mutating file tools never silently write outside the working directory;
     // the permission gate can confirm such calls, but the execution layer
     // refuses regardless so an unwired gate cannot leak a stray write.
@@ -5506,6 +5563,20 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
                     rows.join("\n")
                 ))
             }
+        }
+        T::RepoMap => {
+            if !repo_map_enabled() {
+                return err(
+                    "repo_map is off — set \"repo_map\": true or pass --repo-map to turn it on",
+                );
+            }
+            let focus = input["focus"].as_str().unwrap_or("").trim();
+            let max_chars = input["max_chars"]
+                .as_u64()
+                .unwrap_or(8_000)
+                .clamp(500, 20_000) as usize;
+            let files = walk::source_files(cwd, 4_000);
+            ok(repo_map::render(cwd, &files, focus, max_chars))
         }
         T::KbQuery => {
             let query = input["query"].as_str().unwrap_or("").trim();

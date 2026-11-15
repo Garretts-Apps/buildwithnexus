@@ -198,14 +198,12 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 | llama.cpp server | local | — |
 | LM Studio | local | — |
 
-Gemini, xAI, Mistral and DeepSeek speak the OpenAI chat-completions
-protocol at their own hosts (DeepSeek's is `https://api.deepseek.com`, with
-no `/v1`; Google still labels its compatibility endpoint a beta). A model
-name typed on its own that starts with `gemini` still selects OpenRouter
-(`google/<name>`). `--provider gemini` and `/model gemini <name>` use
-Google's endpoint. With no settings file, a headless run still picks the
-first of the original keys that is set (Anthropic, then OpenAI, OpenRouter,
-Groq, Hugging Face) before these.
+Gemini, xAI, Mistral and DeepSeek use their own OpenAI-compatible hosts
+(DeepSeek's has no `/v1`; Google's compatibility endpoint is still a beta).
+A bare `gemini…` name selects the Gemini preset. `"route_gemini":
+"openrouter"` or `--route-gemini openrouter` restores the old OpenRouter
+`google/<name>` route. With no settings file, a headless run still prefers
+an Anthropic, OpenAI, OpenRouter, Groq, or Hugging Face key when one is set.
 
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600). A key is typed hidden (dots, then only
@@ -427,7 +425,10 @@ an earlier prompt and restores the code, the conversation, or both; the prompt
 comes back in the input box to edit and send again. `/diff` lists every changed and new file
 with one summary line and shows a chosen file's diff; `/diff turn` shows what
 the last turn changed. `/commit` drafts a message and commits only when you
-answer `c` (`[c]ommit · [e]dit · [n]o`). Each folder keeps its newest 500
+answer `c` (`[c]ommit · [e]dit · [n]o`). File-tool edits are also committed
+on their own (`bwn:` subject, no git hooks) when the folder is a git
+repository. `"auto_commit": false` or `--no-auto-commit` turns that off.
+Shell commands are not committed. Each folder keeps its newest 500
 checkpoints. [RECOVERY.md](https://github.com/Garretts-Apps/buildwithnexus/blob/main/RECOVERY.md) has the details.
 
 ## Headless and CI
@@ -442,7 +443,10 @@ whose API key is in the environment, and writes nothing.
 | `--model <name>` | model for this run |
 | `--base-url <url>` | model endpoint for this run, such as a gateway (`--provider custom` reads `CUSTOM_API_KEY`) |
 | `--permission-mode <mode>` | `ask`, `accept-edits`, `auto` or `readonly` (see [Permissions](#permissions)); with no terminal, `ask` blocks every change, so CI usually wants `auto` or `readonly`. An unknown name exits 2. |
-| `--sandbox <off\|auto\|require>` | OS sandbox for shell commands (see [Sandbox](#sandbox)) |
+| `--sandbox <off\|auto\|require>` | OS sandbox for shell commands (default `auto`; see [Sandbox](#sandbox)). `off` is the 0.20 behavior |
+| `--auto-commit` / `--no-auto-commit` | git-commit file edits (default on). `--no-auto-commit` or `"auto_commit": false` leaves them uncommitted |
+| `--repo-map` / `--no-repo-map` | offer the `repo_map` tool (default on). The map is not inserted into the prompt |
+| `--route-gemini <native\|openrouter>` | where a bare `gemini…` model name goes (default `native`) |
 | `--effort <off\|low\|medium\|high>` | reasoning depth |
 | `--max-budget-usd <n>` | stop before the next request once the estimated cost exceeds `n` |
 | `--json` | machine-readable events on stdout instead of text |
@@ -716,26 +720,25 @@ first). Without a terminal and without `--yes` it exits 2 immediately.
 
 ### Sandbox
 
-An optional OS-level layer *under* the permission gate for shell commands
-(`run_command`/`bash`, `!cmd`, and `check_work`). Settings key `"sandbox"`
-(or `--sandbox <mode>`, or `/sandbox <mode>` in a session):
+An OS-level layer *under* the permission gate for shell commands
+(`run_command`/`bash`, `!cmd`, and `check_work`). On by default since 0.21.
+`"sandbox"` (or `--sandbox`, or `/sandbox`):
 
-- `"off"` (default) — commands run as today.
-- `"auto"` — confine commands when a backend works; otherwise run them
-  unsandboxed and say so once per session.
-- `"require"` — refuse to run commands when no backend works.
+- `"auto"` (default) — confine when a backend works; otherwise say so once
+  and run unsandboxed.
+- `"off"` — unsandboxed, the default before 0.21.
+- `"require"` — refuse commands when no backend works.
 
-Backends are external binaries, probed once per session: `bwrap` (bubblewrap)
-on Linux and `sandbox-exec` (Seatbelt) on macOS. Windows and WSL have none.
+Linux uses `bwrap` when it works, otherwise built-in Landlock and seccomp
+(also in WSL, when the kernel allows it). macOS uses `sandbox-exec`.
+Windows has none. Sandboxed shell commands cannot write `.git`; the tool
+result names `--sandbox off`. Auto-commit of file edits runs outside it.
 
-**Confined:** filesystem writes anywhere except the working directory and the
-temp dirs. On Linux, `/tmp` is a fresh private tmpfs (with `TMPDIR=/tmp`)
-that is discarded when the command exits, so files written there are not
-visible to the host or to the next command. On macOS, `/tmp` and `$TMPDIR`
-are the real, shared directories. Everything else, including
-`~/.buildwithnexus` and tool caches such as `~/.cargo` or `~/.npm`, is
-read-only to the command. Set `"sandbox_network": false` to also block the
-network inside the sandbox (default `true`, allowed).
+**Confined:** writes outside the working directory and the temp dirs. With
+bubblewrap, `/tmp` is a private tmpfs (`TMPDIR=/tmp`) discarded on exit.
+With Landlock and on macOS, `/tmp` and `$TMPDIR` are the real directories.
+`~/.buildwithnexus` and caches such as `~/.cargo` stay read-only.
+`"sandbox_network": false` blocks the network (default `true`).
 
 **Not confined:** reads (the whole filesystem stays visible), the agent's own
 file tools (already fenced to the working directory), hooks, MCP servers, and
@@ -1028,6 +1031,9 @@ certificate; a TLS-inspecting proxy needs its root in `NODE_EXTRA_CA_CERTS`.
   (`*_API_KEY`, `*_API_TOKEN`, `*_TOKEN`, `*_SECRET`, `*_SECRETS`,
   `*_PASSWORD`, `AWS_*`, `HF_TOKEN`); `shell_env_passthrough` opts a variable
   back in. See [Permissions](#permissions).
+- `repo_map` lists source files and top-level symbols (ranked by an optional
+  `focus`). It is on by default and is not pasted into the prompt.
+  `"repo_map": false` or `--no-repo-map` hides it.
 - The file tools (`grep_files`, `find_files`, `find_paths`, `list_tree`) and
   `@` completion skip what `.gitignore` ignores and Python virtualenvs, and
   never list `.env` and other sensitive files, even when a `.gitignore` line

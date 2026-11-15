@@ -1,11 +1,12 @@
-//! Opt-in OS-level sandbox for shell commands.
+//! OS-level sandbox for shell commands. On by default (`auto`) since 0.21:
+//! `"sandbox": "off"` or `--sandbox off` restores the old behavior.
 //!
 //! An extra layer *under* the permission gate: once a `run_command` / `bash`
 //! / `check_work` / `start_server` / `python_tool` call has been approved,
 //! the child process is confined so that filesystem writes outside the
-//! working directory (and, optionally, network access) fail at the OS level. Backends are external binaries —
-//! `bwrap` (bubblewrap) on Linux and `sandbox-exec` (Seatbelt) on macOS — so
-//! no crate dependency is added. Windows and WSL have no backend.
+//! working directory (and, optionally, network access) fail at the OS level.
+//! Linux prefers `bwrap` when it works, and otherwise uses the built-in
+//! Landlock and seccomp backend. macOS uses `sandbox-exec`. Windows has none.
 //!
 //! Confined: writes anywhere but the working directory and the temp dirs;
 //! the network when `sandbox_network` is false. Not confined: reads, the
@@ -48,6 +49,8 @@ impl Mode {
 pub enum Backend {
     Bwrap,
     SandboxExec,
+    /// Linux, when bubblewrap is missing or cannot make a namespace.
+    Landlock,
 }
 
 impl Backend {
@@ -55,6 +58,7 @@ impl Backend {
         match self {
             Backend::Bwrap => "bwrap (bubblewrap)",
             Backend::SandboxExec => "sandbox-exec (Seatbelt)",
+            Backend::Landlock => "landlock+seccomp (built-in)",
         }
     }
 }
@@ -142,30 +146,7 @@ fn first_line(bytes: &[u8]) -> String {
         .to_string()
 }
 
-fn detect() -> Result<Backend, String> {
-    if cfg!(windows) {
-        return Err("no sandbox backend on Windows".into());
-    }
-    if crate::tools::is_wsl() {
-        return Err("no sandbox backend inside WSL".into());
-    }
-    let (bin, args, backend): (&str, Vec<String>, Backend) = if cfg!(target_os = "macos") {
-        (
-            "sandbox-exec",
-            vec![
-                "-p".into(),
-                "(version 1) (allow default)".into(),
-                "sh".into(),
-                "-c".into(),
-                "true".into(),
-            ],
-            Backend::SandboxExec,
-        )
-    } else if cfg!(target_os = "linux") {
-        ("bwrap", bwrap_probe_args(), Backend::Bwrap)
-    } else {
-        return Err("no sandbox backend on this platform".into());
-    };
+fn probe_external(bin: &str, args: Vec<String>, backend: Backend) -> Result<Backend, String> {
     let out = Command::new(bin)
         .args(&args)
         .stdin(Stdio::null())
@@ -187,6 +168,53 @@ fn detect() -> Result<Backend, String> {
             }
         )),
         Err(e) => Err(format!("cannot run {bin}: {e}")),
+    }
+}
+
+fn detect() -> Result<Backend, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Err("no sandbox backend on Windows".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return probe_external(
+            "sandbox-exec",
+            vec![
+                "-p".into(),
+                "(version 1) (allow default)".into(),
+                "sh".into(),
+                "-c".into(),
+                "true".into(),
+            ],
+            Backend::SandboxExec,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        detect_linux()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Err("no sandbox backend on this platform".into())
+    }
+}
+
+/// Bubblewrap when it works; otherwise Landlock. Bubblewrap is stricter
+/// (private `/tmp`, read-only `.git`). Landlock also covers WSL.
+#[cfg(target_os = "linux")]
+fn detect_linux() -> Result<Backend, String> {
+    let bwrap = if crate::tools::is_wsl() {
+        Err("bubblewrap is not used inside WSL".to_string())
+    } else {
+        probe_external("bwrap", bwrap_probe_args(), Backend::Bwrap)
+    };
+    match bwrap {
+        Ok(b) => Ok(b),
+        Err(bwrap_err) => match crate::landlock::available() {
+            Ok(()) => Ok(Backend::Landlock),
+            Err(land) => Err(format!("{bwrap_err}; Landlock is also unavailable: {land}")),
+        },
     }
 }
 
@@ -560,7 +588,7 @@ pub fn seatbelt_profile(
     p
 }
 
-fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
+fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, String> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut c = match backend {
         Backend::Bwrap => {
@@ -581,12 +609,22 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Command {
             c.args(["sh", "-c", cmd]);
             c
         }
+        Backend::Landlock => {
+            #[cfg(target_os = "linux")]
+            {
+                crate::landlock::command(cmd, &cwd, &crate::workdirs::list(), network())?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err("landlock is only available on Linux".into());
+            }
+        }
     };
     c.current_dir(&cwd);
     for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
     }
-    c
+    Ok(c)
 }
 
 /// Build the sandboxed command for `cmd`, per the session policy.
@@ -602,7 +640,7 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
         return Ok(None);
     }
     match decide(mode, backend()) {
-        Decision::Sandboxed(b) => Ok(Some(command_for(b, cmd, cwd))),
+        Decision::Sandboxed(b) => command_for(b, cmd, cwd).map(Some),
         Decision::Unsandboxed => {
             if !NOTICED.swap(true, Ordering::Relaxed) {
                 let msg = format!(
@@ -618,9 +656,33 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
             Ok(None)
         }
         Decision::Refused => Err(format!(
-            "sandbox: refusing to run the command — sandbox mode is `require` but no backend is usable ({}). Install bubblewrap (Linux), or switch with /sandbox auto|off.",
+            "sandbox: refusing to run the command — sandbox mode is `require` but no backend is usable ({}). On Linux, bubblewrap or Landlock is enough; or switch with /sandbox off.",
             backend_error().unwrap_or("no backend")
         )),
+    }
+}
+
+/// Appended to a sandboxed command's output when it died writing `.git`.
+pub const GIT_WRITE_BLOCKED: &str = "\
+sandboxed commands cannot write .git, so a hook or git config they plant \
+cannot run later outside the sandbox. git fetch, git pull, and git commit \
+from the shell fail for that reason. bwn still commits its own file edits \
+outside the sandbox when auto_commit is on. To let this command update .git, \
+turn the sandbox off: --sandbox off, \"sandbox\": \"off\" in settings.json, \
+or /sandbox off.";
+
+/// Why a failed sandboxed command could not update `.git`, when the output
+/// says so. `None` when this does not look like that denial.
+pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
+    let l = output.to_ascii_lowercase();
+    let denied = l.contains("operation not permitted")
+        || l.contains("read-only file system")
+        || l.contains("readonly file system")
+        || l.contains("permission denied");
+    if denied && l.contains(".git") {
+        Some(GIT_WRITE_BLOCKED)
+    } else {
+        None
     }
 }
 
@@ -638,6 +700,12 @@ pub fn status_lines() -> Vec<String> {
         Ok(b) => format!("backend: {} — available", b.label()),
         Err(e) => format!("backend: none — {e}"),
     });
+    if matches!(probe(), Ok(Backend::Landlock)) {
+        v.push(
+            "landlock cannot keep .git read-only inside the workspace; bubblewrap can, and is used when it works"
+                .into(),
+        );
+    }
     v.push(format!(
         "network: {}",
         if network() {
@@ -654,7 +722,7 @@ pub fn status_lines() -> Vec<String> {
             Decision::Unsandboxed if mode == Mode::Auto => {
                 "commands: NOT confined — auto mode runs unsandboxed without a backend"
             }
-            Decision::Unsandboxed => "commands: not confined — /sandbox auto to enable",
+            Decision::Unsandboxed => "commands: not confined (sandbox off)",
             Decision::Refused => "commands: REFUSED — require mode with no usable backend",
         }
         .to_string(),
@@ -725,6 +793,18 @@ mod tests {
             Decision::Sandboxed(Backend::SandboxExec)
         );
         assert_eq!(decide(Mode::Require, None), Decision::Refused);
+        let note = git_write_blocked_note(
+            "fatal: could not open '.git/FETCH_HEAD': Operation not permitted",
+        );
+        assert!(note.unwrap().contains("--sandbox off"));
+        assert!(note.unwrap().contains("auto_commit"));
+        assert!(git_write_blocked_note("Read-only file system: .git/refs/heads/main").is_some());
+        assert!(git_write_blocked_note("cargo: permission denied").is_none());
+        assert!(git_write_blocked_note("updated .git/refs/heads/main").is_none());
+        assert_eq!(
+            decide(Mode::Auto, Some(Backend::Landlock)),
+            Decision::Sandboxed(Backend::Landlock)
+        );
     }
 
     #[test]
@@ -1041,7 +1121,7 @@ mod tests {
         let outside = outside_dir.join(format!("bwn-sandbox-escape-{id}.txt"));
         let _ = std::fs::remove_file(&outside);
         let run = |cmd: &str| {
-            let mut c = command_for(Backend::Bwrap, cmd, &ws);
+            let mut c = command_for(Backend::Bwrap, cmd, &ws).unwrap();
             c.stdin(Stdio::null()).output().unwrap()
         };
 

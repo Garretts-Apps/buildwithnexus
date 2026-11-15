@@ -38,9 +38,13 @@ fn model_pick_routes_to_serving_provider() {
         p("local/phi-4.gguf"),
         ("llamacpp".into(), "phi-4.gguf".into())
     );
-    // A bare gemini name still goes to OpenRouter. The preset is explicit.
+    // A bare gemini name selects the Gemini preset. OpenRouter is the opt-out.
     assert_eq!(
-        p("gemini-2.5-pro"),
+        parse_model_pick_with("gemini-2.5-pro", "anthropic", true),
+        ("gemini".into(), "gemini-2.5-pro".into())
+    );
+    assert_eq!(
+        parse_model_pick_with("gemini-2.5-pro", "anthropic", false),
         ("openrouter".into(), "google/gemini-2.5-pro".into())
     );
     assert_eq!(

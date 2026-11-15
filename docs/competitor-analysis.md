@@ -16,7 +16,7 @@ bwn is a single Rust binary (workspace crates `harness` and `bwn`) with an
 npm launcher. The release binary measured for 0.20.0 is 6.43 MB, `--version`
 is about 1.2 ms native and about 27 ms through the Node launcher, and an idle
 TUI is about 9 MiB resident (`BENCHMARKS.md`). Default permission is ask.
-Shell sandboxing is off unless the user opts in.
+Shell sandboxing defaults to `auto` as of 0.21.0 (`"sandbox": "off"` opts out).
 
 Already shipping, and easy to undersell when scanning feature lists:
 
@@ -265,7 +265,8 @@ but they do not close a gap users hit on the first afternoon.
 
 ## Breaking proposals (need owner approval)
 
-These would change what an existing setup does. They are not in this branch.
+Approved and shipped in 0.21.0. The opt-out for each one is in the changelog
+under Breaking changes. The notes below are the original proposal.
 
 1. **Sandbox on by default**, Codex-style: read-only or workspace-write
    until the user relaxes it. Today `sandbox` defaults to `off`, and `ask`
