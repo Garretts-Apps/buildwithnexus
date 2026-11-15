@@ -49,6 +49,10 @@ jobs:
 
       # --workspace: the bwn alias crate is published too, so it is checked
       # like the main crate.
+      - name: Forbidden names
+        working-directory: ${{ github.workspace }}
+        run: sh scripts/check-forbidden-names.sh
+
       - name: Format check
         run: cargo fmt --all --check
 
