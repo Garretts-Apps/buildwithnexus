@@ -400,8 +400,16 @@ def install_pip(layout: Layout, spec: dict) -> dict:
     pkg_dir.mkdir()
     all_dir.mkdir()
     pip = str(prefix / "bin" / "pip")
-    check([pip, "download", "--disable-pip-version-check", "--no-deps", "-d", str(pkg_dir), want], timeout=180)
-    check([pip, "download", "--disable-pip-version-check", "-d", str(all_dir), want], timeout=300)
+    check(
+        [pip, "download", "--disable-pip-version-check", "--no-deps", "-d", str(pkg_dir), want],
+        timeout=180,
+        capture_output=True,
+    )
+    check(
+        [pip, "download", "--disable-pip-version-check", "-d", str(all_dir), want],
+        timeout=300,
+        capture_output=True,
+    )
     pkg_files = [p for p in pkg_dir.iterdir() if p.is_file()]
     all_files = [p for p in all_dir.iterdir() if p.is_file()]
     if len(pkg_files) != 1:
@@ -658,19 +666,24 @@ def seed_bwn_settings(home: Path) -> None:
 
 def measure_prompt(cmd: dict, installs: dict) -> dict:
     pattern = (PINS.get("prompts") or {}).get(cmd["id"], {}).get("pattern")
-    if not pattern:
-        return {
-            "ok": False,
-            "status": "not_measured",
-            "reason": "No ready-prompt pattern is pinned for this tool. A pattern is only timed after it has been seen in that tool's own PTY transcript.",
-        }
     argv, env = command_argv(cmd, installs)
     if cmd["install"] == "bwn":
         seed_bwn_settings(Path(env["NEXUS_HOME"]))
         env["CUSTOM_API_KEY"] = "sk-bench"
         env["BWN_NO_AUTO_UPDATE"] = "1"
-    runs = []
     log(f"prompt {cmd['id']}")
+    if not pattern:
+        # One look, so the result records what the screen actually did.
+        # A time is published only after a pattern from that transcript is pinned.
+        sample = measure_prompt_once(argv, env, None, float(PINS["prompt_timeout_s"]))
+        return {
+            "ok": False,
+            "status": "not_measured",
+            "reason": "No ready-prompt pattern is pinned for this tool. A pattern is only timed after it has been seen in that tool's own PTY transcript.",
+            "process_exited": sample["exit_code"] is not None,
+            "transcript": sample["transcript"],
+        }
+    runs = []
     for _ in range(PINS["prompt_runs"]):
         one = measure_prompt_once(argv, env, pattern, float(PINS["prompt_timeout_s"]))
         runs.append(one)
@@ -720,7 +733,7 @@ def task_succeeded(proc: subprocess.CompletedProcess, out_file: Path | None, req
 
 def measure_task(cmd: dict, installs: dict, base_url: str, work: Path, mock_requests: list) -> dict:
     spec = task_command(cmd, installs, base_url, work)
-    if spec.get("skip"):
+    if spec.get("status") == "skipped" or spec.get("skip"):
         return spec
     argv = spec["argv"]
     env = spec["env"]
