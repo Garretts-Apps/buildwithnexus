@@ -803,7 +803,7 @@ fn confirm_with(
         format!(" `{shown_key}`")
     };
     tui::line(&tui::dim(&format!(
-        "  Y yes   N no   S allow{scope}   A always   D deny"
+        "  Y yes   N no   S allow{scope} this session   A always   D deny"
     )));
     let q = format!("  {} ", tui::accent("ASK"));
     let Some(ans) = ask(&q) else {

