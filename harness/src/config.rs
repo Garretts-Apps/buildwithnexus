@@ -4652,7 +4652,7 @@ mod tests {
         write(&leaf.join("deeper").join("AGENTS.md"), "below cwd");
 
         let files = load_instructions_with(&leaf, &default_instruction_files());
-        let labels: Vec<&str> = files.iter().map(|f| f.label.as_str()).collect();
+        let labels: Vec<String> = files.iter().map(|f| f.label.replace('\\', "/")).collect();
         assert_eq!(labels.len(), 5, "{labels:?}");
         assert!(labels[0].ends_with("AGENTS.md") && files[0].content == "global rules");
         assert_eq!(
@@ -5251,11 +5251,12 @@ mod tests {
         // The person's own AGENTS.md is not the repository's.
         fs::write(h.join("home/AGENTS.md"), "# Mine\n").unwrap();
         let notices = startup_context_notices(&proj);
+        let shown: Vec<String> = notices.iter().map(|n| n.replace('\\', "/")).collect();
         assert_eq!(
-            notices,
+            shown,
             [format!(
                 "instructions: {}",
-                tilde(&h.join("home/AGENTS.md"))
+                tilde(&h.join("home/AGENTS.md")).replace('\\', "/")
             )]
         );
         let repo = repo_instructions(&proj).expect("the repository's AGENTS.md");

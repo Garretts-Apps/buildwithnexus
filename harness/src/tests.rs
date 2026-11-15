@@ -1055,6 +1055,10 @@ fn what_you_type_is_what_the_model_gets() {
     }
     // The composer's own tokens for dropped files round-trip.
     for name in ["my notes.md", "say \"hi\" notes.md", "back\\slash notes.md"] {
+        // `"` and `\` are legal in a Unix file name and rejected by Windows.
+        if cfg!(windows) && name.contains(['\\', '"', ':', '*', '?', '<', '>', '|']) {
+            continue;
+        }
         std::fs::write(dir.join(name), "dropped\n").unwrap();
         let token = crate::tui::attachment_token(&dir.join(name));
         let (text, _) = extract_attachments(&format!("read {token}"), &dir, true);

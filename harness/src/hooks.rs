@@ -3361,6 +3361,7 @@ mod tests {
         assert!(p["transcript_path"]
             .as_str()
             .unwrap()
+            .replace('\\', "/")
             .ends_with(&format!("sessions/{sid}.json")));
         let p = with_fields(p, json!({"tool_name": "spawn_subagent"}));
         assert_eq!(p["tool_name"], "spawn_subagent");

@@ -497,15 +497,19 @@ mod tests {
             .find(|p| !p.starts_with(&pw) && p.is_file());
         assert_eq!(found, system.or(Some(shell)));
         // Windows: the install folders, then Playwright's chrome-win build.
+        // A private Program Files, not the machine's: the runner has Chrome
+        // installed, and that copy would win over the Playwright fixture.
+        let program_files = root.join("Program Files");
+        std::fs::create_dir_all(&program_files).unwrap();
         let env = vars(vec![
             ("PATH", empty.clone().into()),
-            ("ProgramFiles", r"C:\Program Files".into()),
+            ("ProgramFiles", program_files.clone().into()),
             ("LOCALAPPDATA", root.clone().into()),
             ("PLAYWRIGHT_BROWSERS_PATH", pw.clone().into()),
         ]);
         let paths = install_paths(&env, true, false);
         assert!(
-            paths[0].starts_with(r"C:\Program Files")
+            paths[0].starts_with(&program_files)
                 && paths[0].ends_with("Google/Chrome/Application/chrome.exe"),
             "{paths:?}"
         );

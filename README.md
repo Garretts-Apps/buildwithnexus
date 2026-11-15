@@ -39,8 +39,6 @@ npm uninstall -g buildwithnexus      # or: cargo uninstall buildwithnexus
 rm -rf ~/.buildwithnexus             # or $NEXUS_HOME, if you set it
 ```
 
-On Windows (PowerShell):
-
 ```powershell
 npm uninstall -g buildwithnexus
 Remove-Item -Recurse -Force $env:USERPROFILE\.buildwithnexus
@@ -50,8 +48,7 @@ That folder holds your settings, saved sessions, checkpoints, the binaries
 the npm launcher downloaded and your saved API keys (`.env.keys`), so remove
 it only if you want all of that gone. A project's own `.buildwithnexus/`
 folder (rules, skills, project settings) is part of that project and is left
-alone. On Windows the folder is `%USERPROFILE%\.buildwithnexus` (or
-`$NEXUS_HOME`, if you set it).
+alone. On Windows the folder is `%USERPROFILE%\.buildwithnexus`.
 
 ## Requirements
 
@@ -977,28 +974,23 @@ cargo build --release --manifest-path harness/Cargo.toml   # → harness/target/
 bash scripts/vendor.sh                                      # vendor deps for offline / reproducible builds
 ```
 
-The npm package is a thin wrapper — **no install scripts, no bundled
-sources**. The binary is not in the tarball: on first run
-`scripts/bootstrap.js` downloads the release asset for your platform and
-verifies its SHA-256 checksum; every asset carries a build-provenance
-attestation (`gh attestation verify`). Nothing is installed from
-`buildwithnexus-<os>-<cpu>` packages, and 0.12.1-0.14.2, which reference
-them, should not be installed. Non-interactive environments opt in with
-`bwn --bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`; or build from source and point
-`BWN_BIN` at the result.
+The npm package has **no install scripts**. The binary is not in the tarball:
+on first run `scripts/bootstrap.js` downloads it and checks its SHA-256.
+Assets carry a build-provenance attestation (`gh attestation verify`). Do not
+install `buildwithnexus-<os>-<cpu>` packages (0.12.1–0.14.2 reference them).
+Non-interactive runs opt in with `bwn --bootstrap` or `BWN_ALLOW_BOOTSTRAP=1`,
+or set `BWN_BIN` to a binary you built.
 
 ## Platform support
 
 Linux and macOS are the primary targets. Native Windows (PowerShell, cmd,
 Windows Terminal) and WSL are supported: the full TUI, clipboard images,
 per-user ACLs on the key file, and `~` via `%USERPROFILE%` when `HOME` is unset.
-Hook scripts run by
-extension (`.ps1`, `.cmd`, `.bat`, `.py`, `.sh`). Scripts dropped in
-`~/.buildwithnexus/hooks/<Event>/` are auto-discovered, including `.ps1`,
-`.cmd` and `.bat` on Windows, so those do not have to be listed in settings.
-`python_tool` runs `python3`, and falls back to `python` when `python3` is
-missing. Still Unix-only: tmux-backed dev servers, and the `clip.exe` /
-`pbcopy` fallback beside OSC 52. The full list is in
+Hook scripts (`.ps1`, `.cmd`, `.bat`, `.py`, `.sh`) in
+`~/.buildwithnexus/hooks/<Event>/` are auto-discovered on Windows too, with
+no settings entry. `python_tool` uses `python3`,
+or `python` when `python3` does not run. Still Unix-only: tmux dev servers
+and the `clip.exe` / `pbcopy` fallback beside OSC 52. The full list is in
 [Platform support](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/platforms.md).
 
 ### Managed and corporate machines

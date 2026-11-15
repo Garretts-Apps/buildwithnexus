@@ -93,7 +93,9 @@ fn snapshot() -> String {
 
 #[test]
 fn classification_matches_snapshot() {
-    let got = snapshot();
+    // Path's Debug form escapes `\` as `\\`. Fold those to `/` so the Unix
+    // snapshot still describes Windows.
+    let got = snapshot().replace("\\\\", "/").replace('\\', "/");
     if std::env::var_os("BWN_CHAR_DUMP").is_some() {
         std::fs::write(std::env::var("BWN_CHAR_DUMP").unwrap(), &got).unwrap();
     }
