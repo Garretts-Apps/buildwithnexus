@@ -3,6 +3,12 @@
 # rejection are what decide whether the file is installed.
 $ErrorActionPreference = 'Stop'
 $install = Join-Path $PSScriptRoot 'install.ps1'
+# Windows PowerShell lives under System32\WindowsPowerShell, not in System32
+# itself. The cases below replace PATH, so the child host has to be named by
+# its own path and that directory has to stay on PATH.
+$psExe = Join-Path $PSHOME 'powershell.exe'
+if (-not (Test-Path -LiteralPath $psExe)) { $psExe = (Get-Command powershell.exe).Source }
+$psDir = Split-Path -Parent $psExe
 $root = Join-Path $env:TEMP ("bwn-attest-" + [guid]::NewGuid().ToString('n'))
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 
@@ -99,16 +105,17 @@ function Invoke-Install {
   $stdout = New-TemporaryFile
   $stderr = New-TemporaryFile
   try {
+    $basePath = "$psDir;$env:SystemRoot\System32"
     if ($GhDir) {
-      $env:PATH = "$GhDir;$env:SystemRoot\System32"
+      $env:PATH = "$GhDir;$basePath"
       $env:GH_MODE = $Mode
       $env:GH_LOG = Join-Path $GhDir 'gh.log'
     } else {
-      $env:PATH = "$env:SystemRoot\System32"
+      $env:PATH = $basePath
       Remove-Item Env:GH_MODE -ErrorAction SilentlyContinue
       Remove-Item Env:GH_LOG -ErrorAction SilentlyContinue
     }
-    & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $install @ArgList 1>$stdout 2>$stderr
+    & $psExe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $install @ArgList 1>$stdout 2>$stderr
     $code = $LASTEXITCODE
   } finally {
     $env:PATH = $savedPath

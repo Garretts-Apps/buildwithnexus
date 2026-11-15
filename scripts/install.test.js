@@ -24,7 +24,7 @@ function tmp(tag) {
 function toolPath(dir) {
   const bin = path.join(dir, 'tools');
   fs.mkdirSync(bin, { recursive: true });
-  for (const name of ['sh', 'sha256sum', 'awk', 'mktemp', 'uname', 'cp', 'mkdir', 'chmod', 'ln', 'rm', 'cat', 'tr']) {
+  for (const name of ['sh', 'sha256sum', 'shasum', 'awk', 'mktemp', 'uname', 'cp', 'mkdir', 'chmod', 'ln', 'rm', 'cat', 'tr']) {
     if (fs.existsSync(path.join(bin, name))) continue;
     const found = ['/usr/bin', '/bin'].map((dir) => path.join(dir, name)).find((p) => fs.existsSync(p));
     if (found) fs.symlinkSync(found, path.join(bin, name));

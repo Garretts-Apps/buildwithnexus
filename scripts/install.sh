@@ -69,9 +69,14 @@ asset_name() {
 hash_of() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
+    return
   fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+    return
+  fi
+  echo "install.sh: need sha256sum or shasum to check the download" >&2
+  return 1
 }
 
 ASSET=$(asset_name) || exit 1
