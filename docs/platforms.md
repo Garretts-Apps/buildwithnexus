@@ -28,7 +28,11 @@ bwn version
 
 The `.exe` is unsigned: it has no Authenticode signature. It does have a
 GitHub build-provenance attestation, which ties the file to the release
-workflow that built it. Do not install by downloading the `.exe` from GitHub
+workflow that built it. The installer checks that attestation when
+`gh auth status` succeeds. If `gh` is missing, not logged in, offline, or
+too old to attest, the installer prints one warning and still installs
+after the SHA-256 matches. `--require-attest` refuses to install in that
+case. Do not install by downloading the `.exe` from GitHub
 Releases. After `bwn version` has printed `buildwithnexus VERSION`, a copy
 from npm is `%USERPROFILE%\.buildwithnexus\bin\VERSION\buildwithnexus.exe`,
 and the native installer writes

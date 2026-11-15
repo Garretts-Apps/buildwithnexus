@@ -300,7 +300,11 @@ jobs:
           node-version: "22"
 
       - name: Test launcher
-        run: node --test scripts/launcher.test.js
+        run: node --test scripts/launcher.test.js scripts/install.test.js
+
+      - name: Test installer attestation
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts\install-attest.tests.ps1
 
   # The GitHub Action (action.yml) as a workflow uses it: the npm package is
   # packed here and installed by the action like a release, BWN_BIN points
