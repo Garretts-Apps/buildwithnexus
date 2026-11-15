@@ -803,12 +803,8 @@ this session. A headless run cannot ask, so it names them as not reviewed
 and leaves them out. `/init` and `buildwithnexus init --agents-md` draft one.
 `~/.buildwithnexus/system.md` is always yours; a project's `system.md` is
 added after it only once you trust the folder (`"project_system_prompt":
-"replace"` lets a trusted project replace yours). `/system-prompt` shows the
-prompt that is actually sent, each layer labeled, with an estimated token
-count. `e` edits your layer (user or project; the built-in text is never
-rewritten) and shows a diff before saving. `s` asks the model for a revision
-you accept hunk by hunk. `reset` deletes that file.
-`bwn system-prompt show --json` prints the same thing.
+"replace"` lets a trusted project replace yours). `/system-prompt` shows
+that prompt and edits your layer.
 Discovery order, the size caps and `instruction_files` are in
 [Project instructions](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/instructions.md).
 

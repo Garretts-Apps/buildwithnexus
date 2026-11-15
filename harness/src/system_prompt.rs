@@ -490,7 +490,8 @@ fn parse_args(args: &[String], json: bool) -> Result<Parsed, String> {
                     .ok_or("--mode requires build, plan, brainstorm or chat")?;
                 parsed.mode = Some(PromptMode::parse(value)?);
             }
-            other if let Some(value) = other.strip_prefix("--mode=") => {
+            other if other.starts_with("--mode=") => {
+                let value = other.trim_start_matches("--mode=");
                 parsed.mode = Some(PromptMode::parse(value)?);
             }
             "-h" | "--help" => return Err(usage()),
@@ -1018,6 +1019,7 @@ mod tests {
         assert!(parse_suggestion("").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlink_override_is_not_written() {
         let _g = crate::config::TEST_ENV_LOCK
