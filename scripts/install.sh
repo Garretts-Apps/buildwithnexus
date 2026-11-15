@@ -13,9 +13,10 @@ FILE=''
 SHA=''
 UNINSTALL=0
 NO_ATTEST=0
+REQUIRE_ATTEST=0
 
 usage() {
-  echo "usage: install.sh [--version VER] [--prefix DIR] [--file PATH --sha256 HEX] [--no-attest] [--uninstall]" >&2
+  echo "usage: install.sh [--version VER] [--prefix DIR] [--file PATH --sha256 HEX] [--no-attest] [--require-attest] [--uninstall]" >&2
   exit 2
 }
 
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
     --file) FILE=${2:-}; shift 2 ;;
     --sha256) SHA=${2:-}; shift 2 ;;
     --no-attest) NO_ATTEST=1; shift ;;
+    --require-attest) REQUIRE_ATTEST=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage ;;
     *) echo "install.sh: unknown argument: $1" >&2; usage ;;
@@ -35,6 +37,11 @@ done
 if [ -z "${HOME:-}" ] && [ "$PREFIX" = "/.local/bin" ]; then
   echo "install.sh: HOME is not set. Pass --prefix." >&2
   exit 1
+fi
+
+if [ "$NO_ATTEST" = 1 ] && [ "$REQUIRE_ATTEST" = 1 ]; then
+  echo "install.sh: --no-attest and --require-attest cannot be combined" >&2
+  exit 2
 fi
 
 case "$VERSION" in
@@ -62,9 +69,14 @@ asset_name() {
 hash_of() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
+    return
   fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+    return
+  fi
+  echo "install.sh: need sha256sum or shasum to check the download" >&2
+  return 1
 }
 
 ASSET=$(asset_name) || exit 1
@@ -95,9 +107,59 @@ if [ "$(printf '%s' "$got" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SHA" | tr 'A-F
   exit 1
 fi
 
-if [ "$NO_ATTEST" = 0 ] && [ -z "$FILE" ] && command -v gh >/dev/null 2>&1; then
-  gh attestation verify "$tmp" --repo "$REPO"
-fi
+# The checksum above is the install gate. Attestation is checked only when gh
+# is logged in. A missing, logged-out, offline, or too-old gh prints one line
+# and the install continues. A verification that actually runs and rejects the
+# file does not install. --require-attest turns the warning into a failure.
+warn_attest() {
+  if [ "$REQUIRE_ATTEST" = 1 ]; then
+    echo "install.sh: --require-attest: $1" >&2
+    exit 1
+  fi
+  echo "install.sh: $1" >&2
+}
+
+attest_rejected() {
+  case "$1" in
+    *attestations/sha256*|*failed\ to\ verify*|*no\ attestation*|*did\ not\ match*|*verification\ failed*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+check_attest() {
+  if [ "$NO_ATTEST" = 1 ]; then
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    warn_attest "gh is not installed, so the build-provenance attestation was not checked. The SHA-256 matched."
+    return 0
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    warn_attest "gh is not logged in, so the build-provenance attestation was not checked. The SHA-256 matched."
+    return 0
+  fi
+  if ! gh attestation verify --help >/dev/null 2>&1; then
+    warn_attest "this gh has no attestation command, so the build-provenance attestation was not checked. The SHA-256 matched."
+    return 0
+  fi
+  err=$(mktemp)
+  if gh attestation verify "$1" --repo "$REPO" >"$err" 2>&1; then
+    rm -f "$err"
+    return 0
+  fi
+  text=$(cat "$err" 2>/dev/null || true)
+  rm -f "$err"
+  if attest_rejected "$text"; then
+    echo "install.sh: gh attestation verify rejected this binary. Not installing." >&2
+    printf '%s\n' "$text" >&2
+    exit 1
+  fi
+  warn_attest "gh attestation verify could not run, so the build-provenance attestation was not checked. The SHA-256 matched."
+}
+
+check_attest "$tmp"
 
 mkdir -p "$PREFIX" || {
   echo "install.sh: cannot create $PREFIX (no sudo; pick a directory you own with --prefix)" >&2

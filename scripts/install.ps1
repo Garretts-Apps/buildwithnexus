@@ -9,7 +9,8 @@ param(
   [string]$File = '',
   [string]$Sha256 = '',
   [switch]$Uninstall,
-  [switch]$NoAttest
+  [switch]$NoAttest,
+  [switch]$RequireAttest
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -21,6 +22,10 @@ if (-not $Prefix) {
 if ($Version.StartsWith('v')) { $Version = $Version.Substring(1) }
 
 function Say([string]$Text) { Write-Output $Text }
+
+if ($NoAttest -and $RequireAttest) {
+  throw '-NoAttest and -RequireAttest cannot be combined'
+}
 
 if ($Uninstall) {
   foreach ($name in @('bwn.exe', 'buildwithnexus.exe')) {
@@ -64,13 +69,49 @@ try {
     throw "checksum mismatch (got $got, expected $Sha256). Not installing."
   }
 
-  if (-not $NoAttest -and -not $File) {
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh) {
-      & gh attestation verify $tmp --repo $Repo
-      if ($LASTEXITCODE -ne 0) { throw "gh attestation verify failed with exit $LASTEXITCODE" }
+  # The checksum above is the install gate. Attestation runs only when gh is
+  # logged in. Anything that stops the check (no gh, logged out, offline, or
+  # an older gh) is one warning, and the install continues. A verification
+  # that runs and rejects the file does not install. -RequireAttest makes
+  # that warning a failure.
+  if (-not $NoAttest) {
+    function Warn-Attest([string]$Text) {
+      if ($RequireAttest) { throw "-RequireAttest: $Text" }
+      [Console]::Error.WriteLine("install.ps1: $Text")
+    }
+    function Invoke-Gh([string[]]$GhArgs) {
+      $prev = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      $lines = & gh @GhArgs 2>&1
+      $code = $LASTEXITCODE
+      $ErrorActionPreference = $prev
+      $text = @($lines | ForEach-Object { "$_" }) -join "`n"
+      return @{ Code = $code; Text = $text }
+    }
+    function Test-Rejected([string]$Text) {
+      return ($Text -match 'attestations/sha256') -or ($Text -match 'failed to verify') -or ($Text -match 'no attestation') -or ($Text -match 'did not match') -or ($Text -match 'verification failed')
+    }
+    $ghCmd = Get-Command gh -ErrorAction SilentlyContinue
+    if (-not $ghCmd) {
+      Warn-Attest 'gh is not installed, so the build-provenance attestation was not checked. The SHA-256 matched.'
     } else {
-      Say 'gh is not installed, so the build-provenance attestation was not checked. The SHA-256 matched.'
+      $auth = Invoke-Gh @('auth', 'status')
+      if ($auth.Code -ne 0) {
+        Warn-Attest 'gh is not logged in, so the build-provenance attestation was not checked. The SHA-256 matched.'
+      } else {
+        $help = Invoke-Gh @('attestation', 'verify', '--help')
+        if ($help.Code -ne 0) {
+          Warn-Attest 'this gh has no attestation command, so the build-provenance attestation was not checked. The SHA-256 matched.'
+        } else {
+          $verify = Invoke-Gh @('attestation', 'verify', $tmp, '--repo', $Repo)
+          if ($verify.Code -ne 0) {
+            if (Test-Rejected $verify.Text) {
+              throw "gh attestation verify rejected this binary. Not installing.`n$($verify.Text)"
+            }
+            Warn-Attest 'gh attestation verify could not run, so the build-provenance attestation was not checked. The SHA-256 matched.'
+          }
+        }
+      }
     }
   }
 
