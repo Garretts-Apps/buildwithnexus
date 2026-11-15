@@ -1752,14 +1752,47 @@ fn redirect_is_refused_and_key_never_reaches_the_other_host() {
     let base = format!("http://{}", first.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let (mut sock, _) = first.accept().unwrap();
-        sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        // One short read races the request on Windows: the socket is closed
+        // while the client is still writing, and the redirect comes back as
+        // "connection forcibly closed" instead of a 307.
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
-        let mut buf = [0u8; 16384];
-        let _ = sock.read(&mut buf);
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         let resp = format!(
                 "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{other_addr}/v1/messages\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
             );
         let _ = sock.write_all(resp.as_bytes());
+        let _ = sock.flush();
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .ok();
+        loop {
+            match sock.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     });
     let p = Provider {
         protocol: Protocol::Anthropic,

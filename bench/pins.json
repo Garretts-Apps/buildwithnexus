@@ -1,0 +1,131 @@
+{
+  "note": "Exact versions timed by bench/run.py. The runner refuses a tool whose --version text does not contain its pin.",
+  "installs": [
+    {
+      "id": "bwn",
+      "manager": "npm",
+      "package": "buildwithnexus",
+      "version": "0.21.0",
+      "bins": ["bwn", "buildwithnexus"],
+      "bootstrap_release_binary": true
+    },
+    {
+      "id": "claude",
+      "manager": "npm",
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.325",
+      "bins": ["claude"]
+    },
+    {
+      "id": "codex",
+      "manager": "npm",
+      "package": "@openai/codex",
+      "version": "0.169.0",
+      "bins": ["codex"]
+    },
+    {
+      "id": "gemini",
+      "manager": "npm",
+      "package": "@google/gemini-cli",
+      "version": "0.68.0",
+      "bins": ["gemini"]
+    },
+    {
+      "id": "opencode",
+      "manager": "npm",
+      "package": "opencode-ai",
+      "version": "1.19.5",
+      "repository": "https://github.com/sst/opencode",
+      "bins": ["opencode"]
+    },
+    {
+      "id": "aider",
+      "manager": "pip",
+      "package": "aider-chat",
+      "version": "0.86.2",
+      "bins": ["aider"]
+    }
+  ],
+  "commands": [
+    {
+      "id": "bwn-native",
+      "display": "bwn native",
+      "install": "bwn",
+      "launch": "native",
+      "version_expect": "buildwithnexus 0.21.0"
+    },
+    {
+      "id": "bwn-npm",
+      "display": "bwn (npm)",
+      "install": "bwn",
+      "bin": "bwn",
+      "version_expect": "buildwithnexus 0.21.0"
+    },
+    {
+      "id": "claude",
+      "display": "Claude Code",
+      "install": "claude",
+      "bin": "claude",
+      "version_expect": "2.1.325"
+    },
+    {
+      "id": "codex",
+      "display": "Codex CLI",
+      "install": "codex",
+      "bin": "codex",
+      "version_expect": "0.169.0"
+    },
+    {
+      "id": "gemini",
+      "display": "Gemini CLI",
+      "install": "gemini",
+      "bin": "gemini",
+      "version_expect": "0.68.0"
+    },
+    {
+      "id": "opencode",
+      "display": "OpenCode",
+      "install": "opencode",
+      "bin": "opencode",
+      "version_expect": "1.19.5"
+    },
+    {
+      "id": "aider",
+      "display": "Aider",
+      "install": "aider",
+      "bin": "aider",
+      "version_expect": "0.86.2"
+    }
+  ],
+  "startup_runs": 20,
+  "memory_runs": 5,
+  "prompt_runs": 5,
+  "task_runs": 5,
+  "prompt_timeout_s": 20,
+  "task_timeout_s": 90,
+  "task_text": "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.",
+  "prompts": {
+    "bwn-native": {"pattern": "permission:"},
+    "bwn-npm": {"pattern": "permission:"},
+    "claude": {"pattern": null},
+    "codex": {"pattern": "Ask Codex to do anything"},
+    "gemini": {"pattern": null},
+    "opencode": {"pattern": "Ask anything"},
+    "aider": {
+      "pattern": "\n> ",
+      "args": [
+        "--model", "openai/gpt-4o-mini",
+        "--openai-api-base", "http://127.0.0.1:9/v1",
+        "--openai-api-key", "sk-bench",
+        "--no-git",
+        "--no-gitignore",
+        "--no-check-update",
+        "--no-analytics",
+        "--no-show-model-warnings",
+        "--no-show-release-notes",
+        "--no-stream",
+        "--no-fancy-input"
+      ]
+    }
+  }
+}

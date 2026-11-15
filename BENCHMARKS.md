@@ -155,3 +155,12 @@ cargo build --release && ls -l target/release/buildwithnexus
 
 If a number here drifts from what the site or README claims, the docs are
 wrong: file an issue.
+
+## Other terminal agents
+
+Startup, memory, download size, and a canned task against Claude Code, Codex
+CLI, Gemini CLI, Aider, and OpenCode are a separate suite. The command, the
+pinned versions, and the raw JSON are in [bench/](bench/README.md). The same
+figures are published on the
+[benchmarks page](https://buildwithnexus.dev/docs/benchmarks). Those numbers
+are not the microbenchmarks above, and they are not estimated.

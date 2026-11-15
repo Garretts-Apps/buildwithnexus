@@ -1,0 +1,45 @@
+name: Competitor benchmarks
+
+# Manual, plus every Monday. This does not run on pull requests: installing
+# the other CLIs is slow, and the numbers it uploads are a fresh run, not a
+# gate. The figures published in bench/results/ were produced by running the
+# same script and committing its output.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: Startup, memory, size
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Install hyperfine, GNU time, and a Python venv
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hyperfine time python3-venv python3-pip
+
+      - name: Run the suite
+        run: python3 bench/run.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: competitor-benchmarks-${{ github.run_id }}
+          path: bench/results
+          if-no-files-found: error
+          retention-days: 30
