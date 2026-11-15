@@ -287,6 +287,17 @@ pub(super) fn repl(
             continue;
         }
 
+        // /debug export|pause|step|continue|replay — the panel itself is F12.
+        if let Some(arg) = t.strip_prefix("/debug ") {
+            crate::debug_panel::note_session(
+                &provider.protocol.to_string(),
+                &provider.model,
+                provider.context_tokens,
+            );
+            crate::debug_panel::command(arg.trim());
+            continue;
+        }
+
         // /mouse or /scroll on|off — wheel transcript scrolling is on by
         // default; off restores terminal-native text selection.
         if let Some(mouse_arg) = t.strip_prefix("/mouse ") {
@@ -532,8 +543,17 @@ pub(super) fn repl(
                 handle_workflows();
                 continue;
             }
-            "/doctor" | "/debug" => {
+            "/doctor" => {
                 handle_doctor_tui(&provider);
+                continue;
+            }
+            "/debug" => {
+                crate::debug_panel::note_session(
+                    &provider.protocol.to_string(),
+                    &provider.model,
+                    provider.context_tokens,
+                );
+                crate::debug_panel::command("");
                 continue;
             }
             "/diff" => {

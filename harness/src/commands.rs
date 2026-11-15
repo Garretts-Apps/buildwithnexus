@@ -2034,7 +2034,7 @@ pub(super) fn mcp_checks() -> Vec<DoctorCheck> {
         .collect()
 }
 
-// `/doctor` (and `/debug`): the same checks as `buildwithnexus doctor`,
+// `/doctor`: the same checks as `buildwithnexus doctor`,
 // probing the model this session is using.
 pub(super) fn handle_doctor_tui(live: &Provider) {
     tui::line(&tui::accent(&format!("  buildwithnexus {VERSION} doctor")));

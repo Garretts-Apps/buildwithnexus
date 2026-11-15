@@ -1008,6 +1008,7 @@ fn send_raw_blocking(
                 let budget = retries_for(code, &detail);
                 if retries < budget {
                     retries += 1;
+                    crate::debug_panel::note_retry();
                     let wait = server_wait.unwrap_or_else(|| jitter(delay_ms));
                     // Say what's happening — a silent 10s backoff reads as a
                     // frozen UI.
@@ -1048,6 +1049,7 @@ fn send_raw_blocking(
                 // billing) the first attempt.
                 if transport_retryable(&e) && retries < budget {
                     retries += 1;
+                    crate::debug_panel::note_retry();
                     let wait = jitter(delay_ms);
                     crate::report::info(&format!(
                         "  ⟳ connection error — retrying in {:.1}s ({retries}/{budget})",

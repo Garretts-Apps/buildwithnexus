@@ -191,6 +191,11 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         return;
     }
     take_held_preview();
+    crate::workspace::note_pending(
+        name,
+        input,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
     // `finish` and `exit_plan` are internal control signals — don't double up with a header line.
     if name == "finish" || name == "exit_plan" || name == "ExitPlanMode" {
         return;
@@ -779,6 +784,7 @@ pub fn finish(summary: &str) {
 // orchestrator can see what will run before execution starts. Human mode
 // already renders the numbered plan.
 pub fn plan(steps: &[String]) {
+    crate::debug_panel::set_plan(steps);
     if mode() == Mode::Json {
         emit(json!({"type": "plan", "steps": steps}));
     }

@@ -4900,7 +4900,17 @@ fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
 }
 
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
+    if crate::workspace::armed() {
+        crate::workspace::before_tool(name, input, cwd);
+    }
+    let rewritten = crate::workspace::rewrite(name, input, cwd);
+    let input = rewritten.as_ref().unwrap_or(input);
+    let watch = crate::debug_panel::tool_start(name, input, cwd);
     let outcome = run_tool(name, input, cwd);
+    crate::debug_panel::tool_end(watch, name, input, cwd, &outcome.content, outcome.is_error);
+    if crate::workspace::armed() {
+        crate::workspace::after_tool(name, input, cwd, outcome.is_error);
+    }
     if !outcome.is_error {
         maybe_auto_commit(name, input, cwd);
     }

@@ -47,6 +47,7 @@ mod acp;
 pub mod agent;
 pub mod checkpoint;
 pub mod config;
+mod debug_panel;
 pub mod graphics;
 pub mod highlight;
 pub mod hooks;
@@ -74,6 +75,7 @@ pub mod usage;
 pub mod verifier;
 pub mod workdirs;
 pub mod workflow;
+mod workspace;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -411,6 +413,7 @@ fn exit_quietly_on_closed_stdout() {
 }
 
 pub fn run() {
+    debug_panel::init();
     exit_quietly_on_closed_stdout();
     #[cfg(unix)]
     {
@@ -556,6 +559,12 @@ pub fn run() {
         "-v" | "-V" | "--version" | "version" => println!("buildwithnexus {VERSION}"),
         "-h" | "--help" | "help" => usage(),
         "doctor" => run_doctor(&opts),
+        "debug" => {
+            if let Err(e) = debug_panel::cli(&args[1..]) {
+                eprintln!("buildwithnexus debug: {e}");
+                std::process::exit(2);
+            }
+        }
         "trust" => std::process::exit(hooks::trust_cli(&args[1..])),
         "review" => {
             let req = match ReviewRequest::parse(&args[1..]) {
@@ -2496,6 +2505,8 @@ fn usage_text() -> String {
          \x20 buildwithnexus login              replace the provider's API key (checked first)\n\
          \x20 buildwithnexus providers          list built-in providers\n\
          \x20 buildwithnexus doctor             diagnose setup (keys, tools, connectivity)\n\
+         \x20 buildwithnexus debug export [file.jsonl]  write the session trace as JSONL\n\
+         \x20 buildwithnexus debug replay <file.jsonl>  step through a trace in the panel\n\
          \x20 buildwithnexus update [--check]   install the latest release (--check: exit 10 if behind)\n\
          \x20 buildwithnexus review [--base <ref>|--staged] [focus]  read-only review (exit 9: blocking)\n\
          \x20 buildwithnexus trust --print      this folder's settings digest, for --trust-project\n\

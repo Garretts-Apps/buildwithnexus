@@ -53,6 +53,10 @@ pub fn set_model_label(model: &str) {
     render_footer();
 }
 
+pub(crate) fn model_label() -> String {
+    screen::with(|s| s.status.model.clone())
+}
+
 /// Apply the `images` and `notify` settings keys.
 pub fn configure_ui(images: &str, notify: &str) {
     let images_mode = match images.trim().to_ascii_lowercase().as_str() {
@@ -685,11 +689,39 @@ fn drain_typeahead() -> bool {
 // Applies one terminal event read by poll_typeahead: Ctrl-C/Esc raise the
 // interrupt flag, everything else edits the type-ahead buffer. Split out so
 // the buffering is testable without a terminal.
+pub(crate) fn paint_debug() {
+    if !ALT_SCREEN.load(Ordering::Relaxed) || !crate::debug_panel::visible() {
+        return;
+    }
+    let _frame = render_lock();
+    let (width, height) = term_size();
+    let rows = height.saturating_sub(reserved_rows());
+    let mut out = Vec::new();
+    crate::debug_panel::append_overlay(&mut out, width, rows, false);
+    if !out.is_empty() {
+        write_frame(&out);
+    }
+}
+
 fn typeahead_event(ev: Event, agent_running: bool) -> InterruptKind {
     let mut raised = InterruptKind::None;
     match ev {
         Event::Key(k) => {
             if k.kind == KeyEventKind::Release {
+                return raised;
+            }
+            if let Some(key) = crate::debug_panel::DebugKey::from_code(k.code) {
+                if crate::debug_panel::on_key(key) {
+                    if crate::debug_panel::visible() {
+                        crate::debug_panel::mark_input();
+                    }
+                    render_output();
+                    return raised;
+                }
+            }
+            if crate::workspace::on_code(k.code, k.modifiers.contains(KeyModifiers::ALT)) {
+                screen::with(|s| s.transcript.forget_painted());
+                render_output();
                 return raised;
             }
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2220,6 +2252,7 @@ fn build_output_frame(
     (width, height): (usize, usize),
     rows: usize,
     bg: &str,
+    origin_x: u16,
 ) -> (Vec<Placement>, Vec<Placement>, bool) {
     let sel = s.selection.current;
     let drawn_over = std::mem::replace(&mut s.images.dirty, false);
@@ -2297,7 +2330,7 @@ fn build_output_frame(
         if !full && !under_image && painted[row] == buf {
             continue;
         }
-        let _ = queue!(out, MoveTo(0, row as u16));
+        let _ = queue!(out, MoveTo(origin_x, row as u16));
         out.extend_from_slice(buf.as_bytes());
         visible_rows[row] = match line {
             Some(line) if !image_row => plain.unwrap_or_else(|| strip_ansi(line)),
@@ -2326,6 +2359,8 @@ fn render_output() {
     if !ALT_SCREEN.load(Ordering::Relaxed) {
         return;
     }
+    // Hidden panel: one atomic load, then nothing else from the debugger.
+    let _watch = crate::debug_panel::FrameWatch::start();
     // Cleared before the transcript is read: a line landing from here on
     // asks for its own frame.
     OUTPUT_DIRTY.store(false, Ordering::Relaxed);
@@ -2333,8 +2368,10 @@ fn render_output() {
     // Keep the scroll region matched to the current reserved rows before we
     // repaint — a just-queued prompt must not be scrolled over.
     let region_moved = ensure_output_region();
-    let (width, height) = term_size();
-    let width = width as usize;
+    let (term_w, height) = term_size();
+    let (origin_x, content_w) = crate::workspace::content_box(term_w);
+    let cover = crate::workspace::covers_output(term_w);
+    let width = if cover { 0 } else { content_w as usize };
     let rows = height.saturating_sub(reserved_rows()) as usize;
     let mut out: Vec<u8> = Vec::with_capacity(256);
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
@@ -2350,8 +2387,13 @@ fn render_output() {
     let bg = reset_all();
     // The frame is built from the transcript under the screen lock; nothing
     // in here writes to the terminal or takes the lock again.
-    let (placements, kept, full) =
-        screen::with(|s| build_output_frame(s, &mut out, (width, height as usize), rows, &bg));
+    let (placements, kept, full) = if cover {
+        (Vec::new(), Vec::new(), true)
+    } else {
+        screen::with(|s| {
+            build_output_frame(s, &mut out, (width, height as usize), rows, &bg, origin_x)
+        })
+    };
     // Drawing a Sixel leaves the cursor on the row below the image; with the
     // scroll region's bottom margin there, the terminal would scroll the
     // transcript. The margins are lifted while images are drawn: the rows
@@ -2379,6 +2421,9 @@ fn render_output() {
     }
     drop(redraw);
     screen::with(|s| s.images.drawn = placements);
+    let transcript_wrote = out.len() > head;
+    crate::workspace::append_overlay(&mut out, term_w, rows as u16, transcript_wrote);
+    crate::debug_panel::append_overlay(&mut out, term_w, rows as u16, transcript_wrote);
     if out.len() > head {
         let _ = write!(out, "\x1b8\x1b[?2026l");
         write_frame(&out);
@@ -2765,6 +2810,9 @@ fn render_composer(prompt: &str, buf: &[char], cursor: usize, scroll: &mut usize
     queue_composer_row(&mut out, prompt, buf, cursor, scroll);
     COMPOSER_PAINTED.store(false, Ordering::Relaxed);
     write_frame(&out);
+    if crate::debug_panel::visible() {
+        crate::debug_panel::mark_paint();
+    }
 }
 
 fn echo_submitted(prompt: &str, text: &str) {
@@ -3709,6 +3757,10 @@ fn start_typeahead_thread() {
     STARTED.get_or_init(|| {
         std::thread::spawn(|| loop {
             paint_if_due();
+            if crate::debug_panel::visible() {
+                crate::debug_panel::sample_host();
+                paint_debug();
+            }
             if is_raw() && is_agent_running() {
                 poll_typeahead();
                 // Elapsed-time / tokens-per-second readout: repaint the

@@ -700,6 +700,11 @@ pub(super) fn request_reply(
     // so keep it one short dim line instead of re-announcing model and tool
     // count in bright colors each step.
     tui::line(&tui::dim(&format!("  · {label}")));
+    let watch = if crate::debug_panel::armed() {
+        crate::debug_panel::model_start(&p.protocol.to_string(), &p.model, p.context_tokens, msgs)
+    } else {
+        None
+    };
     let thinking = std::cell::RefCell::new(ThinkingStream::default());
     let mut streamed = false;
     let mut renderer = tui::StreamRenderer::new();
@@ -711,6 +716,7 @@ pub(super) fn request_reply(
             if tui::interrupted() {
                 return;
             }
+            crate::debug_panel::model_token();
             thinking.borrow_mut().finish();
             renderer.push(c);
             // Drains typed keys and repaints the composer once.
@@ -721,6 +727,7 @@ pub(super) fn request_reply(
             if tui::interrupted() {
                 return;
             }
+            crate::debug_panel::model_token();
             thinking.borrow_mut().push(t);
         },
     );
@@ -732,14 +739,19 @@ pub(super) fn request_reply(
             if streamed {
                 report::assistant_end();
             }
+            crate::debug_panel::model_end(watch, 0, 0);
             return Err("interrupted".to_string());
         }
-        Err(e) => return Err(e),
+        Err(e) => {
+            crate::debug_panel::model_end(watch, 0, 0);
+            return Err(e);
+        }
     };
     renderer.flush();
     if streamed {
         report::assistant_end();
     }
+    crate::debug_panel::model_end(watch, r.usage.input, r.usage.output);
     Ok(r)
 }
 
