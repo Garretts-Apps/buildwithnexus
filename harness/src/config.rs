@@ -2406,7 +2406,9 @@ mod command_tests {
 
 // ── hooks directory ───────────────────────────────────────────────────────────
 // Auto-discovers scripts in ~/.buildwithnexus/hooks/<Event>/ so users can drop
-// a .sh or .py file there without editing settings.json.
+// a script there without editing settings.json. Unix-like extensions are
+// picked up everywhere; `.ps1`, `.cmd` and `.bat` are picked up on Windows,
+// where those interpreters exist.
 pub fn discover_hook_scripts(event: &str) -> Vec<PathBuf> {
     let dir = hooks_dir().join(event);
     let mut scripts = Vec::new();
@@ -4522,6 +4524,85 @@ mod tests {
         // No USERNAME (or a blank one): fall back to the OWNER RIGHTS SID.
         assert_eq!(icacls_args(p, false, None)[3], "*S-1-3-4:(R,W)");
         assert_eq!(icacls_args(p, false, Some("  "))[3], "*S-1-3-4:(R,W)");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restrict_file_drops_inherited_aces_and_grants_the_current_user() {
+        let d = unique_dir("acl");
+        let f = d.join("secret.txt");
+        fs::write(&f, "k").unwrap();
+        restrict(&f);
+        let out = std::process::Command::new("icacls")
+            .arg(&f)
+            .output()
+            .expect("icacls");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let user = std::env::var("USERNAME").expect("USERNAME");
+        assert!(
+            text.to_ascii_lowercase()
+                .contains(&user.to_ascii_lowercase()),
+            "grant missing for {user}: {text}"
+        );
+        assert!(
+            text.contains("(R,W)"),
+            "file grant should be read+write: {text}"
+        );
+        assert!(
+            !text.contains("(I)"),
+            "inherited ACEs should be removed: {text}"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn discover_hook_scripts_picks_up_windows_extensions_on_windows() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_dir("hooks");
+        std::env::set_var("NEXUS_HOME", &h);
+        let dir = h.join("hooks").join("PreToolUse");
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "a.sh", "b.py", "c.ps1", "d.cmd", "e.bat", "f.txt", "g.PS1", "note.rs",
+        ] {
+            fs::write(dir.join(name), "echo hi\n").unwrap();
+        }
+        let names: Vec<String> = discover_hook_scripts("PreToolUse")
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for kept in ["a.sh", "b.py", "note.rs"] {
+            assert!(
+                names.iter().any(|n| n == kept),
+                "{kept} missing from {names:?}"
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "f.txt"),
+            "non-scripts must stay out: {names:?}"
+        );
+        if cfg!(windows) {
+            for kept in ["c.ps1", "d.cmd", "e.bat", "g.PS1"] {
+                assert!(
+                    names.iter().any(|n| n == kept),
+                    "{kept} should be auto-discovered on Windows: {names:?}"
+                );
+            }
+        } else {
+            for dropped in ["c.ps1", "d.cmd", "e.bat", "g.PS1"] {
+                assert!(
+                    !names.iter().any(|n| n == dropped),
+                    "{dropped} is Windows-only: {names:?}"
+                );
+            }
+        }
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
     }
 
     fn unique_dir(tag: &str) -> PathBuf {

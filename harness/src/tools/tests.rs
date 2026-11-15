@@ -1020,7 +1020,8 @@ fn run_common_aliases_cover_file_search_shell_and_patch() {
     );
     assert!(!e.is_error, "{}", e.content);
 
-    let b = run("bash", &json!({"command": "printf alias-ok"}), &d);
+    // `echo` is a builtin of both `sh -c` and `cmd /C`. `printf` is not.
+    let b = run("bash", &json!({"command": "echo alias-ok"}), &d);
     assert!(!b.is_error, "{}", b.content);
     assert!(b.content.contains("alias-ok"), "{}", b.content);
 
@@ -1038,7 +1039,10 @@ fn run_common_aliases_cover_file_search_shell_and_patch() {
 
 #[test]
 fn python_tool_discovers_and_runs_json_stdin_script() {
-    if Command::new("python3").arg("--version").output().is_err() {
+    // Spawn success is not enough: the Windows Store `python3` stub starts
+    // and exits non-zero. The fallback itself is tested separately.
+    if !python3_invokes() {
+        eprintln!("skipping: python3 is not a working interpreter");
         return;
     }
     let d = tempdir();
@@ -1064,6 +1068,51 @@ print("hello " + data.get("name", "world"))
     assert!(!out.is_error, "{}", out.content);
     assert!(out.content.contains("hello nexus"), "{}", out.content);
 
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn python_interpreter_prefers_python3_and_falls_back_on_windows() {
+    assert_eq!(python_interpreter_name(true), "python3");
+    if cfg!(windows) {
+        assert_eq!(python_interpreter_name(false), "python");
+    } else {
+        assert_eq!(python_interpreter_name(false), "python3");
+    }
+}
+
+// A Store-style `python3` that starts and exits non-zero must not count as
+// an interpreter, and the fallback name `python` must be able to run a tool
+// script. The stub is invoked by path so this does not shadow python3 for
+// other tests.
+#[cfg(windows)]
+#[test]
+fn python_tool_falls_back_to_python_when_python3_fails() {
+    let d = tempdir();
+    let stub = d.join("python3.cmd");
+    fs::write(&stub, "@exit /b 1\r\n").unwrap();
+    assert!(
+        !interpreter_runs(&stub.to_string_lossy()),
+        "a python3 that exits non-zero is the Store stub, not an interpreter"
+    );
+    assert_eq!(python_interpreter_name(false), "python");
+    let script = d.join("tool.py");
+    fs::write(&script, "import sys\nprint('fallback-ok')\n").unwrap();
+    let out = Command::new("python")
+        .arg(&script)
+        .output()
+        .expect("python");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("fallback-ok"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let _ = fs::remove_dir_all(&d);
 }
 
@@ -1670,6 +1719,7 @@ fn run_with_timeout_gives_the_command_no_terminal() {
     assert!(start.elapsed() < Duration::from_secs(10));
 }
 
+#[cfg(unix)]
 #[test]
 fn run_with_timeout_kills_the_whole_process_group() {
     // The shell's background child must die with it on timeout, not linger.
@@ -3357,6 +3407,93 @@ fn editor_insert_preserves_crlf() {
     let _ = fs::remove_dir_all(&d);
 }
 
+#[test]
+fn edit_file_preserves_crlf() {
+    let d = tempdir();
+    run(
+        "write_file",
+        &json!({"path": "f.txt", "content": "alpha\r\nbeta\r\n"}),
+        &d,
+    );
+    let e = run(
+        "edit_file",
+        &json!({"path": "f.txt", "old": "beta", "new": "gamma"}),
+        &d,
+    );
+    assert!(!e.is_error, "{}", e.content);
+    assert_eq!(fs::read(d.join("f.txt")).unwrap(), b"alpha\r\ngamma\r\n");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[cfg(windows)]
+#[test]
+fn run_command_executes_through_cmd() {
+    let d = tempdir();
+    // `%ComSpec%` is expanded by cmd.exe, not by a POSIX shell.
+    let r = run("run_command", &json!({"command": "echo %ComSpec%"}), &d);
+    assert!(!r.is_error, "{}", r.content);
+    assert!(
+        r.content.to_ascii_lowercase().contains("cmd.exe"),
+        "{}",
+        r.content
+    );
+    assert!(r.content.contains("[exit 0]"), "{}", r.content);
+    let written = run(
+        "run_command",
+        &json!({"command": "echo cmd-ok> marker.txt"}),
+        &d,
+    );
+    assert!(!written.is_error, "{}", written.content);
+    let body = fs::read_to_string(d.join("marker.txt")).unwrap();
+    assert!(body.contains("cmd-ok"), "{body}");
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[cfg(windows)]
+#[test]
+fn start_server_runs_under_cmd_and_taskkill_stops_the_tree() {
+    if command_available("tmux") {
+        eprintln!("skipping: tmux would own the server instead of cmd");
+        return;
+    }
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = tempdir().join("home");
+    fs::create_dir_all(&home).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    let cwd = tempdir();
+    let name = format!("winsrv{}", std::process::id());
+    let started = run(
+        "start_server",
+        &json!({"name": name, "command": "ping -n 40 127.0.0.1 >NUL"}),
+        &cwd,
+    );
+    assert!(!started.is_error, "{}", started.content);
+    let expected = safe_name(&name);
+    let listed = run("list_servers", &json!({}), &cwd);
+    let rows: Value = serde_json::from_str(&listed.content).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{}", listed.content);
+    assert_eq!(rows[0]["name"], expected);
+    assert_eq!(rows[0]["running"], true, "{}", listed.content);
+    assert!(rows[0]["tmux_session"].is_null(), "{}", listed.content);
+    let pid = rows[0]["pid"].as_u64().expect("cmd pid");
+    assert!(pid_running(pid), "cmd wrapper {pid} was not alive");
+    let stopped = run("stop_server", &json!({"name": expected}), &cwd);
+    assert!(stopped.content.contains("stopped"), "{}", stopped.content);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pid_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} survived taskkill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::env::remove_var("NEXUS_HOME");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cwd);
+}
+
 // ── edit feedback ───────────────────────────────────────────────────────
 #[test]
 fn run_edit_not_found_reports_closest_line_hint() {
@@ -3772,8 +3909,8 @@ fn check_work_npm_uses_declared_scripts_and_lockfile() {
 #[test]
 fn check_work_reports_pass_fail_and_missing() {
     let d = tempdir();
-    // A custom command that passes.
-    let ok = run("check_work", &json!({"command": "true"}), &d);
+    // A custom command that passes. `echo` is a builtin of sh and of cmd.
+    let ok = run("check_work", &json!({"command": "echo ok"}), &d);
     assert!(!ok.is_error, "{}", ok.content);
     assert!(ok.content.contains("all checks passed"));
 
