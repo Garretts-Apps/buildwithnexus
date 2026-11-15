@@ -54,10 +54,7 @@ pub(crate) fn show_view(asm: &Assembly) -> ShowAction {
             frame.push(String::new());
         }
         frame.push(super::rule());
-        frame.push(clip(
-            &super::dim(" j/k scroll   e edit   s suggest   u your layer   q close"),
-            cols as usize,
-        ));
+        frame.push(show_hint(cols as usize));
         overlay.draw(&frame);
         match overlay.read_event() {
             OverlayEvent::Key(k) => match k.code {
@@ -419,12 +416,30 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Hint under the show pane. `n/p section` is there when the line fits.
+fn show_hint(cols: usize) -> String {
+    let full = " j/k scroll   n/p section   e edit   s suggest   u your layer   q close";
+    let short = " j/k scroll   e edit   s suggest   u your layer   q close";
+    let text = if super::str_width(full) <= cols {
+        full
+    } else {
+        short
+    };
+    clip(&super::dim(text), cols)
+}
+
 fn clip(s: &str, cols: usize) -> String {
-    // Overlay clips again; this keeps a header from wrapping into the body.
-    let plain_width = super::str_width(&super::strip_ansi(s));
-    if plain_width <= cols {
+    // The overlay cuts anything past the pane with no marker. A header has
+    // to finish inside `cols`, ellipsis included, or the last word is sliced
+    // (`bundled.` with the closer gone).
+    if cols == 0 {
+        return String::new();
+    }
+    if super::str_width(&super::strip_ansi(s)) <= cols {
         return s.to_string();
     }
+    let ellipsis = '…';
+    let limit = cols.saturating_sub(super::char_width(ellipsis));
     let mut kept = String::new();
     let mut w = 0usize;
     let mut chars = s.chars().peekable();
@@ -439,14 +454,14 @@ fn clip(s: &str, cols: usize) -> String {
             }
             continue;
         }
-        let cw = super::str_width(&c.to_string()).max(1);
-        if w + cw > cols.saturating_sub(1) {
-            kept.push_str("...");
+        let cw = super::char_width(c);
+        if w + cw > limit {
             break;
         }
         kept.push(c);
         w += cw;
     }
+    kept.push(ellipsis);
     kept
 }
 
@@ -645,5 +660,63 @@ mod tests {
         assert!(!plain.contains(secret), "{plain}");
         assert!(plain.contains(ESTIMATE));
         assert_eq!(painted.starts[0].0, "user override");
+    }
+
+    /// The skills header used to run past 80 columns and the terminal cut it
+    /// at `rust-cli (bundled.` — the closer and everything after it gone.
+    #[test]
+    fn skills_header_truncates_inside_80_columns() {
+        let source = "self-knowledge (bundled), codebase-repair (bundled), rust-cli (bundled), tool-use (bundled), git (bundled), git-release (bundled)";
+        let asm = Assembly {
+            mode: PromptMode::Build,
+            context_tokens: 200_000,
+            sections: vec![Section {
+                layer: "skills",
+                source: source.into(),
+                text: "• /self-knowledge — look it up\n".into(),
+                in_system: true,
+            }],
+        };
+        let broken =
+            "skills  self-knowledge (bundled), codebase-repair (bundled), rust-cli (bundled.";
+        for width in [80usize, 100, 120] {
+            let painted = paint_show(&asm, width);
+            let header = painted
+                .lines
+                .iter()
+                .find(|l| super::super::strip_ansi(l).contains("skills"))
+                .expect("skills header");
+            let plain = super::super::strip_ansi(header);
+            assert!(
+                super::super::str_width(&plain) <= width,
+                "{width}: {} cols, {plain}",
+                super::super::str_width(&plain)
+            );
+            assert!(
+                plain.ends_with('…'),
+                "{width}: a header past the pane ends on an ellipsis, got {plain}"
+            );
+            assert!(
+                !plain.contains(broken) && !plain.ends_with("bundled."),
+                "{width}: {plain}"
+            );
+        }
+        let at_80 = super::super::strip_ansi(
+            paint_show(&asm, 80)
+                .lines
+                .iter()
+                .find(|l| super::super::strip_ansi(l).contains("skills"))
+                .unwrap(),
+        );
+        assert!(at_80.contains("self-knowledge (bundled)"));
+        assert!(at_80.contains("codebase-repair (bundled)"));
+        assert_eq!(super::super::str_width(&at_80), 80);
+
+        let hint = super::super::strip_ansi(&show_hint(80));
+        assert!(hint.contains("n/p section"), "{hint}");
+        assert!(super::super::str_width(&hint) <= 80, "{hint}");
+        let narrow = super::super::strip_ansi(&show_hint(40));
+        assert!(!narrow.contains("n/p section"), "{narrow}");
+        assert!(super::super::str_width(&narrow) <= 40, "{narrow}");
     }
 }
