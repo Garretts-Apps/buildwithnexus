@@ -40,6 +40,14 @@ const MAX_ACT_NUDGES: usize = 2;
 mod compact;
 use compact::*;
 
+mod prompt_layers;
+#[cfg(test)]
+pub(crate) use prompt_layers::effective_system;
+pub(crate) use prompt_layers::{
+    context_pieces, effective_pieces, join_pieces, PromptMode, BRAINSTORM_CONTRACT, CHAT_CONTRACT,
+    COMPACT_CONTEXT, PLAN_CONTRACT,
+};
+
 // ── permissions ───────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Permission {
@@ -151,154 +159,10 @@ fn persona() -> String {
 
 // Build the system prompt prefix from memory and skills/agents files.
 // When context_tokens is small (≤16K), skip expensive sections to leave
-// room for tool definitions + actual conversation.
+// room for tool definitions + actual conversation. The labeled pieces are
+// the same strings; /system-prompt is the only caller that reads the labels.
 fn context_prefix(cwd: &Path, context_tokens: usize) -> String {
-    let compact = context_tokens <= 16_384;
-    let mut parts: Vec<String> = Vec::new();
-
-    // Identity leads every prompt — it is short and always worth the tokens.
-    parts.push(persona());
-
-    let home_str = crate::config::user_home()
-        .map(|h| h.display().to_string())
-        .unwrap_or_default();
-    let mut path_info = format!(
-        "[Environment Paths]\n\
-         Workspace (CWD): {}\n\
-         User Home (~): {}\n",
-        cwd.display(),
-        home_str
-    );
-    if cwd.to_string_lossy().contains("/tmp/") || cwd.to_string_lossy().contains("/private/tmp/") {
-        path_info.push_str(
-            "Note: The current workspace is running in a temporary directory/mount. \
-             To find personal folders or files belonging to the user, you must search starting from the User Home (~).\n"
-        );
-    }
-    parts.push(path_info);
-
-    // Always include the tool manifest so the model knows what's built-in
-    // and doesn't try to install external tools to do things we already handle.
-    parts.push(tool_manifest());
-    if !compact {
-        parts.push(visible_reasoning_policy());
-        parts.push(discovery_policy());
-        parts.push(skill_manifest());
-    }
-
-    // Probe which common system tools are actually present so the model can
-    // pick the right one without guessing or installing alternatives.
-    // Skip for small contexts — the tool defs already dominate.
-    if !compact {
-        let env_snap = env_snapshot();
-        if !env_snap.is_empty() {
-            parts.push(format!(
-                "[Environment — tools already installed]\n{env_snap}"
-            ));
-        }
-    }
-
-    // Folders added with --add-dir, and what their instruction files say.
-    if let Some(section) = crate::workdirs::prompt_section(cwd, compact) {
-        parts.push(section);
-    }
-
-    // Project instructions (AGENTS.md / CLAUDE.md) come before memory and the
-    // Agents.md roles: repository conventions frame everything that follows.
-    let instructions = config::prompt_instructions(cwd);
-    if let Some(text) = config::instructions_prompt(&instructions) {
-        trace::record_visible(
-            "instructions",
-            format!("loaded {} instruction file(s)", instructions.len()),
-            serde_json::json!({
-                "files": instructions.iter().map(|f| f.label.clone()).collect::<Vec<_>>(),
-                "bytes": text.len(),
-            }),
-        );
-        let text = if compact && text.len() > 2_000 {
-            format!("{}…", crate::config::cut_at_char_boundary(&text, 2_000))
-        } else {
-            text
-        };
-        parts.push(text);
-    }
-
-    if let Some(mem) = config::load_memory() {
-        // Memory is user-important; always include but truncate for small ctx
-        let mem_text = if compact && mem.len() > 300 {
-            format!("{}…", crate::config::cut_at_char_boundary(&mem, 300))
-        } else {
-            mem
-        };
-        parts.push(format!("[Memory from previous sessions]\n{mem_text}"));
-    }
-    if let Some(agents) = config::load_agents() {
-        trace::record_visible(
-            "agents",
-            "loaded Agents.md",
-            serde_json::json!({"bytes": agents.len(), "preview": trace::preview(&agents, 600)}),
-        );
-        // For small contexts, truncate Agents.md to avoid blowing the budget
-        let agents_text = if compact && agents.len() > 500 {
-            format!("{}…", crate::config::cut_at_char_boundary(&agents, 500))
-        } else {
-            agents
-        };
-        parts.push(format!("[Agent knowledge — Agents.md]\n{agents_text}"));
-    }
-
-    let (user_sys, project_sys) = config::load_system_prompts(cwd);
-    if let Some(sys_prompt) = user_sys {
-        parts.push(format!(
-            "[Custom User System Prompt — system.md]\n{sys_prompt}"
-        ));
-    }
-    if let Some(sys_prompt) = project_sys {
-        parts.push(format!(
-            "[Project System Prompt — .buildwithnexus/system.md]\n{sys_prompt}"
-        ));
-    }
-
-    // Skip rules, knowledge, hooks, and skill descriptions for small contexts
-    if !compact {
-        // A separate verifier pass enforces the engineering rules — a 2-line
-        // pointer is enough; injecting the full rule list bloated every prompt.
-        parts.push(
-            "[Operational rules]\nProject engineering rules are enforced by a separate \
-             verifier pass after you finish.\nViolations are reported back to you to address."
-                .to_string(),
-        );
-
-        // Inject structured knowledge base if present
-        let kb = crate::knowledge::KnowledgeBase::new(".");
-        if !kb.entities.is_empty() {
-            parts.push(format!(
-                "[Structured Knowledge Base — Known Project Entities]\n{}",
-                kb.generate_context_summary(&[])
-            ));
-        }
-
-        let active_hooks = hooks::list_active();
-        if !active_hooks.is_empty() {
-            parts.push(format!("[Active Hooks]\n{}", active_hooks.join("\n")));
-        }
-        let skill_descs = config::load_skill_descriptions(cwd);
-        if !skill_descs.is_empty() {
-            let joined = skill_descs
-                .iter()
-                .map(|(name, desc)| format!("• /{name} — {desc}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            parts.push(format!(
-                "[Available skills — descriptions only]\n{joined}\n\n\
-    To use a skill, call load_skill with the skill name to load its full instructions. \
-    Only load skills that are directly relevant to the current task. \
-    Do not load skills for simple greetings or casual replies."
-            ));
-        }
-    }
-
-    format!("{}\n\n", parts.join("\n\n"))
+    join_pieces(&context_pieces(cwd, context_tokens))
 }
 
 fn tool_manifest() -> String {

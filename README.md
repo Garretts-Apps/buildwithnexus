@@ -391,6 +391,7 @@ Inside the interactive session:
 /btw <context>            add a note to your next message
 /config                   configure hooks, memory, and commands via AI
 /memory                   view and edit session memory
+/system-prompt [show|edit|suggest|reset|path]  the system prompt that is sent; e edits, s suggests
 /skills                   list skills and custom commands
 /trace                    inspect hooks, tools, skills, and subagents
 ```
@@ -802,8 +803,9 @@ this session. A headless run cannot ask, so it names them as not reviewed
 and leaves them out. `/init` and `buildwithnexus init --agents-md` draft one.
 `~/.buildwithnexus/system.md` is always yours; a project's `system.md` is
 added after it only once you trust the folder (`"project_system_prompt":
-"replace"` lets a trusted project replace yours). Discovery order, the size
-caps and `instruction_files` are in
+"replace"` lets a trusted project replace yours). `/system-prompt` shows
+that prompt and edits your layer.
+Discovery order, the size caps and `instruction_files` are in
 [Project instructions](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/instructions.md).
 
 ## Skills

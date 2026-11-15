@@ -27,6 +27,34 @@ files (or to improve the one there), shown as a diff you approve;
 The `instruction_files` settings key changes which names are looked up
 (default `["AGENTS.md", "CLAUDE.md"]`; add `"GEMINI.md"`, or `[]` to disable).
 
+## Seeing and editing the prompt
+
+`/system-prompt` (and `bwn system-prompt show`) prints the system prompt a
+turn sends, in the order it is sent: the mode contract, the built-in base,
+environment and tool text, instruction files, memory, `Agents.md`, your
+`system.md`, a trusted project's `system.md`, rules, hooks and skill
+descriptions. Tool definitions are listed after that and marked as not part
+of the system text. Each section names its source and an estimated token
+count (the same 4-characters-a-token estimate `/context` uses; the line says
+it is an estimate). Anything that looks like an API key is shown as
+`[redacted]`. A window of 16K tokens or less is the compact prompt, and the
+view says so.
+
+`e`, or `/system-prompt edit`, opens `$VISUAL` or `$EDITOR` on the override.
+With neither set, the session edits it in the terminal. You choose user
+(`~/.buildwithnexus/system.md`, or `$NEXUS_HOME/system.md`) or project
+(`.buildwithnexus/system.md`). The diff is shown before anything is written.
+`/system-prompt reset` deletes the file you name. A project file still waits
+for trust before it is sent.
+
+`s`, or `/system-prompt suggest [goal]`, asks the current model for a new
+version of that same layer. Each hunk starts unaccepted. `a` accepts the
+hunk under the cursor, `r` rejects it, `y` writes only the accepted ones.
+
+`bwn system-prompt` takes `show`, `edit`, `suggest`, `reset` and `path`.
+`--json` is for `show`. `--user` and `--project` pick the file. `--mode` is
+`build` (the default outside a session), `plan`, `brainstorm` or `chat`.
+
 The mixed-case `.buildwithnexus/Agents.md` is different: it defines agent
 roles/capabilities (`/agents` shows it) and is loaded after the instructions.
 
