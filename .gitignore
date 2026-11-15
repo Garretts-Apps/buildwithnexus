@@ -17,6 +17,9 @@ harness/.cargo/
 /buildwithnexus.exe
 *.tar.gz
 
+# Competitor benchmark installs (the JSON under bench/results is committed)
+/bench/.tools/
+
 # Local runtime artifacts
 .buildwithnexus/artifacts/
 .buildwithnexus/settings.local.json
