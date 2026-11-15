@@ -878,7 +878,8 @@ fn unattended_settings(provider: Option<&str>, has_key: impl Fn(&str) -> bool) -
 
 fn no_setup_headless_msg() -> String {
     "no provider is set up, and there is no terminal to run setup in.\n  \
-     Set an API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY or HF_TOKEN),\n  \
+     Set an API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, HF_TOKEN,\n  \
+     GEMINI_API_KEY, XAI_API_KEY, MISTRAL_API_KEY or DEEPSEEK_API_KEY),\n  \
      pass --provider (e.g. --provider ollama), or run `buildwithnexus init` once in a terminal."
         .to_string()
 }

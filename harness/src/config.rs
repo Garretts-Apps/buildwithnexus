@@ -91,6 +91,52 @@ pub const PRESETS: &[Preset] = &[
         more_models: &[],
         local: false,
     },
+    // Hosted OpenAI-compatible APIs. They sit after the original remote
+    // presets so an unattended run that already has one of those keys still
+    // picks the same provider. A bare "gemini…" model name still goes to
+    // OpenRouter; these ids are selected by name (`--provider gemini`).
+    Preset {
+        id: "gemini",
+        label: "Google (Gemini)",
+        protocol: Protocol::OpenAi,
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        env_key: "GEMINI_API_KEY",
+        default_model: "gemini-4-hydrogen",
+        more_models: &["gemini-3.8-flash"],
+        local: false,
+    },
+    Preset {
+        id: "xai",
+        label: "xAI (Grok)",
+        protocol: Protocol::OpenAi,
+        base_url: "https://api.x.ai/v1",
+        env_key: "XAI_API_KEY",
+        default_model: "grok-4.7",
+        more_models: &[],
+        local: false,
+    },
+    Preset {
+        id: "mistral",
+        label: "Mistral",
+        protocol: Protocol::OpenAi,
+        base_url: "https://api.mistral.ai/v1",
+        env_key: "MISTRAL_API_KEY",
+        default_model: "mistral-large-4",
+        more_models: &["mistral-large-latest"],
+        local: false,
+    },
+    Preset {
+        id: "deepseek",
+        label: "DeepSeek",
+        protocol: Protocol::OpenAi,
+        // Chat completions live at the host root (`/chat/completions`), which
+        // is the base URL DeepSeek documents. Not `…/v1`.
+        base_url: "https://api.deepseek.com",
+        env_key: "DEEPSEEK_API_KEY",
+        default_model: "deepseek-flash",
+        more_models: &["deepseek-v4-pro"],
+        local: false,
+    },
     Preset {
         id: "ollama",
         label: "Ollama (local)",
@@ -3930,6 +3976,33 @@ mod tests {
         for n in &names {
             assert!(uniq.insert(n), "duplicate skill name {n}");
         }
+    }
+
+    #[test]
+    fn hosted_compat_presets_follow_the_original_remote_ones() {
+        let ids: Vec<&str> = PRESETS.iter().map(|p| p.id).collect();
+        let huggingface = ids.iter().position(|id| *id == "huggingface").unwrap();
+        for id in ["gemini", "xai", "mistral", "deepseek"] {
+            let i = ids.iter().position(|x| *x == id).unwrap();
+            assert!(
+                i > huggingface,
+                "{id} would change which key an unattended run picks"
+            );
+            let p = preset(id).unwrap();
+            assert!(!p.local, "{id}");
+            assert_eq!(p.protocol, Protocol::OpenAi);
+            assert!(p.base_url.starts_with("https://"), "{}", p.base_url);
+            assert!(p.env_key.ends_with("_API_KEY"), "{}", p.env_key);
+            assert!(!p.default_model.is_empty());
+        }
+        assert_eq!(
+            preset("deepseek").unwrap().base_url,
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            preset("gemini").unwrap().base_url,
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
     }
 
     #[test]

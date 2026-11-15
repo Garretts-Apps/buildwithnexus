@@ -190,9 +190,22 @@ Ollama — cover everything. Pick a provider during setup (or `bwn init`):
 | OpenRouter | remote | `OPENROUTER_API_KEY` |
 | Groq | remote | `GROQ_API_KEY` |
 | Hugging Face | remote | `HF_TOKEN` |
+| Google (Gemini) | remote | `GEMINI_API_KEY` |
+| xAI (Grok) | remote | `XAI_API_KEY` |
+| Mistral | remote | `MISTRAL_API_KEY` |
+| DeepSeek | remote | `DEEPSEEK_API_KEY` |
 | Ollama | local | — |
 | llama.cpp server | local | — |
 | LM Studio | local | — |
+
+Gemini, xAI, Mistral and DeepSeek speak the OpenAI chat-completions
+protocol at their own hosts (DeepSeek's is `https://api.deepseek.com`, with
+no `/v1`; Google still labels its compatibility endpoint a beta). A model
+name typed on its own that starts with `gemini` still selects OpenRouter
+(`google/<name>`). `--provider gemini` and `/model gemini <name>` use
+Google's endpoint. With no settings file, a headless run still picks the
+first of the original keys that is set (Anthropic, then OpenAI, OpenRouter,
+Groq, Hugging Face) before these.
 
 Env vars override the stored key, so CI and one-offs Just Work. Keys live in
 `~/.buildwithnexus/.env.keys` (0600). A key is typed hidden (dots, then only
@@ -347,6 +360,7 @@ Inside the interactive session:
 /rewind                   go back to an earlier prompt: code, conversation, or both
 /checkpoints              tasks and files /undo can restore
 /resume                   pick a saved session (this folder first; type to filter)
+/fork [name]              copy this conversation into a new session and continue there
 /rename <name>            name this session
 /export [file]            this conversation as Markdown (default ~/.buildwithnexus/exports/<id>.md)
 /copy                     the last answer to the clipboard (OSC 52)
@@ -393,7 +407,9 @@ bwn sessions rm <id>           # delete a saved session
 `bwn -c` is `bwn continue`. With no session in this folder, `continue` takes
 the latest one anywhere and says so. In a session, `/resume` picks a saved
 session (this folder first; type words to filter), `/rename <name>` names the
-current one, and `/new` starts a fresh one. `/export [file]` writes the
+current one, and `/new` starts a fresh one. `/fork [name]` copies this
+conversation into a new session and continues there; the previous session
+stays saved, and `/resume` opens it. `/export [file]` writes the
 conversation as Markdown, `/copy` puts the last answer on the clipboard
 (OSC 52, so it works over SSH), and `/ask <question>` answers a side question
 from the conversation without adding it. `/btw <note>` adds a note to your
@@ -854,7 +870,14 @@ client. Configure servers under `mcp_servers` in `~/.buildwithnexus/settings.jso
 | `url`, `headers` | http: the endpoint and extra request headers (a static token goes here). `Mcp-Session-Id` is tracked automatically. |
 | `oauth` | http: a client registered ahead of time, for a server whose authorization server has no dynamic registration: `client_id`, optional `client_secret`, `scopes`, and `callback_port` when the redirect URI must be exact. |
 | `timeout_secs` | Per-request deadline (default `30`). A server that hangs or exits is reported once and its tools drop out for the session. |
+| `include_tools` | Tool names to advertise. Omit the key to advertise every tool the server lists. An empty list advertises none. |
+| `exclude_tools` | Tool names never advertised. A name here is dropped even when `include_tools` lists it. |
 | `enabled` | `false` keeps the entry but never connects. |
+
+A name in `include_tools` or `exclude_tools` is the server's own tool name,
+or the `mcp__<server>__<tool>` name `/mcp` prints. Tools that are filtered
+out are not offered to the model and cannot be called. The connection notice
+counts them as hidden. Omitting both keys advertises every tool, as before.
 
 Servers connect lazily in the background on the first prompt (headless runs
 connect before the first request, waiting at most 5 s, or a server's own

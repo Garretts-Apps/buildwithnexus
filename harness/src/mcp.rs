@@ -58,6 +58,12 @@ pub struct ServerConfig {
     /// `timeout_secs` was set for this server: a headless run waits for it
     /// that long instead of HEADLESS_WAIT.
     pub timeout_set: bool,
+    /// When set, only these tool names are advertised. `None` means every
+    /// tool the server lists (the same as before the key existed).
+    pub include_tools: Option<Vec<String>>,
+    /// Tool names that are never advertised. A name here is dropped even
+    /// when `include_tools` also lists it.
+    pub exclude_tools: Vec<String>,
     /// `oauth`: a pre-registered client for `mcp login` (http only).
     pub oauth: crate::mcp_auth::OAuthSettings,
 }
@@ -68,6 +74,35 @@ impl ServerConfig {
             Transport::Stdio { .. } => "stdio",
             Transport::Http { .. } => "http",
         }
+    }
+}
+
+/// `include_tools` / `exclude_tools`: absent is `None` (no list). A present
+/// list must be strings; an empty `include_tools` advertises nothing.
+fn tool_name_list(
+    server: &str,
+    key: &str,
+    v: Option<&Value>,
+) -> Result<Option<Vec<String>>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut names = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(name) => names.push(name.to_string()),
+                    None => {
+                        return Err(format!(
+                            "mcp_servers.{server}.{key}[{i}] must be a non-empty tool name"
+                        ))
+                    }
+                }
+            }
+            Ok(Some(names))
+        }
+        Some(_) => Err(format!(
+            "mcp_servers.{server}.{key} must be a list of tool names"
+        )),
     }
 }
 
@@ -179,6 +214,9 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         .get("trust_read_only_hints")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let include_tools = tool_name_list(name, "include_tools", obj.get("include_tools"))?;
+    let exclude_tools =
+        tool_name_list(name, "exclude_tools", obj.get("exclude_tools"))?.unwrap_or_default();
     Ok(ServerConfig {
         name: name.to_string(),
         transport,
@@ -186,8 +224,40 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         enabled,
         trust_read_only_hints,
         timeout_set: !matches!(obj.get("timeout_secs"), None | Some(Value::Null)),
+        include_tools,
+        exclude_tools,
         oauth,
     })
+}
+
+/// Tools a server config advertises. `include` of `None` keeps every tool;
+/// `Some` is an allow-list, and an empty allow-list keeps none. `exclude`
+/// always drops a match, including one the allow-list names. A name matches
+/// the server's own tool name or the mangled `mcp__<server>__<tool>` name.
+/// The second value is how many tools were dropped.
+pub fn select_tools(
+    tools: Vec<McpTool>,
+    include: Option<&[String]>,
+    exclude: &[String],
+) -> (Vec<McpTool>, usize) {
+    let before = tools.len();
+    let named = |list: &[String], tool: &McpTool| {
+        list.iter().any(|n| n == &tool.name || n == &tool.mangled)
+    };
+    let kept = tools
+        .into_iter()
+        .filter(|tool| {
+            if named(exclude, tool) {
+                return false;
+            }
+            match include {
+                Some(list) => named(list, tool),
+                None => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let hidden = before - kept.len();
+    (kept, hidden)
 }
 
 // ── tool naming ─────────────────────────────────────────────────────────────
@@ -992,8 +1062,9 @@ fn lock_state(s: &Arc<Mutex<ServerState>>) -> std::sync::MutexGuard<'_, ServerSt
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// A live connection plus the server's "name version" and its tools.
-type Connected = (Box<dyn Rpc>, String, Vec<McpTool>);
+// A live connection, the server's "name version", the tools to advertise,
+// and how many listed tools the include/exclude filters dropped.
+type Connected = (Box<dyn Rpc>, String, Vec<McpTool>, usize);
 
 // Never signs in: a server that wants a login comes back NeedsAuth, and only
 // `mcp login` opens a browser.
@@ -1011,8 +1082,9 @@ fn connect(cfg: &ServerConfig) -> Result<Connected, Status> {
         e => Status::Failed(format!("{step} failed: {}", e.message())),
     };
     let info = handshake(conn.as_mut()).map_err(|e| failed("initialize", e))?;
-    let tools = list_tools(conn.as_mut(), &cfg.name).map_err(|e| failed("tools/list", e))?;
-    Ok((conn, info, tools))
+    let listed = list_tools(conn.as_mut(), &cfg.name).map_err(|e| failed("tools/list", e))?;
+    let (tools, hidden) = select_tools(listed, cfg.include_tools.as_deref(), &cfg.exclude_tools);
+    Ok((conn, info, tools, hidden))
 }
 
 /// Starts connecting every configured server in the background. Idempotent:
@@ -1059,7 +1131,7 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
             let result = connect(&cfg);
             let mut reg = registry();
             let notice = match result {
-                Ok((conn, info, tools)) => {
+                Ok((conn, info, tools, hidden)) => {
                     let n = tools.len();
                     let mut st = lock_state(&state);
                     if generation == reg.generation {
@@ -1068,9 +1140,14 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
                         st.server_info = info;
                         st.status = Status::Connected;
                     }
+                    let hidden = if hidden == 0 {
+                        String::new()
+                    } else {
+                        format!(" ({hidden} hidden by include_tools/exclude_tools)")
+                    };
                     (
                         format!(
-                            "mcp: {name} connected, {n} tool{}",
+                            "mcp: {name} connected, {n} tool{}{hidden}",
                             crate::report::plural(n)
                         ),
                         true,
@@ -1707,7 +1784,7 @@ fn login(name: &str, connect: bool, say: &mut dyn FnMut(&str)) -> Result<Vec<Str
 
 fn connect_once(cfg: &ServerConfig) -> Result<usize, String> {
     connect(cfg)
-        .map(|(_, _, tools)| tools.len())
+        .map(|(_, _, tools, _)| tools.len())
         .map_err(|s| match s {
             Status::NeedsAuth(why) if why.is_empty() => "it still asks for a login".into(),
             other => other.detail().to_string(),
@@ -1914,6 +1991,60 @@ mod tests {
             parse_server("a", &json!({"command": "x", "timeout_secs": 0}))
                 .unwrap_err()
                 .contains("timeout_secs")
+        );
+    }
+
+    #[test]
+    fn tool_filters_are_optional_and_exclude_wins() {
+        let open = parse_server("fs", &json!({"command": "fs"})).unwrap();
+        assert!(open.include_tools.is_none());
+        assert!(open.exclude_tools.is_empty());
+
+        let cfg = parse_server(
+            "fs",
+            &json!({"command": "fs", "include_tools": [" read ", "write"], "exclude_tools": ["write"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.include_tools.as_deref(),
+            Some(["read".to_string(), "write".to_string()].as_slice())
+        );
+        assert_eq!(cfg.exclude_tools, ["write".to_string()]);
+
+        let tools = vec![
+            parse_tool("fs", &json!({"name": "read"})).unwrap(),
+            parse_tool("fs", &json!({"name": "write"})).unwrap(),
+            parse_tool("fs", &json!({"name": "delete"})).unwrap(),
+        ];
+        let (kept, hidden) = select_tools(tools.clone(), None, &[]);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(hidden, 0);
+        let (kept, hidden) = select_tools(
+            tools.clone(),
+            cfg.include_tools.as_deref(),
+            &cfg.exclude_tools,
+        );
+        assert_eq!(
+            kept.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["read"]
+        );
+        assert_eq!(hidden, 2);
+        let (kept, _) = select_tools(tools.clone(), Some(&["mcp__fs__delete".into()]), &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "delete");
+        let (kept, hidden) = select_tools(tools, Some(&[]), &[]);
+        assert!(kept.is_empty());
+        assert_eq!(hidden, 3);
+
+        assert!(
+            parse_server("fs", &json!({"command": "fs", "include_tools": "read"}))
+                .unwrap_err()
+                .contains("list of tool names")
+        );
+        assert!(
+            parse_server("fs", &json!({"command": "fs", "exclude_tools": [""]}))
+                .unwrap_err()
+                .contains("non-empty")
         );
     }
 

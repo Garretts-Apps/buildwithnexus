@@ -329,6 +329,14 @@ pub const COMMANDS: &[SlashCommand] = &[
         "pick a saved session to resume",
         &[],
     ),
+    cmd(
+        TALK,
+        "/fork",
+        &[],
+        "[name]",
+        "copy this conversation into a new session and continue there",
+        &[],
+    ),
     cmd(TALK, "/rename", &[], "<name>", "name this session", &[]),
     cmd(
         TALK,

@@ -4,6 +4,22 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Gemini, xAI, Mistral and DeepSeek are provider presets** (`gemini`,
+  `xai`, `mistral`, `deepseek`), each an OpenAI-compatible endpoint with its
+  own API key. Existing provider ids are unchanged. A bare model name that
+  starts with `gemini` still selects OpenRouter. With no settings file, a
+  headless run still prefers an Anthropic, OpenAI, OpenRouter, Groq or
+  Hugging Face key when one of those is set.
+- **MCP servers can hide tools.** `include_tools` advertises only the named
+  tools (omit it for every tool, as before); `exclude_tools` drops names
+  even when they are included. A filtered-out tool is not offered to the
+  model.
+- **`/fork [name]`** copies the current conversation into a new session and
+  continues there. The previous session stays saved; `/resume` opens it.
+
 ## [0.20.0] - 2026-11-13
 
 A hang fixed, and a pass over what bwn makes the machine do: typing,
