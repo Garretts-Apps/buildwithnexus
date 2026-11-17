@@ -231,6 +231,10 @@ impl Transcript {
         self.lines.push(s);
     }
 
+    fn same_at(&self, i: usize, s: &str) -> bool {
+        self.lines.get(i).is_some_and(|line| line == s)
+    }
+
     fn set(&mut self, i: usize, s: String) {
         if i >= self.lines.len() {
             return;
@@ -370,6 +374,15 @@ pub(crate) use theme::{no_color, span_paint, SpanPaint};
 // Used by report's diff renderer: a background tint behind added and
 // removed spans. The bg is restored to the theme background (alt-screen)
 // or the terminal default afterwards, the same way reset_fg() works.
+
+// A warm lift of the field for code that has no lexer: selection is already
+// in the Notch palette, so a fence in an unknown language is not a new hue.
+fn code_bg(s: &str) -> String {
+    if no_color() || s.is_empty() {
+        return s.to_string();
+    }
+    format!("\x1b[{}m{s}{}", sgr_bg(pal().selection_bg), reset_bg())
+}
 
 fn reset_bg() -> String {
     if no_color() {
@@ -1266,388 +1279,531 @@ pub fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
-fn format_links(s: &str) -> String {
-    if !s.contains('[') || !s.contains("](") {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 32);
-    let mut rest = s;
-    while let Some(start) = rest.find('[') {
-        if let Some(mid) = rest[start..].find("](") {
-            let mid_abs = start + mid;
-            if let Some(end) = rest[mid_abs..].find(')') {
-                let end_abs = mid_abs + end;
-                out.push_str(&rest[..start]);
-                let label = &rest[start + 1..mid_abs];
-                let url = &rest[mid_abs + 2..end_abs];
-                // OSC 8: the label itself is clickable in modern terminals;
-                // the dim URL suffix keeps older terminals usable. Only web
-                // and mail links become clickable: the model writes these,
-                // and a click on file:, ssh:, or an app's own scheme can run
-                // a handler the user never meant to start. The URL still
-                // shows, so the user can copy it deliberately.
-                let shown = underline(&cyan(label));
-                let label = if model_link_clickable(url) {
-                    hyperlink(url, &shown)
-                } else {
-                    shown
-                };
-                out.push_str(&format!("{label} {}", dim(&format!("({url})"))));
-                rest = &rest[end_abs + 1..];
-                continue;
-            }
-        }
-        out.push_str(&rest[..start + 1]);
-        rest = &rest[start + 1..];
-    }
-    out.push_str(rest);
-    out
+// Inline markers the scanner has to look at. A line with none of these is
+// copied once and returned: plain prose pays one allocation, not a char
+// buffer plus a styled pass.
+fn needs_inline(s: &str) -> bool {
+    s.bytes()
+        .any(|b| matches!(b, b'*' | b'_' | b'`' | b'~' | b'[' | b'\\' | b'<'))
 }
 
-// Flush the pending plain-text run to `out`, wrapping it in the styles active
-// when it was collected. Italic is applied inside bold so both can nest.
-fn flush_styled_run(out: &mut String, buf: &mut String, bold_on: bool, italic_on: bool) {
+fn run_len(s: &str, i: usize, m: char) -> usize {
+    s[i..].chars().take_while(|c| *c == m).count()
+}
+
+fn prev_char(s: &str, i: usize) -> Option<char> {
+    s[..i].chars().next_back()
+}
+
+// A later run of at least `n` copies of `m` that can close emphasis: the
+// character before it is not whitespace, so `a ** b` does not close.
+fn find_marker_run(s: &str, from: usize, m: char, n: usize) -> bool {
+    let mut i = from;
+    while i < s.len() {
+        let ch = match s[i..].chars().next() {
+            Some(ch) => ch,
+            None => break,
+        };
+        if ch == m {
+            let len = run_len(s, i, m);
+            let prev_ok = prev_char(s, i).is_some_and(|c| !c.is_whitespace());
+            if len >= n && prev_ok {
+                return true;
+            }
+            i += ch.len_utf8() * len;
+            continue;
+        }
+        i += ch.len_utf8();
+    }
+    false
+}
+
+// How many marker characters to consume, and the style change. `None` means
+// this one character is literal (the caller advances a single marker so a
+// shorter run can still match).
+fn take_emphasis(
+    s: &str,
+    i: usize,
+    ch: char,
+    bold: &mut Option<char>,
+    italic: &mut Option<char>,
+) -> Option<usize> {
+    let n = run_len(s, i, ch);
+    let after = i + ch.len_utf8() * n;
+    let prev = prev_char(s, i);
+    let next = s.get(after..).and_then(|rest| rest.chars().next());
+    let prev_ok = prev.is_some_and(|c| !c.is_whitespace());
+    let next_ok = next.is_some_and(|c| !c.is_whitespace());
+    // Underscores do not emphasize inside a word (`snake_case` stays literal).
+    let word_open = ch == '_' && prev.is_some_and(|c| c.is_alphanumeric());
+    let word_close = ch == '_' && next.is_some_and(|c| c.is_alphanumeric());
+    let can_close = prev_ok && !word_close;
+    let can_open = next_ok && !word_open;
+
+    if can_close && n >= 3 && *bold == Some(ch) && *italic == Some(ch) {
+        *bold = None;
+        *italic = None;
+        return Some(3);
+    }
+    if can_close && n >= 2 && *bold == Some(ch) {
+        *bold = None;
+        return Some(2);
+    }
+    if can_open && n >= 2 && bold.is_none() && find_marker_run(s, after, ch, 2) {
+        *bold = Some(ch);
+        return Some(2);
+    }
+    if can_close && *italic == Some(ch) {
+        *italic = None;
+        return Some(1);
+    }
+    if can_open && italic.is_none() && find_marker_run(s, after, ch, 1) {
+        *italic = Some(ch);
+        return Some(1);
+    }
+    None
+}
+
+fn flush_run(out: &mut String, buf: &mut String, is_bold: bool, is_italic: bool) {
     if buf.is_empty() {
         return;
     }
     let mut s = std::mem::take(buf);
-    if italic_on {
+    if is_italic {
         s = italic(&s);
     }
-    if bold_on {
+    if is_bold {
         s = bold(&s);
     }
     out.push_str(&s);
 }
 
-// Render inline Markdown (`` `code` ``, `**bold**`, `*italic*`) into ANSI in a
-// single left-to-right pass. A marker only opens a style when a matching closer
-// exists ahead and it isn't followed by whitespace, so an unmatched `` ` ``,
-// `**`, or `*` — including arithmetic like `5 * 3` — stays literal instead of
-// styling the rest of the line. Links are resolved first by `format_links`.
-fn format_inline_md(text: &str) -> String {
-    let linked = format_links(text);
-    let chars: Vec<char> = linked.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(linked.len() + 32);
-    let mut buf = String::new();
-    let (mut bold_on, mut italic_on) = (false, false);
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        if c == '`' {
-            // Code span: style only if there's a closing backtick ahead.
-            if let Some(rel) = chars[i + 1..].iter().position(|&x| x == '`') {
-                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
-                let code: String = chars[i + 1..i + 1 + rel].iter().collect();
-                out.push_str(&yellow(&code));
-                i += rel + 2;
-                continue;
-            }
-            buf.push('`');
-            i += 1;
-            continue;
-        }
-        if c == '~' && i + 1 < n && chars[i + 1] == '~' {
-            // ~~strike~~: styled only when a closing pair follows.
-            if let Some(rel) = chars[i + 2..]
-                .windows(2)
-                .position(|w| w[0] == '~' && w[1] == '~')
-            {
-                if rel > 0 {
-                    flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
-                    let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
-                    out.push_str(&format!("\x1b[9m{}\x1b[29m", dim(&inner)));
-                    i += rel + 4;
-                    continue;
-                }
-            }
-            buf.push('~');
-            buf.push('~');
-            i += 2;
-            continue;
-        }
-        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
-            let toggles = if bold_on {
-                i > 0 && !chars[i - 1].is_whitespace()
-            } else {
-                i + 2 < n
-                    && !chars[i + 2].is_whitespace()
-                    && chars[i + 2..]
-                        .windows(2)
-                        .any(|w| w[0] == '*' && w[1] == '*')
-            };
-            if toggles {
-                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
-                bold_on = !bold_on;
-            } else {
-                buf.push('*');
-                buf.push('*');
-            }
-            i += 2;
-            continue;
-        }
-        if c == '*' {
-            let toggles = if italic_on {
-                i > 0 && !chars[i - 1].is_whitespace()
-            } else {
-                i + 1 < n && !chars[i + 1].is_whitespace() && chars[i + 1..].contains(&'*')
-            };
-            if toggles {
-                flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
-                italic_on = !italic_on;
-            } else {
-                buf.push('*');
-            }
-            i += 1;
-            continue;
-        }
-        buf.push(c);
-        i += 1;
-    }
-    flush_styled_run(&mut out, &mut buf, bold_on, italic_on);
-    out
-}
-
-/// Renders a single line of Markdown into ANSI SGR terminal escape sequences.
-///
-/// This function parses and styles block-level constructs at the start of the line:
-/// - Headers (`# `, `## `, `### `): Formatted in bold accent, cyan, and blue respectively.
-/// - Blockquotes (`> `): Rendered with a dimmed vertical accent bar (`│`) and italicized text.
-/// - Unordered lists (`- `, `* `): Rendered with a dimmed bullet point (`•`).
-/// - Numbered lists (`1. `, `2. `): Formatted with bold cyan numbers.
-///
-/// It also processes inline formatting across the line:
-/// - Inline code spans (`` `code` ``): Highlighted in yellow.
-/// - Bold text (`**text**`): Styled with ANSI bold (`\x1b[1m`).
-/// - Italic text (`*text*`): Styled with ANSI italic (`\x1b[3m`).
-/// - Hyperlinks (`[label](url)`): Formatted with an underlined cyan label and dimmed URL.
-///
-/// If color is disabled via `NO_COLOR`, this returns the original unformatted line.
-pub fn render_md_line(s: &str) -> String {
+fn strike_span(s: &str, quiet: bool) -> String {
     if no_color() {
         return s.to_string();
     }
-    let trimmed = s.trim_start();
-    let indent = &s[..s.len().saturating_sub(trimmed.len())];
-    // Thematic break: three or more of the same rule character.
-    if trimmed.len() >= 3 {
-        let mut it = trimmed.chars().filter(|c| !c.is_whitespace());
-        if let Some(first) = it.next() {
-            if matches!(first, '-' | '*' | '_')
-                && it.all(|c| c == first)
-                && trimmed.chars().filter(|c| *c == first).count() >= 3
-            {
-                let wd = term_size().0 as usize;
-                return format!("  {}", dim(&"─".repeat(wd.saturating_sub(4).clamp(8, 72))));
-            }
-        }
+    if quiet {
+        // Attribute only: a foreground reset here would punch the thinking
+        // line back to the body colour.
+        format!("\x1b[9m{s}\x1b[29m")
+    } else {
+        format!("\x1b[9m{}\x1b[29m", dim(s))
     }
-    if let Some(header) = trimmed.strip_prefix("#### ") {
-        return format!("{}{}", indent, bold(&format_inline_md(header)));
+}
+
+fn code_span(s: &str, quiet: bool) -> String {
+    if quiet {
+        underline(s)
+    } else {
+        code_bg(s)
     }
-    if let Some(header) = trimmed.strip_prefix("### ") {
-        return format!("{}{}", indent, bold(&blue(&format_inline_md(header))));
-    }
-    if let Some(header) = trimmed.strip_prefix("## ") {
-        return format!("{}{}", indent, bold(&cyan(&format_inline_md(header))));
-    }
-    if let Some(header) = trimmed.strip_prefix("# ") {
-        return format!("{}{}", indent, bold(&accent(&format_inline_md(header))));
-    }
-    if let Some(quote) = trimmed.strip_prefix("> ") {
-        return format!(
-            "{}  {} {}",
-            indent,
-            dim("│"),
-            italic(&dim(&format_inline_md(quote)))
-        );
-    }
-    let (prefix_span, rest) = if let Some(r) = trimmed
-        .strip_prefix("- [x] ")
-        .or_else(|| trimmed.strip_prefix("* [x] "))
-        .or_else(|| trimmed.strip_prefix("- [X] "))
-    {
-        (Some(green("☑")), r)
-    } else if let Some(r) = trimmed
-        .strip_prefix("- [ ] ")
-        .or_else(|| trimmed.strip_prefix("* [ ] "))
-    {
-        (Some(dim("☐")), r)
-    } else if let Some(r) = trimmed.strip_prefix("- ") {
-        (Some(dim("•")), r)
-    } else if let Some(r) = trimmed.strip_prefix("* ") {
-        (Some(dim("•")), r)
-    } else if let Some(idx) = trimmed.find(". ") {
-        if idx > 0 && idx <= 3 && trimmed[..idx].chars().all(|c| c.is_ascii_digit()) {
-            let num_str = &trimmed[..idx + 1];
-            (Some(bold(&cyan(num_str))), &trimmed[idx + 2..])
+}
+
+fn emit_link(label: &str, url: &str, quiet: bool, show_url: bool) -> String {
+    let text = if label.is_empty() { url } else { label };
+    if quiet || no_color() {
+        return if show_url && text != url {
+            format!("{} ({url})", underline(text))
         } else {
-            (None, trimmed)
-        }
+            underline(text)
+        };
+    }
+    let shown = underline(&cyan(text));
+    let shown = if model_link_clickable(url) {
+        hyperlink(url, &shown)
     } else {
-        (None, trimmed)
+        shown
     };
-
-    let formatted_rest = format_inline_md(rest);
-
-    if let Some(pref) = prefix_span {
-        format!("{}  {} {}", indent, pref, formatted_rest)
+    if show_url && text != url {
+        format!("{shown} {}", dim(&format!("({url})")))
     } else {
-        format!("{}{}", indent, formatted_rest)
+        shown
     }
 }
 
-/// Renders a multiline Markdown document into formatted ANSI terminal output.
-///
-/// Runs the same fence state machine as [`StreamRenderer`]: lines between
-/// triple-backtick fences are drawn inside a bordered code block (with the
-/// language label on the top border) and the fence markers themselves are
-/// never shown raw. All other lines go through [`render_md_line`], so
-/// headings, lists, quotes, links and inline styles render consistently
-/// whether text arrives streamed or as a complete reply.
-// Inline markdown for subdued/meta text (the thinking stream): renders
-// **bold**, *italic*, and `code` as real styling while keeping the whole line
-// muted. It relies on bold()/italic()/underline() using attribute-only resets
-// (22/23/24) that never touch the foreground color, so the MUTED base set by
-// the caller's paint() survives across every styled span — no color flashes
-// back to bright mid-line.
-fn format_inline_md_dim(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut out = String::with_capacity(text.len() + 16);
-    let mut i = 0;
-    while i < n {
-        let c = chars[i];
-        if c == '`' {
-            if let Some(rel) = chars[i + 1..].iter().position(|&x| x == '`') {
-                let code: String = chars[i + 1..i + 1 + rel].iter().collect();
-                // Underline (not a color) marks code so the line stays muted.
-                out.push_str(&underline(&code));
-                i += rel + 2;
-                continue;
-            }
-        }
-        if c == '*' && i + 1 < n && chars[i + 1] == '*' {
-            if let Some(rel) = find_closer(&chars, i + 2, "**") {
-                let inner: String = chars[i + 2..i + 2 + rel].iter().collect();
-                out.push_str(&bold(&format_inline_md_dim(&inner)));
-                i += 2 + rel + 2;
-                continue;
-            }
-        }
-        if c == '*' {
-            if let Some(rel) = find_closer(&chars, i + 1, "*") {
-                let inner: String = chars[i + 1..i + 1 + rel].iter().collect();
-                out.push_str(&italic(&inner));
-                i += 1 + rel + 1;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-// Index (relative to `from`) of the next `marker` that closes a span: it must
-// exist and not open on whitespace. Returns None if the span never closes, so
-// an unmatched `*` stays literal.
-fn find_closer(chars: &[char], from: usize, marker: &str) -> Option<usize> {
-    let m: Vec<char> = marker.chars().collect();
-    if from >= chars.len() || chars[from].is_whitespace() {
+fn take_link(s: &str) -> Option<(&str, &str, usize)> {
+    if !s.starts_with('[') {
         return None;
     }
-    let mut j = from;
-    while j + m.len() <= chars.len() {
-        if chars[j..j + m.len()] == m[..] && j > from && !chars[j - 1].is_whitespace() {
-            return Some(j - from);
+    let mid = s.find("](")?;
+    let label = &s[1..mid];
+    if label.contains('\n') {
+        return None;
+    }
+    let url_at = mid + 2;
+    let end = s[url_at..].find(')')?;
+    let url = &s[url_at..url_at + end];
+    if url.is_empty() || url.chars().any(|c| c.is_control() || c == ' ') {
+        return None;
+    }
+    Some((label, url, url_at + end + 1))
+}
+
+fn take_autolink(s: &str) -> Option<(&str, usize)> {
+    if !s.starts_with('<') {
+        return None;
+    }
+    let end = s.find('>')?;
+    let url = &s[1..end];
+    let low = url.to_ascii_lowercase();
+    let ok =
+        low.starts_with("https://") || low.starts_with("http://") || low.starts_with("mailto:");
+    if !ok || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    Some((url, end + 1))
+}
+
+fn find_backtick_closer(s: &str, n: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'`' {
+            let len = run_len(s, i, '`');
+            if len == n {
+                return Some(i);
+            }
+            i += len;
+            continue;
         }
-        j += 1;
+        i += s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
     }
     None
 }
 
-/// One line of thinking-stream markdown: block markers (headings, list
-/// bullets, quotes) and inline styling become real formatting, all kept in the
-/// muted thinking palette so the reasoning stays visually quiet.
-pub fn render_md_dim_line(s: &str) -> String {
-    let s = &*sanitize_terminal(s);
-    if no_color() {
-        return s.to_string();
+fn find_backtick_like(s: &str, m: char, n: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < s.len() {
+        let ch = s[i..].chars().next().unwrap();
+        if ch == m {
+            let len = run_len(s, i, m);
+            if len >= n {
+                return Some(i);
+            }
+            i += ch.len_utf8() * len;
+            continue;
+        }
+        i += ch.len_utf8();
     }
-    let trimmed = s.trim_start();
-    let indent = &s[..s.len() - trimmed.len()];
-    let inner = if let Some(h) = trimmed
-        .strip_prefix("### ")
-        .or_else(|| trimmed.strip_prefix("## "))
-        .or_else(|| trimmed.strip_prefix("# "))
-    {
-        bold(&format_inline_md_dim(h))
-    } else if let Some(q) = trimmed.strip_prefix("> ") {
-        format!("│ {}", italic(&format_inline_md_dim(q)))
-    } else if let Some(b) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
-        format!("• {}", format_inline_md_dim(b))
-    } else {
-        format_inline_md_dim(trimmed)
-    };
-    // Paint the whole assembled line MUTED once; the attribute toggles inside
-    // never reset the color, so it stays dim end to end.
-    paint(pal().muted, &format!("{indent}{inner}"))
+    None
 }
 
-pub fn render_md(text: &str) -> String {
-    let text = &*sanitize_terminal(text);
-    let w = term_size().0 as usize;
-    let mut out: Vec<String> = Vec::new();
-    // Some(lang) while inside a fenced code block.
-    let mut fence: Option<String> = None;
-    let mut code: Vec<String> = Vec::new();
-    let mut table: Vec<String> = Vec::new();
-    let flush_code = |lang: &str, code: &mut Vec<String>, out: &mut Vec<String>| {
-        let lit = crate::highlight::highlight_block(lang, code);
-        out.extend(lit.iter().map(|l| code_box_line(l)));
-        out.push(code_box_footer(w));
-        code.clear();
-    };
-    for l in text.lines() {
-        match fence {
-            Some(ref lang) => {
-                if l.trim() == "```" {
-                    flush_code(lang, &mut code, &mut out);
-                    fence = None;
-                } else {
-                    code.push(l.to_string());
-                }
-            }
-            None => {
-                if is_table_row(l) {
-                    table.push(l.to_string());
+fn format_inline_md(text: &str) -> String {
+    inline_scan(text, false)
+}
+
+/// Inline markdown for a caller that is not a whole line (help, a popup).
+pub(crate) fn render_inline_md(text: &str) -> String {
+    format_inline_md(text)
+}
+
+// `quiet` is the thinking stream: weight and underline only, no foreground,
+// so the caller's muted paint survives the whole line. The style flags are
+// updated after the open run is flushed, so the run keeps the style it was
+// collected under.
+fn inline_scan(text: &str, quiet: bool) -> String {
+    if !needs_inline(text) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut buf = String::new();
+    let mut bold: Option<char> = None;
+    let mut italic: Option<char> = None;
+    let mut i = 0;
+    while i < text.len() {
+        let ch = text[i..].chars().next().unwrap();
+        let cl = ch.len_utf8();
+        if ch == '\\' {
+            if let Some(nch) = text[i + cl..].chars().next() {
+                if nch.is_ascii_punctuation() {
+                    buf.push(nch);
+                    i += cl + nch.len_utf8();
                     continue;
-                }
-                if !table.is_empty() {
-                    out.extend(render_table(&table, w));
-                    table.clear();
-                }
-                if let Some(rest) = l.trim_start().strip_prefix("```") {
-                    let lang = rest.trim().to_string();
-                    out.push(code_box_header(&lang, w));
-                    fence = Some(lang);
-                } else {
-                    out.push(render_md_line(l));
                 }
             }
         }
+        if ch == '`' {
+            let n = run_len(text, i, '`');
+            let after = i + n;
+            if let Some(rel) = find_backtick_closer(&text[after..], n) {
+                flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+                let mut inner = &text[after..after + rel];
+                if inner.len() >= 2 && inner.starts_with(' ') && inner.ends_with(' ') {
+                    inner = &inner[1..inner.len() - 1];
+                }
+                out.push_str(&code_span(inner, quiet));
+                i = after + rel + n;
+                continue;
+            }
+        }
+        if ch == '~' && run_len(text, i, '~') >= 2 {
+            let after = i + 2;
+            if let Some(rel) = find_backtick_like(&text[after..], '~', 2) {
+                if rel > 0 {
+                    flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+                    let inner = &text[after..after + rel];
+                    out.push_str(&strike_span(&inline_scan(inner, quiet), quiet));
+                    i = after + rel + 2;
+                    continue;
+                }
+            }
+        }
+        if ch == '<' {
+            if let Some((url, n)) = take_autolink(&text[i..]) {
+                flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+                out.push_str(&emit_link(url, url, quiet, false));
+                i += n;
+                continue;
+            }
+        }
+        if ch == '[' {
+            if let Some((label, url, n)) = take_link(&text[i..]) {
+                if buf.ends_with('!') {
+                    buf.pop();
+                }
+                flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+                let label = inline_scan(label, quiet);
+                out.push_str(&emit_link(&label, url, quiet, true));
+                i += n;
+                continue;
+            }
+        }
+        if ch == '*' || ch == '_' {
+            let mut next_bold = bold;
+            let mut next_italic = italic;
+            if let Some(used) = take_emphasis(text, i, ch, &mut next_bold, &mut next_italic) {
+                flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+                bold = next_bold;
+                italic = next_italic;
+                i += ch.len_utf8() * used;
+                continue;
+            }
+        }
+        buf.push(ch);
+        i += cl;
+    }
+    flush_run(&mut out, &mut buf, bold.is_some(), italic.is_some());
+    out
+}
+
+fn atx_heading(trimmed: &str) -> Option<(usize, &str)> {
+    let n = trimmed.bytes().take_while(|b| *b == b'#').count();
+    if !(1..=6).contains(&n) {
+        return None;
+    }
+    let rest = trimmed[n..].strip_prefix(' ')?;
+    let rest = rest.trim_end();
+    let rest = match rest.rfind(' ') {
+        Some(i) if !rest[i + 1..].is_empty() && rest[i + 1..].bytes().all(|b| b == b'#') => {
+            rest[..i].trim_end()
+        }
+        _ => rest,
+    };
+    Some((n, rest))
+}
+
+fn thematic_rule(trimmed: &str, width: usize, quiet: bool) -> Option<String> {
+    if trimmed.len() < 3 {
+        return None;
+    }
+    let mut marks = trimmed.chars().filter(|c| !c.is_whitespace());
+    let first = marks.next()?;
+    if !matches!(first, '-' | '*' | '_') || !marks.all(|c| c == first) {
+        return None;
+    }
+    if trimmed.chars().filter(|c| *c == first).count() < 3 {
+        return None;
+    }
+    let n = width.saturating_sub(4).clamp(8, 72);
+    let bar = "─".repeat(n);
+    let bar = if quiet { bar } else { dim(&bar) };
+    Some(format!("  {bar}"))
+}
+
+fn block_quote(trimmed: &str) -> Option<(usize, &str)> {
+    let mut rest = trimmed;
+    let mut n = 0usize;
+    while let Some(next) = rest.strip_prefix('>') {
+        if next.is_empty() || next.starts_with(' ') || next.starts_with('>') {
+            n += 1;
+            rest = next.strip_prefix(' ').unwrap_or(next);
+            continue;
+        }
+        break;
+    }
+    (n > 0).then_some((n, rest))
+}
+
+fn task_item(trimmed: &str) -> Option<(bool, &str)> {
+    const DONE: &[&str] = &["- [x] ", "- [X] ", "* [x] ", "* [X] ", "+ [x] ", "+ [X] "];
+    const OPEN: &[&str] = &["- [ ] ", "* [ ] ", "+ [ ] "];
+    for p in DONE {
+        if let Some(rest) = trimmed.strip_prefix(p) {
+            return Some((true, rest));
+        }
+    }
+    for p in OPEN {
+        if let Some(rest) = trimmed.strip_prefix(p) {
+            return Some((false, rest));
+        }
+    }
+    None
+}
+
+fn bullet_item(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+}
+
+fn ordered_item(trimmed: &str) -> Option<(&str, &str)> {
+    let b = trimmed.as_bytes();
+    let mut i = 0;
+    while i < b.len() && i < 9 && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= b.len() || (b[i] != b'.' && b[i] != b')') {
+        return None;
+    }
+    if i + 1 >= b.len() || b[i + 1] != b' ' {
+        return None;
+    }
+    Some((&trimmed[..i + 1], &trimmed[i + 2..]))
+}
+
+fn heading_span(level: usize, text: &str, quiet: bool) -> String {
+    let inner = inline_scan(text, quiet);
+    if quiet {
+        return match level {
+            1 | 2 => bold(&underline(&inner)),
+            3 | 4 => bold(&inner),
+            _ => underline(&inner),
+        };
+    }
+    // Six levels, each a different combination of weight, underline and the
+    // mark. h6 is quiet paper. No raw '#'.
+    match level {
+        1 => bold(&underline(&accent(&inner))),
+        2 => bold(&accent(&inner)),
+        3 => bold(&underline(&inner)),
+        4 => bold(&inner),
+        5 => underline(&inner),
+        _ => dim(&inner),
+    }
+}
+
+fn render_line(s: &str, width: usize, quiet: bool) -> String {
+    let trimmed = s.trim_start();
+    let indent = &s[..s.len() - trimmed.len()];
+    if let Some(rule) = thematic_rule(trimmed, width, quiet) {
+        return format!("{indent}{rule}");
+    }
+    if let Some((level, text)) = atx_heading(trimmed) {
+        return format!("{indent}{}", heading_span(level, text, quiet));
+    }
+    if let Some((depth, body)) = block_quote(trimmed) {
+        let bars = "│ ".repeat(depth);
+        let body = inline_scan(body, quiet);
+        if quiet {
+            return format!("{indent}{bars}{}", italic(&body));
+        }
+        return format!("{indent}  {}{}", dim(&bars), italic(&dim(&body)));
+    }
+    if let Some((done, rest)) = task_item(trimmed) {
+        let mark = if done { "☑" } else { "☐" };
+        let rest = inline_scan(rest, quiet);
+        if quiet {
+            return format!("{indent}{mark} {rest}");
+        }
+        let mark = if done { green(mark) } else { dim(mark) };
+        return format!("{indent}  {mark} {rest}");
+    }
+    if let Some(rest) = bullet_item(trimmed) {
+        let rest = inline_scan(rest, quiet);
+        if quiet {
+            return format!("{indent}• {rest}");
+        }
+        return format!("{indent}  {} {rest}", dim("•"));
+    }
+    if let Some((num, rest)) = ordered_item(trimmed) {
+        let rest = inline_scan(rest, quiet);
+        if quiet {
+            return format!("{indent}{num} {rest}");
+        }
+        return format!("{indent}  {} {rest}", bold(&cyan(num)));
+    }
+    format!("{indent}{}", inline_scan(trimmed, quiet))
+}
+
+fn render_md_line_at(s: &str, width: usize) -> String {
+    render_line(s, width, false)
+}
+
+/// One line of Markdown as ANSI. Headings, lists, quotes, rules and inline
+/// styles are drawn; the marker characters are not. `NO_COLOR` drops hue and
+/// weight and keeps the structure (a bullet, not a raw `-`).
+pub fn render_md_line(s: &str) -> String {
+    render_md_line_at(s, term_size().0 as usize)
+}
+
+/// One line of thinking-stream markdown. Block markers and inline styles
+/// become real formatting, kept in the muted palette.
+pub fn render_md_dim_line(s: &str) -> String {
+    let s = &*sanitize_terminal(s);
+    let line = render_line(s, term_size().0 as usize, true);
+    if no_color() {
+        return line;
+    }
+    paint(pal().muted, &line)
+}
+
+/// A finished Markdown document at the current terminal width.
+pub fn render_md(text: &str) -> String {
+    render_md_width(text, term_size().0 as usize)
+}
+
+/// [`render_md`] at an explicit column count. Panes and the golden tests pass
+/// the width they actually have, which is not always the process terminal.
+pub fn render_md_width(text: &str, width: usize) -> String {
+    let text = &*sanitize_terminal(text);
+    let width = width.max(4);
+    let mut out: Vec<String> = Vec::new();
+    let mut fence: Option<(char, String)> = None;
+    let mut code: Vec<String> = Vec::new();
+    let mut table: Vec<String> = Vec::new();
+    let flush_fence = |lang: &str, code: &mut Vec<String>, out: &mut Vec<String>| {
+        out.extend(paint_fenced(lang, code, width));
+        code.clear();
+    };
+    for l in text.lines() {
+        if let Some((tick, ref lang)) = fence {
+            if fence_close(l, tick) {
+                flush_fence(lang, &mut code, &mut out);
+                fence = None;
+            } else {
+                code.push(l.to_string());
+            }
+            continue;
+        }
+        if is_table_row(l) {
+            table.push(l.to_string());
+            continue;
+        }
+        if !table.is_empty() {
+            out.extend(render_table(&table, width));
+            table.clear();
+        }
+        if let Some((tick, lang)) = fence_open(l) {
+            fence = Some((tick, lang));
+        } else {
+            out.push(render_md_line_at(l, width));
+        }
     }
     if !table.is_empty() {
-        out.extend(render_table(&table, w));
+        out.extend(render_table(&table, width));
     }
-    // Unclosed fence: close the border so the block doesn't bleed on.
-    if let Some(lang) = fence {
-        flush_code(&lang, &mut code, &mut out);
+    if let Some((_, lang)) = fence {
+        flush_fence(&lang, &mut code, &mut out);
     }
     out.join("\n")
 }
@@ -3301,6 +3457,52 @@ fn draw_browser(title: &str, items: &[(String, String)], selected: usize, detail
 // their char_width() so a width-2 char is never split across the boundary.
 fn clip_ansi_line(s: &str, max_cols: usize) -> String {
     clip_ansi(s, max_cols).0
+}
+
+// The last `max_cols` of `s`. Escape sequences before the cut are kept, in
+// order, so a colour opened earlier still applies to the tail.
+fn clip_ansi_tail(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let total = str_width(&strip_ansi(s));
+    if total <= max_cols {
+        return s.to_string();
+    }
+    let skip = total - max_cols;
+    let mut skipped = 0usize;
+    let mut prefix = String::new();
+    let mut out = String::new();
+    let mut started = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            let mut esc = String::from("\u{1b}");
+            eat_escape(&mut chars, Some(&mut esc));
+            if started {
+                out.push_str(&esc);
+            } else {
+                prefix.push_str(&esc);
+            }
+            continue;
+        }
+        let w = char_width(c).max(1);
+        if !started {
+            if skipped + w <= skip {
+                skipped += w;
+                continue;
+            }
+            started = true;
+            out.push_str(&prefix);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Clip to `cols` display columns, keeping SGR and OSC sequences intact.
+pub(crate) fn clip_cells(s: &str, cols: usize) -> String {
+    clip_ansi_line(s, cols)
 }
 
 /// `clip_ansi_line`, plus the display width of what it kept.

@@ -761,6 +761,169 @@ fn pipe_tables_render_aligned() {
     );
 }
 
+// Cells of one rendered table row. The indent and the single space on each
+// side of a bar are chrome; the padding left inside a cell is the alignment.
+fn table_cells(line: &str) -> Vec<String> {
+    let line = line.strip_prefix("  ").unwrap_or(line);
+    let parts: Vec<&str> = line.split('│').collect();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let mut cell = *part;
+            if i > 0 {
+                cell = cell.strip_prefix(' ').unwrap_or(cell);
+            }
+            if i + 1 < parts.len() {
+                cell = cell.strip_suffix(' ').unwrap_or(cell);
+            }
+            cell.to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn table_header_and_cells_share_alignment() {
+    std::env::remove_var("NO_COLOR");
+    let rows = vec![
+        "| Left | Mid | Right |".to_string(),
+        "|:-----|:---:|------:|".to_string(),
+        "| a | b | c |".to_string(),
+        "| longer-left-value | m | longer-right-value |".to_string(),
+    ];
+    let plain: Vec<String> = render_table(&rows, 40)
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect();
+    // header, rule, two body rows
+    let header = table_cells(&plain[0]);
+    let short = table_cells(&plain[2]);
+    let long = table_cells(&plain[3]);
+    assert_eq!(header.len(), 3, "{plain:?}");
+    let flush_left = |cell: &str| !cell.starts_with(' ');
+    let flush_right = |cell: &str| !cell.ends_with(' ');
+    // No colon on a separator is left. `:---` is left. Both ends of the
+    // column carry the text, including a cell cut with an ellipsis.
+    for cell in [&header[0], &short[0], &long[0]] {
+        assert!(flush_left(cell), "left column drifted: {cell:?}");
+    }
+    assert!(
+        long[0].ends_with('…'),
+        "left truncation keeps the head: {}",
+        long[0]
+    );
+    // `:---:` centers a short cell. A cut cell uses an ellipsis on both sides.
+    let mid_pad = |cell: &str| {
+        let lead = cell.chars().take_while(|c| *c == ' ').count();
+        let tail = cell.chars().rev().take_while(|c| *c == ' ').count();
+        (lead, tail)
+    };
+    let (hl, ht) = mid_pad(&header[1]);
+    let (sl, st) = mid_pad(&short[1]);
+    assert!(
+        hl.abs_diff(ht) <= 1,
+        "header mid not centered: {:?}",
+        header[1]
+    );
+    assert!(
+        sl.abs_diff(st) <= 1,
+        "cell mid not centered: {:?}",
+        short[1]
+    );
+    // `---:` is right for the header, the short cell, and the cut cell.
+    for cell in [&header[2], &short[2], &long[2]] {
+        assert!(flush_right(cell), "right column drifted: {cell:?}");
+    }
+    assert!(
+        long[2].trim_start().starts_with('…'),
+        "right truncation keeps the tail: {}",
+        long[2]
+    );
+    // A separator with no colon at all is left, same as the default.
+    let plain_default: Vec<String> = render_table(
+        &[
+            "| Name | Notes |".to_string(),
+            "|---|---|".to_string(),
+            "| paper | the note |".to_string(),
+        ],
+        80,
+    )
+    .into_iter()
+    .map(|l| strip_ansi(&l))
+    .collect();
+    let head = table_cells(&plain_default[0]);
+    let body = table_cells(&plain_default[2]);
+    assert!(
+        flush_left(&head[0]) && flush_left(&body[0]),
+        "{plain_default:?}"
+    );
+    assert!(
+        flush_left(&head[1]) && flush_left(&body[1]),
+        "{plain_default:?}"
+    );
+}
+
+#[test]
+fn heading_and_link_underlines_are_not_strikethrough() {
+    std::env::remove_var("NO_COLOR");
+    let marked = [
+        ("h1", render_md_line("# Heading")),
+        ("h3", render_md_line("### Heading")),
+        ("h5", render_md_line("##### Heading")),
+        (
+            "link",
+            render_md_line("[the docs](https://example.com/docs)"),
+        ),
+    ];
+    for (name, rendered) in marked {
+        assert!(
+            rendered.contains("\x1b[4m"),
+            "{name} is underline (SGR 4), got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\x1b[9m"),
+            "{name} must not be strikethrough, got {rendered:?}"
+        );
+    }
+    let struck = render_md_line("~~struck~~");
+    assert!(struck.contains("\x1b[9m"), "{struck:?}");
+    assert!(!struck.contains("\x1b[4m"), "{struck:?}");
+}
+
+#[test]
+fn code_frames_close_on_the_right_at_80_and_120() {
+    std::env::remove_var("NO_COLOR");
+    for width in [80usize, 120] {
+        for doc in ["```rust\nfn answer() {}\n```", "```\nplain block\n```"] {
+            let plain = strip_ansi(&render_md_width(doc, width));
+            let mut saw_top = false;
+            let mut saw_bottom = false;
+            for line in plain.lines() {
+                assert!(
+                    str_width(line) <= width,
+                    "{width}: {} cols: {line}",
+                    str_width(line)
+                );
+                if line.contains('╭') {
+                    saw_top = true;
+                    assert_eq!(str_width(line), width, "{line}");
+                    assert!(line.ends_with('╮'), "missing right corner: {line}");
+                }
+                if line.contains('╰') {
+                    saw_bottom = true;
+                    assert_eq!(str_width(line), width, "{line}");
+                    assert!(line.ends_with('╯'), "missing right corner: {line}");
+                }
+                if line.contains('│') {
+                    assert!(line.ends_with('│'), "missing right border: {line}");
+                    assert_eq!(str_width(line), width, "{line}");
+                }
+            }
+            assert!(saw_top && saw_bottom, "{width}\n{plain}");
+        }
+    }
+}
+
 #[test]
 fn stream_renderer_collects_tables() {
     std::env::remove_var("NO_COLOR");
@@ -1669,6 +1832,184 @@ fn appending_to_a_long_line_touches_only_its_last_row() {
 // A row is repainted on its own, so it cannot lean on what the row above
 // left set; and since the row's start carries the theme, a new theme
 // repaints every row without being told to.
+fn markdown_sample() -> &'static str {
+    include_str!("../../tests/fixtures/markdown/sample.md")
+}
+
+#[test]
+fn markdown_elements_render_at_80_and_120() {
+    std::env::remove_var("NO_COLOR");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/markdown");
+    let mut plains = Vec::new();
+    for width in [80usize, 120] {
+        let raw = render_md_width(markdown_sample(), width);
+        let plain = strip_ansi(&raw);
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(root.join(format!("plain-{width}.txt")), &plain).unwrap();
+        }
+        let want = std::fs::read_to_string(root.join(format!("plain-{width}.txt")))
+            .unwrap_or_else(|e| panic!("golden {width}: {e}"));
+        assert_eq!(plain, want, "width {width}");
+        // Structure, not the marker characters.
+        for gone in ["# Heading", "**", "~~", "`code`", "```", "[the docs]"] {
+            assert!(
+                !plain.contains(gone),
+                "{width} still shows {gone}:\n{plain}"
+            );
+        }
+        for kept in [
+            "Heading one",
+            "Heading two",
+            "Heading three",
+            "Heading four",
+            "Heading five",
+            "Heading six",
+            "bold",
+            "italic",
+            "both",
+            "under bold",
+            "under italic",
+            "struck",
+            "code",
+            "*stars*",
+            "# hash",
+            "│ A quoted line",
+            "│ │ Nested quote",
+            "• outer item",
+            "• nested item",
+            "• deeper item",
+            "1. first",
+            "2. second",
+            "1. nested number",
+            "• plus item",
+            "☐ open task",
+            "☑ done task",
+            "─",
+            "the docs",
+            "(https://example.com/docs)",
+            "https://example.com/auto",
+            "rust",
+            "fn answer",
+            "plain block",
+            "paper",
+            "│",
+        ] {
+            assert!(plain.contains(kept), "{width} missing {kept}");
+        }
+        // Tables and fenced rows are laid out for this width. Prose stays one
+        // logical line; the transcript wraps it when the row is painted.
+        for line in plain.lines() {
+            let laid_out = line.contains('│')
+                || line.contains('┼')
+                || line.contains('╭')
+                || line.contains('╰');
+            if laid_out {
+                assert!(
+                    str_width(line) <= width,
+                    "{width}: line is {} cols: {line}",
+                    str_width(line)
+                );
+            }
+        }
+        plains.push(plain);
+        // Unknown fence gets a background; rust gets the keyword colour.
+        assert!(
+            raw.contains("48;"),
+            "plain fence should paint a code background"
+        );
+    }
+    assert_ne!(plains[0], plains[1], "80 and 120 must not be the same wrap");
+}
+
+#[test]
+fn headings_are_distinct_and_emphasis_nests() {
+    std::env::remove_var("NO_COLOR");
+    let mut seen = Vec::new();
+    for (src, level) in [
+        ("# H", 1),
+        ("## H", 2),
+        ("### H", 3),
+        ("#### H", 4),
+        ("##### H", 5),
+        ("###### H", 6),
+    ] {
+        let out = render_md_line(src);
+        assert_eq!(strip_ansi(&out), "H", "{src} -> {out:?}");
+        assert!(
+            !seen.contains(&out),
+            "heading {level} matches an earlier level"
+        );
+        seen.push(out);
+    }
+    let both = render_md_line("***both***");
+    assert_eq!(strip_ansi(&both), "both");
+    assert!(both.contains("\x1b[1m"), "{both:?}");
+    assert!(both.contains("\x1b[3m"), "{both:?}");
+    assert_eq!(
+        strip_ansi(&render_md_line(r"\*not italic\*")),
+        "*not italic*"
+    );
+    assert_eq!(strip_ansi(&render_md_line("snake_case")), "snake_case");
+    assert_eq!(strip_ansi(&render_md_line("a _word_ b")), "a word b");
+    let code = render_md_width("```\nhello\n```", 40);
+    assert!(code.contains("48;"), "{code}");
+    let rust = render_md_width("```rust\nfn main() {}\n```", 60);
+    assert!(rust.contains("fn"), "{rust}");
+    assert!(!strip_ansi(&rust).contains("```"));
+    // A long identifier is not cut while a shorter neighbour still fits.
+    let wrapped = strip_ansi(&render_md_width(
+        "```\nalpha beta gamma delta epsilon zeta eta theta\n```",
+        24,
+    ));
+    for word in [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ] {
+        assert!(
+            wrapped.lines().any(|l| l.contains(word)),
+            "{word} was split:\n{wrapped}"
+        );
+    }
+}
+
+#[test]
+fn stream_unclosed_fence_does_not_rewrite_history() {
+    std::env::remove_var("NO_COLOR");
+    let mut r = StreamRenderer::new();
+    r.push("kept\n");
+    let first = r.sink[0].clone();
+    r.push("```rust\nlet ");
+    r.push("alpha");
+    let mid = strip_ansi(&r.sink.join("\n"));
+    assert!(mid.contains("kept"), "{mid}");
+    assert!(mid.contains("rust"), "{mid}");
+    assert!(!mid.contains("```"), "{mid}");
+    assert!(!mid.contains("alpha"), "{mid}");
+    assert_eq!(r.sink[0], first);
+    let n = r.sink.len();
+    r.push(" = 1;\n");
+    assert!(r.sink.len() > n);
+    assert_eq!(r.sink[0], first);
+    let line = strip_ansi(&r.sink.join("\n"));
+    assert!(line.contains("let alpha = 1;"), "{line}");
+    assert!(!line.contains('╰'), "{line}");
+    r.flush();
+    let end = strip_ansi(&r.sink.join("\n"));
+    assert!(end.contains('╰'), "{end}");
+    assert!(!end.contains("```"), "{end}");
+    assert_eq!(r.sink[0], first);
+}
+
+#[test]
+fn stream_holds_a_json_tool_fence_until_it_can_drop_it() {
+    let mut r = StreamRenderer::new();
+    r.push("```json\n{\"name\":\"read_file\",\"path\":\"a.rs\"}\n```\nafter\n");
+    r.flush();
+    let joined = r.sink.join("\n");
+    assert!(!joined.contains("read_file"), "{joined}");
+    assert!(!joined.contains("```"), "{joined}");
+    assert!(strip_ansi(&joined).contains("after"), "{joined}");
+}
+
 #[test]
 fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
     let mut s = frame_screen(20, 10);

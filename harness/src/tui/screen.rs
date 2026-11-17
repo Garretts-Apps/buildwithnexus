@@ -208,6 +208,30 @@ impl TranscriptState {
         self.trim();
     }
 
+    /// Put `rendered` in the open stream line, creating that line when none
+    /// is open. False when the visible bytes did not change, so a repeated
+    /// token does not rewrap or ask for a frame. Only this line is touched.
+    pub fn show_open(&mut self, rendered: &str) -> bool {
+        if self.open_stream_line < self.text.len() {
+            if self.text.same_at(self.open_stream_line, rendered) {
+                return false;
+            }
+            let before = self.rows_if_scrolled();
+            self.text.set(self.open_stream_line, rendered.to_string());
+            self.pin_scroll(before);
+            return true;
+        }
+        if rendered.is_empty() {
+            return false;
+        }
+        let before = self.rows_if_scrolled();
+        self.text.push(rendered.to_string());
+        self.open_stream_line = self.text.len() - 1;
+        self.pin_scroll(before);
+        self.trim();
+        true
+    }
+
     /// Replace the open stream line with its rendered form and close it.
     /// False when no stream line was open.
     pub fn commit_stream(&mut self, rendered: &str) -> bool {

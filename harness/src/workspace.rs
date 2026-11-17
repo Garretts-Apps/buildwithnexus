@@ -708,6 +708,28 @@ fn diff_lines(g: &State, width: usize, rows: usize, wide_side: bool) -> Vec<Stri
     };
     let full = format!("{name}  +{adds} -{dels}  {mode}");
     let short = format!("{name}  +{adds} -{dels}");
+    // An unchanged Markdown file is a page, not a diff of every line.
+    if is_markdown_ext(&diff.ext) && diff.hunks.is_empty() {
+        lines.push(fit(&phrase(width, &[name, "page"]), width));
+        let src = diff
+            .rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = crate::tui::render_md_width(&src, width);
+        let start = g
+            .diff_scroll
+            .min(body.lines().count().saturating_sub(rows.saturating_sub(1)));
+        for line in body.lines().skip(start).take(rows.saturating_sub(1)) {
+            lines.push(pad_cells(line, width));
+        }
+        while lines.len() < rows {
+            lines.push(fit("", width));
+        }
+        lines.truncate(rows);
+        return lines;
+    }
     lines.push(fit(&phrase(width, &[&full, &short, name]), width));
     let side = diff.side_by_side && (wide_side || width >= 64);
     let body: Vec<String> = if side {
@@ -1024,6 +1046,23 @@ fn rel(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn is_markdown_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+}
+
+fn pad_cells(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let visible = crate::tui::str_width(&crate::tui::strip_ansi(s));
+    if visible > width {
+        return crate::tui::clip_cells(s, width);
+    }
+    let mut out = s.to_string();
+    out.extend(std::iter::repeat_n(' ', width - visible));
+    out
 }
 
 fn ext_of(path: &Path) -> String {
@@ -1382,6 +1421,27 @@ mod tests {
         let got = materialize(old, &rows, &hunks);
         assert!(got.contains('B'), "{got}");
         assert!(got.contains('e') && !got.contains('E'), "{got}");
+    }
+
+    #[test]
+    fn markdown_file_with_no_edits_is_a_rendered_page() {
+        let (hunks, rows) = hunks_of("# Title\n\n- item\n", "# Title\n\n- item\n");
+        assert!(hunks.is_empty());
+        let diff = Diff {
+            rows,
+            hunks,
+            side_by_side: false,
+            vs_git: false,
+            ext: "md".into(),
+        };
+        let mut g = State::new();
+        g.diff = Some(("notes.md".into(), diff));
+        let lines = diff_lines(&g, 40, 16, false);
+        let plain = crate::tui::strip_ansi(&lines.join("\n"));
+        assert!(plain.contains("Title"), "{plain}");
+        assert!(plain.contains("•"), "{plain}");
+        assert!(!plain.contains("# Title"), "{plain}");
+        assert!(!plain.contains("+0"), "{plain}");
     }
 
     #[test]
