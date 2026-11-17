@@ -1808,6 +1808,27 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
             "hero-subagents",
             include_str!("bundled_skills/letsbeheroes/hero-subagents.md"),
         ),
+        (
+            "distinctive-design",
+            include_str!("bundled_skills/distinctive-design.md"),
+        ),
+        ("deslop", include_str!("bundled_skills/deslop.md")),
+    ]
+}
+
+/// Built-in slash commands from the workflow kit. User and project command
+/// files of the same name win; bundled commands load only when the name is free.
+pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("commit", include_str!("bundled_commands/commit.md")),
+        ("review", include_str!("bundled_commands/review.md")),
+        ("test", include_str!("bundled_commands/test.md")),
+        ("debug", include_str!("bundled_commands/debug.md")),
+        ("handoff", include_str!("bundled_commands/handoff.md")),
+        ("pr", include_str!("bundled_commands/pr.md")),
+        ("changelog", include_str!("bundled_commands/changelog.md")),
+        ("design-pass", include_str!("bundled_commands/design-pass.md")),
+        ("deslop", include_str!("bundled_commands/deslop.md")),
     ]
 }
 
@@ -1932,6 +1953,25 @@ pub fn load_custom_commands() -> Vec<CustomCommand> {
     let mut seen = HashSet::new();
     for (dir, in_project) in command_dirs(&cwd) {
         scan_commands(&dir, in_project, &mut seen, &mut out);
+    }
+    for (name, text) in bundled_commands() {
+        if seen.contains(name) {
+            continue;
+        }
+        let (fm, body) = parse_frontmatter(text);
+        let body = body.trim().to_string();
+        seen.insert(name.to_string());
+        out.push(CustomCommand {
+            name: name.to_string(),
+            description: fm
+                .get("description")
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| skill_description(&body)),
+            content: body,
+            script: None,
+            skill: false,
+        });
     }
     // Every discovered skill (bundled, user, project, .claude, .agents) is a
     // slash command too; an explicit commands/ entry of the same name wins.
@@ -4011,6 +4051,54 @@ mod tests {
         for n in &names {
             assert!(uniq.insert(n), "duplicate skill name {n}");
         }
+    }
+
+    #[test]
+    fn bundled_workflow_kit_commands_and_skills_ship() {
+        let cmd_names: Vec<_> = bundled_commands().iter().map(|(n, _)| *n).collect();
+        for n in [
+            "commit",
+            "review",
+            "test",
+            "debug",
+            "handoff",
+            "pr",
+            "changelog",
+            "design-pass",
+            "deslop",
+        ] {
+            assert!(cmd_names.contains(&n), "missing bundled command {n}");
+        }
+        let skill_names: Vec<_> = bundled_skills().iter().map(|(n, _)| *n).collect();
+        assert!(skill_names.contains(&"distinctive-design"));
+        assert!(skill_names.contains(&"deslop"));
+        let cmds = load_custom_commands();
+        let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
+        assert!(!commit.skill);
+        assert!(commit.content.contains("git status"));
+        let deslop_skill = discover_skills(Path::new("."))
+            .into_iter()
+            .find(|s| s.name == "deslop")
+            .unwrap();
+        assert_eq!(deslop_skill.source, SkillSource::Bundled);
+    }
+
+    #[test]
+    fn user_command_overrides_bundled_workflow_command() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        write(
+            &h.join("commands").join("commit.md"),
+            "---\ndescription: Mine\n---\nUser commit.",
+        );
+        let cmds = load_custom_commands();
+        let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
+        assert_eq!(commit.content, "User commit.");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
     }
 
     #[test]
