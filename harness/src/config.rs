@@ -1846,6 +1846,33 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
         ("retro", include_str!("bundled_commands/retro.md")),
         ("api-docs", include_str!("bundled_commands/api-docs.md")),
         ("explain", include_str!("bundled_commands/explain.md")),
+        ("brainstorm", include_str!("bundled_commands/brainstorm.md")),
+        ("bug", include_str!("bundled_commands/bug.md")),
+        ("discovery", include_str!("bundled_commands/discovery.md")),
+        ("feature", include_str!("bundled_commands/feature.md")),
+        (
+            "migration-plan",
+            include_str!("bundled_commands/migration-plan.md"),
+        ),
+        ("onboard", include_str!("bundled_commands/onboard.md")),
+        ("runbook", include_str!("bundled_commands/runbook.md")),
+        ("rfc", include_str!("bundled_commands/rfc.md")),
+        ("test-plan", include_str!("bundled_commands/test-plan.md")),
+        ("testgen", include_str!("bundled_commands/testgen.md")),
+        ("threat-model", include_str!("bundled_commands/threat-model.md")),
+        ("user-story", include_str!("bundled_commands/user-story.md")),
+        ("bdd", include_str!("bundled_commands/bdd.md")),
+        ("questionnaire", include_str!("bundled_commands/questionnaire.md")),
+        ("grill", include_str!("bundled_commands/grill.md")),
+        ("new-skill", include_str!("bundled_commands/new-skill.md")),
+        ("new-agent", include_str!("bundled_commands/new-agent.md")),
+        ("new-command", include_str!("bundled_commands/new-command.md")),
+        ("sbom", include_str!("bundled_commands/sbom.md")),
+        ("load-test", include_str!("bundled_commands/load-test.md")),
+        ("coverage", include_str!("bundled_commands/coverage.md")),
+        ("playwright", include_str!("bundled_commands/playwright.md")),
+        ("design-brief", include_str!("bundled_commands/design-brief.md")),
+        ("journey", include_str!("bundled_commands/journey.md")),
     ]
 }
 
@@ -4094,22 +4121,16 @@ mod tests {
     #[test]
     fn bundled_workflow_kit_commands_and_skills_ship() {
         let cmd_names: Vec<_> = bundled_commands().iter().map(|(n, _)| *n).collect();
-        for n in [
-            "commit",
-            "review",
-            "test",
-            "debug",
-            "handoff",
-            "pr",
-            "changelog",
-            "design-pass",
-            "deslop",
-            "adr",
-            "retro",
-            "api-docs",
-            "explain",
-        ] {
-            assert!(cmd_names.contains(&n), "missing bundled command {n}");
+        let expect_cmd: &[&str] = &[
+            "commit", "review", "test", "debug", "handoff", "pr", "changelog", "design-pass",
+            "deslop", "adr", "retro", "api-docs", "explain", "brainstorm", "bug", "discovery",
+            "feature", "migration-plan", "onboard", "runbook", "rfc", "test-plan", "testgen",
+            "threat-model", "user-story", "bdd", "questionnaire", "grill", "new-skill", "new-agent",
+            "new-command", "sbom", "load-test", "coverage", "playwright", "design-brief", "journey",
+        ];
+        assert_eq!(cmd_names.len(), expect_cmd.len());
+        for n in expect_cmd {
+            assert!(cmd_names.contains(n), "missing bundled command {n}");
         }
         let skill_names: Vec<_> = bundled_skills().iter().map(|(n, _)| *n).collect();
         for n in [
