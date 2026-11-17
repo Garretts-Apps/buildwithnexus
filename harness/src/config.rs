@@ -1891,6 +1891,19 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
         ("rebuild", include_str!("bundled_commands/rebuild.md")),
         ("sdd", include_str!("bundled_commands/sdd.md")),
         ("entropy", include_str!("bundled_commands/entropy.md")),
+        (
+            "security-review",
+            include_str!("bundled_commands/security-review.md"),
+        ),
+        (
+            "secrets-scan",
+            include_str!("bundled_commands/secrets-scan.md"),
+        ),
+        ("deps-audit", include_str!("bundled_commands/deps-audit.md")),
+        (
+            "supply-chain",
+            include_str!("bundled_commands/supply-chain.md"),
+        ),
     ]
 }
 
@@ -4180,6 +4193,10 @@ mod tests {
             "rebuild",
             "sdd",
             "entropy",
+            "security-review",
+            "secrets-scan",
+            "deps-audit",
+            "supply-chain",
         ];
         assert_eq!(cmd_names.len(), expect_cmd.len());
         for n in expect_cmd {
@@ -4193,6 +4210,7 @@ mod tests {
             "verify-before-done",
             "api-design",
             "agent-orchestration",
+            "security-review",
         ] {
             assert!(skill_names.contains(&n), "missing skill {n}");
         }
