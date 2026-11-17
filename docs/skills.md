@@ -46,7 +46,7 @@ hooks and permission gate as `run_command`.
 Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
 and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. A file in one of those folders with the same name
-as a bundled default replaces the built-in (37 workflow-kit commands ship in the
+as a bundled default replaces the built-in (38 workflow-kit commands ship in the
 binary; `/skills` and `/commit` autocomplete list the names). Built-in commands
 load when the name is still free.
 Skills and commands work headless too: `bwn run '/deploy staging'`.
