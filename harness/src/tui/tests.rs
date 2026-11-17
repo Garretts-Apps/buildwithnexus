@@ -761,6 +761,169 @@ fn pipe_tables_render_aligned() {
     );
 }
 
+// Cells of one rendered table row. The indent and the single space on each
+// side of a bar are chrome; the padding left inside a cell is the alignment.
+fn table_cells(line: &str) -> Vec<String> {
+    let line = line.strip_prefix("  ").unwrap_or(line);
+    let parts: Vec<&str> = line.split('│').collect();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let mut cell = *part;
+            if i > 0 {
+                cell = cell.strip_prefix(' ').unwrap_or(cell);
+            }
+            if i + 1 < parts.len() {
+                cell = cell.strip_suffix(' ').unwrap_or(cell);
+            }
+            cell.to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn table_header_and_cells_share_alignment() {
+    std::env::remove_var("NO_COLOR");
+    let rows = vec![
+        "| Left | Mid | Right |".to_string(),
+        "|:-----|:---:|------:|".to_string(),
+        "| a | b | c |".to_string(),
+        "| longer-left-value | m | longer-right-value |".to_string(),
+    ];
+    let plain: Vec<String> = render_table(&rows, 40)
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect();
+    // header, rule, two body rows
+    let header = table_cells(&plain[0]);
+    let short = table_cells(&plain[2]);
+    let long = table_cells(&plain[3]);
+    assert_eq!(header.len(), 3, "{plain:?}");
+    let flush_left = |cell: &str| !cell.starts_with(' ');
+    let flush_right = |cell: &str| !cell.ends_with(' ');
+    // No colon on a separator is left. `:---` is left. Both ends of the
+    // column carry the text, including a cell cut with an ellipsis.
+    for cell in [&header[0], &short[0], &long[0]] {
+        assert!(flush_left(cell), "left column drifted: {cell:?}");
+    }
+    assert!(
+        long[0].ends_with('…'),
+        "left truncation keeps the head: {}",
+        long[0]
+    );
+    // `:---:` centers a short cell. A cut cell uses an ellipsis on both sides.
+    let mid_pad = |cell: &str| {
+        let lead = cell.chars().take_while(|c| *c == ' ').count();
+        let tail = cell.chars().rev().take_while(|c| *c == ' ').count();
+        (lead, tail)
+    };
+    let (hl, ht) = mid_pad(&header[1]);
+    let (sl, st) = mid_pad(&short[1]);
+    assert!(
+        hl.abs_diff(ht) <= 1,
+        "header mid not centered: {:?}",
+        header[1]
+    );
+    assert!(
+        sl.abs_diff(st) <= 1,
+        "cell mid not centered: {:?}",
+        short[1]
+    );
+    // `---:` is right for the header, the short cell, and the cut cell.
+    for cell in [&header[2], &short[2], &long[2]] {
+        assert!(flush_right(cell), "right column drifted: {cell:?}");
+    }
+    assert!(
+        long[2].trim_start().starts_with('…'),
+        "right truncation keeps the tail: {}",
+        long[2]
+    );
+    // A separator with no colon at all is left, same as the default.
+    let plain_default: Vec<String> = render_table(
+        &[
+            "| Name | Notes |".to_string(),
+            "|---|---|".to_string(),
+            "| paper | the note |".to_string(),
+        ],
+        80,
+    )
+    .into_iter()
+    .map(|l| strip_ansi(&l))
+    .collect();
+    let head = table_cells(&plain_default[0]);
+    let body = table_cells(&plain_default[2]);
+    assert!(
+        flush_left(&head[0]) && flush_left(&body[0]),
+        "{plain_default:?}"
+    );
+    assert!(
+        flush_left(&head[1]) && flush_left(&body[1]),
+        "{plain_default:?}"
+    );
+}
+
+#[test]
+fn heading_and_link_underlines_are_not_strikethrough() {
+    std::env::remove_var("NO_COLOR");
+    let marked = [
+        ("h1", render_md_line("# Heading")),
+        ("h3", render_md_line("### Heading")),
+        ("h5", render_md_line("##### Heading")),
+        (
+            "link",
+            render_md_line("[the docs](https://example.com/docs)"),
+        ),
+    ];
+    for (name, rendered) in marked {
+        assert!(
+            rendered.contains("\x1b[4m"),
+            "{name} is underline (SGR 4), got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\x1b[9m"),
+            "{name} must not be strikethrough, got {rendered:?}"
+        );
+    }
+    let struck = render_md_line("~~struck~~");
+    assert!(struck.contains("\x1b[9m"), "{struck:?}");
+    assert!(!struck.contains("\x1b[4m"), "{struck:?}");
+}
+
+#[test]
+fn code_frames_close_on_the_right_at_80_and_120() {
+    std::env::remove_var("NO_COLOR");
+    for width in [80usize, 120] {
+        for doc in ["```rust\nfn answer() {}\n```", "```\nplain block\n```"] {
+            let plain = strip_ansi(&render_md_width(doc, width));
+            let mut saw_top = false;
+            let mut saw_bottom = false;
+            for line in plain.lines() {
+                assert!(
+                    str_width(line) <= width,
+                    "{width}: {} cols: {line}",
+                    str_width(line)
+                );
+                if line.contains('╭') {
+                    saw_top = true;
+                    assert_eq!(str_width(line), width, "{line}");
+                    assert!(line.ends_with('╮'), "missing right corner: {line}");
+                }
+                if line.contains('╰') {
+                    saw_bottom = true;
+                    assert_eq!(str_width(line), width, "{line}");
+                    assert!(line.ends_with('╯'), "missing right corner: {line}");
+                }
+                if line.contains('│') {
+                    assert!(line.ends_with('│'), "missing right border: {line}");
+                    assert_eq!(str_width(line), width, "{line}");
+                }
+            }
+            assert!(saw_top && saw_bottom, "{width}\n{plain}");
+        }
+    }
+}
+
 #[test]
 fn stream_renderer_collects_tables() {
     std::env::remove_var("NO_COLOR");

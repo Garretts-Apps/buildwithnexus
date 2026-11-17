@@ -603,14 +603,14 @@ pub(super) fn paint_code_rows(
     width: usize,
     st: &mut crate::highlight::State,
 ) -> Vec<String> {
-    let inner = width.saturating_sub(4).max(1);
+    let inner = code_frame_inner(width);
     let parts = wrap_tokens(line, inner);
     if parts.is_empty() {
-        return vec![code_box_line("")];
+        return vec![code_box_line("", width)];
     }
     parts
         .into_iter()
-        .map(|part| code_box_line(&style_code_piece(lang, &part, st)))
+        .map(|part| code_box_line(&style_code_piece(lang, &part, st), width))
         .collect()
 }
 
@@ -691,6 +691,31 @@ pub(super) fn table_separator(cells: &[String]) -> Option<Vec<Align>> {
     Some(out)
 }
 
+// Cut `styled` down to `target` columns. The ellipsis sits on the cut side, so
+// a right-aligned column keeps its tail and a left-aligned column keeps its
+// head. Header and body use the same rule.
+fn fit_cell(styled: &str, target: usize, align: Align) -> String {
+    let width = str_width(&strip_ansi(styled));
+    if width <= target || target == 0 {
+        return styled.to_string();
+    }
+    let room = target.saturating_sub(1);
+    if room == 0 {
+        return "…".to_string();
+    }
+    match align {
+        Align::Right => format!("…{}", clip_ansi_tail(styled, room)),
+        Align::Center if target >= 5 => {
+            let keep = target - 2;
+            let skip = width.saturating_sub(keep) / 2;
+            let head = clip_ansi_line(styled, skip + keep);
+            let mid = clip_ansi_tail(&head, keep);
+            format!("…{mid}…")
+        }
+        Align::Left | Align::Center => format!("{}…", clip_ansi_line(styled, room)),
+    }
+}
+
 pub(super) fn render_table(rows: &[String], w: usize) -> Vec<String> {
     let parsed: Vec<Vec<String>> = rows.iter().map(|r| split_table_cells(r)).collect();
     let mut aligns: Option<Vec<Align>> = None;
@@ -747,21 +772,18 @@ pub(super) fn render_table(rows: &[String], w: usize) -> Vec<String> {
     let mut out = Vec::with_capacity(fmt.len() + 1);
     for (ri, row) in fmt.iter().enumerate() {
         let mut line = String::from("  ");
-        for (j, (styled, width)) in row.iter().enumerate() {
+        for (j, (styled, _)) in row.iter().enumerate() {
             let target = widths[j];
-            let (cell, cw) = if *width > target {
-                let cut = clip_ansi_line(styled, target.saturating_sub(1));
-                (format!("{cut}…"), target)
-            } else {
-                (styled.clone(), *width)
-            };
+            let align = aligns.get(j).copied().unwrap_or(Align::Left);
+            let cell = fit_cell(styled, target, align);
+            let cw = str_width(&strip_ansi(&cell)).min(target);
             let cell = if has_header && ri == 0 {
                 bold(&cell)
             } else {
                 cell
             };
             let pad = target - cw;
-            let (l, r) = match aligns.get(j).copied().unwrap_or(Align::Left) {
+            let (l, r) = match align {
                 Align::Left => (0, pad),
                 Align::Right => (pad, 0),
                 Align::Center => (pad / 2, pad - pad / 2),
@@ -790,26 +812,57 @@ pub(super) fn render_table(rows: &[String], w: usize) -> Vec<String> {
     out
 }
 
+// Room for the code itself inside `  │ … │`.
+fn code_frame_inner(w: usize) -> usize {
+    w.saturating_sub(6).max(1)
+}
+
+// A closed frame exactly `w` columns wide: left rule, fill, right corner.
+// `left_plain` is what the eye sees; `left_styled` is that text with colour.
+fn frame_rule(left_plain: &str, left_styled: &str, right: &str, w: usize) -> String {
+    let dashes = w.saturating_sub(str_width(left_plain) + str_width(right));
+    format!("{left_styled}{}{}", dim(&"─".repeat(dashes)), dim(right))
+}
+
 // Bordered code-block chrome, shared by the streaming renderer and render_md().
+// Both corners are on the row, so an 80-column terminal still shows the right
+// one. The language name is the mark colour; the rule stays quiet.
 pub(super) fn code_box_header(lang: &str, w: usize) -> String {
-    let prefix = if lang.is_empty() {
-        "  ╭─".to_string()
-    } else {
-        format!("  ╭─ ⟨ {lang} ⟩ ")
-    };
-    let used = str_width(&prefix);
-    let dashes = w.saturating_sub(used).max(1);
-    format!("{}{}", dim(&prefix), dim(&"─".repeat(dashes)))
+    let w = w.max(4);
+    let mut label = lang.trim().to_string();
+    loop {
+        let left_plain = if label.is_empty() {
+            "  ╭".to_string()
+        } else {
+            format!("  ╭─ {label} ")
+        };
+        if str_width(&left_plain) < w || label.is_empty() {
+            let left_styled = if label.is_empty() {
+                dim("  ╭")
+            } else {
+                format!("{}{}{}", dim("  ╭─ "), accent(&label), dim(" "))
+            };
+            return frame_rule(&left_plain, &left_styled, "╮", w);
+        }
+        label.pop();
+    }
 }
 
 pub(super) fn code_box_footer(w: usize) -> String {
-    let prefix = "  ╰";
-    let dashes = w.saturating_sub(str_width(prefix)).max(1);
-    format!("{}{}", dim(prefix), dim(&"─".repeat(dashes)))
+    let w = w.max(4);
+    frame_rule("  ╰", &dim("  ╰"), "╯", w)
 }
 
-pub(super) fn code_box_line(text: &str) -> String {
-    format!("  {} {text}", dim("│"))
+pub(super) fn code_box_line(text: &str, w: usize) -> String {
+    let w = w.max(4);
+    let inner = code_frame_inner(w);
+    let shown = if str_width(&strip_ansi(text)) > inner {
+        clip_ansi_line(text, inner)
+    } else {
+        text.to_string()
+    };
+    let pad = inner.saturating_sub(str_width(&strip_ansi(&shown)));
+    format!("  {} {shown}{} {}", dim("│"), " ".repeat(pad), dim("│"))
 }
 
 pub(super) fn starts_like_top_level_json(text: &str) -> bool {

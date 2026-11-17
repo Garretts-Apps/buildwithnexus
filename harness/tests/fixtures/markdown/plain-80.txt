@@ -37,21 +37,21 @@ See the docs (https://example.com/docs) and https://example.com/auto.
 
 This sentence is long enough that it wraps once at one hundred twenty columns and twice at eighty columns so the two goldens cannot be the same file.
 
-  ╭─ ⟨ rust ⟩ ──────────────────────────────────────────────────────────────────
-  │ fn answer() -> i32 {
-  │     let value = 40 + 2;
-  │     value
-  │ }
-  ╰─────────────────────────────────────────────────────────────────────────────
+  ╭─ rust ─────────────────────────────────────────────────────────────────────╮
+  │ fn answer() -> i32 {                                                       │
+  │     let value = 40 + 2;                                                    │
+  │     value                                                                  │
+  │ }                                                                          │
+  ╰────────────────────────────────────────────────────────────────────────────╯
 
-  ╭─────────────────────────────────────────────────────────────────────────────
-  │ plain block
-  │ token token token token token token token token token token token token 
-  │ token token token token
-  ╰─────────────────────────────────────────────────────────────────────────────
+  ╭────────────────────────────────────────────────────────────────────────────╮
+  │ plain block                                                                │
+  │ token token token token token token token token token token token token    │
+  │ token token token token                                                    │
+  ╰────────────────────────────────────────────────────────────────────────────╯
 
   Name  │   Role    │                                                      Notes
   ──────┼───────────┼───────────────────────────────────────────────────────────
-  paper │   body    │ the long note that forces the notes column to shrink when…
+  paper │   body    │ …n to shrink when the terminal is only eighty columns wide
   mark  │   notch   │                                               a short cell
-  quiet │ secondary │ another long note about secondary text that should stay a…
+  quiet │ secondary │ …ondary text that should stay aligned with the header rule

@@ -3459,6 +3459,47 @@ fn clip_ansi_line(s: &str, max_cols: usize) -> String {
     clip_ansi(s, max_cols).0
 }
 
+// The last `max_cols` of `s`. Escape sequences before the cut are kept, in
+// order, so a colour opened earlier still applies to the tail.
+fn clip_ansi_tail(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let total = str_width(&strip_ansi(s));
+    if total <= max_cols {
+        return s.to_string();
+    }
+    let skip = total - max_cols;
+    let mut skipped = 0usize;
+    let mut prefix = String::new();
+    let mut out = String::new();
+    let mut started = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            let mut esc = String::from("\u{1b}");
+            eat_escape(&mut chars, Some(&mut esc));
+            if started {
+                out.push_str(&esc);
+            } else {
+                prefix.push_str(&esc);
+            }
+            continue;
+        }
+        let w = char_width(c).max(1);
+        if !started {
+            if skipped + w <= skip {
+                skipped += w;
+                continue;
+            }
+            started = true;
+            out.push_str(&prefix);
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Clip to `cols` display columns, keeping SGR and OSC sequences intact.
 pub(crate) fn clip_cells(s: &str, cols: usize) -> String {
     clip_ansi_line(s, cols)
