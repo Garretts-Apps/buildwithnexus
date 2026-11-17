@@ -1,0 +1,49 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 $NEXUS_HOME/hooks/guard_shell.py"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 $NEXUS_HOME/hooks/guard_writes.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 $NEXUS_HOME/hooks/screen_prompt.py"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 $NEXUS_HOME/hooks/strip_invisible.py"
+          }
+        ]
+      }
+    ]
+  }
+}
