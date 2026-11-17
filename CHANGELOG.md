@@ -4,6 +4,16 @@ All notable changes to `buildwithnexus` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **MCP resources and prompts are read-only tools.** When a connected server
+  publishes them, the model can call `mcp_resources` (list, or read a `uri`)
+  and `mcp_prompts` (list, or fetch a `name` with its arguments). They are
+  not pasted into the prompt. A server that publishes neither leaves the
+  tool list unchanged. A blob is omitted. Text is cut at 16 KB, the same cap
+  as other tool output. `/mcp reload` refreshes the lists.
+
 ## [0.21.0] - 2026-11-15
 
 Five behavior changes that were proposed in the competitor analysis and

@@ -1,6 +1,8 @@
 // Model Context Protocol client: persistent stdio / Streamable HTTP
 // connections, the initialize handshake, paginated tool discovery, and the
-// dispatch of `mcp__<server>__<tool>` calls. One process-wide registry holds
+// dispatch of `mcp__<server>__<tool>` calls. Resources and prompts are a
+// separate read-only surface (`mcp_resources`, `mcp_prompts`), listed at
+// connect time and never pasted into the prompt. One process-wide registry holds
 // a connection per configured server for the life of the session; servers
 // connect lazily in background threads so startup never waits on them, and a
 // hung or crashed server is reported once and dropped from the tool surface.
@@ -909,9 +911,24 @@ impl HttpConn {
 
 // ── protocol flows (transport-agnostic) ─────────────────────────────────────
 
-/// `initialize` + `notifications/initialized`. Returns "name version" of the
-/// server for status displays.
-pub fn handshake(rpc: &mut dyn Rpc) -> Result<String, RpcError> {
+/// What `initialize` said. `resources` and `prompts` are the server's
+/// advertised capabilities, not a promise that the lists are non-empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Handshake {
+    pub info: String,
+    pub resources: bool,
+    pub prompts: bool,
+}
+
+fn capability_on(res: &Value, key: &str) -> bool {
+    !matches!(
+        res["capabilities"].get(key),
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    )
+}
+
+/// `initialize` + `notifications/initialized`.
+pub fn handshake(rpc: &mut dyn Rpc) -> Result<Handshake, RpcError> {
     let params = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
@@ -921,28 +938,249 @@ pub fn handshake(rpc: &mut dyn Rpc) -> Result<String, RpcError> {
     rpc.notify("notifications/initialized", None)?;
     let name = res["serverInfo"]["name"].as_str().unwrap_or("");
     let version = res["serverInfo"]["version"].as_str().unwrap_or("");
-    Ok(format!("{name} {version}").trim().to_string())
+    Ok(Handshake {
+        info: format!("{name} {version}").trim().to_string(),
+        resources: capability_on(&res, "resources"),
+        prompts: capability_on(&res, "prompts"),
+    })
+}
+
+/// One list method, following `nextCursor` until the server stops handing
+/// one out, repeats a cursor, or `MAX_LIST_PAGES` is reached.
+fn each_page(
+    rpc: &mut dyn Rpc,
+    method: &str,
+    mut on_page: impl FnMut(&Value),
+) -> Result<(), RpcError> {
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_LIST_PAGES {
+        let params = cursor.as_ref().map(|c| json!({"cursor": c}));
+        let res = rpc.request(method, params.as_ref())?;
+        on_page(&res);
+        match res["nextCursor"].as_str() {
+            Some(c) if !c.is_empty() && seen.insert(c.to_string()) => {
+                cursor = Some(c.to_string());
+            }
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
 }
 
 /// `tools/list`, following `nextCursor` until the server stops handing one out.
 pub fn list_tools(rpc: &mut dyn Rpc, server: &str) -> Result<Vec<McpTool>, RpcError> {
     let mut out = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut seen = HashSet::new();
-    for _ in 0..MAX_LIST_PAGES {
-        let params = cursor.as_ref().map(|c| json!({"cursor": c}));
-        let res = rpc.request("tools/list", params.as_ref())?;
+    each_page(rpc, "tools/list", |res| {
         if let Some(tools) = res["tools"].as_array() {
             out.extend(tools.iter().filter_map(|t| parse_tool(server, t)));
         }
-        match res["nextCursor"].as_str() {
-            Some(c) if !c.is_empty() && seen.insert(c.to_string()) => {
-                cursor = Some(c.to_string());
+    })?;
+    Ok(out)
+}
+
+/// A resource or a URI template the server published. A template is not a
+/// readable URI; the model fills it and passes the result to `resources/read`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpResource {
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime: String,
+    pub template: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptArg {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+
+/// A prompt template the server published.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpPrompt {
+    pub server: String,
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<PromptArg>,
+}
+
+fn non_empty(v: &Value) -> Option<&str> {
+    v.as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn parse_resource(server: &str, v: &Value, template: bool) -> Option<McpResource> {
+    let uri = non_empty(if template {
+        &v["uriTemplate"]
+    } else {
+        &v["uri"]
+    })?;
+    let name = non_empty(&v["name"]).unwrap_or(uri);
+    Some(McpResource {
+        server: server.to_string(),
+        uri: uri.to_string(),
+        name: name.to_string(),
+        description: non_empty(&v["description"]).unwrap_or("").to_string(),
+        mime: non_empty(&v["mimeType"]).unwrap_or("").to_string(),
+        template,
+    })
+}
+
+fn parse_prompt(server: &str, v: &Value) -> Option<McpPrompt> {
+    let name = non_empty(&v["name"])?;
+    let arguments = v["arguments"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(|a| {
+                    let name = non_empty(&a["name"])?;
+                    Some(PromptArg {
+                        name: name.to_string(),
+                        description: non_empty(&a["description"]).unwrap_or("").to_string(),
+                        required: a["required"].as_bool() == Some(true),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(McpPrompt {
+        server: server.to_string(),
+        name: name.to_string(),
+        description: non_empty(&v["description"]).unwrap_or("").to_string(),
+        arguments,
+    })
+}
+
+fn list_named(
+    rpc: &mut dyn Rpc,
+    method: &str,
+    key: &str,
+    mut take: impl FnMut(&Value),
+) -> Result<(), RpcError> {
+    each_page(rpc, method, |res| {
+        if let Some(items) = res[key].as_array() {
+            for item in items {
+                take(item);
             }
-            _ => break,
         }
+    })
+}
+
+/// `resources/list` plus `resources/templates/list` when the server has it.
+/// A missing templates method is an empty template list, not a failure:
+/// templates are optional even when resources are advertised.
+pub fn list_resources(rpc: &mut dyn Rpc, server: &str) -> Result<Vec<McpResource>, RpcError> {
+    let mut out = Vec::new();
+    list_named(rpc, "resources/list", "resources", |item| {
+        if let Some(r) = parse_resource(server, item, false) {
+            out.push(r);
+        }
+    })?;
+    match list_named(
+        rpc,
+        "resources/templates/list",
+        "resourceTemplates",
+        |item| {
+            if let Some(r) = parse_resource(server, item, true) {
+                out.push(r);
+            }
+        },
+    ) {
+        Ok(()) => {}
+        Err(RpcError::Remote(m)) if method_missing(&m) => {}
+        Err(e) => return Err(e),
     }
     Ok(out)
+}
+
+pub fn list_prompts(rpc: &mut dyn Rpc, server: &str) -> Result<Vec<McpPrompt>, RpcError> {
+    let mut out = Vec::new();
+    list_named(rpc, "prompts/list", "prompts", |item| {
+        if let Some(p) = parse_prompt(server, item) {
+            out.push(p);
+        }
+    })?;
+    Ok(out)
+}
+
+fn method_missing(message: &str) -> bool {
+    message.contains("code -32601") || message.to_ascii_lowercase().contains("method not found")
+}
+
+/// Tool-result sized. A resource or prompt larger than this is cut, the same
+/// way other tool output is.
+const CONTEXT_CAP: usize = 16 * 1024;
+
+fn cap_text(s: String) -> String {
+    if s.len() <= CONTEXT_CAP {
+        return s;
+    }
+    let mut out = crate::config::cut_at_char_boundary(&s, CONTEXT_CAP).to_string();
+    out.push_str("\n…[truncated]");
+    out
+}
+
+/// Flattens `resources/read` contents. Text is kept. A blob is named and
+/// omitted: it is not a document the model can read as text.
+pub fn render_resource_read(res: &Value) -> String {
+    let mut parts = Vec::new();
+    let items = res["contents"].as_array();
+    if let Some(items) = items {
+        for item in items {
+            let uri = item["uri"].as_str().unwrap_or("?");
+            if let Some(text) = item["text"].as_str() {
+                if items.len() > 1 {
+                    parts.push(format!("{uri}\n{text}"));
+                } else {
+                    parts.push(text.to_string());
+                }
+            } else if item.get("blob").is_some() {
+                let mime = item["mimeType"]
+                    .as_str()
+                    .unwrap_or("application/octet-stream");
+                parts.push(format!("[blob omitted: {uri} {mime}]"));
+            } else {
+                parts.push(format!("[empty resource: {uri}]"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return "the server returned no content".into();
+    }
+    cap_text(parts.join("\n\n"))
+}
+
+fn render_blocks(items: &[Value]) -> String {
+    render_result(&json!({"content": items})).0
+}
+
+/// Flattens `prompts/get` messages into role-labelled text.
+pub fn render_prompt(res: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(desc) = non_empty(&res["description"]) {
+        parts.push(desc.to_string());
+    }
+    if let Some(msgs) = res["messages"].as_array() {
+        for m in msgs {
+            let role = m["role"].as_str().unwrap_or("user");
+            let body = if let Some(items) = m["content"].as_array() {
+                render_blocks(items)
+            } else if m["content"].is_object() {
+                render_blocks(std::slice::from_ref(&m["content"]))
+            } else if let Some(text) = m["content"].as_str() {
+                text.to_string()
+            } else {
+                String::new()
+            };
+            parts.push(format!("{role}:\n{body}"));
+        }
+    }
+    if parts.is_empty() {
+        return "the server returned no prompt".into();
+    }
+    cap_text(parts.join("\n\n"))
 }
 
 /// Flattens a `tools/call` result to `(text, is_error)`: text blocks are
@@ -1033,8 +1271,17 @@ struct ServerState {
     config: Option<ServerConfig>,
     status: Status,
     tools: Vec<McpTool>,
+    resources: Vec<McpResource>,
+    prompts: Vec<McpPrompt>,
     conn: Option<Box<dyn Rpc>>,
     server_info: String,
+}
+
+fn clear_surface(st: &mut ServerState) {
+    st.conn = None;
+    st.tools.clear();
+    st.resources.clear();
+    st.prompts.clear();
 }
 
 struct Registry {
@@ -1062,9 +1309,31 @@ fn lock_state(s: &Arc<Mutex<ServerState>>) -> std::sync::MutexGuard<'_, ServerSt
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// A live connection, the server's "name version", the tools to advertise,
-// and how many listed tools the include/exclude filters dropped.
-type Connected = (Box<dyn Rpc>, String, Vec<McpTool>, usize);
+// A live connection and what discovery kept. A resources or prompts list
+// that fails does not drop the tools: the note says which list failed.
+struct Connected {
+    conn: Box<dyn Rpc>,
+    info: String,
+    tools: Vec<McpTool>,
+    hidden: usize,
+    resources: Vec<McpResource>,
+    prompts: Vec<McpPrompt>,
+    notes: Vec<String>,
+}
+
+fn list_optional<T>(
+    notes: &mut Vec<String>,
+    label: &str,
+    result: Result<Vec<T>, RpcError>,
+) -> Vec<T> {
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            notes.push(format!("{label} failed: {}", e.message()));
+            Vec::new()
+        }
+    }
+}
 
 // Never signs in: a server that wants a login comes back NeedsAuth, and only
 // `mcp login` opens a browser.
@@ -1081,10 +1350,37 @@ fn connect(cfg: &ServerConfig) -> Result<Connected, Status> {
         RpcError::Unauthorized(m) => Status::NeedsAuth(m),
         e => Status::Failed(format!("{step} failed: {}", e.message())),
     };
-    let info = handshake(conn.as_mut()).map_err(|e| failed("initialize", e))?;
+    let hello = handshake(conn.as_mut()).map_err(|e| failed("initialize", e))?;
     let listed = list_tools(conn.as_mut(), &cfg.name).map_err(|e| failed("tools/list", e))?;
     let (tools, hidden) = select_tools(listed, cfg.include_tools.as_deref(), &cfg.exclude_tools);
-    Ok((conn, info, tools, hidden))
+    let mut notes = Vec::new();
+    let resources = if hello.resources {
+        list_optional(
+            &mut notes,
+            "resources/list",
+            list_resources(conn.as_mut(), &cfg.name),
+        )
+    } else {
+        Vec::new()
+    };
+    let prompts = if hello.prompts {
+        list_optional(
+            &mut notes,
+            "prompts/list",
+            list_prompts(conn.as_mut(), &cfg.name),
+        )
+    } else {
+        Vec::new()
+    };
+    Ok(Connected {
+        conn,
+        info: hello.info,
+        tools,
+        hidden,
+        resources,
+        prompts,
+        notes,
+    })
 }
 
 /// Starts connecting every configured server in the background. Idempotent:
@@ -1117,6 +1413,8 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
             config: config.clone(),
             status: status.clone(),
             tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
             conn: None,
             server_info: String::new(),
         }));
@@ -1131,23 +1429,35 @@ pub fn start_with(servers: &BTreeMap<String, Value>) {
             let result = connect(&cfg);
             let mut reg = registry();
             let notice = match result {
-                Ok((conn, info, tools, hidden)) => {
-                    let n = tools.len();
-                    let mut st = lock_state(&state);
-                    if generation == reg.generation {
-                        st.conn = Some(conn);
-                        st.tools = tools;
-                        st.server_info = info;
-                        st.status = Status::Connected;
-                    }
-                    let hidden = if hidden == 0 {
+                Ok(connected) => {
+                    let n = connected.tools.len();
+                    let context =
+                        context_suffix(connected.resources.len(), connected.prompts.len());
+                    let notes = if connected.notes.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({hidden} hidden by include_tools/exclude_tools)")
+                        format!(" ({})", connected.notes.join("; "))
+                    };
+                    let mut st = lock_state(&state);
+                    if generation == reg.generation {
+                        st.conn = Some(connected.conn);
+                        st.tools = connected.tools;
+                        st.resources = connected.resources;
+                        st.prompts = connected.prompts;
+                        st.server_info = connected.info;
+                        st.status = Status::Connected;
+                    }
+                    let hidden = if connected.hidden == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} hidden by include_tools/exclude_tools)",
+                            connected.hidden
+                        )
                     };
                     (
                         format!(
-                            "mcp: {name} connected, {n} tool{}{hidden}",
+                            "mcp: {name} connected, {n} tool{}{context}{hidden}{notes}",
                             crate::report::plural(n)
                         ),
                         true,
@@ -1321,10 +1631,12 @@ pub fn is_read_only(mangled: &str) -> bool {
     false
 }
 
-/// Calls `tool` on `server` over its persistent connection. A transport
-/// failure marks the server failed, drops its tools for the session, and
-/// queues one notice.
-pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), String> {
+/// One request on a connected server. A transport failure marks the server
+/// failed and drops its tools, resources and prompts for the session.
+fn with_server<T>(
+    server: &str,
+    f: impl FnOnce(&mut dyn Rpc) -> Result<T, RpcError>,
+) -> Result<T, String> {
     let state = {
         let reg = registry();
         reg.servers.get(server).map(Arc::clone)
@@ -1356,12 +1668,11 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), St
     let Some(conn) = st.conn.as_mut() else {
         return Err(format!("MCP server '{server}' has no connection"));
     };
-    match call_tool(conn.as_mut(), tool, args) {
+    match f(conn.as_mut()) {
         Ok(r) => Ok(r),
         Err(RpcError::Remote(m)) => Err(format!("MCP server '{server}' error: {m}")),
         Err(RpcError::Unauthorized(why)) => {
-            st.conn = None;
-            st.tools.clear();
+            clear_surface(&mut st);
             st.status = Status::NeedsAuth(why.clone());
             drop(st);
             let hint = crate::mcp_auth::login_hint(server, &why);
@@ -1372,8 +1683,7 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), St
             Err(format!("MCP server '{server}' needs login: {hint}"))
         }
         Err(RpcError::Transport(m)) => {
-            st.conn = None;
-            st.tools.clear();
+            clear_surface(&mut st);
             st.status = Status::Failed(m.clone());
             drop(st);
             registry().notices.push((
@@ -1382,6 +1692,268 @@ pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), St
             ));
             Err(format!("MCP server '{server}' disconnected: {m}"))
         }
+    }
+}
+
+/// Calls `tool` on `server` over its persistent connection. A transport
+/// failure marks the server failed, drops its tools for the session, and
+/// queues one notice.
+pub fn call(server: &str, tool: &str, args: &Value) -> Result<(String, bool), String> {
+    with_server(server, |rpc| call_tool(rpc, tool, args))
+}
+
+fn context_suffix(resources: usize, prompts: usize) -> String {
+    match (resources, prompts) {
+        (0, 0) => String::new(),
+        (r, 0) => format!(", {r} resource{}", crate::report::plural(r)),
+        (0, p) => format!(", {p} prompt{}", crate::report::plural(p)),
+        (r, p) => format!(
+            ", {r} resource{}, {p} prompt{}",
+            crate::report::plural(r),
+            crate::report::plural(p)
+        ),
+    }
+}
+
+fn connected_states() -> Vec<(String, Arc<Mutex<ServerState>>)> {
+    server_states()
+        .into_iter()
+        .filter(|(_, s)| lock_state(s).status == Status::Connected)
+        .collect()
+}
+
+/// Resources and URI templates of every connected server.
+pub fn resources() -> Vec<McpResource> {
+    let mut out = Vec::new();
+    for (_, state) in connected_states() {
+        out.extend(lock_state(&state).resources.iter().cloned());
+    }
+    out
+}
+
+/// Prompts of every connected server.
+pub fn prompts() -> Vec<McpPrompt> {
+    let mut out = Vec::new();
+    for (_, state) in connected_states() {
+        out.extend(lock_state(&state).prompts.iter().cloned());
+    }
+    out
+}
+
+fn known_server(name: &str) -> bool {
+    server_states().iter().any(|(n, _)| n == name)
+}
+
+fn resolve_one(label: &str, owners: &[String]) -> Result<String, String> {
+    match owners {
+        [] => Err(format!("no connected MCP server has published {label}")),
+        [one] => Ok(one.clone()),
+        many => Err(format!(
+            "{label} is published by {} — pass server to choose one",
+            many.join(", ")
+        )),
+    }
+}
+
+fn filter_server(server: Option<&str>, name: &str) -> bool {
+    server.is_none_or(|want| want == name)
+}
+
+/// The listing `mcp_resources` returns when no URI was passed.
+pub fn resource_list_text(server: Option<&str>) -> Result<String, String> {
+    if let Some(name) = server {
+        if !known_server(name) {
+            return Err(format!(
+                "MCP server '{name}' not found in settings.json mcp_servers"
+            ));
+        }
+    }
+    let items: Vec<McpResource> = resources()
+        .into_iter()
+        .filter(|r| filter_server(server, &r.server))
+        .collect();
+    if items.is_empty() {
+        return Ok("no MCP server has published a resource".into());
+    }
+    let mut lines = Vec::new();
+    let extra = items.len().saturating_sub(200);
+    for r in items.iter().take(200) {
+        let mime = if r.mime.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", r.mime)
+        };
+        let kind = if r.template { "  template" } else { "" };
+        lines.push(format!("{}  {}  {}{mime}{kind}", r.server, r.name, r.uri));
+        if !r.description.is_empty() {
+            lines.push(format!(
+                "    {}",
+                crate::tools::clamp_preview(&r.description, 160)
+            ));
+        }
+    }
+    if extra > 0 {
+        lines.push(format!("{extra} more not shown"));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `resources/read`. A URI that was not listed is still read when `server`
+/// names the server (a filled-in template). A blob comes back omitted.
+pub fn read_resource(server: Option<&str>, uri: &str) -> Result<String, String> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return Err("uri is required".into());
+    }
+    let target = if let Some(name) = server {
+        if !known_server(name) {
+            return Err(format!(
+                "MCP server '{name}' not found in settings.json mcp_servers"
+            ));
+        }
+        name.to_string()
+    } else {
+        let owners: Vec<String> = resources()
+            .into_iter()
+            .filter(|r| !r.template && r.uri == uri)
+            .map(|r| r.server)
+            .collect();
+        resolve_one(&format!("resource {uri}"), &owners)?
+    };
+    let res = with_server(&target, |rpc| {
+        rpc.request("resources/read", Some(&json!({"uri": uri})))
+    })?;
+    Ok(render_resource_read(&res))
+}
+
+/// The listing `mcp_prompts` returns when no name was passed.
+pub fn prompt_list_text(server: Option<&str>) -> Result<String, String> {
+    if let Some(name) = server {
+        if !known_server(name) {
+            return Err(format!(
+                "MCP server '{name}' not found in settings.json mcp_servers"
+            ));
+        }
+    }
+    let items: Vec<McpPrompt> = prompts()
+        .into_iter()
+        .filter(|p| filter_server(server, &p.server))
+        .collect();
+    if items.is_empty() {
+        return Ok("no MCP server has published a prompt".into());
+    }
+    let mut lines = Vec::new();
+    let extra = items.len().saturating_sub(200);
+    for p in items.iter().take(200) {
+        let args = if p.arguments.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = p
+                .arguments
+                .iter()
+                .map(|a| {
+                    if a.required {
+                        a.name.clone()
+                    } else {
+                        format!("{}?", a.name)
+                    }
+                })
+                .collect();
+            format!("  ({})", names.join(", "))
+        };
+        lines.push(format!("{}  {}{args}", p.server, p.name));
+        if !p.description.is_empty() {
+            lines.push(format!(
+                "    {}",
+                crate::tools::clamp_preview(&p.description, 160)
+            ));
+        }
+    }
+    if extra > 0 {
+        lines.push(format!("{extra} more not shown"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn string_arguments(v: &Value) -> Value {
+    let Some(obj) = v.as_object() else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for (k, val) in obj {
+        let s = match val {
+            Value::String(s) => s.clone(),
+            Value::Null => continue,
+            other => other.to_string(),
+        };
+        out.insert(k.clone(), Value::String(s));
+    }
+    Value::Object(out)
+}
+
+/// `prompts/get`. Arguments are sent as strings, which is what the protocol
+/// asks for. A required argument missing from a listed prompt is refused
+/// before the request.
+pub fn get_prompt(server: Option<&str>, name: &str, arguments: &Value) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is required".into());
+    }
+    let args = string_arguments(arguments);
+    let listed: Vec<McpPrompt> = prompts()
+        .into_iter()
+        .filter(|p| p.name == name && filter_server(server, &p.server))
+        .collect();
+    let target = if let Some(server_name) = server {
+        if !known_server(server_name) {
+            return Err(format!(
+                "MCP server '{server_name}' not found in settings.json mcp_servers"
+            ));
+        }
+        if let Some(prompt) = listed.iter().find(|p| p.server == server_name) {
+            missing_prompt_args(prompt, &args)?;
+        }
+        server_name.to_string()
+    } else {
+        let owners: Vec<String> = listed.iter().map(|p| p.server.clone()).collect();
+        let target = resolve_one(&format!("prompt {name}"), &owners)?;
+        if let Some(prompt) = listed.iter().find(|p| p.server == target) {
+            missing_prompt_args(prompt, &args)?;
+        }
+        target
+    };
+    let res = with_server(&target, |rpc| {
+        rpc.request(
+            "prompts/get",
+            Some(&json!({"name": name, "arguments": args})),
+        )
+    })?;
+    Ok(render_prompt(&res))
+}
+
+fn argument_given(args: &Value, name: &str) -> bool {
+    args.as_object().is_some_and(|obj| {
+        obj.get(name)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    })
+}
+
+fn missing_prompt_args(prompt: &McpPrompt, args: &Value) -> Result<(), String> {
+    let missing: Vec<&str> = prompt
+        .arguments
+        .iter()
+        .filter(|a| a.required && !argument_given(args, &a.name))
+        .map(|a| a.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "prompt {} needs {}",
+            prompt.name,
+            missing.join(", ")
+        ))
     }
 }
 
@@ -1422,6 +1994,8 @@ pub struct ServerReport {
     pub status: Status,
     pub server_info: String,
     pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub prompts: Vec<McpPrompt>,
     /// How an http server is signed in to; None for stdio.
     pub auth: Option<String>,
 }
@@ -1453,6 +2027,8 @@ pub fn report() -> Vec<ServerReport> {
                 status: st.status.clone(),
                 server_info: st.server_info.clone(),
                 tools: st.tools.clone(),
+                resources: st.resources.clone(),
+                prompts: st.prompts.clone(),
                 auth: st.config.as_ref().and_then(auth_state),
             }
         })
@@ -1492,8 +2068,9 @@ fn status_lines() -> Vec<String> {
             .unwrap_or_default();
         let detail = match &r.status {
             Status::Connected => format!(
-                "{n} tool{}{}{signed_in}",
+                "{n} tool{}{}{}{signed_in}",
                 crate::report::plural(n),
+                context_suffix(r.resources.len(), r.prompts.len()),
                 if r.server_info.is_empty() {
                     String::new()
                 } else {
@@ -1547,6 +2124,13 @@ fn server_lines(name: &str) -> Result<Vec<String>, String> {
                 "      {}",
                 crate::tools::clamp_preview(&t.description, 160)
             ));
+        }
+        for res in &r.resources {
+            let kind = if res.template { " template" } else { "" };
+            lines.push(format!("  resource {} {}{kind}", res.name, res.uri));
+        }
+        for prompt in &r.prompts {
+            lines.push(format!("  prompt {}", prompt.name));
         }
     }
     Ok(lines)
@@ -1775,16 +2359,26 @@ fn login(name: &str, connect: bool, say: &mut dyn FnMut(&str)) -> Result<Vec<Str
     } else {
         // An http server spawns nothing, so the CLI can prove the token.
         lines.push(match connect_once(&cfg) {
-            Ok(n) => format!("{name} connected, {n} tool{}", crate::report::plural(n)),
+            Ok((n, extra)) => {
+                format!(
+                    "{name} connected, {n} tool{}{extra}",
+                    crate::report::plural(n)
+                )
+            }
             Err(e) => format!("{name} did not connect with the new login: {e}"),
         });
     }
     Ok(lines)
 }
 
-fn connect_once(cfg: &ServerConfig) -> Result<usize, String> {
+fn connect_once(cfg: &ServerConfig) -> Result<(usize, String), String> {
     connect(cfg)
-        .map(|(_, _, tools, _)| tools.len())
+        .map(|c| {
+            (
+                c.tools.len(),
+                context_suffix(c.resources.len(), c.prompts.len()),
+            )
+        })
         .map_err(|s| match s {
             Status::NeedsAuth(why) if why.is_empty() => "it still asks for a login".into(),
             other => other.detail().to_string(),
@@ -2281,7 +2875,10 @@ mod tests {
             calls: vec![],
             notified: vec![],
         };
-        assert_eq!(handshake(&mut m).unwrap(), "srv 1.2");
+        let hello = handshake(&mut m).unwrap();
+        assert_eq!(hello.info, "srv 1.2");
+        assert!(!hello.resources);
+        assert!(!hello.prompts);
         let (method, params) = &m.calls[0];
         assert_eq!(method, "initialize");
         let p = params.as_ref().unwrap();
@@ -2374,6 +2971,45 @@ mod tests {
         assert_eq!(m.calls[0].1, Some(json!({"name": "t", "arguments": {}})));
     }
 
+    #[test]
+    fn list_resources_pages_and_keeps_templates() {
+        let mut m = Mock {
+            responses: vec![
+                json!({"resources": [{"uri": "mem://a", "name": "A", "description": "one"}], "nextCursor": "p2"}),
+                json!({"resources": [{"uri": "mem://b", "name": "B"}]}),
+                json!({"resourceTemplates": [{"uriTemplate": "mem://{id}", "name": "by id", "mimeType": "text/plain"}]}),
+            ],
+            calls: vec![],
+            notified: vec![],
+        };
+        let got = list_resources(&mut m, "s").unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].uri, "mem://a");
+        assert!(!got[0].template);
+        assert_eq!(got[1].uri, "mem://b");
+        assert!(got[2].template);
+        assert_eq!(got[2].uri, "mem://{id}");
+        assert_eq!(got[2].mime, "text/plain");
+        assert_eq!(m.calls[0].0, "resources/list");
+        assert_eq!(m.calls[1].1, Some(json!({"cursor": "p2"})));
+        assert_eq!(m.calls[2].0, "resources/templates/list");
+    }
+
+    #[test]
+    fn render_prompt_keeps_text_and_omits_other_blocks() {
+        let text = render_prompt(&json!({
+            "description": "a review",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "data": "..", "mimeType": "image/png"}
+                ]
+            }]
+        }));
+        assert_eq!(text, "a review\n\nuser:\nlook\n[image omitted]");
+    }
+
     // ── stdio transport against the Python fixture ──────────────────────
     #[test]
     fn stdio_handshake_discovery_and_call_round_trip() {
@@ -2382,7 +3018,10 @@ mod tests {
             return;
         }
         let mut conn = fixture_conn(Duration::from_secs(20));
-        assert_eq!(handshake(&mut conn).unwrap(), "fake-mcp 0.1");
+        let hello = handshake(&mut conn).unwrap();
+        assert_eq!(hello.info, "fake-mcp 0.1");
+        assert!(hello.resources);
+        assert!(hello.prompts);
         let tools = list_tools(&mut conn, "fake").unwrap();
         assert_eq!(tools.len(), 2, "two tools across two pages");
         assert_eq!(tools[0].mangled, "mcp__fake__echo");
@@ -2413,6 +3052,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(conn.stderr_tail().contains("fake-mcp: starting"));
+        let resources = list_resources(&mut conn, "fake").unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "file:///note.txt");
+        assert!(!resources[0].template);
+        let read = conn
+            .request("resources/read", Some(&json!({"uri": "file:///note.txt"})))
+            .unwrap();
+        assert_eq!(render_resource_read(&read), "hello from the resource");
+        let blob = conn
+            .request("resources/read", Some(&json!({"uri": "file:///blob.bin"})))
+            .unwrap();
+        assert_eq!(
+            render_resource_read(&blob),
+            "[blob omitted: file:///blob.bin application/octet-stream]"
+        );
+        let prompts = list_prompts(&mut conn, "fake").unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].arguments[0].required);
+        let got = conn
+            .request(
+                "prompts/get",
+                Some(&json!({"name": "review", "arguments": {"diff": "one line"}})),
+            )
+            .unwrap();
+        assert_eq!(render_prompt(&got), "user:\nReview this:\none line");
     }
 
     #[test]
@@ -2596,7 +3260,7 @@ mod tests {
             &headers,
             Duration::from_secs(5),
         );
-        assert_eq!(handshake(&mut conn).unwrap(), "h 9");
+        assert_eq!(handshake(&mut conn).unwrap().info, "h 9");
         assert_eq!(conn.session_id(), Some("sess-42"));
         let tools = list_tools(&mut conn, "h").unwrap();
         assert_eq!(tools.len(), 1);
@@ -2770,7 +3434,10 @@ mod tests {
             .contains("not found"));
 
         let notices = drain_notices();
-        assert!(notices.contains(&("mcp: fake connected, 2 tools".to_string(), true)));
+        assert!(notices.contains(&(
+            "mcp: fake connected, 2 tools, 1 resource, 1 prompt".to_string(),
+            true
+        )));
         assert!(notices
             .iter()
             .any(|(m, ok)| !ok && m.starts_with("mcp: missing failed: failed to spawn")));
@@ -2793,12 +3460,49 @@ mod tests {
         assert!(detail
             .iter()
             .any(|l| l.contains("mcp__fake__add [read-only]")));
+        assert!(detail
+            .iter()
+            .any(|l| l.contains("resource note file:///note.txt")));
+        assert!(detail.iter().any(|l| l.contains("prompt review")));
         assert!(server_lines("nope").is_err());
+        let listed = crate::tools::run("mcp_resources", &json!({}), std::path::Path::new("."));
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("file:///note.txt"));
+        let read = crate::tools::run(
+            "mcp_resources",
+            &json!({"uri": "file:///note.txt"}),
+            std::path::Path::new("."),
+        );
+        assert!(!read.is_error);
+        assert_eq!(read.content, "hello from the resource");
+        let missing = crate::tools::run(
+            "mcp_prompts",
+            &json!({"name": "review"}),
+            std::path::Path::new("."),
+        );
+        assert!(missing.is_error && missing.content.contains("needs diff"));
+        let prompt = crate::tools::run(
+            "mcp_prompts",
+            &json!({"name": "review", "arguments": {"diff": "+added"}}),
+            std::path::Path::new("."),
+        );
+        assert!(!prompt.is_error, "{}", prompt.content);
+        assert_eq!(prompt.content, "user:\nReview this:\n+added");
+        assert!(crate::tools::defs(false)
+            .iter()
+            .any(|d| d.name == "mcp_resources"));
+        assert!(crate::tools::defs(false)
+            .iter()
+            .any(|d| d.name == "mcp_prompts"));
+        assert!(!crate::tools::is_mutating("mcp_resources"));
+        assert!(!crate::tools::is_mutating("mcp_prompts"));
 
         // A hung call drops the server for the session, once.
         let hung = call("fake", "sleep", &json!({"seconds": 60}));
         assert!(hung.unwrap_err().contains("disconnected"));
         assert!(tools().is_empty());
+        assert!(resources().is_empty());
+        assert!(prompts().is_empty());
         assert!(matches!(by_name("fake").status, Status::Connected)); // snapshot from before
         assert!(matches!(
             report().iter().find(|r| r.name == "fake").unwrap().status,

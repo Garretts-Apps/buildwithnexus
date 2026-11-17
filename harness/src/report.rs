@@ -208,7 +208,7 @@ pub fn tool_call(name: &str, preview: &str, input: &Value) {
         "read" | "read_file" | "list" | "list_dir" | "glob" | "find_paths" | "find_files"
         | "grep" | "grep_files" | "webfetch" | "websearch" | "fetch_url" | "web_search"
         | "headless_browser" | "list_servers" | "read_server_log" | "wait_for_url"
-        | "list_python_tools" => ("RD", tui::accent(preview)),
+        | "list_python_tools" | "mcp_resources" | "mcp_prompts" => ("RD", tui::accent(preview)),
         "write" | "write_file" | "edit" | "edit_file" | "patch" | "apply_patch" => {
             ("WR", tui::yellow(preview))
         }

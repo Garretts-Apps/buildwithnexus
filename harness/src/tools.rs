@@ -360,14 +360,38 @@ const PARALLEL_NOTE: &str = " Set read_only=true for a helper that only reads an
 // `mcp__<server>__<tool>` with the server's own description and input
 // schema. Empty until discovery finishes (see mcp::start_background).
 fn mcp_defs() -> Vec<ToolDef> {
-    crate::mcp::tools()
+    let mut v: Vec<ToolDef> = crate::mcp::tools()
         .into_iter()
         .map(|t| ToolDef {
             name: crate::mcp::intern(&t.mangled),
             description: crate::mcp::intern(&t.description),
             schema: t.input_schema,
         })
-        .collect()
+        .collect();
+    // A server that published nothing of this kind does not add a tool, so a
+    // session with no such server keeps today's tool list.
+    if !crate::mcp::resources().is_empty() {
+        v.push(ToolDef {
+            name: "mcp_resources",
+            description: "List or read a resource a connected MCP server published. Omit uri to list them. Pass uri to read that resource's text. This does not change files and is not pasted into the prompt. A blob is omitted.",
+            schema: json!({"type":"object","properties":{
+                "uri":{"type":"string","description":"resource URI to read; omit to list"},
+                "server":{"type":"string","description":"only this server, or the server to read a URI that was not listed"}
+            }}),
+        });
+    }
+    if !crate::mcp::prompts().is_empty() {
+        v.push(ToolDef {
+            name: "mcp_prompts",
+            description: "List or fetch a prompt a connected MCP server published. Omit name to list them. Pass name, and arguments when the prompt requires them, to get its text. This does not change files and is not pasted into the prompt.",
+            schema: json!({"type":"object","properties":{
+                "name":{"type":"string","description":"prompt name to fetch; omit to list"},
+                "server":{"type":"string","description":"only this server"},
+                "arguments":{"type":"object","additionalProperties":{"type":"string"},"description":"values the prompt asks for"}
+            }}),
+        });
+    }
+    v
 }
 
 // Models reporting fewer context tokens than this get the compact tool set.
@@ -402,6 +426,8 @@ pub fn defs_for_context(include_subagent: bool, context_tokens: usize) -> Vec<To
 fn compact_tool(name: &str) -> bool {
     // MCP tools are opt-in per user, so they stay even on the compact surface.
     crate::mcp::is_mcp_tool(name)
+        || name == "mcp_resources"
+        || name == "mcp_prompts"
         || matches!(
             name,
             "read_file"
@@ -422,6 +448,8 @@ pub fn defs_readonly() -> Vec<ToolDef> {
         .into_iter()
         .filter(|d| {
             (crate::mcp::is_mcp_tool(d.name) && !is_mutating(d.name))
+                || d.name == "mcp_resources"
+                || d.name == "mcp_prompts"
                 || matches!(
                     d.name,
                     "bash"
@@ -1793,6 +1821,22 @@ fn raw_preview(name: &str, input: &Value) -> String {
             input["server"].as_str().unwrap_or("?"),
             input["tool"].as_str().unwrap_or("?")
         ),
+        "mcp_resources" => match input["uri"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(uri) => format!("read resource {uri}"),
+            None => "list resources".to_string(),
+        },
+        "mcp_prompts" => match input["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => format!("read prompt {name}"),
+            None => "list prompts".to_string(),
+        },
         n if crate::mcp::is_mcp_tool(n) => match crate::mcp::demangle(n) {
             Some((server, tool)) => format!("MCP call: {server}/{tool}"),
             None => format!("MCP call: {n}"),
@@ -4899,6 +4943,10 @@ fn mcp_outcome(r: Result<(String, bool), String>) -> Outcome {
     }
 }
 
+fn opt_text<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input[key].as_str().map(str::trim).filter(|s| !s.is_empty())
+}
+
 pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     if crate::workspace::armed() {
         crate::workspace::before_tool(name, input, cwd);
@@ -5734,6 +5782,34 @@ fn run_tool(name: &str, input: &Value, cwd: &Path) -> Outcome {
             // Legacy entry point: same persistent connection as `mcp__*`.
             crate::mcp::ensure_ready();
             mcp_outcome(crate::mcp::call(server, tool, &input["arguments"]))
+        }
+        T::McpResources => {
+            crate::mcp::ensure_ready();
+            let server = opt_text(input, "server");
+            match opt_text(input, "uri") {
+                None => match crate::mcp::resource_list_text(server) {
+                    Ok(text) => ok(text),
+                    Err(e) => err(e),
+                },
+                Some(uri) => match crate::mcp::read_resource(server, uri) {
+                    Ok(text) => ok(truncate(text, MAX_OUT)),
+                    Err(e) => err(e),
+                },
+            }
+        }
+        T::McpPrompts => {
+            crate::mcp::ensure_ready();
+            let server = opt_text(input, "server");
+            match opt_text(input, "name") {
+                None => match crate::mcp::prompt_list_text(server) {
+                    Ok(text) => ok(text),
+                    Err(e) => err(e),
+                },
+                Some(name) => match crate::mcp::get_prompt(server, name, &input["arguments"]) {
+                    Ok(text) => ok(truncate(text, MAX_OUT)),
+                    Err(e) => err(e),
+                },
+            }
         }
         T::Mcp => {
             let n = name;
