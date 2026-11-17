@@ -1669,6 +1669,184 @@ fn appending_to_a_long_line_touches_only_its_last_row() {
 // A row is repainted on its own, so it cannot lean on what the row above
 // left set; and since the row's start carries the theme, a new theme
 // repaints every row without being told to.
+fn markdown_sample() -> &'static str {
+    include_str!("../../tests/fixtures/markdown/sample.md")
+}
+
+#[test]
+fn markdown_elements_render_at_80_and_120() {
+    std::env::remove_var("NO_COLOR");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/markdown");
+    let mut plains = Vec::new();
+    for width in [80usize, 120] {
+        let raw = render_md_width(markdown_sample(), width);
+        let plain = strip_ansi(&raw);
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            std::fs::write(root.join(format!("plain-{width}.txt")), &plain).unwrap();
+        }
+        let want = std::fs::read_to_string(root.join(format!("plain-{width}.txt")))
+            .unwrap_or_else(|e| panic!("golden {width}: {e}"));
+        assert_eq!(plain, want, "width {width}");
+        // Structure, not the marker characters.
+        for gone in ["# Heading", "**", "~~", "`code`", "```", "[the docs]"] {
+            assert!(
+                !plain.contains(gone),
+                "{width} still shows {gone}:\n{plain}"
+            );
+        }
+        for kept in [
+            "Heading one",
+            "Heading two",
+            "Heading three",
+            "Heading four",
+            "Heading five",
+            "Heading six",
+            "bold",
+            "italic",
+            "both",
+            "under bold",
+            "under italic",
+            "struck",
+            "code",
+            "*stars*",
+            "# hash",
+            "│ A quoted line",
+            "│ │ Nested quote",
+            "• outer item",
+            "• nested item",
+            "• deeper item",
+            "1. first",
+            "2. second",
+            "1. nested number",
+            "• plus item",
+            "☐ open task",
+            "☑ done task",
+            "─",
+            "the docs",
+            "(https://example.com/docs)",
+            "https://example.com/auto",
+            "rust",
+            "fn answer",
+            "plain block",
+            "paper",
+            "│",
+        ] {
+            assert!(plain.contains(kept), "{width} missing {kept}");
+        }
+        // Tables and fenced rows are laid out for this width. Prose stays one
+        // logical line; the transcript wraps it when the row is painted.
+        for line in plain.lines() {
+            let laid_out = line.contains('│')
+                || line.contains('┼')
+                || line.contains('╭')
+                || line.contains('╰');
+            if laid_out {
+                assert!(
+                    str_width(line) <= width,
+                    "{width}: line is {} cols: {line}",
+                    str_width(line)
+                );
+            }
+        }
+        plains.push(plain);
+        // Unknown fence gets a background; rust gets the keyword colour.
+        assert!(
+            raw.contains("48;"),
+            "plain fence should paint a code background"
+        );
+    }
+    assert_ne!(plains[0], plains[1], "80 and 120 must not be the same wrap");
+}
+
+#[test]
+fn headings_are_distinct_and_emphasis_nests() {
+    std::env::remove_var("NO_COLOR");
+    let mut seen = Vec::new();
+    for (src, level) in [
+        ("# H", 1),
+        ("## H", 2),
+        ("### H", 3),
+        ("#### H", 4),
+        ("##### H", 5),
+        ("###### H", 6),
+    ] {
+        let out = render_md_line(src);
+        assert_eq!(strip_ansi(&out), "H", "{src} -> {out:?}");
+        assert!(
+            !seen.contains(&out),
+            "heading {level} matches an earlier level"
+        );
+        seen.push(out);
+    }
+    let both = render_md_line("***both***");
+    assert_eq!(strip_ansi(&both), "both");
+    assert!(both.contains("\x1b[1m"), "{both:?}");
+    assert!(both.contains("\x1b[3m"), "{both:?}");
+    assert_eq!(
+        strip_ansi(&render_md_line(r"\*not italic\*")),
+        "*not italic*"
+    );
+    assert_eq!(strip_ansi(&render_md_line("snake_case")), "snake_case");
+    assert_eq!(strip_ansi(&render_md_line("a _word_ b")), "a word b");
+    let code = render_md_width("```\nhello\n```", 40);
+    assert!(code.contains("48;"), "{code}");
+    let rust = render_md_width("```rust\nfn main() {}\n```", 60);
+    assert!(rust.contains("fn"), "{rust}");
+    assert!(!strip_ansi(&rust).contains("```"));
+    // A long identifier is not cut while a shorter neighbour still fits.
+    let wrapped = strip_ansi(&render_md_width(
+        "```\nalpha beta gamma delta epsilon zeta eta theta\n```",
+        24,
+    ));
+    for word in [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ] {
+        assert!(
+            wrapped.lines().any(|l| l.contains(word)),
+            "{word} was split:\n{wrapped}"
+        );
+    }
+}
+
+#[test]
+fn stream_unclosed_fence_does_not_rewrite_history() {
+    std::env::remove_var("NO_COLOR");
+    let mut r = StreamRenderer::new();
+    r.push("kept\n");
+    let first = r.sink[0].clone();
+    r.push("```rust\nlet ");
+    r.push("alpha");
+    let mid = strip_ansi(&r.sink.join("\n"));
+    assert!(mid.contains("kept"), "{mid}");
+    assert!(mid.contains("rust"), "{mid}");
+    assert!(!mid.contains("```"), "{mid}");
+    assert!(!mid.contains("alpha"), "{mid}");
+    assert_eq!(r.sink[0], first);
+    let n = r.sink.len();
+    r.push(" = 1;\n");
+    assert!(r.sink.len() > n);
+    assert_eq!(r.sink[0], first);
+    let line = strip_ansi(&r.sink.join("\n"));
+    assert!(line.contains("let alpha = 1;"), "{line}");
+    assert!(!line.contains('╰'), "{line}");
+    r.flush();
+    let end = strip_ansi(&r.sink.join("\n"));
+    assert!(end.contains('╰'), "{end}");
+    assert!(!end.contains("```"), "{end}");
+    assert_eq!(r.sink[0], first);
+}
+
+#[test]
+fn stream_holds_a_json_tool_fence_until_it_can_drop_it() {
+    let mut r = StreamRenderer::new();
+    r.push("```json\n{\"name\":\"read_file\",\"path\":\"a.rs\"}\n```\nafter\n");
+    r.flush();
+    let joined = r.sink.join("\n");
+    assert!(!joined.contains("read_file"), "{joined}");
+    assert!(!joined.contains("```"), "{joined}");
+    assert!(strip_ansi(&joined).contains("after"), "{joined}");
+}
+
 #[test]
 fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
     let mut s = frame_screen(20, 10);

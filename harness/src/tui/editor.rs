@@ -791,23 +791,18 @@ pub(super) fn render_suggestions(sug: &[String], sel: usize) {
         let cand = &sug[idx];
         let padded = format!("{cand:<pad$}");
         // Skill and command descriptions are read from project files.
-        let desc = popup_desc(cand);
-        let desc = &*sanitize_terminal(&desc);
+        // Skill text is markdown. Render it muted so a raw `**` or `#` does
+        // not sit in the popup, and the row stays quiet.
+        let desc = render_md_dim_line(&popup_desc(cand));
         let counter = if sug.len() > show && idx == sel {
             dim(&format!(" ({}/{})", sel + 1, sug.len()))
         } else {
             String::new()
         };
         let entry = if idx == sel {
-            format!(
-                "  {} {}  {}{}",
-                accent("›"),
-                bold(&padded),
-                dim(desc),
-                counter
-            )
+            format!("  {} {}  {desc}{counter}", accent("›"), bold(&padded),)
         } else {
-            format!("    {padded}  {}", dim(desc))
+            format!("    {padded}  {desc}")
         };
         let _ = write!(out, "{}", ellipsize_ansi_line(&entry, width as usize));
     }

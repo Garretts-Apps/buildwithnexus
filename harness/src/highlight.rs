@@ -661,7 +661,7 @@ pub fn lang_for(tag: &str) -> Option<&'static Lang> {
 
 /// Lexer state carried between lines of one block (an open `/* … */` or a
 /// still-open backtick/triple-quote string).
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct State {
     in_block_comment: bool,
     in_string: Option<Str>,

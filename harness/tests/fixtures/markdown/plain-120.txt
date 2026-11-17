@@ -1,0 +1,56 @@
+Heading one
+
+Heading two
+
+Heading three
+
+Heading four
+
+Heading five
+
+Heading six
+
+A line with bold, italic, both, under bold, under italic, and struck plus code.
+
+Escaped *stars* and # hash stay literal.
+
+  │ A quoted line
+  │ 
+  │ │ Nested quote
+
+  • outer item
+    • nested item
+      • deeper item
+
+  1. first
+  2. second
+     1. nested number
+
+  • plus item
+
+  ☐ open task
+  ☑ done task
+
+  ────────────────────────────────────────────────────────────────────────
+
+See the docs (https://example.com/docs) and https://example.com/auto.
+
+This sentence is long enough that it wraps once at one hundred twenty columns and twice at eighty columns so the two goldens cannot be the same file.
+
+  ╭─ ⟨ rust ⟩ ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  │ fn answer() -> i32 {
+  │     let value = 40 + 2;
+  │     value
+  │ }
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  │ plain block
+  │ token token token token token token token token token token token token token token token token
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  Name  │   Role    │                                                                                              Notes
+  ──────┼───────────┼───────────────────────────────────────────────────────────────────────────────────────────────────
+  paper │   body    │ the long note that forces the notes column to shrink when the terminal is only eighty columns wide
+  mark  │   notch   │                                                                                       a short cell
+  quiet │ secondary │               another long note about secondary text that should stay aligned with the header rule

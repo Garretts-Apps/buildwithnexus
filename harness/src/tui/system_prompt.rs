@@ -295,12 +295,13 @@ fn paint_show(asm: &Assembly, width: usize) -> Painted {
             width,
         ));
         let shown = redact_text(&section.text);
-        for raw in shown.split('\n') {
-            if raw.is_empty() {
+        let rendered = super::render_md_width(&shown, width.saturating_sub(2));
+        for raw in rendered.split('\n') {
+            if super::strip_ansi(raw).is_empty() {
                 lines.push(String::new());
                 continue;
             }
-            for row in wrap(raw, width.saturating_sub(2)) {
+            for row in super::wrap_ansi_line(raw, width.saturating_sub(2)) {
                 lines.push(paint_redacted(&format!("  {row}")));
             }
         }
@@ -571,7 +572,7 @@ impl Editor {
         }
     }
 
-    fn paint(&self, _width: usize) -> Vec<String> {
+    fn paint(&self, width: usize) -> Vec<String> {
         let mut lines = vec![
             super::accent(" edit your layer"),
             super::dim(" the built-in prompt stays as it is; this file is appended"),
@@ -584,6 +585,12 @@ impl Editor {
                 line.clone()
             };
             lines.push(format!("  {shown}"));
+        }
+        lines.push(String::new());
+        lines.push(super::dim(" preview"));
+        let rendered = super::render_md_width(&self.text(), width.saturating_sub(2).max(4));
+        for row in rendered.split('\n') {
+            lines.push(format!("  {row}"));
         }
         lines
     }
@@ -637,6 +644,43 @@ mod tests {
             ed.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             EditStep::Save
         ));
+    }
+
+    #[test]
+    fn show_renders_markdown_in_the_layer() {
+        let asm = Assembly {
+            mode: PromptMode::Build,
+            context_tokens: 200_000,
+            sections: vec![Section {
+                layer: "user override",
+                source: "user".into(),
+                text: "# Rules\n\n- use **tabs**\n".into(),
+                in_system: true,
+            }],
+        };
+        let plain = super::super::strip_ansi(&paint_show(&asm, 80).lines.join("\n"));
+        assert!(plain.contains("Rules"), "{plain}");
+        assert!(plain.contains("•"), "{plain}");
+        assert!(plain.contains("tabs"), "{plain}");
+        assert!(!plain.contains("# Rules"), "{plain}");
+        assert!(!plain.contains("**"), "{plain}");
+    }
+
+    #[test]
+    fn edit_preview_renders_the_buffer() {
+        let ed = Editor::from_text("# Hello\n\n**bold** and `code`\n");
+        let plain = super::super::strip_ansi(&ed.paint(80).join("\n"));
+        let preview = plain.split("preview").nth(1).expect("preview");
+        assert!(preview.contains("Hello"), "{preview}");
+        assert!(!preview.contains("# Hello"), "{preview}");
+        assert!(
+            preview.contains("bold") && !preview.contains("**"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains("code") && !preview.contains('`'),
+            "{preview}"
+        );
     }
 
     #[test]

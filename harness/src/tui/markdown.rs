@@ -17,11 +17,24 @@ use super::*;
 
 pub(super) enum StreamState {
     Normal,
-    InCode { lang: String, lines: Vec<String> },
-    MaybeJson { lines: Vec<String> },
+    InCode {
+        lang: String,
+        tick: char,
+        // json / tool-call fences stay buffered until they can be classified,
+        // so a protocol block never flashes onto the transcript.
+        hold: bool,
+        lines: Vec<String>,
+        hi: crate::highlight::State,
+        header: bool,
+    },
+    MaybeJson {
+        lines: Vec<String>,
+    },
     // A pipe table being collected; rendered as one aligned block when the
     // first non-table line (or the end of the stream) arrives.
-    InTable { rows: Vec<String> },
+    InTable {
+        rows: Vec<String>,
+    },
 }
 
 pub struct StreamRenderer {
@@ -102,27 +115,59 @@ impl StreamRenderer {
         }
     }
 
-    // Echo the not-yet-terminated tail of the current line raw so streaming
-    // stays visibly live between newlines. Alt-screen only: the transcript
-    // tracks the open line there (`Screen.transcript`), so the raw text can be
-    // replaced by the rendered line once the newline arrives. Lines that may
-    // still classify as fence openers or protocol JSON are held back — they
-    // may never be shown at all.
+    // Show the open line. Plain prose is appended, so the wrap cache only
+    // walks the new bytes. A line that already contains markdown is replaced
+    // in place with its rendered form: one transcript line, not the history.
+    // Alt-screen only. A fence opener, a table row, or protocol JSON is held
+    // until the newline, because it may never be shown.
     pub(super) fn echo_partial(&mut self) {
-        if !ALT_SCREEN.load(Ordering::Relaxed)
-            || capturing()
-            || !matches!(self.state, StreamState::Normal)
-        {
+        if !ALT_SCREEN.load(Ordering::Relaxed) || capturing() || self.pending.is_empty() {
             return;
         }
-        let head = self.pending.trim_start();
-        if head.starts_with('`') || head.starts_with('{') || head.starts_with('[') {
-            return;
+        match &self.state {
+            StreamState::Normal => {
+                let head = self.pending.trim_start();
+                if head.starts_with('`')
+                    || head.starts_with('~')
+                    || head.starts_with('{')
+                    || head.starts_with('[')
+                    || head.starts_with('|')
+                {
+                    return;
+                }
+                if !needs_live_md(&self.pending) {
+                    if self.pending.len() > self.shown {
+                        write_stream(&self.pending[self.shown..]);
+                        self.shown = self.pending.len();
+                    }
+                    return;
+                }
+                let rendered = render_md_line_at(&self.pending, self.w);
+                self.show_rendered(&rendered);
+            }
+            StreamState::InCode {
+                lang,
+                hold,
+                hi,
+                header,
+                ..
+            } if !hold && *header => {
+                let mut st = *hi;
+                let rows = paint_code_rows(lang, &self.pending, self.w, &mut st);
+                if let Some(row) = rows.first() {
+                    self.show_rendered(row);
+                }
+            }
+            _ => {}
         }
-        if self.pending.len() > self.shown {
-            write_stream(&self.pending[self.shown..]);
-            self.shown = self.pending.len();
+    }
+
+    fn show_rendered(&mut self, rendered: &str) {
+        let changed = screen::with(|s| s.transcript.show_open(rendered));
+        if changed {
+            request_frame();
         }
+        self.shown = self.pending.len().max(1);
     }
 
     pub(super) fn process_line(&mut self, text: &str, had_partial: bool) {
@@ -130,18 +175,26 @@ impl StreamRenderer {
         let state = std::mem::replace(&mut self.state, StreamState::Normal);
         match state {
             StreamState::Normal => {
-                if let Some(rest) = text.strip_prefix("```") {
+                if let Some((tick, lang)) = fence_open(text) {
                     // Fence markers are chrome — pull back any echoed raw prefix.
                     if had_partial {
                         retract_stream_line();
                     }
-                    // Buffer fenced code until the close. Local models sometimes
-                    // emit tool-call JSON as a code block; rendering only after
-                    // classification keeps protocol artifacts out of the transcript.
-                    let lang = rest.trim().to_string();
+                    // json and tool-call fences stay buffered until the close
+                    // so a protocol block never lands in the transcript. Every
+                    // other fence is drawn as it arrives, including while the
+                    // closing marker is still missing.
+                    let hold = fence_holds(&lang);
+                    if !hold {
+                        self.emit(&code_box_header(&lang, self.w));
+                    }
                     self.state = StreamState::InCode {
                         lang,
+                        tick,
+                        hold,
                         lines: Vec::new(),
+                        hi: crate::highlight::State::default(),
+                        header: !hold,
                     };
                 } else if starts_like_top_level_json(text) {
                     if had_partial {
@@ -172,16 +225,48 @@ impl StreamRenderer {
                     self.state = StreamState::Normal;
                 }
             }
-            StreamState::InCode { lang, mut lines } => {
-                if text.trim_end_matches('\r') == "```" {
-                    let code = lines.join("\n");
-                    if !is_tool_call_json_block(&lang, &code) {
-                        self.render_code_block(&lang, &lines);
+            StreamState::InCode {
+                lang,
+                tick,
+                hold,
+                mut lines,
+                mut hi,
+                header,
+            } => {
+                if fence_close(text, tick) {
+                    if had_partial {
+                        retract_stream_line();
+                    }
+                    if hold {
+                        let code = lines.join("\n");
+                        if !is_tool_call_json_block(&lang, &code) {
+                            self.render_code_block(&lang, &lines);
+                        }
+                    } else if header {
+                        self.emit(&code_box_footer(self.w));
                     }
                     self.state = StreamState::Normal;
-                } else {
+                } else if hold {
                     lines.push(text.to_string());
-                    self.state = StreamState::InCode { lang, lines };
+                    self.state = StreamState::InCode {
+                        lang,
+                        tick,
+                        hold,
+                        lines,
+                        hi,
+                        header,
+                    };
+                } else {
+                    let rows = paint_code_rows(&lang, text, self.w, &mut hi);
+                    self.commit_rows(&rows, had_partial);
+                    self.state = StreamState::InCode {
+                        lang,
+                        tick,
+                        hold,
+                        lines,
+                        hi,
+                        header,
+                    };
                 }
             }
             StreamState::MaybeJson { mut lines } => {
@@ -212,10 +297,22 @@ impl StreamRenderer {
         let state = std::mem::replace(&mut self.state, StreamState::Normal);
         match state {
             StreamState::Normal => {}
-            StreamState::InCode { lang, lines } => {
-                let code = lines.join("\n");
-                if !is_tool_call_json_block(&lang, &code) {
-                    self.render_code_block(&lang, &lines);
+            StreamState::InCode {
+                lang,
+                lines,
+                hold,
+                header,
+                ..
+            } => {
+                if hold {
+                    let code = lines.join("\n");
+                    if !is_tool_call_json_block(&lang, &code) {
+                        self.render_code_block(&lang, &lines);
+                    }
+                } else if header {
+                    // The rows already streamed stay. Close the border so an
+                    // unclosed fence does not run into the next paragraph.
+                    self.emit(&code_box_footer(self.w));
                 }
             }
             StreamState::MaybeJson { lines } => {
@@ -262,13 +359,270 @@ impl StreamRenderer {
     pub(super) fn render_code_block(&mut self, lang: &str, lines: &[String]) {
         // One emit for the whole block: line() splits on '\n', and a single
         // call means one repaint instead of one per code row.
-        let mut rows = Vec::with_capacity(lines.len() + 2);
-        rows.push(code_box_header(lang, self.w));
-        let lit = crate::highlight::highlight_block(lang, lines);
-        rows.extend(lit.iter().map(|text| code_box_line(text)));
-        rows.push(code_box_footer(self.w));
-        self.emit(&rows.join("\n"));
+        self.emit(&paint_fenced(lang, lines, self.w).join("\n"));
     }
+
+    fn commit_rows(&mut self, rows: &[String], had_partial: bool) {
+        if rows.is_empty() {
+            return;
+        }
+        if had_partial {
+            commit_stream_line(&rows[0]);
+            if rows.len() > 1 {
+                self.emit(&rows[1..].join("\n"));
+            }
+        } else {
+            self.emit(&rows.join("\n"));
+        }
+    }
+}
+
+// A fence opener: ``` or ~~~, up to three spaces of indent, then a language tag.
+pub(super) fn fence_open(text: &str) -> Option<(char, String)> {
+    let trimmed = text.trim_start();
+    if text.len() - trimmed.len() > 3 {
+        return None;
+    }
+    let tick = trimmed.chars().next()?;
+    if tick != '`' && tick != '~' {
+        return None;
+    }
+    let n = trimmed.chars().take_while(|c| *c == tick).count();
+    if n < 3 {
+        return None;
+    }
+    let info = trimmed[tick.len_utf8() * n..].trim();
+    if tick == '`' && info.contains('`') {
+        return None;
+    }
+    Some((tick, info.to_string()))
+}
+
+pub(super) fn fence_close(text: &str, tick: char) -> bool {
+    let t = text.trim().trim_end_matches('\r');
+    !t.is_empty() && t.chars().all(|c| c == tick) && t.chars().count() >= 3
+}
+
+fn fence_holds(lang: &str) -> bool {
+    let key = lang
+        .trim()
+        .split([' ', ':', ','])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "json" | "jsonc" | "tool_code" | "tools" | "tool_call" | "function"
+    )
+}
+
+// True when the open line would look different once markdown is applied, so
+// the raw tail cannot simply be appended.
+fn needs_live_md(s: &str) -> bool {
+    let t = s.trim_start();
+    if t.starts_with('#')
+        || t.starts_with('>')
+        || t.starts_with("- ")
+        || t.starts_with("* ")
+        || t.starts_with("+ ")
+        || looks_like_rule(t)
+        || ordered_started(t)
+    {
+        return true;
+    }
+    s.bytes()
+        .any(|b| matches!(b, b'*' | b'_' | b'`' | b'~' | b'[' | b'\\' | b'<'))
+}
+
+fn looks_like_rule(t: &str) -> bool {
+    let mut marks = t.chars().filter(|c| !c.is_whitespace());
+    let Some(first) = marks.next() else {
+        return false;
+    };
+    matches!(first, '-' | '*' | '_')
+        && marks.all(|c| c == first)
+        && t.chars().filter(|c| *c == first).count() >= 3
+}
+
+fn ordered_started(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() && i < 9 && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 0 && i + 1 < b.len() && (b[i] == b'.' || b[i] == b')') && b.get(i + 1) == Some(&b' ')
+}
+
+// Break `s` on token boundaries so a fenced line is not cut through an
+// identifier or a string. A single token wider than `width` is the only
+// split that lands inside a token: the row has nowhere else to put it.
+fn wrap_tokens(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    if width == 0 || str_width(s) <= width {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut line_w = 0usize;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let token = next_token(rest);
+        let tw = str_width(token);
+        let blank = token.chars().all(|c| c.is_whitespace());
+        if !blank && line_w > 0 && line_w + tw > width {
+            out.push(std::mem::take(&mut line));
+            line_w = 0;
+        }
+        if line_w == 0 && blank {
+            rest = &rest[token.len()..];
+            continue;
+        }
+        if tw > width && line_w == 0 {
+            let (fit, more) = split_width(token, width);
+            out.push(fit);
+            rest = more;
+            continue;
+        }
+        line.push_str(token);
+        line_w += tw;
+        rest = &rest[token.len()..];
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+fn next_token(s: &str) -> &str {
+    let Some(c) = s.chars().next() else {
+        return s;
+    };
+    if c.is_whitespace() {
+        let n: usize = s
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .map(|c| c.len_utf8())
+            .sum();
+        return &s[..n];
+    }
+    if c == '"' || c == '\'' || c == '`' {
+        return string_token(s, c);
+    }
+    if s.starts_with("//") || (s.starts_with("/*") && !s.contains("*/")) {
+        return s;
+    }
+    if let Some(end) = s.find("*/").filter(|_| s.starts_with("/*")) {
+        return &s[..end + 2];
+    }
+    if is_token_ident(c) {
+        let n: usize = s
+            .chars()
+            .take_while(|c| is_token_ident(*c))
+            .map(|c| c.len_utf8())
+            .sum();
+        return &s[..n];
+    }
+    for glue in ["::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||"] {
+        if s.starts_with(glue) {
+            return &s[..glue.len()];
+        }
+    }
+    &s[..c.len_utf8()]
+}
+
+fn is_token_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn string_token(s: &str, q: char) -> &str {
+    let mut chars = s.char_indices();
+    chars.next();
+    let mut escaped = false;
+    for (i, c) in chars {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == q {
+            return &s[..i + c.len_utf8()];
+        }
+    }
+    s
+}
+
+fn split_width(s: &str, width: usize) -> (String, &str) {
+    let mut w = 0usize;
+    for (i, c) in s.char_indices() {
+        let cw = str_width(&c.to_string()).max(1);
+        if w + cw > width && i > 0 {
+            return (s[..i].to_string(), &s[i..]);
+        }
+        w += cw;
+    }
+    (s.to_string(), "")
+}
+
+fn style_code_piece(lang: &str, part: &str, st: &mut crate::highlight::State) -> String {
+    if no_color() {
+        return part.to_string();
+    }
+    let key = lang
+        .trim()
+        .split([' ', ':', ','])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if key == "diff" || key == "patch" {
+        return if part.starts_with("+++") || part.starts_with("---") {
+            bold(part)
+        } else if part.starts_with('+') {
+            green(part)
+        } else if part.starts_with('-') {
+            red(part)
+        } else if part.starts_with("@@") {
+            cyan(part)
+        } else {
+            part.to_string()
+        };
+    }
+    if let Some(l) = crate::highlight::lang_for(lang) {
+        return crate::highlight::highlight_line(l, part, st);
+    }
+    code_bg(part)
+}
+
+pub(super) fn paint_code_rows(
+    lang: &str,
+    line: &str,
+    width: usize,
+    st: &mut crate::highlight::State,
+) -> Vec<String> {
+    let inner = width.saturating_sub(4).max(1);
+    let parts = wrap_tokens(line, inner);
+    if parts.is_empty() {
+        return vec![code_box_line("")];
+    }
+    parts
+        .into_iter()
+        .map(|part| code_box_line(&style_code_piece(lang, &part, st)))
+        .collect()
+}
+
+pub(super) fn paint_fenced(lang: &str, lines: &[String], width: usize) -> Vec<String> {
+    let mut rows = Vec::with_capacity(lines.len() + 2);
+    rows.push(code_box_header(lang, width));
+    let mut st = crate::highlight::State::default();
+    for line in lines {
+        rows.extend(paint_code_rows(lang, line, width, &mut st));
+    }
+    rows.push(code_box_footer(width));
+    rows
 }
 
 // ── markdown pipe tables ─────────────────────────────────────────────────────

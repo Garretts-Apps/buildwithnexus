@@ -2278,6 +2278,7 @@ pub(super) fn help_lines() -> Vec<String> {
             } else {
                 format!("  {}", tui::dim(args))
             };
+            let desc = tui::render_inline_md(desc);
             out.push(format!("    {}{pad}  {desc}{args_part}", tui::bold(cmd)));
         }
     }
