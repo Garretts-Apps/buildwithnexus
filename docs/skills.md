@@ -47,9 +47,9 @@ Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
 and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. A file in one of those folders with the same name
 as a bundled default (`commit`, `review`, `test`, `debug`, `handoff`, `pr`,
-`changelog`, `design-pass`, `deslop`) replaces the built-in. Built-in
-commands load when the name is still free. Skills and commands work headless
-too: `bwn run '/deploy staging'`.
+`changelog`, `design-pass`, `deslop`, `adr`, `retro`, `api-docs`, `explain`)
+replaces the built-in. Built-in commands load when the name is still free.
+Skills and commands work headless too: `bwn run '/deploy staging'`.
 
 ```markdown
 ---
@@ -68,6 +68,10 @@ limits what it may use, and Claude Code's tool names work (`Read`, `Grep`,
 `Bash`, …). A helper with a `tools` list can never delegate further (`task`
 and `spawn_subagent` are left out), and a call naming an unknown role fails
 with the list of roles. `/agents` lists the helpers.
+
+Bundled read-only helpers ship as `reviewer`, `debugger`, and
+`security-check`. An agent file in `~/.buildwithnexus/agents/` or
+`~/.claude/agents/` with the same name replaces the bundled one.
 
 ```markdown
 ---

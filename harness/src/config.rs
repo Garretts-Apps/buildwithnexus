@@ -1813,6 +1813,19 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
             include_str!("bundled_skills/distinctive-design.md"),
         ),
         ("deslop", include_str!("bundled_skills/deslop.md")),
+        (
+            "vertical-slicing",
+            include_str!("bundled_skills/vertical-slicing.md"),
+        ),
+        (
+            "verify-before-done",
+            include_str!("bundled_skills/verify-before-done.md"),
+        ),
+        ("api-design", include_str!("bundled_skills/api-design.md")),
+        (
+            "agent-orchestration",
+            include_str!("bundled_skills/agent-orchestration.md"),
+        ),
     ]
 }
 
@@ -1829,6 +1842,22 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
         ("changelog", include_str!("bundled_commands/changelog.md")),
         ("design-pass", include_str!("bundled_commands/design-pass.md")),
         ("deslop", include_str!("bundled_commands/deslop.md")),
+        ("adr", include_str!("bundled_commands/adr.md")),
+        ("retro", include_str!("bundled_commands/retro.md")),
+        ("api-docs", include_str!("bundled_commands/api-docs.md")),
+        ("explain", include_str!("bundled_commands/explain.md")),
+    ]
+}
+
+/// Built-in helper agents. User agent files of the same name win.
+pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("reviewer", include_str!("bundled_agents/reviewer.md")),
+        ("debugger", include_str!("bundled_agents/debugger.md")),
+        (
+            "security-check",
+            include_str!("bundled_agents/security-check.md"),
+        ),
     ]
 }
 
@@ -2161,6 +2190,15 @@ pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDef> {
             {
                 out.push(def);
             }
+        }
+    }
+    for (name, text) in bundled_agents() {
+        if BUILTIN_ROLES.contains(&name) || out.iter().any(|a| a.name == name) {
+            continue;
+        }
+        let path = PathBuf::from("bundled_agents").join(format!("{name}.md"));
+        if let Some(def) = parse_agent_file(&path, text) {
+            out.push(def);
         }
     }
     out
@@ -4066,12 +4104,31 @@ mod tests {
             "changelog",
             "design-pass",
             "deslop",
+            "adr",
+            "retro",
+            "api-docs",
+            "explain",
         ] {
             assert!(cmd_names.contains(&n), "missing bundled command {n}");
         }
         let skill_names: Vec<_> = bundled_skills().iter().map(|(n, _)| *n).collect();
-        assert!(skill_names.contains(&"distinctive-design"));
-        assert!(skill_names.contains(&"deslop"));
+        for n in [
+            "distinctive-design",
+            "deslop",
+            "vertical-slicing",
+            "verify-before-done",
+            "api-design",
+            "agent-orchestration",
+        ] {
+            assert!(skill_names.contains(&n), "missing skill {n}");
+        }
+        let agent_names: Vec<_> = bundled_agents().iter().map(|(n, _)| *n).collect();
+        for n in ["reviewer", "debugger", "security-check"] {
+            assert!(agent_names.contains(&n), "missing agent {n}");
+        }
+        let agents = load_agent_defs(Path::new("."));
+        let rev = agents.iter().find(|a| a.name == "reviewer").unwrap();
+        assert!(rev.read_only);
         let cmds = load_custom_commands();
         let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
         assert!(!commit.skill);
@@ -4097,6 +4154,25 @@ mod tests {
         let cmds = load_custom_commands();
         let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
         assert_eq!(commit.content, "User commit.");
+        std::env::remove_var("NEXUS_HOME");
+        let _ = fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn user_agent_overrides_bundled_workflow_agent() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let h = unique_home();
+        let _ = fs::remove_dir_all(&h);
+        fs::create_dir_all(&h).unwrap();
+        std::env::set_var("NEXUS_HOME", &h);
+        fs::create_dir_all(h.join("agents")).unwrap();
+        write(
+            &h.join("agents").join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Custom\n---\nCustom reviewer.",
+        );
+        let agents = load_agent_defs(Path::new("."));
+        let rev = agents.iter().find(|a| a.name == "reviewer").unwrap();
+        assert_eq!(rev.prompt, "Custom reviewer.");
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }

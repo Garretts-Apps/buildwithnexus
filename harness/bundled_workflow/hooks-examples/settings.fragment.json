@@ -2,22 +2,22 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|run_command|check_work",
         "hooks": [
           {
             "type": "command",
             "timeout": 8,
-            "command": "python3 $NEXUS_HOME/hooks/guard_shell.py"
+            "command": "python \"$NEXUS_HOME/hooks/guard_shell.py\""
           }
         ]
       },
       {
-        "matcher": "Write|edit_file",
+        "matcher": "Write|Edit|write_file|edit_file",
         "hooks": [
           {
             "type": "command",
             "timeout": 8,
-            "command": "python3 $NEXUS_HOME/hooks/guard_writes.py"
+            "command": "python \"$NEXUS_HOME/hooks/guard_writes.py\""
           }
         ]
       }
@@ -28,19 +28,19 @@
           {
             "type": "command",
             "timeout": 8,
-            "command": "python3 $NEXUS_HOME/hooks/screen_prompt.py"
+            "command": "python \"$NEXUS_HOME/hooks/screen_prompt.py\""
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Write|edit_file",
+        "matcher": "Write|Edit|write_file|edit_file",
         "hooks": [
           {
             "type": "command",
             "timeout": 8,
-            "command": "python3 $NEXUS_HOME/hooks/strip_invisible.py"
+            "command": "python \"$NEXUS_HOME/hooks/strip_invisible.py\""
           }
         ]
       }
