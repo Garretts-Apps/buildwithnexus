@@ -1873,6 +1873,7 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
         ("playwright", include_str!("bundled_commands/playwright.md")),
         ("design-brief", include_str!("bundled_commands/design-brief.md")),
         ("journey", include_str!("bundled_commands/journey.md")),
+        ("rebuild", include_str!("bundled_commands/rebuild.md")),
     ]
 }
 
@@ -4127,6 +4128,7 @@ mod tests {
             "feature", "migration-plan", "onboard", "runbook", "rfc", "test-plan", "testgen",
             "threat-model", "user-story", "bdd", "questionnaire", "grill", "new-skill", "new-agent",
             "new-command", "sbom", "load-test", "coverage", "playwright", "design-brief", "journey",
+            "rebuild",
         ];
         assert_eq!(cmd_names.len(), expect_cmd.len());
         for n in expect_cmd {
