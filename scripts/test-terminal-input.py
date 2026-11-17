@@ -2000,7 +2000,10 @@ class EscAtApprovalTests(ModelHarness):
 
     def test_one_line_says_the_turn_stopped(self):
         self.send("/build make the file\r")
-        self.wait_for(lambda: b"ASK" in self.output, "approval prompt")
+        # The footer already says ASK, so that word is not the prompt. The
+        # legend is only drawn once the question is open; Esc before that
+        # hits the composer and the turn never says it stopped.
+        self.wait_for(lambda: b"Y yes" in self.output, "approval prompt")
         self.send("\x1b")
         self.wait_for(lambda: b"stopped by the user" in self.output, "the refusal")
         self.pump(1.0)
