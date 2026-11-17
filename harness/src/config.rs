@@ -1904,6 +1904,11 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
             "supply-chain",
             include_str!("bundled_commands/supply-chain.md"),
         ),
+        ("soc2", include_str!("bundled_commands/soc2.md")),
+        (
+            "pipeline-review",
+            include_str!("bundled_commands/pipeline-review.md"),
+        ),
     ]
 }
 
@@ -1915,6 +1920,10 @@ pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
         (
             "security-check",
             include_str!("bundled_agents/security-check.md"),
+        ),
+        (
+            "pipeline-reviewer",
+            include_str!("bundled_agents/pipeline-reviewer.md"),
         ),
     ]
 }
@@ -4197,6 +4206,8 @@ mod tests {
             "secrets-scan",
             "deps-audit",
             "supply-chain",
+            "soc2",
+            "pipeline-review",
         ];
         assert_eq!(cmd_names.len(), expect_cmd.len());
         for n in expect_cmd {
@@ -4215,7 +4226,12 @@ mod tests {
             assert!(skill_names.contains(&n), "missing skill {n}");
         }
         let agent_names: Vec<_> = bundled_agents().iter().map(|(n, _)| *n).collect();
-        for n in ["reviewer", "debugger", "security-check"] {
+        for n in [
+            "reviewer",
+            "debugger",
+            "security-check",
+            "pipeline-reviewer",
+        ] {
             assert!(agent_names.contains(&n), "missing agent {n}");
         }
         let agents = load_agent_defs(Path::new("."));
