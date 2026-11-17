@@ -1840,7 +1840,10 @@ pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
         ("handoff", include_str!("bundled_commands/handoff.md")),
         ("pr", include_str!("bundled_commands/pr.md")),
         ("changelog", include_str!("bundled_commands/changelog.md")),
-        ("design-pass", include_str!("bundled_commands/design-pass.md")),
+        (
+            "design-pass",
+            include_str!("bundled_commands/design-pass.md"),
+        ),
         ("deslop", include_str!("bundled_commands/deslop.md")),
         ("adr", include_str!("bundled_commands/adr.md")),
         ("retro", include_str!("bundled_commands/retro.md")),
