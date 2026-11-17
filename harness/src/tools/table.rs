@@ -52,6 +52,8 @@ pub(crate) enum Tool {
     Verify,
     CheckWork,
     McpCall,
+    McpResources,
+    McpPrompts,
     Editor,
     Artifact,
     Finish,
@@ -341,6 +343,10 @@ pub(crate) static TOOLS: &[ToolSpec] = &[
     spec("rule_check", RuleCheck),
     spec("verify", Verify),
     spec("mcp_call", McpCall).mutating(),
+    // Offered only once a connected server has published that kind of
+    // context. Read-only: a resource or a prompt does not change files.
+    spec("mcp_resources", McpResources),
+    spec("mcp_prompts", McpPrompts),
     spec("Artifact", Artifact).mutating(),
     spec("publish_artifact", Artifact)
         .alias_of("Artifact")

@@ -906,18 +906,14 @@ or the `mcp__<server>__<tool>` name `/mcp` prints. Tools that are filtered
 out are not offered to the model and cannot be called. The connection notice
 counts them as hidden. Omitting both keys advertises every tool, as before.
 
-Servers connect lazily in the background on the first prompt (headless runs
-connect before the first request, waiting at most 5 s, or a server's own
-`timeout_secs`, and skip a server that is not ready with a notice); each one logs
-`mcp: <name> connected, N tools` or its error. Discovered tools are advertised
-to the model as **`mcp__<server>__<tool>`** with the server's own description
-and input schema, and answer over the persistent connection. They count as
-mutating under the permission gate (prompted under `ask`, blocked under
-`readonly`). A server's `readOnlyHint: true` annotations are only honoured
-when you set `"trust_read_only_hints": true` on that server, because the hint
-is the server's own claim. The older
-`mcp_call` tool (`server`, `tool`, `arguments`) still works over the same
-connection.
+Servers connect in the background. A headless run waits 5 s, or
+`timeout_secs`, then skips one that is not ready. Tools are
+**`mcp__<server>__<tool>`** and count as mutating (asked under `ask`,
+blocked under `readonly`). Honour `readOnlyHint` only with
+`"trust_read_only_hints": true`. `mcp_call` uses the same connection.
+`mcp_resources` and `mcp_prompts` appear only when a server publishes
+that kind: omit `uri` or `name` to list, pass one to read. They are
+read-only and are not pasted into the prompt.
 
 ```
 /mcp                                   servers: transport, status, tool count

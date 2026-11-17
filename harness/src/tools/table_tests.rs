@@ -13,12 +13,18 @@ fn table_rows_are_unique_and_match_the_offered_tools() {
     let rows: Vec<&str> = TOOLS.iter().map(|s| s.name).collect();
     let unique: BTreeSet<&str> = rows.iter().copied().collect();
     assert_eq!(rows.len(), unique.len(), "duplicate table rows");
+    // MCP tools, and the resource/prompt tools, appear in `defs` only after
+    // a server publishes them. They stay in the table so a call cannot skip
+    // a gate.
+    let static_name =
+        |n: &str| !crate::mcp::is_mcp_tool(n) && n != "mcp_resources" && n != "mcp_prompts";
     let offered: BTreeSet<&str> = defs(true)
         .iter()
         .map(|d| d.name)
-        .filter(|n| !crate::mcp::is_mcp_tool(n))
+        .filter(|n| static_name(n))
         .collect();
-    assert_eq!(unique, offered, "table rows vs defs(true)");
+    let static_rows: BTreeSet<&str> = unique.into_iter().filter(|n| static_name(n)).collect();
+    assert_eq!(static_rows, offered, "table rows vs defs(true)");
 }
 
 #[test]

@@ -210,8 +210,10 @@ the Cline/Roo multi-model lineage. None of these change the gaps below.
 - Provider catalog is still a short preset list plus `custom` and
   OpenRouter. OpenCode, Goose, Aider, and Crush cover Azure, Bedrock, and
   Vertex, which need more than an API key in a header.
-- MCP is tools over stdio and Streamable HTTP. No resources or prompts as
-  context, no legacy SSE, and bwn is not itself an MCP server (Codex is).
+- MCP resources and prompts are read-only tools (`mcp_resources`,
+  `mcp_prompts`), offered only when a connected server published that kind,
+  and not pasted into the prompt. Still no legacy SSE, and bwn is not itself
+  an MCP server (Codex is).
 - Sub-agents do not run as background sessions you can detach, and there is
   no fan-out across worktrees like Claude Code's `/batch`.
 - Auto-compact is a fixed 80% of the known window. Claude Code lets you set
@@ -240,6 +242,10 @@ than a blank one.
 
 ## Prioritized next work
 
+Row 1 shipped in 0.21.0. Row 2 is now `mcp_resources` and `mcp_prompts`:
+read-only tools, offered only when a connected server published that kind,
+and not inserted into the prompt.
+
 Ordered by impact for a coding-agent CLI, then by how contained the change
 is. Effort is relative to this codebase: small is a setting or command,
 medium crosses a subsystem, large is a new subsystem or a new dependency.
@@ -247,7 +253,7 @@ medium crosses a subsystem, large is a new subsystem or a new dependency.
 | # | Capability | Effort | Impact | Breaking |
 |---|---|---|---|---|
 | 1 | Repository map as a tool the model calls, not text stuffed into every prompt. A ranked list of files and symbols (tree-sitter, or a smaller scanner if a new native dependency is rejected). Budget it like Aider's `--map-tokens`. | large | high | no, if it is a tool with a default that does not change today's prompts |
-| 2 | MCP resources (and prompts) as read-only context, beside tools. OpenCode and the MCP spec treat these as separate from tool calls. | medium | medium | no |
+| 2 | MCP resources (and prompts) as read-only context, beside tools. Landed: `mcp_resources` and `mcp_prompts`, not pasted into the prompt. | medium | medium | no |
 | 3 | Answer the model's question tool in `bwn acp`. Terminal sessions already ask; editor sessions drop the question. | medium | medium for Zed and JetBrains | no |
 | 4 | `compact_ratio` (default `0.8`, today's behavior) and a `/compact auto` readout, so the window is choosable the way Claude Code's is. | small | medium | no, while the default stays 0.8 |
 | 5 | A different model for Plan than for Build, set explicitly. Cline's useful split. Default: the session's current model. | medium | medium | no |

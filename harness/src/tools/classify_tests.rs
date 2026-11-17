@@ -9,9 +9,17 @@ use std::fmt::Write as _;
 // Every name `defs(true)` offers, plus names that classify specially.
 fn names() -> Vec<String> {
     let mut v: Vec<String> = defs(true).iter().map(|d| d.name.to_string()).collect();
-    v.push("mcp__x__y".to_string());
-    v.push("mcp__bad".to_string());
-    v.push("no_such_tool".to_string());
+    for extra in [
+        "mcp_resources",
+        "mcp_prompts",
+        "mcp__x__y",
+        "mcp__bad",
+        "no_such_tool",
+    ] {
+        if !v.iter().any(|n| n == extra) {
+            v.push(extra.to_string());
+        }
+    }
     v
 }
 
@@ -437,6 +445,16 @@ spawn_subagent: mut=true canon=spawn_subagent cmd=None
   view: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="subagent: look around" al="subagent: look around"
   create: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="subagent: build it" al="subagent: build it"
   noread: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="subagent: ?" al="subagent: ?"
+mcp_resources: mut=false canon=mcp_resources cmd=None
+  empty: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list resources" al="list resources"
+  view: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list resources" al="list resources"
+  create: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list resources" al="list resources"
+  noread: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list resources" al="list resources"
+mcp_prompts: mut=false canon=mcp_prompts cmd=None
+  empty: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list prompts" al="list prompts"
+  view: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list prompts" al="list prompts"
+  create: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list prompts" al="list prompts"
+  noread: call=false edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="list prompts" al="list prompts"
 mcp__x__y: mut=true canon=mcp__x__y cmd=None
   empty: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="MCP call: x/y" al="MCP call: x/y"
   view: call=true edit=false net=None tp=None tps=[] rt=None et=None oc=None pv="MCP call: x/y" al="MCP call: x/y"
