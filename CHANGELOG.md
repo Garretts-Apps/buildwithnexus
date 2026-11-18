@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Five workflow-kit commands ship in the binary:** `/test`, `/handoff`,
+  `/changelog`, `/design-pass` and `/deslop`, plus the `distinctive-design`
+  and `deslop` skills, from nexus-workflows. A command file of the same name
+  replaces the bundled one. The kit's `commit`, `review`, `pr` and `debug`
+  are not bundled, because the session's own commands of those names run
+  first and a bundled copy was listed in `/help` but never ran.
 - **MCP resources and prompts are read-only tools.** When a connected server
   publishes them, the model can call `mcp_resources` (list, or read a `uri`)
   and `mcp_prompts` (list, or fetch a `name` with its arguments). They are
