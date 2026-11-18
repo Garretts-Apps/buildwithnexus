@@ -2473,6 +2473,21 @@ mod terminal_ui_tests {
             .collect()
     }
 
+    // The REPL matches its own commands before any command file, so a bundled
+    // command named like one is listed in /help and the popup but never runs.
+    #[test]
+    fn no_bundled_command_takes_a_session_command_name() {
+        let session = repl_commands();
+        let popup = tui::builtin_slash_commands();
+        for (name, _) in crate::config::bundled_commands() {
+            let slash = format!("/{name}");
+            assert!(
+                !session.contains(&slash) && !popup.contains(&slash.as_str()),
+                "bundled /{name} is shadowed by the session's own /{name}"
+            );
+        }
+    }
+
     #[test]
     fn every_command_the_repl_takes_is_in_help_the_popup_and_completion() {
         let cmds = repl_commands();

@@ -46,9 +46,11 @@ hooks and permission gate as `run_command`.
 Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
 and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. A file in one of those folders with the same name
-as a bundled default (`commit`, `review`, `test`, `debug`, `handoff`, `pr`,
-`changelog`, `design-pass`, `deslop`) replaces the built-in. Built-in
-commands load when the name is still free. Skills and commands work headless
+as a bundled default (`test`, `handoff`, `changelog`, `design-pass`,
+`deslop`) replaces the bundled one, which loads only when the name is still
+free. A session command (`/commit`, `/review`, `/pr`, `/debug` and the rest
+of `/help`) is matched before any command file, so a file named like one
+runs only headless, as in `bwn run '/commit'`. Skills and commands work headless
 too: `bwn run '/deploy staging'`.
 
 ```markdown

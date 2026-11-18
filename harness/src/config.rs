@@ -1816,16 +1816,16 @@ pub fn bundled_skills() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Built-in slash commands from the workflow kit. User and project command
-/// files of the same name win; bundled commands load only when the name is free.
+/// Prompt commands from the workflow kit. User and project command files of
+/// the same name win; bundled commands load only when the name is free. The
+/// kit's commit, review, pr and debug are not here: the session's own
+/// `/commit`, `/review`, `/pr` and `/debug` are matched before any command
+/// file, so a bundled copy would be listed and never run. A test in
+/// `tui::editor` keeps this list clear of the session's command names.
 pub fn bundled_commands() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("commit", include_str!("bundled_commands/commit.md")),
-        ("review", include_str!("bundled_commands/review.md")),
         ("test", include_str!("bundled_commands/test.md")),
-        ("debug", include_str!("bundled_commands/debug.md")),
         ("handoff", include_str!("bundled_commands/handoff.md")),
-        ("pr", include_str!("bundled_commands/pr.md")),
         ("changelog", include_str!("bundled_commands/changelog.md")),
         (
             "design-pass",
@@ -4059,26 +4059,16 @@ mod tests {
     #[test]
     fn bundled_workflow_kit_commands_and_skills_ship() {
         let cmd_names: Vec<_> = bundled_commands().iter().map(|(n, _)| *n).collect();
-        for n in [
-            "commit",
-            "review",
-            "test",
-            "debug",
-            "handoff",
-            "pr",
-            "changelog",
-            "design-pass",
-            "deslop",
-        ] {
+        for n in ["test", "handoff", "changelog", "design-pass", "deslop"] {
             assert!(cmd_names.contains(&n), "missing bundled command {n}");
         }
         let skill_names: Vec<_> = bundled_skills().iter().map(|(n, _)| *n).collect();
         assert!(skill_names.contains(&"distinctive-design"));
         assert!(skill_names.contains(&"deslop"));
         let cmds = load_custom_commands();
-        let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
-        assert!(!commit.skill);
-        assert!(commit.content.contains("git status"));
+        let test = cmds.iter().find(|c| c.name == "test").unwrap();
+        assert!(!test.skill);
+        assert!(test.content.contains("$ARGUMENTS"));
         let deslop_skill = discover_skills(Path::new("."))
             .into_iter()
             .find(|s| s.name == "deslop")
@@ -4094,12 +4084,12 @@ mod tests {
         fs::create_dir_all(&h).unwrap();
         std::env::set_var("NEXUS_HOME", &h);
         write(
-            &h.join("commands").join("commit.md"),
-            "---\ndescription: Mine\n---\nUser commit.",
+            &h.join("commands").join("test.md"),
+            "---\ndescription: Mine\n---\nUser test.",
         );
         let cmds = load_custom_commands();
-        let commit = cmds.iter().find(|c| c.name == "commit").unwrap();
-        assert_eq!(commit.content, "User commit.");
+        let test = cmds.iter().find(|c| c.name == "test").unwrap();
+        assert_eq!(test.content, "User test.");
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
     }
