@@ -47,7 +47,7 @@ Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
 and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. A file in one of those folders with the same name
 as a bundled default replaces the built-in, which loads only when the name
-is still free (42 workflow-kit commands ship in the binary; `/skills` and the
+is still free (41 workflow-kit commands ship in the binary; `/skills` and the
 `/` popup list the names). A session command (`/commit`, `/review`, `/pr`,
 `/debug` and the rest of `/help`) is matched before any command file, so a
 file named like one runs only headless, as in `bwn run '/commit'`. Skills and
