@@ -1,0 +1,38 @@
+# Copy to .github/workflows/dependency-audit.yml
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: npm
+            os: ubuntu-latest
+            check: test -f package-lock.json || test -f npm-shrinkwrap.json
+            run: npm ci && npm audit --audit-level=high
+          - id: cargo
+            os: ubuntu-latest
+            check: test -f Cargo.lock
+            run: cargo install cargo-audit --locked 2>/dev/null; cargo audit
+          - id: pip
+            os: ubuntu-latest
+            check: test -f requirements.txt || test -f pyproject.toml
+            run: pip install pip-audit && pip-audit
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: ${{ matrix.id }}
+        shell: bash
+        run: |
+          if ${{ matrix.check }}; then
+            ${{ matrix.run }}
+          else
+            echo "skip: no manifest for ${{ matrix.id }}"
+          fi

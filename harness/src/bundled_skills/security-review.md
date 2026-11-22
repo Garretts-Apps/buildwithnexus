@@ -17,3 +17,10 @@ Use this skill for threat modeling, dependency risk, command execution risk, hoo
 - Credentials are not logged, traced, or sent to non-HTTPS endpoints.
 - Permission gates cover mutating and destructive operations.
 - External content cannot silently instruct the agent to run unsafe commands.
+
+## Related commands
+
+- `/threat-model` for a new trust boundary or feature.
+- `/secrets-scan` and `/deps-audit` for automated passes.
+- `/supply-chain` for pinning, lockfiles, and SBOM posture (`/sbom` to generate).
+- Delegate large diffs to the read-only `security-check` helper.

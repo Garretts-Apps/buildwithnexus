@@ -46,12 +46,12 @@ hooks and permission gate as `run_command`.
 Commands load from `~/.buildwithnexus/commands/` and `~/.claude/commands/`,
 and, once you trust them, from the project's `.buildwithnexus/commands/`
 and `.claude/commands/`. A file in one of those folders with the same name
-as a bundled default (`test`, `handoff`, `changelog`, `design-pass`,
-`deslop`) replaces the bundled one, which loads only when the name is still
-free. A session command (`/commit`, `/review`, `/pr`, `/debug` and the rest
-of `/help`) is matched before any command file, so a file named like one
-runs only headless, as in `bwn run '/commit'`. Skills and commands work headless
-too: `bwn run '/deploy staging'`.
+as a bundled default replaces the built-in, which loads only when the name
+is still free (41 workflow-kit commands ship in the binary; `/skills` and the
+`/` popup list the names). A session command (`/commit`, `/review`, `/pr`,
+`/debug` and the rest of `/help`) is matched before any command file, so a
+file named like one runs only headless, as in `bwn run '/commit'`. Skills and
+commands work headless too: `bwn run '/deploy staging'`.
 
 ```markdown
 ---
@@ -70,6 +70,11 @@ limits what it may use, and Claude Code's tool names work (`Read`, `Grep`,
 `Bash`, …). A helper with a `tools` list can never delegate further (`task`
 and `spawn_subagent` are left out), and a call naming an unknown role fails
 with the list of roles. `/agents` lists the helpers.
+
+Bundled read-only helpers ship as `reviewer`, `debugger`,
+`security-check`, and `pipeline-reviewer`. An agent file in
+`~/.buildwithnexus/agents/` or
+`~/.claude/agents/` with the same name replaces the bundled one.
 
 ```markdown
 ---
