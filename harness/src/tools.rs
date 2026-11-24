@@ -4120,6 +4120,12 @@ fn run_with_timeout_keeping(
     let mut stderr_buf = BoundedBuf::new(head_keep, tail_keep);
     let deadline = std::time::Instant::now() + timeout;
     let mut timed_out = false;
+    // Between polls the loop waits on the output channels, so output (and
+    // the EOF a clean exit brings) wakes it at once. The wait starts at 1 ms
+    // and doubles up to 50 ms: a short command is seen to exit within a
+    // millisecond or two instead of a whole 50 ms nap, and a long one is
+    // still checked for interrupts and the deadline every 50 ms.
+    let mut nap = Duration::from_millis(1);
     let code = loop {
         while let Ok(chunk) = out_rx.try_recv() {
             stdout_buf.push(&chunk);
@@ -4139,7 +4145,19 @@ fn run_with_timeout_keeping(
                     kill_process_tree(&mut child);
                     break None;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                use std::sync::mpsc::RecvTimeoutError::Disconnected;
+                match out_rx.recv_timeout(nap) {
+                    Ok(chunk) => stdout_buf.push(&chunk),
+                    Err(Disconnected) => match err_rx.recv_timeout(nap) {
+                        Ok(chunk) => stderr_buf.push(&chunk),
+                        // Both pipes closed and the child still running:
+                        // nothing left to wake on.
+                        Err(Disconnected) => std::thread::sleep(nap),
+                        Err(_) => {}
+                    },
+                    Err(_) => {}
+                }
+                nap = (nap * 2).min(Duration::from_millis(50));
             }
             Err(e) => return Err(format!("failed to wait for command: {e}")),
         }
