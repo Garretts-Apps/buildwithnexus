@@ -504,7 +504,7 @@ impl<'a> Chunk<'a> {
 }
 
 pub(super) fn openai_stream(
-    reader: impl Read,
+    reader: impl BufRead,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {

@@ -1261,6 +1261,38 @@ fn interruptible_reader_passes_a_stream_through_unchanged() {
     assert_eq!(interruptible(|| 7).unwrap(), 7);
 }
 
+// A body that arrives a few bytes at a time, so lines and multibyte
+// characters straddle the chunks the reader is handed.
+struct Trickle(Cursor<Vec<u8>>, usize);
+impl Read for Trickle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.1);
+        self.0.read(&mut buf[..n])
+    }
+}
+
+#[test]
+fn interruptible_reader_cuts_lines_across_chunks_as_a_slice_does() {
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"日本語 🚀 <thi\"}}]}\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\"nk>why</think>ok é\"}}]}\n\
+               \n\
+               data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"finish\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
+               data: [DONE]\n";
+    let run = |r: Box<dyn BufRead>| {
+        let (mut text, mut thought) = (String::new(), String::new());
+        let reply = openai_stream(r, &mut |t| text.push_str(t), &mut |t| thought.push_str(t));
+        (format!("{reply:?}"), text, thought)
+    };
+    let want = run(Box::new(Cursor::new(sse.as_bytes().to_vec())));
+    assert!(want.0.contains("finish"), "{want:?}");
+    assert_eq!(want.2, "why");
+    for step in [1, 2, 3, 7, 64, 100_000] {
+        let body = Trickle(Cursor::new(sse.as_bytes().to_vec()), step);
+        let got = run(Box::new(InterruptibleReader::new(Box::new(body))));
+        assert_eq!(got, want, "{step}-byte reads");
+    }
+}
+
 #[test]
 fn flatten_openai_keeps_images_and_describes_tools_in_text() {
     let tools = [ToolDef {
@@ -1912,7 +1944,7 @@ fn stream_read_error_before_terminal_event_is_err() {
     // No message_stop / [DONE] — the transport dies first.
     let a = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n";
     let r = anthropic_stream(
-        BrokenPipe(Cursor::new(a.as_bytes().to_vec())),
+        BufReader::new(BrokenPipe(Cursor::new(a.as_bytes().to_vec()))),
         &mut |_| {},
         &mut |_| {},
     );
@@ -1920,7 +1952,7 @@ fn stream_read_error_before_terminal_event_is_err() {
 
     let o = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n";
     let r = openai_stream(
-        BrokenPipe(Cursor::new(o.as_bytes().to_vec())),
+        BufReader::new(BrokenPipe(Cursor::new(o.as_bytes().to_vec()))),
         &mut |_| {},
         &mut |_| {},
     );
@@ -1933,7 +1965,7 @@ fn stream_read_error_after_terminal_event_is_ok() {
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\
                    data: [DONE]\n";
     let r = openai_stream(
-        BrokenPipe(Cursor::new(sse.as_bytes().to_vec())),
+        BufReader::new(BrokenPipe(Cursor::new(sse.as_bytes().to_vec()))),
         &mut |_| {},
         &mut |_| {},
     )
@@ -2280,7 +2312,7 @@ fn ollama_stream_error_line_is_err() {
 fn ollama_stream_read_error_before_done_is_err() {
     let ndjson = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n";
     let r = ollama_stream(
-        BrokenPipe(Cursor::new(ndjson.as_bytes().to_vec())),
+        BufReader::new(BrokenPipe(Cursor::new(ndjson.as_bytes().to_vec()))),
         &mut |_| {},
         &mut |_| {},
     );
