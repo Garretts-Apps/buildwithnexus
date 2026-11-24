@@ -4,6 +4,7 @@
 // "\r\n" and we echo keystrokes ourselves. Falls back to cooked line input when
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -148,11 +149,22 @@ struct Selection {
 // keystroke / scroll tick — the single biggest source of TUI lag on long
 // sessions. Instead each line is wrapped once when it lands (or when it
 // mutates), and a resize rewraps everything exactly once.
+// Kept as rings: at the line cap every new line drops the oldest, and a
+// ring drops it without moving the other 1,999. `rows` is the total of
+// `wrapped`'s lengths, kept in step as lines change, so a frame does not
+// add up every line to find the bottom of the transcript.
 struct Transcript {
-    lines: Vec<String>,
-    wrapped: Vec<Vec<String>>, // parallel to `lines`, wrapped at `width`
-    width: usize,              // 0 = not yet sized
-    height: usize,             // terminal rows the wrap was made for (images)
+    lines: VecDeque<String>,
+    wrapped: VecDeque<Vec<String>>, // parallel to `lines`, wrapped at `width`
+    rows: usize,                    // sum of `wrapped[i].len()`
+    // Rows ever dropped from the front (the line cap, a clear). With it a
+    // row has a number that does not change as older lines go: row `r` of
+    // `wrapped` is row `dropped + r` of everything shown this session. A
+    // frame compares that number with the last frame's to see how far the
+    // view moved.
+    dropped: usize,
+    width: usize,  // 0 = not yet sized
+    height: usize, // terminal rows the wrap was made for (images)
     // The line last appended to and where its wrap stands: the next chunk
     // of a streamed line is wrapped from there (`append_to`). Dropped by
     // anything else that changes a line, the line count or the width.
@@ -201,13 +213,34 @@ pub mod bench {
     pub fn full_rewrap(c: &mut WrapCache, width: usize) {
         c.0.ensure_width(width);
     }
+
+    /// A finished line arriving at a full transcript: it is wrapped and
+    /// added, and the oldest line is dropped to stay at the cap.
+    pub fn push_at_cap(c: &mut WrapCache, line: &str) {
+        c.0.push(line.to_string());
+        c.0.drain_front(1);
+    }
+
+    /// What a frame asks of the transcript: how many rows it has, and the
+    /// `rows` rows at the bottom (the view follows the newest output).
+    pub fn bottom_window(c: &WrapCache, rows: usize) -> usize {
+        let total = c.0.total_rows();
+        c.0.rows_range(total.saturating_sub(rows), rows).len()
+    }
+
+    /// One line wrapped from scratch.
+    pub fn wrap(line: &str, width: usize) -> usize {
+        super::wrap_ansi_line(line, width).len()
+    }
 }
 
 impl Transcript {
     const fn new() -> Self {
         Transcript {
-            lines: Vec::new(),
-            wrapped: Vec::new(),
+            lines: VecDeque::new(),
+            wrapped: VecDeque::new(),
+            rows: 0,
+            dropped: 0,
             width: 0,
             height: 0,
             open: None,
@@ -227,8 +260,16 @@ impl Transcript {
 
     fn push(&mut self, s: String) {
         let w = self.cur_width();
-        self.wrapped.push(wrap_ansi_line(&s, w));
-        self.lines.push(s);
+        let rows = wrap_ansi_line(&s, w);
+        self.rows += rows.len();
+        self.wrapped.push_back(rows);
+        self.lines.push_back(s);
+    }
+
+    // Put `rows` in at `i`, keeping the row total in step.
+    fn replace_rows(&mut self, i: usize, rows: Vec<String>) {
+        self.rows = self.rows - self.wrapped[i].len() + rows.len();
+        self.wrapped[i] = rows;
     }
 
     fn same_at(&self, i: usize, s: &str) -> bool {
@@ -241,7 +282,7 @@ impl Transcript {
         }
         let w = self.cur_width();
         self.open = None;
-        self.wrapped[i] = wrap_ansi_line(&s, w);
+        self.replace_rows(i, wrap_ansi_line(&s, w));
         self.lines[i] = s;
     }
 
@@ -257,17 +298,19 @@ impl Transcript {
         let w = self.cur_width();
         let line = &self.lines[i];
         if let Some((at, st)) = self.open.as_mut() {
+            let before = self.wrapped[i].len();
             if *at == i
                 && st.max_cols == w
                 && st.lead_final
                 && !line.starts_with(IMG_MARK)
                 && st.feed(&mut self.wrapped[i], line)
             {
+                self.rows = self.rows - before + self.wrapped[i].len();
                 return true;
             }
         }
         let (rows, st) = wrap_ansi_open(line, w);
-        self.wrapped[i] = rows;
+        self.replace_rows(i, rows);
         self.open = st.map(|st| (i, st));
         true
     }
@@ -276,7 +319,9 @@ impl Transcript {
         if i < self.lines.len() {
             self.open = None;
             self.lines.remove(i);
-            self.wrapped.remove(i);
+            if let Some(rows) = self.wrapped.remove(i) {
+                self.rows -= rows.len();
+            }
         }
     }
 
@@ -284,13 +329,18 @@ impl Transcript {
         let n = n.min(self.lines.len());
         self.open = None;
         self.lines.drain(0..n);
-        self.wrapped.drain(0..n);
+        for rows in self.wrapped.drain(0..n) {
+            self.rows -= rows.len();
+            self.dropped += rows.len();
+        }
     }
 
     fn clear(&mut self) {
         self.open = None;
         self.lines.clear();
         self.wrapped.clear();
+        self.dropped += self.rows;
+        self.rows = 0;
     }
 
     // Rewrap everything if the terminal width changed (resize only).
@@ -299,6 +349,7 @@ impl Transcript {
             self.open = None;
             self.width = w;
             self.wrapped = self.lines.iter().map(|l| wrap_ansi_line(l, w)).collect();
+            self.rows = self.wrapped.iter().map(Vec::len).sum();
         }
     }
 
@@ -312,15 +363,31 @@ impl Transcript {
     }
 
     fn total_rows(&self) -> usize {
-        self.wrapped.iter().map(|w| w.len()).sum()
+        self.rows
+    }
+
+    fn dropped_rows(&self) -> usize {
+        self.dropped
     }
 
     // The visible window: `count` wrapped rows starting at row `start`,
-    // without materializing the full flattened transcript.
+    // without materializing the full flattened transcript. The line holding
+    // row `start` is found from whichever end is nearer, so following the
+    // newest output costs the lines on screen, not the lines kept.
     fn rows_range(&self, start: usize, count: usize) -> Vec<&String> {
         let mut out = Vec::with_capacity(count);
-        let mut skipped = 0usize;
-        for w in &self.wrapped {
+        let (mut first, mut skipped) = (0usize, 0usize);
+        if start > self.rows / 2 {
+            let mut row = self.rows;
+            for (i, w) in self.wrapped.iter().enumerate().rev() {
+                row -= w.len();
+                if row <= start {
+                    (first, skipped) = (i, row);
+                    break;
+                }
+            }
+        }
+        for w in self.wrapped.range(first..) {
             if out.len() >= count {
                 break;
             }
@@ -1244,6 +1311,9 @@ fn footer_row() -> u16 {
 
 pub fn char_width(c: char) -> usize {
     let u = c as u32;
+    if u < 0x0300 {
+        return 1;
+    }
     if (0x0300..=0x036F).contains(&u)
         || (0x1AB0..=0x1AFF).contains(&u)
         || (0x20D0..=0x20FF).contains(&u)
@@ -1276,6 +1346,10 @@ pub fn char_width(c: char) -> usize {
 }
 
 pub fn str_width(s: &str) -> usize {
+    // One column per byte for ASCII (char_width's answer for every one).
+    if s.is_ascii() {
+        return s.len();
+    }
     s.chars().map(char_width).sum()
 }
 
@@ -2387,6 +2461,7 @@ fn build_output_frame(
     rows: usize,
     bg: &str,
     origin_x: u16,
+    scroll_ok: bool,
 ) -> (Vec<Placement>, Vec<Placement>, bool) {
     let sel = s.selection.current;
     let drawn_over = std::mem::replace(&mut s.images.dirty, false);
@@ -2400,6 +2475,7 @@ fn build_output_frame(
     let screen::TranscriptState {
         text,
         painted,
+        painted_at,
         visible_rows,
         ..
     } = view;
@@ -2411,6 +2487,42 @@ fn build_output_frame(
         visible_rows.clear();
         visible_rows.resize(rows, String::new());
     }
+    // New output at the bottom moves every row up. Repainting them all
+    // sends the whole output area again; instead the terminal is told to
+    // scroll the output region (a line feed on its bottom margin, which every
+    // terminal back to the VT100 understands) and keeps the rows it already
+    // has, so only the new rows at the bottom are written. `painted` is
+    // shifted the same way, so the row comparison below then repaints
+    // exactly what the scroll did not account for: a wrong guess costs
+    // bytes, never a wrong screen. Sixel images drawn wholly inside the rows
+    // that stay move with them and are not sent again.
+    let at = text.dropped_rows() + start;
+    let mut scrolled_drawn: Option<Vec<Placement>> = None;
+    if scroll_ok && !full && sel.is_none() {
+        if let Some((was, was_width)) = *painted_at {
+            let k = at.saturating_sub(was);
+            if was_width == width
+                && k > 0
+                && k < rows
+                && scroll_lines_up(painted, &visible, k, rows, bg, width)
+            {
+                let _ = write!(out, "{bg}\x1b[{rows}H{}", "\n".repeat(k));
+                painted.drain(0..k);
+                painted.resize(rows, String::new());
+                visible_rows.drain(0..k);
+                visible_rows.resize(rows, String::new());
+                scrolled_drawn = Some(
+                    drawn
+                        .iter()
+                        .filter(|p| p.1 >= k)
+                        .map(|&(id, top, first, n)| (id, top - k, first, n))
+                        .collect(),
+                );
+            }
+        }
+    }
+    *painted_at = Some((at, width));
+    let drawn: &[Placement] = scrolled_drawn.as_deref().unwrap_or(drawn);
     // Sixel images are pixels over blank rows. One that is on screen at
     // the same place as last frame, with nothing drawn over it since, is
     // left alone: rewriting its rows would erase it, and re-sending it
@@ -2480,6 +2592,46 @@ fn build_output_frame(
     (placements, kept, full)
 }
 
+// A row as a frame paints it when nothing is selected and it is not an
+// image row: the theme's start, the line, and padding to the width.
+fn plain_row_bytes(bg: &str, line: Option<&String>, width: usize) -> String {
+    let mut b = String::with_capacity(width + 32);
+    b.push_str(bg);
+    match line {
+        Some(line) => pad_ansi_into(&mut b, line, width),
+        None => b.extend(std::iter::repeat_n(' ', width)),
+    }
+    b
+}
+
+// Whether scrolling the painted rows up by `k` lines them up with the new
+// view: the first and the last row that would survive the scroll (text
+// rows, not images) are already on screen, `k` rows lower.
+fn scroll_lines_up(
+    painted: &[String],
+    visible: &[&String],
+    k: usize,
+    rows: usize,
+    bg: &str,
+    width: usize,
+) -> bool {
+    let text_row = |i: usize| {
+        let line = visible.get(i).copied();
+        let image = line.is_some_and(|l| l.starts_with(IMG_MARK)) || painted[i + k] == SIXEL_ROW;
+        (!image).then_some(line)
+    };
+    let survivors = rows - k;
+    let first = (0..survivors).find_map(|i| text_row(i).map(|l| (i, l)));
+    let last = (0..survivors)
+        .rev()
+        .find_map(|i| text_row(i).map(|l| (i, l)));
+    let (Some((a, la)), Some((b, lb))) = (first, last) else {
+        return false;
+    };
+    painted[a + k] == plain_row_bytes(bg, la, width)
+        && painted[b + k] == plain_row_bytes(bg, lb, width)
+}
+
 // Paint the output rows: only those that changed since the last frame (see
 // `build_output_frame`), as one write inside a synchronized-output bracket.
 // The cursor is saved and restored around them, so the composer — where the
@@ -2507,6 +2659,14 @@ fn render_output() {
     let cover = crate::workspace::covers_output(term_w);
     let width = if cover { 0 } else { content_w as usize };
     let rows = height.saturating_sub(reserved_rows()) as usize;
+    // The terminal may scroll the output rows only when they are whole
+    // rows of the screen, exactly the scroll region, with nothing drawn over
+    // them: a side panel or an overlay would scroll with them.
+    let scroll_ok = origin_x == 0
+        && content_w == term_w
+        && !crate::workspace::visible()
+        && !crate::debug_panel::visible()
+        && LAST_REGION_BOTTOM.load(Ordering::Relaxed) as usize == rows;
     let mut out: Vec<u8> = Vec::with_capacity(256);
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
@@ -2525,7 +2685,15 @@ fn render_output() {
         (Vec::new(), Vec::new(), true)
     } else {
         screen::with(|s| {
-            build_output_frame(s, &mut out, (width, height as usize), rows, &bg, origin_x)
+            build_output_frame(
+                s,
+                &mut out,
+                (width, height as usize),
+                rows,
+                &bg,
+                origin_x,
+                scroll_ok,
+            )
         })
     };
     // Drawing a Sixel leaves the cursor on the row below the image; with the
@@ -3570,8 +3738,10 @@ struct WrapState {
     // id colour would break its placeholder cells).
     active: String,
     // Last place this row may break: byte offset just after a space that
-    // follows some text, the columns used up to it, and the SGR state there.
-    brk: Option<(usize, usize, String)>,
+    // follows some text, the columns used up to it, and the SGR state there
+    // (None: the same as `active` now; it is copied only if `active`
+    // changes before the break is used, not at every space).
+    brk: Option<(usize, usize, Option<String>)>,
     seen_text: bool,
     // Bytes of the line taken in.
     pos: usize,
@@ -3636,7 +3806,27 @@ impl WrapState {
         let max_cols = self.max_cols;
         let indent = self.indent;
         let mut chars = rest.chars().peekable();
-        while let Some(c) = chars.next() {
+        loop {
+            // A run of printable ASCII up to the next space or escape, when
+            // it fits on this row, is one copy: each byte is one column and
+            // none is a break point, which is all the per-character path
+            // below would conclude about them, one at a time.
+            let run = line.as_bytes()[self.pos..]
+                .iter()
+                .take_while(|b| b.is_ascii_graphic())
+                .count();
+            if run > 1 && self.visible + run <= max_cols {
+                current.push_str(&line[self.pos..self.pos + run]);
+                self.tail = None;
+                self.pos += run;
+                self.visible += run;
+                self.seen_text = true;
+                chars = line[self.pos..].chars().peekable();
+                continue;
+            }
+            let Some(c) = chars.next() else {
+                break;
+            };
             if c == '\x1b' {
                 if self.tail.is_none() {
                     self.tail = Some((self.pos, current.len(), self.active.clone()));
@@ -3647,6 +3837,9 @@ impl WrapState {
                 let seq = &current[start..];
                 self.pos += seq.len();
                 if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                    if let Some((_, _, saved @ None)) = self.brk.as_mut() {
+                        *saved = Some(self.active.clone());
+                    }
                     if seq == "\x1b[0m" || seq == "\x1b[m" {
                         self.active.clear();
                     } else {
@@ -3667,6 +3860,7 @@ impl WrapState {
                     Some((at, cols, sgr)) => {
                         let rest = current.split_off(at);
                         rows.push(std::mem::take(&mut current));
+                        let sgr = sgr.as_deref().unwrap_or(&self.active);
                         current = format!("{sgr}{pad}{rest}");
                         self.visible = indent + self.visible - cols;
                     }
@@ -3685,7 +3879,7 @@ impl WrapState {
             self.visible += w;
             if c == ' ' {
                 if self.seen_text {
-                    self.brk = Some((current.len(), self.visible, self.active.clone()));
+                    self.brk = Some((current.len(), self.visible, None));
                 }
             } else {
                 self.seen_text = true;

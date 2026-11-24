@@ -872,6 +872,51 @@ class FrameTests(TerminalHarness):
         self.assertEqual(self.output_frames(since), [])
 
 
+
+class ScrollTests(TerminalHarness):
+    """A reply longer than the screen: once the output rows are full, each
+    new line scrolls the terminal (a line feed on the region's bottom
+    margin) and paints only the rows that arrived, instead of sending every
+    output row again."""
+
+    SCRIPT = [(f"reply line {i:02d}\n", 0.05) for i in range(60)] + [("last-marker\n", 0)]
+    SCROLL = re.compile(rb"\x1b\[(\d+)H(\n+)")
+
+    def prepare(self):
+        self.model = StreamModel(self.SCRIPT)
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "auto", "auto_update": "off"}
+
+    def test_a_long_reply_scrolls_the_terminal_and_paints_only_new_rows(self):
+        since = len(self.output)
+        self.send("hello\r")
+        self.wait_for(lambda: b"last-marker" in self.output[since:], "the last line", timeout=30)
+        self.pump(0.3)
+        frames = []
+        for part in bytes(self.output[since:]).split(b"\x1b[?2026h\x1b7")[1:]:
+            body = part.split(b"\x1b8\x1b[?2026l")[0]
+            rows = [int(r) for r in re.findall(rb"\x1b\[(\d+);1H", body)]
+            if rows and max(rows) <= 26:
+                frames.append((body, rows))
+        scrolled = [(body, rows) for body, rows in frames if self.SCROLL.search(body)]
+        # The reply is three screens long: most of its frames scroll.
+        self.assertGreaterEqual(len(scrolled), 20, f"{len(scrolled)} of {len(frames)} frames scrolled")
+        for body, rows in scrolled:
+            feeds = len(self.SCROLL.search(body).group(2))
+            # The rows painted are the ones the scroll opened (and the open
+            # line above them, when a streamed line was finished), never
+            # the whole output area.
+            self.assertLessEqual(len(rows), feeds + 2, rows)
+        sizes = sorted(len(body) for body, _ in scrolled)
+        median = sizes[len(sizes) // 2]
+        print(f"\n  scrolled frames: {len(scrolled)} of {len(frames)}, median {median} bytes",
+              file=sys.stderr)
+        self.assertLess(median, 1200, sizes)
+
 class GitAttachmentTests(TerminalHarness):
     """@diff in a repository whose git config runs a program asks first."""
 

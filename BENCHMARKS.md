@@ -70,6 +70,49 @@ token-sized chunks:
 | `chunks_into_2000char_line` (333 chunks) | 17.2 µs | 0.05 µs |
 | `chunks_into_20000char_line` (3,333 chunks) | 171 µs | 0.05 µs |
 
+### Work that scaled with the session, or ran per character
+
+Measured 2026-11-24 on a 4-core Intel Xeon @ 2.10GHz cloud container,
+before and after the same change, back to back on the same machine (so the
+"before" column is not comparable with the tables above, which ran on a
+different one). Criterion medians, `cargo bench --bench perf --
+"transcript_cap|wrap_line|transcript_append|stream_wrap"`.
+
+| Benchmark | Before | After | |
+|---|---|---|---|
+| `transcript_cap/frame_window_40rows_of_2000lines`: a frame finds the rows at the bottom | 1.69 µs | 0.085 µs | 20× |
+| `transcript_cap/push_line_at_2000`: a finished line at the 2,000-line cap | 3.51 µs | 1.16 µs | 3.0× |
+| `wrap_line/plain_1300chars` | 11.7 µs | 7.43 µs | 1.6× |
+| `wrap_line/coloured_1300chars` | 26.9 µs | 18.4 µs | 1.5× |
+| `transcript_append/incremental/2000lines` | 3.61 µs | 2.43 µs | 1.5× |
+| `stream_wrap/chunks_into_2000char_line` | 22.3 µs | 14.9 µs | 1.5× |
+
+What changed: the transcript is kept in rings, so the line cap drops the
+oldest line without moving the rest; the row total is counted as lines
+change, and the bottom of the view is found from the end, so a frame costs
+the lines on screen rather than the lines kept; ASCII skips the
+character-width tables; a run of printable ASCII is copied onto a row in one
+go; and a wrap point copies the colour state only when it changes, not at
+every space.
+
+### A long reply: the terminal scrolls, bwn sends the new rows
+
+Once the output rows are full, every new line used to change every row (the
+view moved up by one), so each frame sent the whole output area again. Now
+bwn tells the terminal to scroll the output region (a line feed on its
+bottom margin, as on a VT100) and paints only the rows that arrived; Sixel
+images still wholly on screen move with the scroll and are not sent again.
+
+Measured with `scripts/test-terminal-input.py` (`ScrollTests`): a scripted
+model streams a 61-line reply into a 100×30 PTY, one line per chunk, debug
+builds of main and of this change, three runs each (identical):
+
+| | Before | After |
+|---|---|---|
+| Bytes written for the whole reply's output frames | 137,581 | 9,805 (14× less) |
+| A frame after the screen is full: median bytes | 2,773 | 113 (25× less) |
+| A frame after the screen is full: median rows painted | 26 | 1 |
+
 ## Tools
 
 A generated project of 2,000 source files (8.8 MB); a 60 MB log for
