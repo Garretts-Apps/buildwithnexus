@@ -3699,7 +3699,27 @@ impl WrapState {
         let max_cols = self.max_cols;
         let indent = self.indent;
         let mut chars = rest.chars().peekable();
-        while let Some(c) = chars.next() {
+        loop {
+            // A run of printable ASCII up to the next space or escape, when
+            // it fits on this row, is one copy: each byte is one column and
+            // none is a break point, which is all the per-character path
+            // below would conclude about them, one at a time.
+            let run = line.as_bytes()[self.pos..]
+                .iter()
+                .take_while(|b| b.is_ascii_graphic())
+                .count();
+            if run > 1 && self.visible + run <= max_cols {
+                current.push_str(&line[self.pos..self.pos + run]);
+                self.tail = None;
+                self.pos += run;
+                self.visible += run;
+                self.seen_text = true;
+                chars = line[self.pos..].chars().peekable();
+                continue;
+            }
+            let Some(c) = chars.next() else {
+                break;
+            };
             if c == '\x1b' {
                 if self.tail.is_none() {
                     self.tail = Some((self.pos, current.len(), self.active.clone()));
