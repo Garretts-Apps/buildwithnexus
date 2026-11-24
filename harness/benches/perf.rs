@@ -9,7 +9,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 
 use buildwithnexus::config;
@@ -282,6 +282,132 @@ fn bench_sse_parse(c: &mut Criterion) {
             );
         })
     });
+    g.finish();
+}
+
+// ── request bodies and the stream reader, the paths the fixes touch ─────────
+// The Anthropic body with extended thinking on: every assistant turn that
+// made a call gets the thinking blocks recorded for it put back in front of
+// its tool_use. The memory keeps the last 64 replies, so on the longer
+// sessions only the latest turns replay, as they would live.
+fn bench_request_body_thinking(c: &mut Criterion) {
+    let defs = tools::defs(true);
+    let thought = "The failing assertion compares the token count after the last line. \
+                   If the loop exits on EOF before flushing, the final token is lost. "
+        .repeat(16);
+    // A base64 signature of the length the API sends with a thinking block.
+    let signature = "c2lnbmVkIHRoaW5raW5nIGJsb2Nr".repeat(16);
+    let mut g = c.benchmark_group("request_body_thinking");
+    for (label, msgs) in [
+        ("30turns_50kb", session(30, 330, 0)),
+        ("120turns_1.4mb", session(120, 8_100, 150_000)),
+        ("300turns_4.6mb", session(300, 11_200, 450_000)),
+    ] {
+        let turns = msgs.len() / 4;
+        for i in 0..turns {
+            pbench::remember_thinking(
+                &format!("call_{i}"),
+                vec![serde_json::json!({
+                    "type": "thinking",
+                    "thinking": format!("step {i}: {thought}"),
+                    "signature": signature,
+                })],
+            );
+        }
+        let wire =
+            pbench::anthropic_thinking_request_bytes("claude-sonnet-4-5", &msgs, &defs).len();
+        g.throughput(Throughput::Bytes(wire as u64));
+        g.bench_function(format!("anthropic/{label}"), |b| {
+            b.iter(|| {
+                pbench::anthropic_thinking_request_bytes(
+                    black_box("claude-sonnet-4-5"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+    }
+    g.finish();
+}
+
+// The OpenAI body in the flattened fallback: the transcript folded into
+// alternating user/assistant turns, tool calls and results written as text,
+// the tool guide at the top of the first turn.
+fn bench_request_body_flat(c: &mut Criterion) {
+    let defs = tools::defs(true);
+    let mut g = c.benchmark_group("request_body_flat");
+    for (label, msgs) in [
+        ("30turns_50kb", session(30, 330, 0)),
+        ("120turns_1.4mb", session(120, 8_100, 150_000)),
+        ("300turns_4.6mb", session(300, 11_200, 450_000)),
+    ] {
+        let wire = pbench::openai_flat_request_bytes("gpt-4o", &msgs, &defs).len();
+        g.throughput(Throughput::Bytes(wire as u64));
+        g.bench_function(format!("openai/{label}"), |b| {
+            b.iter(|| {
+                pbench::openai_flat_request_bytes(
+                    black_box("gpt-4o"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+    }
+    g.finish();
+}
+
+// A response body that hands out at most `max` bytes per read, the way a
+// socket delivers a stream in pieces, so the reader's per-read work counts.
+struct Trickle {
+    data: std::sync::Arc<[u8]>,
+    pos: usize,
+    max: usize,
+}
+
+impl std::io::Read for Trickle {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = out.len().min(self.max).min(self.data.len() - self.pos);
+        out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+// The same stream as sse_parse/openai_stream, read through the
+// interruptible reader (worker thread, channel, line buffer) a live
+// response goes through.
+fn bench_sse_stream_reader(c: &mut Criterion) {
+    let mut sse = String::new();
+    for i in 0..2000 {
+        sse.push_str(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"tok{i} \"}}}}]}}\n"
+        ));
+    }
+    sse.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"finish\",\"arguments\":\"{\\\"summary\\\"\"}}]}}]}\n");
+    sse.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"done\\\"}\"}}]}}]}\n");
+    sse.push_str("data: [DONE]\n");
+    let data: std::sync::Arc<[u8]> = sse.as_bytes().into();
+
+    let mut g = c.benchmark_group("sse_stream_reader");
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    for max in [256usize, 4096] {
+        g.bench_function(format!("openai_stream/2000deltas_{max}b_reads"), |b| {
+            b.iter(|| {
+                let mut sink = |_: &str| {};
+                let mut think_sink = |_: &str| {};
+                let body = Trickle {
+                    data: data.clone(),
+                    pos: 0,
+                    max,
+                };
+                let _ = pbench::openai_stream_interruptible(
+                    black_box(body),
+                    &mut sink,
+                    &mut think_sink,
+                );
+            })
+        });
+    }
     g.finish();
 }
 
@@ -578,6 +704,92 @@ fn bench_highlight(c: &mut Criterion) {
     g.finish();
 }
 // ── end terminal UI ──────────────────────────────────────────────────────────
+
+// ── terminal UI in colour: fenced code, colour spans, streamed markdown ──────
+// These run with colour on (see main). The fenced-code benches go through
+// the path the transcript uses for a finished fence: the box, then each line
+// highlighted and framed.
+fn bench_highlight_colour(c: &mut Criterion) {
+    use buildwithnexus::highlight::highlight_block;
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let cases: [(&str, &str); 4] = [
+        (
+            "rust",
+            include_str!("../tests/fixtures/highlight/sample.rs.txt"),
+        ),
+        (
+            "python",
+            include_str!("../tests/fixtures/highlight/sample.py"),
+        ),
+        (
+            "yaml",
+            include_str!("../tests/fixtures/highlight/sample.yml"),
+        ),
+        (
+            "json",
+            include_str!("../tests/fixtures/highlight/sample.json"),
+        ),
+    ];
+    let mut g = c.benchmark_group("highlight_colour");
+    for (tag, text) in cases {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        // Highlighting must change the text, or this times a copy.
+        assert_ne!(highlight_block(tag, &lines), lines, "{tag} came back plain");
+        g.throughput(Throughput::Bytes(text.len() as u64));
+        g.bench_function(format!("{tag}/{}lines_fenced", lines.len()), |b| {
+            b.iter(|| uibench::fenced(black_box(tag), black_box(&lines), 100))
+        });
+    }
+    g.finish();
+}
+
+// The colour helpers every renderer calls per span: muted text, the mark,
+// the inks, weight, and the diff and code tints.
+fn bench_theme_paint(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let words = ["fn", "main", "let", "value", "String", "42", "// note"];
+    assert!(uibench::paint_spans(&words, 12) > words.iter().map(|w| w.len()).sum::<usize>());
+    let mut g = c.benchmark_group("theme");
+    g.throughput(Throughput::Elements(1_000));
+    g.bench_function("paint_1000_spans", |b| {
+        b.iter(|| uibench::paint_spans(black_box(&words), 1_000))
+    });
+    g.finish();
+}
+
+// Streamed markdown in token-sized chunks, the open line echoed into a
+// transcript as the alt-screen TUI does: a paragraph with inline code,
+// emphasis and links, and a code fence.
+fn bench_stream_md(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let paragraph = "The loader reads `config.toml` first, then *merges* the \
+                     values from the [environment](x) so a flag set there wins; \
+                     see `Settings::load` and the *override order* in the \
+                     [design notes](x). Nothing is written back, and a missing \
+                     file is **not** an error: `defaults()` fills the gaps, as \
+                     [the tests](x) show.\n";
+    let mut fence = String::from("```rust\n");
+    for i in 0..40 {
+        fence.push_str(&format!(
+            "    let item_{i} = lexer.next().expect(\"end of input\"); // step {i}\n"
+        ));
+    }
+    fence.push_str("```\n");
+    let mut g = c.benchmark_group("stream_md");
+    g.throughput(Throughput::Bytes(paragraph.len() as u64));
+    g.bench_function("inline_code_paragraph_300", |b| {
+        b.iter(|| uibench::stream_md(black_box(paragraph), 4, 100))
+    });
+    g.throughput(Throughput::Bytes(fence.len() as u64));
+    g.bench_function("fence_chunks", |b| {
+        b.iter(|| uibench::stream_md(black_box(&fence), 4, 100))
+    });
+    g.finish();
+}
+// ── end terminal UI in colour ────────────────────────────────────────────────
 // ── perf-tools: grep_files and large-file read_file ─────────────────────
 // A 2,000-file, ~8 MB tree: `bench_project` plus filler so each file is
 // about 4 KB, the size the search was measured on.
@@ -666,6 +878,203 @@ fn bench_tool_lookup(c: &mut Criterion) {
 }
 // ── end perf-tools ──────────────────────────────────────────────────────
 
+// ── per-round bookkeeping: token estimate, trust check, trace ────────────
+// Work the build loop repeats on every request or every tool call, whose
+// cost should follow what the round added, not the size of the session or
+// how many files the project's settings name.
+
+// The context estimate before each request, on a 4.6 MB transcript: one
+// message appended, then the estimate, as the loop pays it every round.
+fn bench_token_estimate(c: &mut Criterion) {
+    use buildwithnexus::agent::bench::TokenMeter;
+    use std::time::{Duration, Instant};
+    let base = session_transcript(4_600_000);
+    let mut g = c.benchmark_group("token_estimate");
+    g.bench_function("4.6MB_session", |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                // Untimed: the transcript back at its starting size, the
+                // estimate already taken once, and the messages to add.
+                let mut msgs = base.clone();
+                let mut meter = TokenMeter::new();
+                black_box(meter.tokens(&msgs));
+                let n = left.min(64);
+                let adds: Vec<Msg> = (0..n as usize)
+                    .flat_map(session_round)
+                    .take(n as usize)
+                    .collect();
+                let start = Instant::now();
+                for m in adds {
+                    msgs.push(m);
+                    black_box(meter.tokens(black_box(&msgs)));
+                }
+                spent += start.elapsed();
+                left -= n;
+            }
+            spent
+        })
+    });
+    g.finish();
+}
+
+// One gated tool call (a plain `ls` in ask mode, pre-approved by default)
+// in a trusted project whose settings name 10 hook scripts: the deny, ask
+// and allow rules and the saved approvals are looked up, and each lookup
+// checks the project's trust.
+fn bench_trust_gate(c: &mut Criterion) {
+    use buildwithnexus::agent::bench as abench;
+    let root = std::env::temp_dir().join(format!("bwn-bench-trust-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let project = root.join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(project.join(".buildwithnexus/hooks")).unwrap();
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    let mut groups = Vec::new();
+    for i in 0..10 {
+        let script = format!(".buildwithnexus/hooks/check_{i}.sh");
+        std::fs::write(
+            project.join(&script),
+            format!("#!/bin/sh\n# check {i}\necho '{{}}'\n").repeat(100),
+        )
+        .unwrap();
+        groups.push(serde_json::json!({
+            "matcher": "write_file",
+            "hooks": [{"type": "command", "command": format!("sh {script}")}],
+        }));
+    }
+    let settings = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {"PreToolUse": groups},
+        "permissions": {
+            "allow": ["run_command(cargo test)"],
+            "deny": ["run_command(rm -rf /)"],
+        },
+    }))
+    .unwrap();
+    std::fs::write(project.join(".buildwithnexus/settings.json"), &settings).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    let digest = buildwithnexus::hooks::trust_digest(&project, &settings);
+    let store = serde_json::json!({ config::project_key(&project): {"settings.json": digest} });
+    std::fs::write(home.join("trusted.json"), store.to_string()).unwrap();
+    // A session runs in its project: settings lookups that take no folder
+    // use the current one.
+    let was = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&project).unwrap();
+    let input = serde_json::json!({"command": "ls src"});
+    assert_eq!(abench::gate("run_command", &input, &project), None);
+    let mut g = c.benchmark_group("trust");
+    g.bench_function("gate_10_hook_refs", |b| {
+        b.iter(|| abench::gate(black_box("run_command"), black_box(&input), &project))
+    });
+    g.finish();
+    std::env::set_current_dir(was).unwrap();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// 100 trace events as hooks record them: 50 hook runs, each a trigger
+// carrying a 20 KB tool input and a result with 20 KB of stdout, so both
+// are clipped before they are kept and written to the session's trace file.
+fn bench_trace_hook_events(c: &mut Criterion) {
+    use buildwithnexus::hooks::bench as hbench;
+    let home = std::env::temp_dir().join(format!("bwn-bench-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("NEXUS_HOME", &home);
+    buildwithnexus::trace::set_session("bench-trace");
+    let content = "    let value = compute(input)?; // a line of the file being written\n"
+        .repeat(20_000 / 68 + 1);
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "bench-trace",
+        "cwd": "/bench/project",
+        "tool_name": "write_file",
+        "tool_input": {"path": "src/lib.rs", "content": content},
+    });
+    let stdout = "checked src/lib.rs: no findings on this line\n".repeat(20_000 / 45 + 1);
+    let mut g = c.benchmark_group("trace");
+    g.sample_size(20);
+    g.bench_function("hook_events_100", |b| {
+        b.iter(|| {
+            for _ in 0..50 {
+                hbench::record_hook_run(black_box(&payload), black_box(&stdout), "");
+            }
+        })
+    });
+    g.finish();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+// ── end per-round bookkeeping ────────────────────────────────────────────
+
+// ── perf-tools-2: command runner and gitignored walks ───────────────────
+// The bash tool's runner on `true`: the fixed cost of every command the
+// agent runs (spawn, pipe readers, waiting for exit), with no sandbox.
+fn bench_run_command(c: &mut Criterion) {
+    let dir = std::env::temp_dir();
+    let mut g = c.benchmark_group("run_command");
+    g.sample_size(20);
+    g.bench_function("true", |b| {
+        b.iter(|| tbench::run_command(black_box("true"), &dir))
+    });
+    g.finish();
+}
+
+// `grep_tree` inside a git checkout with a .gitignore of the rules a real
+// project carries, so every walked entry is matched against them. None of
+// the rules hides the source files, so the search finds what it finds in
+// `grep_tree`.
+fn gitignored_tree() -> std::path::PathBuf {
+    let dir = grep_tree();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let rules = [
+        "# build output",
+        "target/",
+        "dist/",
+        "build/",
+        "out/",
+        "/coverage/",
+        "*.log",
+        "*.tmp",
+        "**/*.tmp",
+        "*.swp",
+        "*~",
+        ".DS_Store",
+        "node_modules/",
+        "bower_components/",
+        "__pycache__/",
+        "*.py[cod]",
+        ".venv/",
+        "*.egg-info/",
+        ".idea/",
+        ".vscode/",
+        "*.o",
+        "*.so",
+        "*.a",
+        "docs/_build/",
+        "**/generated/**",
+        "src/**/*.bak",
+        "!src/keep.bak",
+    ];
+    std::fs::write(dir.join(".gitignore"), rules.join("\n") + "\n").unwrap();
+    dir
+}
+
+fn bench_grep_gitignored(c: &mut Criterion) {
+    use serde_json::json;
+    let dir = gitignored_tree();
+    let mut g = c.benchmark_group("grep_files");
+    g.sample_size(20);
+    let input = json!({"pattern": "run_1999()"});
+    g.bench_function("gitignored_tree", |b| {
+        b.iter(|| tools::run("grep_files", black_box(&input), &dir))
+    });
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+// ── end perf-tools-2 ────────────────────────────────────────────────────
+
 criterion_group!(
     benches,
     bench_stream_wrap,
@@ -674,6 +1083,8 @@ criterion_group!(
     bench_grep_files,
     bench_read_large_file,
     bench_tool_lookup,
+    bench_run_command,
+    bench_grep_gitignored,
     bench_wrap_cache,
     bench_transcript_cap,
     bench_wrap_line,
@@ -681,8 +1092,27 @@ criterion_group!(
     bench_redact,
     bench_parse_args,
     bench_sse_parse,
+    bench_request_body_thinking,
+    bench_request_body_flat,
+    bench_sse_stream_reader,
     bench_truncate,
     bench_path_and_classify,
     bench_session_save,
+    bench_token_estimate,
+    bench_trust_gate,
+    bench_trace_hook_events,
+    bench_highlight_colour,
+    bench_theme_paint,
+    bench_stream_md,
 );
-criterion_main!(benches);
+
+// criterion_main!, with colour forced on first. Under `cargo bench` stdout is
+// a pipe, so the colour decision (made once, on first use) would come out
+// "off" and every colour path would return its input unchanged. Setting
+// FORCE_COLOR before any benchmark runs makes the UI benches time the work a
+// terminal session does.
+fn main() {
+    std::env::set_var("FORCE_COLOR", "1");
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

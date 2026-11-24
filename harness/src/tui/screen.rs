@@ -133,6 +133,20 @@ pub(super) struct TranscriptState {
 }
 
 impl TranscriptState {
+    pub(super) const fn new() -> Self {
+        TranscriptState {
+            text: Transcript::new(),
+            scroll_offset: 0,
+            open_stream_line: NO_STREAM_LINE,
+            visible_rows: Vec::new(),
+            painted: Vec::new(),
+            painted_at: None,
+            painted_borders: Vec::new(),
+            painted_footer: Vec::new(),
+            painted_composer: Vec::new(),
+        }
+    }
+
     /// Something other than an output frame drew on the screen, or cleared
     /// it: the next frame repaints every row.
     pub fn forget_painted(&mut self) {
@@ -335,17 +349,7 @@ pub(super) struct Screen {
 impl Screen {
     pub(super) fn new() -> Self {
         Screen {
-            transcript: TranscriptState {
-                text: Transcript::new(),
-                scroll_offset: 0,
-                open_stream_line: NO_STREAM_LINE,
-                visible_rows: Vec::new(),
-                painted: Vec::new(),
-                painted_at: None,
-                painted_borders: Vec::new(),
-                painted_footer: Vec::new(),
-                painted_composer: Vec::new(),
-            },
+            transcript: TranscriptState::new(),
             composer: Composer {
                 typeahead: TypeAheadState {
                     buf: Vec::new(),

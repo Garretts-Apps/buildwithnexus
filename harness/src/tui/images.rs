@@ -425,8 +425,8 @@ pub(super) fn image_preview_cells(rgb: &[u8], w: u32, h: u32) -> Vec<String> {
                 line.push_str(&format!("\x1b[38;2;{tr};{tg};{tb}m▀"));
             }
         }
-        line.push_str(&reset_all());
-        line.push_str(&reset_bg());
+        line.push_str(reset_all());
+        line.push_str(reset_bg());
         out.push(line);
     }
     out

@@ -12,7 +12,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct IgnoreRule {
     pub(super) base: PathBuf,
-    pub(super) parts: Vec<String>,
+    pub(super) parts: Vec<IgnoreGlob>,
     pub(super) anchored: bool,
     pub(super) dir_only: bool,
     pub(super) negate: bool,
@@ -84,11 +84,11 @@ pub(super) fn parse_gitignore(text: &str, base: &Path) -> Vec<IgnoreRule> {
         let dir_only = pat.ends_with('/');
         let pat = pat.trim_end_matches('/');
         let anchored = pat.contains('/');
-        let parts: Vec<String> = pat
+        let parts: Vec<IgnoreGlob> = pat
             .trim_start_matches('/')
             .split('/')
             .filter(|p| !p.is_empty())
-            .map(str::to_string)
+            .map(IgnoreGlob::new)
             .collect();
         if parts.is_empty() {
             continue;
@@ -116,42 +116,73 @@ impl IgnoreRule {
             // Only the last name matters; this runs per rule per walked entry.
             return rel
                 .file_name()
-                .is_some_and(|n| ignore_glob(&self.parts[0], &n.to_string_lossy()));
+                .is_some_and(|n| self.parts[0].matches(&n.to_string_lossy()));
         }
-        let names: Vec<std::borrow::Cow<str>> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect();
-        ignore_parts_match(&self.parts, &names)
+        let names = rel.components().map(|c| c.as_os_str().to_string_lossy());
+        ignore_parts_match(&self.parts, names)
+    }
+}
+
+// One `/`-separated part of a gitignore pattern, split into characters
+// once when the .gitignore is read rather than for every entry it is
+// matched against.
+#[derive(Clone)]
+pub(super) struct IgnoreGlob {
+    chars: Vec<char>,
+    /// The part is `**`, any run of folders.
+    any_dirs: bool,
+}
+
+impl IgnoreGlob {
+    pub(super) fn new(part: &str) -> Self {
+        IgnoreGlob {
+            chars: part.chars().collect(),
+            any_dirs: part == "**",
+        }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        glob_match(&self.chars, name)
     }
 }
 
 // `**` matches any run of folders, including none. Like ignore_glob, one
-// pass that backtracks only to the last `**`.
-pub(super) fn ignore_parts_match<S: AsRef<str>>(pat: &[String], names: &[S]) -> bool {
-    let (mut pi, mut ni) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while ni < names.len() {
+// pass that backtracks only to the last `**`. `names` is walked as an
+// iterator (cloned to look ahead and to remember the backtrack point), so
+// matching an entry's path collects nothing.
+pub(super) fn ignore_parts_match<I>(pat: &[IgnoreGlob], mut names: I) -> bool
+where
+    I: Iterator + Clone,
+    I::Item: AsRef<str>,
+{
+    let mut pi = 0;
+    let mut star: Option<(usize, I)> = None;
+    loop {
+        let mut after = names.clone();
+        let Some(name) = after.next() else {
+            break;
+        };
         match pat.get(pi) {
-            Some(p) if p == "**" => {
-                star = Some((pi, ni));
+            Some(p) if p.any_dirs => {
+                star = Some((pi, names.clone()));
                 pi += 1;
             }
-            Some(p) if ignore_glob(p, names[ni].as_ref()) => {
+            Some(p) if p.matches(name.as_ref()) => {
                 pi += 1;
-                ni += 1;
+                names = after;
             }
             _ => match star {
-                Some((sp, sn)) => {
+                Some((sp, mut sn)) => {
                     pi = sp + 1;
-                    ni = sn + 1;
-                    star = Some((sp, sn + 1));
+                    sn.next();
+                    names = sn.clone();
+                    star = Some((sp, sn));
                 }
                 None => return false,
             },
         }
     }
-    pat[pi..].iter().all(|p| p == "**")
+    pat[pi..].iter().all(|p| p.any_dirs)
 }
 
 // One name against one gitignore glob: `*` any run, `?` one char, `[…]`
@@ -159,22 +190,35 @@ pub(super) fn ignore_parts_match<S: AsRef<str>>(pat: &[String], names: &[S]) -> 
 // lets `*` match a leading dot. The pattern comes from the checkout, so it
 // is matched in one pass that backtracks only to the last `*`: at most
 // pattern × name steps, however the pattern is built.
+#[cfg(test)]
 pub(super) fn ignore_glob(pat: &str, name: &str) -> bool {
-    let p: Vec<char> = pat.chars().collect();
-    let n: Vec<char> = name.chars().collect();
+    IgnoreGlob::new(pat).matches(name)
+}
+
+// `ignore_glob` with the pattern already split into characters. The name
+// is walked in place: `ni` and the backtrack point are byte offsets of
+// character starts, so nothing is collected per name.
+fn glob_match(p: &[char], name: &str) -> bool {
     let (mut pi, mut ni) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
-    while ni < n.len() {
+    // The offset just past the character that starts at `at`.
+    let step = |at: usize| {
+        name[at..]
+            .chars()
+            .next()
+            .map_or(at + 1, |c| at + c.len_utf8())
+    };
+    while let Some(c) = name[ni..].chars().next() {
         if p.get(pi) == Some(&'*') {
             star = Some((pi, ni));
             pi += 1;
-        } else if let Some(next) = glob_char(&p, pi, n[ni]) {
+        } else if let Some(next) = glob_char(p, pi, c) {
             pi = next;
-            ni += 1;
+            ni += c.len_utf8();
         } else if let Some((sp, sn)) = star {
             pi = sp + 1;
-            ni = sn + 1;
-            star = Some((sp, sn + 1));
+            ni = step(sn);
+            star = Some((sp, ni));
         } else {
             return false;
         }
@@ -246,11 +290,14 @@ impl Walk<'_> {
         };
         // The folder's real path, resolved once for the sensitivity check of
         // the plain files in it (Unix only: elsewhere each file is resolved).
-        let real_root = (self.skip_sensitive && cfg!(unix))
+        // The folder's part of that check is worked out once here too, so
+        // each file only checks its own name.
+        let folder = (self.skip_sensitive && cfg!(unix))
             .then(|| fs::canonicalize(root).ok())
-            .flatten();
-        let sensitive = |path: &Path, is_link: bool| match &real_root {
-            Some(real) if !is_link => is_sensitive_entry(path, real),
+            .flatten()
+            .and_then(|real| SensitiveFolder::new(root, &real));
+        let sensitive = |path: &Path, is_link: bool| match (&folder, path.file_name()) {
+            (Some(folder), Some(name)) if !is_link => folder.entry(name),
             _ => is_sensitive(path),
         };
         for entry in rd.filter_map(|e| e.ok()) {
@@ -539,6 +586,144 @@ pub(super) fn source_files(root: &Path, limit: usize) -> Vec<PathBuf> {
 mod walker_tests {
     use super::*;
 
+    // The glob match as it was before the patterns were split at parse
+    // time: both sides collected into Vec<char> on every call.
+    fn reference_glob(pat: &str, name: &str) -> bool {
+        let p: Vec<char> = pat.chars().collect();
+        let n: Vec<char> = name.chars().collect();
+        let (mut pi, mut ni) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while ni < n.len() {
+            if p.get(pi) == Some(&'*') {
+                star = Some((pi, ni));
+                pi += 1;
+            } else if let Some(next) = glob_char(&p, pi, n[ni]) {
+                pi = next;
+                ni += 1;
+            } else if let Some((sp, sn)) = star {
+                pi = sp + 1;
+                ni = sn + 1;
+                star = Some((sp, sn + 1));
+            } else {
+                return false;
+            }
+        }
+        p[pi..].iter().all(|&c| c == '*')
+    }
+
+    // The folder match as it was, over a collected list of names.
+    fn reference_parts(pat: &[&str], names: &[&str]) -> bool {
+        let (mut pi, mut ni) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while ni < names.len() {
+            match pat.get(pi) {
+                Some(&"**") => {
+                    star = Some((pi, ni));
+                    pi += 1;
+                }
+                Some(p) if reference_glob(p, names[ni]) => {
+                    pi += 1;
+                    ni += 1;
+                }
+                _ => match star {
+                    Some((sp, sn)) => {
+                        pi = sp + 1;
+                        ni = sn + 1;
+                        star = Some((sp, sn + 1));
+                    }
+                    None => return false,
+                },
+            }
+        }
+        pat[pi..].iter().all(|p| *p == "**")
+    }
+
+    #[test]
+    fn precomputed_gitignore_globs_match_as_before() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut below = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        // Multibyte characters so byte offsets and character counts differ.
+        let pat_pieces = [
+            "*", "?", "a", "b", ".", "[ab]", "[!a]", "[^b]", "[a-c]", "[é-ü]", "[", "]", "é", "日",
+            "\\", "-",
+        ];
+        let name_pieces = ["a", "b", "c", ".", "é", "ü", "日", "[", "]", "-", "x"];
+        for _ in 0..20_000 {
+            let pat: String = (0..below(6))
+                .map(|_| pat_pieces[below(pat_pieces.len())])
+                .collect();
+            let name: String = (0..below(8))
+                .map(|_| name_pieces[below(name_pieces.len())])
+                .collect();
+            assert_eq!(
+                ignore_glob(&pat, &name),
+                reference_glob(&pat, &name),
+                "{pat:?} {name:?}"
+            );
+        }
+        let part_pieces = ["**", "*", "a", "b*", "?", "é*", "[ab]"];
+        let dir_pieces = ["a", "b", "ab", "é", "éa", "bb", "x"];
+        for _ in 0..20_000 {
+            let pat: Vec<&str> = (0..1 + below(5))
+                .map(|_| part_pieces[below(part_pieces.len())])
+                .collect();
+            let names: Vec<&str> = (0..below(6))
+                .map(|_| dir_pieces[below(dir_pieces.len())])
+                .collect();
+            let globs: Vec<IgnoreGlob> = pat.iter().map(|p| IgnoreGlob::new(p)).collect();
+            assert_eq!(
+                ignore_parts_match(&globs, names.iter()),
+                reference_parts(&pat, &names),
+                "{pat:?} {names:?}"
+            );
+        }
+    }
+
+    // Rules read from a .gitignore, applied through `Ignores` to real
+    // paths: anchored, unanchored, folder-only, negated, nested and `**`.
+    #[test]
+    fn parsed_rules_decide_as_git_does() {
+        let base = Path::new("/r");
+        let ig = Ignores {
+            rules: parse_gitignore(
+                "target/\n*.log\n!keep.log\n/out\ndocs/**/*.md\n**/gen/**\nsrc/*.é\n\\!bang\n[!a]x.txt\n",
+                base,
+            ),
+        };
+        let cases: &[(&str, bool, bool)] = &[
+            ("/r/target", true, true),
+            ("/r/target", false, false),
+            ("/r/a/target", true, true),
+            ("/r/x.log", false, true),
+            ("/r/a/keep.log", false, false),
+            ("/r/out", false, true),
+            ("/r/a/out", false, false),
+            ("/r/docs/a/b/c.md", false, true),
+            ("/r/docs/c.md", false, true),
+            ("/r/docs/c.txt", false, false),
+            ("/r/x/gen/y/z.rs", false, true),
+            ("/r/gen/z.rs", false, true),
+            ("/r/src/naïve.é", false, true),
+            ("/r/src/a/naïve.é", false, false),
+            ("/r/!bang", false, true),
+            ("/r/bx.txt", false, true),
+            ("/r/ax.txt", false, false),
+            ("/elsewhere/x.log", false, false),
+        ];
+        for &(path, is_dir, want) in cases {
+            assert_eq!(
+                ig.ignored(Path::new(path), is_dir),
+                want,
+                "{path} dir {is_dir}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn walks_follow_links_out_but_not_round_a_loop() {
@@ -669,18 +854,19 @@ mod walker_tests {
         assert!(ignore_glob("secret?.txt", "secret1.txt"));
         assert!(!ignore_glob("secret?.txt", "secret12.txt"));
         assert!(ignore_glob("[a-c]x", "bx") && !ignore_glob("[!a-c]x", "bx"));
-        let parts = |s: &str| s.split('/').map(str::to_string).collect::<Vec<_>>();
-        assert!(ignore_parts_match(&parts("**/gen"), &parts("a/b/gen")));
-        assert!(ignore_parts_match(&parts("**/gen"), &parts("gen")));
+        let parts = |s: &str| s.split('/').map(IgnoreGlob::new).collect::<Vec<_>>();
+        let names = |s: &'static str| s.split('/');
+        assert!(ignore_parts_match(&parts("**/gen"), names("a/b/gen")));
+        assert!(ignore_parts_match(&parts("**/gen"), names("gen")));
         assert!(ignore_parts_match(
             &parts("docs/**/*.md"),
-            &parts("docs/a/b.md")
+            names("docs/a/b.md")
         ));
         assert!(!ignore_parts_match(
             &parts("docs/*.md"),
-            &parts("docs/a/b.md")
+            names("docs/a/b.md")
         ));
-        assert!(ignore_parts_match(&parts("gen/**"), &parts("gen/x/y")));
+        assert!(ignore_parts_match(&parts("gen/**"), names("gen/x/y")));
         assert!(ignore_glob("a*b*c", "a-b-b-c") && !ignore_glob("a*b*c", "a-b-b-d"));
         assert!(ignore_glob("[x", "[x") && !ignore_glob("[x", "x"));
     }

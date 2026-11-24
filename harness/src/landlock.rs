@@ -13,7 +13,7 @@
 //! installs the seccomp filter. The parent process is never restricted.
 
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -218,11 +218,19 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], network: bool) -> Resul
     let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
     let fd = ruleset(&cwd, extra, tmp.as_deref())
         .map_err(|e| format!("landlock ruleset: {e} (the kernel may not have Landlock enabled)"))?;
+    // SAFETY: ruleset returned a fresh fd that nothing else owns.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let block_network = !network;
     let mut child = Command::new("sh");
     child.args(["-c", cmd]).current_dir(&cwd);
+    // The hook owns the parent's copy of the ruleset fd, so it is closed
+    // when the Command is dropped after spawning. Before, only the child
+    // closed its copy and every sandboxed command leaked one fd in bwn.
+    // The child only borrows it: it closes its own copy and execs, and
+    // never runs the OwnedFd's drop.
     unsafe {
         child.pre_exec(move || {
+            let fd = owned.as_raw_fd();
             let r = engage(fd, block_network);
             let _ = libc::close(fd);
             r
@@ -357,6 +365,31 @@ mod tests {
         assert!(roots.iter().any(|p| p == Path::new("/var/tmp/build")));
         assert!(roots.iter().any(|p| p == Path::new("/dev")));
         assert!(!roots.iter().any(|p| p == Path::new("/home")));
+    }
+
+    // Each command used to leave its ruleset fd open in bwn. Other tests
+    // open files on other threads meanwhile, so the check allows some
+    // noise, far below one fd per command.
+    #[test]
+    fn a_confined_command_does_not_leak_its_ruleset_fd() {
+        if available().is_err() {
+            return;
+        }
+        let open_fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+        let dir = std::env::temp_dir();
+        let runs = 64;
+        let before = open_fds();
+        for _ in 0..runs {
+            let mut cmd = command("true", &dir, &[], false).expect("ruleset");
+            let out = cmd.stdout(Stdio::null()).output().expect("spawn");
+            assert!(out.status.success(), "{:?}", out.status);
+        }
+        let after = open_fds();
+        assert!(
+            after < before + runs / 2,
+            "{} fds open after {runs} confined commands, {before} before",
+            after
+        );
     }
 
     #[test]

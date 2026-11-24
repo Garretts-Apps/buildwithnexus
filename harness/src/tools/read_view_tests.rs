@@ -331,3 +331,51 @@ fn read_file_still_refuses_a_device() {
     assert!(r.is_error);
     assert!(r.content.contains("not a regular file"), "{}", r.content);
 }
+
+#[test]
+fn newline_count_matches_the_byte_by_byte_count() {
+    let naive = |b: &[u8]| b.iter().filter(|&&c| c == b'\n').count();
+    let mut cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"\n".to_vec(),
+        b"no newline at the end".to_vec(),
+        b"one\r\ntwo\r\nthree".to_vec(),
+        b"\r\n".repeat(5000),
+        vec![b'\n'; 32 * 255],
+        vec![b'\n'; 32 * 255 + 1],
+        vec![b'\n'; 32 * 255 * 3 + 31],
+        vec![b'\n'; 1 << 20],
+        vec![b'x'; 32 * 255 * 2 + 17],
+    ];
+    // Every length around the block and group edges, all newlines (the
+    // case that would overflow a lane) and none.
+    for len in (0..100).chain(8150..8200).chain(16300..16340) {
+        cases.push(vec![b'\n'; len]);
+        cases.push(vec![b'\r'; len]);
+    }
+    let mut rng = Rng(11);
+    for _ in 0..200 {
+        let len = rng.below(40_000);
+        let density = 1 + rng.below(8);
+        let bytes = (0..len)
+            .map(|_| match rng.below(density) {
+                0 => b'\n',
+                _ => [b'a', b'\r', 0, 0xff, b' '][rng.below(5)],
+            })
+            .collect();
+        cases.push(bytes);
+    }
+    for bytes in &cases {
+        assert_eq!(
+            read_view::count_newlines(bytes),
+            naive(bytes),
+            "len {}",
+            bytes.len()
+        );
+        // Starts off the block boundary as well.
+        for skip in 1..4.min(bytes.len() + 1) {
+            let s = &bytes[skip..];
+            assert_eq!(read_view::count_newlines(s), naive(s), "len {}", s.len());
+        }
+    }
+}

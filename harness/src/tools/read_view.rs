@@ -14,6 +14,34 @@ use super::*;
 const STREAM_OVER: u64 = 2 * MAX_READ as u64;
 const CHUNK: usize = 128 * 1024;
 
+// The number of `\n` bytes in `bytes`. Counting with `filter().count()`
+// goes a byte at a time; here 32 one-byte lanes add up the newlines of each
+// 32-byte block, which the compiler turns into vector compares and adds.
+// A lane gains at most one per block, so the lanes are summed into the
+// total every 255 blocks, before a u8 can overflow.
+pub(super) fn count_newlines(bytes: &[u8]) -> usize {
+    const LANES: usize = 32;
+    let mut total = 0usize;
+    let (groups, rest) = bytes.as_chunks::<{ LANES * 255 }>();
+    for group in groups {
+        total += count_blocks(group);
+    }
+    let tail = rest.len() / LANES * LANES;
+    total += count_blocks(&rest[..tail]);
+    total + rest[tail..].iter().filter(|&&b| b == b'\n').count()
+}
+
+// Newlines in at most 255 whole 32-byte blocks.
+fn count_blocks(blocks: &[u8]) -> usize {
+    let mut lanes = [0u8; 32];
+    for block in blocks.as_chunks::<32>().0 {
+        for (lane, &b) in lanes.iter_mut().zip(block) {
+            *lane += u8::from(b == b'\n');
+        }
+    }
+    lanes.iter().map(|&n| usize::from(n)).sum()
+}
+
 /// The text `read_file` shows for `path`, and whether the file was longer
 /// than MAX_TEXT_FILE. The editor's copy is used when it has one.
 pub(super) fn read_file_view(
@@ -52,7 +80,7 @@ impl Shown {
         let room = (self.max + 4).saturating_sub(self.kept.len());
         self.kept.extend_from_slice(&bytes[..room.min(bytes.len())]);
         self.len += bytes.len();
-        self.newlines += bytes.iter().filter(|&&b| b == b'\n').count();
+        self.newlines += count_newlines(bytes);
         self.last = last;
     }
 
@@ -93,7 +121,7 @@ impl Lines {
         while !rest.is_empty() && !self.done {
             if self.line_no < self.start {
                 // Whole chunks before the range are only counted.
-                let count = rest.iter().filter(|&&b| b == b'\n').count();
+                let count = count_newlines(rest);
                 if count < self.start - self.line_no {
                     self.line_no += count;
                     return;

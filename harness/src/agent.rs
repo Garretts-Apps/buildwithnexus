@@ -532,6 +532,9 @@ fn confirm_call(
     tool_key: &str,
     cwd: &Path,
 ) -> Option<String> {
+    // PermissionRequest hooks and the person can change the project's files:
+    // trust is worked out afresh from here on.
+    hooks::suspend_trust_memo();
     let watching = crate::debug_panel::enter_permission(label);
     let decided = match hooks::permission_request(name, input, label, cwd) {
         PreDecision::Allow => None,
@@ -1381,7 +1384,9 @@ fn gate_after_hook(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
-    let reason = match decision {
+    // The project's trust is worked out once for the whole decision (see
+    // hooks::with_trust_memo).
+    let reason = hooks::with_trust_memo(|| match decision {
         PreDecision::Deny(r) => Some(r),
         // A hook's allow skips the prompts, never a deny rule.
         PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => {
@@ -1395,7 +1400,7 @@ fn gate_after_hook(
             )
         }
         _ => gate(perm, name, input, cwd),
-    };
+    });
     if crate::debug_panel::armed() {
         crate::debug_panel::permission(name, reason.as_deref());
     }
@@ -1954,6 +1959,9 @@ fn build_turn(
     }
 
     let mut st = TurnState::default();
+    // From here the loop only appends to the transcript, except where it
+    // compacts, which resets the count.
+    let mut tokens = TokenCount::default();
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -1963,7 +1971,7 @@ fn build_turn(
         if budget_exhausted() {
             return Ok(String::new());
         }
-        maybe_compact(p, msgs);
+        maybe_compact_counted(p, msgs, &mut tokens);
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
         }
@@ -1993,6 +2001,7 @@ fn build_turn(
                         *msgs = compact_within(taken, compaction_budget(p), |middle| {
                             model_summary(p, middle)
                         });
+                        tokens.reset();
                         continue;
                     }
                 }
@@ -3232,6 +3241,34 @@ fn trace_tool_result(name: &str, content: &str, is_error: bool, phase: &str, dep
 pub enum ModeHint {
     Build,
     Plan,
+}
+
+// Thin wrappers exposing the build loop's per-round costs to the criterion
+// perf suite without widening the real API. Not semver-stable.
+#[doc(hidden)]
+pub mod bench {
+    use super::*;
+
+    /// The context estimate the build loop takes before each request, kept
+    /// across rounds the way the loop keeps it.
+    #[derive(Default)]
+    pub struct TokenMeter(TokenCount);
+
+    impl TokenMeter {
+        pub fn new() -> Self {
+            TokenMeter::default()
+        }
+
+        pub fn tokens(&mut self, msgs: &[Msg]) -> usize {
+            self.0.tokens(msgs)
+        }
+    }
+
+    /// The PreToolUse hooks and the permission gate for one call in ask
+    /// mode, as the build loop runs them before a tool.
+    pub fn gate(name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+        hook_gate(Permission::Ask, name, input, cwd)
+    }
 }
 
 #[cfg(test)]

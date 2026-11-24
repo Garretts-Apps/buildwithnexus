@@ -143,6 +143,69 @@ starting threads costs more than reading:
 
 The fetch case is simulated latency, not a real network.
 
+## Fixed costs per command, search, request and frame
+
+Measured 2026-11-24 on a 4-core Intel Xeon @ 2.10GHz cloud container. Each
+column is the same benchmark code, release profile, back to back: "Before"
+is this change's benchmarks on the code it started from, "After" is the
+change. Criterion medians. Every row below passed a gate that needs a gain
+of at least 5% with no overlap between the two runs' samples.
+
+| Benchmark | Before | After | |
+|---|---|---|---|
+| `run_command/true`: the fixed cost of every shell command | 51.6 ms | 3.17 ms | 16× |
+| `grep_files/zero_insensitive` (2,000 files, no match) | 9.67 ms | 4.56 ms | 2.1× |
+| `grep_files/many_insensitive` | 13.0 ms | 5.61 ms | 2.3× |
+| `grep_files/gitignored_tree` (a 26-rule .gitignore) | 20.4 ms | 10.2 ms | 2.0× |
+| `read_file/60mb_whole` | 35.2 ms | 30.0 ms | 1.17× |
+| `read_file/60mb_last_lines` | 34.3 ms | 29.8 ms | 1.15× |
+| `token_estimate/4.6MB_session`: the context estimate before each request | 5.5 µs | 0.06 µs | 90× |
+| `trust/gate_10_hook_refs`: a gated tool call's project-trust check | 567 µs | 302 µs | 1.9× |
+| `theme/paint_1000_spans`: 1,000 calls through the colour helpers | 1.20 ms | 28.3 µs | 42× |
+| `highlight_colour/rust_271lines_fenced`: a finished fence as drawn | 2.78 ms | 0.40 ms | 7.0× |
+| `stream_md/fence_chunks`: a fence streamed in 4-byte chunks | 11.0 ms | 5.11 ms | 2.2× |
+
+All seven `grep_files` rows passed (47–57% less time). `read_file/small` and
+`read_file/60mb_lines_100_200` did not move (1% and 4%).
+
+What changed:
+
+- The command runner waits on the child's output channel, not in 50 ms
+  sleeps.
+- A search checks each folder against the sensitive-path rules once, not
+  once per file. It searches files on up to 8 threads and merges the results
+  in path order, so output is the same. The .gitignore patterns are split
+  once, and names are matched without allocating.
+- `read_file` counts newlines 32 bytes at a time.
+- The context estimate keeps each message's count across rounds and counts
+  only what the round added.
+- A permission decision works out the project's trust once, not once per
+  hook reference.
+- Whether to use colour is decided once, and each theme's escapes come from
+  a table, not the environment read on every span.
+
+The sandbox no longer leaks a file descriptor per command: the parent closes
+its copy of the ruleset after spawning. That is a fix, not a speed claim.
+
+Tried and not kept, because they missed the gate:
+
+| Change | Result |
+|---|---|
+| one read buffer for the live stream reader | 31–41% faster with 256-byte reads in two runs, but the sample ranges overlapped; 2–3% with 4 KB reads |
+| the flattened local-server prompt from borrowed pieces | 8–11% faster, ranges overlapped |
+| keeping the trace file open | 15% faster, ranges overlapped |
+| keyword lookup by length in the highlighter | 3–26%, ranges overlapped |
+| replayed thinking blocks without a copy | 1–4% |
+| a fence's style resolved once | 4% |
+| OpenAI deltas routed in place | 9% slower |
+| incremental streamed paragraphs | 7% slower |
+| the turn's git snapshot on a thread | no benchmark, so it was not measured |
+
+The kept changes were also run end to end: a scripted model drove `bwn run`
+through searches, reads, a sandboxed command and a streamed reply with code
+fences. bwn's output and every tool result it sent back were identical
+before and after.
+
 ## Per step of the agent loop
 
 | Bench | Time | Notes |
@@ -156,7 +219,7 @@ The fetch case is simulated latency, not a real network.
 | `sse_parse/openai_stream/2000deltas` | 414 µs | full streaming parse: 2,000 text deltas + fragmented tool call |
 | `sse_parse/anthropic_stream/2000deltas` | 536 µs | |
 | `redact/50kb_mixed` | 41 µs | secret scrubbing on 50 KB of mixed output |
-| `highlight/rust/271lines` | 121 µs | a fenced code block, highlighted once when it closes (run with `FORCE_COLOR=1`; piped output has colour off and measures a copy) |
+| `highlight/rust/271lines` | 121 µs | a fenced code block, highlighted once when it closes (the bench binary now forces colour on itself; before that, piped output had colour off and this row measured a copy) |
 | `truncate/multibyte_cut` | 512 ns | char-boundary back-off on hundreds of KB of multibyte text |
 | `parse_args/valid` | 294 ns | tool-call JSON args |
 | `normalize/deep` | 180 ns | path normalization |
@@ -174,8 +237,8 @@ Said plainly, so nobody takes them for measured:
 - "Repaints are frame-coalesced (~60fps)": output frames are capped at one
   per 16 ms and the last one always lands; it is a cap, not a frame loop, and
   the terminal tests check the behaviour, not a frame rate.
-- Start-up to first prompt, `find_files` and the other tree walks, and the
-  markdown renderer have no benchmark here.
+- Start-up to first prompt and `find_files` and the other tree walks have no
+  benchmark here. The streamed markdown renderer has two (`stream_md/*`).
 - `opt-level = 3` is what ships. On 0.19.0, `opt-level = "s"` gave a binary
   about 22% smaller with the same `--version` time; the hot paths above have
   not been compared at that level.
@@ -183,7 +246,7 @@ Said plainly, so nobody takes them for measured:
 ## Reproduce
 
 ```bash
-FORCE_COLOR=1 cargo bench                     # all microbenchmarks (criterion)
+cargo bench                                   # all microbenchmarks (criterion; colour is forced on)
 cargo build --release && ls -l target/release/buildwithnexus
 # startup: 3 warmups, then 30 runs of `target/release/buildwithnexus --version`,
 # each timed from the parent (spawn to exit); report the median and the 95th

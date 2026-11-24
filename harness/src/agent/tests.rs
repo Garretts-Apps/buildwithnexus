@@ -1647,6 +1647,100 @@ fn estimate_tokens_counts_text() {
     assert_eq!(estimate_tokens(&[Msg::User("a".repeat(40))]), 10);
 }
 
+// The estimate as it was computed before per-message counts were kept: one
+// pass over the whole transcript.
+fn estimate_tokens_whole(msgs: &[Msg]) -> usize {
+    let mut chars = 0usize;
+    for m in msgs {
+        chars += match m {
+            Msg::System(s) | Msg::User(s) => s.len(),
+            Msg::UserImages { text, images } => {
+                text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>()
+            }
+            Msg::Assistant { text, calls } => {
+                text.len()
+                    + calls
+                        .iter()
+                        .map(|c| c.name.len() + serde_json::to_string(&c.input).unwrap().len())
+                        .sum::<usize>()
+            }
+            Msg::Tool(rs) => rs
+                .iter()
+                .map(|r| r.content.len() + r.images.iter().map(|(_, d)| d.len() / 3).sum::<usize>())
+                .sum(),
+        };
+    }
+    chars / 4
+}
+
+#[test]
+fn the_kept_token_count_matches_a_whole_pass_through_push_compact_and_rewind() {
+    let round = |i: usize| -> Vec<Msg> {
+        vec![
+            Msg::Assistant {
+                text: format!("step {i}"),
+                calls: vec![provider::ToolCall {
+                    id: format!("c{i}"),
+                    name: "write_file".into(),
+                    input: json!({"path": format!("src/m{i}.rs"), "content": "é\"\n".repeat(i * 7)}),
+                }],
+            },
+            Msg::Tool(vec![provider::ToolResult {
+                id: format!("c{i}"),
+                content: "x".repeat(i * 13 + 1),
+                is_error: false,
+                images: if i.is_multiple_of(5) {
+                    vec![("image/png".into(), "A".repeat(i * 31 + 2))]
+                } else {
+                    Vec::new()
+                },
+            }]),
+        ]
+    };
+    let mut msgs = vec![
+        Msg::System("system".repeat(9)),
+        Msg::UserImages {
+            text: "the task".into(),
+            images: vec![("image/png".into(), "B".repeat(301))],
+        },
+    ];
+    let mut count = TokenCount::default();
+    let check = |count: &mut TokenCount, msgs: &[Msg]| {
+        assert_eq!(count.tokens(msgs), estimate_tokens_whole(msgs));
+        assert_eq!(estimate_tokens(msgs), estimate_tokens_whole(msgs));
+    };
+    check(&mut count, &msgs);
+    for i in 1..40 {
+        msgs.extend(round(i));
+        check(&mut count, &msgs);
+        if i.is_multiple_of(11) {
+            // Compaction: the middle replaced by a summary.
+            let tail = msgs.split_off(msgs.len() - 4);
+            msgs.truncate(1);
+            msgs.push(Msg::User(format!("[summary] {i}")));
+            msgs.extend(tail);
+            count.reset();
+            check(&mut count, &msgs);
+        }
+        if i.is_multiple_of(7) {
+            // A rewind drops the newest rounds; one that grows back past
+            // the old length still needs the reset.
+            msgs.truncate(msgs.len() - 4);
+            check(&mut count, &msgs);
+            msgs.extend(round(i + 100));
+            msgs.extend(round(i + 200));
+            msgs.extend(round(i + 300));
+            count.reset();
+            check(&mut count, &msgs);
+        }
+        if i.is_multiple_of(9) {
+            msgs[0] = Msg::System(format!("system again {i}"));
+            count.reset();
+            check(&mut count, &msgs);
+        }
+    }
+}
+
 #[test]
 fn compaction_split_keeps_system_and_recent_tail() {
     let mut msgs = vec![Msg::System("s".into())];
@@ -2206,6 +2300,77 @@ fn plan_mode_only_plans_real_workspace_tasks() {
     ] {
         assert!(task_is_plannable(task), "should be plannable: {task}");
     }
+}
+
+#[test]
+fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let real = std::env::temp_dir().join(format!("bwn-trustgate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&real);
+    std::fs::create_dir_all(&real).unwrap();
+    // The project is reached through a symlink, as macOS's temp folder is
+    // (/var is /private/var): the cwd the process reports is then not the
+    // path the gate was given, and both must find the same trust answer.
+    #[cfg(unix)]
+    let base = {
+        let link = real.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        link
+    };
+    #[cfg(not(unix))]
+    let base = real.clone();
+    let home = base.join("home");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    let old_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&proj).unwrap();
+    let script = proj.join(".buildwithnexus/check.sh");
+    std::fs::write(&script, "#!/bin/sh\necho ok-1\n").unwrap();
+    std::fs::write(
+        proj.join(".buildwithnexus/settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"write_file","hooks":[{"type":"command","command":"sh .buildwithnexus/check.sh"}]}]},
+            "permissions":{"allow":["run_command(make build)"]}}"#,
+    )
+    .unwrap();
+    let make = json!({"command": "make build"});
+    let gated = |input: &serde_json::Value| {
+        crate::hooks::DIGESTS_TAKEN.with(|n| n.set(0));
+        let r = hook_gate(Permission::Ask, "run_command", input, &proj);
+        (r, crate::hooks::DIGESTS_TAKEN.with(|n| n.get()))
+    };
+    // Untrusted: the project's allow rule waits, so the call asks (and is
+    // refused with nobody to ask).
+    assert!(gated(&make).0.is_some());
+    crate::hooks::store_trust(&proj, &crate::config::untrusted_project_files(&proj));
+    // Trusted: allowed by the project's rule on the very next call.
+    let (r, digests) = gated(&make);
+    assert_eq!(r, None);
+    // One digest for the whole decision, though the rules and the saved
+    // approvals each consult the project's settings.
+    let (r, ls_digests) = gated(&json!({"command": "ls src"}));
+    assert_eq!(r, None);
+    assert_eq!((digests, ls_digests), (1, 1));
+    // The script the settings run is edited, keeping its size: the next
+    // call no longer trusts the project.
+    std::fs::write(&script, "#!/bin/sh\necho ok-2\n").unwrap();
+    assert!(gated(&make).0.is_some());
+    // Trusted again: in force on the next call.
+    crate::hooks::store_trust(&proj, &crate::config::untrusted_project_files(&proj));
+    assert_eq!(gated(&make).0, None);
+    // Trust withdrawn by removing the store: refused again at once.
+    std::fs::remove_file(home.join("trusted.json")).unwrap();
+    assert!(gated(&make).0.is_some());
+    std::env::set_current_dir(old_cwd).unwrap();
+    std::env::remove_var("NEXUS_HOME");
+    if base != real {
+        let _ = std::fs::remove_file(&base);
+    }
+    let _ = std::fs::remove_dir_all(&real);
 }
 
 #[test]
