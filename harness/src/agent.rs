@@ -532,6 +532,9 @@ fn confirm_call(
     tool_key: &str,
     cwd: &Path,
 ) -> Option<String> {
+    // PermissionRequest hooks and the person can change the project's files:
+    // trust is worked out afresh from here on.
+    hooks::suspend_trust_memo();
     let watching = crate::debug_panel::enter_permission(label);
     let decided = match hooks::permission_request(name, input, label, cwd) {
         PreDecision::Allow => None,
@@ -1381,7 +1384,9 @@ fn gate_after_hook(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
-    let reason = match decision {
+    // The project's trust is worked out once for the whole decision (see
+    // hooks::with_trust_memo).
+    let reason = hooks::with_trust_memo(|| match decision {
         PreDecision::Deny(r) => Some(r),
         // A hook's allow skips the prompts, never a deny rule.
         PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => {
@@ -1395,7 +1400,7 @@ fn gate_after_hook(
             )
         }
         _ => gate(perm, name, input, cwd),
-    };
+    });
     if crate::debug_panel::armed() {
         crate::debug_panel::permission(name, reason.as_deref());
     }

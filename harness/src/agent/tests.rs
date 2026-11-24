@@ -2303,6 +2303,61 @@ fn plan_mode_only_plans_real_workspace_tasks() {
 }
 
 #[test]
+fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::temp_dir().join(format!("bwn-trustgate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    let old_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&proj).unwrap();
+    let script = proj.join(".buildwithnexus/check.sh");
+    std::fs::write(&script, "#!/bin/sh\necho ok-1\n").unwrap();
+    std::fs::write(
+        proj.join(".buildwithnexus/settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"write_file","hooks":[{"type":"command","command":"sh .buildwithnexus/check.sh"}]}]},
+            "permissions":{"allow":["run_command(make build)"]}}"#,
+    )
+    .unwrap();
+    let make = json!({"command": "make build"});
+    let gated = |input: &serde_json::Value| {
+        crate::hooks::DIGESTS_TAKEN.with(|n| n.set(0));
+        let r = hook_gate(Permission::Ask, "run_command", input, &proj);
+        (r, crate::hooks::DIGESTS_TAKEN.with(|n| n.get()))
+    };
+    // Untrusted: the project's allow rule waits, so the call asks (and is
+    // refused with nobody to ask).
+    assert!(gated(&make).0.is_some());
+    crate::hooks::store_trust(&proj, &crate::config::untrusted_project_files(&proj));
+    // Trusted: allowed by the project's rule on the very next call.
+    let (r, digests) = gated(&make);
+    assert_eq!(r, None);
+    // One digest for the whole decision, though the rules and the saved
+    // approvals each consult the project's settings.
+    let (r, ls_digests) = gated(&json!({"command": "ls src"}));
+    assert_eq!(r, None);
+    assert_eq!((digests, ls_digests), (1, 1));
+    // The script the settings run is edited, keeping its size: the next
+    // call no longer trusts the project.
+    std::fs::write(&script, "#!/bin/sh\necho ok-2\n").unwrap();
+    assert!(gated(&make).0.is_some());
+    // Trusted again: in force on the next call.
+    crate::hooks::store_trust(&proj, &crate::config::untrusted_project_files(&proj));
+    assert_eq!(gated(&make).0, None);
+    // Trust withdrawn by removing the store: refused again at once.
+    std::fs::remove_file(home.join("trusted.json")).unwrap();
+    assert!(gated(&make).0.is_some());
+    std::env::set_current_dir(old_cwd).unwrap();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn repo_system_md_needs_trust_and_adds_to_user_prompt() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
