@@ -48,6 +48,10 @@ pub struct StreamRenderer {
     // so chunk-split behaviour is assertable without a terminal.
     #[cfg(test)]
     pub(super) sink: Vec<String>,
+    // A transcript of its own in place of the screen's, for the benches and
+    // tests: the open line is echoed into it as the alt-screen TUI echoes
+    // into the screen, without a terminal or a frame.
+    pub(super) local: Option<Box<screen::TranscriptState>>,
 }
 
 impl Default for StreamRenderer {
@@ -66,6 +70,19 @@ impl StreamRenderer {
             shown: 0,
             #[cfg(test)]
             sink: Vec::new(),
+            local: None,
+        }
+    }
+
+    // A renderer that echoes and commits into its own transcript, wrapped at
+    // `width`, as the alt-screen TUI does into the screen's.
+    pub(super) fn with_local(width: usize) -> Self {
+        let mut t = screen::TranscriptState::new();
+        t.text.ensure_width(width);
+        StreamRenderer {
+            w: width,
+            local: Some(Box::new(t)),
+            ..Self::new()
         }
     }
 
@@ -73,8 +90,33 @@ impl StreamRenderer {
     pub(super) fn emit(&mut self, s: &str) {
         #[cfg(test)]
         self.sink.push(s.to_string());
-        #[cfg(not(test))]
-        line(s);
+        match self.local.as_mut() {
+            Some(t) => t.push_lines(s),
+            #[cfg(not(test))]
+            None => line(s),
+            #[cfg(test)]
+            None => {}
+        }
+    }
+
+    // The open line's rendered form replaces its echo (commit_stream_line).
+    fn commit_line(&mut self, rendered: &str) {
+        match self.local.as_mut() {
+            Some(t) => {
+                if !t.commit_stream(rendered) {
+                    t.push_lines(rendered);
+                }
+            }
+            None => commit_stream_line(rendered),
+        }
+    }
+
+    // The open line's echo is taken back (retract_stream_line).
+    fn retract_line(&mut self) {
+        match self.local.as_mut() {
+            Some(t) => t.retract_stream(),
+            None => retract_stream_line(),
+        }
     }
 
     pub fn push(&mut self, chunk: &str) {
@@ -121,7 +163,8 @@ impl StreamRenderer {
     // Alt-screen only. A fence opener, a table row, or protocol JSON is held
     // until the newline, because it may never be shown.
     pub(super) fn echo_partial(&mut self) {
-        if !ALT_SCREEN.load(Ordering::Relaxed) || capturing() || self.pending.is_empty() {
+        let live = self.local.is_some() || (ALT_SCREEN.load(Ordering::Relaxed) && !capturing());
+        if !live || self.pending.is_empty() {
             return;
         }
         match &self.state {
@@ -137,7 +180,10 @@ impl StreamRenderer {
                 }
                 if !needs_live_md(&self.pending) {
                     if self.pending.len() > self.shown {
-                        write_stream(&self.pending[self.shown..]);
+                        match self.local.as_mut() {
+                            Some(t) => t.stream(&self.pending[self.shown..]),
+                            None => write_stream(&self.pending[self.shown..]),
+                        }
                         self.shown = self.pending.len();
                     }
                     return;
@@ -163,8 +209,9 @@ impl StreamRenderer {
     }
 
     fn show_rendered(&mut self, rendered: &str) {
-        let changed = screen::with(|s| s.transcript.show_open(rendered));
-        if changed {
+        if let Some(t) = self.local.as_mut() {
+            t.show_open(rendered);
+        } else if screen::with(|s| s.transcript.show_open(rendered)) {
             request_frame();
         }
         self.shown = self.pending.len().max(1);
@@ -178,7 +225,7 @@ impl StreamRenderer {
                 if let Some((tick, lang)) = fence_open(text) {
                     // Fence markers are chrome — pull back any echoed raw prefix.
                     if had_partial {
-                        retract_stream_line();
+                        self.retract_line();
                     }
                     // json and tool-call fences stay buffered until the close
                     // so a protocol block never lands in the transcript. Every
@@ -198,7 +245,7 @@ impl StreamRenderer {
                     };
                 } else if starts_like_top_level_json(text) {
                     if had_partial {
-                        retract_stream_line();
+                        self.retract_line();
                     }
                     let lines = vec![text.to_string()];
                     self.state = StreamState::MaybeJson { lines };
@@ -207,7 +254,7 @@ impl StreamRenderer {
                     // The raw row was echoed live; it is replaced by the
                     // aligned table once the block is complete.
                     if had_partial {
-                        retract_stream_line();
+                        self.retract_line();
                     }
                     self.state = StreamState::InTable {
                         rows: vec![text.to_string()],
@@ -218,7 +265,7 @@ impl StreamRenderer {
                     // for the rendered form instead of appending a duplicate.
                     let rendered = render_md_line(text);
                     if had_partial {
-                        commit_stream_line(&rendered);
+                        self.commit_line(&rendered);
                     } else {
                         self.emit(&rendered);
                     }
@@ -235,7 +282,7 @@ impl StreamRenderer {
             } => {
                 if fence_close(text, tick) {
                     if had_partial {
-                        retract_stream_line();
+                        self.retract_line();
                     }
                     if hold {
                         let code = lines.join("\n");
@@ -283,7 +330,7 @@ impl StreamRenderer {
                     // open stream line; pull it back so the table lands
                     // first, then render that line normally.
                     if had_partial {
-                        retract_stream_line();
+                        self.retract_line();
                     }
                     self.emit(&render_table(&rows, self.w).join("\n"));
                     self.state = StreamState::Normal;
@@ -367,7 +414,7 @@ impl StreamRenderer {
             return;
         }
         if had_partial {
-            commit_stream_line(&rows[0]);
+            self.commit_line(&rows[0]);
             if rows.len() > 1 {
                 self.emit(&rows[1..].join("\n"));
             }

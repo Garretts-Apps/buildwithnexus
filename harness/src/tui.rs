@@ -232,6 +232,66 @@ pub mod bench {
     pub fn wrap(line: &str, width: usize) -> usize {
         super::wrap_ansi_line(line, width).len()
     }
+
+    /// Whether colour output is on. The colour benches check it first: with
+    /// it off every helper returns its input and they would time a copy.
+    pub fn colour_on() -> bool {
+        !super::no_color()
+    }
+
+    /// A finished fenced block as the transcript shows it: the box, and each
+    /// line highlighted and framed (`paint_fenced`). Returns the bytes made.
+    pub fn fenced(lang: &str, lines: &[String], width: usize) -> usize {
+        super::paint_fenced(lang, lines, width)
+            .iter()
+            .map(String::len)
+            .sum()
+    }
+
+    /// `n` spans through the colour helpers, cycling through the roles the
+    /// renderers use (muted, mark, inks, weight, the diff and code tints).
+    /// Returns the bytes made.
+    pub fn paint_spans(words: &[&str], n: usize) -> usize {
+        type Helper = fn(&str) -> String;
+        const HELPERS: [Helper; 12] = [
+            super::dim,
+            super::accent,
+            super::green,
+            super::red,
+            super::yellow,
+            super::cyan,
+            super::text,
+            super::bold,
+            super::italic,
+            super::underline,
+            super::diff_add_span,
+            super::code_bg,
+        ];
+        let mut bytes = 0;
+        for i in 0..n {
+            let word = words[i % words.len()];
+            bytes += HELPERS[i % HELPERS.len()](word).len();
+        }
+        bytes
+    }
+
+    /// Streams `text` through the markdown renderer in `chunk`-byte pieces,
+    /// echoing the open line into a transcript wrapped at `width` the way
+    /// the alt-screen TUI does, then flushes. Returns the transcript's rows.
+    pub fn stream_md(text: &str, chunk: usize, width: usize) -> usize {
+        let mut r = super::StreamRenderer::with_local(width);
+        let mut at = 0;
+        while at < text.len() {
+            let mut end = (at + chunk).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            r.push(&text[at..end]);
+            at = end;
+        }
+        r.flush();
+        r.local.as_ref().map_or(0, |t| t.text.total_rows())
+    }
 }
 
 impl Transcript {

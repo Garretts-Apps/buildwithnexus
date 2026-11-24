@@ -9,7 +9,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, Criterion, Throughput};
 use std::hint::black_box;
 
 use buildwithnexus::config;
@@ -704,6 +704,92 @@ fn bench_highlight(c: &mut Criterion) {
     g.finish();
 }
 // ── end terminal UI ──────────────────────────────────────────────────────────
+
+// ── terminal UI in colour: fenced code, colour spans, streamed markdown ──────
+// These run with colour on (see main). The fenced-code benches go through
+// the path the transcript uses for a finished fence: the box, then each line
+// highlighted and framed.
+fn bench_highlight_colour(c: &mut Criterion) {
+    use buildwithnexus::highlight::highlight_block;
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let cases: [(&str, &str); 4] = [
+        (
+            "rust",
+            include_str!("../tests/fixtures/highlight/sample.rs.txt"),
+        ),
+        (
+            "python",
+            include_str!("../tests/fixtures/highlight/sample.py"),
+        ),
+        (
+            "yaml",
+            include_str!("../tests/fixtures/highlight/sample.yml"),
+        ),
+        (
+            "json",
+            include_str!("../tests/fixtures/highlight/sample.json"),
+        ),
+    ];
+    let mut g = c.benchmark_group("highlight_colour");
+    for (tag, text) in cases {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        // Highlighting must change the text, or this times a copy.
+        assert_ne!(highlight_block(tag, &lines), lines, "{tag} came back plain");
+        g.throughput(Throughput::Bytes(text.len() as u64));
+        g.bench_function(format!("{tag}/{}lines_fenced", lines.len()), |b| {
+            b.iter(|| uibench::fenced(black_box(tag), black_box(&lines), 100))
+        });
+    }
+    g.finish();
+}
+
+// The colour helpers every renderer calls per span: muted text, the mark,
+// the inks, weight, and the diff and code tints.
+fn bench_theme_paint(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let words = ["fn", "main", "let", "value", "String", "42", "// note"];
+    assert!(uibench::paint_spans(&words, 12) > words.iter().map(|w| w.len()).sum::<usize>());
+    let mut g = c.benchmark_group("theme");
+    g.throughput(Throughput::Elements(1_000));
+    g.bench_function("paint_1000_spans", |b| {
+        b.iter(|| uibench::paint_spans(black_box(&words), 1_000))
+    });
+    g.finish();
+}
+
+// Streamed markdown in token-sized chunks, the open line echoed into a
+// transcript as the alt-screen TUI does: a paragraph with inline code,
+// emphasis and links, and a code fence.
+fn bench_stream_md(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    assert!(uibench::colour_on(), "colour benches need colour on");
+    let paragraph = "The loader reads `config.toml` first, then *merges* the \
+                     values from the [environment](x) so a flag set there wins; \
+                     see `Settings::load` and the *override order* in the \
+                     [design notes](x). Nothing is written back, and a missing \
+                     file is **not** an error: `defaults()` fills the gaps, as \
+                     [the tests](x) show.\n";
+    let mut fence = String::from("```rust\n");
+    for i in 0..40 {
+        fence.push_str(&format!(
+            "    let item_{i} = lexer.next().expect(\"end of input\"); // step {i}\n"
+        ));
+    }
+    fence.push_str("```\n");
+    let mut g = c.benchmark_group("stream_md");
+    g.throughput(Throughput::Bytes(paragraph.len() as u64));
+    g.bench_function("inline_code_paragraph_300", |b| {
+        b.iter(|| uibench::stream_md(black_box(paragraph), 4, 100))
+    });
+    g.throughput(Throughput::Bytes(fence.len() as u64));
+    g.bench_function("fence_chunks", |b| {
+        b.iter(|| uibench::stream_md(black_box(&fence), 4, 100))
+    });
+    g.finish();
+}
+// ── end terminal UI in colour ────────────────────────────────────────────────
 // ── perf-tools: grep_files and large-file read_file ─────────────────────
 // A 2,000-file, ~8 MB tree: `bench_project` plus filler so each file is
 // about 4 KB, the size the search was measured on.
@@ -1015,5 +1101,18 @@ criterion_group!(
     bench_token_estimate,
     bench_trust_gate,
     bench_trace_hook_events,
+    bench_highlight_colour,
+    bench_theme_paint,
+    bench_stream_md,
 );
-criterion_main!(benches);
+
+// criterion_main!, with colour forced on first. Under `cargo bench` stdout is
+// a pipe, so the colour decision (made once, on first use) would come out
+// "off" and every colour path would return its input unchanged. Setting
+// FORCE_COLOR before any benchmark runs makes the UI benches time the work a
+// terminal session does.
+fn main() {
+    std::env::set_var("FORCE_COLOR", "1");
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
