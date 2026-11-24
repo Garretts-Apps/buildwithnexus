@@ -3234,5 +3234,33 @@ pub enum ModeHint {
     Plan,
 }
 
+// Thin wrappers exposing the build loop's per-round costs to the criterion
+// perf suite without widening the real API. Not semver-stable.
+#[doc(hidden)]
+pub mod bench {
+    use super::*;
+
+    /// The context estimate the build loop takes before each request, kept
+    /// across rounds the way the loop keeps it.
+    #[derive(Default)]
+    pub struct TokenMeter;
+
+    impl TokenMeter {
+        pub fn new() -> Self {
+            TokenMeter
+        }
+
+        pub fn tokens(&mut self, msgs: &[Msg]) -> usize {
+            estimate_tokens(msgs)
+        }
+    }
+
+    /// The PreToolUse hooks and the permission gate for one call in ask
+    /// mode, as the build loop runs them before a tool.
+    pub fn gate(name: &str, input: &serde_json::Value, cwd: &Path) -> Option<String> {
+        hook_gate(Permission::Ask, name, input, cwd)
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -2664,6 +2664,51 @@ fn run_selected(
     Some(run)
 }
 
+// Exposes what a hook run records in the trace to the criterion perf suite,
+// without running a hook. Not semver-stable.
+#[doc(hidden)]
+pub mod bench {
+    use super::*;
+
+    /// The two trace events `run_selected` records for one shell hook that
+    /// was given `payload` and printed `stdout` and `stderr`.
+    pub fn record_hook_run(payload: &Value, stdout: &str, stderr: &str) {
+        let cmd = HookCmd::Shell("./hooks/check.sh".into());
+        let run = HookRun {
+            code: 0,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            failure: None,
+        };
+        let title = "PreToolUse:write_file";
+        let fields = json!({
+            "event": "PreToolUse",
+            "matcher": "write_file",
+            "source": source_label(Source::Project),
+            "command": cmd_label(&cmd),
+            "tool": "write_file",
+        });
+        trace::record_visible(
+            "hook",
+            format!("{title} {}", cmd_label(&cmd)),
+            with_fields(fields.clone(), json!({"trigger": payload})),
+        );
+        trace::record_visible(
+            "hook_result",
+            format!("{title} {}", run.status()),
+            with_fields(
+                fields,
+                json!({
+                    "exit_code": run.code,
+                    "error": run.failure.as_ref().map(HookFailure::describe),
+                    "stdout": run.stdout,
+                    "stderr": run.stderr,
+                }),
+            ),
+        );
+    }
+}
+
 // A hook's stdout as JSON, when it is JSON.
 fn stdout_json(run: &HookRun) -> Option<Value> {
     serde_json::from_str::<Value>(run.stdout.trim()).ok()

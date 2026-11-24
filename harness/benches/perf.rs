@@ -792,6 +792,136 @@ fn bench_tool_lookup(c: &mut Criterion) {
 }
 // ── end perf-tools ──────────────────────────────────────────────────────
 
+// ── per-round bookkeeping: token estimate, trust check, trace ────────────
+// Work the build loop repeats on every request or every tool call, whose
+// cost should follow what the round added, not the size of the session or
+// how many files the project's settings name.
+
+// The context estimate before each request, on a 4.6 MB transcript: one
+// message appended, then the estimate, as the loop pays it every round.
+fn bench_token_estimate(c: &mut Criterion) {
+    use buildwithnexus::agent::bench::TokenMeter;
+    use std::time::{Duration, Instant};
+    let base = session_transcript(4_600_000);
+    let mut g = c.benchmark_group("token_estimate");
+    g.bench_function("4.6MB_session", |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            let mut left = iters;
+            while left > 0 {
+                // Untimed: the transcript back at its starting size, the
+                // estimate already taken once, and the messages to add.
+                let mut msgs = base.clone();
+                let mut meter = TokenMeter::new();
+                black_box(meter.tokens(&msgs));
+                let n = left.min(64);
+                let adds: Vec<Msg> = (0..n as usize)
+                    .flat_map(session_round)
+                    .take(n as usize)
+                    .collect();
+                let start = Instant::now();
+                for m in adds {
+                    msgs.push(m);
+                    black_box(meter.tokens(black_box(&msgs)));
+                }
+                spent += start.elapsed();
+                left -= n;
+            }
+            spent
+        })
+    });
+    g.finish();
+}
+
+// One gated tool call (a plain `ls` in ask mode, pre-approved by default)
+// in a trusted project whose settings name 10 hook scripts: the deny, ask
+// and allow rules and the saved approvals are looked up, and each lookup
+// checks the project's trust.
+fn bench_trust_gate(c: &mut Criterion) {
+    use buildwithnexus::agent::bench as abench;
+    let root = std::env::temp_dir().join(format!("bwn-bench-trust-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let project = root.join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(project.join(".buildwithnexus/hooks")).unwrap();
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    let mut groups = Vec::new();
+    for i in 0..10 {
+        let script = format!(".buildwithnexus/hooks/check_{i}.sh");
+        std::fs::write(
+            project.join(&script),
+            format!("#!/bin/sh\n# check {i}\necho '{{}}'\n").repeat(100),
+        )
+        .unwrap();
+        groups.push(serde_json::json!({
+            "matcher": "write_file",
+            "hooks": [{"type": "command", "command": format!("sh {script}")}],
+        }));
+    }
+    let settings = serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {"PreToolUse": groups},
+        "permissions": {
+            "allow": ["run_command(cargo test)"],
+            "deny": ["run_command(rm -rf /)"],
+        },
+    }))
+    .unwrap();
+    std::fs::write(project.join(".buildwithnexus/settings.json"), &settings).unwrap();
+    std::env::set_var("NEXUS_HOME", &home);
+    let digest = buildwithnexus::hooks::trust_digest(&project, &settings);
+    let store = serde_json::json!({ config::project_key(&project): {"settings.json": digest} });
+    std::fs::write(home.join("trusted.json"), store.to_string()).unwrap();
+    // A session runs in its project: settings lookups that take no folder
+    // use the current one.
+    let was = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&project).unwrap();
+    let input = serde_json::json!({"command": "ls src"});
+    assert_eq!(abench::gate("run_command", &input, &project), None);
+    let mut g = c.benchmark_group("trust");
+    g.bench_function("gate_10_hook_refs", |b| {
+        b.iter(|| abench::gate(black_box("run_command"), black_box(&input), &project))
+    });
+    g.finish();
+    std::env::set_current_dir(was).unwrap();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// 100 trace events as hooks record them: 50 hook runs, each a trigger
+// carrying a 20 KB tool input and a result with 20 KB of stdout, so both
+// are clipped before they are kept and written to the session's trace file.
+fn bench_trace_hook_events(c: &mut Criterion) {
+    use buildwithnexus::hooks::bench as hbench;
+    let home = std::env::temp_dir().join(format!("bwn-bench-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::env::set_var("NEXUS_HOME", &home);
+    buildwithnexus::trace::set_session("bench-trace");
+    let content = "    let value = compute(input)?; // a line of the file being written\n"
+        .repeat(20_000 / 68 + 1);
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "bench-trace",
+        "cwd": "/bench/project",
+        "tool_name": "write_file",
+        "tool_input": {"path": "src/lib.rs", "content": content},
+    });
+    let stdout = "checked src/lib.rs: no findings on this line\n".repeat(20_000 / 45 + 1);
+    let mut g = c.benchmark_group("trace");
+    g.sample_size(20);
+    g.bench_function("hook_events_100", |b| {
+        b.iter(|| {
+            for _ in 0..50 {
+                hbench::record_hook_run(black_box(&payload), black_box(&stdout), "");
+            }
+        })
+    });
+    g.finish();
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+// ── end per-round bookkeeping ────────────────────────────────────────────
+
 criterion_group!(
     benches,
     bench_stream_wrap,
@@ -813,5 +943,8 @@ criterion_group!(
     bench_truncate,
     bench_path_and_classify,
     bench_session_save,
+    bench_token_estimate,
+    bench_trust_gate,
+    bench_trace_hook_events,
 );
 criterion_main!(benches);
