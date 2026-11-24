@@ -163,22 +163,14 @@ pub mod bench {
         on_text: &mut dyn FnMut(&str),
         on_thinking: &mut dyn FnMut(&str),
     ) -> Result<Reply, String> {
-        super::openai_stream(
-            BufReader::with_capacity(32 * 1024, reader),
-            on_text,
-            on_thinking,
-        )
+        super::openai_stream(reader, on_text, on_thinking)
     }
     pub fn anthropic_stream(
         reader: impl Read,
         on_text: &mut dyn FnMut(&str),
         on_thinking: &mut dyn FnMut(&str),
     ) -> Result<Reply, String> {
-        super::anthropic_stream(
-            BufReader::with_capacity(32 * 1024, reader),
-            on_text,
-            on_thinking,
-        )
+        super::anthropic_stream(reader, on_text, on_thinking)
     }
     // The OpenAI stream parser fed the way a live response feeds it: through
     // the interruptible reader and its worker thread.
@@ -967,11 +959,6 @@ fn interruptible<T: Send + 'static>(
 // A streamed response body read on a worker thread, so a stream that goes
 // quiet (a local model still thinking) can still be interrupted. Dropping the
 // reader ends the worker at its next chunk, closing the connection.
-//
-// The worker reads into one buffer and sends only the bytes each read got.
-// The reader is itself the line buffer the stream parsers read from: lines
-// are cut straight out of the chunk that arrived, with no second buffer
-// copying it again.
 struct InterruptibleReader {
     rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     buf: Vec<u8>,
@@ -981,23 +968,22 @@ struct InterruptibleReader {
 impl InterruptibleReader {
     fn new(mut inner: Box<dyn Read + Send + Sync>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        std::thread::spawn(move || loop {
             let mut chunk = vec![0u8; 16 * 1024];
-            loop {
-                match inner.read(&mut chunk) {
-                    Ok(0) => {
-                        let _ = tx.send(Ok(Vec::new()));
+            match inner.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(Vec::new()));
+                    break;
+                }
+                Ok(n) => {
+                    chunk.truncate(n);
+                    if tx.send(Ok(chunk)).is_err() {
                         break;
                     }
-                    Ok(n) => {
-                        if tx.send(Ok(chunk[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
                 }
             }
         });
@@ -1009,12 +995,12 @@ impl InterruptibleReader {
     }
 }
 
-impl BufRead for InterruptibleReader {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+impl Read for InterruptibleReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         use std::sync::mpsc::RecvTimeoutError;
         while self.pos >= self.buf.len() {
             match self.rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Ok(chunk)) if chunk.is_empty() => return Ok(&[]),
+                Ok(Ok(chunk)) if chunk.is_empty() => return Ok(0),
                 Ok(Ok(chunk)) => {
                     self.buf = chunk;
                     self.pos = 0;
@@ -1025,23 +1011,12 @@ impl BufRead for InterruptibleReader {
                         return Err(std::io::Error::other("interrupted"));
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => return Ok(&[]),
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
             }
         }
-        Ok(&self.buf[self.pos..])
-    }
-
-    fn consume(&mut self, n: usize) {
-        self.pos = (self.pos + n).min(self.buf.len());
-    }
-}
-
-impl Read for InterruptibleReader {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let available = self.fill_buf()?;
-        let n = out.len().min(available.len());
-        out[..n].copy_from_slice(&available[..n]);
-        self.consume(n);
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
         Ok(n)
     }
 }
@@ -1780,16 +1755,15 @@ fn parse_args(args: &str) -> Value {
 }
 
 // Iterate `data:` payloads of an SSE stream, handing each JSON value to `f`.
-// `f` returns true to stop early (e.g. on [DONE]). Takes any buffered reader
-// (the interruptible one live, an in-memory byte slice in tests) and reads
-// lines straight out of its buffer.
+// `f` returns true to stop early (e.g. on [DONE]). Takes any reader so the
+// streaming parsers are unit-testable against an in-memory byte slice.
 // A transport error mid-stream is surfaced as Err rather than treated as a
 // clean end — otherwise a dropped connection silently truncates the reply.
 // Returns whether `f` stopped the stream; false means it hit EOF first, which
 // callers treat as truncation unless they already saw a finish marker.
-fn for_each_sse(reader: impl BufRead, mut f: impl FnMut(&str) -> bool) -> Result<bool, String> {
+fn for_each_sse(reader: impl Read, mut f: impl FnMut(&str) -> bool) -> Result<bool, String> {
     // Reuse one buffer across lines instead of allocating a String per line.
-    let mut reader = reader;
+    let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
     let mut last_poll = Instant::now();
     loop {

@@ -240,7 +240,7 @@ fn anthropic_stream_reads_every_shape_as_the_value_reader_did() {
 // ── the readers as they were (main at 83190bc) ─────────────────────────────
 
 fn reference_openai_stream(
-    reader: impl BufRead,
+    reader: impl Read,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
@@ -341,7 +341,7 @@ fn reference_openai_stream(
 }
 
 fn reference_anthropic_stream(
-    reader: impl BufRead,
+    reader: impl Read,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {

@@ -451,7 +451,7 @@ impl Blocks {
 }
 
 pub(super) fn anthropic_stream(
-    reader: impl BufRead,
+    reader: impl Read,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {

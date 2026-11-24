@@ -418,10 +418,10 @@ pub(super) fn ollama_parse(v: Value) -> Result<Reply, String> {
 // true to stop (the "done": true line). Same transport contract as
 // `for_each_sse`: a mid-stream read error is Err, natural EOF is success.
 pub(super) fn for_each_ndjson(
-    reader: impl BufRead,
+    reader: impl Read,
     mut f: impl FnMut(&Value) -> bool,
 ) -> Result<(), String> {
-    let mut reader = reader;
+    let mut reader = BufReader::with_capacity(32 * 1024, reader);
     let mut line = String::new();
     let mut last_poll = Instant::now();
     loop {
@@ -449,7 +449,7 @@ pub(super) fn for_each_ndjson(
 }
 
 pub(super) fn ollama_stream(
-    reader: impl BufRead,
+    reader: impl Read,
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
