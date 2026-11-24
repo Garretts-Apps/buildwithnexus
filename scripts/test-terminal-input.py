@@ -840,23 +840,39 @@ class FrameTests(TerminalHarness):
         self.assertNotIn(b" end.", bytes(self.output))
 
     def test_a_streamed_chunk_repaints_one_row(self):
+        # The first request of a session prints the posture check right
+        # before the reply starts, and the two can land in one frame. Let
+        # that reply finish, then measure the next one.
         self.send("hello\r")
-        self.wait_for(lambda: b"tail-marker" in self.output, "the reply", timeout=15)
+        self.wait_for(lambda: b" end." in self.output, "the first reply", timeout=15)
+        self.pump(0.5)
+        since = len(self.output)
+        self.send("again\r")
+        self.wait_for(lambda: b"tail-marker" in self.output[since:], "the reply", timeout=15)
         self.pump(0.3)
-        frames = self.output_frames(0)
+        frames = self.output_frames(since)
         with_marker = [f for f in frames if f]
         self.assertTrue(with_marker)
         # The frame that brought the marker touched the reply's row, and at
         # most the "thinking" row above it when the reply's first words land
         # in the same frame as that line: never the rest of the screen. The
         # frames after it (nothing changed) wrote nothing at all.
-        at = bytes(self.output).index(b"tail-marker")
+        at = bytes(self.output).index(b"tail-marker", since)
         last = bytes(self.output)[:at].rsplit(b"\x1b[?2026h\x1b7", 1)[1]
         rows = [int(r) for r in re.findall(rb"\x1b\[(\d+);1H", last)]
-        self.assertIn(len(rows), (1, 2), last)
-        if len(rows) == 2:
-            self.assertEqual(rows[1], rows[0] + 1, last)
-            self.assertIn(b"thinking", last.split(b"\x1b[%d;1H" % rows[1])[0])
+        # When the screen is full the frame first scrolls the output region
+        # (a line feed per new row on its bottom margin) and then paints only
+        # the rows that scrolled in: this turn's prompt, "thinking" and the
+        # reply can all be new in one frame.
+        scroll = re.match(rb"\x1b\[(\d+)H(\n+)", last)
+        if scroll:
+            bottom, k = int(scroll.group(1)), len(scroll.group(2))
+            self.assertTrue(rows and all(bottom - k < r <= bottom for r in rows), last)
+        else:
+            self.assertIn(len(rows), (1, 2), last)
+            if len(rows) == 2:
+                self.assertEqual(rows[1], rows[0] + 1, last)
+                self.assertIn(b"thinking", last.split(b"\x1b[%d;1H" % rows[1])[0])
         quiet = len(self.output)
         self.pump(1.0)
         self.assertEqual(self.output_frames(quiet), [])
