@@ -732,7 +732,7 @@ pub fn set_permission_mode(mode: &str) {
     }
 }
 
-fn permission_mode() -> String {
+pub(crate) fn permission_mode() -> String {
     PERMISSION_MODE
         .lock()
         .ok()

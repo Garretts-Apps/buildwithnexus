@@ -467,6 +467,7 @@ whose API key is in the environment, and writes nothing.
 | `--base-url <url>` | model endpoint for this run, such as a gateway (`--provider custom` reads `CUSTOM_API_KEY`) |
 | `--permission-mode <mode>` | `ask`, `accept-edits`, `auto` or `readonly` (see [Permissions](#permissions)); with no terminal, `ask` blocks every change, so CI usually wants `auto` or `readonly`. An unknown name exits 2. |
 | `--sandbox <off\|auto\|require>` | OS sandbox for shell commands (default `auto`; see [Sandbox](#sandbox)). `off` is the 0.20 behavior |
+| `--accept-posture` | accept the posture check without being asked; headless runs need it |
 | `--auto-commit` / `--no-auto-commit` | git-commit file edits (default on). `--no-auto-commit` or `"auto_commit": false` leaves them uncommitted |
 | `--repo-map` / `--no-repo-map` | offer the `repo_map` tool (default on). The map is not inserted into the prompt |
 | `--route-gemini <native\|openrouter>` | where a bare `gemini…` model name goes (default `native`) |
@@ -761,15 +762,16 @@ result names `--sandbox off`. Auto-commit of file edits runs outside it.
 bubblewrap, `/tmp` is a private tmpfs (`TMPDIR=/tmp`) discarded on exit.
 With Landlock and on macOS, `/tmp` and `$TMPDIR` are the real directories.
 `~/.buildwithnexus` and caches such as `~/.cargo` stay read-only.
-`"sandbox_network": false` blocks the network (default `true`).
 
-**Not confined:** reads (the whole filesystem stays visible), the agent's own
-file tools (already fenced to the working directory), hooks, MCP servers, and
-`start_server`. The sandbox never approves anything — the permission gate is
+Credential files (`~/.ssh`, `~/.aws`, `~/.netrc`, …, the SSH agent) are
+hidden, and the network goes only through a host checker. A posture check
+asks before the first model request. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
+
+**Not confined:** other reads, the agent's own file tools, hooks, MCP
+servers, `start_server`. The sandbox never approves anything — the gate is
 unchanged; it only limits what an approved command can touch. Sandboxed
-commands are marked `[sandboxed]` on the tool header; `/sandbox status` and
-`buildwithnexus doctor` show backend availability and whether commands would
-be confined. To escape for one command, switch with `/sandbox off` and back.
+commands are marked `[sandboxed]`; `/sandbox status` and `buildwithnexus
+doctor` show the backend. To escape for one command, use `/sandbox off`.
 
 ## Inline images
 

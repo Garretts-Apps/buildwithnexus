@@ -574,6 +574,27 @@ pub fn set_remote_approver(ask: RemoteApprover) {
     let _ = REMOTE_APPROVER.set(ask);
 }
 
+/// Whether approval questions go to an editor (bwn acp).
+pub(crate) fn has_remote_approver() -> bool {
+    REMOTE_APPROVER.get().is_some()
+}
+
+/// The posture check's question, asked in the editor when bwn runs under
+/// ACP; None when there is no editor to ask.
+pub(crate) fn ask_remote_posture(posture: &str) -> Option<crate::posture::Answer> {
+    let ask = REMOTE_APPROVER.get()?;
+    let label = format!("{posture}\naccept this posture and continue?");
+    Some(
+        match ask(RemoteAsk::Tool {
+            label: &label,
+            key: "",
+        }) {
+            RemoteAnswer::Once | RemoteAnswer::Always => crate::posture::Answer::Accept,
+            RemoteAnswer::Reject | RemoteAnswer::Cancelled => crate::posture::Answer::Stop,
+        },
+    )
+}
+
 // A remote answer at the gate means what the terminal's y, a, n and Esc do.
 fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<String> {
     match answer {
@@ -1607,6 +1628,7 @@ pub fn run_build_session_with_images(
     // the user's own text: a Stop hook's reason below is not.
     crate::egress::note_user_text(task);
     sync_untrusted(sid, transcript);
+    crate::posture::before_turn(sid, perm, cwd, &p.base_url)?;
     let pruned = checkpoint::begin_turn(cwd, task);
     if pruned > 0 {
         report::info(&format!(

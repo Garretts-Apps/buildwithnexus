@@ -890,6 +890,8 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
                 "off",
                 "--no-auto-commit",
                 "--no-repo-map",
+                # Headless: the posture check needs its answer.
+                "--accept-posture",
                 "run",
                 TASK_TEXT,
             ],

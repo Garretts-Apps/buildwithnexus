@@ -6,6 +6,31 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **Credential files are hidden from sandboxed commands.** `~/.ssh`,
+  `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, bwn's own folder, the SSH
+  agent's socket and the other stores the file tools already treat as
+  sensitive cannot be read from inside the sandbox, however a command spells
+  the path. `sandbox_expose` makes one readable again.
+- **Sandboxed commands reach the network only through a host checker.** Ports
+  443 and 80 to package and source hosts, hosts you named, and
+  `network.allow`; private and metadata addresses refused; this machine's own
+  servers reachable. `sandbox_egress_check: false` restores direct access.
+  On Linux it needs Landlock ABI 4 (kernel 6.7+); without it commands get no
+  network.
+- **A posture check before the first model request** shows what the session
+  can reach and probes this machine's network, then asks to accept or stop.
+  The answer is kept per session. Headless runs pass `--accept-posture`; the
+  GitHub Action has an `accept-posture` input (default `true`).
+- **Untrusted content is labelled, and auto mode asks after reading it.**
+  Web pages, search results and MCP output reach the model marked as someone
+  else's text; once a session has read any, auto mode asks before commands,
+  fetches and MCP calls that can change things. Auto mode also asks before
+  commands where no sandbox can hide credential files.
+- io_uring is denied inside the Linux sandbox (it could open connections
+  that seccomp does not see).
+- `url` 2.5.9.
+
 ### Added
 - **Five workflow-kit commands ship in the binary:** `/test`, `/handoff`,
   `/changelog`, `/design-pass` and `/deslop`, plus the `distinctive-design`

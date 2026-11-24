@@ -452,37 +452,66 @@ approval prompts still happen one by one, in order, before any of them
 runs; a refused call is never run, and nothing that writes, runs a command
 or asks a question is ever run beside another call.
 
-Shell commands (`run_command`/`bash`, `!cmd`, and `check_work`) can also run
-inside an opt-in OS sandbox. It is off by default. Turn it on with the
-`"sandbox"` setting, `--sandbox <mode>`, or `/sandbox <mode>`:
+Shell commands (`run_command`/`bash`, `!cmd`, and `check_work`) run inside
+an OS sandbox by default since 0.21. Set it with the `"sandbox"` setting,
+`--sandbox <mode>`, or `/sandbox <mode>`:
 
-- `auto` confines commands when a backend works, and otherwise runs them
-  unconfined and says so once per session.
+- `auto` (default) confines commands when a backend works, and otherwise runs
+  them unconfined and says so once per session (auto mode then asks before
+  each command).
 - `require` refuses to run commands when no backend works.
+- `off` runs them unconfined.
 
-Backends: `bwrap` (bubblewrap) on Linux and `sandbox-exec` (Seatbelt) on
-macOS. Windows and WSL have no backend, so `auto` runs unconfined there and
-`require` refuses to run commands.
+Backends: `bwrap` (bubblewrap) or the built-in Landlock and seccomp backend
+on Linux, and `sandbox-exec` (Seatbelt) on macOS. Windows has none.
 
 Inside the sandbox, the command can write only to the working directory,
 the folders added with `--add-dir` and the temp directories; the rest of the
 filesystem, including `~/.buildwithnexus`, is read-only, and so are the
 `.git` and `.buildwithnexus` of the workspace and of each added folder, and
 the `.git` of repositories nested inside them that exist when the command
-starts (on
-Linux an empty read-only placeholder stands in when
-they don't exist yet, so a command cannot create a `.git/config` that runs
-later outside the sandbox). On Linux, `/tmp` is a fresh private
-directory that is discarded when the command exits. On macOS, `/tmp` and
-`$TMPDIR` are the real, shared directories. Network access stays on unless
-you set `"sandbox_network": false`.
+starts (on Linux an empty read-only placeholder stands in when they don't
+exist yet, so a command cannot create a `.git/config` that runs later outside
+the sandbox). On Linux with bubblewrap, `/tmp` is a fresh private directory
+that is discarded when the command exits.
 
-The sandbox does not confine: reads (the whole filesystem stays readable,
-including files such as `~/.ssh` and `.env` unless their permissions stop
-your user), network access by default, the agent's own file tools (which are
-fenced to the working directory and the added folders by the permission gate
-instead), hooks and MCP servers. `start_server` runs inside it when it is
-on (directly, not in tmux, since a tmux server would run the command
-outside it). It never approves anything; it only limits what
-an already-approved command can touch. For untrusted work, use a container
-or VM.
+The user's credential stores cannot be read from inside it, whatever path a
+command uses to reach them: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`,
+`~/.azure`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json`,
+`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.pgpass`,
+`~/.buildwithnexus`, and the SSH agent's socket. Bubblewrap mounts empty
+read-only stand-ins over them, Seatbelt denies the reads (and connections to
+the socket), and Landlock grants reads everywhere else. Landlock cannot hide a
+store that lies inside the workspace (a session run from the home folder); the
+posture check says so, and auto mode asks before commands there.
+`"sandbox_expose"` makes a store readable again.
+
+Commands reach the network only through a checker inside bwn: TCP to its
+proxy and nothing else (Landlock ABI 4 and seccomp on Linux, which also
+refuse UDP and Unix sockets; a Seatbelt rule on macOS). It lets through ports
+443 and 80 to package and source hosts, hosts the user named in a message,
+and `network.allow`; private, link-local and metadata addresses are refused
+unless `network.allow` names them; this machine's own servers stay reachable.
+On Linux the kernel rule is by port, so a command could still reach another
+machine on the checker's own port, which is random per session. Without
+Landlock ABI 4, commands get no network. `"sandbox_network": false` blocks it
+entirely; `"sandbox_egress_check": false` removes the checker.
+
+Data can still leave through an allowed host (publishing a package, for
+example), which is why the credential files are hidden as well.
+
+The sandbox does not confine: other reads (including a project's `.env`),
+the agent's own file tools (which are fenced to the working directory and the
+added folders by the permission gate instead), hooks and MCP servers.
+`start_server` runs inside it when it is on (directly, not in tmux, since a
+tmux server would run the command outside it). It never approves anything; it
+only limits what an already-approved command can touch. For untrusted work,
+use a container or VM.
+
+Before a session's first model request, the posture check shows all of this,
+plus what this machine's network does (the model endpoint, name lookup, the
+cloud metadata address, listening ports), and asks to accept or stop.
+Headless runs need `--accept-posture`. Text from web pages, search results
+and MCP servers is labelled as untrusted for the model, and after a session
+reads any, auto mode asks before commands, fetches and MCP calls that can
+change things.

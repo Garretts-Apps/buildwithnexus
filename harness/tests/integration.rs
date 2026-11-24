@@ -26,6 +26,10 @@ const FAKE_MCP: &str = concat!(
 // ── unique temp dirs (no external deps, no Date/random) ─────────────────────
 static SEQ: AtomicU64 = AtomicU64::new(0);
 fn tmp(tag: &str) -> PathBuf {
+    // Every bwn these tests start accepts the posture check (the check has
+    // tests of its own); set once, before any child is spawned.
+    static POSTURE: std::sync::Once = std::sync::Once::new();
+    POSTURE.call_once(|| std::env::set_var("BWN_ACCEPT_POSTURE", "1"));
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!("bwn-it-{tag}-{}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
@@ -861,9 +865,15 @@ fn mcp_server_failure_is_a_notice_not_a_crash() {
     assert!(r.success, "stderr: {}", r.stderr);
     let notices = r.text_of("notice");
     assert!(notices.contains("mcp: ghost failed"), "{notices}");
+    // The disabled server named `off` is never mentioned: no failure
+    // notice, and the posture check lists only `ghost`.
     assert!(
-        !notices.contains("off"),
+        !notices.contains("mcp: off") && !notices.contains("ghost, off"),
         "disabled servers stay silent: {notices}"
+    );
+    assert!(
+        notices.contains("MCP servers") && notices.contains("ghost (they run"),
+        "{notices}"
     );
 }
 
@@ -10651,4 +10661,60 @@ fn a_post_tool_use_hook_sees_read_only_calls_in_order() {
         .map(|l| l.rsplit('/').next().unwrap_or(l))
         .collect();
     assert_eq!(names, ["a.txt", "b.txt", "c.txt"], "{seen}");
+}
+
+// The posture check through the real binary: without an answer a headless
+// run stops before any model request; with --accept-posture it goes on, and
+// a later run of the same session is not asked again.
+#[test]
+fn headless_runs_stop_at_the_posture_check_until_accepted() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![finish("done"), finish("done again")]);
+    write_config(&home, "ollama", "ask", port);
+    let run_with = |extra: &[&str], accept: bool| {
+        let mut c = Command::new(BIN);
+        c.args(extra)
+            .arg("--json")
+            .arg("say done")
+            .current_dir(&cwd)
+            .env("NEXUS_HOME", &home)
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null());
+        if accept {
+            c.env("BWN_ACCEPT_POSTURE", "1");
+        } else {
+            c.env_remove("BWN_ACCEPT_POSTURE");
+        }
+        c.output().unwrap()
+    };
+    let stopped = run_with(&["run"], false);
+    let text = String::from_utf8_lossy(&stopped.stdout).to_string()
+        + &String::from_utf8_lossy(&stopped.stderr);
+    assert!(!stopped.status.success(), "{text}");
+    assert!(text.contains("--accept-posture"), "{text}");
+    assert!(
+        text.contains("command network") || text.contains("commands"),
+        "{text}"
+    );
+    let ok = run_with(&["run", "--accept-posture"], false);
+    let text = String::from_utf8_lossy(&ok.stdout).to_string();
+    assert!(
+        ok.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        text.contains("posture accepted by --accept-posture"),
+        "{text}"
+    );
+    // `continue` is the same session: remembered.
+    let again = run_with(&["continue"], false);
+    let text = String::from_utf8_lossy(&again.stdout).to_string();
+    assert!(
+        again.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(text.contains("earlier for this session"), "{text}");
 }

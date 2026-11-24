@@ -55,6 +55,7 @@ pub fn plan_turn(
     crate::session::set_current(sid);
     crate::egress::note_user_text(task);
     super::sync_untrusted(sid, transcript);
+    crate::posture::before_turn(sid, perm, cwd, &p.base_url)?;
     let running = AgentRunningGuard::new();
     // Hooks see the phase's real gate, not the session permission.
     hooks::set_permission_mode("plan");

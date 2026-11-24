@@ -61,6 +61,7 @@ pub mod mcp_auth;
 pub mod media;
 pub mod net;
 pub mod onboarding;
+pub mod posture;
 pub mod provider;
 pub mod report;
 pub mod rules;
@@ -146,6 +147,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--sandbox",
     "--no-auto-commit",
     "--auto-commit",
+    "--accept-posture",
     "--no-repo-map",
     "--repo-map",
     "--route-gemini",
@@ -224,6 +226,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--repo-map" {
             opts.repo_map = Some(true);
+            continue;
+        }
+        if arg == "--accept-posture" {
+            posture::accept_by_flag();
             continue;
         }
         if arg == "--no-auto-commit" {
@@ -2548,6 +2554,8 @@ fn usage_text() -> String {
          \x20                               readonly); also --permission\n\
          \x20 --sandbox <mode>              auto (default), off, or require (OS sandbox for\n\
          \x20                               shell commands; off is the 0.20 default)\n\
+         \x20 --accept-posture              accept the posture check (what the session can\n\
+         \x20                               reach) without being asked; for headless runs\n\
          \x20 --auto-commit                 git-commit file edits (the default)\n\
          \x20 --no-auto-commit              leave file edits uncommitted\n\
          \x20 --repo-map                    offer the repo_map tool (the default)\n\

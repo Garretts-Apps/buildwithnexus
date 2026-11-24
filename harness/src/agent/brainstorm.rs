@@ -45,6 +45,7 @@ pub fn brainstorm_turn(
     hooks::set_permission_mode("readonly");
     crate::egress::note_user_text(question);
     super::sync_untrusted(sid, msgs);
+    crate::posture::before_turn(sid, Permission::ReadOnly, cwd, &p.base_url)?;
     // Role identity + mode contract come first; environment sections follow.
     use_system(msgs, BRAINSTORM_HEAD, || {
         let prefix = context_prefix(cwd, p.context_tokens);
@@ -356,6 +357,9 @@ pub fn run_chat_turn(
         ChatIn::Plan => "plan",
         _ => permission_name(perm),
     });
+    crate::egress::note_user_text(question);
+    super::sync_untrusted(sid, msgs);
+    crate::posture::before_turn(sid, perm, cwd, &p.base_url)?;
     // A chat question keeps whatever prompt the conversation already has;
     // only a fresh conversation gets the chat prompt.
     if msgs.is_empty() {
@@ -400,6 +404,9 @@ pub fn ask_aside(
     transcript: &[Msg],
 ) -> Result<(), String> {
     let _running_guard = AgentRunningGuard::new();
+    // A side question is a model request too: same check, same session.
+    let sid = crate::session::current().unwrap_or_default();
+    crate::posture::before_turn(&sid, Permission::ReadOnly, cwd, &p.base_url)?;
     let mut msgs = transcript.to_vec();
     if msgs.is_empty() {
         let prefix = context_prefix(cwd, p.context_tokens);
