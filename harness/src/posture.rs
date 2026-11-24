@@ -327,8 +327,13 @@ fn parse_listen(line: &str, v6: bool) -> Option<String> {
     Some(format!("{ip}:{port}"))
 }
 
+/// How long a probe waits. Windows retries a refused connection for about
+/// two seconds before it reports it, so a shorter wait there would call a
+/// closed port "not responding".
+pub const PROBE_WAIT: Duration = Duration::from_millis(if cfg!(windows) { 3000 } else { 1500 });
+
 fn network_rows(endpoint: Option<(String, u16)>) -> Vec<Row> {
-    let wait = Duration::from_millis(1500);
+    let wait = PROBE_WAIT;
     let mut v = Vec::new();
     let upstream = endpoint.as_ref().and_then(|(h, p)| {
         let scheme = if *p == 443 { "https" } else { "http" };
@@ -700,17 +705,11 @@ mod tests {
     fn probe_tells_open_from_refused() {
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = l.local_addr().unwrap().port();
-        assert_eq!(
-            probe("127.0.0.1", port, Duration::from_secs(1)),
-            Probe::Open
-        );
+        assert_eq!(probe("127.0.0.1", port, PROBE_WAIT), Probe::Open);
         drop(l);
+        assert_eq!(probe("127.0.0.1", port, PROBE_WAIT), Probe::Refused);
         assert_eq!(
-            probe("127.0.0.1", port, Duration::from_secs(1)),
-            Probe::Refused
-        );
-        assert_eq!(
-            probe("no-such-host.invalid", 443, Duration::from_secs(1)),
+            probe("no-such-host.invalid", 443, PROBE_WAIT),
             Probe::Unresolved
         );
     }
