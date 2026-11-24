@@ -2307,8 +2307,21 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let base = std::env::temp_dir().join(format!("bwn-trustgate-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let real = std::env::temp_dir().join(format!("bwn-trustgate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&real);
+    std::fs::create_dir_all(&real).unwrap();
+    // The project is reached through a symlink, as macOS's temp folder is
+    // (/var is /private/var): the cwd the process reports is then not the
+    // path the gate was given, and both must find the same trust answer.
+    #[cfg(unix)]
+    let base = {
+        let link = real.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        link
+    };
+    #[cfg(not(unix))]
+    let base = real.clone();
     let home = base.join("home");
     let proj = base.join("proj");
     std::fs::create_dir_all(&home).unwrap();
@@ -2354,7 +2367,10 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     assert!(gated(&make).0.is_some());
     std::env::set_current_dir(old_cwd).unwrap();
     std::env::remove_var("NEXUS_HOME");
-    let _ = std::fs::remove_dir_all(&base);
+    if base != real {
+        let _ = std::fs::remove_file(&base);
+    }
+    let _ = std::fs::remove_dir_all(&real);
 }
 
 #[test]

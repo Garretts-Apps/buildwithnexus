@@ -1261,26 +1261,31 @@ thread_local! {
 struct TrustMemo;
 
 impl TrustMemo {
-    fn get(cwd: &Path, name: &str, text: &str) -> Option<Option<Vec<String>>> {
+    // Answers are keyed by the project's canonical path, the path the answer
+    // itself is worked out from (the digest's root, the store's key): the
+    // same project is reached as the cwd the process reports and as the
+    // path a caller was given, which differ under a symlink (on macOS the
+    // temp folder's /var is /private/var). None outside a live memo.
+    fn key(cwd: &Path) -> Option<PathBuf> {
+        let live = TRUST_MEMO.with(|m| matches!(*m.borrow(), Some(Some(_))));
+        live.then(|| cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()))
+    }
+
+    fn get(key: &Path, name: &str, text: &str) -> Option<Option<Vec<String>>> {
         TRUST_MEMO.with(|m| {
             let m = m.borrow();
             let answers = m.as_ref()?.as_ref()?;
             answers
                 .iter()
-                .find(|(c, n, t, _)| c == cwd && n == name && t == text)
+                .find(|(c, n, t, _)| c == key && n == name && t == text)
                 .map(|(_, _, _, trust)| trust.clone())
         })
     }
 
-    fn put(cwd: &Path, name: &str, text: &str, trust: &Option<Vec<String>>) {
+    fn put(key: PathBuf, name: &str, text: &str, trust: &Option<Vec<String>>) {
         TRUST_MEMO.with(|m| {
             if let Some(Some(answers)) = m.borrow_mut().as_mut() {
-                answers.push((
-                    cwd.to_path_buf(),
-                    name.to_string(),
-                    text.to_string(),
-                    trust.clone(),
-                ));
+                answers.push((key, name.to_string(), text.to_string(), trust.clone()));
             }
         });
     }
@@ -1325,11 +1330,14 @@ pub(crate) fn suspend_trust_memo() {
 /// `permission`), which apply only where they tighten, as in an untrusted
 /// file. A store entry is the digest (all trusted) or {"digest", "declined"}.
 pub fn project_trust(cwd: &Path, name: &str, text: &str) -> Option<Vec<String>> {
-    if let Some(known) = TrustMemo::get(cwd, name, text) {
+    let Some(key) = TrustMemo::key(cwd) else {
+        return project_trust_now(cwd, name, text);
+    };
+    if let Some(known) = TrustMemo::get(&key, name, text) {
         return known;
     }
     let trust = project_trust_now(cwd, name, text);
-    TrustMemo::put(cwd, name, text, &trust);
+    TrustMemo::put(key, name, text, &trust);
     trust
 }
 
