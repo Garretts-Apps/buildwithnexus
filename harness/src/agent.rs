@@ -1477,6 +1477,9 @@ pub fn run_build_session_with_images(
     // only records which session and gate it runs under, then fires Stop.
     crate::session::set_current(sid);
     hooks::set_permission_mode(permission_name(perm));
+    // Hosts the user names, sandboxed commands may reach (egress.rs). Only
+    // the user's own text: a Stop hook's reason below is not.
+    crate::egress::note_user_text(task);
     let pruned = checkpoint::begin_turn(cwd, task);
     if pruned > 0 {
         report::info(&format!(

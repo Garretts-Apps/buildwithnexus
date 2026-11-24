@@ -48,6 +48,7 @@ pub mod agent;
 pub mod checkpoint;
 pub mod config;
 mod debug_panel;
+pub mod egress;
 pub mod graphics;
 pub mod highlight;
 pub mod hooks;
@@ -414,6 +415,14 @@ fn exit_quietly_on_closed_stdout() {
 }
 
 pub fn run() {
+    // Inside bubblewrap: limit the network, then become the command.
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("__confine-net") {
+            landlock::confine_net_and_exec(&args[1..]);
+        }
+    }
     debug_panel::init();
     exit_quietly_on_closed_stdout();
     #[cfg(unix)]
@@ -844,6 +853,7 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // (and leaves the sandbox off) so a typo can't lock the user out.
     let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
     sandbox::set_expose(&settings.sandbox_expose);
+    sandbox::set_egress_check(settings.sandbox_egress_check);
     if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
         if opts.sandbox.is_some() {
             return Err(e);

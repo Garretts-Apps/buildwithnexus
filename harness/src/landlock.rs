@@ -55,6 +55,23 @@ const ABI1: u64 = FS_WRITE_FILE
 #[repr(C)]
 struct RulesetAttr {
     handled_access_fs: u64,
+    handled_access_net: u64,
+}
+
+const RULE_NET_PORT: u32 = 2;
+const NET_CONNECT_TCP: u64 = 1 << 1;
+
+#[repr(C)]
+struct NetPortAttr {
+    allowed_access: u64,
+    port: u64,
+}
+
+pub use crate::sandbox::Net;
+
+/// Whether this kernel can limit TCP connections by port (Landlock ABI 4).
+pub fn limits_connections() -> bool {
+    abi().is_ok_and(|v| v >= 4)
 }
 
 #[repr(C, packed)]
@@ -121,32 +138,21 @@ fn handled_access(version: i32) -> u64 {
 ///
 /// With `hidden` paths, reading files is handled too: everything stays
 /// readable except those paths (see `allow_reads_except`).
-pub fn ruleset(
+///
+/// The network part of `net` is here too: Landlock limits TCP connects to
+/// the proxy's port; the rest is seccomp's, in `engage`.
+pub fn ruleset_with(
     cwd: &Path,
     extra: &[PathBuf],
     tmpdir: Option<&Path>,
     hidden: &[PathBuf],
+    net: Net,
 ) -> io::Result<RawFd> {
     let version = abi()?;
     let write = handled_access(version);
     let read = if hidden.is_empty() { 0 } else { FS_READ_FILE };
     let access = write | read;
-    let attr = RulesetAttr {
-        handled_access_fs: access,
-    };
-    // SAFETY: attr is a valid ruleset attribute and outlives the call.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attr,
-            std::mem::size_of::<RulesetAttr>(),
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let fd = fd as RawFd;
+    let fd = create(access, net, version)?;
     let roots = write_roots(cwd, extra, tmpdir);
     for (i, root) in roots.iter().enumerate() {
         if let Err(e) = add_path(fd, root, write | read) {
@@ -162,6 +168,58 @@ pub fn ruleset(
         allow_reads_except(fd, hidden);
     }
     Ok(fd)
+}
+
+// A ruleset handling `fs` access and, for Net::Proxy, TCP connects (with
+// the one port granted).
+fn create(fs: u64, net: Net, version: i32) -> io::Result<RawFd> {
+    let net_access = match net {
+        Net::Proxy(_) if version >= 4 => NET_CONNECT_TCP,
+        Net::Proxy(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this kernel's Landlock cannot limit connections (ABI 4 needed)",
+            ))
+        }
+        _ => 0,
+    };
+    let attr = RulesetAttr {
+        handled_access_fs: fs,
+        handled_access_net: net_access,
+    };
+    // Before ABI 4 the attribute has no net field; pass the short size.
+    let size = if net_access == 0 {
+        std::mem::size_of::<u64>()
+    } else {
+        std::mem::size_of::<RulesetAttr>()
+    };
+    // SAFETY: attr is a valid ruleset attribute and outlives the call.
+    let fd = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, &attr, size, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = fd as RawFd;
+    if let Net::Proxy(port) = net {
+        let rule = NetPortAttr {
+            allowed_access: NET_CONNECT_TCP,
+            port: u64::from(port),
+        };
+        // SAFETY: rule is a valid net-port rule; the kernel copies it.
+        let rc = unsafe { libc::syscall(libc::SYS_landlock_add_rule, fd, RULE_NET_PORT, &rule, 0) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+    }
+    Ok(fd)
+}
+
+/// A ruleset that limits only the network (for a command inside
+/// bubblewrap, which confines the filesystem itself).
+pub fn net_ruleset(net: Net) -> io::Result<RawFd> {
+    let version = abi()?;
+    create(0, net, version)
 }
 
 /// Whether Landlock can keep `hidden` unreadable for a command whose
@@ -276,7 +334,7 @@ pub fn available() -> Result<(), String> {
 
 /// Apply `ruleset` to this process, then the seccomp deny-list. For the
 /// child after fork only.
-pub fn engage(ruleset: RawFd, block_network: bool) -> io::Result<()> {
+pub fn engage(ruleset: RawFd, net: Net) -> io::Result<()> {
     // Landlock and seccomp both require no_new_privs.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
@@ -285,11 +343,11 @@ pub fn engage(ruleset: RawFd, block_network: bool) -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    seccomp(block_network)
+    seccomp(net)
 }
 
 /// `cmd` as a child that confines itself with Landlock and seccomp.
-pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], network: bool) -> Result<Command, String> {
+pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Command, String> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
     let roots: Vec<&Path> = std::iter::once(cwd.as_path())
@@ -303,11 +361,10 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], network: bool) -> Resul
     } else {
         Vec::new()
     };
-    let fd = ruleset(&cwd, extra, tmp.as_deref(), &hidden)
+    let fd = ruleset_with(&cwd, extra, tmp.as_deref(), &hidden, net)
         .map_err(|e| format!("landlock ruleset: {e} (the kernel may not have Landlock enabled)"))?;
     // SAFETY: ruleset returned a fresh fd that nothing else owns.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let block_network = !network;
     let mut child = Command::new("sh");
     child.args(["-c", cmd]).current_dir(&cwd);
     // The hook owns the parent's copy of the ruleset fd, so it is closed
@@ -318,12 +375,41 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], network: bool) -> Resul
     unsafe {
         child.pre_exec(move || {
             let fd = owned.as_raw_fd();
-            let r = engage(fd, block_network);
+            let r = engage(fd, net);
             let _ = libc::close(fd);
             r
         });
     }
     Ok(child)
+}
+
+/// `bwn __confine-net <port> -- <program> <args…>`: inside bubblewrap,
+/// limit this process's network to the egress proxy's port (Landlock and
+/// seccomp, as `command` does for the built-in backend), then become the
+/// program. Never returns.
+pub fn confine_net_and_exec(args: &[String]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let fail = |e: String| -> ! {
+        eprintln!("bwn sandbox: {e}");
+        std::process::exit(126)
+    };
+    let (Some(port), Some(rest)) = (
+        args.first().and_then(|p| p.parse::<u16>().ok()),
+        args.iter().position(|a| a == "--").map(|i| &args[i + 1..]),
+    ) else {
+        fail("usage: __confine-net <port> -- <program> <args>".into())
+    };
+    let Some((prog, prog_args)) = rest.split_first() else {
+        fail("no program to run".into())
+    };
+    let net = Net::Proxy(port);
+    let fd = net_ruleset(net).unwrap_or_else(|e| fail(format!("network rules: {e}")));
+    if let Err(e) = engage(fd, net) {
+        fail(format!("network rules: {e}"));
+    }
+    unsafe { libc::close(fd) };
+    let e = Command::new(prog).args(prog_args).exec();
+    fail(format!("{prog}: {e}"))
 }
 
 // ── seccomp ──────────────────────────────────────────────────────────────────
@@ -360,7 +446,18 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> SockFilter {
     SockFilter { code, jt, jf, k }
 }
 
-fn seccomp(block_network: bool) -> io::Result<()> {
+const BPF_ALU: u16 = 0x04;
+const BPF_AND: u16 = 0x50;
+// Offsets into struct seccomp_data: nr, arch, then args[i] at 16 + 8i
+// (the low word on these little-endian targets).
+const ARG0: u32 = 16;
+const ARG1: u32 = 24;
+const ARG2: u32 = 32;
+const ARG3: u32 = 40;
+const MSG_FASTOPEN: u32 = 0x2000_0000;
+
+fn seccomp(net: Net) -> io::Result<()> {
+    let block_network = net == Net::Off;
     let arch = audit_arch();
     let mut deny: Vec<i64> = vec![
         libc::SYS_ptrace,
@@ -374,6 +471,11 @@ fn seccomp(block_network: bool) -> io::Result<()> {
         libc::SYS_bpf,
         libc::SYS_perf_event_open,
         libc::SYS_userfaultfd,
+        // io_uring can open connections and files outside these checks'
+        // reach (seccomp sees only the io_uring call).
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ];
     if block_network {
         deny.extend([
@@ -396,6 +498,9 @@ fn seccomp(block_network: bool) -> io::Result<()> {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
+    if let Net::Proxy(_) = net {
+        prog.extend(proxy_filter());
+    }
     for nr in deny {
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr as u32, 0, 1));
         prog.push(stmt(
@@ -405,6 +510,45 @@ fn seccomp(block_network: bool) -> io::Result<()> {
     }
     prog.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
+    install(&prog)
+}
+
+// With the network limited to the proxy: sockets only of the kinds that
+// Landlock's port rule covers (TCP over IPv4 or IPv6), so no UDP (DNS
+// tunnels) and no Unix sockets (the SSH agent, the Docker socket); and no
+// TCP Fast Open, whose implicit connect from sendto/sendmsg is not a
+// connect() call. Each block starts with the syscall number loaded and
+// either returns or falls through with it still loaded.
+fn proxy_filter() -> Vec<SockFilter> {
+    let deny = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+    let ld = |off| stmt(BPF_LD | BPF_W | BPF_ABS, off);
+    let ret = |k| stmt(BPF_RET | BPF_K, k);
+    let jeq = |k, jt, jf| jump(BPF_JMP | BPF_JEQ | BPF_K, k, jt, jf);
+    let mut p = vec![
+        jeq(libc::SYS_socket as u32, 0, 8),
+        ld(ARG0),
+        jeq(libc::AF_INET as u32, 1, 0),
+        jeq(libc::AF_INET6 as u32, 0, 3),
+        ld(ARG1),
+        stmt(BPF_ALU | BPF_AND | BPF_K, 0xf),
+        jeq(libc::SOCK_STREAM as u32, 1, 0),
+        ret(deny),
+        ret(SECCOMP_RET_ALLOW),
+    ];
+    for (nr, flags) in [(libc::SYS_sendto, ARG3), (libc::SYS_sendmsg, ARG2)] {
+        p.extend([
+            jeq(nr as u32, 0, 5),
+            ld(flags),
+            stmt(BPF_ALU | BPF_AND | BPF_K, MSG_FASTOPEN),
+            jeq(0, 0, 1),
+            ret(SECCOMP_RET_ALLOW),
+            ret(deny),
+        ]);
+    }
+    p
+}
+
+fn install(prog: &[SockFilter]) -> io::Result<()> {
     #[repr(C)]
     struct SockFprog {
         len: u16,
@@ -467,7 +611,7 @@ mod tests {
         let runs = 64;
         let before = open_fds();
         for _ in 0..runs {
-            let mut cmd = command("true", &dir, &[], false).expect("ruleset");
+            let mut cmd = command("true", &dir, &[], Net::Off).expect("ruleset");
             let out = cmd.stdout(Stdio::null()).output().expect("spawn");
             assert!(out.status.success(), "{:?}", out.status);
         }
@@ -505,7 +649,7 @@ mod tests {
             "echo inside > in.txt; echo outside > {} ; echo done",
             outside.display()
         );
-        let mut cmd = command(&script, &dir, &[], true).expect("ruleset");
+        let mut cmd = command(&script, &dir, &[], Net::Open).expect("ruleset");
         let out = cmd.output().expect("spawn");
         let inside = std::fs::read_to_string(dir.join("in.txt")).unwrap_or_default();
         let leaked = std::fs::read_to_string(&outside).unwrap_or_default();

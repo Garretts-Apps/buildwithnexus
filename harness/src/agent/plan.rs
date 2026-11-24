@@ -53,6 +53,7 @@ pub fn plan_turn(
     sid: &str,
 ) -> Result<PlanEnd, String> {
     crate::session::set_current(sid);
+    crate::egress::note_user_text(task);
     let running = AgentRunningGuard::new();
     // Hooks see the phase's real gate, not the session permission.
     hooks::set_permission_mode("plan");

@@ -204,6 +204,62 @@ pub fn hidden_note(output: &str, hidden: &[PathBuf]) -> Option<String> {
     })
 }
 
+// ── network for commands ─────────────────────────────────────────────────────
+
+/// What a confined command may do on the network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Net {
+    /// No sockets at all (`sandbox_network: false`, or no way to check).
+    Off,
+    /// Out only through the egress checker's proxy on this loopback port
+    /// (see egress.rs); listening is allowed, so a dev server works.
+    Proxy(u16),
+    /// Anything (`sandbox_egress_check: false`).
+    Open,
+}
+
+static EGRESS_CHECK: AtomicBool = AtomicBool::new(true);
+
+/// `sandbox_egress_check` from the settings.
+pub fn set_egress_check(on: bool) {
+    EGRESS_CHECK.store(on, Ordering::Relaxed);
+}
+
+pub fn egress_check() -> bool {
+    EGRESS_CHECK.load(Ordering::Relaxed)
+}
+
+/// Whether `backend` can hold a command to the proxy: Seatbelt always;
+/// on Linux, a kernel whose Landlock limits connections (ABI 4).
+pub fn can_check_egress(backend: Backend) -> bool {
+    match backend {
+        Backend::SandboxExec => true,
+        #[cfg(target_os = "linux")]
+        Backend::Bwrap | Backend::Landlock => crate::landlock::limits_connections(),
+        #[cfg(not(target_os = "linux"))]
+        Backend::Bwrap | Backend::Landlock => false,
+    }
+}
+
+/// The network a command run now under `backend` gets. With the network
+/// allowed and the check on, that is the proxy; where the backend cannot
+/// hold a command to it, no network (the posture check says so).
+pub fn net_for(backend: Backend) -> Net {
+    if !network() {
+        return Net::Off;
+    }
+    if !egress_check() {
+        return Net::Open;
+    }
+    if !can_check_egress(backend) {
+        return Net::Off;
+    }
+    match crate::egress::proxy() {
+        Some(p) => Net::Proxy(p.port),
+        None => Net::Off,
+    }
+}
+
 /// Apply the `sandbox` / `sandbox_network` settings (or the `--sandbox`
 /// flag). Err names the bad value; nothing changes in that case.
 pub fn configure(mode: &str, network: bool) -> Result<(), String> {
@@ -329,25 +385,25 @@ fn detect_linux() -> Result<Backend, String> {
 ///
 /// Folders added with --add-dir are bound read-write the same way, each with
 /// its own `.git` and `.buildwithnexus` kept read-only.
-pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
+pub fn bwrap_args(cmd: &str, cwd: &Path, net: Net) -> Vec<String> {
     let extra = crate::workdirs::list();
     let roots: Vec<&Path> = std::iter::once(cwd)
         .chain(extra.iter().map(PathBuf::as_path))
         .collect();
     let hidden = hidden_paths(&roots);
-    bwrap_argv(cmd, cwd, &extra, network, true, &hidden)
+    bwrap_argv(cmd, cwd, &extra, net, true, &hidden)
 }
 
 // The availability probe runs at `/` and must not mount anything there.
 fn bwrap_probe_args() -> Vec<String> {
-    bwrap_argv("true", Path::new("/"), &[], true, false, &[])
+    bwrap_argv("true", Path::new("/"), &[], Net::Open, false, &[])
 }
 
 fn bwrap_argv(
     cmd: &str,
     cwd: &Path,
     extra: &[PathBuf],
-    network: bool,
+    net: Net,
     protect: bool,
     hidden: &[PathBuf],
 ) -> Vec<String> {
@@ -374,7 +430,7 @@ fn bwrap_argv(
     }
     let cwd = cwd.to_string_lossy().into_owned();
     let mut a: Vec<String> = vec!["--unshare-all".into()];
-    if network {
+    if net != Net::Off {
         a.push("--share-net".into());
     }
     a.extend(
@@ -437,9 +493,44 @@ fn bwrap_argv(
             a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
         }
     }
-    a.extend(["--chdir", &cwd, "--", "sh", "-c", cmd].map(str::to_string));
+    a.extend(["--chdir", &cwd, "--"].map(str::to_string));
+    // Out only through the proxy: bwn itself, bound in where no hidden path
+    // can cover it, limits the network and then runs the command.
+    if let Net::Proxy(port) = net {
+        if let Some(exe) = confine_exe() {
+            let at = a.len() - 3;
+            a.splice(
+                at..at,
+                [
+                    "--ro-bind".to_string(),
+                    exe.to_string_lossy().into_owned(),
+                    CONFINE_EXE.to_string(),
+                ],
+            );
+            a.extend([
+                CONFINE_EXE.to_string(),
+                "__confine-net".into(),
+                port.to_string(),
+                "--".into(),
+            ]);
+        }
+    }
+    a.extend(["sh", "-c", cmd].map(str::to_string));
     a
 }
+
+// bwn's own binary; tests point at the built one (a test binary does not
+// handle `__confine-net`).
+fn confine_exe() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = std::env::var_os("BWN_TEST_CONFINE_EXE") {
+        return Some(PathBuf::from(p));
+    }
+    std::env::current_exe().ok()
+}
+
+/// Where bwn's own binary is bound inside bubblewrap to limit the network.
+const CONFINE_EXE: &str = "/run/bwn-confine";
 
 /// Workspace entries a sandboxed command may read but never write.
 const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
@@ -677,7 +768,7 @@ pub fn seatbelt_profile(
     cwd: &Path,
     extra: &[PathBuf],
     tmpdir: Option<&Path>,
-    network: bool,
+    net: Net,
     hidden: &[PathBuf],
 ) -> String {
     let mut p =
@@ -704,8 +795,14 @@ pub fn seatbelt_profile(
         }
     }
     p.push_str(")\n(deny appleevent-send)\n");
-    if !network {
-        p.push_str("(deny network*)\n");
+    match net {
+        Net::Off => p.push_str("(deny network*)\n"),
+        // Out only to the proxy on loopback; listening and accepting stay
+        // allowed so a dev server works.
+        Net::Proxy(port) => p.push_str(&format!(
+            "(deny network*)\n(allow network-outbound (remote ip \"localhost:{port}\"))\n(allow network-bind (local ip \"*:*\"))\n(allow network-inbound (local ip \"*:*\"))\n"
+        )),
+        Net::Open => {}
     }
     // Credential stores: no reads of a folder's contents or of a file, and
     // no connection to the SSH agent's socket (a connect is not a read).
@@ -736,7 +833,7 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
     let mut c = match backend {
         Backend::Bwrap => {
             let mut c = Command::new("bwrap");
-            c.args(bwrap_args(cmd, &cwd, network()));
+            c.args(bwrap_args(cmd, &cwd, net_for(backend)));
             c
         }
         Backend::SandboxExec => {
@@ -751,7 +848,7 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
             let hidden = hidden_paths(&roots);
             c.args([
                 "-p",
-                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), network(), &hidden),
+                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), net_for(backend), &hidden),
             ]);
             c.args(["sh", "-c", cmd]);
             c
@@ -759,7 +856,7 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
         Backend::Landlock => {
             #[cfg(target_os = "linux")]
             {
-                crate::landlock::command(cmd, &cwd, &crate::workdirs::list(), network())?
+                crate::landlock::command(cmd, &cwd, &crate::workdirs::list(), net_for(backend))?
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -770,6 +867,14 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
     c.current_dir(&cwd);
     for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
+    }
+    if let Net::Proxy(port) = net_for(backend) {
+        for k in crate::egress::UNSET_ENV {
+            c.env_remove(k);
+        }
+        for (k, v) in crate::egress::proxy_env(port) {
+            c.env(k, v);
+        }
     }
     Ok(c)
 }
@@ -984,7 +1089,14 @@ mod tests {
     fn bwrap_argv_binds_only_the_workspace_rw() {
         // No hidden paths here: those depend on this machine's home folder
         // and have tests of their own below.
-        let a = bwrap_argv("echo hi", Path::new("/work/proj"), &[], true, true, &[]);
+        let a = bwrap_argv(
+            "echo hi",
+            Path::new("/work/proj"),
+            &[],
+            Net::Open,
+            true,
+            &[],
+        );
         let s = a.join(" ");
         assert!(s.starts_with("--unshare-all --share-net --die-with-parent --new-session "));
         assert!(s.contains("--ro-bind / /"));
@@ -995,7 +1107,7 @@ mod tests {
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 1);
         assert_eq!(&a[a.len() - 4..], ["--", "sh", "-c", "echo hi"]);
         // Network off drops --share-net and nothing else.
-        let off = bwrap_argv("echo hi", Path::new("/work/proj"), &[], false, true, &[]);
+        let off = bwrap_argv("echo hi", Path::new("/work/proj"), &[], Net::Off, true, &[]);
         assert!(!off.contains(&"--share-net".to_string()));
         assert_eq!(off.len(), a.len() - 1);
     }
@@ -1004,7 +1116,7 @@ mod tests {
     #[test]
     fn added_folders_are_bound_writable_with_their_git_read_only() {
         let extra = [PathBuf::from("/work/lib"), PathBuf::from("/srv/data")];
-        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, false, true, &[]);
+        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, Net::Off, true, &[]);
         let s = a.join(" ");
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 3, "{s}");
         let at = |needle: &str| {
@@ -1018,7 +1130,7 @@ mod tests {
             assert!(bind < at(&format!("--remount-ro {d}/.buildwithnexus")));
         }
         assert!(at("--chdir /work/proj") > at("/srv/data/.buildwithnexus"));
-        let p = seatbelt_profile(Path::new("/w"), &extra, None, false, &[]);
+        let p = seatbelt_profile(Path::new("/w"), &extra, None, Net::Off, &[]);
         let (allow, deny) = p.split_once("(deny file-write*\n").unwrap();
         assert!(
             allow.contains("(subpath \"/work/lib\")") && allow.contains("(subpath \"/srv/data\")")
@@ -1053,7 +1165,7 @@ mod tests {
             .map(|p| ws.join(p))
             .collect();
         assert_eq!(found, want);
-        let s = bwrap_args("true", &ws, false).join(" ");
+        let s = bwrap_args("true", &ws, Net::Off).join(" ");
         let rw = s
             .find(&format!("--bind {w} {w} ", w = ws.display()))
             .unwrap();
@@ -1061,7 +1173,7 @@ mod tests {
             let bind = format!("--ro-bind {p} {p}", p = p.display());
             assert!(s.find(&bind).is_some_and(|at| at > rw), "{bind}: {s}");
         }
-        let profile = seatbelt_profile(&ws, &[], None, true, &[]);
+        let profile = seatbelt_profile(&ws, &[], None, Net::Open, &[]);
         let deny = profile.split_once("(deny file-write*\n").unwrap().1;
         for p in &want {
             assert!(deny.contains(&sbpl_quote(p)), "{p:?}: {profile}");
@@ -1076,7 +1188,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(ws.join(".git")).unwrap();
         std::fs::create_dir_all(ws.join(".buildwithnexus")).unwrap();
-        let a = bwrap_args("true", &ws, false);
+        let a = bwrap_args("true", &ws, Net::Off);
         let s = a.join(" ");
         let w = ws.display();
         assert!(s.contains("--tmpfs /run"), "{s}");
@@ -1093,7 +1205,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
         // Absent entries get a read-only tmpfs instead, so they cannot be
         // created from inside the sandbox.
-        let absent = bwrap_args("true", Path::new("/work/none"), true).join(" ");
+        let absent = bwrap_args("true", Path::new("/work/none"), Net::Open).join(" ");
         assert!(
             absent.contains("--tmpfs /work/none/.git --remount-ro /work/none/.git"),
             "{absent}"
@@ -1235,7 +1347,7 @@ mod tests {
             Path::new("/private/var/w/my \"proj\""),
             &[],
             Some(Path::new("/private/var/folders/xy/T")),
-            true,
+            Net::Open,
             &[],
         );
         assert!(p.starts_with("(version 1)\n(allow default)\n(deny file-write*)\n"));
@@ -1250,7 +1362,7 @@ mod tests {
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
         assert!(!p.contains("network"));
-        let no_net = seatbelt_profile(Path::new("/w"), &[], None, false, &[]);
+        let no_net = seatbelt_profile(Path::new("/w"), &[], None, Net::Off, &[]);
         assert!(no_net.ends_with("(deny network*)\n"));
         assert!(!no_net.contains("folders"));
     }
@@ -1474,7 +1586,7 @@ mod tests {
         let (home, ws, hidden) = fake_home("bwrap");
         let run = |cmd: &str| {
             Command::new("bwrap")
-                .args(bwrap_argv(cmd, &ws, &[], false, true, &hidden))
+                .args(bwrap_argv(cmd, &ws, &[], Net::Off, true, &hidden))
                 .stdin(Stdio::null())
                 .output()
                 .unwrap()
@@ -1497,11 +1609,11 @@ mod tests {
         assert!(crate::landlock::can_hide(&[&ws], &hidden));
         assert!(!crate::landlock::can_hide(&[&home], &hidden));
         let run = |cmd: &str| {
-            let fd = crate::landlock::ruleset(&ws, &[], None, &hidden).unwrap();
+            let fd = crate::landlock::ruleset_with(&ws, &[], None, &hidden, Net::Off).unwrap();
             let mut c = Command::new("sh");
             c.args(["-c", cmd]).current_dir(&ws).stdin(Stdio::null());
             unsafe {
-                c.pre_exec(move || crate::landlock::engage(fd, true));
+                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off));
             }
             let o = c.output().unwrap();
             unsafe { libc::close(fd) };
@@ -1518,7 +1630,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".ssh")).unwrap();
         std::fs::write(dir.join(".netrc"), "x").unwrap();
         let hidden = [dir.join(".ssh"), dir.join(".netrc")];
-        let p = seatbelt_profile(Path::new("/w"), &[], None, true, &hidden);
+        let p = seatbelt_profile(Path::new("/w"), &[], None, Net::Open, &hidden);
         let reads = p.split_once("(deny file-read*").unwrap().1;
         assert!(
             reads.contains(&format!("(subpath {})", sbpl_quote(&hidden[0]))),
@@ -1534,7 +1646,9 @@ mod tests {
             sbpl_quote(&hidden[0])
         )));
         // Nothing hidden, nothing added.
-        assert!(!seatbelt_profile(Path::new("/w"), &[], None, true, &[]).contains("file-read"));
+        assert!(
+            !seatbelt_profile(Path::new("/w"), &[], None, Net::Open, &[]).contains("file-read")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1559,7 +1673,7 @@ mod tests {
             Command::new("sandbox-exec")
                 .args([
                     "-p",
-                    &seatbelt_profile(&ws, &[], None, false, &hidden),
+                    &seatbelt_profile(&ws, &[], None, Net::Off, &hidden),
                     "sh",
                     "-c",
                     cmd,
@@ -1583,5 +1697,142 @@ mod tests {
         );
         drop(listener);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // What a confined command can reach, checked by python3 inside it:
+    // the proxy's port, nothing else over TCP, no UDP, no Unix sockets.
+    #[cfg(target_os = "linux")]
+    const NET_PROBE: &str = r#"python3 -c '
+import socket, sys
+def tcp(port):
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect(("127.0.0.1", port)); return "ok"
+    except Exception as e:
+        return type(e).__name__
+def kind(fam, typ):
+    try:
+        socket.socket(fam, typ); return "ok"
+    except Exception as e:
+        return type(e).__name__
+print("proxy", tcp(int(sys.argv[1])))
+print("other", tcp(int(sys.argv[2])))
+print("udp", kind(socket.AF_INET, socket.SOCK_DGRAM))
+print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
+' "#;
+
+    #[cfg(target_os = "linux")]
+    fn assert_proxy_only(out: &std::process::Output) {
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(s.contains("proxy ok"), "{out:?}");
+        assert!(
+            !s.contains("other ok"),
+            "reached a port that is not the proxy: {out:?}"
+        );
+        assert!(!s.contains("udp ok"), "{out:?}");
+        assert!(!s.contains("unix ok"), "{out:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_limits_the_network_to_the_proxy() {
+        use std::os::unix::process::CommandExt;
+        if crate::landlock::available().is_err() || !crate::landlock::limits_connections() {
+            eprintln!("skip: Landlock cannot limit connections here");
+            return;
+        }
+        let proxy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (pp, op) = (
+            proxy.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        let ws = std::env::temp_dir();
+        let net = Net::Proxy(pp);
+        let fd = crate::landlock::ruleset_with(&ws, &[], None, &[], net).unwrap();
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("{NET_PROBE} {pp} {op}")])
+            .stdin(Stdio::null());
+        unsafe {
+            c.pre_exec(move || crate::landlock::engage(fd, net));
+        }
+        let out = c.output().unwrap();
+        unsafe { libc::close(fd) };
+        assert_proxy_only(&out);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_limits_the_network_to_the_proxy() {
+        let usable = Command::new("bwrap")
+            .args(bwrap_probe_args())
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        // The built bwn binary does the limiting inside bubblewrap.
+        // The built binary sits in an ancestor of the test binary (how deep
+        // depends on cargo's build-dir layout).
+        let exe = std::env::current_exe().ok().and_then(|t| {
+            t.ancestors()
+                .map(|a| a.join("buildwithnexus"))
+                .find(|p| p.is_file())
+        });
+        if !usable || !crate::landlock::limits_connections() || exe.is_none() {
+            eprintln!("skip: bwrap, Landlock ABI 4 or the built binary missing");
+            return;
+        }
+        let proxy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (pp, op) = (
+            proxy.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        std::env::set_var("BWN_TEST_CONFINE_EXE", exe.unwrap());
+        let ws = std::env::temp_dir().join(format!("bwn-bwrap-net-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let args = bwrap_argv(
+            &format!("{NET_PROBE} {pp} {op}"),
+            &ws,
+            &[],
+            Net::Proxy(pp),
+            false,
+            &[],
+        );
+        let out = Command::new("bwrap")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        std::env::remove_var("BWN_TEST_CONFINE_EXE");
+        let _ = std::fs::remove_dir_all(&ws);
+        assert_proxy_only(&out);
+    }
+
+    // Real Seatbelt (macOS runners): out only to the proxy's port on
+    // loopback.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_limits_the_network_to_the_proxy() {
+        let proxy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (pp, op) = (
+            proxy.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        let ws = std::env::temp_dir().canonicalize().unwrap();
+        let profile = seatbelt_profile(&ws, &[], None, Net::Proxy(pp), &[]);
+        let run = |cmd: String| {
+            Command::new("sandbox-exec")
+                .args(["-p", &profile, "sh", "-c", &cmd])
+                .current_dir(&ws)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let to_proxy = run(format!("nc -z -G 2 127.0.0.1 {pp}"));
+        assert!(to_proxy.status.success(), "{to_proxy:?}");
+        let to_other = run(format!("nc -z -G 2 127.0.0.1 {op}"));
+        assert!(!to_other.status.success(), "{to_other:?}");
     }
 }

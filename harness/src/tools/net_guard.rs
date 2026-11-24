@@ -7,7 +7,7 @@ use super::*;
 // credentials, so the fetch tools never reach them: not by literal, not by a
 // hostname that resolves there, not through a redirect. Loopback stays
 // usable for dev servers (auto mode asks first; see private_network_host).
-pub(super) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => v4.is_link_local() || v4.octets() == [100, 100, 100, 200],

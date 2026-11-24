@@ -4299,6 +4299,10 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
             s.push_str(&note);
         }
     }
+    if let Some(note) = crate::egress::refusal_note(&crate::egress::take_refusals()) {
+        s.push('\n');
+        s.push_str(&note);
+    }
     s.push_str(&format!("\n[exit {code}]"));
     Outcome {
         content: truncate_head_tail_omitting(s, MAX_OUT, cap.omitted),
@@ -6428,6 +6432,7 @@ use net_guard::*;
 
 mod table;
 pub use net_guard::{blocked_url, private_network_host};
+pub(crate) use net_guard::{is_blocked_ip, is_private_ip};
 
 #[cfg(test)]
 mod classify_tests;

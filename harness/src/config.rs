@@ -342,6 +342,11 @@ pub struct Settings {
     /// Whether sandboxed commands may reach the network (default true).
     #[serde(default = "default_true")]
     pub sandbox_network: bool,
+    /// Whether sandboxed commands reach the network only through the egress
+    /// checker (default true; see egress.rs). False lets them reach any
+    /// host directly, as before 0.22.
+    #[serde(default = "default_true")]
+    pub sandbox_egress_check: bool,
     /// Inline images in the transcript: "auto" (default; pixel-perfect on
     /// kitty/Ghostty and on terminals that report Sixel, half-block art
     /// elsewhere), "kitty" (force the graphics protocol), "sixel" (force
@@ -511,6 +516,7 @@ impl Default for Settings {
             notify: default_auto(),
             idle_notify_secs: None,
             sandbox_network: true,
+            sandbox_egress_check: true,
             project_system_prompt: None,
             project_skills_override: false,
             permissions: PermissionRules::default(),

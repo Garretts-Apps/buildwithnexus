@@ -43,6 +43,7 @@ pub fn brainstorm_turn(
     crate::session::set_current(sid);
     let running = AgentRunningGuard::new();
     hooks::set_permission_mode("readonly");
+    crate::egress::note_user_text(question);
     // Role identity + mode contract come first; environment sections follow.
     use_system(msgs, BRAINSTORM_HEAD, || {
         let prefix = context_prefix(cwd, p.context_tokens);
