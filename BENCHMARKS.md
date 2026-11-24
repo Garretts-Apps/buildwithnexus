@@ -95,6 +95,24 @@ character-width tables; a run of printable ASCII is copied onto a row in one
 go; and a wrap point copies the colour state only when it changes, not at
 every space.
 
+### A long reply: the terminal scrolls, bwn sends the new rows
+
+Once the output rows are full, every new line used to change every row (the
+view moved up by one), so each frame sent the whole output area again. Now
+bwn tells the terminal to scroll the output region (a line feed on its
+bottom margin, as on a VT100) and paints only the rows that arrived; Sixel
+images still wholly on screen move with the scroll and are not sent again.
+
+Measured with `scripts/test-terminal-input.py` (`ScrollTests`): a scripted
+model streams a 61-line reply into a 100×30 PTY, one line per chunk, debug
+builds of main and of this change, three runs each (identical):
+
+| | Before | After |
+|---|---|---|
+| Bytes written for the whole reply's output frames | 137,581 | 9,805 (14× less) |
+| A frame after the screen is full: median bytes | 2,773 | 113 (25× less) |
+| A frame after the screen is full: median rows painted | 26 | 1 |
+
 ## Tools
 
 A generated project of 2,000 source files (8.8 MB); a 60 MB log for

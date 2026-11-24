@@ -118,6 +118,11 @@ pub(super) struct TranscriptState {
     /// (`tui::build_output_frame`). Empty = not known: the next frame
     /// paints every row.
     pub painted: Vec<String>,
+    /// Where the view started when `painted` was made: the row's number
+    /// counting rows dropped from the front (`Transcript::dropped_rows`),
+    /// and the width it was wrapped at. A frame whose view starts `k` rows
+    /// later scrolls the terminal instead of repainting every row.
+    pub painted_at: Option<(usize, usize)>,
     /// The composer's box borders and the footer as last painted
     /// (`tui::queue_chrome`), and the rest of the composer frame
     /// (`tui::render_queued_composer`): not written again while unchanged.
@@ -132,6 +137,7 @@ impl TranscriptState {
     /// it: the next frame repaints every row.
     pub fn forget_painted(&mut self) {
         self.painted.clear();
+        self.painted_at = None;
         self.painted_borders.clear();
         self.painted_footer.clear();
         self.painted_composer.clear();
@@ -335,6 +341,7 @@ impl Screen {
                 open_stream_line: NO_STREAM_LINE,
                 visible_rows: Vec::new(),
                 painted: Vec::new(),
+                painted_at: None,
                 painted_borders: Vec::new(),
                 painted_footer: Vec::new(),
                 painted_composer: Vec::new(),

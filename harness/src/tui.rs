@@ -157,8 +157,14 @@ struct Transcript {
     lines: VecDeque<String>,
     wrapped: VecDeque<Vec<String>>, // parallel to `lines`, wrapped at `width`
     rows: usize,                    // sum of `wrapped[i].len()`
-    width: usize,                   // 0 = not yet sized
-    height: usize,                  // terminal rows the wrap was made for (images)
+    // Rows ever dropped from the front (the line cap, a clear). With it a
+    // row has a number that does not change as older lines go: row `r` of
+    // `wrapped` is row `dropped + r` of everything shown this session. A
+    // frame compares that number with the last frame's to see how far the
+    // view moved.
+    dropped: usize,
+    width: usize,  // 0 = not yet sized
+    height: usize, // terminal rows the wrap was made for (images)
     // The line last appended to and where its wrap stands: the next chunk
     // of a streamed line is wrapped from there (`append_to`). Dropped by
     // anything else that changes a line, the line count or the width.
@@ -234,6 +240,7 @@ impl Transcript {
             lines: VecDeque::new(),
             wrapped: VecDeque::new(),
             rows: 0,
+            dropped: 0,
             width: 0,
             height: 0,
             open: None,
@@ -324,6 +331,7 @@ impl Transcript {
         self.lines.drain(0..n);
         for rows in self.wrapped.drain(0..n) {
             self.rows -= rows.len();
+            self.dropped += rows.len();
         }
     }
 
@@ -331,6 +339,7 @@ impl Transcript {
         self.open = None;
         self.lines.clear();
         self.wrapped.clear();
+        self.dropped += self.rows;
         self.rows = 0;
     }
 
@@ -355,6 +364,10 @@ impl Transcript {
 
     fn total_rows(&self) -> usize {
         self.rows
+    }
+
+    fn dropped_rows(&self) -> usize {
+        self.dropped
     }
 
     // The visible window: `count` wrapped rows starting at row `start`,
@@ -2448,6 +2461,7 @@ fn build_output_frame(
     rows: usize,
     bg: &str,
     origin_x: u16,
+    scroll_ok: bool,
 ) -> (Vec<Placement>, Vec<Placement>, bool) {
     let sel = s.selection.current;
     let drawn_over = std::mem::replace(&mut s.images.dirty, false);
@@ -2461,6 +2475,7 @@ fn build_output_frame(
     let screen::TranscriptState {
         text,
         painted,
+        painted_at,
         visible_rows,
         ..
     } = view;
@@ -2472,6 +2487,42 @@ fn build_output_frame(
         visible_rows.clear();
         visible_rows.resize(rows, String::new());
     }
+    // New output at the bottom moves every row up. Repainting them all
+    // sends the whole output area again; instead the terminal is told to
+    // scroll the output region (a line feed on its bottom margin, which every
+    // terminal back to the VT100 understands) and keeps the rows it already
+    // has, so only the new rows at the bottom are written. `painted` is
+    // shifted the same way, so the row comparison below then repaints
+    // exactly what the scroll did not account for: a wrong guess costs
+    // bytes, never a wrong screen. Sixel images drawn wholly inside the rows
+    // that stay move with them and are not sent again.
+    let at = text.dropped_rows() + start;
+    let mut scrolled_drawn: Option<Vec<Placement>> = None;
+    if scroll_ok && !full && sel.is_none() {
+        if let Some((was, was_width)) = *painted_at {
+            let k = at.saturating_sub(was);
+            if was_width == width
+                && k > 0
+                && k < rows
+                && scroll_lines_up(painted, &visible, k, rows, bg, width)
+            {
+                let _ = write!(out, "{bg}\x1b[{rows}H{}", "\n".repeat(k));
+                painted.drain(0..k);
+                painted.resize(rows, String::new());
+                visible_rows.drain(0..k);
+                visible_rows.resize(rows, String::new());
+                scrolled_drawn = Some(
+                    drawn
+                        .iter()
+                        .filter(|p| p.1 >= k)
+                        .map(|&(id, top, first, n)| (id, top - k, first, n))
+                        .collect(),
+                );
+            }
+        }
+    }
+    *painted_at = Some((at, width));
+    let drawn: &[Placement] = scrolled_drawn.as_deref().unwrap_or(drawn);
     // Sixel images are pixels over blank rows. One that is on screen at
     // the same place as last frame, with nothing drawn over it since, is
     // left alone: rewriting its rows would erase it, and re-sending it
@@ -2541,6 +2592,46 @@ fn build_output_frame(
     (placements, kept, full)
 }
 
+// A row as a frame paints it when nothing is selected and it is not an
+// image row: the theme's start, the line, and padding to the width.
+fn plain_row_bytes(bg: &str, line: Option<&String>, width: usize) -> String {
+    let mut b = String::with_capacity(width + 32);
+    b.push_str(bg);
+    match line {
+        Some(line) => pad_ansi_into(&mut b, line, width),
+        None => b.extend(std::iter::repeat_n(' ', width)),
+    }
+    b
+}
+
+// Whether scrolling the painted rows up by `k` lines them up with the new
+// view: the first and the last row that would survive the scroll (text
+// rows, not images) are already on screen, `k` rows lower.
+fn scroll_lines_up(
+    painted: &[String],
+    visible: &[&String],
+    k: usize,
+    rows: usize,
+    bg: &str,
+    width: usize,
+) -> bool {
+    let text_row = |i: usize| {
+        let line = visible.get(i).copied();
+        let image = line.is_some_and(|l| l.starts_with(IMG_MARK)) || painted[i + k] == SIXEL_ROW;
+        (!image).then_some(line)
+    };
+    let survivors = rows - k;
+    let first = (0..survivors).find_map(|i| text_row(i).map(|l| (i, l)));
+    let last = (0..survivors)
+        .rev()
+        .find_map(|i| text_row(i).map(|l| (i, l)));
+    let (Some((a, la)), Some((b, lb))) = (first, last) else {
+        return false;
+    };
+    painted[a + k] == plain_row_bytes(bg, la, width)
+        && painted[b + k] == plain_row_bytes(bg, lb, width)
+}
+
 // Paint the output rows: only those that changed since the last frame (see
 // `build_output_frame`), as one write inside a synchronized-output bracket.
 // The cursor is saved and restored around them, so the composer — where the
@@ -2568,6 +2659,14 @@ fn render_output() {
     let cover = crate::workspace::covers_output(term_w);
     let width = if cover { 0 } else { content_w as usize };
     let rows = height.saturating_sub(reserved_rows()) as usize;
+    // The terminal may scroll the output rows only when they are whole
+    // rows of the screen, exactly the scroll region, with nothing drawn over
+    // them: a side panel or an overlay would scroll with them.
+    let scroll_ok = origin_x == 0
+        && content_w == term_w
+        && !crate::workspace::visible()
+        && !crate::debug_panel::visible()
+        && LAST_REGION_BOTTOM.load(Ordering::Relaxed) as usize == rows;
     let mut out: Vec<u8> = Vec::with_capacity(256);
     // Synchronized output (DEC 2026): supporting terminals (kitty, iTerm2,
     // WezTerm, Alacritty, foot…) apply the whole repaint as one atomic frame
@@ -2586,7 +2685,15 @@ fn render_output() {
         (Vec::new(), Vec::new(), true)
     } else {
         screen::with(|s| {
-            build_output_frame(s, &mut out, (width, height as usize), rows, &bg, origin_x)
+            build_output_frame(
+                s,
+                &mut out,
+                (width, height as usize),
+                rows,
+                &bg,
+                origin_x,
+                scroll_ok,
+            )
         })
     };
     // Drawing a Sixel leaves the cursor on the row below the image; with the

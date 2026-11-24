@@ -1474,7 +1474,8 @@ fn frame_screen(width: usize, height: usize) -> screen::Screen {
 // (1-based, as addressed) it repainted.
 fn frame(s: &mut screen::Screen, width: usize, rows: usize) -> (String, Vec<usize>, bool) {
     let mut out = Vec::new();
-    let (placements, _kept, full) = build_output_frame(s, &mut out, (width, 10), rows, "", 0);
+    let (placements, _kept, full) =
+        build_output_frame(s, &mut out, (width, 10), rows, "", 0, false);
     s.images.drawn = placements;
     let text = String::from_utf8(out).unwrap();
     let painted = text
@@ -1516,6 +1517,113 @@ fn an_output_frame_repaints_only_the_rows_that_changed() {
         s.transcript.visible_rows,
         ["two", "three", "streamed", "five", "six"]
     );
+}
+
+// A frame that may scroll the terminal, as render_output builds it when
+// the output rows are the whole scroll region.
+fn scroll_frame(s: &mut screen::Screen, width: usize, rows: usize) -> String {
+    let mut out = Vec::new();
+    let (placements, _kept, _full) =
+        build_output_frame(s, &mut out, (width, 10), rows, "", 0, true);
+    s.images.drawn = placements;
+    String::from_utf8(out).unwrap()
+}
+
+// The output rows as a terminal holds them, fed the frames bwn writes:
+// `ESC[<r>H` then line feeds scrolls the region up (the cursor is put on its
+// bottom margin), and `ESC[<r>;1H` then text writes row r.
+fn apply_frame(screen: &mut Vec<String>, frame: &str) {
+    for part in frame.split("\x1b[").skip(1) {
+        if let Some((row, text)) = part.split_once(";1H") {
+            let row: usize = row.parse().unwrap();
+            screen[row - 1] = text.to_string();
+        } else if let Some((row, feeds)) = part.split_once('H') {
+            assert_eq!(
+                row.parse::<usize>().unwrap(),
+                screen.len(),
+                "scroll from the bottom margin"
+            );
+            assert!(
+                !feeds.is_empty() && feeds.chars().all(|c| c == '\n'),
+                "{feeds:?}"
+            );
+            for _ in feeds.chars() {
+                screen.remove(0);
+                screen.push(String::new());
+            }
+        } else {
+            panic!("unexpected sequence {part:?}");
+        }
+    }
+}
+
+#[test]
+fn new_output_scrolls_the_terminal_instead_of_repainting_every_row() {
+    let mut s = frame_screen(20, 10);
+    s.transcript.push_lines("one\ntwo\nthree\nfour\nfive");
+    let mut term = vec![String::new(); 5];
+    apply_frame(&mut term, &scroll_frame(&mut s, 20, 5));
+    // Two lines arrive: one scroll of two rows, then just those two rows.
+    s.transcript.push_lines("six\nseven");
+    let text = scroll_frame(&mut s, 20, 5);
+    assert_eq!(
+        text,
+        format!("\x1b[5H\n\n\x1b[4;1H{:<20}\x1b[5;1H{:<20}", "six", "seven")
+    );
+    apply_frame(&mut term, &text);
+    let want: Vec<String> = ["three", "four", "five", "six", "seven"]
+        .iter()
+        .map(|l| format!("{l:<20}"))
+        .collect();
+    assert_eq!(term, want);
+    assert_eq!(
+        s.transcript.visible_rows,
+        ["three", "four", "five", "six", "seven"]
+    );
+    // A streamed chunk that opens a new line scrolls by one, and paints
+    // only that row.
+    s.transcript.stream("partial");
+    let text = scroll_frame(&mut s, 20, 5);
+    assert_eq!(text, format!("\x1b[5H\n\x1b[5;1H{:<20}", "partial"));
+}
+
+#[test]
+fn a_scrolled_terminal_always_shows_the_view() {
+    // Whatever happens to the transcript (lines pushed, streamed, a line
+    // above the view rewritten to a different height, a long line
+    // wrapping), the rows a terminal holds after each frame are the view.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let (width, rows) = (12, 6);
+    let mut s = frame_screen(width, 10);
+    let mut term = vec![String::new(); rows];
+    for step in 0..2000 {
+        match wrap_rng(&mut seed) % 6 {
+            0 => s.transcript.push_lines(&format!("line {step}")),
+            1 => s.transcript.push_lines(&format!("a {step}\nb {step}\nc")),
+            2 => s.transcript.stream(&format!("tok{step} ")),
+            3 => s.transcript.stream("\n"),
+            4 => {
+                let n = s.transcript.text.len();
+                if n > 2 {
+                    let i = wrap_rng(&mut seed) % n;
+                    s.transcript
+                        .text
+                        .set(i, "x".repeat(wrap_rng(&mut seed) % 30));
+                }
+            }
+            _ => s
+                .transcript
+                .push_lines(&"word ".repeat(wrap_rng(&mut seed) % 8)),
+        }
+        apply_frame(&mut term, &scroll_frame(&mut s, width, rows));
+        let want: Vec<String> = s
+            .transcript
+            .visible_rows
+            .iter()
+            .map(|l| format!("{l:<width$}"))
+            .collect();
+        assert_eq!(term, want, "step {step}");
+    }
 }
 
 #[test]
@@ -1587,6 +1695,39 @@ fn a_sixel_image_in_place_is_left_alone_and_its_rows_repaint_when_it_moves() {
     assert_eq!(rows, vec![1, 2, 3, 4]);
     assert_eq!(s.images.drawn, vec![(987654, 0, 0, 2)]);
     assert_eq!(s.transcript.visible_rows, ["", "", "after", "more"]);
+}
+
+#[test]
+fn a_sixel_image_rides_a_terminal_scroll_and_is_not_sent_again() {
+    let m = |r: usize| format!("{IMG_MARK}987654:{r}");
+    let mut s = frame_screen(20, 10);
+    s.transcript
+        .push_lines(&format!("a\nb\n{}\n{}\nc", m(0), m(1)));
+    let rows_of = |text: &str| -> Vec<usize> {
+        text.split("\x1b[")
+            .skip(1)
+            .filter_map(|part| part.split_once(";1H")?.0.parse::<usize>().ok())
+            .collect()
+    };
+    scroll_frame(&mut s, 20, 5);
+    assert_eq!(s.images.drawn, vec![(987654, 2, 0, 2)]);
+    // A line arrives: one scroll, one new row; the image moved up with the
+    // terminal's rows, so its rows are neither blanked nor redrawn.
+    s.transcript.push_lines("d");
+    let text = scroll_frame(&mut s, 20, 5);
+    assert!(text.starts_with("\x1b[5H\n"), "{text:?}");
+    assert_eq!(rows_of(&text), vec![5]);
+    assert_eq!(s.images.drawn, vec![(987654, 1, 0, 2)]);
+    s.transcript.push_lines("e");
+    assert_eq!(rows_of(&scroll_frame(&mut s, 20, 5)), vec![5]);
+    assert_eq!(s.images.drawn, vec![(987654, 0, 0, 2)]);
+    // Now its top row scrolls away: what is left of it is drawn again,
+    // cropped, on a blanked row.
+    s.transcript.push_lines("f");
+    let text = scroll_frame(&mut s, 20, 5);
+    assert!(text.starts_with("\x1b[5H\n"), "{text:?}");
+    assert_eq!(rows_of(&text), vec![1, 5]);
+    assert_eq!(s.images.drawn, vec![(987654, 0, 1, 1)]);
 }
 
 #[test]
@@ -2020,7 +2161,7 @@ fn every_row_starts_from_the_theme_and_a_new_theme_repaints_them_all() {
     s.transcript.push_lines("\x1b[31mred, never closed\nplain");
     let paint = |s: &mut screen::Screen, row_start: &str| {
         let mut out = Vec::new();
-        build_output_frame(s, &mut out, (20, 10), 3, row_start, 0);
+        build_output_frame(s, &mut out, (20, 10), 3, row_start, 0, false);
         String::from_utf8(out).unwrap()
     };
     let first = paint(&mut s, "\x1b[0m");
