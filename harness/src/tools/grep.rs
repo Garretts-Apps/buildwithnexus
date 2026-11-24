@@ -264,6 +264,90 @@ pub(super) fn search_bytes(pattern: &str, case_sensitive: bool, hay: &[u8], limi
     hits
 }
 
+// A search spreads over at most this many threads, each given at least
+// MIN_FILES_PER_THREAD files: below that, starting a thread costs more than
+// the files it would search.
+const MAX_THREADS: usize = 8;
+const MIN_FILES_PER_THREAD: usize = 32;
+
+// The files `keep` admits, searched in the order given, on `threads`
+// threads. Each thread searches one run of consecutive files with its own
+// buffer and hits, and the runs are joined in order: the first `limit`
+// lines of all runs, in order, are the lines a search of one file after
+// another keeps, and the totals add up. So the result is the same for any
+// number of threads.
+fn search_files(
+    search: &Search,
+    files: &[PathBuf],
+    keep: &(dyn Fn(&Path) -> bool + Sync),
+    cwd: &Path,
+    limit: usize,
+    threads: usize,
+) -> Hits {
+    let run = |files: &[PathBuf]| {
+        let mut hits = Hits {
+            limit,
+            lines: Vec::new(),
+            total: 0,
+        };
+        let mut buf = Vec::new();
+        for path in files {
+            if !keep(path) {
+                continue;
+            }
+            let Some(len) = read_into(path, &mut buf) else {
+                continue;
+            };
+            search_buffer(search, &buf[..len], &|| display_path(path, cwd), &mut hits);
+            // One very large file does not keep its buffer for the rest.
+            if buf.len() as u64 > MAX_TEXT_FILE {
+                buf = Vec::new();
+            }
+        }
+        hits
+    };
+    if threads <= 1 || files.len() < 2 {
+        return run(files);
+    }
+    let runs: Vec<Hits> = std::thread::scope(|s| {
+        let handles: Vec<_> = files
+            .chunks(files.len().div_ceil(threads))
+            .map(|chunk| s.spawn(move || run(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    let mut hits = Hits {
+        limit,
+        lines: Vec::new(),
+        total: 0,
+    };
+    for part in runs {
+        hits.total += part.total;
+        let room = limit.saturating_sub(hits.lines.len());
+        hits.lines.extend(part.lines.into_iter().take(room));
+    }
+    hits
+}
+
+/// `grep_files`' matched lines and total for `files` searched on
+/// `threads` threads, for the test that holds every count to one thread.
+#[cfg(test)]
+pub(super) fn search_paths(
+    pattern: &str,
+    case_sensitive: bool,
+    files: &[PathBuf],
+    cwd: &Path,
+    limit: usize,
+    threads: usize,
+) -> (Vec<String>, usize) {
+    let search = Search::new(pattern, case_sensitive);
+    let hits = search_files(&search, files, &|_| true, cwd, limit, threads);
+    (hits.lines, hits.total)
+}
+
 /// `grep_files`: search file contents under a folder.
 pub(super) fn run_grep(input: &Value, cwd: &Path) -> Outcome {
     let pattern = input["pattern"].as_str().unwrap_or("");
@@ -284,36 +368,22 @@ pub(super) fn run_grep(input: &Value, cwd: &Path) -> Outcome {
     }
     // Results are listed in path order.
     files.sort_unstable();
-    let mut hits = Hits {
-        limit: search_limit(input),
-        lines: Vec::new(),
-        total: 0,
+    let keep = |path: &Path| {
+        if every_file {
+            return true;
+        }
+        let basename_matches = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| simple_glob_match(file_pattern, name));
+        basename_matches || simple_glob_match(file_pattern, &display_path(path, cwd))
     };
-    let mut buf = Vec::new();
-    for path in files {
-        if !every_file {
-            let basename_matches = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| simple_glob_match(file_pattern, name));
-            if !basename_matches && !simple_glob_match(file_pattern, &display_path(&path, cwd)) {
-                continue;
-            }
-        }
-        let Some(len) = read_into(&path, &mut buf) else {
-            continue;
-        };
-        search_buffer(
-            &search,
-            &buf[..len],
-            &|| display_path(&path, cwd),
-            &mut hits,
-        );
-        // One very large file does not keep its buffer for the rest.
-        if buf.len() as u64 > MAX_TEXT_FILE {
-            buf = Vec::new();
-        }
-    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_THREADS)
+        .min(files.len() / MIN_FILES_PER_THREAD)
+        .max(1);
+    let hits = search_files(&search, &files, &keep, cwd, search_limit(input), threads);
     if hits.lines.is_empty() {
         ok(format!("no matches for {pattern}"))
     } else {

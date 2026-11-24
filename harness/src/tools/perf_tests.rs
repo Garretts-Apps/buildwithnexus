@@ -402,6 +402,51 @@ fn walk_sensitivity_by_folder_agrees_with_resolving_every_file() {
     let _ = fs::remove_dir_all(&d);
 }
 
+// The search split over threads against one thread, and grep_files on a
+// tree big enough to be split against the line-by-line reference: the same
+// lines in the same order, the same totals, at every limit.
+#[test]
+fn grep_on_many_threads_prints_what_one_thread_prints() {
+    let d = tempdir("grep-threads");
+    let mut rng = Rng(31);
+    let words = ["needle", "Needle", "hay", "stack", "\n", "\n", " ", "x"];
+    for i in 0..300 {
+        let mut text = String::new();
+        // Some files with no match, some with many, a few large.
+        let n = match i % 7 {
+            0 => 0,
+            1 => 5000,
+            _ => rng.below(200),
+        };
+        for _ in 0..n {
+            text.push_str(words[rng.below(words.len())]);
+        }
+        fs::create_dir_all(d.join(format!("d{}", i % 9))).unwrap();
+        fs::write(d.join(format!("d{}/f{i:03}.txt", i % 9)), text).unwrap();
+    }
+    let mut files = Vec::new();
+    collect_files(&d, &mut files, &mut 0);
+    files.sort_unstable();
+    assert_eq!(files.len(), 300);
+    for (pattern, case_sensitive) in [("needle", false), ("Needle", true), ("zzz", false)] {
+        for limit in [1, 2, 3, 50, 500, 100_000] {
+            let one = grep::search_paths(pattern, case_sensitive, &files, &d, limit, 1);
+            for threads in 2..=9 {
+                let many = grep::search_paths(pattern, case_sensitive, &files, &d, limit, threads);
+                assert_eq!(many, one, "{pattern} limit {limit} threads {threads}");
+            }
+        }
+        for max in [None, Some(1), Some(7), Some(500)] {
+            let mut input = json!({"pattern": pattern, "case_sensitive": case_sensitive});
+            if let Some(max) = max {
+                input["max"] = json!(max);
+            }
+            assert_same_grep(&d, &input);
+        }
+    }
+    let _ = fs::remove_dir_all(&d);
+}
+
 // The walk's per-folder check against `is_sensitive_entry` (which checks
 // every name of every path) over synthetic folders and names: credential
 // folders and files in any case, subpaths split across the folder and the
