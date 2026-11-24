@@ -401,3 +401,149 @@ fn walk_sensitivity_by_folder_agrees_with_resolving_every_file() {
     assert_eq!(names, ["keys/plain.txt", "notes.md", "src/main.rs"]);
     let _ = fs::remove_dir_all(&d);
 }
+
+// The walk's per-folder check against `is_sensitive_entry` (which checks
+// every name of every path) over synthetic folders and names: credential
+// folders and files in any case, subpaths split across the folder and the
+// entry, `/proc` environ files and globs, dot-segments and relative paths.
+// Neither looks at the disk, so the paths need not exist.
+#[cfg(unix)]
+#[test]
+fn per_folder_sensitivity_gives_the_per_path_answer() {
+    let folders = [
+        "",
+        "/",
+        "a",
+        "a/./b",
+        "a/b/..",
+        "../..",
+        "/home/u",
+        "/home/u/project",
+        "/home/u/.ssh",
+        "/home/u/.SSH/keys",
+        "/home/u/.Ssh.",
+        "/home/u/.aws/x/y",
+        "/home/u/.gnupg",
+        "/home/u/.kube",
+        "/home/u/.azure",
+        "/home/u/.buildwithnexus",
+        "/w/.buildwithnexus/skills",
+        "/home/u/.docker",
+        "/home/u/.DOCKER",
+        "/home/u/.config",
+        "/home/u/.config/gh",
+        "/home/u/.config/gcloud/x",
+        "/home/u/.config/other",
+        "/home/u/.ssh/../work",
+        "/x/.ssh/..",
+        "/proc",
+        "/proc/1",
+        "/proc/self",
+        "/proc/self/task/2",
+        "proc",
+        "proc/1",
+        "/x/../proc/1",
+        "/srv/proc/1",
+        "/home/u/.env",
+        "/home/u/id_rsa.d",
+        "/tmp/ssh~1",
+        "/tmp/a b/c",
+        "/tmp/ünï/Ç",
+    ];
+    let names = [
+        "config.json",
+        "CONFIG.JSON",
+        "gh",
+        "GH",
+        "gcloud",
+        "environ",
+        "Environ",
+        "env*",
+        "env?ron",
+        "[e]nviron",
+        "*",
+        "e*",
+        "environ.bak",
+        "id_rsa",
+        "id_rsa.pub",
+        "ID_ED25519",
+        "id_ecdsa_x",
+        "id_dsa",
+        ".env",
+        ".env.local",
+        ".ENV.prod",
+        ".envrc",
+        ".netrc",
+        "_netrc",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+        ".pgpass",
+        "key.pem",
+        "KEY.PEM",
+        "x.p12",
+        "x.pfx",
+        ".ssh",
+        ".SSH",
+        ".aws",
+        ".buildwithnexus",
+        ".docker",
+        ".config",
+        "ssh~1",
+        "notes.md",
+        ".gitignore",
+        "main.rs",
+        "Ünï",
+        "a b",
+        "...",
+        "x.",
+    ];
+    let mut checked = 0;
+    let mut sensitive = 0;
+    for dir in folders {
+        for real in folders.iter().filter(|r| r.starts_with('/')) {
+            let folder = SensitiveFolder::new(Path::new(dir), Path::new(real)).unwrap();
+            for name in names {
+                let want = is_sensitive_entry(&Path::new(dir).join(name), Path::new(real));
+                let got = folder.entry(std::ffi::OsStr::new(name));
+                assert_eq!(got, want, "folder {dir:?} real {real:?} name {name:?}");
+                checked += 1;
+                sensitive += usize::from(want);
+            }
+        }
+    }
+    // Generated folders from the same pieces, deeper and in any order.
+    let pieces = [
+        "proc", "1", "self", "task", ".ssh", ".config", "gh", ".docker", "src", "..", ".",
+        "Environ", ".AWS", "x",
+    ];
+    let mut rng = Rng(23);
+    for _ in 0..3000 {
+        let mut dir = String::from(if rng.below(2) == 0 { "/" } else { "" });
+        for _ in 0..rng.below(6) {
+            dir.push_str(pieces[rng.below(pieces.len())]);
+            dir.push('/');
+        }
+        let mut real = String::from("/");
+        for _ in 0..rng.below(5) {
+            real.push_str(pieces[rng.below(pieces.len())]);
+            real.push('/');
+        }
+        let folder = SensitiveFolder::new(Path::new(&dir), Path::new(&real)).unwrap();
+        for name in names.iter().chain(&pieces) {
+            if *name == ".." || *name == "." {
+                continue; // never a listed name
+            }
+            let want = is_sensitive_entry(&Path::new(&dir).join(name), Path::new(&real));
+            let got = folder.entry(std::ffi::OsStr::new(name));
+            assert_eq!(got, want, "folder {dir:?} real {real:?} name {name:?}");
+            checked += 1;
+            sensitive += usize::from(want);
+        }
+    }
+    // Both answers turn up often.
+    assert!(
+        sensitive > checked / 10 && sensitive < checked * 9 / 10,
+        "{sensitive}/{checked}"
+    );
+}

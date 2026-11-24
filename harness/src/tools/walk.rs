@@ -246,11 +246,14 @@ impl Walk<'_> {
         };
         // The folder's real path, resolved once for the sensitivity check of
         // the plain files in it (Unix only: elsewhere each file is resolved).
-        let real_root = (self.skip_sensitive && cfg!(unix))
+        // The folder's part of that check is worked out once here too, so
+        // each file only checks its own name.
+        let folder = (self.skip_sensitive && cfg!(unix))
             .then(|| fs::canonicalize(root).ok())
-            .flatten();
-        let sensitive = |path: &Path, is_link: bool| match &real_root {
-            Some(real) if !is_link => is_sensitive_entry(path, real),
+            .flatten()
+            .and_then(|real| SensitiveFolder::new(root, &real));
+        let sensitive = |path: &Path, is_link: bool| match (&folder, path.file_name()) {
+            (Some(folder), Some(name)) if !is_link => folder.entry(name),
             _ => is_sensitive(path),
         };
         for entry in rd.filter_map(|e| e.ok()) {

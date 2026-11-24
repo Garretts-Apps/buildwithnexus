@@ -3381,13 +3381,87 @@ fn is_sensitive_for(p: &Path, windows: bool) -> bool {
 // `is_sensitive` for an entry a walk lists in a folder whose real path is
 // `real_parent`. An entry that is not itself a symlink has the real path
 // `real_parent/name`, so the walk resolves each folder once instead of
-// every file in it.
+// every file in it. The walk now asks `SensitiveFolder`; this stays as the
+// reference the tests hold it to.
+#[cfg(test)]
 fn is_sensitive_entry(p: &Path, real_parent: &Path) -> bool {
     let windows = cfg!(windows);
     let check = |q: &Path| sensitive_names(&path_names(q, windows), windows, false);
     match p.file_name() {
         Some(name) => check(&normalize(p)) || check(&real_parent.join(name)),
         None => is_sensitive(p),
+    }
+}
+
+// What `sensitive_names` decides for `<folder>/<name>` from the folder's
+// names alone (Unix path rules, outside a project).
+struct FolderNames {
+    /// A folder name is a credential folder, or two of them form a
+    /// credential subpath.
+    hit: bool,
+    /// The folder's own name, which a subpath can pair with the entry.
+    last: Option<String>,
+    /// The folder is `/proc/<x>` or deeper, where `environ` is sensitive.
+    in_proc: bool,
+}
+
+impl FolderNames {
+    fn new(names: Vec<String>) -> Self {
+        let hit = names.iter().any(|n| is_sensitive_dir_name(n, false))
+            || names.windows(2).any(|w| {
+                SENSITIVE_SUBPATHS
+                    .iter()
+                    .any(|s| name_is(&w[0], s[0], false) && name_is(&w[1], s[1], false))
+            });
+        let in_proc = names.len() >= 2 && names[0] == "proc";
+        FolderNames {
+            hit,
+            last: names.last().cloned(),
+            in_proc,
+        }
+    }
+
+    // `sensitive_names` of the folder's names followed by `name`, which is
+    // already lowercased.
+    fn with(&self, name: &str) -> bool {
+        self.hit
+            || is_sensitive_dir_name(name, false)
+            || self.last.as_deref().is_some_and(|last| {
+                SENSITIVE_SUBPATHS
+                    .iter()
+                    .any(|s| name_is(last, s[0], false) && name_is(name, s[1], false))
+            })
+            || is_sensitive_file_name(name, false)
+            || (self.in_proc && (name == "environ" || component_glob_match(name, "environ")))
+    }
+}
+
+/// `is_sensitive_entry` for the plain (not symlinked) entries of one
+/// folder a walk lists: the folder's lexical names and its real path's are
+/// read once, and each entry checks only its own name against them. Unix
+/// path rules only, so None on Windows.
+pub(super) struct SensitiveFolder {
+    lexical: FolderNames,
+    real: FolderNames,
+}
+
+impl SensitiveFolder {
+    pub(super) fn new(dir: &Path, real_dir: &Path) -> Option<Self> {
+        if cfg!(windows) {
+            return None;
+        }
+        // `normalize(dir/name)` is `normalize(dir)/name` for a name with no
+        // separator, which every listed name is.
+        Some(SensitiveFolder {
+            lexical: FolderNames::new(path_names(&normalize(dir), false)),
+            real: FolderNames::new(path_names(real_dir, false)),
+        })
+    }
+
+    /// Whether `dir/name` is sensitive, as `is_sensitive_entry` says.
+    pub(super) fn entry(&self, name: &std::ffi::OsStr) -> bool {
+        let name = name.to_string_lossy().to_lowercase();
+        self.lexical.with(&name) || self.real.with(&name)
     }
 }
 
