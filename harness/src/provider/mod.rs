@@ -172,8 +172,58 @@ pub mod bench {
     ) -> Result<Reply, String> {
         super::anthropic_stream(reader, on_text, on_thinking)
     }
+    // The OpenAI stream parser fed the way a live response feeds it: through
+    // the interruptible reader and its worker thread.
+    pub fn openai_stream_interruptible(
+        reader: impl Read + Send + Sync + 'static,
+        on_text: &mut dyn FnMut(&str),
+        on_thinking: &mut dyn FnMut(&str),
+    ) -> Result<Reply, String> {
+        super::openai_stream(
+            InterruptibleReader::new(Box::new(reader)),
+            on_text,
+            on_thinking,
+        )
+    }
+    // Records thinking blocks as if a reply had sent them in front of the
+    // call `first_call_id`, so a thinking request body replays them.
+    pub fn remember_thinking(first_call_id: &str, blocks: Vec<Value>) {
+        super::remember_thinking(&Reply {
+            calls: vec![ToolCall {
+                id: first_call_id.to_string(),
+                name: String::new(),
+                input: Value::Null,
+            }],
+            thinking_blocks: blocks,
+            ..Default::default()
+        });
+    }
     // The bytes a streaming request puts on the wire, as the request path
     // builds them.
+    pub fn anthropic_thinking_request_bytes(
+        model: &str,
+        msgs: &[Msg],
+        tools: &[ToolDef],
+    ) -> Vec<u8> {
+        let shape = AnthropicBody {
+            model,
+            max_tokens: None,
+            effort: Effort::Medium,
+            stream: true,
+        };
+        super::anthropic_bytes(msgs, tools, &shape)
+    }
+    pub fn openai_flat_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
+        let shape = OpenAiBody {
+            model,
+            temperature: None,
+            max_tokens: None,
+            effort: Effort::Off,
+            stream: true,
+            flatten: Some(true),
+        };
+        super::openai_bytes(msgs, tools, &shape)
+    }
     pub fn anthropic_request_bytes(model: &str, msgs: &[Msg], tools: &[ToolDef]) -> Vec<u8> {
         let shape = AnthropicBody {
             model,

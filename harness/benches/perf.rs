@@ -285,6 +285,132 @@ fn bench_sse_parse(c: &mut Criterion) {
     g.finish();
 }
 
+// ── request bodies and the stream reader, the paths the fixes touch ─────────
+// The Anthropic body with extended thinking on: every assistant turn that
+// made a call gets the thinking blocks recorded for it put back in front of
+// its tool_use. The memory keeps the last 64 replies, so on the longer
+// sessions only the latest turns replay, as they would live.
+fn bench_request_body_thinking(c: &mut Criterion) {
+    let defs = tools::defs(true);
+    let thought = "The failing assertion compares the token count after the last line. \
+                   If the loop exits on EOF before flushing, the final token is lost. "
+        .repeat(16);
+    // A base64 signature of the length the API sends with a thinking block.
+    let signature = "c2lnbmVkIHRoaW5raW5nIGJsb2Nr".repeat(16);
+    let mut g = c.benchmark_group("request_body_thinking");
+    for (label, msgs) in [
+        ("30turns_50kb", session(30, 330, 0)),
+        ("120turns_1.4mb", session(120, 8_100, 150_000)),
+        ("300turns_4.6mb", session(300, 11_200, 450_000)),
+    ] {
+        let turns = msgs.len() / 4;
+        for i in 0..turns {
+            pbench::remember_thinking(
+                &format!("call_{i}"),
+                vec![serde_json::json!({
+                    "type": "thinking",
+                    "thinking": format!("step {i}: {thought}"),
+                    "signature": signature,
+                })],
+            );
+        }
+        let wire =
+            pbench::anthropic_thinking_request_bytes("claude-sonnet-4-5", &msgs, &defs).len();
+        g.throughput(Throughput::Bytes(wire as u64));
+        g.bench_function(format!("anthropic/{label}"), |b| {
+            b.iter(|| {
+                pbench::anthropic_thinking_request_bytes(
+                    black_box("claude-sonnet-4-5"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+    }
+    g.finish();
+}
+
+// The OpenAI body in the flattened fallback: the transcript folded into
+// alternating user/assistant turns, tool calls and results written as text,
+// the tool guide at the top of the first turn.
+fn bench_request_body_flat(c: &mut Criterion) {
+    let defs = tools::defs(true);
+    let mut g = c.benchmark_group("request_body_flat");
+    for (label, msgs) in [
+        ("30turns_50kb", session(30, 330, 0)),
+        ("120turns_1.4mb", session(120, 8_100, 150_000)),
+        ("300turns_4.6mb", session(300, 11_200, 450_000)),
+    ] {
+        let wire = pbench::openai_flat_request_bytes("gpt-4o", &msgs, &defs).len();
+        g.throughput(Throughput::Bytes(wire as u64));
+        g.bench_function(format!("openai/{label}"), |b| {
+            b.iter(|| {
+                pbench::openai_flat_request_bytes(
+                    black_box("gpt-4o"),
+                    black_box(&msgs),
+                    black_box(&defs),
+                )
+            })
+        });
+    }
+    g.finish();
+}
+
+// A response body that hands out at most `max` bytes per read, the way a
+// socket delivers a stream in pieces, so the reader's per-read work counts.
+struct Trickle {
+    data: std::sync::Arc<[u8]>,
+    pos: usize,
+    max: usize,
+}
+
+impl std::io::Read for Trickle {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = out.len().min(self.max).min(self.data.len() - self.pos);
+        out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+// The same stream as sse_parse/openai_stream, read through the
+// interruptible reader (worker thread, channel, line buffer) a live
+// response goes through.
+fn bench_sse_stream_reader(c: &mut Criterion) {
+    let mut sse = String::new();
+    for i in 0..2000 {
+        sse.push_str(&format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"tok{i} \"}}}}]}}\n"
+        ));
+    }
+    sse.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"finish\",\"arguments\":\"{\\\"summary\\\"\"}}]}}]}\n");
+    sse.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"done\\\"}\"}}]}}]}\n");
+    sse.push_str("data: [DONE]\n");
+    let data: std::sync::Arc<[u8]> = sse.as_bytes().into();
+
+    let mut g = c.benchmark_group("sse_stream_reader");
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    for max in [256usize, 4096] {
+        g.bench_function(format!("openai_stream/2000deltas_{max}b_reads"), |b| {
+            b.iter(|| {
+                let mut sink = |_: &str| {};
+                let mut think_sink = |_: &str| {};
+                let body = Trickle {
+                    data: data.clone(),
+                    pos: 0,
+                    max,
+                };
+                let _ = pbench::openai_stream_interruptible(
+                    black_box(body),
+                    &mut sink,
+                    &mut think_sink,
+                );
+            })
+        });
+    }
+    g.finish();
+}
+
 fn bench_truncate(c: &mut Criterion) {
     // Large multibyte output is the worst case for the char-boundary back-off.
     let big = "🎉日本語テキスト ".repeat(20_000); // hundreds of KB, multibyte
@@ -681,6 +807,9 @@ criterion_group!(
     bench_redact,
     bench_parse_args,
     bench_sse_parse,
+    bench_request_body_thinking,
+    bench_request_body_flat,
+    bench_sse_stream_reader,
     bench_truncate,
     bench_path_and_classify,
     bench_session_save,
