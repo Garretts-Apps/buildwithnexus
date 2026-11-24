@@ -201,6 +201,25 @@ pub mod bench {
     pub fn full_rewrap(c: &mut WrapCache, width: usize) {
         c.0.ensure_width(width);
     }
+
+    /// A finished line arriving at a full transcript: it is wrapped and
+    /// added, and the oldest line is dropped to stay at the cap.
+    pub fn push_at_cap(c: &mut WrapCache, line: &str) {
+        c.0.push(line.to_string());
+        c.0.drain_front(1);
+    }
+
+    /// What a frame asks of the transcript: how many rows it has, and the
+    /// `rows` rows at the bottom (the view follows the newest output).
+    pub fn bottom_window(c: &WrapCache, rows: usize) -> usize {
+        let total = c.0.total_rows();
+        c.0.rows_range(total.saturating_sub(rows), rows).len()
+    }
+
+    /// One line wrapped from scratch.
+    pub fn wrap(line: &str, width: usize) -> usize {
+        super::wrap_ansi_line(line, width).len()
+    }
 }
 
 impl Transcript {

@@ -109,6 +109,47 @@ fn bench_wrap_cache(c: &mut Criterion) {
     g.finish();
 }
 
+// A transcript at its cap, as in any long session or a long tool output:
+// every finished line drops the oldest one, and every frame reads the rows
+// at the bottom. Neither should cost in proportion to the 2,000 lines kept.
+fn bench_transcript_cap(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    let line = "the agent read three files, proposed a diff with word-level highlights, \
+                then streamed an explanation of the change while tests ran in the background";
+    let mut g = c.benchmark_group("transcript_cap");
+    g.bench_function("push_line_at_2000", |b| {
+        let mut t = uibench::transcript(2_000, 100, line);
+        b.iter(|| uibench::push_at_cap(black_box(&mut t), black_box(line)))
+    });
+    g.bench_function("frame_window_40rows_of_2000lines", |b| {
+        let t = uibench::transcript(2_000, 100, line);
+        b.iter(|| uibench::bottom_window(black_box(&t), black_box(40)))
+    });
+    g.finish();
+}
+
+// Wrapping one line from scratch: plain prose, and the same prose in colour
+// (rendered markdown and highlighted code carry SGR runs through every word).
+fn bench_wrap_line(c: &mut Criterion) {
+    use buildwithnexus::tui::bench as uibench;
+    let plain = "the agent read three files, proposed a diff with word-level highlights, \
+                 then streamed an explanation of the change while tests ran in the background "
+        .repeat(8);
+    let coloured: String = plain
+        .split(' ')
+        .enumerate()
+        .map(|(i, w)| if i % 3 == 0 { format!("\x1b[38;2;102;209;163m{w}\x1b[39m") } else { w.to_string() })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let coloured = format!("\x1b[1m{coloured}\x1b[0m");
+    let mut g = c.benchmark_group("wrap_line");
+    g.throughput(Throughput::Bytes(plain.len() as u64));
+    g.bench_function("plain_1300chars", |b| b.iter(|| uibench::wrap(black_box(&plain), 100)));
+    g.throughput(Throughput::Bytes(coloured.len() as u64));
+    g.bench_function("coloured_1300chars", |b| b.iter(|| uibench::wrap(black_box(&coloured), 100)));
+    g.finish();
+}
+
 // Msg → the bytes of one streaming request, per protocol, at three session
 // sizes. Tool definitions (the real set, ~23 KB) ride on every request.
 fn bench_request_body(c: &mut Criterion) {
@@ -624,6 +665,8 @@ criterion_group!(
     bench_read_large_file,
     bench_tool_lookup,
     bench_wrap_cache,
+    bench_transcript_cap,
+    bench_wrap_line,
     bench_request_body,
     bench_redact,
     bench_parse_args,
