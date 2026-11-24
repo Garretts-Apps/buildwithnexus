@@ -26,3 +26,6 @@ harness/.cargo/
 .buildwithnexus/artifacts/
 .buildwithnexus/settings.local.json
 test_output.log
+
+# Red-team papers describe attack chains against this code; keep them local.
+docs/security/redteam-paper-*.md
