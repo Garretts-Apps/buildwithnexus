@@ -675,7 +675,7 @@ enum Str {
 
 /// The escapes each token class is wrapped in, looked up once per block
 /// (or line) rather than once per token.
-struct Paints(tui::SpanPaint);
+struct Paints(&'static tui::SpanPaint);
 
 impl Paints {
     fn new() -> Self {

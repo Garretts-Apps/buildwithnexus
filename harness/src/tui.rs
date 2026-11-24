@@ -500,38 +500,19 @@ pub(crate) use theme::{no_color, span_paint, SpanPaint};
 // ── diff paint helpers ───────────────────────────────────────────────────────
 // Used by report's diff renderer: a background tint behind added and
 // removed spans. The bg is restored to the theme background (alt-screen)
-// or the terminal default afterwards, the same way reset_fg() works.
+// or the terminal default afterwards, as a span's foreground is.
 
 // A warm lift of the field for code that has no lexer: selection is already
 // in the Notch palette, so a fence in an unknown language is not a new hue.
 fn code_bg(s: &str) -> String {
-    if no_color() || s.is_empty() {
+    if s.is_empty() {
         return s.to_string();
     }
-    format!("\x1b[{}m{s}{}", sgr_bg(pal().selection_bg), reset_bg())
-}
-
-fn reset_bg() -> String {
-    if no_color() {
-        String::new()
-    } else if ALT_SCREEN.load(Ordering::Relaxed) && pal().background.is_some() {
-        theme_bg()
-    } else {
-        "\x1b[49m".to_string()
-    }
+    paint_bg(pal().selection_bg, s)
 }
 
 fn on_bg(bg: Col, fg: Col, s: &str) -> String {
-    if no_color() {
-        return s.to_string();
-    }
-    format!(
-        "\x1b[{};{}m{s}{}{}",
-        sgr_bg(bg),
-        sgr_fg(fg),
-        reset_bg(),
-        reset_fg()
-    )
+    paint_on(bg, fg, s)
 }
 
 pub fn diff_add_span(s: &str) -> String {
@@ -2750,7 +2731,7 @@ fn render_output() {
                 &mut out,
                 (width, height as usize),
                 rows,
-                &bg,
+                bg,
                 origin_x,
                 scroll_ok,
             )

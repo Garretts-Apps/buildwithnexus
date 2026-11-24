@@ -246,11 +246,24 @@ pub fn line_mode() -> bool {
 }
 
 pub(super) fn term_is_dumb() -> bool {
-    std::env::var("TERM").is_ok_and(|t| t == "dumb")
+    static DUMB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DUMB.get_or_init(|| std::env::var("TERM").is_ok_and(|t| t == "dumb"))
 }
 
 /// True when colour output is off (`NO_COLOR`); highlighters skip work.
 pub(crate) fn no_color() -> bool {
+    // Decided once, like stdout_wants_color: the environment and stdout do
+    // not change mid-run, and every colour helper asks. Tests take NO_COLOR
+    // out of their environment as they go, so under test it is read each
+    // time.
+    if cfg!(test) {
+        return colour_off();
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(colour_off)
+}
+
+fn colour_off() -> bool {
     std::env::var_os("NO_COLOR").is_some() || !stdout_wants_color() || term_is_dumb()
 }
 
@@ -331,20 +344,28 @@ pub(super) mod win_console {
     }
 }
 
+// 24-bit colour, or the nearest 256-colour cube entry. Off whenever colour
+// is off; otherwise COLORTERM, then TERM, read once.
 pub(super) fn truecolor() -> bool {
-    if no_color() {
-        return false;
+    !no_color() && truecolor_term()
+}
+
+fn truecolor_term() -> bool {
+    static TC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TC.get_or_init(|| {
+        truecolor_for(
+            std::env::var("COLORTERM").ok().as_deref(),
+            &std::env::var("TERM").unwrap_or_default(),
+        )
+    })
+}
+
+fn truecolor_for(colorterm: Option<&str>, term: &str) -> bool {
+    match colorterm {
+        Some("truecolor" | "24bit") => true,
+        Some("256color" | "no" | "0") => false,
+        _ => !(term == "linux" || term == "vt100" || term == "dumb"),
     }
-    if let Ok(ct) = std::env::var("COLORTERM") {
-        if ct == "truecolor" || ct == "24bit" {
-            return true;
-        }
-        if ct == "256color" || ct == "no" || ct == "0" {
-            return false;
-        }
-    }
-    let term = std::env::var("TERM").unwrap_or_default();
-    !(term == "linux" || term == "vt100" || term == "dumb")
 }
 
 pub(super) fn cube(c: u8) -> u32 {
@@ -362,52 +383,257 @@ pub(super) fn cube(c: u8) -> u32 {
 }
 
 pub(super) fn sgr_fg(c: Col) -> String {
+    sgr_fg_at(c, truecolor())
+}
+
+pub(super) fn sgr_bg(c: Col) -> String {
+    sgr_bg_at(c, truecolor())
+}
+
+fn sgr_fg_at(c: Col, tc: bool) -> String {
     match c {
-        Col::Rgb(r, g, b) if truecolor() => format!("38;2;{r};{g};{b}"),
+        Col::Rgb(r, g, b) if tc => format!("38;2;{r};{g};{b}"),
         Col::Rgb(r, g, b) => format!("38;5;{}", 16 + 36 * cube(r) + 6 * cube(g) + cube(b)),
         Col::Ansi(n) => n.to_string(),
         Col::Default => "39".to_string(),
     }
 }
 
-pub(super) fn sgr_bg(c: Col) -> String {
+fn sgr_bg_at(c: Col, tc: bool) -> String {
     match c {
-        Col::Rgb(r, g, b) if truecolor() => format!("48;2;{r};{g};{b}"),
+        Col::Rgb(r, g, b) if tc => format!("48;2;{r};{g};{b}"),
         Col::Rgb(r, g, b) => format!("48;5;{}", 16 + 36 * cube(r) + 6 * cube(g) + cube(b)),
         Col::Ansi(n) => (n + 10).to_string(),
         Col::Default => "49".to_string(),
     }
 }
 
+// ── SGR tables ───────────────────────────────────────────────────────────
+// Every escape the colour helpers send, made once per theme at the colour
+// depth in use, so a span costs one allocation (its own text) instead of a
+// format! per escape. The helpers only reach a table with colour on. All
+// three themes are built together on first use; a theme switch picks
+// another table, and the alternate screen picks the other half of the
+// pairs below, so neither has anything to rebuild.
+pub(super) struct Sgr {
+    // SGR parameters ("38;2;r;g;b" / "48;…") for each colour the palette
+    // names, foreground and background.
+    cols: Vec<(Col, String, String)>,
+    // [main screen, alternate screen].
+    reset_fg: [String; 2],
+    reset_all: [String; 2],
+    reset_bg: [String; 2],
+    theme_bg: String,
+    span: [SpanPaint; 2],
+}
+
+impl Sgr {
+    fn new(p: &Palette, tc: bool) -> Self {
+        let mut list = vec![
+            p.text,
+            p.accent,
+            p.muted,
+            p.success,
+            p.warning,
+            p.error,
+            p.info,
+            p.mode_plan,
+            p.mode_build,
+            p.mode_bstorm,
+            p.diff_add_bg,
+            p.diff_del_bg,
+            p.diff_add_emph_bg,
+            p.diff_del_emph_bg,
+            p.selection_bg,
+        ];
+        list.extend(p.background);
+        list.extend(p.wordmark);
+        let mut cols: Vec<(Col, String, String)> = Vec::new();
+        for c in list {
+            if !cols.iter().any(|(k, _, _)| *k == c) {
+                cols.push((c, sgr_fg_at(c, tc), sgr_bg_at(c, tc)));
+            }
+        }
+        let theme_bg = match p.background {
+            Some(bg) => format!("\x1b[{}m", sgr_bg_at(bg, tc)),
+            None => String::new(),
+        };
+        let text_fg = sgr_fg_at(p.text, tc);
+        let reset_fg = ["\x1b[39m".to_string(), format!("\x1b[{text_fg}m")];
+        let reset_all = [
+            "\x1b[0m".to_string(),
+            format!("\x1b[0m\x1b[{text_fg}m{theme_bg}"),
+        ];
+        let reset_bg = [
+            "\x1b[49m".to_string(),
+            if p.background.is_some() {
+                theme_bg.clone()
+            } else {
+                "\x1b[49m".to_string()
+            },
+        ];
+        let on = |c: Col| format!("\x1b[{}m", sgr_fg_at(c, tc));
+        let span = |reset: &str| SpanPaint {
+            accent: on(p.accent),
+            info: on(p.info),
+            success: on(p.success),
+            warning: on(p.warning),
+            muted: on(p.muted),
+            reset: reset.to_string(),
+        };
+        let span = [span(&reset_fg[0]), span(&reset_fg[1])];
+        Sgr {
+            cols,
+            reset_fg,
+            reset_all,
+            reset_bg,
+            theme_bg,
+            span,
+        }
+    }
+
+    fn fg(&self, c: Col) -> Option<&str> {
+        self.cols
+            .iter()
+            .find(|(k, _, _)| *k == c)
+            .map(|(_, fg, _)| fg.as_str())
+    }
+
+    fn bg(&self, c: Col) -> Option<&str> {
+        self.cols
+            .iter()
+            .find(|(k, _, _)| *k == c)
+            .map(|(_, _, bg)| bg.as_str())
+    }
+
+    // "\x1b[<fg>m{s}<reset>", from the table when the palette names `c`.
+    fn paint(&self, alt: bool, c: Col, s: &str) -> String {
+        let reset = &self.reset_fg[usize::from(alt)];
+        match self.fg(c) {
+            Some(fg) => {
+                let mut out = String::with_capacity(fg.len() + s.len() + reset.len() + 3);
+                out.push_str("\x1b[");
+                out.push_str(fg);
+                out.push('m');
+                out.push_str(s);
+                out.push_str(reset);
+                out
+            }
+            None => format!("\x1b[{}m{s}{reset}", sgr_fg(c)),
+        }
+    }
+
+    fn attr(&self, alt: bool, code: &str, s: &str) -> String {
+        let reset = match code {
+            "1" => "\x1b[22m",
+            "3" => "\x1b[23m",
+            "4" => "\x1b[24m",
+            _ => &self.reset_all[usize::from(alt)],
+        };
+        let mut out = String::with_capacity(code.len() + s.len() + reset.len() + 3);
+        out.push_str("\x1b[");
+        out.push_str(code);
+        out.push('m');
+        out.push_str(s);
+        out.push_str(reset);
+        out
+    }
+
+    // A background behind `s`, then the background reset (code_bg).
+    fn on_bg_only(&self, alt: bool, bg: Col, s: &str) -> String {
+        let reset = &self.reset_bg[usize::from(alt)];
+        match self.bg(bg) {
+            Some(b) => {
+                let mut out = String::with_capacity(b.len() + s.len() + reset.len() + 3);
+                out.push_str("\x1b[");
+                out.push_str(b);
+                out.push('m');
+                out.push_str(s);
+                out.push_str(reset);
+                out
+            }
+            None => format!("\x1b[{}m{s}{reset}", sgr_bg(bg)),
+        }
+    }
+
+    // Background and foreground behind `s`, then both resets (on_bg).
+    fn on_bg(&self, alt: bool, bg: Col, fg: Col, s: &str) -> String {
+        let a = usize::from(alt);
+        let (reset_bg, reset_fg) = (&self.reset_bg[a], &self.reset_fg[a]);
+        match (self.bg(bg), self.fg(fg)) {
+            (Some(b), Some(f)) => {
+                let mut out = String::with_capacity(
+                    b.len() + f.len() + s.len() + reset_bg.len() + reset_fg.len() + 4,
+                );
+                out.push_str("\x1b[");
+                out.push_str(b);
+                out.push(';');
+                out.push_str(f);
+                out.push('m');
+                out.push_str(s);
+                out.push_str(reset_bg);
+                out.push_str(reset_fg);
+                out
+            }
+            _ => format!("\x1b[{};{}m{s}{reset_bg}{reset_fg}", sgr_bg(bg), sgr_fg(fg)),
+        }
+    }
+}
+
+fn sgr_tables_at(tc: bool) -> [Sgr; 3] {
+    [
+        Sgr::new(&DARK, tc),
+        Sgr::new(&LIGHT, tc),
+        Sgr::new(&ANSI, tc),
+    ]
+}
+
+// The table for the theme in use. Only called with colour on, where the
+// depth is truecolor_term()'s.
+pub(super) fn sgr() -> &'static Sgr {
+    static TABLES: std::sync::OnceLock<[Sgr; 3]> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| sgr_tables_at(truecolor_term()));
+    // pal() settles the theme on first use; the index follows its mapping.
+    pal();
+    match THEME.load(Ordering::Relaxed) {
+        2 => &tables[1],
+        3 => &tables[2],
+        _ => &tables[0],
+    }
+}
+
+fn alt() -> bool {
+    ALT_SCREEN.load(Ordering::Relaxed)
+}
+
 // The theme's painted background, or nothing for themes that keep the
 // terminal's own.
-pub(super) fn theme_bg() -> String {
-    match pal().background {
-        Some(bg) if !no_color() => format!("\x1b[{}m", sgr_bg(bg)),
-        _ => String::new(),
+pub(super) fn theme_bg() -> &'static str {
+    if no_color() {
+        ""
+    } else {
+        &sgr().theme_bg
     }
 }
 
 // Back to plain text after a styled span. On the alternate screen that is
 // the theme's text colour on the theme's background, so a reset never
 // leaves a hole of terminal-default background in a painted screen.
-pub(super) fn reset_all() -> String {
+pub(super) fn reset_all() -> &'static str {
     if no_color() {
-        String::new()
-    } else if ALT_SCREEN.load(Ordering::Relaxed) {
-        format!("\x1b[0m\x1b[{}m{}", sgr_fg(pal().text), theme_bg())
+        ""
     } else {
-        "\x1b[0m".to_string()
+        &sgr().reset_all[usize::from(alt())]
     }
 }
 
-pub(super) fn reset_fg() -> String {
+// The background back to the theme's (alternate screen, painted themes) or
+// the terminal default, as a span's foreground reset does for text.
+pub(super) fn reset_bg() -> &'static str {
     if no_color() {
-        String::new()
-    } else if ALT_SCREEN.load(Ordering::Relaxed) {
-        format!("\x1b[{}m", sgr_fg(pal().text))
+        ""
     } else {
-        "\x1b[39m".to_string()
+        &sgr().reset_bg[usize::from(alt())]
     }
 }
 
@@ -415,7 +641,23 @@ pub(super) fn paint(c: Col, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    format!("\x1b[{}m{s}{}", sgr_fg(c), reset_fg())
+    sgr().paint(alt(), c, s)
+}
+
+// `s` on a background tint, the background then reset (code_bg).
+pub(super) fn paint_bg(bg: Col, s: &str) -> String {
+    if no_color() {
+        return s.to_string();
+    }
+    sgr().on_bg_only(alt(), bg, s)
+}
+
+// `s` in `fg` on `bg`, both reset afterwards (the diff spans, selection).
+pub(super) fn paint_on(bg: Col, fg: Col, s: &str) -> String {
+    if no_color() {
+        return s.to_string();
+    }
+    sgr().on_bg(alt(), bg, fg, s)
 }
 
 /// What `paint` wraps text in, per colour role, for a caller that paints
@@ -431,33 +673,27 @@ pub(crate) struct SpanPaint {
     pub reset: String,
 }
 
-pub(crate) fn span_paint() -> SpanPaint {
+/// The span escapes for the theme and screen in use; a lookup, not a build.
+pub(crate) fn span_paint() -> &'static SpanPaint {
+    static OFF: SpanPaint = SpanPaint {
+        accent: String::new(),
+        info: String::new(),
+        success: String::new(),
+        warning: String::new(),
+        muted: String::new(),
+        reset: String::new(),
+    };
     if no_color() {
-        return SpanPaint::default();
+        return &OFF;
     }
-    let p = pal();
-    let on = |c: Col| format!("\x1b[{}m", sgr_fg(c));
-    SpanPaint {
-        accent: on(p.accent),
-        info: on(p.info),
-        success: on(p.success),
-        warning: on(p.warning),
-        muted: on(p.muted),
-        reset: reset_fg(),
-    }
+    &sgr().span[usize::from(alt())]
 }
 
 pub(super) fn attr(code: &str, s: &str) -> String {
     if no_color() {
         return s.to_string();
     }
-    let reset = match code {
-        "1" => "\x1b[22m".to_string(),
-        "3" => "\x1b[23m".to_string(),
-        "4" => "\x1b[24m".to_string(),
-        _ => reset_all(),
-    };
-    format!("\x1b[{code}m{s}{reset}")
+    sgr().attr(alt(), code, s)
 }
 
 pub fn bold(s: &str) -> String {
@@ -511,5 +747,291 @@ pub fn mode_badge(mode: &str) -> String {
         format!("[{label}]")
     } else {
         format!("\x1b[{}m[{label}]{}", sgr_fg(color), reset_all())
+    }
+}
+
+// The colour helpers as they were before the SGR tables: every escape
+// formatted per call. Kept to check the tables send the same bytes, with
+// the palette, the screen and the colour depth passed in rather than read
+// from the globals, so the check covers every theme and mode without
+// switching the theme under other tests.
+#[cfg(test)]
+pub(super) mod before_tables {
+    use super::{cube, Col, Palette};
+
+    pub fn sgr_fg(c: Col, tc: bool) -> String {
+        match c {
+            Col::Rgb(r, g, b) if tc => format!("38;2;{r};{g};{b}"),
+            Col::Rgb(r, g, b) => format!("38;5;{}", 16 + 36 * cube(r) + 6 * cube(g) + cube(b)),
+            Col::Ansi(n) => n.to_string(),
+            Col::Default => "39".to_string(),
+        }
+    }
+
+    pub fn sgr_bg(c: Col, tc: bool) -> String {
+        match c {
+            Col::Rgb(r, g, b) if tc => format!("48;2;{r};{g};{b}"),
+            Col::Rgb(r, g, b) => format!("48;5;{}", 16 + 36 * cube(r) + 6 * cube(g) + cube(b)),
+            Col::Ansi(n) => (n + 10).to_string(),
+            Col::Default => "49".to_string(),
+        }
+    }
+
+    pub fn theme_bg(p: &Palette, tc: bool) -> String {
+        match p.background {
+            Some(bg) => format!("\x1b[{}m", sgr_bg(bg, tc)),
+            _ => String::new(),
+        }
+    }
+
+    pub fn reset_all(p: &Palette, alt: bool, tc: bool) -> String {
+        if alt {
+            format!("\x1b[0m\x1b[{}m{}", sgr_fg(p.text, tc), theme_bg(p, tc))
+        } else {
+            "\x1b[0m".to_string()
+        }
+    }
+
+    pub fn reset_fg(p: &Palette, alt: bool, tc: bool) -> String {
+        if alt {
+            format!("\x1b[{}m", sgr_fg(p.text, tc))
+        } else {
+            "\x1b[39m".to_string()
+        }
+    }
+
+    pub fn reset_bg(p: &Palette, alt: bool, tc: bool) -> String {
+        if alt && p.background.is_some() {
+            theme_bg(p, tc)
+        } else {
+            "\x1b[49m".to_string()
+        }
+    }
+
+    pub fn paint(p: &Palette, alt: bool, tc: bool, c: Col, s: &str) -> String {
+        format!("\x1b[{}m{s}{}", sgr_fg(c, tc), reset_fg(p, alt, tc))
+    }
+
+    pub fn attr(p: &Palette, alt: bool, tc: bool, code: &str, s: &str) -> String {
+        let reset = match code {
+            "1" => "\x1b[22m".to_string(),
+            "3" => "\x1b[23m".to_string(),
+            "4" => "\x1b[24m".to_string(),
+            _ => reset_all(p, alt, tc),
+        };
+        format!("\x1b[{code}m{s}{reset}")
+    }
+
+    pub fn code_bg(p: &Palette, alt: bool, tc: bool, s: &str) -> String {
+        if s.is_empty() {
+            return s.to_string();
+        }
+        format!(
+            "\x1b[{}m{s}{}",
+            sgr_bg(p.selection_bg, tc),
+            reset_bg(p, alt, tc)
+        )
+    }
+
+    pub fn on_bg(p: &Palette, alt: bool, tc: bool, bg: Col, fg: Col, s: &str) -> String {
+        format!(
+            "\x1b[{};{}m{s}{}{}",
+            sgr_bg(bg, tc),
+            sgr_fg(fg, tc),
+            reset_bg(p, alt, tc),
+            reset_fg(p, alt, tc)
+        )
+    }
+
+    // span_paint's fields: accent, info, success, warning, muted, reset.
+    pub fn span(p: &Palette, alt: bool, tc: bool) -> [String; 6] {
+        let on = |c: Col| format!("\x1b[{}m", sgr_fg(c, tc));
+        [
+            on(p.accent),
+            on(p.info),
+            on(p.success),
+            on(p.warning),
+            on(p.muted),
+            reset_fg(p, alt, tc),
+        ]
+    }
+
+    pub fn truecolor(colorterm: Option<&str>, term: &str) -> bool {
+        if let Some(ct) = colorterm {
+            if ct == "truecolor" || ct == "24bit" {
+                return true;
+            }
+            if ct == "256color" || ct == "no" || ct == "0" {
+                return false;
+            }
+        }
+        !(term == "linux" || term == "vt100" || term == "dumb")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::before_tables as old;
+    use super::*;
+
+    fn palettes() -> [&'static Palette; 3] {
+        let by_name = |n: &str| -> &'static Palette {
+            match n {
+                "dark" => &DARK,
+                "light" => &LIGHT,
+                "ansi" => &ANSI,
+                other => panic!("no palette for theme {other}"),
+            }
+        };
+        THEME_NAMES.map(by_name)
+    }
+
+    fn cols(p: &Palette) -> Vec<Col> {
+        let mut v = vec![
+            p.text,
+            p.accent,
+            p.muted,
+            p.success,
+            p.warning,
+            p.error,
+            p.info,
+            p.mode_plan,
+            p.mode_build,
+            p.mode_bstorm,
+            p.diff_add_bg,
+            p.diff_del_bg,
+            p.diff_add_emph_bg,
+            p.diff_del_emph_bg,
+            p.selection_bg,
+        ];
+        v.extend(p.background);
+        v.extend(p.wordmark);
+        v
+    }
+
+    const WORDS: [&str; 5] = ["", "x", "fn main()", "naïve 中文", "\x1b[1mnested\x1b[0m"];
+
+    // Every escape the tables hold, for every theme, both screens and both
+    // colour depths, against the per-call formatting they replace.
+    #[test]
+    fn sgr_tables_send_the_bytes_the_per_call_helpers_sent() {
+        for p in palettes() {
+            for tc in [false, true] {
+                let t = Sgr::new(p, tc);
+                assert_eq!(t.theme_bg, old::theme_bg(p, tc), "{} tc={tc}", p.name);
+                for alt in [false, true] {
+                    let a = usize::from(alt);
+                    let ctx = format!("{} alt={alt} tc={tc}", p.name);
+                    assert_eq!(t.reset_all[a], old::reset_all(p, alt, tc), "{ctx}");
+                    assert_eq!(t.reset_fg[a], old::reset_fg(p, alt, tc), "{ctx}");
+                    assert_eq!(t.reset_bg[a], old::reset_bg(p, alt, tc), "{ctx}");
+                    let sp = &t.span[a];
+                    let got = [
+                        sp.accent.clone(),
+                        sp.info.clone(),
+                        sp.success.clone(),
+                        sp.warning.clone(),
+                        sp.muted.clone(),
+                        sp.reset.clone(),
+                    ];
+                    assert_eq!(got, old::span(p, alt, tc), "{ctx}");
+                    for s in WORDS {
+                        for code in ["1", "3", "4", "2", "7", "9"] {
+                            assert_eq!(
+                                t.attr(alt, code, s),
+                                old::attr(p, alt, tc, code, s),
+                                "{ctx}"
+                            );
+                        }
+                        for c in cols(p) {
+                            assert_eq!(t.paint(alt, c, s), old::paint(p, alt, tc, c, s), "{ctx}");
+                            for fg in cols(p) {
+                                assert_eq!(
+                                    t.on_bg(alt, c, fg, s),
+                                    old::on_bg(p, alt, tc, c, fg, s),
+                                    "{ctx}"
+                                );
+                            }
+                        }
+                        if !s.is_empty() {
+                            assert_eq!(
+                                t.on_bg_only(alt, p.selection_bg, s),
+                                old::code_bg(p, alt, tc, s),
+                                "{ctx}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The helpers themselves, as the renderers call them, against the old
+    // formatting at the theme, screen and depth in use, including colours
+    // the palette does not name (they are formatted, not looked up).
+    #[test]
+    fn colour_helpers_match_the_per_call_formatting() {
+        std::env::remove_var("NO_COLOR");
+        let (p, alt, tc) = (pal(), ALT_SCREEN.load(Ordering::Relaxed), truecolor());
+        for s in WORDS {
+            assert_eq!(dim(s), old::paint(p, alt, tc, p.muted, s));
+            assert_eq!(red(s), old::paint(p, alt, tc, p.error, s));
+            assert_eq!(green(s), old::paint(p, alt, tc, p.success, s));
+            assert_eq!(yellow(s), old::paint(p, alt, tc, p.warning, s));
+            assert_eq!(blue(s), old::paint(p, alt, tc, p.info, s));
+            assert_eq!(cyan(s), old::paint(p, alt, tc, p.info, s));
+            assert_eq!(accent(s), old::paint(p, alt, tc, p.accent, s));
+            assert_eq!(text(s), old::paint(p, alt, tc, p.text, s));
+            assert_eq!(bold(s), old::attr(p, alt, tc, "1", s));
+            assert_eq!(italic(s), old::attr(p, alt, tc, "3", s));
+            assert_eq!(underline(s), old::attr(p, alt, tc, "4", s));
+            for c in [Col::Rgb(1, 2, 3), Col::Ansi(95), Col::Default] {
+                assert_eq!(paint(c, s), old::paint(p, alt, tc, c, s));
+                assert_eq!(
+                    paint_on(Col::Ansi(44), c, s),
+                    old::on_bg(p, alt, tc, Col::Ansi(44), c, s)
+                );
+            }
+            assert_eq!(
+                paint_on(p.diff_add_bg, p.success, s),
+                old::on_bg(p, alt, tc, p.diff_add_bg, p.success, s)
+            );
+        }
+        assert_eq!(theme_bg(), old::theme_bg(p, tc));
+        assert_eq!(reset_all(), old::reset_all(p, alt, tc));
+        assert_eq!(reset_bg(), old::reset_bg(p, alt, tc));
+        let sp = span_paint();
+        assert_eq!(sp.muted, old::span(p, alt, tc)[4]);
+        assert_eq!(sp.reset, old::span(p, alt, tc)[5]);
+        assert_eq!(
+            truecolor_term(),
+            old::truecolor(
+                std::env::var("COLORTERM").ok().as_deref(),
+                &std::env::var("TERM").unwrap_or_default()
+            )
+        );
+    }
+
+    #[test]
+    fn colour_depth_reads_colorterm_then_term_as_before() {
+        let cts = [
+            None,
+            Some("truecolor"),
+            Some("24bit"),
+            Some("256color"),
+            Some("no"),
+            Some("0"),
+            Some("yes"),
+            Some(""),
+        ];
+        for ct in cts {
+            for term in ["", "xterm-256color", "linux", "vt100", "dumb", "screen"] {
+                assert_eq!(
+                    truecolor_for(ct, term),
+                    old::truecolor(ct, term),
+                    "{ct:?} {term}"
+                );
+            }
+        }
     }
 }
