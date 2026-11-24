@@ -665,13 +665,16 @@ fn write_mcp_settings(home: &Path) {
 }
 
 fn write_mcp_settings_with(home: &Path, trust_hints: bool) {
+    // The tools are allowed by rule: after one MCP result, auto mode asks
+    // before the next MCP action, and these tests are about the plumbing.
     let settings = json!({
         "mcp_servers": {
             "fake": {
                 "command": "python3", "args": [FAKE_MCP], "timeout_secs": 20,
                 "trust_read_only_hints": trust_hints
             }
-        }
+        },
+        "permissions": {"allow": ["mcp__fake__*", "mcp_call"]}
     });
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
 }
@@ -740,13 +743,19 @@ fn mcp_tools_are_discovered_and_called_over_stdio() {
         .iter()
         .find(|e| e["name"] == "mcp__fake__echo")
         .expect("echo result");
-    assert_eq!(echo["content"], "echo: hello mcp");
+    assert_eq!(
+        echo["content"],
+        buildwithnexus::tools::untrusted_label("mcp__fake__echo", "echo: hello mcp")
+    );
     assert_eq!(echo["is_error"], false);
     let add = results
         .iter()
         .find(|e| e["name"] == "mcp__fake__add")
         .expect("add result");
-    assert_eq!(add["content"], "5");
+    assert_eq!(
+        add["content"],
+        buildwithnexus::tools::untrusted_label("mcp__fake__add", "5")
+    );
 }
 
 #[test]
@@ -794,7 +803,10 @@ fn mcp_read_only_hint_gates_under_readonly() {
         .iter()
         .find(|e| e["type"] == "tool_result" && e["name"] == "mcp__fake__add")
         .expect("add ran");
-    assert_eq!(add["content"], "42");
+    assert_eq!(
+        add["content"],
+        buildwithnexus::tools::untrusted_label("mcp__fake__add", "42")
+    );
 }
 
 #[test]
@@ -821,7 +833,10 @@ fn legacy_mcp_call_uses_the_same_connection() {
         .filter(|e| e["type"] == "tool_result" && e["name"] == "mcp_call")
         .collect();
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0]["content"], "echo: legacy");
+    assert_eq!(
+        results[0]["content"],
+        buildwithnexus::tools::untrusted_label("mcp_call", "echo: legacy")
+    );
     assert_eq!(results[0]["is_error"], false);
     // isError from the server surfaces as a tool error.
     assert_eq!(results[1]["content"], "boom");
@@ -5324,7 +5339,10 @@ fn a_stuck_mcp_server_is_skipped_after_a_few_seconds() {
         .iter()
         .find(|e| e["type"] == "tool_result" && e["name"] == "mcp__fake__echo")
         .expect("the ready server's tool ran");
-    assert_eq!(echo["content"], "echo: still here");
+    assert_eq!(
+        echo["content"],
+        buildwithnexus::tools::untrusted_label("mcp__fake__echo", "echo: still here")
+    );
 }
 
 #[test]
@@ -5365,7 +5383,11 @@ fn mcp_add_refuses_to_replace_without_force() {
 fn a_blocked_read_only_mcp_tool_names_the_setting_that_trusts_its_hint() {
     let home = tmp("home");
     let cwd = tmp("proj");
-    write_mcp_settings(&home);
+    // No allow rule: the point is the refusal.
+    let settings = json!({
+        "mcp_servers": {"fake": {"command": "python3", "args": [FAKE_MCP], "timeout_secs": 20}}
+    });
+    std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
     let port = serve(vec![
         tool_call("c1", "mcp__fake__add", json!({"a": 2, "b": 3})),
         finish("done"),
@@ -5534,7 +5556,10 @@ fn oauth_cli(
 
 #[cfg(unix)]
 fn write_oauth_settings(home: &Path, server: Value) {
-    let settings = json!({"mcp_servers": {"remote": server}});
+    let settings = json!({
+        "mcp_servers": {"remote": server},
+        "permissions": {"allow": ["mcp__remote__*"]}
+    });
     std::fs::write(home.join("settings.json"), settings.to_string()).unwrap();
 }
 
@@ -5657,9 +5682,18 @@ fn mcp_oauth_login_use_and_logout() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(who["content"], format!("hello {client}"));
+    assert_eq!(
+        who["content"],
+        buildwithnexus::tools::untrusted_label("mcp__remote__whoami", &format!("hello {client}"))
+    );
     let echoed = result("mcp__remote__echo_header");
-    assert_eq!(echoed["content"], "you sent: Bearer [redacted]");
+    assert_eq!(
+        echoed["content"],
+        buildwithnexus::tools::untrusted_label(
+            "mcp__remote__echo_header",
+            "you sent: Bearer [redacted]"
+        )
+    );
     let stdout_all: String = r.events.iter().map(|e| e.to_string()).collect();
     assert!(!stdout_all.contains(&access));
     assert!(!r.stderr.contains(&access));
@@ -7875,6 +7909,15 @@ fn screenshot_url_shows_a_local_page_to_the_model() {
     }
     assert!(r.success, "stderr: {}\n{:?}", r.stderr, r.events);
     assert_eq!(result["is_error"], false, "{content}");
+    // The page is someone else's text: it comes labelled.
+    let content = content
+        .strip_prefix(&buildwithnexus::tools::untrusted_label(
+            "screenshot_url",
+            "",
+        ))
+        .map(|_| content)
+        .unwrap_or(content);
+    let content = content.split_once("]\n").map_or(content, |(_, rest)| rest);
     assert!(
         content.starts_with(&format!("screenshot of {url} (400x300, HTTP 200)")),
         "{content}"
@@ -9787,7 +9830,7 @@ fn acp_mcp_servers_from_the_editor_are_connected_and_called() {
         .expect("the mcp call completed");
     assert_eq!(
         done["content"][0]["content"]["text"],
-        "echo: from the editor"
+        buildwithnexus::tools::untrusted_label("mcp__editor_fake__echo", "echo: from the editor")
     );
     let (_, stderr) = acp.close();
     assert!(

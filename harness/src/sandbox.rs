@@ -523,9 +523,20 @@ fn bwrap_argv(
 // handle `__confine-net`).
 fn confine_exe() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Some(p) = std::env::var_os("BWN_TEST_CONFINE_EXE") {
-        return Some(PathBuf::from(p));
+    {
+        // A test binary would take `__confine-net` for a test filter and
+        // run the suite: use the built bwn binary, found in an ancestor of
+        // the test binary, or leave the network unlimited.
+        if let Some(p) = std::env::var_os("BWN_TEST_CONFINE_EXE") {
+            return Some(PathBuf::from(p));
+        }
+        std::env::current_exe().ok().and_then(|t| {
+            t.ancestors()
+                .map(|a| a.join("buildwithnexus"))
+                .find(|p| p.is_file())
+        })
     }
+    #[cfg(not(test))]
     std::env::current_exe().ok()
 }
 
