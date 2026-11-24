@@ -642,6 +642,8 @@ fn stream_renderer_flushes_partial_last_line_rendered() {
 fn assert_cache_coherent(t: &Transcript) {
     let expect: Vec<Vec<String>> = t.lines.iter().map(|l| wrap_ansi_line(l, t.width)).collect();
     assert_eq!(t.wrapped, expect);
+    // The stored row count is the one a frame reads; it must match the rows.
+    assert_eq!(t.total_rows(), expect.iter().map(Vec::len).sum::<usize>());
 }
 
 #[test]
@@ -681,7 +683,9 @@ fn transcript_rows_range_matches_flattened_window() {
     let flat: Vec<String> = t.wrapped.iter().flatten().cloned().collect();
     let total = t.total_rows();
     assert_eq!(total, flat.len());
-    for start in [0usize, 1, 5, total.saturating_sub(3), total] {
+    // Every start: the window is found from the front in the top half and
+    // from the back in the bottom half, and both must agree with the flat rows.
+    for start in 0..=total {
         for count in [0usize, 1, 4, total] {
             let got: Vec<String> = t.rows_range(start, count).into_iter().cloned().collect();
             let want: Vec<String> = flat.iter().skip(start).take(count).cloned().collect();

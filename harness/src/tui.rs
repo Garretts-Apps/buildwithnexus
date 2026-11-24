@@ -4,6 +4,7 @@
 // "\r\n" and we echo keystrokes ourselves. Falls back to cooked line input when
 // stdout isn't a TTY, so piped/headless use is unaffected.
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -148,10 +149,15 @@ struct Selection {
 // keystroke / scroll tick — the single biggest source of TUI lag on long
 // sessions. Instead each line is wrapped once when it lands (or when it
 // mutates), and a resize rewraps everything exactly once.
+// Kept as rings: at the line cap every new line drops the oldest, and a
+// ring drops it without moving the other 1,999. `rows` is the total of
+// `wrapped`'s lengths, kept in step as lines change, so a frame does not
+// add up every line to find the bottom of the transcript.
 struct Transcript {
-    lines: Vec<String>,
-    wrapped: Vec<Vec<String>>, // parallel to `lines`, wrapped at `width`
-    width: usize,              // 0 = not yet sized
+    lines: VecDeque<String>,
+    wrapped: VecDeque<Vec<String>>, // parallel to `lines`, wrapped at `width`
+    rows: usize,                    // sum of `wrapped[i].len()`
+    width: usize,                   // 0 = not yet sized
     height: usize,             // terminal rows the wrap was made for (images)
     // The line last appended to and where its wrap stands: the next chunk
     // of a streamed line is wrapped from there (`append_to`). Dropped by
@@ -225,8 +231,9 @@ pub mod bench {
 impl Transcript {
     const fn new() -> Self {
         Transcript {
-            lines: Vec::new(),
-            wrapped: Vec::new(),
+            lines: VecDeque::new(),
+            wrapped: VecDeque::new(),
+            rows: 0,
             width: 0,
             height: 0,
             open: None,
@@ -246,8 +253,16 @@ impl Transcript {
 
     fn push(&mut self, s: String) {
         let w = self.cur_width();
-        self.wrapped.push(wrap_ansi_line(&s, w));
-        self.lines.push(s);
+        let rows = wrap_ansi_line(&s, w);
+        self.rows += rows.len();
+        self.wrapped.push_back(rows);
+        self.lines.push_back(s);
+    }
+
+    // Put `rows` in at `i`, keeping the row total in step.
+    fn replace_rows(&mut self, i: usize, rows: Vec<String>) {
+        self.rows = self.rows - self.wrapped[i].len() + rows.len();
+        self.wrapped[i] = rows;
     }
 
     fn same_at(&self, i: usize, s: &str) -> bool {
@@ -260,7 +275,7 @@ impl Transcript {
         }
         let w = self.cur_width();
         self.open = None;
-        self.wrapped[i] = wrap_ansi_line(&s, w);
+        self.replace_rows(i, wrap_ansi_line(&s, w));
         self.lines[i] = s;
     }
 
@@ -276,17 +291,19 @@ impl Transcript {
         let w = self.cur_width();
         let line = &self.lines[i];
         if let Some((at, st)) = self.open.as_mut() {
+            let before = self.wrapped[i].len();
             if *at == i
                 && st.max_cols == w
                 && st.lead_final
                 && !line.starts_with(IMG_MARK)
                 && st.feed(&mut self.wrapped[i], line)
             {
+                self.rows = self.rows - before + self.wrapped[i].len();
                 return true;
             }
         }
         let (rows, st) = wrap_ansi_open(line, w);
-        self.wrapped[i] = rows;
+        self.replace_rows(i, rows);
         self.open = st.map(|st| (i, st));
         true
     }
@@ -295,7 +312,9 @@ impl Transcript {
         if i < self.lines.len() {
             self.open = None;
             self.lines.remove(i);
-            self.wrapped.remove(i);
+            if let Some(rows) = self.wrapped.remove(i) {
+                self.rows -= rows.len();
+            }
         }
     }
 
@@ -303,13 +322,16 @@ impl Transcript {
         let n = n.min(self.lines.len());
         self.open = None;
         self.lines.drain(0..n);
-        self.wrapped.drain(0..n);
+        for rows in self.wrapped.drain(0..n) {
+            self.rows -= rows.len();
+        }
     }
 
     fn clear(&mut self) {
         self.open = None;
         self.lines.clear();
         self.wrapped.clear();
+        self.rows = 0;
     }
 
     // Rewrap everything if the terminal width changed (resize only).
@@ -318,6 +340,7 @@ impl Transcript {
             self.open = None;
             self.width = w;
             self.wrapped = self.lines.iter().map(|l| wrap_ansi_line(l, w)).collect();
+            self.rows = self.wrapped.iter().map(Vec::len).sum();
         }
     }
 
@@ -331,15 +354,27 @@ impl Transcript {
     }
 
     fn total_rows(&self) -> usize {
-        self.wrapped.iter().map(|w| w.len()).sum()
+        self.rows
     }
 
     // The visible window: `count` wrapped rows starting at row `start`,
-    // without materializing the full flattened transcript.
+    // without materializing the full flattened transcript. The line holding
+    // row `start` is found from whichever end is nearer, so following the
+    // newest output costs the lines on screen, not the lines kept.
     fn rows_range(&self, start: usize, count: usize) -> Vec<&String> {
         let mut out = Vec::with_capacity(count);
-        let mut skipped = 0usize;
-        for w in &self.wrapped {
+        let (mut first, mut skipped) = (0usize, 0usize);
+        if start > self.rows / 2 {
+            let mut row = self.rows;
+            for (i, w) in self.wrapped.iter().enumerate().rev() {
+                row -= w.len();
+                if row <= start {
+                    (first, skipped) = (i, row);
+                    break;
+                }
+            }
+        }
+        for w in self.wrapped.range(first..) {
             if out.len() >= count {
                 break;
             }
@@ -1263,6 +1298,9 @@ fn footer_row() -> u16 {
 
 pub fn char_width(c: char) -> usize {
     let u = c as u32;
+    if u < 0x0300 {
+        return 1;
+    }
     if (0x0300..=0x036F).contains(&u)
         || (0x1AB0..=0x1AFF).contains(&u)
         || (0x20D0..=0x20FF).contains(&u)
@@ -1295,6 +1333,10 @@ pub fn char_width(c: char) -> usize {
 }
 
 pub fn str_width(s: &str) -> usize {
+    // One column per byte for ASCII (char_width's answer for every one).
+    if s.is_ascii() {
+        return s.len();
+    }
     s.chars().map(char_width).sum()
 }
 
@@ -3589,8 +3631,10 @@ struct WrapState {
     // id colour would break its placeholder cells).
     active: String,
     // Last place this row may break: byte offset just after a space that
-    // follows some text, the columns used up to it, and the SGR state there.
-    brk: Option<(usize, usize, String)>,
+    // follows some text, the columns used up to it, and the SGR state there
+    // (None: the same as `active` now; it is copied only if `active`
+    // changes before the break is used, not at every space).
+    brk: Option<(usize, usize, Option<String>)>,
     seen_text: bool,
     // Bytes of the line taken in.
     pos: usize,
@@ -3666,6 +3710,9 @@ impl WrapState {
                 let seq = &current[start..];
                 self.pos += seq.len();
                 if seq.ends_with('m') && seq.starts_with("\x1b[") {
+                    if let Some((_, _, saved @ None)) = self.brk.as_mut() {
+                        *saved = Some(self.active.clone());
+                    }
                     if seq == "\x1b[0m" || seq == "\x1b[m" {
                         self.active.clear();
                     } else {
@@ -3686,6 +3733,7 @@ impl WrapState {
                     Some((at, cols, sgr)) => {
                         let rest = current.split_off(at);
                         rows.push(std::mem::take(&mut current));
+                        let sgr = sgr.as_deref().unwrap_or(&self.active);
                         current = format!("{sgr}{pad}{rest}");
                         self.visible = indent + self.visible - cols;
                     }
@@ -3704,7 +3752,7 @@ impl WrapState {
             self.visible += w;
             if c == ' ' {
                 if self.seen_text {
-                    self.brk = Some((current.len(), self.visible, self.active.clone()));
+                    self.brk = Some((current.len(), self.visible, None));
                 }
             } else {
                 self.seen_text = true;
