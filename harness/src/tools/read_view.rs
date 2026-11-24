@@ -22,11 +22,10 @@ const CHUNK: usize = 128 * 1024;
 pub(super) fn count_newlines(bytes: &[u8]) -> usize {
     const LANES: usize = 32;
     let mut total = 0usize;
-    let mut groups = bytes.chunks_exact(LANES * 255);
-    for group in groups.by_ref() {
+    let (groups, rest) = bytes.as_chunks::<{ LANES * 255 }>();
+    for group in groups {
         total += count_blocks(group);
     }
-    let rest = groups.remainder();
     let tail = rest.len() / LANES * LANES;
     total += count_blocks(&rest[..tail]);
     total + rest[tail..].iter().filter(|&&b| b == b'\n').count()
@@ -35,7 +34,7 @@ pub(super) fn count_newlines(bytes: &[u8]) -> usize {
 // Newlines in at most 255 whole 32-byte blocks.
 fn count_blocks(blocks: &[u8]) -> usize {
     let mut lanes = [0u8; 32];
-    for block in blocks.chunks_exact(32) {
+    for block in blocks.as_chunks::<32>().0 {
         for (lane, &b) in lanes.iter_mut().zip(block) {
             *lane += u8::from(b == b'\n');
         }
