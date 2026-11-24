@@ -8,6 +8,9 @@
 //! this backend `.git` and `.buildwithnexus` inside the workspace are
 //! writable too. Writes outside the workspace and the temp dirs still fail.
 //!
+//! Reads are allowed everywhere except the user's credential stores
+//! (sandbox::hidden_paths), which no rule grants; see `allow_reads_except`.
+//!
 //! The ruleset is built in the parent. The child, after `fork` and before
 //! `exec`, drops new privileges, restricts itself to the ruleset, and
 //! installs the seccomp filter. The parent process is never restricted.
@@ -24,6 +27,7 @@ const RULE_PATH_BENEATH: u32 = 1;
 
 // Landlock ABI 1 write-ish rights, plus ABI 2's truncate and refer. A right
 // the running ABI does not know is dropped before the ruleset is created.
+const FS_READ_FILE: u64 = 1 << 2;
 const FS_WRITE_FILE: u64 = 1 << 1;
 const FS_REMOVE_DIR: u64 = 1 << 4;
 const FS_REMOVE_FILE: u64 = 1 << 5;
@@ -59,8 +63,8 @@ struct PathBeneathAttr {
     parent_fd: i32,
 }
 
-/// Directories and device nodes a Landlock-sandboxed command may write.
-/// Reads stay allowed everywhere, because the ruleset does not handle them.
+/// Directories and device nodes a Landlock-sandboxed command may write (and
+/// read).
 pub fn write_roots(cwd: &Path, extra: &[PathBuf], tmpdir: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut push = |p: &Path| {
@@ -114,9 +118,19 @@ fn handled_access(version: i32) -> u64 {
 /// A ruleset fd that allows writes only under `write_roots`. The caller
 /// closes it. Fails when the kernel has no Landlock or a writable root
 /// that must exist (the workspace) cannot be opened.
-pub fn ruleset(cwd: &Path, extra: &[PathBuf], tmpdir: Option<&Path>) -> io::Result<RawFd> {
+///
+/// With `hidden` paths, reading files is handled too: everything stays
+/// readable except those paths (see `allow_reads_except`).
+pub fn ruleset(
+    cwd: &Path,
+    extra: &[PathBuf],
+    tmpdir: Option<&Path>,
+    hidden: &[PathBuf],
+) -> io::Result<RawFd> {
     let version = abi()?;
-    let access = handled_access(version);
+    let write = handled_access(version);
+    let read = if hidden.is_empty() { 0 } else { FS_READ_FILE };
+    let access = write | read;
     let attr = RulesetAttr {
         handled_access_fs: access,
     };
@@ -135,7 +149,7 @@ pub fn ruleset(cwd: &Path, extra: &[PathBuf], tmpdir: Option<&Path>) -> io::Resu
     let fd = fd as RawFd;
     let roots = write_roots(cwd, extra, tmpdir);
     for (i, root) in roots.iter().enumerate() {
-        if let Err(e) = add_path(fd, root, access) {
+        if let Err(e) = add_path(fd, root, write | read) {
             // The workspace itself must be writable. Device nodes and /tmp
             // are best-effort: a container without /dev/shm still confines.
             if i == 0 {
@@ -144,7 +158,69 @@ pub fn ruleset(cwd: &Path, extra: &[PathBuf], tmpdir: Option<&Path>) -> io::Resu
             }
         }
     }
+    if read != 0 {
+        allow_reads_except(fd, hidden);
+    }
     Ok(fd)
+}
+
+/// Whether Landlock can keep `hidden` unreadable for a command whose
+/// writable roots are `roots`: a rule grants everything beneath its path,
+/// so a root that holds a hidden path (a session run from the home folder)
+/// would make it readable again, and Landlock cannot carve it out.
+pub fn can_hide(roots: &[&Path], hidden: &[PathBuf]) -> bool {
+    !hidden
+        .iter()
+        .any(|h| roots.iter().any(|r| h.starts_with(r)))
+}
+
+// Landlock only grants: there is no rule that takes a path away. So every
+// path is made readable except the hidden ones by walking from `/` down to
+// each hidden path and granting the siblings met on the way: the entries of
+// `/` but `home`, the entries of `/home` but the user's folder, and so on.
+// Symlinks are skipped (a rule on one would grant its target, which may be
+// a hidden path); what they point to is readable through its own rule.
+// Entries created later in those few folders are not readable, which is
+// fine: a command cannot create them, since it cannot write there.
+fn allow_reads_except(ruleset: RawFd, hidden: &[PathBuf]) {
+    use std::collections::{HashMap, HashSet};
+    let mut on_path: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
+    for h in hidden {
+        let mut child = h.as_path();
+        while let Some(parent) = child.parent() {
+            if let Some(name) = child.file_name() {
+                on_path
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .insert(name.to_os_string());
+            }
+            child = parent;
+        }
+    }
+    let mut stack = vec![PathBuf::from("/")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let skip = on_path.get(&dir);
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let path = e.path();
+            if skip.is_some_and(|s| s.contains(&name)) {
+                if !hidden.contains(&path) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            match e.file_type() {
+                Ok(t) if t.is_symlink() => {}
+                Ok(_) => {
+                    let _ = add_path(ruleset, &path, FS_READ_FILE);
+                }
+                Err(_) => {}
+            }
+        }
+    }
 }
 
 fn add_path(ruleset: RawFd, path: &Path, access: u64) -> io::Result<()> {
@@ -216,7 +292,18 @@ pub fn engage(ruleset: RawFd, block_network: bool) -> io::Result<()> {
 pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], network: bool) -> Result<Command, String> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
-    let fd = ruleset(&cwd, extra, tmp.as_deref())
+    let roots: Vec<&Path> = std::iter::once(cwd.as_path())
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    let hidden = crate::sandbox::hidden_paths(&roots);
+    // A root that holds a hidden path cannot have it carved out; the
+    // session reports reads as not confined then (sandbox::hides_reads).
+    let hidden = if can_hide(&roots, &hidden) {
+        hidden
+    } else {
+        Vec::new()
+    };
+    let fd = ruleset(&cwd, extra, tmp.as_deref(), &hidden)
         .map_err(|e| format!("landlock ruleset: {e} (the kernel may not have Landlock enabled)"))?;
     // SAFETY: ruleset returned a fresh fd that nothing else owns.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };

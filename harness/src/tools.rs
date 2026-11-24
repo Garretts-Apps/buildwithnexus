@@ -3223,6 +3223,23 @@ const SENSITIVE_FILES: &[&str] = &[
     ".env",
 ];
 
+/// The credential stores in `home` that sandboxed commands must not read:
+/// each sensitive folder and sub-path, and each sensitive file that lives in
+/// the home folder itself. A project's own `.env` is not listed: commands
+/// run the project and read it. Paths are returned whether or not they
+/// exist; the sandbox keeps the ones that do.
+pub(crate) fn credential_stores(home: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = SENSITIVE_DIRS.iter().map(|d| home.join(d)).collect();
+    v.extend(SENSITIVE_SUBPATHS.iter().map(|[a, b]| home.join(a).join(b)));
+    v.extend(
+        SENSITIVE_FILES
+            .iter()
+            .filter(|f| **f != ".env")
+            .map(|f| home.join(f)),
+    );
+    v
+}
+
 fn is_sensitive_dir_name(name: &str, windows: bool) -> bool {
     SENSITIVE_DIRS.iter().any(|d| name_is(name, d, windows))
 }
@@ -4275,6 +4292,11 @@ fn command_outcome(cap: CommandCapture, timeout: Duration) -> Outcome {
         if let Some(note) = crate::sandbox::git_write_blocked_note(&s) {
             s.push('\n');
             s.push_str(note);
+        } else if let Some(note) =
+            crate::sandbox::hidden_note(&s, &crate::sandbox::hidden_paths(&[]))
+        {
+            s.push('\n');
+            s.push_str(&note);
         }
     }
     s.push_str(&format!("\n[exit {code}]"));

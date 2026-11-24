@@ -9,8 +9,10 @@
 //! Landlock and seccomp backend. macOS uses `sandbox-exec`. Windows has none.
 //!
 //! Confined: writes anywhere but the working directory and the temp dirs;
-//! the network when `sandbox_network` is false. Not confined: reads, the
-//! agent's own file tools (already fenced to cwd), hooks, MCP servers.
+//! reads of the user's credential stores and the SSH agent's socket (see
+//! `hidden_paths`); the network when `sandbox_network` is false. Not
+//! confined: other reads, the agent's own file tools (already fenced to cwd
+//! and gated on sensitive paths), hooks, MCP servers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -107,6 +109,99 @@ pub fn set_network(allowed: bool) {
 
 pub fn network() -> bool {
     NETWORK.load(Ordering::Relaxed)
+}
+
+// ── credential stores hidden from commands ───────────────────────────────────
+// Sandboxed commands may read the whole filesystem except the user's
+// credential stores (~/.ssh, ~/.aws, ~/.config/gh, ~/.netrc, bwn's own
+// folder, …, see tools::credential_stores) and the SSH agent's socket. A
+// command reaches a path however it spells it, so this is enforced by the
+// backend at the resolved path, not by reading the command. Paths listed in
+// `sandbox_expose` stay readable.
+
+static EXPOSE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Set the `sandbox_expose` list (`~` expanded).
+pub fn set_expose(paths: &[String]) {
+    let home = crate::config::user_home();
+    let v = paths
+        .iter()
+        .map(|p| match (p.strip_prefix("~/"), &home) {
+            (Some(rest), Some(h)) => h.join(rest),
+            _ => PathBuf::from(p),
+        })
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect();
+    *EXPOSE.lock().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// The paths a command run in `roots` (the workspace first, then folders
+/// added with --add-dir) must not read: each credential store that exists,
+/// bwn's own folder and the SSH agent's socket, resolved through symlinks.
+/// A store that holds a root is left alone (hiding it would hide the
+/// workspace), and so is one the user exposed.
+pub fn hidden_paths(roots: &[&Path]) -> Vec<PathBuf> {
+    let Some(home) = crate::config::user_home() else {
+        return Vec::new();
+    };
+    let expose = EXPOSE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    hidden_paths_in(
+        &home,
+        &crate::config::home(),
+        std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+        &expose,
+        roots,
+    )
+}
+
+fn hidden_paths_in(
+    home: &Path,
+    bwn_home: &Path,
+    agent_socket: Option<PathBuf>,
+    expose: &[PathBuf],
+    roots: &[&Path],
+) -> Vec<PathBuf> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.to_path_buf()))
+        .collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let candidates = crate::tools::credential_stores(home)
+        .into_iter()
+        .chain([bwn_home.to_path_buf()])
+        .chain(agent_socket);
+    for c in candidates {
+        if c.symlink_metadata().is_err() {
+            continue;
+        }
+        let c = c.canonicalize().unwrap_or(c);
+        if c == Path::new("/") || out.contains(&c) {
+            continue;
+        }
+        if roots.iter().any(|r| r.starts_with(&c)) || expose.iter().any(|e| c.starts_with(e)) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Appended to a sandboxed command's output when it failed on a hidden path.
+pub fn hidden_note(output: &str, hidden: &[PathBuf]) -> Option<String> {
+    let l = output.to_ascii_lowercase();
+    let denied = l.contains("permission denied")
+        || l.contains("operation not permitted")
+        || l.contains("no such file")
+        || l.contains("not found");
+    let hit = hidden
+        .iter()
+        .find(|p| output.contains(p.to_string_lossy().as_ref()))?;
+    denied.then(|| {
+        format!(
+            "{} is hidden from sandboxed commands (credentials stay out of reach of a command the model chose). To let commands read it, add it to \"sandbox_expose\" in settings.json.",
+            hit.display()
+        )
+    })
 }
 
 /// Apply the `sandbox` / `sandbox_network` settings (or the `--sandbox`
@@ -235,12 +330,17 @@ fn detect_linux() -> Result<Backend, String> {
 /// Folders added with --add-dir are bound read-write the same way, each with
 /// its own `.git` and `.buildwithnexus` kept read-only.
 pub fn bwrap_args(cmd: &str, cwd: &Path, network: bool) -> Vec<String> {
-    bwrap_argv(cmd, cwd, &crate::workdirs::list(), network, true)
+    let extra = crate::workdirs::list();
+    let roots: Vec<&Path> = std::iter::once(cwd)
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    let hidden = hidden_paths(&roots);
+    bwrap_argv(cmd, cwd, &extra, network, true, &hidden)
 }
 
 // The availability probe runs at `/` and must not mount anything there.
 fn bwrap_probe_args() -> Vec<String> {
-    bwrap_argv("true", Path::new("/"), &[], true, false)
+    bwrap_argv("true", Path::new("/"), &[], true, false, &[])
 }
 
 fn bwrap_argv(
@@ -249,6 +349,7 @@ fn bwrap_argv(
     extra: &[PathBuf],
     network: bool,
     protect: bool,
+    hidden: &[PathBuf],
 ) -> Vec<String> {
     let roots: Vec<&Path> = std::iter::once(cwd)
         .chain(extra.iter().map(PathBuf::as_path))
@@ -314,6 +415,26 @@ fn bwrap_argv(
                 "--remount-ro".to_string(),
                 p.clone(),
             ]);
+        }
+    }
+    // Credential stores: an empty read-only folder over each folder, the
+    // empty /dev/null over each file. /tmp and /run are already private,
+    // so a path under them (the usual SSH agent socket) is gone anyway and
+    // has no mount point to cover.
+    for p in hidden {
+        if p.starts_with("/tmp") || p.starts_with("/run") {
+            continue;
+        }
+        let s = p.to_string_lossy().into_owned();
+        if p.is_dir() {
+            a.extend([
+                "--tmpfs".to_string(),
+                s.clone(),
+                "--remount-ro".to_string(),
+                s,
+            ]);
+        } else {
+            a.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s]);
         }
     }
     a.extend(["--chdir", &cwd, "--", "sh", "-c", cmd].map(str::to_string));
@@ -557,6 +678,7 @@ pub fn seatbelt_profile(
     extra: &[PathBuf],
     tmpdir: Option<&Path>,
     network: bool,
+    hidden: &[PathBuf],
 ) -> String {
     let mut p =
         String::from("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
@@ -585,6 +707,27 @@ pub fn seatbelt_profile(
     if !network {
         p.push_str("(deny network*)\n");
     }
+    // Credential stores: no reads of a folder's contents or of a file, and
+    // no connection to the SSH agent's socket (a connect is not a read).
+    if !hidden.is_empty() {
+        p.push_str("(deny file-read*");
+        for h in hidden {
+            let q = sbpl_quote(h);
+            if h.is_dir() {
+                p.push_str(&format!("\n  (subpath {q})"));
+            } else {
+                p.push_str(&format!("\n  (literal {q})"));
+            }
+        }
+        p.push_str(")\n(deny network-outbound");
+        for h in hidden {
+            p.push_str(&format!(
+                "\n  (remote unix-socket (path-literal {}))",
+                sbpl_quote(h)
+            ));
+        }
+        p.push_str(")\n");
+    }
     p
 }
 
@@ -602,9 +745,13 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
                 .and_then(|t| t.canonicalize().ok());
             let mut c = Command::new("sandbox-exec");
             let extra = crate::workdirs::list();
+            let roots: Vec<&Path> = std::iter::once(cwd.as_path())
+                .chain(extra.iter().map(PathBuf::as_path))
+                .collect();
+            let hidden = hidden_paths(&roots);
             c.args([
                 "-p",
-                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), network()),
+                &seatbelt_profile(&cwd, &extra, tmp.as_deref(), network(), &hidden),
             ]);
             c.args(["sh", "-c", cmd]);
             c
@@ -683,6 +830,29 @@ pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
         Some(GIT_WRITE_BLOCKED)
     } else {
         None
+    }
+}
+
+/// Whether a command run now, in `cwd`, is kept from reading the credential
+/// stores: bubblewrap and Seatbelt always hide them; Landlock does unless
+/// the workspace holds one (a session run from the home folder). False when
+/// commands run unsandboxed.
+pub fn hides_reads(cwd: &Path) -> bool {
+    if mode() == Mode::Off {
+        return false;
+    }
+    match decide(mode(), backend()) {
+        Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
+        #[cfg(target_os = "linux")]
+        Decision::Sandboxed(Backend::Landlock) => {
+            let extra = crate::workdirs::list();
+            let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+            let roots: Vec<&Path> = std::iter::once(cwd.as_path())
+                .chain(extra.iter().map(PathBuf::as_path))
+                .collect();
+            crate::landlock::can_hide(&roots, &hidden_paths(&roots))
+        }
+        _ => false,
     }
 }
 
@@ -812,7 +982,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bwrap_argv_binds_only_the_workspace_rw() {
-        let a = bwrap_args("echo hi", Path::new("/work/proj"), true);
+        // No hidden paths here: those depend on this machine's home folder
+        // and have tests of their own below.
+        let a = bwrap_argv("echo hi", Path::new("/work/proj"), &[], true, true, &[]);
         let s = a.join(" ");
         assert!(s.starts_with("--unshare-all --share-net --die-with-parent --new-session "));
         assert!(s.contains("--ro-bind / /"));
@@ -823,7 +995,7 @@ mod tests {
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 1);
         assert_eq!(&a[a.len() - 4..], ["--", "sh", "-c", "echo hi"]);
         // Network off drops --share-net and nothing else.
-        let off = bwrap_args("echo hi", Path::new("/work/proj"), false);
+        let off = bwrap_argv("echo hi", Path::new("/work/proj"), &[], false, true, &[]);
         assert!(!off.contains(&"--share-net".to_string()));
         assert_eq!(off.len(), a.len() - 1);
     }
@@ -832,7 +1004,7 @@ mod tests {
     #[test]
     fn added_folders_are_bound_writable_with_their_git_read_only() {
         let extra = [PathBuf::from("/work/lib"), PathBuf::from("/srv/data")];
-        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, false, true);
+        let a = bwrap_argv("true", Path::new("/work/proj"), &extra, false, true, &[]);
         let s = a.join(" ");
         assert_eq!(a.iter().filter(|x| *x == "--bind").count(), 3, "{s}");
         let at = |needle: &str| {
@@ -846,7 +1018,7 @@ mod tests {
             assert!(bind < at(&format!("--remount-ro {d}/.buildwithnexus")));
         }
         assert!(at("--chdir /work/proj") > at("/srv/data/.buildwithnexus"));
-        let p = seatbelt_profile(Path::new("/w"), &extra, None, false);
+        let p = seatbelt_profile(Path::new("/w"), &extra, None, false, &[]);
         let (allow, deny) = p.split_once("(deny file-write*\n").unwrap();
         assert!(
             allow.contains("(subpath \"/work/lib\")") && allow.contains("(subpath \"/srv/data\")")
@@ -889,7 +1061,7 @@ mod tests {
             let bind = format!("--ro-bind {p} {p}", p = p.display());
             assert!(s.find(&bind).is_some_and(|at| at > rw), "{bind}: {s}");
         }
-        let profile = seatbelt_profile(&ws, &[], None, true);
+        let profile = seatbelt_profile(&ws, &[], None, true, &[]);
         let deny = profile.split_once("(deny file-write*\n").unwrap().1;
         for p in &want {
             assert!(deny.contains(&sbpl_quote(p)), "{p:?}: {profile}");
@@ -1064,6 +1236,7 @@ mod tests {
             &[],
             Some(Path::new("/private/var/folders/xy/T")),
             true,
+            &[],
         );
         assert!(p.starts_with("(version 1)\n(allow default)\n(deny file-write*)\n"));
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"\")"));
@@ -1077,7 +1250,7 @@ mod tests {
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
         assert!(!p.contains("network"));
-        let no_net = seatbelt_profile(Path::new("/w"), &[], None, false);
+        let no_net = seatbelt_profile(Path::new("/w"), &[], None, false, &[]);
         assert!(no_net.ends_with("(deny network*)\n"));
         assert!(!no_net.contains("folders"));
     }
@@ -1172,5 +1345,243 @@ mod tests {
         crate::workdirs::clear();
         let _ = std::fs::remove_dir_all(&added);
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // A home folder with credential stores, outside /tmp (bubblewrap
+    // replaces /tmp, and Landlock lets commands write and read it).
+    #[cfg(target_os = "linux")]
+    fn fake_home(tag: &str) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
+            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+        let home = base.join(format!("bwn-hide-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".config/gh")).unwrap();
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::write(home.join(".ssh/id_test"), "KEY-MATERIAL\n").unwrap();
+        std::fs::write(home.join(".config/gh/hosts.yml"), "GH-TOKEN\n").unwrap();
+        std::fs::write(home.join(".netrc"), "NETRC\n").unwrap();
+        std::fs::write(home.join("notes.txt"), "plain\n").unwrap();
+        std::fs::write(home.join(".config/other.toml"), "other\n").unwrap();
+        let home = home.canonicalize().unwrap();
+        let ws = home.join("proj");
+        std::os::unix::fs::symlink(home.join(".ssh"), ws.join("keys")).unwrap();
+        let hidden = hidden_paths_in(&home, &home.join(".buildwithnexus"), None, &[], &[&ws]);
+        (home, ws, hidden)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_hidden(run: impl Fn(&str) -> std::process::Output, home: &Path) {
+        let ok = |cmd: &str| {
+            let o = run(cmd);
+            assert!(o.status.success(), "{cmd}: {o:?}");
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let denied = |cmd: &str| {
+            let o = run(cmd);
+            let out = String::from_utf8_lossy(&o.stdout);
+            assert!(
+                !out.contains("KEY-MATERIAL") && !out.contains("TOKEN") && !out.contains("NETRC"),
+                "{cmd} read a hidden file: {o:?}"
+            );
+        };
+        assert_eq!(
+            ok(&format!("cat '{}/notes.txt'", home.display())),
+            "plain\n"
+        );
+        assert_eq!(
+            ok(&format!("cat '{}/.config/other.toml'", home.display())),
+            "other\n"
+        );
+        assert_eq!(ok("echo x > made.txt && cat made.txt"), "x\n");
+        denied(&format!("cat '{}/.ssh/id_test'", home.display()));
+        denied("cat keys/id_test");
+        denied(&format!("cd '{}' && cat .ssh/id_test", home.display()));
+        denied(&format!("cat '{}/.config/gh/hosts.yml'", home.display()));
+        denied(&format!("cat '{}/.netrc'", home.display()));
+        denied(&format!(
+            "cat $(printf '%s/.%s/id_test' '{}' ssh)",
+            home.display()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_paths_lists_existing_stores_and_spares_the_rest() {
+        let (home, ws, hidden) = fake_home("list");
+        assert!(hidden.contains(&home.join(".ssh")));
+        assert!(hidden.contains(&home.join(".config/gh")));
+        assert!(hidden.contains(&home.join(".netrc")));
+        assert!(!hidden
+            .iter()
+            .any(|h| h.ends_with("notes.txt") || h.ends_with(".aws")));
+        // Exposed by the user: readable again.
+        let exposed = hidden_paths_in(
+            &home,
+            &home.join(".buildwithnexus"),
+            None,
+            &[home.join(".ssh")],
+            &[&ws],
+        );
+        assert!(!exposed.contains(&home.join(".ssh")));
+        // A workspace inside a store keeps it visible: hiding it would hide
+        // the workspace too.
+        let inside = hidden_paths_in(
+            &home,
+            &home.join(".buildwithnexus"),
+            None,
+            &[],
+            &[&home.join(".config/gh")],
+        );
+        assert!(!inside.contains(&home.join(".config/gh")));
+        // The agent socket is hidden wherever it is.
+        let sock = home.join("agent.sock");
+        std::fs::write(&sock, "").unwrap();
+        let with_sock = hidden_paths_in(
+            &home,
+            &home.join(".buildwithnexus"),
+            Some(sock.clone()),
+            &[],
+            &[&ws],
+        );
+        assert!(with_sock.contains(&sock));
+        let note = hidden_note(
+            &format!("cat: {}/.ssh/id_test: Permission denied", home.display()),
+            &hidden,
+        )
+        .unwrap();
+        assert!(note.contains("sandbox_expose"), "{note}");
+        assert!(hidden_note("cat: x: Permission denied", &hidden).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // Real bubblewrap: the stores are empty from inside, however they are
+    // reached, and everything else in the home folder still reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_hides_credential_stores() {
+        let usable = Command::new("bwrap")
+            .args(bwrap_probe_args())
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !usable {
+            eprintln!("skip: bwrap unusable here");
+            return;
+        }
+        let (home, ws, hidden) = fake_home("bwrap");
+        let run = |cmd: &str| {
+            Command::new("bwrap")
+                .args(bwrap_argv(cmd, &ws, &[], false, true, &hidden))
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        assert_hidden(run, &home);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // Real Landlock: the same, through the read rules carved around the
+    // stores; and a workspace that holds a store cannot hide it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_hides_credential_stores() {
+        use std::os::unix::process::CommandExt;
+        if crate::landlock::available().is_err() {
+            eprintln!("skip: Landlock unavailable here");
+            return;
+        }
+        let (home, ws, hidden) = fake_home("landlock");
+        assert!(crate::landlock::can_hide(&[&ws], &hidden));
+        assert!(!crate::landlock::can_hide(&[&home], &hidden));
+        let run = |cmd: &str| {
+            let fd = crate::landlock::ruleset(&ws, &[], None, &hidden).unwrap();
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd]).current_dir(&ws).stdin(Stdio::null());
+            unsafe {
+                c.pre_exec(move || crate::landlock::engage(fd, true));
+            }
+            let o = c.output().unwrap();
+            unsafe { libc::close(fd) };
+            o
+        };
+        assert_hidden(run, &home);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seatbelt_profile_denies_reads_of_hidden_paths() {
+        let dir = std::env::temp_dir().join(format!("bwn-sb-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
+        std::fs::write(dir.join(".netrc"), "x").unwrap();
+        let hidden = [dir.join(".ssh"), dir.join(".netrc")];
+        let p = seatbelt_profile(Path::new("/w"), &[], None, true, &hidden);
+        let reads = p.split_once("(deny file-read*").unwrap().1;
+        assert!(
+            reads.contains(&format!("(subpath {})", sbpl_quote(&hidden[0]))),
+            "{p}"
+        );
+        assert!(
+            reads.contains(&format!("(literal {})", sbpl_quote(&hidden[1]))),
+            "{p}"
+        );
+        assert!(p.contains("(deny network-outbound"), "{p}");
+        assert!(p.contains(&format!(
+            "(remote unix-socket (path-literal {}))",
+            sbpl_quote(&hidden[0])
+        )));
+        // Nothing hidden, nothing added.
+        assert!(!seatbelt_profile(Path::new("/w"), &[], None, true, &[]).contains("file-read"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Real Seatbelt (macOS runners): a hidden folder and file cannot be
+    // read, a hidden socket cannot be connected to, and the rest reads.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_hides_credential_stores() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let base = home.join(format!("bwn-sb-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".ssh")).unwrap();
+        std::fs::create_dir_all(base.join("proj")).unwrap();
+        std::fs::write(base.join(".ssh/id_test"), "KEY-MATERIAL").unwrap();
+        std::fs::write(base.join("notes.txt"), "plain").unwrap();
+        let base = base.canonicalize().unwrap();
+        let sock = base.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let hidden = vec![base.join(".ssh"), sock.clone()];
+        let ws = base.join("proj");
+        let run = |cmd: &str| {
+            Command::new("sandbox-exec")
+                .args([
+                    "-p",
+                    &seatbelt_profile(&ws, &[], None, false, &hidden),
+                    "sh",
+                    "-c",
+                    cmd,
+                ])
+                .current_dir(&ws)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let key = run(&format!("cat '{}/.ssh/id_test'", base.display()));
+        assert!(
+            !String::from_utf8_lossy(&key.stdout).contains("KEY-MATERIAL"),
+            "{key:?}"
+        );
+        let plain = run(&format!("cat '{}/notes.txt'", base.display()));
+        assert_eq!(String::from_utf8_lossy(&plain.stdout), "plain", "{plain:?}");
+        let connect = run(&format!("nc -U '{}' </dev/null", sock.display()));
+        assert!(
+            !connect.status.success(),
+            "connected to a hidden socket: {connect:?}"
+        );
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

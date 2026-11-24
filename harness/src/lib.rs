@@ -843,6 +843,7 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // A bad --sandbox flag is a hard error; a bad settings value only warns
     // (and leaves the sandbox off) so a typo can't lock the user out.
     let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
+    sandbox::set_expose(&settings.sandbox_expose);
     if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
         if opts.sandbox.is_some() {
             return Err(e);
