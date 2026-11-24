@@ -138,15 +138,25 @@ fn bench_wrap_line(c: &mut Criterion) {
     let coloured: String = plain
         .split(' ')
         .enumerate()
-        .map(|(i, w)| if i % 3 == 0 { format!("\x1b[38;2;102;209;163m{w}\x1b[39m") } else { w.to_string() })
+        .map(|(i, w)| {
+            if i % 3 == 0 {
+                format!("\x1b[38;2;102;209;163m{w}\x1b[39m")
+            } else {
+                w.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
     let coloured = format!("\x1b[1m{coloured}\x1b[0m");
     let mut g = c.benchmark_group("wrap_line");
     g.throughput(Throughput::Bytes(plain.len() as u64));
-    g.bench_function("plain_1300chars", |b| b.iter(|| uibench::wrap(black_box(&plain), 100)));
+    g.bench_function("plain_1300chars", |b| {
+        b.iter(|| uibench::wrap(black_box(&plain), 100))
+    });
     g.throughput(Throughput::Bytes(coloured.len() as u64));
-    g.bench_function("coloured_1300chars", |b| b.iter(|| uibench::wrap(black_box(&coloured), 100)));
+    g.bench_function("coloured_1300chars", |b| {
+        b.iter(|| uibench::wrap(black_box(&coloured), 100))
+    });
     g.finish();
 }
 

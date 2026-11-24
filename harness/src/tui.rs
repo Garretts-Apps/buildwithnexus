@@ -158,7 +158,7 @@ struct Transcript {
     wrapped: VecDeque<Vec<String>>, // parallel to `lines`, wrapped at `width`
     rows: usize,                    // sum of `wrapped[i].len()`
     width: usize,                   // 0 = not yet sized
-    height: usize,             // terminal rows the wrap was made for (images)
+    height: usize,                  // terminal rows the wrap was made for (images)
     // The line last appended to and where its wrap stands: the next chunk
     // of a streamed line is wrapped from there (`append_to`). Dropped by
     // anything else that changes a line, the line count or the width.
