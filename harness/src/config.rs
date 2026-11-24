@@ -342,6 +342,11 @@ pub struct Settings {
     /// Whether sandboxed commands may reach the network (default true).
     #[serde(default = "default_true")]
     pub sandbox_network: bool,
+    /// Whether sandboxed commands reach the network only through the egress
+    /// checker (default true; see egress.rs). False lets them reach any
+    /// host directly, as before 0.22.
+    #[serde(default = "default_true")]
+    pub sandbox_egress_check: bool,
     /// Inline images in the transcript: "auto" (default; pixel-perfect on
     /// kitty/Ghostty and on terminals that report Sixel, half-block art
     /// elsewhere), "kitty" (force the graphics protocol), "sixel" (force
@@ -381,6 +386,12 @@ pub struct Settings {
     /// removed before a command runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shell_env_passthrough: Vec<String>,
+    /// Credential stores sandboxed commands may read after all (`~/.ssh`,
+    /// `~/.config/gh`, …). By default every store tools::credential_stores
+    /// lists, bwn's own folder and the SSH agent's socket are hidden from
+    /// sandboxed commands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_expose: Vec<String>,
     /// The address last used with each provider (`{"ollama":
     /// "http://gpu-box:11434"}`), so a /model swap back to a provider returns
     /// to its server without asking. Written by /model and setup; read from
@@ -505,11 +516,13 @@ impl Default for Settings {
             notify: default_auto(),
             idle_notify_secs: None,
             sandbox_network: true,
+            sandbox_egress_check: true,
             project_system_prompt: None,
             project_skills_override: false,
             permissions: PermissionRules::default(),
             network: NetworkRules::default(),
             shell_env_passthrough: Vec::new(),
+            sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),
             vision: None,

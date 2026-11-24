@@ -850,6 +850,10 @@ fn request(
     on_text: &mut dyn FnMut(&str),
     on_thinking: &mut dyn FnMut(&str),
 ) -> Result<Reply, String> {
+    // Nothing goes to a model before the session's posture is accepted
+    // (posture.rs); turns ask first, and this catches every other request
+    // (a commit message, a review, a summary).
+    crate::posture::before_request(&p.base_url)?;
     // A spend cap that cannot be counted is not sent past (a /model swap
     // to an unpriced model mid-session lands here; startup exits earlier).
     if let Some(why) = budget_guard(p) {

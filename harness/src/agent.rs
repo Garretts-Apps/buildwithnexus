@@ -574,6 +574,27 @@ pub fn set_remote_approver(ask: RemoteApprover) {
     let _ = REMOTE_APPROVER.set(ask);
 }
 
+/// Whether approval questions go to an editor (bwn acp).
+pub(crate) fn has_remote_approver() -> bool {
+    REMOTE_APPROVER.get().is_some()
+}
+
+/// The posture check's question, asked in the editor when bwn runs under
+/// ACP; None when there is no editor to ask.
+pub(crate) fn ask_remote_posture(posture: &str) -> Option<crate::posture::Answer> {
+    let ask = REMOTE_APPROVER.get()?;
+    let label = format!("{posture}\naccept this posture and continue?");
+    Some(
+        match ask(RemoteAsk::Tool {
+            label: &label,
+            key: "",
+        }) {
+            RemoteAnswer::Once | RemoteAnswer::Always => crate::posture::Answer::Accept,
+            RemoteAnswer::Reject | RemoteAnswer::Cancelled => crate::posture::Answer::Stop,
+        },
+    )
+}
+
 // A remote answer at the gate means what the terminal's y, a, n and Esc do.
 fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<String> {
     match answer {
@@ -735,6 +756,115 @@ fn phase_readonly_reason(reason: String, phase_msg: &str) -> String {
     }
 }
 
+// ── when auto mode asks ─────────────────────────────────────────────────────
+
+// Per session: the session it belongs to, and the tool through which that
+// session first read untrusted text. Process-wide, because web reads run on
+// helper threads too; per thread in tests, so one test's state cannot leak
+// into others running alongside it.
+#[derive(Default)]
+struct Untrusted {
+    sid: String,
+    tool: Option<String>,
+}
+
+#[cfg(not(test))]
+static UNTRUSTED: std::sync::Mutex<Untrusted> = std::sync::Mutex::new(Untrusted {
+    sid: String::new(),
+    tool: None,
+});
+
+fn with_untrusted<T>(f: impl FnOnce(&mut Untrusted) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut UNTRUSTED.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static UNTRUSTED: std::cell::RefCell<Untrusted> = std::cell::RefCell::default();
+        }
+        UNTRUSTED.with(|u| f(&mut u.borrow_mut()))
+    }
+}
+
+/// The session read text someone else wrote (a web page, a search result,
+/// an MCP tool's output) through `tool`. From here on auto mode asks before
+/// commands, fetches and MCP calls: that text may carry instructions, and
+/// the model may follow them.
+pub fn mark_untrusted_read(tool: &str) {
+    with_untrusted(|u| {
+        u.tool.get_or_insert_with(|| tool.to_string());
+    });
+}
+
+/// The tool through which this session first read untrusted text, if any.
+pub fn untrusted_read() -> Option<String> {
+    with_untrusted(|u| u.tool.clone())
+}
+
+/// Called as a turn starts: a different session than the last one (a new
+/// one, /clear, a resumed one) starts from what its own messages hold, so a
+/// resumed session that had read untrusted text is still marked.
+pub fn sync_untrusted(sid: &str, msgs: &[Msg]) {
+    with_untrusted(|u| {
+        if u.sid == sid {
+            return;
+        }
+        u.sid = sid.to_string();
+        u.tool = msgs.iter().find_map(|m| match m {
+            Msg::Tool(results) => results.iter().find_map(|r| {
+                let rest = r.content.split_once("[untrusted content from ")?.1;
+                rest.split_once(':').map(|(t, _)| t.to_string())
+            }),
+            _ => None,
+        });
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_untrusted_read() {
+    with_untrusted(|u| *u = Untrusted::default());
+}
+
+// Why auto mode asks before this call, if it does:
+// - after the session read untrusted text, commands, fetches and MCP calls
+//   ask (the rest of auto mode, file edits included, carries on);
+// - a command asks where it could read the user's credential stores: no
+//   sandbox backend, or one that cannot hide them from this folder. A user
+//   who turned the sandbox off chose that, and is not asked.
+fn auto_asks(
+    name: &str,
+    input: &serde_json::Value,
+    any_cmd: Option<&str>,
+    host: Option<&str>,
+    cwd: &Path,
+) -> Option<String> {
+    let command = any_cmd.is_some() && tools::is_mutating_call(name, input);
+    // An MCP tool that declares itself read-only cannot act for anyone;
+    // the others can (send, post, write), so they ask.
+    let mcp_action =
+        (name.starts_with("mcp__") || name == "mcp_call") && tools::is_mutating_call(name, input);
+    let reaches_out = host.is_some() || mcp_action;
+    if command || reaches_out {
+        if let Some(tool) = untrusted_read() {
+            return Some(format!(
+                "auto mode asks: this session read content from {tool} that someone else wrote, and it may carry instructions"
+            ));
+        }
+    }
+    if command
+        && crate::sandbox::mode() != crate::sandbox::Mode::Off
+        && !crate::sandbox::hides_reads(cwd)
+    {
+        return Some(
+            "auto mode asks: commands here are not kept from your credential files (no sandbox can hide them in this folder on this machine)"
+                .to_string(),
+        );
+    }
+    None
+}
+
 pub(crate) fn gate(
     perm: Permission,
     name: &str,
@@ -891,6 +1021,23 @@ pub(crate) fn gate(
         host_ref,
     )
     .is_some();
+
+    // Auto mode asks where running unasked is no longer safe (see
+    // `auto_asks`): an allow rule or an earlier "always" still lets the
+    // call through.
+    if perm == Permission::Auto && !allowed_by_rule {
+        if let Some(why) = auto_asks(name, input, any_cmd, host_ref, cwd) {
+            if !is_pre_approved(shell, &tool_key, cwd) {
+                return confirm_call(
+                    name,
+                    input,
+                    &format!("{} — {why}", tools::approval_label(name, input)),
+                    &tool_key,
+                    cwd,
+                );
+            }
+        }
+    }
 
     // Network tools can send what the agent has read to any host and reach
     // services on the local network, so outside `auto` each new host is
@@ -1477,6 +1624,11 @@ pub fn run_build_session_with_images(
     // only records which session and gate it runs under, then fires Stop.
     crate::session::set_current(sid);
     hooks::set_permission_mode(permission_name(perm));
+    // Hosts the user names, sandboxed commands may reach (egress.rs). Only
+    // the user's own text: a Stop hook's reason below is not.
+    crate::egress::note_user_text(task);
+    sync_untrusted(sid, transcript);
+    crate::posture::before_turn(sid, perm, cwd, &p.base_url)?;
     let pruned = checkpoint::begin_turn(cwd, task);
     if pruned > 0 {
         report::info(&format!(

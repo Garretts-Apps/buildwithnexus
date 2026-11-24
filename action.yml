@@ -18,6 +18,9 @@ inputs:
   permission-mode:
     description: "`readonly`, `accept-edits`, `auto` or `ask` (with no terminal, `ask` blocks every change)."
     default: readonly
+  accept-posture:
+    description: "bwn checks what the run can reach (sandbox, credential files, command network, the model endpoint, the cloud metadata address, listening ports) before its first model request, and prints it to this log. `true` accepts it; `false` stops the job there."
+    default: "true"
   max-budget-usd:
     description: Stop before the next model request once the estimated cost exceeds this many dollars.
     default: ""
@@ -137,6 +140,7 @@ runs:
         INPUT_PROMPT: ${{ inputs.prompt }}
         INPUT_PERMISSION_MODE: ${{ inputs.permission-mode }}
         INPUT_MAX_BUDGET_USD: ${{ inputs.max-budget-usd }}
+        INPUT_ACCEPT_POSTURE: ${{ inputs.accept-posture }}
         INPUT_PROVIDER: ${{ inputs.provider }}
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_BASE_URL: ${{ inputs.base-url }}
@@ -152,6 +156,7 @@ runs:
         mkdir -p "$(dirname "$events")"
         artifact="${INPUT_ARTIFACT_NAME:-bwn-events-${GITHUB_JOB}-${dir##*-}}"
         args=(--json --permission-mode "$INPUT_PERMISSION_MODE")
+        if [ "$INPUT_ACCEPT_POSTURE" = true ]; then args+=(--accept-posture); fi
         if [ -n "$INPUT_MAX_BUDGET_USD" ]; then args+=(--max-budget-usd "$INPUT_MAX_BUDGET_USD"); fi
         if [ -n "$INPUT_PROVIDER" ]; then args+=(--provider "$INPUT_PROVIDER"); fi
         if [ -n "$INPUT_MODEL" ]; then args+=(--model "$INPUT_MODEL"); fi

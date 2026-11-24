@@ -249,9 +249,11 @@ class TerminalHarness(unittest.TestCase):
         self.editor = self.root / "editor.sh"
         self.editor.write_text("#!/bin/sh\nprintf 'line one\\nline two\\n' > \"$1\"\n")
         self.editor.chmod(0o755)
+        # The posture check before the first model request is accepted for
+        # every test but PostureTests, which answers it in the terminal.
         env = {**os.environ, "NEXUS_HOME": str(self.home),
                "TERM": "xterm-256color", "NO_COLOR": "1",
-               "EDITOR": str(self.editor)}
+               "EDITOR": str(self.editor), "BWN_ACCEPT_POSTURE": "1"}
         env.pop("VISUAL", None)
         for key in ("TMUX", "KITTY_WINDOW_ID", "GHOSTTY_RESOURCES_DIR", "BWN_IMAGES"):
             env.pop(key, None)
@@ -872,6 +874,48 @@ class FrameTests(TerminalHarness):
         self.assertEqual(self.output_frames(since), [])
 
 
+
+
+class PostureTests(TerminalHarness):
+    """The posture check in the terminal: shown before the first model
+    request, `n` stops the request, `y` lets it through, and the next
+    prompt of the session is not asked again."""
+
+    def prepare(self):
+        self.model = StreamModel([("posture ok.\n", 0)])
+        self.addCleanup(self.model.close)
+
+    def settings(self):
+        return {"provider": "custom", "model": "mock-model",
+                "base_url": f"http://127.0.0.1:{self.model.port}/v1",
+                "permission": "ask", "auto_update": "off"}
+
+    def extra_env(self):
+        return {"BWN_ACCEPT_POSTURE": None}
+
+    def test_the_posture_is_asked_once_and_n_stops(self):
+        since = len(self.output)
+        self.send("hello\r")
+        self.wait_for(lambda: b"accept this posture and continue?" in self.output[since:],
+                      "the posture question", timeout=10)
+        self.assertIn(b"this session can reach", self.output[since:])
+        self.assertEqual(self.model.requests, [], "no model request before the answer")
+        self.send("n\r")
+        self.wait_for(lambda: b"stopped at the posture check" in self.output[since:],
+                      "the stop", timeout=10)
+        self.assertEqual(self.model.requests, [])
+        since = len(self.output)
+        self.send("hello again\r")
+        self.wait_for(lambda: b"accept this posture and continue?" in self.output[since:],
+                      "the question again after a stop", timeout=10)
+        self.send("y\r")
+        self.wait_for(lambda: b"posture ok." in self.output[since:], "the reply", timeout=10)
+        self.assertEqual(len(self.model.requests), 1)
+        # The next prompt reaches the model with nothing typed in answer: a
+        # question would hold it. (A full repaint can redraw the earlier
+        # question, so the screen text proves nothing here.)
+        self.send("and again\r")
+        self.wait_for(lambda: len(self.model.requests) == 2, "the second request", timeout=10)
 
 class ScrollTests(TerminalHarness):
     """A reply longer than the screen: once the output rows are full, each

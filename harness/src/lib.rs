@@ -48,6 +48,7 @@ pub mod agent;
 pub mod checkpoint;
 pub mod config;
 mod debug_panel;
+pub mod egress;
 pub mod graphics;
 pub mod highlight;
 pub mod hooks;
@@ -60,6 +61,7 @@ pub mod mcp_auth;
 pub mod media;
 pub mod net;
 pub mod onboarding;
+pub mod posture;
 pub mod provider;
 pub mod report;
 pub mod rules;
@@ -145,6 +147,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--sandbox",
     "--no-auto-commit",
     "--auto-commit",
+    "--accept-posture",
     "--no-repo-map",
     "--repo-map",
     "--route-gemini",
@@ -223,6 +226,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--repo-map" {
             opts.repo_map = Some(true);
+            continue;
+        }
+        if arg == "--accept-posture" {
+            posture::accept_by_flag();
             continue;
         }
         if arg == "--no-auto-commit" {
@@ -414,6 +421,14 @@ fn exit_quietly_on_closed_stdout() {
 }
 
 pub fn run() {
+    // Inside bubblewrap: limit the network, then become the command.
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("__confine-net") {
+            landlock::confine_net_and_exec(&args[1..]);
+        }
+    }
     debug_panel::init();
     exit_quietly_on_closed_stdout();
     #[cfg(unix)]
@@ -843,6 +858,8 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     // A bad --sandbox flag is a hard error; a bad settings value only warns
     // (and leaves the sandbox off) so a typo can't lock the user out.
     let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
+    sandbox::set_expose(&settings.sandbox_expose);
+    sandbox::set_egress_check(settings.sandbox_egress_check);
     if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
         if opts.sandbox.is_some() {
             return Err(e);
@@ -2537,6 +2554,8 @@ fn usage_text() -> String {
          \x20                               readonly); also --permission\n\
          \x20 --sandbox <mode>              auto (default), off, or require (OS sandbox for\n\
          \x20                               shell commands; off is the 0.20 default)\n\
+         \x20 --accept-posture              accept the posture check (what the session can\n\
+         \x20                               reach) without being asked; for headless runs\n\
          \x20 --auto-commit                 git-commit file edits (the default)\n\
          \x20 --no-auto-commit              leave file edits uncommitted\n\
          \x20 --repo-map                    offer the repo_map tool (the default)\n\

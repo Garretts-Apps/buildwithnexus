@@ -2874,7 +2874,12 @@ fn a_redirect_to_a_denied_host_is_not_followed() {
     let url = json!({"url": format!("http://127.0.0.1:{front}/")});
     // Without a rule the redirect is followed.
     let r = run("fetch_url", &url, &d);
-    assert!(!r.is_error && r.content == "secret", "{}", r.content);
+    // The page comes back labelled as someone else's text.
+    assert!(
+        !r.is_error && r.content == untrusted_label("fetch_url", "secret"),
+        "{}",
+        r.content
+    );
     fs::write(
         home.join("settings.json"),
         json!({"network": {"deny": [format!("127.0.0.1:{target}")]}}).to_string(),

@@ -3412,7 +3412,11 @@ mod tests {
             std::path::Path::new("."),
         );
         assert!(!out.is_error);
-        assert_eq!(out.content, "42");
+        // A server's output reaches the model labelled as someone else's.
+        assert_eq!(
+            out.content,
+            crate::tools::untrusted_label("mcp__fake__add", "42")
+        );
         let failed = crate::tools::run("mcp__fake__fail", &json!({}), std::path::Path::new("."));
         assert!(failed.is_error);
         assert_eq!(failed.content, "boom");
@@ -3422,7 +3426,10 @@ mod tests {
             std::path::Path::new("."),
         );
         assert!(!legacy.is_error);
-        assert_eq!(legacy.content, "echo: old");
+        assert_eq!(
+            legacy.content,
+            crate::tools::untrusted_label("mcp_call", "echo: old")
+        );
         assert!(call("off", "x", &json!({}))
             .unwrap_err()
             .contains("disabled"));
@@ -3474,7 +3481,10 @@ mod tests {
             std::path::Path::new("."),
         );
         assert!(!read.is_error);
-        assert_eq!(read.content, "hello from the resource");
+        assert_eq!(
+            read.content,
+            crate::tools::untrusted_label("mcp_resources", "hello from the resource")
+        );
         let missing = crate::tools::run(
             "mcp_prompts",
             &json!({"name": "review"}),

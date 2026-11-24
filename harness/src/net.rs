@@ -91,6 +91,36 @@ impl Client {
         })
     }
 
+    /// The upstream proxy a connection for `url` must go through, as
+    /// `host:port` and the `Proxy-Authorization` value its URL's user name
+    /// and password give; None to connect direct.
+    pub fn upstream_for(&self, url: &str) -> Option<(String, Option<String>)> {
+        let (_, value) = self.env.route(url)?;
+        let u = url::Url::parse(value).ok()?;
+        let host = u.host_str()?;
+        let port = u.port_or_known_default().unwrap_or(3128);
+        let host_port = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let decode = |s: &str| {
+            url::form_urlencoded::parse(format!("x={s}").as_bytes())
+                .next()
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default()
+        };
+        let auth = (!u.username().is_empty()).then(|| {
+            let pair = format!(
+                "{}:{}",
+                decode(u.username()),
+                decode(u.password().unwrap_or(""))
+            );
+            format!("Basic {}", base64(pair.as_bytes()))
+        });
+        Some((host_port, auth))
+    }
+
     pub fn get(&self, url: &str) -> Request {
         self.agent_for(url).get(url)
     }
@@ -98,6 +128,25 @@ impl Client {
     pub fn post(&self, url: &str) -> Request {
         self.agent_for(url).post(url)
     }
+}
+
+/// Standard base64 with padding (for a Basic proxy credential).
+pub fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= c.len() {
+                out.push(T[((n >> shift) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A client with the default settings (30 s to connect, 5 redirects), for
