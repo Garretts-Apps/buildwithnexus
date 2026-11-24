@@ -922,6 +922,73 @@ fn bench_trace_hook_events(c: &mut Criterion) {
 }
 // ── end per-round bookkeeping ────────────────────────────────────────────
 
+// ── perf-tools-2: command runner and gitignored walks ───────────────────
+// The bash tool's runner on `true`: the fixed cost of every command the
+// agent runs (spawn, pipe readers, waiting for exit), with no sandbox.
+fn bench_run_command(c: &mut Criterion) {
+    let dir = std::env::temp_dir();
+    let mut g = c.benchmark_group("run_command");
+    g.sample_size(20);
+    g.bench_function("true", |b| {
+        b.iter(|| tbench::run_command(black_box("true"), &dir))
+    });
+    g.finish();
+}
+
+// `grep_tree` inside a git checkout with a .gitignore of the rules a real
+// project carries, so every walked entry is matched against them. None of
+// the rules hides the source files, so the search finds what it finds in
+// `grep_tree`.
+fn gitignored_tree() -> std::path::PathBuf {
+    let dir = grep_tree();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let rules = [
+        "# build output",
+        "target/",
+        "dist/",
+        "build/",
+        "out/",
+        "/coverage/",
+        "*.log",
+        "*.tmp",
+        "**/*.tmp",
+        "*.swp",
+        "*~",
+        ".DS_Store",
+        "node_modules/",
+        "bower_components/",
+        "__pycache__/",
+        "*.py[cod]",
+        ".venv/",
+        "*.egg-info/",
+        ".idea/",
+        ".vscode/",
+        "*.o",
+        "*.so",
+        "*.a",
+        "docs/_build/",
+        "**/generated/**",
+        "src/**/*.bak",
+        "!src/keep.bak",
+    ];
+    std::fs::write(dir.join(".gitignore"), rules.join("\n") + "\n").unwrap();
+    dir
+}
+
+fn bench_grep_gitignored(c: &mut Criterion) {
+    use serde_json::json;
+    let dir = gitignored_tree();
+    let mut g = c.benchmark_group("grep_files");
+    g.sample_size(20);
+    let input = json!({"pattern": "run_1999()"});
+    g.bench_function("gitignored_tree", |b| {
+        b.iter(|| tools::run("grep_files", black_box(&input), &dir))
+    });
+    g.finish();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+// ── end perf-tools-2 ────────────────────────────────────────────────────
+
 criterion_group!(
     benches,
     bench_stream_wrap,
@@ -930,6 +997,8 @@ criterion_group!(
     bench_grep_files,
     bench_read_large_file,
     bench_tool_lookup,
+    bench_run_command,
+    bench_grep_gitignored,
     bench_wrap_cache,
     bench_transcript_cap,
     bench_wrap_line,

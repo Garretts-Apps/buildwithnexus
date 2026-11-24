@@ -70,6 +70,13 @@ pub mod bench {
     pub fn truncate(s: String, max: usize) -> String {
         super::truncate(s, max)
     }
+    /// `cmd` through the bash tool's runner (`sh -c`, unsandboxed, the
+    /// normal timeout), returning its exit code.
+    pub fn run_command(cmd: &str, cwd: &Path) -> Result<Option<i32>, String> {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", cmd]).current_dir(cwd);
+        super::run_with_timeout(c, None, super::COMMAND_TIMEOUT).map(|cap| cap.code)
+    }
 }
 
 static REPO_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
