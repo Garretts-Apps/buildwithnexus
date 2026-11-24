@@ -1954,6 +1954,9 @@ fn build_turn(
     }
 
     let mut st = TurnState::default();
+    // From here the loop only appends to the transcript, except where it
+    // compacts, which resets the count.
+    let mut tokens = TokenCount::default();
 
     for step in 1..=MAX_ITERS {
         if tui::interrupted() {
@@ -1963,7 +1966,7 @@ fn build_turn(
         if budget_exhausted() {
             return Ok(String::new());
         }
-        maybe_compact(p, msgs);
+        maybe_compact_counted(p, msgs, &mut tokens);
         if step > 1 && !report::is_json() {
             tui::line(&tui::dim(&format!("  ↻ step {step}")));
         }
@@ -1993,6 +1996,7 @@ fn build_turn(
                         *msgs = compact_within(taken, compaction_budget(p), |middle| {
                             model_summary(p, middle)
                         });
+                        tokens.reset();
                         continue;
                     }
                 }
@@ -3243,15 +3247,15 @@ pub mod bench {
     /// The context estimate the build loop takes before each request, kept
     /// across rounds the way the loop keeps it.
     #[derive(Default)]
-    pub struct TokenMeter;
+    pub struct TokenMeter(TokenCount);
 
     impl TokenMeter {
         pub fn new() -> Self {
-            TokenMeter
+            TokenMeter::default()
         }
 
         pub fn tokens(&mut self, msgs: &[Msg]) -> usize {
-            estimate_tokens(msgs)
+            self.0.tokens(msgs)
         }
     }
 

@@ -21,28 +21,64 @@ pub(super) fn json_len(v: &serde_json::Value) -> usize {
     n.0
 }
 
-pub(super) fn estimate_tokens(msgs: &[Msg]) -> usize {
-    let mut chars = 0usize;
-    for m in msgs {
-        chars += match m {
-            Msg::System(s) | Msg::User(s) => s.len(),
-            Msg::UserImages { text, images } => {
-                text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>()
-            }
-            Msg::Assistant { text, calls } => {
-                text.len()
-                    + calls
-                        .iter()
-                        .map(|c| c.name.len() + json_len(&c.input))
-                        .sum::<usize>()
-            }
-            Msg::Tool(rs) => rs
-                .iter()
-                .map(|r| r.content.len() + r.images.iter().map(|(_, d)| d.len() / 3).sum::<usize>())
-                .sum(),
-        };
+// What one message adds to the estimate, in characters.
+fn msg_chars(m: &Msg) -> usize {
+    match m {
+        Msg::System(s) | Msg::User(s) => s.len(),
+        Msg::UserImages { text, images } => {
+            text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>()
+        }
+        Msg::Assistant { text, calls } => {
+            text.len()
+                + calls
+                    .iter()
+                    .map(|c| c.name.len() + json_len(&c.input))
+                    .sum::<usize>()
+        }
+        Msg::Tool(rs) => rs
+            .iter()
+            .map(|r| r.content.len() + r.images.iter().map(|(_, d)| d.len() / 3).sum::<usize>())
+            .sum(),
     }
-    chars / 4
+}
+
+pub(super) fn estimate_tokens(msgs: &[Msg]) -> usize {
+    msgs.iter().map(msg_chars).sum::<usize>() / 4
+}
+
+// `estimate_tokens` for a transcript that only grows between estimates, as
+// the build loop's does from one request to the next. Each message is
+// counted once, when it is first seen, so a round costs what it added
+// rather than another pass over every tool input in the conversation.
+//
+// Holding a count for each message seen means anything that changes the
+// transcript other than appending to it (compaction, a rewind, replacing a
+// message) must call `reset`. A transcript shorter than the counts resets
+// on its own; the debug assertion catches a missed reset in tests.
+#[derive(Default)]
+pub(super) struct TokenCount {
+    chars: Vec<usize>,
+    total: usize,
+}
+
+impl TokenCount {
+    pub(super) fn tokens(&mut self, msgs: &[Msg]) -> usize {
+        if msgs.len() < self.chars.len() {
+            self.reset();
+        }
+        for m in &msgs[self.chars.len()..] {
+            let n = msg_chars(m);
+            self.chars.push(n);
+            self.total += n;
+        }
+        debug_assert_eq!(self.total / 4, estimate_tokens(msgs));
+        self.total / 4
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.chars.clear();
+        self.total = 0;
+    }
 }
 
 pub(super) fn compaction_split(msgs: &[Msg]) -> (usize, usize) {
@@ -285,8 +321,14 @@ pub(super) fn model_summary(p: &Provider, middle: &[Msg]) -> String {
 }
 
 pub(super) fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
+    maybe_compact_counted(p, msgs, &mut TokenCount::default());
+}
+
+// `maybe_compact` with the estimate kept in `count` across rounds; a
+// compaction replaces the transcript, so it starts the count again.
+pub(super) fn maybe_compact_counted(p: &Provider, msgs: &mut Vec<Msg>, count: &mut TokenCount) {
     let budget = compaction_budget(p);
-    if estimate_tokens(msgs) <= budget {
+    if count.tokens(msgs) <= budget {
         return;
     }
     let (sys_end, tail_start) = compaction_split(msgs);
@@ -298,6 +340,7 @@ pub(super) fn maybe_compact(p: &Provider, msgs: &mut Vec<Msg>) {
     report::info("  ⟳ compacting context…");
     let taken = std::mem::take(msgs);
     *msgs = compact_within(taken, budget, |middle| model_summary(p, middle));
+    count.reset();
 }
 
 // The estimated size a compacted transcript must fit in: 80% of the model's

@@ -1647,6 +1647,100 @@ fn estimate_tokens_counts_text() {
     assert_eq!(estimate_tokens(&[Msg::User("a".repeat(40))]), 10);
 }
 
+// The estimate as it was computed before per-message counts were kept: one
+// pass over the whole transcript.
+fn estimate_tokens_whole(msgs: &[Msg]) -> usize {
+    let mut chars = 0usize;
+    for m in msgs {
+        chars += match m {
+            Msg::System(s) | Msg::User(s) => s.len(),
+            Msg::UserImages { text, images } => {
+                text.len() + images.iter().map(|(_, d)| d.len() / 3).sum::<usize>()
+            }
+            Msg::Assistant { text, calls } => {
+                text.len()
+                    + calls
+                        .iter()
+                        .map(|c| c.name.len() + serde_json::to_string(&c.input).unwrap().len())
+                        .sum::<usize>()
+            }
+            Msg::Tool(rs) => rs
+                .iter()
+                .map(|r| r.content.len() + r.images.iter().map(|(_, d)| d.len() / 3).sum::<usize>())
+                .sum(),
+        };
+    }
+    chars / 4
+}
+
+#[test]
+fn the_kept_token_count_matches_a_whole_pass_through_push_compact_and_rewind() {
+    let round = |i: usize| -> Vec<Msg> {
+        vec![
+            Msg::Assistant {
+                text: format!("step {i}"),
+                calls: vec![provider::ToolCall {
+                    id: format!("c{i}"),
+                    name: "write_file".into(),
+                    input: json!({"path": format!("src/m{i}.rs"), "content": "é\"\n".repeat(i * 7)}),
+                }],
+            },
+            Msg::Tool(vec![provider::ToolResult {
+                id: format!("c{i}"),
+                content: "x".repeat(i * 13 + 1),
+                is_error: false,
+                images: if i.is_multiple_of(5) {
+                    vec![("image/png".into(), "A".repeat(i * 31 + 2))]
+                } else {
+                    Vec::new()
+                },
+            }]),
+        ]
+    };
+    let mut msgs = vec![
+        Msg::System("system".repeat(9)),
+        Msg::UserImages {
+            text: "the task".into(),
+            images: vec![("image/png".into(), "B".repeat(301))],
+        },
+    ];
+    let mut count = TokenCount::default();
+    let check = |count: &mut TokenCount, msgs: &[Msg]| {
+        assert_eq!(count.tokens(msgs), estimate_tokens_whole(msgs));
+        assert_eq!(estimate_tokens(msgs), estimate_tokens_whole(msgs));
+    };
+    check(&mut count, &msgs);
+    for i in 1..40 {
+        msgs.extend(round(i));
+        check(&mut count, &msgs);
+        if i.is_multiple_of(11) {
+            // Compaction: the middle replaced by a summary.
+            let tail = msgs.split_off(msgs.len() - 4);
+            msgs.truncate(1);
+            msgs.push(Msg::User(format!("[summary] {i}")));
+            msgs.extend(tail);
+            count.reset();
+            check(&mut count, &msgs);
+        }
+        if i.is_multiple_of(7) {
+            // A rewind drops the newest rounds; one that grows back past
+            // the old length still needs the reset.
+            msgs.truncate(msgs.len() - 4);
+            check(&mut count, &msgs);
+            msgs.extend(round(i + 100));
+            msgs.extend(round(i + 200));
+            msgs.extend(round(i + 300));
+            count.reset();
+            check(&mut count, &msgs);
+        }
+        if i.is_multiple_of(9) {
+            msgs[0] = Msg::System(format!("system again {i}"));
+            count.reset();
+            check(&mut count, &msgs);
+        }
+    }
+}
+
 #[test]
 fn compaction_split_keeps_system_and_recent_tail() {
     let mut msgs = vec![Msg::System("s".into())];
