@@ -14,6 +14,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **Three more fail-closed fixes.** With bubblewrap, a command whose
+  network limiter (bwn's own binary) can't be found now gets no network
+  instead of the host's. With no home folder (`HOME` unset), the sandbox no
+  longer claims to hide credential stores it couldn't find; the posture
+  check warns and auto mode asks. With `require` and no backend, the posture
+  check says commands are refused rather than "unsandboxed".
 - **Landlock's `.git` gap is shown, and auto mode asks there.** Landlock
   (the Linux fallback, and always the backend inside WSL) can't keep `.git`
   and `.buildwithnexus` read-only, so the posture check now says so and

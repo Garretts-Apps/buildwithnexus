@@ -459,8 +459,20 @@ fn bwrap_argv(
         }
     }
     let cwd = cwd.to_string_lossy().into_owned();
+    // The proxy is held by bwn's own binary inside the sandbox. Without it
+    // the command gets no network rather than the host's (roadmap 1.6;
+    // analysis M8(b)).
+    let limiter = match net {
+        Net::Proxy(_) => confine_exe(),
+        _ => None,
+    };
+    let share_net = match net {
+        Net::Off => false,
+        Net::Proxy(_) => limiter.is_some(),
+        Net::Open => true,
+    };
     let mut a: Vec<String> = vec!["--unshare-all".into()];
-    if net != Net::Off {
+    if share_net {
         a.push("--share-net".into());
     }
     a.extend(
@@ -527,7 +539,7 @@ fn bwrap_argv(
     // Out only through the proxy: bwn itself, bound in where no hidden path
     // can cover it, limits the network and then runs the command.
     if let Net::Proxy(port) = net {
-        if let Some(exe) = confine_exe() {
+        if let Some(exe) = limiter {
             let at = a.len() - 3;
             a.splice(
                 at..at,
@@ -557,8 +569,9 @@ fn confine_exe() -> Option<PathBuf> {
         // A test binary would take `__confine-net` for a test filter and
         // run the suite: use the built bwn binary, found in an ancestor of
         // the test binary, or leave the network unlimited.
+        // Set and empty: no binary to limit the network with.
         if let Some(p) = std::env::var_os("BWN_TEST_CONFINE_EXE") {
-            return Some(PathBuf::from(p));
+            return (!p.is_empty()).then(|| PathBuf::from(p));
         }
         std::env::current_exe().ok().and_then(|t| {
             t.ancestors()
@@ -995,7 +1008,9 @@ pub fn protects_policy_files() -> bool {
 /// the workspace holds one (a session run from the home folder). False when
 /// commands run unsandboxed.
 pub fn hides_reads(cwd: &Path) -> bool {
-    if mode() == Mode::Off {
+    // With no home folder to find the stores in, nothing is hidden: report
+    // it, so the posture check warns and auto mode asks (roadmap 1.6).
+    if mode() == Mode::Off || crate::config::user_home().is_none() {
         return false;
     }
     match decide(mode(), backend()) {
@@ -1142,6 +1157,66 @@ mod tests {
 
     // bwrap's argv is a Linux path list. On Windows `Path` renders `\`, so
     // these fixtures only run where bwrap itself runs.
+    // Roadmap 1.6: with no home folder there is no list of stores to hide,
+    // so the sandbox must not claim to hide them.
+    #[test]
+    fn invariant_g3_no_home_folder_means_nothing_is_claimed_hidden() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (home, profile) = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+        let m = mode();
+        set_mode(Mode::Auto);
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", "");
+        let hides = hides_reads(&std::env::temp_dir());
+        let listed = hidden_paths(&[&std::env::temp_dir()]);
+        for (k, v) in [("HOME", home), ("USERPROFILE", profile)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        set_mode(m);
+        assert!(listed.is_empty());
+        assert!(!hides, "claimed to hide stores it could not find");
+    }
+
+    // Roadmap 1.6 (analysis M8(b)): when bwn can't find its own binary to
+    // hold a command to the proxy, the command gets no network, not the
+    // host's.
+    #[cfg(unix)]
+    #[test]
+    fn invariant_m8b_no_network_limiter_means_no_network() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("BWN_TEST_CONFINE_EXE", "");
+        let a = bwrap_argv(
+            "curl x",
+            Path::new("/work/proj"),
+            &[],
+            Net::Proxy(8080),
+            true,
+            &[],
+        );
+        std::env::remove_var("BWN_TEST_CONFINE_EXE");
+        assert!(!a.contains(&"--share-net".to_string()), "{a:?}");
+        assert!(!a.contains(&"__confine-net".to_string()));
+        std::env::set_var("BWN_TEST_CONFINE_EXE", "/usr/bin/true");
+        let a = bwrap_argv(
+            "curl x",
+            Path::new("/work/proj"),
+            &[],
+            Net::Proxy(8080),
+            true,
+            &[],
+        );
+        std::env::remove_var("BWN_TEST_CONFINE_EXE");
+        assert!(a.contains(&"--share-net".to_string()));
+        assert!(a.contains(&"__confine-net".to_string()));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bwrap_argv_binds_only_the_workspace_rw() {
@@ -1838,6 +1913,10 @@ print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
     #[cfg(target_os = "linux")]
     #[test]
     fn bwrap_limits_the_network_to_the_proxy() {
+        // BWN_TEST_CONFINE_EXE is process-wide; the M8(b) test sets it too.
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let usable = Command::new("bwrap")
             .args(bwrap_probe_args())
             .stdin(Stdio::null())
