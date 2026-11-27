@@ -14,6 +14,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **Landlock works on kernels 5.19 to 6.1 again (Debian 12).** bwn asked
+  Landlock for the truncate right from ABI 2, but it arrived in ABI 3
+  (kernel 6.2), and the kernel rejects an unknown right: on Debian 12 every
+  sandboxed command was refused with "Invalid argument". bwn now asks only
+  for rights the running kernel has. Below ABI 3 (Ubuntu 22.04, Debian 12)
+  Landlock can't stop a command truncating a file outside the workspace;
+  the posture check says so, and auto mode already asks before commands on
+  Landlock.
 - **With no sandbox backend, commands are refused until you allow them.**
   In `auto` sandbox mode with no working backend (Windows, or Linux without
   bubblewrap or Landlock), bwn used to run commands unconfined. Now it asks
