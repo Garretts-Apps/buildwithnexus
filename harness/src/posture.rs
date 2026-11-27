@@ -155,6 +155,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             Level::Warn,
         ),
         (_, Some(b)) => (b.label().to_string(), Level::Good),
+        // require refuses commands when no backend works (roadmap 1.6).
+        (Mode::Require, None) => (
+            format!(
+                "none usable ({}): commands are refused (sandbox mode require)",
+                crate::sandbox::backend_error().unwrap_or("no backend")
+            ),
+            Level::Warn,
+        ),
         (_, None) => (
             format!(
                 "none usable ({}): commands run unsandboxed",
@@ -203,6 +211,12 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 format!("hidden from commands: {}", names.join(", "))
             };
             (shown, Level::Good, format!("hidden:{}", names.join(",")))
+        } else if crate::config::user_home().is_none() {
+            (
+                "not hidden: no home folder (HOME) to find them in".into(),
+                Level::Warn,
+                "readable-no-home".to_string(),
+            )
         } else {
             (
                 "readable by commands (the workspace holds a credential store, which this sandbox cannot carve out)".into(),
@@ -241,7 +255,16 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         };
         v.push(row("session", "command network", nv, nl, nk));
     } else {
-        v.push(row(
+        v.push(if smode == Mode::Require {
+            row(
+                "session",
+                "commands",
+                "refused: sandbox mode is require and no backend works".into(),
+                Level::Good,
+                "refused",
+            )
+        } else {
+            row(
             "session",
             "commands",
             if perm == P::Auto && smode != Mode::Off {
@@ -251,7 +274,8 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             },
             Level::Warn,
             "unconfined",
-        ));
+        )
+        });
     }
 
     let settings = crate::config::load_settings();
@@ -879,6 +903,33 @@ mod tests {
             commands.value
         );
         crate::sandbox::set_mode(mode0);
+    }
+
+    // Roadmap 1.6: with require and no backend the check says commands are
+    // refused, not that they run unsandboxed. Runs in the no-backend cell.
+    #[test]
+    fn invariant_d1_require_with_no_backend_says_commands_are_refused() {
+        if crate::sandbox::backend().is_some() {
+            return;
+        }
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let m = crate::sandbox::mode();
+        crate::sandbox::set_mode(crate::sandbox::Mode::Require);
+        let rows = session_rows(crate::agent::Permission::Auto, &std::env::temp_dir());
+        crate::sandbox::set_mode(m);
+        let get = |item: &str| rows.iter().find(|r| r.item == item).unwrap().value.clone();
+        assert!(
+            get("sandbox").contains("commands are refused"),
+            "{}",
+            get("sandbox")
+        );
+        assert!(
+            get("commands").starts_with("refused"),
+            "{}",
+            get("commands")
+        );
     }
 
     // IN-3 (roadmap 1.5; analysis M11, Integrity invariant): once accepted,
