@@ -7,6 +7,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **On bwn's namespace backend, commands get a private network.** Every
+  command now joins one network namespace made for the session. It holds
+  only loopback and the host checker, so a command can't reach the internet,
+  the local network or this machine's own services except through the
+  checker.
+  - This closes SEC-2 there: a command could reach another machine listening
+    on the checker's port.
+  - It works on every Landlock ABI, so the network now works through the
+    checker on kernels below 6.7 too.
+  - There's no DNS inside. Through the checker, `localhost` is the namespace.
+  - Servers a command starts stay up for later commands, and bwn's fetch,
+    `wait_for_url` and `screenshot_url` still reach them. Model providers on
+    loopback are never dialled inside, so a command can't pose as one.
+  - The release suite gains escape tests for this: the checker's port on
+    another address, host loopback, IPv6, UDP, DNS, raw, netlink, packet and
+    Unix sockets, joining the host's namespace, and reading the holder
+    process. A further test checks that the namespace holds when that
+    process is killed.
+  - Bubblewrap still holds commands by port; running it in the same
+    namespace is next.
 - **On Landlock alone, commands get no network unless you allow it.**
   Where neither bubblewrap nor unprivileged user namespaces work, Landlock
   holds a command to the host checker by port, not address, so it could

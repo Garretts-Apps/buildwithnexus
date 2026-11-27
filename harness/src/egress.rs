@@ -257,9 +257,6 @@ pub fn check(
 /// network, and kept for the session.
 pub struct Proxy {
     pub port: u16,
-    /// The same proxy on a Unix socket (for a backend that can reach only a
-    /// path).
-    pub socket: Option<PathBuf>,
 }
 
 static PROXY: OnceLock<Option<Proxy>> = OnceLock::new();
@@ -272,20 +269,27 @@ pub fn proxy() -> Option<&'static Proxy> {
 fn start() -> Option<Proxy> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
     let port = listener.local_addr().ok()?.port();
+    serve_listener(listener, false).ok()?;
+    Some(Proxy { port })
+}
+
+/// Check every connection on `listener` for the session. `private` is the
+/// session namespace's listener (netns.rs): there, "this machine" is the
+/// namespace, so a loopback target is dialled inside it and the host's own
+/// services stay out of reach.
+pub fn serve_listener(listener: TcpListener, private: bool) -> std::io::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cwd2 = cwd.clone();
     std::thread::Builder::new()
         .name("bwn-egress".into())
         .spawn(move || {
             for conn in listener.incoming().flatten() {
-                let cwd = cwd2.clone();
+                let cwd = cwd.clone();
                 std::thread::spawn(move || {
-                    let _ = serve(conn, &cwd);
+                    let _ = serve(conn, &cwd, private);
                 });
             }
         })
-        .ok()?;
-    Some(Proxy { port, socket: None })
+        .map(|_| ())
 }
 
 /// The environment a sandboxed command gets so its tools use the proxy.
@@ -323,7 +327,7 @@ fn refuse(mut client: TcpStream, target: &str, why: &str) -> std::io::Result<()>
 
 // One client connection: a CONNECT (HTTPS) or an absolute-form request
 // (plain HTTP).
-fn serve(client: TcpStream, cwd: &Path) -> std::io::Result<()> {
+fn serve(client: TcpStream, cwd: &Path, private: bool) -> std::io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(client.try_clone()?);
     let mut head = Vec::new();
@@ -360,7 +364,12 @@ fn serve(client: TcpStream, cwd: &Path) -> std::io::Result<()> {
         Ok(a) => a,
         Err(why) => return refuse(client, &label, &why),
     };
+    // From the private namespace, "this machine" is the namespace: a
+    // loopback target is dialled inside it, never on the host or through an
+    // upstream proxy.
+    let inside = private && !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback());
     let upstream = match &hop {
+        _ if inside => addrs.iter().find_map(|a| dial_private(*a)),
         // bwn's own proxy carries it: a tunnel to the checked name.
         Some((proxy, auth)) => tunnel(proxy, auth.as_deref(), &label),
         None => addrs
@@ -384,6 +393,17 @@ fn serve(client: TcpStream, cwd: &Path) -> std::io::Result<()> {
         (&upstream).write_all(&pending)?;
     }
     splice(reader.into_inner(), client_w, upstream)
+}
+
+// A loopback address inside the session's namespace; never the host's.
+#[cfg(target_os = "linux")]
+fn dial_private(a: SocketAddr) -> Option<TcpStream> {
+    crate::netns::session().ok()?.dial(a).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dial_private(_: SocketAddr) -> Option<TcpStream> {
+    None
 }
 
 // A CONNECT tunnel to `target` through the upstream proxy at `proxy`.
@@ -433,7 +453,7 @@ fn split_host_port(target: &str, default: u16) -> (String, u16) {
     }
 }
 
-fn splice(
+pub(crate) fn splice(
     mut client_r: TcpStream,
     mut client_w: TcpStream,
     upstream: TcpStream,

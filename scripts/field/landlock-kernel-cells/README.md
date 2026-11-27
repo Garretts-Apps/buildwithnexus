@@ -9,6 +9,10 @@ and `invariant_m2` / `invariant_m5` / `invariant_m8c` tests inside each:
 
 - Ubuntu 22.04 — kernel 5.15, Landlock ABI 1
 - Debian 12 — kernel 6.1, Landlock ABI 2
+- Ubuntu 24.04 — kernel 6.8, Landlock ABI 4. After the root tests,
+  `kit/userns-probe.sh` runs as an unprivileged user with AppArmor's
+  user-namespace restriction at its default. It reports whether bwn's
+  namespace backend, bubblewrap and a joined holder namespace work there.
 
 It is a developer tool, not part of CI (a TCG run is ~10 minutes per cell and
 needs no network once the images are cached). Nested KVM makes it fast where
@@ -19,6 +23,8 @@ needs no network once the images are cached). Nested KVM makes it fast where
 ```sh
 scripts/field/landlock-kernel-cells/run.sh
 ```
+
+`CELLS="noble"` (or `"jammy bookworm"`) runs only the named cells.
 
 Needs `qemu-system-x86_64`, `genisoimage` (or `xorriso`), `cloud-localds`
 (from `cloud-image-utils`), and the `x86_64-unknown-linux-musl` Rust target

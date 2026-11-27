@@ -447,11 +447,17 @@ fn build(
     let plan = if userns {
         let protected = crate::sandbox::protected_paths(&roots);
         let writable = write_roots(&cwd, extra, tmp.as_deref());
-        Some(
-            crate::userns::Plan::new(&cwd, &writable, &protected, &hidden)
-                .ok_or("namespace plan: a path is not representable")?,
-        )
+        let mut plan = crate::userns::Plan::new(&cwd, &writable, &protected, &hidden)
+            .ok_or("namespace plan: a path is not representable")?;
+        // Join the session's private network namespace.
+        if let Net::Private(_) = net {
+            plan.join(crate::netns::join_fds()?);
+        }
+        Some(plan)
     } else {
+        if let Net::Private(_) = net {
+            return Err("the private network namespace needs the namespace backend".into());
+        }
         None
     };
     let mut child = Command::new("sh");
@@ -630,7 +636,9 @@ fn seccomp(net: Net, deny_truncate: bool) -> io::Result<()> {
     if deny_truncate {
         prog.extend(otrunc_filter());
     }
-    if let Net::Proxy(_) = net {
+    // In the private namespace too: only TCP sockets, so no Unix socket
+    // reaches a pathname socket in the shared file tree (the SSH agent).
+    if let Net::Proxy(_) | Net::Private(_) = net {
         prog.extend(proxy_filter());
     }
     for nr in deny {

@@ -274,8 +274,22 @@ pub enum Net {
     /// Out only through the egress checker's proxy on this loopback port
     /// (see egress.rs); listening is allowed, so a dev server works.
     Proxy(u16),
+    /// In the session's private network namespace (netns.rs), whose only
+    /// way out is the checker on this port of its own loopback. Servers a
+    /// command starts there are reachable from the next command.
+    Private(u16),
     /// Anything (`sandbox_egress_check: false`).
     Open,
+}
+
+impl Net {
+    /// The checker's port, when the command goes out through it.
+    pub fn checker_port(self) -> Option<u16> {
+        match self {
+            Net::Proxy(p) | Net::Private(p) => Some(p),
+            Net::Off | Net::Open => None,
+        }
+    }
 }
 
 static EGRESS_CHECK: AtomicBool = AtomicBool::new(true);
@@ -294,10 +308,11 @@ pub fn egress_check() -> bool {
 pub fn can_check_egress(backend: Backend) -> bool {
     match backend {
         Backend::SandboxExec => true,
+        // Held by the private network namespace, on any Landlock ABI.
         #[cfg(target_os = "linux")]
-        Backend::Bwrap | Backend::Landlock | Backend::Userns => {
-            crate::landlock::limits_connections()
-        }
+        Backend::Userns => true,
+        #[cfg(target_os = "linux")]
+        Backend::Bwrap | Backend::Landlock => crate::landlock::limits_connections(),
         #[cfg(not(target_os = "linux"))]
         Backend::Bwrap | Backend::Landlock | Backend::Userns => false,
     }
@@ -315,6 +330,16 @@ pub fn net_for(backend: Backend) -> Net {
     }
     if !egress_check() {
         return Net::Open;
+    }
+    // The namespace backend runs every command in the session's private
+    // network namespace. If that can't be made, no network rather than the
+    // host's.
+    #[cfg(target_os = "linux")]
+    if backend == Backend::Userns {
+        return match crate::netns::session() {
+            Ok(s) => Net::Private(s.port),
+            Err(_) => Net::Off,
+        };
     }
     if !can_check_egress(backend) {
         return Net::Off;
@@ -536,7 +561,8 @@ fn bwrap_argv(
         _ => None,
     };
     let share_net = match net {
-        Net::Off => false,
+        // Only the namespace backend joins the private namespace.
+        Net::Off | Net::Private(_) => false,
         Net::Proxy(_) => limiter.is_some(),
         Net::Open => true,
     };
@@ -937,7 +963,7 @@ pub fn seatbelt_profile(
     }
     p.push_str(")\n(deny appleevent-send)\n");
     match net {
-        Net::Off => p.push_str("(deny network*)\n"),
+        Net::Off | Net::Private(_) => p.push_str("(deny network*)\n"),
         // Out only to the proxy on loopback; listening and accepting stay
         // allowed so a dev server works.
         Net::Proxy(port) => p.push_str(&format!(
@@ -1015,7 +1041,7 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
     for k in scrubbed_env_keeping(env_names(), &passthrough()) {
         c.env_remove(k);
     }
-    if let Net::Proxy(port) = net_for(backend) {
+    if let Some(port) = net_for(backend).checker_port() {
         for k in crate::egress::UNSET_ENV {
             c.env_remove(k);
         }

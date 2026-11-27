@@ -5,6 +5,11 @@
 // (IP literals included) and neither can Chrome's own services. The tool and
 // the permission gate allow loopback addresses only, unless settings allow
 // the host; that host is then the one reached directly.
+//
+// Once sandboxed commands run in the session's private network namespace
+// (netns.rs), the dev server a command started is there, not on this
+// machine's loopback. Loopback then goes to the proxy too, which dials it
+// in the namespace (or on this machine, for a server started outside bwn).
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
@@ -191,6 +196,9 @@ fn playwright_builds(dir: &Path, windows: bool, macos: bool) -> Vec<PathBuf> {
 /// Requests to hosts other than loopback and `direct` go to the proxy on
 /// `proxy_port`, which refuses them. Chrome refuses to start as root with
 /// its sandbox (containers, CI), so `no_sandbox` turns it off there.
+/// `loopback_via_proxy` sends loopback to the proxy too (see the top of
+/// this file).
+#[allow(clippy::too_many_arguments)]
 pub fn chrome_args(
     url: &str,
     (width, height): (u32, u32),
@@ -199,6 +207,7 @@ pub fn chrome_args(
     proxy_port: u16,
     direct: Option<&str>,
     no_sandbox: bool,
+    loopback_via_proxy: bool,
 ) -> Vec<OsString> {
     let mut a: Vec<OsString> = [
         "--headless",
@@ -236,7 +245,11 @@ pub fn chrome_args(
     // where cloud metadata answers, and fe80::/10) around any proxy.
     // `<-loopback>` drops those rules; loopback is then named to stay direct.
     a.push(format!("--proxy-server=http://127.0.0.1:{proxy_port}").into());
-    let mut bypass = String::from(DIRECT_LOOPBACK);
+    let mut bypass = String::from(if loopback_via_proxy {
+        NO_IMPLICIT_BYPASS
+    } else {
+        DIRECT_LOOPBACK
+    });
     if let Some(host) = direct {
         bypass.push(';');
         bypass.push_str(host);
@@ -251,6 +264,16 @@ pub fn chrome_args(
 }
 
 const DIRECT_LOOPBACK: &str = "<-loopback>;localhost;*.localhost;127.0.0.1/8;[::1]";
+const NO_IMPLICIT_BYPASS: &str = "<-loopback>";
+
+/// Whether loopback pages go through the proxy to the session's network
+/// namespace (see the top of this file).
+pub fn loopback_in_session() -> bool {
+    #[cfg(target_os = "linux")]
+    return crate::netns::active();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
 
 fn flag_path(flag: &str, p: &Path) -> OsString {
     let mut s = OsString::from(flag);
@@ -290,7 +313,7 @@ impl Blackhole {
             while !done.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Some(host) = refuse(stream) {
+                        if let Some(host) = handle(stream) {
                             if let Ok(mut l) = log.lock() {
                                 if !l.contains(&host) {
                                     l.push(host);
@@ -332,23 +355,124 @@ impl Drop for Blackhole {
     }
 }
 
-// Answers one proxied request with 403 and returns the host it named
-// (`CONNECT host:443` or `GET http://host/…`).
-fn refuse(stream: std::net::TcpStream) -> Option<String> {
+// One proxied request (`CONNECT host:443` or `GET http://host/…`). A
+// loopback target, while commands run in the session's namespace, is
+// forwarded there; anything else is answered with 403 and its host
+// returned.
+fn handle(stream: std::net::TcpStream) -> Option<String> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut first = String::new();
-    let _ = BufReader::new(&stream).read_line(&mut first);
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") && !head.ends_with(b"\n\n") && head.len() < 16 * 1024 {
+        match reader.read_until(b'\n', &mut head) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    let first = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let target = first.split_whitespace().nth(1).unwrap_or("");
+    let connect = first.starts_with("CONNECT ");
+    let parsed = if connect {
+        url::Url::parse(&format!("https://{target}")).ok()
+    } else {
+        url::Url::parse(target).ok()
+    };
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .map(|h| h.trim_matches(['[', ']']).to_string());
+    #[cfg(target_os = "linux")]
+    if let (Some(u), Some(h)) = (&parsed, &host) {
+        if loopback_in_session() && is_loopback_host(h) {
+            let port = u.port_or_known_default().unwrap_or(80);
+            let pending = reader.buffer().to_vec();
+            let ip = h_addr(h);
+            std::thread::spawn(move || forward(stream, ip, port, connect, head, pending));
+            return None;
+        }
+    }
     let _ = (&stream)
         .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-    let target = first.split_whitespace().nth(1)?;
-    let host = if first.starts_with("CONNECT ") {
-        url::Url::parse(&format!("https://{target}")).ok()?
-    } else {
-        url::Url::parse(target).ok()?
+    host
+}
+
+// The loopback address a loopback host name means.
+#[cfg(target_os = "linux")]
+fn h_addr(host: &str) -> std::net::IpAddr {
+    host.parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+// A proxy request's head with its request line in origin form
+// (`GET /path?q HTTP/1.1`), as a server expects it, and without the
+// proxy-only header.
+#[cfg(target_os = "linux")]
+fn origin_form(head: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(head);
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if i == 0 {
+            let mut parts = line.splitn(3, ' ');
+            let (m, t, rest) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+            );
+            let path = url::Url::parse(t)
+                .map(|u| {
+                    let mut p = u.path().to_string();
+                    if let Some(q) = u.query() {
+                        p.push('?');
+                        p.push_str(q);
+                    }
+                    p
+                })
+                .unwrap_or_else(|_| t.to_string());
+            out.push_str(&format!("{m} {path} {rest}"));
+        } else if !line.to_ascii_lowercase().starts_with("proxy-connection:") {
+            out.push_str(line);
+        }
+    }
+    out.into_bytes()
+}
+
+// Carry one loopback request to the session's namespace (or this machine).
+#[cfg(target_os = "linux")]
+fn forward(
+    client: std::net::TcpStream,
+    ip: std::net::IpAddr,
+    port: u16,
+    connect: bool,
+    head: Vec<u8>,
+    pending: Vec<u8>,
+) {
+    let _ = client.set_read_timeout(None);
+    let Ok(up) = crate::netns::dial_loopback((ip, port).into()) else {
+        let _ = (&client).write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
+        return;
     };
-    host.host_str()
-        .map(|h| h.trim_matches(['[', ']']).to_string())
+    if connect {
+        if (&client)
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+    } else if (&up).write_all(&origin_form(&head)).is_err() {
+        return;
+    }
+    if !pending.is_empty() && (&up).write_all(&pending).is_err() {
+        return;
+    }
+    let (Ok(r), Ok(w)) = (client.try_clone(), client.try_clone()) else {
+        return;
+    };
+    let _ = crate::egress::splice(r, w, up);
 }
 
 /// The browser's name for the result line (`headless_shell`, `chrome`).
@@ -362,6 +486,16 @@ pub fn browser_name(p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forwarded_request_is_in_origin_form() {
+        let head = b"GET http://127.0.0.1:3000/a/b?x=1 HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nProxy-Connection: keep-alive\r\n\r\n";
+        assert_eq!(
+            String::from_utf8(origin_form(head)).unwrap(),
+            "GET /a/b?x=1 HTTP/1.1\r\nHost: 127.0.0.1:3000\r\n\r\n"
+        );
+    }
 
     #[test]
     fn loopback_hosts_are_this_machine_only() {
@@ -400,6 +534,7 @@ mod tests {
             4242,
             None,
             false,
+            false,
         );
         let a: Vec<String> = a.iter().map(|s| s.to_string_lossy().into_owned()).collect();
         for want in [
@@ -427,6 +562,7 @@ mod tests {
             1,
             Some("docs.example.com"),
             true,
+            false,
         );
         let a: Vec<String> = a.iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert!(a.contains(&format!(

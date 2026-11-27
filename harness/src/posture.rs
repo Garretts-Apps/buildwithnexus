@@ -278,6 +278,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         allowed.sort();
         let allow = allowed.len();
         let checked = format!("checked:{}", allowed.join(","));
+        let private = format!("private:{}", allowed.join(","));
         let landlock_alone = matches!(backend, crate::sandbox::Backend::Landlock);
         let (nv, nl, nk) = match net {
             Net::Off if !crate::sandbox::network() => {
@@ -300,6 +301,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 ),
                 Level::Good,
                 checked.as_str(),
+            ),
+            Net::Private(_) => (
+                format!(
+                    "only through the checker, from a private network namespace: {} package and source hosts, hosts you name, {allow} in network.allow; servers commands start reach each other, this machine's own services don't",
+                    crate::egress::KNOWN_HOSTS.len()
+                ),
+                Level::Good,
+                private.as_str(),
             ),
             Net::Open => (
                 "any host (sandbox_egress_check: false)".to_string(),

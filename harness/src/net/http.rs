@@ -70,6 +70,7 @@ struct Settings {
 pub struct Builder {
     settings: Settings,
     resolver: Option<Arc<dyn Resolver>>,
+    session_loopback: bool,
 }
 
 impl Builder {
@@ -82,7 +83,17 @@ impl Builder {
                 redirects: 5,
             },
             resolver: None,
+            session_loopback: false,
         }
+    }
+
+    /// Loopback addresses are tried in the session's private network
+    /// namespace first (servers sandboxed commands started), then on this
+    /// machine. Only for the tools' client: a model provider on loopback is
+    /// never dialled where a command could stand in for it.
+    pub fn session_loopback(mut self) -> Builder {
+        self.session_loopback = true;
+        self
     }
 
     /// The whole request: connecting, sending, and reading the body.
@@ -163,7 +174,7 @@ impl Agent {
                 plain: config(None),
             })
             .chain(ConnectProxyConnector::default())
-            .chain(Dial(TcpConnector::default()))
+            .chain(Dial(TcpConnector::default(), b.session_loopback))
             .chain(Tls);
         Agent {
             inner: ureq::Agent::with_parts(config(proxy), connector, resolver),
@@ -713,10 +724,10 @@ impl ureq::unversioned::resolver::Resolver for Resolve {
 // TCP, with a failure to connect told apart from a failure after it, as
 // ureq 2's ConnectionFailed was: only the first is safe to retry.
 #[derive(Debug)]
-struct Dial(TcpConnector);
+struct Dial(TcpConnector, bool);
 
 impl<In: Conn> Connector<In> for Dial {
-    type Out = <TcpConnector as Connector<In>>::Out;
+    type Out = Either<<TcpConnector as Connector<In>>::Out, Bridged>;
 
     fn connect(
         &self,
@@ -724,15 +735,103 @@ impl<In: Conn> Connector<In> for Dial {
         chained: Option<In>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
         let dialing = chained.is_none();
-        self.0.connect(details, chained).map_err(|e| match e {
-            ureq::Error::Io(io) if dialing => tag(ErrorKind::ConnectionFailed, "Connect error", io),
-            ureq::Error::Timeout(_) if dialing => tag(
-                ErrorKind::ConnectionFailed,
-                "Connect error",
-                timed_out("connection timed out"),
-            ),
-            other => other,
-        })
+        #[cfg(target_os = "linux")]
+        if self.1
+            && dialing
+            && crate::netns::active()
+            && !details.addrs.is_empty()
+            && details.addrs.iter().all(|a| a.ip().is_loopback())
+        {
+            let stream = details
+                .addrs
+                .iter()
+                .find_map(|a| crate::netns::dial_loopback(*a).ok())
+                .ok_or_else(|| {
+                    tag(
+                        ErrorKind::ConnectionFailed,
+                        "Connect error",
+                        io::Error::from(io::ErrorKind::ConnectionRefused),
+                    )
+                })?;
+            let config = details.config;
+            let buffers = LazyBuffers::new(config.input_buffer_size(), config.output_buffer_size());
+            return Ok(Some(Either::B(Bridged { stream, buffers })));
+        }
+        self.0
+            .connect(details, chained)
+            .map(|t| t.map(Either::A))
+            .map_err(|e| match e {
+                ureq::Error::Io(io) if dialing => {
+                    tag(ErrorKind::ConnectionFailed, "Connect error", io)
+                }
+                ureq::Error::Timeout(_) if dialing => tag(
+                    ErrorKind::ConnectionFailed,
+                    "Connect error",
+                    timed_out("connection timed out"),
+                ),
+                other => other,
+            })
+    }
+}
+
+// A connection bwn dialled itself (a loopback server in the session's
+// private network namespace, netns.rs).
+#[derive(Debug)]
+pub struct Bridged {
+    stream: std::net::TcpStream,
+    buffers: LazyBuffers,
+}
+
+impl Conn for Bridged {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        use std::io::Write;
+        let _ = self
+            .stream
+            .set_write_timeout(timeout.not_zero().map(|t| *t));
+        let output = &self.buffers.output()[..amount];
+        match self.stream.write_all(output) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(ureq::Error::Timeout(timeout.reason))
+            }
+            other => Ok(other?),
+        }
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let _ = self.stream.set_read_timeout(timeout.not_zero().map(|t| *t));
+        let input = self.buffers.input_append_buf();
+        let amount = match self.stream.read(input) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(ureq::Error::Timeout(timeout.reason))
+            }
+            other => other?,
+        };
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        // Open unless the peer has closed: a peek that would block.
+        let _ = self.stream.set_nonblocking(true);
+        let mut b = [0u8; 1];
+        let open =
+            matches!(self.stream.peek(&mut b), Err(e) if e.kind() == io::ErrorKind::WouldBlock);
+        let _ = self.stream.set_nonblocking(false);
+        open
     }
 }
 

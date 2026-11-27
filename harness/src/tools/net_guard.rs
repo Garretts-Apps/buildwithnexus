@@ -160,9 +160,11 @@ impl crate::net::Resolver for GuardedResolver {
 // The client every fetch tool uses. Redirects are followed by web_get, not
 // ureq, so each hop is checked again and takes its own route: through a
 // proxy only the proxy resolves names, and GuardedResolver never sees them.
-pub(super) fn web_client() -> &'static crate::net::Client {
+pub(crate) fn web_client() -> &'static crate::net::Client {
     static CLIENT: OnceLock<crate::net::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| crate::net::Client::new(|b| b.resolver(GuardedResolver).redirects(0)))
+    CLIENT.get_or_init(|| {
+        crate::net::Client::new(|b| b.resolver(GuardedResolver).redirects(0).session_loopback())
+    })
 }
 
 pub(super) enum WebError {

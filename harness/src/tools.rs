@@ -5026,6 +5026,7 @@ fn screenshot_url(input: &Value, cwd: &Path) -> Outcome {
         hole.port,
         direct,
         running_as_root(),
+        screenshot::loopback_in_session(),
     ));
     crate::sandbox::scrub_credentials(&mut cmd);
     let ran = run_with_timeout(cmd, None, SCREENSHOT_TIMEOUT);
@@ -6501,7 +6502,7 @@ use net_guard::*;
 
 mod table;
 pub use net_guard::{blocked_url, private_network_host};
-pub(crate) use net_guard::{is_blocked_ip, is_private_ip};
+pub(crate) use net_guard::{is_blocked_ip, is_private_ip, web_client};
 
 #[cfg(test)]
 mod classify_tests;

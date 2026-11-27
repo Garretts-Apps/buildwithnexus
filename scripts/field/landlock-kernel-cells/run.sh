@@ -44,6 +44,8 @@ cloud-localds "$work/seed.iso" "$here/user-data" "$here/meta-data"
 rc=0
 while IFS='|' read -r cell url sha; do
   case "$cell" in ''|\#*) continue ;; esac
+  # CELLS="noble" runs only the named cells.
+  case " ${CELLS:-$cell} " in *" $cell "*) ;; *) continue ;; esac
   img="$work/$cell.base"
   if [ ! -f "$img" ] || [ "$(sha256sum "$img" | cut -d' ' -f1)" != "$sha" ]; then
     echo "fetching $cell..."

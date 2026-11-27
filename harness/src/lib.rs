@@ -61,6 +61,8 @@ pub mod mcp;
 pub mod mcp_auth;
 pub mod media;
 pub mod net;
+#[cfg(target_os = "linux")]
+mod netns;
 pub mod onboarding;
 pub mod posture;
 pub mod provider;

@@ -8070,6 +8070,102 @@ fn b64_head(s: &str, n: usize) -> Vec<u8> {
 }
 
 // A vision model asks for a screenshot of a page a local server is serving:
+// Roadmap 2.2: on the namespace backend commands run in the session's
+// private network namespace, so a dev server a command starts is not on
+// this machine's loopback. start_server then screenshot_url still works:
+// the browser's loopback request is carried into the namespace. Skips where
+// unprivileged user namespaces are off (most CI runners).
+#[cfg(target_os = "linux")]
+#[test]
+fn invariant_netns_screenshot_reaches_a_server_a_command_started() {
+    let userns = Command::new("unshare")
+        .args(["-Ur", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !userns {
+        eprintln!("skip: unprivileged user namespaces are off here");
+        return;
+    }
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        cwd.join("index.html"),
+        "<html><body style=\"background:#0c0\"><h1>inside</h1>\
+         <img src=\"/from-browser.png\"></body></html>",
+    )
+    .unwrap();
+    let page = TcpListener::bind("127.0.0.1:0").unwrap();
+    let pp = page.local_addr().unwrap().port();
+    drop(page);
+    let url = format!("http://127.0.0.1:{pp}/");
+    let (port, _posts) = serve_protocols(
+        vec![
+            tool_call(
+                "c1",
+                "start_server",
+                json!({"name": "web", "command": format!("python3 -m http.server {pp} --bind 127.0.0.1"), "port": pp}),
+            ),
+            tool_call("c2", "run_command", json!({"command": "sleep 2"})),
+            tool_call(
+                "c3",
+                "screenshot_url",
+                json!({"url": url, "width": 400, "height": 300}),
+            ),
+            // Let the server write its log before the session ends it.
+            tool_call("c4", "run_command", json!({"command": "sleep 1"})),
+            finish("green"),
+        ],
+        None,
+    );
+    let cfg = json!({
+        "provider": "llamacpp", "model": "gemma3:4b", "permission": "auto",
+        "base_url": format!("http://127.0.0.1:{port}/v1"), "context_tokens": 131_072,
+    });
+    std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+    let r = run_env(
+        &home,
+        &cwd,
+        &["--json", "run", "how does the page look?"],
+        &[("BWN_TEST_SANDBOX_BACKEND", "userns")],
+    );
+    // The server is the session's; nothing of it is left on this machine.
+    let from_host = std::net::TcpStream::connect(("127.0.0.1", pp)).is_ok();
+    let result = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "screenshot_url")
+        .unwrap_or_else(|| panic!("stderr: {}\n{:?}", r.stderr, r.events));
+    let content = result["content"].as_str().unwrap();
+    if content.contains("no Chrome, Chromium or Edge found") {
+        eprintln!("skipping: no browser installed ({content})");
+        return;
+    }
+    assert_eq!(result["is_error"], false, "{content}\n{:?}", r.events);
+    assert!(content.contains("HTTP 200"), "{content}");
+    assert!(
+        !from_host,
+        "the server was reachable on this machine's loopback"
+    );
+    // The browser itself reached the server in the namespace: only it asks
+    // for the page's image (the tool's own check fetches the page alone).
+    let started = r
+        .events
+        .iter()
+        .find(|e| e["type"] == "tool_result" && e["name"] == "start_server")
+        .and_then(|e| e["content"].as_str())
+        .unwrap_or("");
+    let log = started
+        .lines()
+        .find_map(|l| l.strip_prefix("log: "))
+        .unwrap_or_else(|| panic!("no log path: {started}"));
+    let log = std::fs::read_to_string(log.trim()).unwrap_or_default();
+    assert!(
+        log.contains("/from-browser.png"),
+        "the browser did not reach the server: {log}"
+    );
+}
+
 // the request after it carries a PNG of the requested size, and what the
 // page asked of other hosts was blocked and named.
 #[test]
