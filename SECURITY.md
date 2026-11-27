@@ -309,6 +309,14 @@ refuse in every mode and which a project's settings cannot remove,
 placed and verified itself), and `BWN_TLS_ROOTS=bundled` (trust only the
 roots built into the binary, not the OS store or `SSL_CERT_FILE`).
 
+A broken setting never loosens these. A `sandbox` value bwn can't parse runs
+as `require`, and a `permission` value as `readonly`, each with a warning
+naming the fix. A settings file that exists but doesn't load (bad JSON, a
+top level that isn't an object, or a file bwn can't read), the user's or a
+project's, stops bwn from starting, so its deny rules can't be skipped. If
+one stops loading during a session, every tool call and every connection a
+sandboxed command makes is refused until it loads again.
+
 ### Why endpoint protection may block it
 
 EDR products such as CrowdStrike Falcon and Microsoft Defender score

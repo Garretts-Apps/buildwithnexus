@@ -14,6 +14,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **A broken setting never loosens the policy.** A `sandbox` value bwn
+  can't parse runs as `require` (it used to leave the sandbox off), and a
+  `permission` value as `readonly` (it used to be `ask`), each with a
+  warning. A settings file that exists but doesn't load (bad JSON, not an
+  object, or unreadable), yours or a project's, now stops bwn from starting;
+  before, it was skipped with a warning and its deny rules with it. If one
+  stops loading mid-session, tool calls and sandboxed connections are
+  refused until it loads again. `doctor` says so instead of showing a
+  sandbox mode that won't apply.
 - **An untrusted project can no longer repair a broken user setting.** When
   your own file held a value bwn can't load (say `"permission": 5`), bwn
   refused to start, but a project file setting the same key to a valid

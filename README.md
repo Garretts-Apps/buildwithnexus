@@ -599,7 +599,8 @@ sensitive-path or dangerous-command confirmation can't slip one through.
 commands, deletions, network access and anything inside `.git` still ask.
 Claude Code's names are accepted too (`acceptEdits`, `default` for ask,
 `plan` and `dontAsk` for readonly, `bypassPermissions` for auto); an unknown
-name is an error, and a misspelt `permission` setting warns and uses `ask`.
+name is an error. A misspelt setting runs strictest; a broken settings
+file stops bwn.
 
 A switch made in a session (`/permissions auto`, or typing "use auto") lasts
 for that session. `/permissions default <mode>`, or "save as default" in the

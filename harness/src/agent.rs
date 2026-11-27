@@ -885,6 +885,14 @@ pub(crate) fn gate(
     // tool itself.
     let any_cmd = command_of(name, input);
 
+    // A settings file that exists but doesn't load hides its rules, deny
+    // rules included: refuse everything until it loads again, so they can't
+    // be skipped (roadmap 1.3; analysis I4).
+    if let Some(why) = config::broken_policy_file(cwd) {
+        return Some(format!(
+            "{why}; bwn refuses tool calls until it loads, so its rules can't be skipped. Fix or remove the file."
+        ));
+    }
     // Deny rules and network.deny refuse in every mode, before anything can
     // ask or allow.
     let rules = config::policy_rules(cwd);
@@ -1362,6 +1370,9 @@ mod rule_tests;
 /// Whether settings allow screenshot_url to open `host`: a `network.allow`
 /// entry or an allow rule for the tool that covers it.
 pub(crate) fn network_allows(host: &str, cwd: &Path) -> bool {
+    if config::broken_policy_file(cwd).is_some() {
+        return false;
+    }
     let input = serde_json::json!({"url": format!("http://{host}/")});
     rule_for(
         &config::policy_rules(cwd),
@@ -1398,6 +1409,9 @@ fn denied_by_rule(
 /// The refusal for a request bwn makes on its own behalf (an http hook) to
 /// `host`, when network.deny names it.
 pub(crate) fn network_denied(cwd: &Path, host: &str) -> Option<String> {
+    if let Some(why) = config::broken_policy_file(cwd) {
+        return Some(why);
+    }
     config::policy_rules(cwd)
         .iter()
         .find(|r| r.network && r.effect == config::RuleEffect::Deny && host_matches(&r.rule, host))
@@ -1537,6 +1551,11 @@ fn gate_after_hook(
         PreDecision::Deny(r) => Some(r),
         // A hook's allow skips the prompts, never a deny rule.
         PreDecision::Allow if !matches!(perm, Permission::ReadOnly) => {
+            if let Some(why) = config::broken_policy_file(cwd) {
+                return Some(format!(
+                    "{why}; a hook's allow can't skip rules bwn can't read"
+                ));
+            }
             let host = tools::network_host(name, input);
             denied_by_rule(
                 &config::policy_rules(cwd),

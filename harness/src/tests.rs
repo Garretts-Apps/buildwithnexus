@@ -2021,3 +2021,18 @@ fn an_unreachable_ollama_is_still_reported_by_the_deferred_probe() {
         "a server started later is asked again on the first request"
     );
 }
+
+// Roadmap 1.3 (analysis M13, Integrity invariant, IN-2): a permission value
+// in settings that bwn can't parse runs as readonly, never as something
+// looser. The --permission-mode flag still exits on a bad value.
+#[test]
+fn a_bad_permission_setting_runs_as_readonly() {
+    for bad in ["bogus", "", "auto-ish"] {
+        assert!(
+            matches!(permission_from(None, bad), Permission::ReadOnly),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(permission_from(None, "auto"), Permission::Auto));
+    assert!(matches!(permission_from(None, "ask"), Permission::Ask));
+}

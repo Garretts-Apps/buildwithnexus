@@ -270,6 +270,17 @@ pub fn configure(mode: &str, network: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply a `sandbox` value from settings. A value bwn can't parse falls back
+/// to `require`, the strictest mode, and the error says so: a typo never
+/// leaves commands unconfined (roadmap 1.3; analysis M13).
+pub fn configure_setting(mode: &str, network: bool) -> Result<(), String> {
+    configure(mode, network).map_err(|e| {
+        set_mode(Mode::Require);
+        set_network(network);
+        format!("{e}; using require until it is fixed")
+    })
+}
+
 // ── backend detection (once per session) ──────────────────────────────────────
 fn probe() -> &'static Result<Backend, String> {
     static PROBE: OnceLock<Result<Backend, String>> = OnceLock::new();
@@ -1376,6 +1387,21 @@ mod tests {
         let no_net = seatbelt_profile(Path::new("/w"), &[], None, Net::Off, &[]);
         assert!(no_net.ends_with("(deny network*)\n"));
         assert!(!no_net.contains("folders"));
+    }
+
+    #[test]
+    fn a_bad_sandbox_setting_falls_back_to_require() {
+        // Roadmap 1.3 (analysis M13, IN-2): a value bwn can't parse never
+        // leaves commands less confined than the strictest mode.
+        let (m, n) = (mode(), network());
+        set_mode(Mode::Off);
+        let err = configure_setting("bogus", false).unwrap_err();
+        assert!(err.contains("using require"), "{err}");
+        assert_eq!(mode(), Mode::Require);
+        assert!(configure_setting("auto", true).is_ok());
+        assert_eq!(mode(), Mode::Auto);
+        set_mode(m);
+        set_network(n);
     }
 
     #[test]
