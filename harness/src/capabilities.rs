@@ -103,14 +103,16 @@ pub const CAPABILITIES: &[Cap] = &[
         id: "network_through_checker",
         guarantee: "Network only through the host checker",
         bwrap: "Yes; no network if bwn's own binary can't be found",
-        landlock: "Needs Landlock ABI 4 (kernel 6.7); otherwise no network",
+        landlock: "Needs Landlock ABI 4 (kernel 6.7); otherwise no network. The rule is by port, so the checker's port on another address also connects (roadmap 2.2); only plain TCP sockets are allowed, so MPTCP and x32 calls are refused",
         seatbelt: "Yes",
-        proven_by: "`bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`",
+        proven_by: "`bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`",
         tests: &[
             "bwrap_limits_the_network_to_the_proxy",
             "landlock_limits_the_network_to_the_proxy",
             "seatbelt_limits_the_network_to_the_proxy",
             "invariant_m8b_no_network_limiter_means_no_network",
+            "invariant_sec1_mptcp_socket_is_refused_under_the_proxy",
+            "invariant_m8c_x32_syscalls_are_refused",
         ],
     },
     Cap {

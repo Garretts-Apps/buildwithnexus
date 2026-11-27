@@ -10,11 +10,14 @@ cp "$K/bwn-tests" /root/bwn-tests
 cp "$K/bwn" /root/buildwithnexus
 chmod +x /root/bwn-tests /root/buildwithnexus
 cd /root
-for t in landlock:: invariant_m2 invariant_m5 invariant_m8c sandbox::tests::landlock; do
+for t in landlock:: invariant_m2 invariant_m5 invariant_m8c invariant_sec1 sandbox::tests::landlock; do
   echo "--- $t"
   BWN_TEST_SANDBOX_BACKEND=landlock BWN_TEST_CONFINE_EXE=/root/buildwithnexus \
     ./bwn-tests --test-threads=1 --nocapture "$t" 2>&1 \
-    | grep -E "^test |panicked|ABI|test result|truncated|ruleset" | head -60
+    | grep -E "^test |panicked|ABI|test result|truncated|ruleset" | head -60 > /root/out.txt
+  cat /root/out.txt
+  # A named filter that matches no test is a lost test, not a pass.
+  grep -q "test result: ok. 0 passed" /root/out.txt && echo "EMPTY FILTER: $t"
 done
 echo "=== PROBE END"
 poweroff
