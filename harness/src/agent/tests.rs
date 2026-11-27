@@ -4063,3 +4063,44 @@ fn invariant_au2_a_policy_change_is_never_pre_approved() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// AU-5, disclosure half (roadmap 1.8; analysis M1, A2): on Landlock,
+// commands can write .git and .buildwithnexus, so auto mode asks before
+// each command and the startup check says why. On bubblewrap and Seatbelt
+// they are read-only and auto mode doesn't ask for this reason. The
+// invariant suite runs this once per backend.
+#[test]
+fn invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home("landlock-gap", json!({}));
+    let mode0 = crate::sandbox::mode();
+    crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+    let reason = gate(
+        Permission::Auto,
+        "run_command",
+        &json!({"command": "make"}),
+        &proj,
+    )
+    .unwrap_or_default();
+    let rows = crate::posture::gather_session_rows_for_test(Permission::Auto, &proj);
+    let writes = rows
+        .iter()
+        .find(|r| r.item == "writes")
+        .map(|r| r.value.clone());
+    match crate::sandbox::backend() {
+        Some(crate::sandbox::Backend::Landlock) => {
+            assert!(reason.contains("Landlock"), "{reason:?}");
+            assert!(writes.unwrap().contains(".git and .buildwithnexus"));
+        }
+        Some(_) => {
+            assert!(!reason.contains("Landlock"), "{reason:?}");
+            assert!(!writes.unwrap().contains(".git and .buildwithnexus"));
+        }
+        None => eprintln!("skip: no backend, covered by the no-backend rows"),
+    }
+    crate::sandbox::set_mode(mode0);
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -170,17 +170,30 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         // Keys carry what the row allows, so a change to it changes the
         // fingerprint (roadmap 1.5; analysis M11).
         let added: Vec<String> = crate::workdirs::list().iter().map(|p| tilde(p)).collect();
-        v.push(row(
-            "session",
-            "writes",
-            if added.is_empty() {
-                "only the workspace and temp folders".into()
-            } else {
-                format!("only the workspace, temp folders and {}", added.join(", "))
-            },
-            Level::Good,
-            &format!("confined:{}", added.join(",")),
-        ));
+        let where_ = if added.is_empty() {
+            "only the workspace and temp folders".to_string()
+        } else {
+            format!("only the workspace, temp folders and {}", added.join(", "))
+        };
+        // Landlock can't keep .git and .buildwithnexus read-only inside the
+        // workspace; say so, and auto mode asks (roadmap 1.8; M1).
+        if crate::sandbox::protects_policy_files() {
+            v.push(row(
+                "session",
+                "writes",
+                where_,
+                Level::Good,
+                &format!("confined:{}", added.join(",")),
+            ));
+        } else {
+            v.push(row(
+                "session",
+                "writes",
+                format!("{where_}, including .git and .buildwithnexus on this backend (a planted hook or setting runs later outside the sandbox; auto mode asks before commands)"),
+                Level::Warn,
+                &format!("confined-policy-writable:{}", added.join(",")),
+            ));
+        }
         let hidden = crate::sandbox::hidden_paths(&[cwd]);
         let (cv, cl, ck) = if crate::sandbox::hides_reads(cwd) {
             let names: Vec<String> = hidden.iter().map(|p| tilde(p)).collect();
@@ -729,6 +742,11 @@ pub fn before_request(base_url: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn gather_session_rows_for_test(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
+    session_rows(perm, cwd)
+}
+
+#[cfg(test)]
 pub(crate) fn forget_accepted() {
     *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -833,6 +851,34 @@ mod tests {
         assert!(ensure("s2", p, &cwd, base).is_err());
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // Roadmap 1.11 (decision D4): on Windows the startup check says commands
+    // are not confined, and in auto mode that each one asks.
+    #[cfg(windows)]
+    #[test]
+    fn invariant_d4_windows_states_its_reduced_guarantees() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mode0 = crate::sandbox::mode();
+        crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+        let cwd = std::env::temp_dir();
+        let rows = session_rows(crate::agent::Permission::Auto, &cwd);
+        let sandbox = rows.iter().find(|r| r.item == "sandbox").unwrap();
+        assert!(
+            sandbox.value.contains("no sandbox backend on Windows"),
+            "{}",
+            sandbox.value
+        );
+        assert_eq!(sandbox.level, Level::Warn);
+        let commands = rows.iter().find(|r| r.item == "commands").unwrap();
+        assert!(
+            commands.value.contains("asks before each one"),
+            "{}",
+            commands.value
+        );
+        crate::sandbox::set_mode(mode0);
     }
 
     // IN-3 (roadmap 1.5; analysis M11, Integrity invariant): once accepted,

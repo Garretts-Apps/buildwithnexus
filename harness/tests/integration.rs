@@ -6844,6 +6844,12 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     )
     .unwrap();
     let r = run(&home, &cwd, "touch fetch head");
+    // On Landlock, which can't keep .git read-only, auto mode asks before
+    // the command and, headless, nothing runs (roadmap 1.8).
+    if r.text_of("tool_denied").contains("Landlock") {
+        assert!(!cwd.join(".git/FETCH_HEAD").exists());
+        return;
+    }
     let result = r.text_of("tool_result");
     if result.contains("[exit 0]") {
         return;

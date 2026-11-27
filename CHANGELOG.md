@@ -14,6 +14,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **Landlock's `.git` gap is shown, and auto mode asks there.** Landlock
+  (the Linux fallback, and always the backend inside WSL) can't keep `.git`
+  and `.buildwithnexus` read-only, so the posture check now says so and
+  auto mode asks before each command on that backend. In WSL this means
+  every command asks in auto mode until roadmap item 2.2 closes the gap.
+  SECURITY.md no longer states the read-only rule without the backend.
+- **Windows states that commands aren't confined,** in the posture check,
+  `doctor` and SECURITY.md; auto mode already asks before each command there.
 - **The posture check asks again when the session's reach changes.** Its
   acceptance now covers the permission and sandbox modes, added folders,
   which credential stores are hidden, and the hosts `network.allow` names.

@@ -979,6 +979,17 @@ pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether sandboxed commands are kept from writing `.git` and
+/// `.buildwithnexus`, where a planted hook or setting would run later outside
+/// the sandbox. Bubblewrap and Seatbelt keep them read-only; Landlock can't
+/// carve them out of the writable workspace (roadmap 1.8; analysis M1).
+pub fn protects_policy_files() -> bool {
+    match decide(mode(), backend()) {
+        Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
+        Decision::Sandboxed(_) | Decision::Unsandboxed | Decision::Refused => false,
+    }
+}
+
 /// Whether a command run now, in `cwd`, is kept from reading the credential
 /// stores: bubblewrap and Seatbelt always hide them; Landlock does unless
 /// the workspace holds one (a session run from the home folder). False when
