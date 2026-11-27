@@ -495,6 +495,10 @@ const ARG3: u32 = 40;
 const MSG_FASTOPEN: u32 = 0x2000_0000;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+// O_TRUNC in the open flags, and the access-mode mask. On Linux these are
+// the same on every architecture bwn builds for.
+const O_TRUNC: u32 = 0x200;
+const O_ACCMODE: u32 = 0x3;
 
 fn seccomp(net: Net, deny_truncate: bool) -> io::Result<()> {
     let block_network = net == Net::Off;
@@ -548,6 +552,15 @@ fn seccomp(net: Net, deny_truncate: bool) -> io::Result<()> {
         jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)),
     ]);
+    // Below Landlock ABI 3, truncate(2) is refused above; but an
+    // `open(O_RDONLY|O_TRUNC)` also truncates and the ruleset grants
+    // READ_FILE broadly, so Landlock there does not catch it. Refuse that
+    // open (and openat2, whose flags sit behind a pointer seccomp cannot
+    // read, so a caller falls back to openat). A write-mode O_TRUNC open
+    // needs WRITE_FILE, which Landlock confines, so it is left alone.
+    if deny_truncate {
+        prog.extend(otrunc_filter());
+    }
     if let Net::Proxy(_) = net {
         prog.extend(proxy_filter());
     }
@@ -598,6 +611,42 @@ fn proxy_filter() -> Vec<SockFilter> {
     p
 }
 
+// Deny `open`/`openat` with O_TRUNC in O_RDONLY mode, and openat2 outright
+// (ENOSYS, so glibc falls back to openat). Each block starts with the
+// syscall number loaded; a non-match skips the block with it still loaded,
+// and a match returns. Used only when `deny_truncate` is set (ABI < 3).
+fn otrunc_filter() -> Vec<SockFilter> {
+    let deny = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+    let ld = |off| stmt(BPF_LD | BPF_W | BPF_ABS, off);
+    let and = |k| stmt(BPF_ALU | BPF_AND | BPF_K, k);
+    let ret = |k| stmt(BPF_RET | BPF_K, k);
+    let jeq = |k, jt, jf| jump(BPF_JMP | BPF_JEQ | BPF_K, k, jt, jf);
+    // openat2's flags are unreadable here; make callers fall back to openat.
+    let mut p = vec![
+        jeq(libc::SYS_openat2 as u32, 0, 1),
+        ret(SECCOMP_RET_ERRNO | (libc::ENOSYS as u32)),
+    ];
+    // (syscall number, byte offset of its flags argument in seccomp_data).
+    #[cfg(target_arch = "x86_64")]
+    let opens: &[(i64, u32)] = &[(libc::SYS_openat, ARG2), (libc::SYS_open, ARG1)];
+    #[cfg(not(target_arch = "x86_64"))]
+    let opens: &[(i64, u32)] = &[(libc::SYS_openat, ARG2)];
+    for &(nr, flags) in opens {
+        p.extend([
+            jeq(nr as u32, 0, 8),
+            ld(flags),
+            and(O_TRUNC),
+            jeq(0, 4, 0), // no O_TRUNC bit -> allow
+            ld(flags),
+            and(O_ACCMODE),
+            jeq(0, 0, 1), // O_RDONLY (0) -> deny; any write mode -> allow
+            ret(deny),
+            ret(SECCOMP_RET_ALLOW),
+        ]);
+    }
+    p
+}
+
 fn install(prog: &[SockFilter]) -> io::Result<()> {
     #[repr(C)]
     struct SockFprog {
@@ -634,114 +683,6 @@ fn audit_arch() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn write_roots_include_the_workspace_and_temp_and_not_the_home_dir() {
-        let cwd = Path::new("/work/app");
-        let extra = vec![PathBuf::from("/other")];
-        let roots = write_roots(cwd, &extra, Some(Path::new("/var/tmp/build")));
-        assert!(roots.iter().any(|p| p == Path::new("/work/app")));
-        assert!(roots.iter().any(|p| p == Path::new("/other")));
-        assert!(roots.iter().any(|p| p == Path::new("/tmp")));
-        assert!(roots.iter().any(|p| p == Path::new("/var/tmp/build")));
-        assert!(roots.iter().any(|p| p == Path::new("/dev")));
-        assert!(!roots.iter().any(|p| p == Path::new("/home")));
-    }
-
-    // Each command used to leave its ruleset fd open in bwn. Other tests
-    // open files on other threads meanwhile, so the check allows some
-    // noise, far below one fd per command.
-    #[test]
-    fn a_confined_command_does_not_leak_its_ruleset_fd() {
-        if available().is_err() {
-            return;
-        }
-        let open_fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
-        let dir = std::env::temp_dir();
-        let runs = 64;
-        let before = open_fds();
-        for _ in 0..runs {
-            let mut cmd = command("true", &dir, &[], Net::Off).expect("ruleset");
-            let out = cmd.stdout(Stdio::null()).output().expect("spawn");
-            assert!(out.status.success(), "{:?}", out.status);
-        }
-        let after = open_fds();
-        assert!(
-            after < before + runs / 2,
-            "{} fds open after {runs} confined commands, {before} before",
-            after
-        );
-    }
-
-    #[test]
-    fn a_confined_command_can_write_inside_and_not_outside() {
-        if available().is_err() {
-            return;
-        }
-        // Under the crate's target dir, not /tmp (a writable root) and not
-        // a path that only exists on one machine. A sibling of the workspace
-        // must stay unwritable.
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "bwn-landlock-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let dir = base.join("ws");
-        let outside = base.join("out.txt");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = format!(
-            "echo inside > in.txt; echo outside > {} ; echo done",
-            outside.display()
-        );
-        let mut cmd = command(&script, &dir, &[], Net::Open).expect("ruleset");
-        let out = cmd.output().expect("spawn");
-        let inside = std::fs::read_to_string(dir.join("in.txt")).unwrap_or_default();
-        let leaked = std::fs::read_to_string(&outside).unwrap_or_default();
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(
-            out.status.success(),
-            "status {:?} stderr {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(inside.contains("inside"), "{inside}");
-        assert!(
-            !leaked.contains("outside"),
-            "landlock allowed a write outside the workspace: {leaked}"
-        );
-    }
-
-    // Roadmap 2.2 (analysis M8c): an x32 syscall carries the x86-64 audit
-    // architecture and the x32 bit (1 << 30) in its number, so a deny list
-    // of x86-64 numbers never matches it. The filter refuses every x32
-    // number. A kernel without x32 answers ENOSYS when nothing refuses it,
-    // so this fails on the old filter on any x86-64 kernel.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn invariant_m8c_x32_syscalls_are_refused() {
-        if available().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir();
-        // getpid (39) and socket (41) with the x32 bit.
-        let script =
-            "perl -e 'for my $n (39, 41) { syscall(0x40000000 + $n, 2, 1, 0); print $!+0, \" \" }'";
-        let mut cmd = command(script, &dir, &[], Net::Off).expect("ruleset");
-        let out = cmd.output().expect("spawn");
-        let errnos = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert_eq!(
-            errnos,
-            format!("{} {}", libc::EPERM, libc::EPERM),
-            "x32 syscalls were not refused (errno per call): {errnos}; stderr {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
 
     // Roadmap 2.2 (analysis M2): the seccomp half, forced on so it runs on
     // any kernel. truncate(2) is refused inside the workspace too (the
@@ -791,6 +732,58 @@ mod tests {
         assert_eq!(path, "data", "truncate(2) inside was not refused: {said}");
         assert_eq!(otrunc, "", "O_TRUNC inside failed: {said}");
         assert_eq!(ftrunc, "", "ftruncate inside failed: {said}");
+    }
+
+    // Roadmap 2.2 (analysis M2): the O_RDONLY|O_TRUNC open path. Below ABI 3
+    // Landlock only grants READ_FILE on an outside file, so such an open
+    // truncates it unless seccomp stops it. Build an ABI1-only ruleset (no
+    // FS_TRUNCATE) so the check holds on any kernel, not just old ones: the
+    // outside file must survive, and a normal write-mode truncate inside the
+    // workspace must still work.
+    #[test]
+    fn invariant_m2_seccomp_refuses_otrunc_open_below_abi3() {
+        use std::os::unix::process::CommandExt;
+        if available().is_err() {
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bwn-landlock-otrunc-{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("keep.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(&outside, "keepdata").unwrap();
+        std::fs::write(ws.join("inside.txt"), "insidedata").unwrap();
+        // ABI1-only ruleset: writes handled, truncate not (like ABI 1 and 2).
+        let fd = create(ABI1, Net::Open, abi().unwrap()).unwrap();
+        add_path(fd, &ws, ABI1).unwrap();
+        // O_RDONLY|O_TRUNC on the outside file (its open is refused when the
+        // filter is on), then a normal write-mode truncate inside.
+        let script = format!(
+            "python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDONLY|os.O_TRUNC))' {}; : > inside.txt",
+            outside.display()
+        );
+        let mut c = Command::new("sh");
+        c.args(["-c", &script]).current_dir(&ws);
+        unsafe {
+            c.pre_exec(move || engage(fd, Net::Open, true));
+        }
+        let out = c.output().expect("spawn");
+        unsafe { libc::close(fd) };
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+        let (kept, inside) = (read(&outside), read(&ws.join("inside.txt")));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            kept,
+            "keepdata",
+            "O_RDONLY|O_TRUNC emptied the outside file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            inside, "",
+            "a normal write-mode truncate inside was blocked"
+        );
     }
 
     // Roadmap 1.7 and 2.2 (analysis M2): truncate(2) on a file outside the

@@ -32,11 +32,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (kernel 6.2), and the kernel rejects an unknown right: on Debian 12 every
   sandboxed command was refused with "Invalid argument". bwn now asks only
   for rights the running kernel has. Below ABI 3 (Ubuntu 22.04, Debian 12)
-  Landlock can't stop a command truncating a file outside the workspace by
-  path, so the seccomp filter now refuses `truncate(2)` on those kernels,
-  inside the workspace too. Opening a file to empty it (`: > file`) and
-  `ftruncate` still work inside; `perl`'s and Python's `truncate` on a
-  path name do not. The posture check says so.
+  Landlock can't stop a command truncating a file outside the workspace, so
+  on those kernels the seccomp filter now refuses `truncate(2)` and an
+  `open` with `O_TRUNC` in read-only mode (which also truncates and which
+  Landlock there does not catch), inside the workspace too. A normal
+  write-mode truncate — `: > file`, `ftruncate`, opening for writing with
+  `O_TRUNC` — still works inside, because Landlock confines those. `perl`'s
+  and Python's `truncate` on a path name do not. The posture check says so.
 - **With no sandbox backend, commands are refused until you allow them.**
   In `auto` sandbox mode with no working backend (Windows, or Linux without
   bubblewrap or Landlock), bwn used to run commands unconfined. Now it asks
