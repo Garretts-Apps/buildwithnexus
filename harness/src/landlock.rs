@@ -363,8 +363,9 @@ pub fn available() -> Result<(), String> {
 }
 
 /// Apply `ruleset` to this process, then the seccomp deny-list. For the
-/// child after fork only.
-pub fn engage(ruleset: RawFd, net: Net) -> io::Result<()> {
+/// child after fork only. `deny_truncate` refuses truncate(2) outright,
+/// for a Landlock ABI that cannot confine it by path (`confines_truncate`).
+pub fn engage(ruleset: RawFd, net: Net, deny_truncate: bool) -> io::Result<()> {
     // Landlock and seccomp both require no_new_privs.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
@@ -373,7 +374,7 @@ pub fn engage(ruleset: RawFd, net: Net) -> io::Result<()> {
     if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    seccomp(net)
+    seccomp(net, deny_truncate)
 }
 
 /// `cmd` as a child that confines itself with Landlock and seccomp.
@@ -395,6 +396,11 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Com
         .map_err(|e| format!("landlock ruleset: {e} (the kernel may not have Landlock enabled)"))?;
     // SAFETY: ruleset returned a fresh fd that nothing else owns.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    // Below ABI 3 Landlock cannot refuse truncate(2) on a path outside the
+    // workspace, so seccomp refuses the call everywhere (analysis M2).
+    // ftruncate stays: it needs a file opened for writing, which Landlock
+    // does check.
+    let deny_truncate = !confines_truncate();
     let mut child = Command::new("sh");
     child.args(["-c", cmd]).current_dir(&cwd);
     // The hook owns the parent's copy of the ruleset fd, so it is closed
@@ -405,7 +411,7 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Com
     unsafe {
         child.pre_exec(move || {
             let fd = owned.as_raw_fd();
-            let r = engage(fd, net);
+            let r = engage(fd, net, deny_truncate);
             let _ = libc::close(fd);
             r
         });
@@ -434,7 +440,8 @@ pub fn confine_net_and_exec(args: &[String]) -> ! {
     };
     let net = Net::Proxy(port);
     let fd = net_ruleset(net).unwrap_or_else(|e| fail(format!("network rules: {e}")));
-    if let Err(e) = engage(fd, net) {
+    // Inside bubblewrap the mount namespace already confines truncate(2).
+    if let Err(e) = engage(fd, net, false) {
         fail(format!("network rules: {e}"));
     }
     unsafe { libc::close(fd) };
@@ -489,7 +496,7 @@ const MSG_FASTOPEN: u32 = 0x2000_0000;
 #[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
-fn seccomp(net: Net) -> io::Result<()> {
+fn seccomp(net: Net, deny_truncate: bool) -> io::Result<()> {
     let block_network = net == Net::Off;
     let arch = audit_arch();
     let mut deny: Vec<i64> = vec![
@@ -510,6 +517,9 @@ fn seccomp(net: Net) -> io::Result<()> {
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
     ];
+    if deny_truncate {
+        deny.push(libc::SYS_truncate);
+    }
     if block_network {
         deny.extend([
             libc::SYS_socket,
@@ -733,10 +743,60 @@ mod tests {
         );
     }
 
-    // Roadmap 1.7 (analysis M2): truncate(2) on a file outside the
-    // workspace is a write. Landlock only handles it from ABI 3 (kernel
-    // 6.2); before that, the guarantee has to come from elsewhere or be
-    // disclosed. Run on 5.15 and 6.1 in the field cells.
+    // Roadmap 2.2 (analysis M2): the seccomp half, forced on so it runs on
+    // any kernel. truncate(2) is refused inside the workspace too (the
+    // disclosed cost); opening with O_TRUNC and ftruncate still work there.
+    #[test]
+    fn invariant_m2_seccomp_refuses_truncate_below_abi_3() {
+        use std::os::unix::process::CommandExt;
+        if available().is_err() {
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bwn-landlock-trunc-sc-{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("keep.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(&outside, "keep").unwrap();
+        for f in ["path.txt", "otrunc.txt", "ftrunc.txt"] {
+            std::fs::write(ws.join(f), "data").unwrap();
+        }
+        let fd = ruleset_with(&ws, &[], None, &[], Net::Open).unwrap();
+        let script = format!(
+            "perl -e 'truncate($ARGV[0], 0) or print \"refused \"' {}; \
+             perl -e 'truncate($ARGV[0], 0) or print \"refused \"' path.txt; \
+             : > otrunc.txt; \
+             perl -e 'open(my $f, \"+<\", $ARGV[0]) or die; truncate($f, 0) or print \"ftruncate-refused \"' ftrunc.txt",
+            outside.display()
+        );
+        let mut c = Command::new("sh");
+        c.args(["-c", &script]).current_dir(&ws);
+        unsafe {
+            c.pre_exec(move || engage(fd, Net::Open, true));
+        }
+        let out = c.output().expect("spawn");
+        unsafe { libc::close(fd) };
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+        let (kept, path, otrunc, ftrunc) = (
+            read(&outside),
+            read(&ws.join("path.txt")),
+            read(&ws.join("otrunc.txt")),
+            read(&ws.join("ftrunc.txt")),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(kept, "keep", "truncated outside: {said}");
+        assert_eq!(path, "data", "truncate(2) inside was not refused: {said}");
+        assert_eq!(otrunc, "", "O_TRUNC inside failed: {said}");
+        assert_eq!(ftrunc, "", "ftruncate inside failed: {said}");
+    }
+
+    // Roadmap 1.7 and 2.2 (analysis M2): truncate(2) on a file outside the
+    // workspace is a write. Landlock handles it from ABI 3 (kernel 6.2);
+    // below that, seccomp refuses truncate(2) altogether. Run on 5.15 and
+    // 6.1 in the field cells.
     #[test]
     fn invariant_m2_a_confined_command_cannot_truncate_outside() {
         if available().is_err() {
@@ -763,16 +823,6 @@ mod tests {
         let out = cmd.output().expect("spawn");
         let after = std::fs::read_to_string(&outside).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&base);
-        if !confines_truncate() {
-            // Documented: on ABI 1 and 2 this is a known gap, shown in the
-            // posture check. Record what happened instead of failing.
-            eprintln!(
-                "ABI {:?}: truncation outside confined: {}",
-                abi(),
-                after == "keep"
-            );
-            return;
-        }
         assert_eq!(
             after,
             "keep",
