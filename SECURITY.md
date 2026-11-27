@@ -506,7 +506,7 @@ this table applies.
 | Network only through the host checker | Yes; no network if bwn's own binary can't be found | Needs Landlock ABI 4 (kernel 6.7); otherwise no network | Yes | `bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network` |
 | No inbound connections | No: a command can listen | No | No | Not guaranteed |
 | Provider keys and tokens stripped from the environment | Yes | Yes | Yes (and with no backend) | `sandboxed_children_lose_sockets_and_provider_keys` |
-| Older kernels | n/a | ABI 1 (5.13 to 5.18) and ABI 2 (5.19 to 6.1) are being tested (roadmap 1.7) | n/a | Pending |
+| Older kernels | n/a | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold, but a command can truncate a file outside the workspace with `truncate(2)`; the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside` (asserts from ABI 3), run in 5.15 and 6.1 VMs |
 
 The invariant suite (`cargo test -- invariant_`) runs once per backend in CI
 and gates every release.
