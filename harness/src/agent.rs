@@ -883,6 +883,20 @@ fn auto_asks(
             ));
         }
     }
+    // Landlock leaves .git and .buildwithnexus writable, so a command could
+    // plant a hook or setting that runs later outside the sandbox (roadmap
+    // 1.8; analysis M1, A2). Until 2.2 closes that, auto mode asks.
+    if command
+        && matches!(
+            crate::sandbox::decide(crate::sandbox::mode(), crate::sandbox::backend()),
+            crate::sandbox::Decision::Sandboxed(b) if !matches!(b, crate::sandbox::Backend::Bwrap | crate::sandbox::Backend::SandboxExec)
+        )
+    {
+        return Some(
+            "auto mode asks: on this machine's sandbox (Landlock) commands can still write .git and .buildwithnexus, where a planted hook or setting would run later outside the sandbox"
+                .to_string(),
+        );
+    }
     if command
         && crate::sandbox::mode() != crate::sandbox::Mode::Off
         && !crate::sandbox::hides_reads(cwd)

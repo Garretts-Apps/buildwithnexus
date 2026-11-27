@@ -339,6 +339,20 @@ fn probe_external(bin: &str, args: Vec<String>, backend: Backend) -> Result<Back
 }
 
 fn detect() -> Result<Backend, String> {
+    // Debug builds only: the invariant suite runs once per backend on the
+    // same machine (roadmap 1.12). A release binary ignores this, so nothing
+    // outside a test build can switch the sandbox backend off.
+    #[cfg(debug_assertions)]
+    if let Ok(forced) = std::env::var("BWN_TEST_SANDBOX_BACKEND") {
+        match forced.as_str() {
+            "none" => return Err("no backend (BWN_TEST_SANDBOX_BACKEND=none)".into()),
+            #[cfg(target_os = "linux")]
+            "landlock" => return crate::landlock::available().map(|()| Backend::Landlock),
+            #[cfg(target_os = "linux")]
+            "bwrap" => return probe_external("bwrap", bwrap_probe_args(), Backend::Bwrap),
+            _ => {}
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         return Err("no sandbox backend on Windows".into());
@@ -965,6 +979,17 @@ pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether sandboxed commands are kept from writing `.git` and
+/// `.buildwithnexus`, where a planted hook or setting would run later outside
+/// the sandbox. Bubblewrap and Seatbelt keep them read-only; Landlock can't
+/// carve them out of the writable workspace (roadmap 1.8; analysis M1).
+pub fn protects_policy_files() -> bool {
+    match decide(mode(), backend()) {
+        Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
+        Decision::Sandboxed(_) | Decision::Unsandboxed | Decision::Refused => false,
+    }
+}
+
 /// Whether a command run now, in `cwd`, is kept from reading the credential
 /// stores: bubblewrap and Seatbelt always hide them; Landlock does unless
 /// the workspace holds one (a session run from the home folder). False when
@@ -1401,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_sandbox_setting_falls_back_to_require() {
+    fn invariant_in2_a_bad_sandbox_setting_falls_back_to_require() {
         // Roadmap 1.3 (analysis M13, IN-2): a value bwn can't parse never
         // leaves commands less confined than the strictest mode.
         let (m, n) = (mode(), network());

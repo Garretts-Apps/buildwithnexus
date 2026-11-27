@@ -344,7 +344,7 @@ fn parse(text: &str) -> Value {
 }
 
 #[test]
-fn every_settings_field_is_classified() {
+fn invariant_au1_every_settings_field_is_classified() {
     // The fields as serde sees them, read from the struct's source so a new
     // field cannot be missed.
     let src = include_str!("config.rs");
@@ -513,7 +513,7 @@ fn user_cases(key: &Key) -> Vec<Option<String>> {
 }
 
 #[test]
-fn an_untrusted_project_never_expands_authority_beyond_the_user_baseline() {
+fn invariant_au1_an_untrusted_project_never_expands_authority_beyond_the_user_baseline() {
     let env = env();
     let mut cases = 0;
     for key in KEYS {
@@ -553,7 +553,7 @@ fn an_untrusted_project_never_expands_authority_beyond_the_user_baseline() {
 }
 
 #[test]
-fn hooks_in_an_untrusted_project_wait_for_trust() {
+fn invariant_au1_hooks_in_an_untrusted_project_wait_for_trust() {
     let env = env();
     let uf = json!({"provider": "ollama"});
     let hooks = json!({"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "evil"}]}]});
@@ -584,7 +584,7 @@ fn hooks_in_an_untrusted_project_wait_for_trust() {
 }
 
 #[test]
-fn a_trusted_project_applies_what_the_user_approved() {
+fn invariant_au1_a_trusted_project_applies_what_the_user_approved() {
     // The human path: once the user trusts the file, its loosening values
     // apply. Without this the suite above would pass by ignoring projects.
     let env = env();
@@ -625,7 +625,7 @@ fn a_trusted_project_applies_what_the_user_approved() {
 // starting. Before, it was dropped with its rules and the rest loaded, so a
 // user's readonly, require and deny rules vanished with one stray comma.
 #[test]
-fn a_settings_file_that_does_not_load_stops_startup() {
+fn invariant_in2_a_settings_file_that_does_not_load_stops_startup() {
     let env = env();
     let good = json!({"provider": "ollama", "model": "m"});
     let strict =
@@ -671,7 +671,7 @@ fn a_settings_file_that_does_not_load_stops_startup() {
 // A file bwn can't read is not "absent": its rules would be skipped.
 #[cfg(unix)]
 #[test]
-fn an_unreadable_settings_file_stops_startup() {
+fn invariant_in2_an_unreadable_settings_file_stops_startup() {
     use std::os::unix::fs::PermissionsExt;
     let env = env();
     fs::write(env.home.join("config.json"), r#"{"provider":"ollama"}"#).unwrap();

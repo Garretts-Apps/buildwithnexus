@@ -2026,7 +2026,7 @@ fn an_unreachable_ollama_is_still_reported_by_the_deferred_probe() {
 // in settings that bwn can't parse runs as readonly, never as something
 // looser. The --permission-mode flag still exits on a bad value.
 #[test]
-fn a_bad_permission_setting_runs_as_readonly() {
+fn invariant_in2_a_bad_permission_setting_runs_as_readonly() {
     for bad in ["bogus", "", "auto-ish"] {
         assert!(
             matches!(permission_from(None, bad), Permission::ReadOnly),

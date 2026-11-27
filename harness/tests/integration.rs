@@ -3269,7 +3269,7 @@ fn settings_without_a_model_run_on_the_preset_default_and_take_the_model_flag() 
 // one to answer the policy prompt the write is refused, the file is never
 // written, and the next start runs with the user's baseline.
 #[test]
-fn the_model_cannot_write_the_project_settings_file_unasked() {
+fn invariant_au2_the_model_cannot_write_the_project_settings_file_unasked() {
     let home = tmp("home");
     let cwd = tmp("proj");
     let port = serve(vec![
@@ -3291,7 +3291,7 @@ fn the_model_cannot_write_the_project_settings_file_unasked() {
 // here holding a deny rule, stops the run before any model request. Before,
 // the file was dropped and the run went ahead without its rules.
 #[test]
-fn a_settings_file_that_does_not_load_stops_the_run() {
+fn invariant_in2_a_settings_file_that_does_not_load_stops_the_run() {
     let home = tmp("home");
     let cwd = tmp("proj");
     let (port, posts) = serve_recording(vec![
@@ -3314,7 +3314,7 @@ fn a_settings_file_that_does_not_load_stops_the_run() {
 // IN-2 (roadmap 1.3; analysis M13): a sandbox value bwn can't parse runs as
 // require, never off.
 #[test]
-fn a_bad_sandbox_setting_runs_as_require() {
+fn invariant_in2_a_bad_sandbox_setting_runs_as_require() {
     let home = tmp("home");
     let cwd = tmp("proj");
     std::fs::write(
@@ -5094,7 +5094,7 @@ fn doctor_names_each_missing_tool_once_with_its_install_command() {
 // sandbox off, whether the user's settings leave `sandbox` at the default
 // or name it.
 #[test]
-fn an_untrusted_project_cannot_turn_the_sandbox_off() {
+fn invariant_au1_an_untrusted_project_cannot_turn_the_sandbox_off() {
     for user in [None, Some("auto"), Some("require")] {
         let home = tmp("home");
         let mut cfg = json!({
@@ -6844,6 +6844,12 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     )
     .unwrap();
     let r = run(&home, &cwd, "touch fetch head");
+    // On Landlock, which can't keep .git read-only, auto mode asks before
+    // the command and, headless, nothing runs (roadmap 1.8).
+    if r.text_of("tool_denied").contains("Landlock") {
+        assert!(!cwd.join(".git/FETCH_HEAD").exists());
+        return;
+    }
     let result = r.text_of("tool_result");
     if result.contains("[exit 0]") {
         return;
