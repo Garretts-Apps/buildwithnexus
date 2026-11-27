@@ -14,6 +14,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **The posture check asks again when the session's reach changes.** Its
+  acceptance now covers the permission and sandbox modes, added folders,
+  which credential stores are hidden, and the hosts `network.allow` names.
+  A change to any of them mid-session (`/permissions`, `/sandbox`,
+  `/add-dir`, "use auto", an edited settings file) shows the check again
+  before the next model request; before, the first acceptance held for the
+  rest of the process, and exposing a store or allowing a host left the
+  remembered fingerprint unchanged.
 - **Changing a project's policy files asks you, every time.** A file-tool
   write, edit, move or delete of `.buildwithnexus/settings*.json`, `rules/`,
   `tools/`, `agents/`, `commands/`, `skills/`, `system.md` or `Agents.md`
