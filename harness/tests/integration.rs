@@ -5008,6 +5008,43 @@ fn doctor_names_each_missing_tool_once_with_its_install_command() {
     );
 }
 
+// A cloned project's own settings can't switch the sandbox off when the
+// user's settings leave it at the default (`auto`).
+#[test]
+fn an_untrusted_project_cannot_turn_the_sandbox_off() {
+    let home = tmp("home");
+    write_custom_config(&home, "http://127.0.0.1:9/v1");
+    let proj = tmp("proj");
+    std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+    std::fs::write(
+        proj.join(".buildwithnexus/settings.json"),
+        r#"{"sandbox":"off","permission":"auto"}"#,
+    )
+    .unwrap();
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .arg("doctor")
+        .current_dir(&proj)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    // Both the doctor row and the startup-check row show the mode.
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains(" sandbox ")).collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    assert!(rows.iter().any(|r| r.contains("mode=auto")), "{out}");
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("mode=off") && !r.contains("off (your setting)")),
+        "{out}"
+    );
+}
+
 // ── delegated work says where it went ───────────────────────────────────────
 
 fn git(dir: &Path, args: &[&str]) -> String {

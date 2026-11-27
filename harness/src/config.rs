@@ -2817,12 +2817,22 @@ fn untrusted_view(
         }
         let safe = match k.as_str() {
             k if HARMLESS_PROJECT_KEYS.contains(&k) => true,
+            // A key the user's settings don't name is compared with its
+            // default, never with the loosest value.
             "permission" => {
-                let cur = base.get(&k).and_then(permission_rank).unwrap_or(2);
+                let cur = base
+                    .get(&k)
+                    .and_then(permission_rank)
+                    .or_else(|| permission_rank(&default_permission().into()))
+                    .unwrap_or(u8::MAX);
                 permission_rank(&v).is_some_and(|r| r >= cur)
             }
             "sandbox" => {
-                let cur = base.get(&k).and_then(sandbox_rank).unwrap_or(0);
+                let cur = base
+                    .get(&k)
+                    .and_then(sandbox_rank)
+                    .or_else(|| sandbox_rank(&default_sandbox().into()))
+                    .unwrap_or(u8::MAX);
                 sandbox_rank(&v).is_some_and(|r| r >= cur)
             }
             "max_budget_usd" => match (positive(Some(&v)), positive(base.get(&k))) {
@@ -4713,6 +4723,29 @@ mod tests {
         // Unknown values and "no limit" budgets never pass as tightening.
         let (kept, _) = view(serde_json::json!({"sandbox": "bogus", "max_budget_usd": 0}));
         assert!(kept.is_empty());
+
+        // A user file that names neither key is compared with the defaults
+        // (ask, auto), so a project can't loosen them by their absence.
+        let empty = serde_json::Map::new();
+        for (key, loose, tight) in [
+            ("sandbox", "off", "require"),
+            ("permission", "auto", "readonly"),
+            ("permission", "accept-edits", "ask"),
+        ] {
+            let proj = serde_json::json!({ key: loose });
+            let (keep, ignored) = untrusted_view(&empty, proj.as_object().unwrap().clone());
+            assert!(keep.is_empty(), "{key}: {loose} was applied untrusted");
+            assert_eq!(ignored, [key]);
+            let proj = serde_json::json!({ key: tight });
+            let (keep, ignored) = untrusted_view(&empty, proj.as_object().unwrap().clone());
+            assert!(
+                keep.contains_key(key) && ignored.is_empty(),
+                "{key}: {tight}"
+            );
+        }
+        let proj = serde_json::json!({"sandbox": "auto", "permission": "ask"});
+        let (keep, _) = untrusted_view(&empty, proj.as_object().unwrap().clone());
+        assert_eq!(keep.len(), 2, "restating a default is not a loosening");
     }
 
     #[test]
