@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **An untrusted project can no longer turn the sandbox off.** When your own
+  settings didn't name `sandbox`, a project's `.buildwithnexus/settings.json`
+  with `"sandbox": "off"` was applied without asking for trust, because the
+  missing value was compared as `off` instead of the default `auto`. Both
+  `sandbox` and `permission` are now compared with their defaults.
+  `doctor`'s startup-check panel also showed the sandbox as off before it
+  had read your settings; it now shows the real mode.
 - **Credential files are hidden from sandboxed commands.** `~/.ssh`,
   `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, bwn's own folder, the SSH
   agent's socket and the other stores the file tools already treat as

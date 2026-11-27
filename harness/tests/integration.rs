@@ -5008,6 +5008,57 @@ fn doctor_names_each_missing_tool_once_with_its_install_command() {
     );
 }
 
+// AU-1 (analysis M12/A1): a cloned project's own settings can't switch the
+// sandbox off, whether the user's settings leave `sandbox` at the default
+// or name it.
+#[test]
+fn an_untrusted_project_cannot_turn_the_sandbox_off() {
+    for user in [None, Some("auto"), Some("require")] {
+        let home = tmp("home");
+        let mut cfg = json!({
+            "provider": "custom", "model": "test-model", "permission": "auto",
+            "base_url": "http://127.0.0.1:9/v1",
+        });
+        if let Some(u) = user {
+            cfg["sandbox"] = json!(u);
+        }
+        std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+        let proj = tmp("proj");
+        std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+        std::fs::write(
+            proj.join(".buildwithnexus/settings.json"),
+            r#"{"sandbox":"off","permission":"auto"}"#,
+        )
+        .unwrap();
+        let mut cmd = Command::new(BIN);
+        for var in NET_VARS {
+            cmd.env_remove(var);
+        }
+        let out = cmd
+            .arg("doctor")
+            .current_dir(&proj)
+            .env("NEXUS_HOME", &home)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        // Both the doctor row and the startup-check row show the mode.
+        let rows: Vec<&str> = out.lines().filter(|l| l.contains(" sandbox ")).collect();
+        assert!(rows.len() >= 2, "user {user:?}: {out}");
+        let want = format!("mode={}", user.unwrap_or("auto"));
+        assert!(
+            rows.iter().any(|r| r.contains(&want)),
+            "user {user:?}: {out}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| !r.contains("mode=off") && !r.contains("off (your setting)")),
+            "user {user:?}: {out}"
+        );
+    }
+}
+
 // ── delegated work says where it went ───────────────────────────────────────
 
 fn git(dir: &Path, args: &[&str]) -> String {

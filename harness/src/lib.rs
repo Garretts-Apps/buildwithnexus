@@ -2874,6 +2874,16 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
         }
     }
 
+    // Configured before the provider check: that check is a model request,
+    // and the startup check it triggers shows the sandbox mode. The probe
+    // runs the real backend once, so the sandbox row reports whether shell
+    // commands would actually be confined on this machine.
+    let mut sandbox_err = None;
+    if let Some(s) = &settings {
+        if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
+            sandbox_err = Some(e);
+        }
+    }
     if let Some(s) = &settings {
         match live {
             Some(p) => {
@@ -2890,12 +2900,8 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
         }
     }
 
-    // The probe runs the real backend once, so this reports whether shell
-    // commands would actually be confined on this machine.
-    if let Some(s) = &settings {
-        if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
-            out.push(DoctorCheck::fail("sandbox", e));
-        }
+    if let Some(e) = sandbox_err {
+        out.push(DoctorCheck::fail("sandbox", e));
     }
     let (glyph, text) = sandbox::doctor_summary();
     out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
