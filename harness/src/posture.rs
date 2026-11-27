@@ -243,12 +243,22 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         let hidden = crate::sandbox::hidden_paths(&[cwd]);
         let (cv, cl, ck) = if crate::sandbox::hides_reads(cwd) {
             let names: Vec<String> = hidden.iter().map(|p| tilde(p)).collect();
+            // Under Landlock, listing the folder is refused but `stat` of a
+            // guessed name still confirms it, and a file's metadata stays
+            // writable (roadmap 2.2); bubblewrap and Seatbelt hide fully.
+            let partial = matches!(backend, crate::sandbox::Backend::Landlock);
             let shown = if names.is_empty() {
                 "none found to hide".to_string()
+            } else if partial {
+                format!(
+                    "contents hidden from commands: {} (a guessed name can still be confirmed with `stat`, and the file's metadata is writable — roadmap 2.2)",
+                    names.join(", ")
+                )
             } else {
                 format!("hidden from commands: {}", names.join(", "))
             };
-            (shown, Level::Good, format!("hidden:{}", names.join(",")))
+            let level = if partial { Level::Warn } else { Level::Good };
+            (shown, level, format!("hidden:{}", names.join(",")))
         } else if crate::config::user_home().is_none() {
             (
                 "not hidden: no home folder (HOME) to find them in".into(),
