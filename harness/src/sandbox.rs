@@ -1219,7 +1219,7 @@ pub fn doctor_summary() -> (&'static str, String) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // Owner decision (roadmap 2.2): Landlock alone holds a command to the
@@ -1917,6 +1917,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // Real bubblewrap: the SSH agent's socket is covered, so a command can't
+    // connect to it even with the network open (the cover is a plain file).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invariant_bwrap_agent_socket_is_unreachable() {
+        let usable = Command::new("bwrap")
+            .args(bwrap_probe_args())
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !usable {
+            eprintln!("skip: bwrap unusable here");
+            return;
+        }
+        let (home, ws, _) = fake_home("bwrap-agent");
+        let sock = home.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let hidden = hidden_paths_in(
+            &home,
+            &home.join(".buildwithnexus"),
+            Some(sock.clone()),
+            &[],
+            &[&ws],
+        );
+        assert!(hidden.contains(&sock), "{hidden:?}");
+        let probe = format!(
+            "python3 -c 'import socket; s = socket.socket(socket.AF_UNIX); \
+             s.connect(\"{}\"); print(\"CONNECTED\")'",
+            sock.display()
+        );
+        let out = Command::new("bwrap")
+            .args(bwrap_argv(&probe, &ws, &[], Net::Open, true, &hidden))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("CONNECTED"),
+            "reached the agent socket: {out:?}"
+        );
+        // The probe ran and failed on the connect, not on a missing python.
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Error"),
+            "{out:?}"
+        );
+    }
+
     // Real Landlock: the same, through the read rules carved around the
     // stores; and a workspace that holds a store cannot hide it.
     #[cfg(target_os = "linux")]
@@ -2078,7 +2126,7 @@ mod tests {
     // What a confined command can reach, checked by python3 inside it:
     // the proxy's port, nothing else over TCP, no UDP, no Unix sockets.
     #[cfg(target_os = "linux")]
-    const NET_PROBE: &str = r#"python3 -c '
+    pub(crate) const NET_PROBE: &str = r#"python3 -c '
 import socket, sys
 def tcp(port):
     s = socket.socket()
@@ -2099,7 +2147,7 @@ print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
 ' "#;
 
     #[cfg(target_os = "linux")]
-    fn assert_proxy_only(out: &std::process::Output) {
+    pub(crate) fn assert_proxy_only(out: &std::process::Output) {
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("proxy ok"), "{out:?}");
         assert!(

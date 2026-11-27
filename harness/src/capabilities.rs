@@ -26,10 +26,19 @@ pub struct Cap {
     pub seatbelt: &'static str,
     /// The last column, verbatim (may hold prose, not only test names).
     pub proven_by: &'static str,
-    /// Test fns that prove this row; each must exist in the source and be
-    /// named in `proven_by`.
-    pub tests: &'static [&'static str],
+    /// Test fns that prove this row, each tagged with the backends it
+    /// runs on. Each must exist in the source and be named in `proven_by`,
+    /// and every cell that claims something must cite a test of its own
+    /// backend.
+    pub tests: &'static [(u8, &'static str)],
 }
+
+/// Backend bits for `Cap::tests`.
+pub const BW: u8 = 1;
+pub const UN: u8 = 2;
+pub const LL: u8 = 4;
+pub const SB: u8 = 8;
+pub const ALL: u8 = BW | UN | LL | SB;
 
 /// The guarantee table. The order is the order shown in `SECURITY.md`.
 pub const CAPABILITIES: &[Cap] = &[
@@ -41,15 +50,7 @@ pub const CAPABILITIES: &[Cap] = &[
         landlock: "Contents yes — a write, rename, link, create, `mkdir` or remove outside is refused — plus all of `/dev` and the real `/tmp`. A file's metadata outside stays writable (`chmod`, `chown`, `utime`, xattrs), and below ABI 3 truncation is seccomp's (see Older kernels). bwn uses its namespace backend instead where user namespaces are allowed",
         seatbelt: "Yes",
         proven_by: "`bwrap_confines_writes_to_the_workspace`, `invariant_userns_confines_metadata_outside`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `a_confined_command_can_write_inside_and_not_outside`, `invariant_landlock_confines_write_syscall_paths_outside`, `landlock_does_not_confine_file_metadata_outside`, `seatbelt_profile_denies_writes_except_workspace_and_tmp`",
-        tests: &[
-            "invariant_userns_confines_metadata_outside",
-            "invariant_userns_keeps_the_workspace_writable_and_git_read_only",
-            "bwrap_confines_writes_to_the_workspace",
-            "a_confined_command_can_write_inside_and_not_outside",
-            "invariant_landlock_confines_write_syscall_paths_outside",
-            "landlock_does_not_confine_file_metadata_outside",
-            "seatbelt_profile_denies_writes_except_workspace_and_tmp",
-        ],
+        tests: &[(UN, "invariant_userns_confines_metadata_outside"), (UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only"), (BW, "bwrap_confines_writes_to_the_workspace"), (LL, "a_confined_command_can_write_inside_and_not_outside"), (LL, "invariant_landlock_confines_write_syscall_paths_outside"), (LL, "landlock_does_not_confine_file_metadata_outside"), (SB, "seatbelt_profile_denies_writes_except_workspace_and_tmp")],
     },
     Cap {
         id: "policy_files_readonly",
@@ -58,12 +59,8 @@ pub const CAPABILITIES: &[Cap] = &[
         userns: "Yes",
         landlock: "No: the posture check says so and auto mode asks before every command (roadmap 2.2)",
         seatbelt: "Yes",
-        proven_by: "`bwrap_argv_keeps_git_and_settings_read_only`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks`",
-        tests: &[
-            "invariant_userns_keeps_the_workspace_writable_and_git_read_only",
-            "bwrap_argv_keeps_git_and_settings_read_only",
-            "invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks",
-        ],
+        proven_by: "`bwrap_argv_keeps_git_and_settings_read_only`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks`, `seatbelt_profile_denies_writes_except_workspace_and_tmp`",
+        tests: &[(UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only"), (BW, "bwrap_argv_keeps_git_and_settings_read_only"), (LL, "invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks"), (SB, "seatbelt_profile_denies_writes_except_workspace_and_tmp")],
     },
     Cap {
         id: "nested_git_readonly",
@@ -73,10 +70,7 @@ pub const CAPABILITIES: &[Cap] = &[
         landlock: "No",
         seatbelt: "Same bounds as bubblewrap",
         proven_by: "`nested_repositories_stay_read_only_too`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`",
-        tests: &[
-            "nested_repositories_stay_read_only_too",
-            "invariant_userns_keeps_the_workspace_writable_and_git_read_only",
-        ],
+        tests: &[(BW | SB, "nested_repositories_stay_read_only_too"), (UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only")],
     },
     Cap {
         id: "credential_stores_hidden",
@@ -86,15 +80,7 @@ pub const CAPABILITIES: &[Cap] = &[
         landlock: "Contents yes. Listing the folder is refused, so names can't be enumerated, but `stat` of a guessed name confirms it exists and a file's metadata stays writable (bwn's namespace backend closes both where user namespaces are allowed). Listing is blocked by also refusing to list `/`, `/home`, your home folder and `~/.config` (files in them stay readable by name)",
         seatbelt: "Yes",
         proven_by: "`bwrap_hides_credential_stores`, `landlock_hides_credential_stores`, `invariant_m5_landlock_does_not_list_hidden_store_names`, `landlock_credential_names_leak_via_stat`, `invariant_userns_hides_store_names`, `invariant_userns_command_cannot_undo_the_mounts`, `seatbelt_hides_credential_stores`",
-        tests: &[
-            "invariant_userns_hides_store_names",
-            "invariant_userns_command_cannot_undo_the_mounts",
-            "bwrap_hides_credential_stores",
-            "landlock_hides_credential_stores",
-            "invariant_m5_landlock_does_not_list_hidden_store_names",
-            "landlock_credential_names_leak_via_stat",
-            "seatbelt_hides_credential_stores",
-        ],
+        tests: &[(UN, "invariant_userns_hides_store_names"), (UN, "invariant_userns_command_cannot_undo_the_mounts"), (BW, "bwrap_hides_credential_stores"), (LL, "landlock_hides_credential_stores"), (LL, "invariant_m5_landlock_does_not_list_hidden_store_names"), (LL, "landlock_credential_names_leak_via_stat"), (SB, "seatbelt_hides_credential_stores")],
     },
     Cap {
         id: "store_contains_workspace",
@@ -104,7 +90,7 @@ pub const CAPABILITIES: &[Cap] = &[
         landlock: "No (auto mode asks)",
         seatbelt: "No",
         proven_by: "`invariant_g3_no_home_folder_means_nothing_is_claimed_hidden` covers the no-home case",
-        tests: &["invariant_g3_no_home_folder_means_nothing_is_claimed_hidden"],
+        tests: &[(ALL, "invariant_g3_no_home_folder_means_nothing_is_claimed_hidden")],
     },
     Cap {
         id: "agent_socket_unreachable",
@@ -113,8 +99,8 @@ pub const CAPABILITIES: &[Cap] = &[
         userns: "Only while the network is checked or off",
         landlock: "Only while the network is checked or off",
         seatbelt: "Yes",
-        proven_by: "`seatbelt_profile_denies_reads_of_hidden_paths`",
-        tests: &["seatbelt_profile_denies_reads_of_hidden_paths"],
+        proven_by: "`invariant_bwrap_agent_socket_is_unreachable`, `invariant_userns_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_profile_denies_reads_of_hidden_paths`",
+        tests: &[(BW, "invariant_bwrap_agent_socket_is_unreachable"), (UN, "invariant_userns_limits_the_network_to_the_proxy"), (LL, "landlock_limits_the_network_to_the_proxy"), (SB, "seatbelt_profile_denies_reads_of_hidden_paths")],
     },
     Cap {
         id: "network_through_checker",
@@ -123,16 +109,8 @@ pub const CAPABILITIES: &[Cap] = &[
         userns: "As bubblewrap: through the checker, held by port, only plain TCP sockets (the private network namespace is roadmap 2.2)",
         landlock: "No network, unless the user allows it for the session (`/sandbox network`, `--sandbox-network`): Landlock alone holds a command by port only, and no private network namespace is possible here. Once allowed, with Landlock ABI 4 (kernel 6.7), as bubblewrap",
         seatbelt: "Yes",
-        proven_by: "`bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`, `invariant_landlock_alone_has_no_network_until_allowed`",
-        tests: &[
-            "invariant_landlock_alone_has_no_network_until_allowed",
-            "bwrap_limits_the_network_to_the_proxy",
-            "landlock_limits_the_network_to_the_proxy",
-            "seatbelt_limits_the_network_to_the_proxy",
-            "invariant_m8b_no_network_limiter_means_no_network",
-            "invariant_sec1_mptcp_socket_is_refused_under_the_proxy",
-            "invariant_m8c_x32_syscalls_are_refused",
-        ],
+        proven_by: "`bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `invariant_userns_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`, `invariant_landlock_alone_has_no_network_until_allowed`",
+        tests: &[(LL | UN, "invariant_landlock_alone_has_no_network_until_allowed"), (BW, "bwrap_limits_the_network_to_the_proxy"), (LL, "landlock_limits_the_network_to_the_proxy"), (UN, "invariant_userns_limits_the_network_to_the_proxy"), (SB, "seatbelt_limits_the_network_to_the_proxy"), (BW, "invariant_m8b_no_network_limiter_means_no_network"), (LL, "invariant_sec1_mptcp_socket_is_refused_under_the_proxy"), (LL, "invariant_m8c_x32_syscalls_are_refused")],
     },
     Cap {
         id: "no_inbound",
@@ -152,7 +130,7 @@ pub const CAPABILITIES: &[Cap] = &[
         landlock: "Yes",
         seatbelt: "Yes (and with no backend)",
         proven_by: "`sandboxed_children_lose_sockets_and_provider_keys`",
-        tests: &["sandboxed_children_lose_sockets_and_provider_keys"],
+        tests: &[(ALL, "sandboxed_children_lose_sockets_and_provider_keys")],
     },
     Cap {
         id: "older_kernels",
@@ -161,13 +139,8 @@ pub const CAPABILITIES: &[Cap] = &[
         userns: "As Landlock alone; the namespace needs `mount_setattr` (kernel 5.12), which every Landlock kernel has",
         landlock: "ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold. Landlock can't confine truncation there, so seccomp refuses `truncate(2)` and a read-only `open` with `O_TRUNC`, inside the workspace too (write-mode truncation — `: > file`, `ftruncate`, opening for writing with `O_TRUNC` — still works, because Landlock confines it); the posture check says so. Confirmed on 5.15 and 6.1",
         seatbelt: "n/a",
-        proven_by: "`a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, run in 5.15 and 6.1 VMs",
-        tests: &[
-            "a_confined_command_can_write_inside_and_not_outside",
-            "invariant_m2_a_confined_command_cannot_truncate_outside",
-            "invariant_m2_seccomp_refuses_truncate_below_abi_3",
-            "invariant_m2_seccomp_refuses_otrunc_open_below_abi3",
-        ],
+        proven_by: "`a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, `invariant_userns_confines_metadata_outside`, run in 5.15 and 6.1 VMs",
+        tests: &[(LL, "a_confined_command_can_write_inside_and_not_outside"), (LL, "invariant_m2_a_confined_command_cannot_truncate_outside"), (LL, "invariant_m2_seccomp_refuses_truncate_below_abi_3"), (LL, "invariant_m2_seccomp_refuses_otrunc_open_below_abi3"), (UN, "invariant_userns_confines_metadata_outside")],
     },
 ];
 
@@ -218,7 +191,7 @@ mod tests {
             collect_rs(&harness.join(dir), &mut sources);
         }
         for c in CAPABILITIES {
-            for t in c.tests {
+            for &(_, t) in c.tests {
                 assert!(
                     c.proven_by.contains(t),
                     "{}: test `{t}` is in `tests` but not named in `proven_by`",
@@ -227,6 +200,31 @@ mod tests {
                 assert!(
                     sources.contains(&format!("fn {t}(")),
                     "{}: cited test `{t}` has no `fn {t}` under harness/src or harness/tests",
+                    c.id
+                );
+            }
+        }
+    }
+
+    // A cell that claims a guarantee must cite a test that runs on that
+    // backend, so one backend's test can't stand in for another's. A cell
+    // is a claim unless it is "n/a" or starts with "No" (a documented gap;
+    // a gap with a disclosure, like Landlock's policy row, still cites).
+    #[test]
+    fn every_claimed_cell_cites_a_test_of_its_backend() {
+        for c in CAPABILITIES {
+            for (bit, name, cell) in [
+                (BW, "bubblewrap", c.bwrap),
+                (UN, "namespace", c.userns),
+                (LL, "landlock", c.landlock),
+                (SB, "seatbelt", c.seatbelt),
+            ] {
+                if cell == "n/a" || cell.starts_with("No") {
+                    continue;
+                }
+                assert!(
+                    c.tests.iter().any(|&(b, _)| b & bit != 0),
+                    "{}: the {name} cell claims \"{cell}\" but no cited test runs on {name}",
                     c.id
                 );
             }
