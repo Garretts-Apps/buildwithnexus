@@ -3889,6 +3889,16 @@ fn a_settings_file_broken_mid_session_refuses_every_call() {
         let r = gate(Permission::Auto, tool, &input, &proj).unwrap_or_default();
         assert!(r.contains("does not load"), "{tool}: {r:?}");
     }
+    // A hook's allow skips the prompts, never rules bwn can't read.
+    let r = gate_after_hook(
+        crate::hooks::PreDecision::Allow,
+        Permission::Auto,
+        "run_command",
+        &rm,
+        &proj,
+    )
+    .unwrap_or_default();
+    assert!(r.contains("does not load"), "{r:?}");
     assert!(network_denied(&proj, "example.com").is_some());
     assert!(!network_allows("example.com", &proj));
     std::fs::write(

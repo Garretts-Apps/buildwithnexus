@@ -4030,7 +4030,7 @@ mod tests {
         assert!(l.issues.is_empty());
         assert!(!l.any_present);
 
-        // Syntax error: file is present, ignored, and the issue names it.
+        // Syntax error: file is present, nothing loads, and the issue names it.
         fs::write(h.join("settings.json"), "{ \"provider\": \"openai\", }").unwrap();
         let l = load_settings_from_dir_diag(&work);
         assert!(l.settings.is_none());
@@ -4039,7 +4039,7 @@ mod tests {
         assert!(l.issues[0].source.contains("settings.json"));
         assert!(l.issues[0].error.contains("line"));
 
-        // Valid JSON, wrong shape: array top level is ignored with a clear reason.
+        // Valid JSON, wrong shape: an array top level stops the load with a clear reason.
         fs::write(h.join("settings.json"), "[1,2,3]").unwrap();
         let l = load_settings_from_dir_diag(&work);
         assert!(l.settings.is_none() && l.any_present);
@@ -4070,13 +4070,18 @@ mod tests {
         assert!(l.settings.is_some());
         assert!(l.issues.is_empty());
 
-        // A broken project-local file is reported but doesn't take down the
-        // valid global settings.
+        // A broken project file stops the load too: its deny and ask rules
+        // can't be read, and an agent that corrupts it must not drop them
+        // (roadmap 1.3; analysis I4, IN-2). The issue names the file.
         fs::create_dir_all(work.join(".buildwithnexus")).unwrap();
         fs::write(work.join(".buildwithnexus/settings.json"), "{oops").unwrap();
         let l = load_settings_from_dir_diag(&work);
-        assert!(l.settings.is_some());
+        assert!(l.settings.is_none() && l.any_present);
         assert_eq!(l.issues.len(), 1);
+        assert!(l.issues[0].source.ends_with(&format!(
+            ".buildwithnexus{}settings.json",
+            std::path::MAIN_SEPARATOR
+        )));
 
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
