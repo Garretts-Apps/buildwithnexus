@@ -490,6 +490,27 @@ on Linux (always Landlock inside WSL), and `sandbox-exec` (Seatbelt) on
 macOS. Windows has none: commands there are refused until you allow them to
 run unconfined for the session, and the posture check and `doctor` say so.
 
+What each backend guarantees, and the test that proves it. "No" is a
+documented gap, not a bug report: each one has a roadmap item. With no backend,
+commands are refused until allowed (see above), and once allowed nothing in
+this table applies.
+
+| Guarantee | bubblewrap | Landlock | Seatbelt | Proven by |
+|---|---|---|---|---|
+| Writes only in the workspace, added folders and temp | Yes | Yes, plus all of `/dev` and the real `/tmp` | Yes | `bwrap_confines_writes_to_the_workspace`, `a_confined_command_can_write_inside_and_not_outside`, `seatbelt_profile_denies_writes_except_workspace_and_tmp` |
+| `.git` and `.buildwithnexus` read-only | Yes | No: the posture check says so and auto mode asks before every command (roadmap 2.2) | Yes | `bwrap_argv_keeps_git_and_settings_read_only`, `invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks` |
+| Nested repositories' `.git` read-only | Up to 64 found in 10,000 folders, skipping `node_modules` and `target` | No | Same bounds as bubblewrap | `nested_repositories_stay_read_only_too` |
+| Credential stores unreadable | Yes | Contents yes; their file names can be listed | Yes | `bwrap_hides_credential_stores`, `landlock_hides_credential_stores`, `seatbelt_hides_credential_stores` |
+| A store that contains the workspace hidden | No | No (auto mode asks) | No | `invariant_g3_no_home_folder_means_nothing_is_claimed_hidden` covers the no-home case |
+| SSH agent socket unreachable | Yes | Only while the network is checked or off | Yes | `seatbelt_profile_denies_reads_of_hidden_paths` |
+| Network only through the host checker | Yes; no network if bwn's own binary can't be found | Needs Landlock ABI 4 (kernel 6.7); otherwise no network | Yes | `bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network` |
+| No inbound connections | No: a command can listen | No | No | Not guaranteed |
+| Provider keys and tokens stripped from the environment | Yes | Yes | Yes (and with no backend) | `sandboxed_children_lose_sockets_and_provider_keys` |
+| Older kernels | n/a | ABI 1 (5.13 to 5.18) and ABI 2 (5.19 to 6.1) are being tested (roadmap 1.7) | n/a | Pending |
+
+The invariant suite (`cargo test -- invariant_`) runs once per backend in CI
+and gates every release.
+
 Inside the sandbox, the command can write only to the working directory,
 the folders added with `--add-dir` and the temp directories; the rest of the
 filesystem, including `~/.buildwithnexus`, is read-only, and so are the
