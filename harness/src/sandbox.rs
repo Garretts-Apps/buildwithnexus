@@ -144,6 +144,28 @@ pub fn network() -> bool {
     NETWORK.load(Ordering::Relaxed)
 }
 
+// Landlock alone holds a command to the checker by port only, so a command
+// could still reach another machine listening on that port. There it gets
+// no network unless the user allows it for this session, with
+// `/sandbox network` or `--sandbox-network`; never from settings, a project
+// or the model (owner decision; roadmap 2.2).
+static LANDLOCK_NETWORK: AtomicBool = AtomicBool::new(false);
+
+/// `/sandbox network` and `--sandbox-network`: on Landlock alone, let
+/// commands use the network through the checker for this session.
+pub fn allow_landlock_network_for_session() {
+    LANDLOCK_NETWORK.store(true, Ordering::Relaxed);
+}
+
+pub fn landlock_network_allowed() -> bool {
+    LANDLOCK_NETWORK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn forget_landlock_network() {
+    LANDLOCK_NETWORK.store(false, Ordering::Relaxed);
+}
+
 // ── credential stores hidden from commands ───────────────────────────────────
 // Sandboxed commands may read the whole filesystem except the user's
 // credential stores (~/.ssh, ~/.aws, ~/.config/gh, ~/.netrc, bwn's own
@@ -286,6 +308,9 @@ pub fn can_check_egress(backend: Backend) -> bool {
 /// hold a command to it, no network (the posture check says so).
 pub fn net_for(backend: Backend) -> Net {
     if !network() {
+        return Net::Off;
+    }
+    if backend == Backend::Landlock && !landlock_network_allowed() {
         return Net::Off;
     }
     if !egress_check() {
@@ -1196,6 +1221,34 @@ pub fn doctor_summary() -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Owner decision (roadmap 2.2): Landlock alone holds a command to the
+    // checker by port only, so there the network is off until the user
+    // allows it for the session. With the egress check off, the namespace
+    // backend gets an open network and Landlock alone gets none; the old
+    // rule gave both the open network.
+    #[test]
+    fn invariant_landlock_alone_has_no_network_until_allowed() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (net0, egress0) = (network(), egress_check());
+        set_network(true);
+        set_egress_check(false);
+        forget_landlock_network();
+        let before = (net_for(Backend::Landlock), net_for(Backend::Userns));
+        allow_landlock_network_for_session();
+        let after = net_for(Backend::Landlock);
+        forget_landlock_network();
+        set_network(net0);
+        set_egress_check(egress0);
+        assert_eq!(
+            before,
+            (Net::Off, Net::Open),
+            "Landlock alone had a network"
+        );
+        assert_eq!(after, Net::Open, "allowing it for the session did not");
+    }
 
     #[test]
     fn mode_parses_the_three_values_only() {

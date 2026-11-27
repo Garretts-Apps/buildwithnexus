@@ -417,6 +417,15 @@ pub(super) fn handle_sandbox(arg: &str) {
                 tui::line(&format!("  {l}"));
             }
         }
+        "network" => {
+            sandbox::allow_landlock_network_for_session();
+            tui::line(&tui::green(
+                "  ✓ commands may use the network through the checker for this session",
+            ));
+            tui::line(&tui::dim(
+                "  only Landlock alone needs this; with bubblewrap or bwn's namespace backend it is already on",
+            ));
+        }
         other => match sandbox::Mode::parse(other) {
             Some(mode) => {
                 sandbox::set_mode(mode);
@@ -427,7 +436,7 @@ pub(super) fn handle_sandbox(arg: &str) {
                 }
             }
             None => tui::line(&tui::red(&format!(
-                "  unknown sandbox mode '{other}' — try: off, auto, require, status"
+                "  unknown sandbox mode '{other}' — try: off, auto, require, status, network"
             ))),
         },
     }

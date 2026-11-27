@@ -7,6 +7,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **On Landlock alone, commands get no network unless you allow it.**
+  Where neither bubblewrap nor unprivileged user namespaces work, Landlock
+  holds a command to the host checker by port, not address, so it could
+  reach another machine listening on that port. There commands now get no
+  network unless you allow it for the session: type `/sandbox network`, or
+  pass `--sandbox-network` (for headless runs and the GitHub Action on
+  GitHub's Ubuntu runners, which restrict user namespaces). Only you can
+  allow it: settings, a project and the model cannot. The posture check
+  says which applies. The capability table now also states that bubblewrap
+  and the namespace backend hold commands by port too, until the private
+  network namespace lands.
 - **Without bubblewrap, commands run in bwn's own namespace.** Where
   bubblewrap is missing (and always in WSL) but the kernel allows
   unprivileged user namespaces, bwn now runs each command in a new user and

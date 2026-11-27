@@ -765,8 +765,8 @@ Elsewhere, `/tmp` and `$TMPDIR` are the real directories.
 `~/.buildwithnexus` and caches such as `~/.cargo` stay read-only.
 
 Credential files (`~/.ssh`, `~/.aws`, `~/.netrc`, …, the SSH agent) are
-hidden, and the network goes only through a host checker. A posture check
-asks before the first model request. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
+hidden, and the network goes only through a host checker (on Landlock alone,
+only after `/sandbox network`). A posture check asks first. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
 
 **Not confined:** other reads, the agent's own file tools, hooks, MCP
 servers, `start_server`. The sandbox never approves anything — the gate is
