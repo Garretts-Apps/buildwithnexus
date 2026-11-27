@@ -475,7 +475,7 @@ mod tests {
     // Roadmap 1.3 (analysis I4): with a settings file that doesn't load,
     // nothing connects, not even a host the rules or the known list allow.
     #[test]
-    fn a_broken_settings_file_refuses_every_connection() {
+    fn invariant_in2_a_broken_settings_file_refuses_every_connection() {
         let mut r = rules(&["docs.example"], &[]);
         assert!(check("127.0.0.1", 8080, &r, false).is_ok());
         r.broken = Some("settings file x does not load".into());

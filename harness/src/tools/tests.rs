@@ -4006,7 +4006,7 @@ fn remove_path_removes_a_symlink_to_a_directory_not_the_directory() {
 // Roadmap 1.4 (analysis I1, Integrity invariant): what counts as a project
 // policy file, by any spelling, path or link.
 #[test]
-fn project_policy_paths_are_recognized_by_any_spelling() {
+fn invariant_in1_project_policy_paths_are_recognized_by_any_spelling() {
     let root = std::env::temp_dir().join(format!("bwn-policy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let dot = root.join(".buildwithnexus");

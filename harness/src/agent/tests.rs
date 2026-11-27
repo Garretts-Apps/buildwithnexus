@@ -3865,7 +3865,7 @@ fn untrusted_tools_are_labelled() {
 // loading mid-session takes its deny rules with it unless the gate refuses.
 // It refuses every call, reads included, until the file loads again.
 #[test]
-fn a_settings_file_broken_mid_session_refuses_every_call() {
+fn invariant_in2_a_settings_file_broken_mid_session_refuses_every_call() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -3923,7 +3923,7 @@ fn a_settings_file_broken_mid_session_refuses_every_call() {
 // before. With no terminal the ask is a refusal. Reads stay allowed, and
 // bwn's own working files under .buildwithnexus are ordinary writes.
 #[test]
-fn file_tools_ask_before_changing_project_policy_files() {
+fn invariant_in1_file_tools_ask_before_changing_project_policy_files() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4035,7 +4035,7 @@ fn file_tools_ask_before_changing_project_policy_files() {
 // in auto mode, and a mixed-case spelling was not sensitive at all outside
 // Windows. Neither may let a policy change through unasked.
 #[test]
-fn a_policy_change_is_never_pre_approved() {
+fn invariant_au2_a_policy_change_is_never_pre_approved() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());

@@ -76,6 +76,78 @@ jobs:
       - name: Compile benchmarks
         run: cargo bench --no-run --locked
 
+  # The invariant suite (roadmap 1.12): every test named `invariant_*`, run
+  # once per sandbox backend. The release workflow calls this file, so a
+  # failing case blocks a release. Each cell first checks with `doctor` that
+  # the backend it names is the one in use, so a backend that fails to start
+  # can't pass as a test of it. BWN_TEST_SANDBOX_BACKEND is honoured by debug
+  # builds only.
+  invariant-suite:
+    name: Invariant suite (${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: harness
+        shell: bash
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, backend: bwrap, expect: "bwrap (bubblewrap)" }
+          - { os: ubuntu-latest, backend: landlock, expect: "landlock+seccomp" }
+          - { os: ubuntu-latest, backend: none, expect: "no backend" }
+          - { os: macos-15, backend: seatbelt, expect: "sandbox-exec" }
+          - { os: windows-2022, backend: windows-none, expect: "no sandbox backend on Windows" }
+    env:
+      BWN_TEST_SANDBOX_BACKEND: ${{ contains(fromJSON('["bwrap","landlock","none"]'), matrix.backend) && matrix.backend || '' }}
+    steps:
+      - name: Keep LF line endings
+        if: runner.os == 'Windows'
+        working-directory: ${{ runner.temp }}
+        shell: powershell
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (branch head 2026-09-29)
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # Ubuntu's AppArmor stops unprivileged user namespaces, which
+      # bubblewrap needs.
+      - name: Install bubblewrap
+        if: matrix.backend == 'bwrap'
+        run: |
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Build
+        run: cargo build --locked --bin buildwithnexus
+
+      - name: The backend in use is ${{ matrix.backend }}
+        env:
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          out="$(NEXUS_HOME="$RUNNER_TEMP/bwn-home" ../target/debug/buildwithnexus doctor 2>&1 || true)"
+          echo "$out" | grep ' sandbox '
+          echo "$out" | grep ' sandbox ' | grep -qF "$EXPECT"
+
+      - name: Invariant tests
+        if: runner.os != 'Windows'
+        run: cargo test --locked -- invariant_
+
+      # The integration suite drives POSIX shell, so Windows runs the
+      # library's invariant tests.
+      - name: Invariant tests (library)
+        if: runner.os == 'Windows'
+        run: cargo test --locked --lib -- invariant_
+
   # harness/Cargo.toml promises rust-version 1.94 to `cargo install` users;
   # the other jobs use the latest stable, so check the floor really builds.
   msrv:

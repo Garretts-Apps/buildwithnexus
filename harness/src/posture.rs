@@ -841,7 +841,7 @@ mod tests {
     // exposed credential store, a network.allow entry. Before, the first
     // acceptance held for the rest of the process whatever changed.
     #[test]
-    fn a_session_is_asked_again_when_its_reach_changes() {
+    fn invariant_in3_a_session_is_asked_again_when_its_reach_changes() {
         let _g = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -904,7 +904,7 @@ mod tests {
     // them (roadmap 1.5; M11: the keys were the constants "hidden" and
     // "checked").
     #[test]
-    fn the_fingerprint_follows_hidden_stores_and_allowed_hosts() {
+    fn invariant_in3_the_fingerprint_follows_hidden_stores_and_allowed_hosts() {
         let _g = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());

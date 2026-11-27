@@ -339,6 +339,20 @@ fn probe_external(bin: &str, args: Vec<String>, backend: Backend) -> Result<Back
 }
 
 fn detect() -> Result<Backend, String> {
+    // Debug builds only: the invariant suite runs once per backend on the
+    // same machine (roadmap 1.12). A release binary ignores this, so nothing
+    // outside a test build can switch the sandbox backend off.
+    #[cfg(debug_assertions)]
+    if let Ok(forced) = std::env::var("BWN_TEST_SANDBOX_BACKEND") {
+        match forced.as_str() {
+            "none" => return Err("no backend (BWN_TEST_SANDBOX_BACKEND=none)".into()),
+            #[cfg(target_os = "linux")]
+            "landlock" => return crate::landlock::available().map(|()| Backend::Landlock),
+            #[cfg(target_os = "linux")]
+            "bwrap" => return probe_external("bwrap", bwrap_probe_args(), Backend::Bwrap),
+            _ => {}
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         return Err("no sandbox backend on Windows".into());
@@ -1401,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_sandbox_setting_falls_back_to_require() {
+    fn invariant_in2_a_bad_sandbox_setting_falls_back_to_require() {
         // Roadmap 1.3 (analysis M13, IN-2): a value bwn can't parse never
         // leaves commands less confined than the strictest mode.
         let (m, n) = (mode(), network());
