@@ -70,12 +70,16 @@ pub enum Decision {
     Unsandboxed,
     Sandboxed(Backend),
     Refused,
+    /// `auto` with no working backend: commands are refused until a person
+    /// allows them to run unconfined for this session (decision D1).
+    NeedsException,
 }
 
 /// The policy in one place: what `mode` does given whether a backend works.
 pub fn decide(mode: Mode, backend: Option<Backend>) -> Decision {
     match (mode, backend) {
-        (Mode::Off, _) | (Mode::Auto, None) => Decision::Unsandboxed,
+        (Mode::Off, _) => Decision::Unsandboxed,
+        (Mode::Auto, None) => Decision::NeedsException,
         (Mode::Auto, Some(b)) | (Mode::Require, Some(b)) => Decision::Sandboxed(b),
         (Mode::Require, None) => Decision::Refused,
     }
@@ -85,6 +89,29 @@ pub fn decide(mode: Mode, backend: Option<Backend>) -> Decision {
 static MODE: AtomicU8 = AtomicU8::new(0); // 0 off, 1 auto, 2 require
 static NETWORK: AtomicBool = AtomicBool::new(true);
 static NOTICED: AtomicBool = AtomicBool::new(false);
+// A person allowed commands to run unconfined for this session (D1). Never
+// saved: a resumed session asks again.
+static UNCONFINED_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Record that a person allowed commands to run unconfined for this session.
+pub fn allow_unconfined_for_session() {
+    UNCONFINED_ALLOWED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a person allowed unconfined commands for this session.
+pub fn unconfined_allowed() -> bool {
+    UNCONFINED_ALLOWED.load(Ordering::Relaxed)
+}
+
+/// Whether the next confined tool call needs that person's answer first.
+pub fn needs_exception() -> bool {
+    decide(mode(), backend()) == Decision::NeedsException && !unconfined_allowed()
+}
+
+#[cfg(test)]
+pub(crate) fn forget_unconfined_allowed() {
+    UNCONFINED_ALLOWED.store(false, Ordering::Relaxed);
+}
 
 pub fn set_mode(mode: Mode) {
     let v = match mode {
@@ -947,10 +974,16 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
     }
     match decide(mode, backend()) {
         Decision::Sandboxed(b) => command_for(b, cmd, cwd).map(Some),
-        Decision::Unsandboxed => {
+        // D1: refused until a person allows it for this session. The gate
+        // asks; this is the enforcement every path goes through.
+        Decision::NeedsException if !unconfined_allowed() => Err(format!(
+            "sandbox: refusing to run the command — no sandbox backend works here ({}), and commands run unconfined only when the user allows it for this session. Changing that is the user's decision.",
+            backend_error().unwrap_or("no backend")
+        )),
+        Decision::Unsandboxed | Decision::NeedsException => {
             if !NOTICED.swap(true, Ordering::Relaxed) {
                 let msg = format!(
-                    "  sandbox: {} — running commands unsandboxed (sandbox=auto)",
+                    "  sandbox: {} — running commands unsandboxed (sandbox=auto, allowed for this session)",
                     backend_error().unwrap_or("no backend")
                 );
                 if crate::report::mode() == crate::report::Mode::Json {
@@ -999,7 +1032,10 @@ pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
 pub fn protects_policy_files() -> bool {
     match decide(mode(), backend()) {
         Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
-        Decision::Sandboxed(_) | Decision::Unsandboxed | Decision::Refused => false,
+        Decision::Sandboxed(_)
+        | Decision::Unsandboxed
+        | Decision::Refused
+        | Decision::NeedsException => false,
     }
 }
 
@@ -1061,8 +1097,11 @@ pub fn status_lines() -> Vec<String> {
             Decision::Sandboxed(_) => {
                 "commands: confined — writes outside the workspace and temp dirs fail"
             }
-            Decision::Unsandboxed if mode == Mode::Auto => {
-                "commands: NOT confined — auto mode runs unsandboxed without a backend"
+            Decision::NeedsException if unconfined_allowed() => {
+                "commands: NOT confined — you allowed unconfined commands for this session"
+            }
+            Decision::NeedsException => {
+                "commands: refused until you allow them to run unconfined for this session"
             }
             Decision::Unsandboxed => "commands: not confined (sandbox off)",
             Decision::Refused => "commands: REFUSED — require mode with no usable backend",
@@ -1099,9 +1138,15 @@ pub fn doctor_summary() -> (&'static str, String) {
                 b.label()
             ),
         ),
+        (_, Err(e)) if mode == Mode::Auto && unconfined_allowed() => (
+            "⚠",
+            format!("mode=auto but no backend ({e}) — commands run unconfined (allowed for this session)"),
+        ),
         (_, Err(e)) if mode == Mode::Auto => (
             "⚠",
-            format!("mode=auto but no backend ({e}) — commands run unconfined"),
+            format!(
+                "mode=auto but no backend ({e}) — commands are refused until you allow them to run unconfined for a session"
+            ),
         ),
         (_, Err(e)) => ("·", format!("mode=off — no backend available ({e})")),
     }
@@ -1129,7 +1174,7 @@ mod tests {
         assert_eq!(decide(Mode::Off, b), Decision::Unsandboxed);
         assert_eq!(decide(Mode::Off, None), Decision::Unsandboxed);
         assert_eq!(decide(Mode::Auto, b), Decision::Sandboxed(Backend::Bwrap));
-        assert_eq!(decide(Mode::Auto, None), Decision::Unsandboxed);
+        assert_eq!(decide(Mode::Auto, None), Decision::NeedsException);
         assert_eq!(
             decide(Mode::Require, Some(Backend::SandboxExec)),
             Decision::Sandboxed(Backend::SandboxExec)
@@ -1157,6 +1202,37 @@ mod tests {
 
     // bwrap's argv is a Linux path list. On Windows `Path` renders `\`, so
     // these fixtures only run where bwrap itself runs.
+    // D1 (roadmap 1.6): with sandbox auto and no backend, the execution
+    // point refuses every command until a person allows unconfined commands
+    // for the session, whatever approved it upstream (a hook's allow, a
+    // saved approval, an allow rule). The refusal names no way around it.
+    // Runs in the no-backend cells, Windows included.
+    #[test]
+    fn invariant_d1_wrap_refuses_commands_until_the_person_allows_them() {
+        if backend().is_some() {
+            return;
+        }
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let m = mode();
+        set_mode(Mode::Auto);
+        forget_unconfined_allowed();
+        let cwd = std::env::temp_dir();
+        assert!(needs_exception());
+        let err = wrap("echo hi", &cwd).unwrap_err();
+        assert!(err.contains("the user allows it for this session"), "{err}");
+        assert!(
+            !err.contains("--sandbox off") && !err.contains("/sandbox"),
+            "{err}"
+        );
+        allow_unconfined_for_session();
+        assert!(!needs_exception());
+        assert!(matches!(wrap("echo hi", &cwd), Ok(None)));
+        forget_unconfined_allowed();
+        set_mode(m);
+    }
+
     // Roadmap 1.6: with no home folder there is no list of stores to hide,
     // so the sandbox must not claim to hide them.
     #[test]

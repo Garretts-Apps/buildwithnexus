@@ -478,10 +478,17 @@ an OS sandbox by default since 0.21. Set it with the `"sandbox"` setting,
 - `require` refuses to run commands when no backend works.
 - `off` runs them unconfined.
 
+When no backend works and the mode is `auto`, commands are refused until a
+person allows them to run unconfined for that session. bwn asks once, at the
+first command; no hook, saved approval or allow rule answers that question,
+the answer is not saved, and the posture check shows it. With no one to ask
+(headless, CI), commands are refused; `--sandbox off` is the explicit way to
+run them unconfined. `--accept-posture` does not grant it.
+
 Backends: `bwrap` (bubblewrap) or the built-in Landlock and seccomp backend
 on Linux (always Landlock inside WSL), and `sandbox-exec` (Seatbelt) on
-macOS. Windows has none: commands there are not confined, the posture check
-and `doctor` say so, and auto mode asks before each command.
+macOS. Windows has none: commands there are refused until you allow them to
+run unconfined for the session, and the posture check and `doctor` say so.
 
 Inside the sandbox, the command can write only to the working directory,
 the folders added with `--add-dir` and the temp directories; the rest of the

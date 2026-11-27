@@ -79,6 +79,7 @@ struct PolicyState {
     permission: &'static str,
     added: Vec<PathBuf>,
     settings_reads: usize,
+    unconfined_allowed: bool,
 }
 
 fn policy_state(perm: crate::agent::Permission) -> PolicyState {
@@ -90,6 +91,18 @@ fn policy_state(perm: crate::agent::Permission) -> PolicyState {
         permission: crate::agent::permission_name(perm),
         added: crate::workdirs::list(),
         settings_reads: crate::config::settings_file_reads(),
+        unconfined_allowed: crate::sandbox::unconfined_allowed(),
+    }
+}
+
+/// A person just allowed unconfined commands for this session (D1): that
+/// answer is also their acceptance of the posture it changes, so the next
+/// request doesn't ask again for the same change.
+pub fn note_unconfined_allowed(perm: crate::agent::Permission, cwd: &Path) {
+    let mut acc = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = acc.as_mut() {
+        a.state = policy_state(perm);
+        a.session_fp = session_fingerprint(&session_rows(perm, cwd));
     }
 }
 
@@ -163,15 +176,28 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             ),
             Level::Warn,
         ),
+        (_, None) if crate::sandbox::unconfined_allowed() => (
+            format!(
+                "none usable ({}): commands run unconfined, as you allowed for this session",
+                crate::sandbox::backend_error().unwrap_or("no backend")
+            ),
+            Level::Warn,
+        ),
         (_, None) => (
             format!(
-                "none usable ({}): commands run unsandboxed",
+                "none usable ({}): commands are refused until you allow them to run unconfined for this session",
                 crate::sandbox::backend_error().unwrap_or("no backend")
             ),
             Level::Warn,
         ),
     };
-    let skey = backend.map_or(smode.as_str(), |b| b.label());
+    let skey = match backend {
+        Some(b) => b.label(),
+        None if smode == Mode::Auto && crate::sandbox::unconfined_allowed() => {
+            "auto-unconfined-allowed"
+        }
+        None => smode.as_str(),
+    };
     v.push(row("session", "sandbox", sb, sl, skey));
 
     if let Some(backend) = backend {
@@ -262,6 +288,15 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 "refused: sandbox mode is require and no backend works".into(),
                 Level::Good,
                 "refused",
+            )
+        } else if smode == Mode::Auto && !crate::sandbox::unconfined_allowed() {
+            // D1: refused until a person allows them for this session.
+            row(
+                "session",
+                "commands",
+                "refused until you allow them to run unconfined for this session (bwn asks at the first one)".into(),
+                Level::Good,
+                "refused-until-allowed",
             )
         } else {
             row(
@@ -897,8 +932,9 @@ mod tests {
         );
         assert_eq!(sandbox.level, Level::Warn);
         let commands = rows.iter().find(|r| r.item == "commands").unwrap();
+        // D1 (roadmap 1.6): refused until the person allows them.
         assert!(
-            commands.value.contains("asks before each one"),
+            commands.value.starts_with("refused until you allow"),
             "{}",
             commands.value
         );
