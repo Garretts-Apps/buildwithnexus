@@ -527,7 +527,12 @@ use a container or VM.
 Before a session's first model request, the posture check shows all of this,
 plus what this machine's network does (the model endpoint, name lookup, the
 cloud metadata address, listening ports), and asks to accept or stop.
-Headless runs need `--accept-posture`. Text from web pages, search results
+Headless runs need `--accept-posture`. The acceptance is tied to what the
+session can reach: the permission and sandbox modes, the added folders, which
+credential stores are hidden, and the hosts `network.allow` names. If any of
+these changes in the session (`/permissions`, `/sandbox`, `/add-dir`, a typed
+switch, an edited settings file), the check asks again before the next model
+request. Text from web pages, search results
 and MCP servers is labelled as untrusted for the model, and after a session
 reads any, auto mode asks before commands, fetches and MCP calls that can
 change things.

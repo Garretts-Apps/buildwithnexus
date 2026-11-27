@@ -121,6 +121,11 @@ pub fn network() -> bool {
 
 static EXPOSE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
+/// The `sandbox_expose` list as set.
+pub fn exposed() -> Vec<PathBuf> {
+    EXPOSE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Set the `sandbox_expose` list (`~` expanded).
 pub fn set_expose(paths: &[String]) {
     let home = crate::config::user_home();
