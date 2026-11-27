@@ -1578,6 +1578,10 @@ mod tests {
 
     #[test]
     fn invariant_in2_a_bad_sandbox_setting_falls_back_to_require() {
+        // The mode is process-wide; tests that read it hold the same lock.
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Roadmap 1.3 (analysis M13, IN-2): a value bwn can't parse never
         // leaves commands less confined than the strictest mode.
         let (m, n) = (mode(), network());
