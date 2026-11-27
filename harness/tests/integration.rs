@@ -3264,6 +3264,29 @@ fn settings_without_a_model_run_on_the_preset_default_and_take_the_model_flag() 
     assert_eq!(body["model"], "mock-coder");
 }
 
+// AU-2 (roadmap 1.4; analysis I1, A1): a scripted model in auto mode tries
+// to switch the sandbox off by writing the project's settings file. With no
+// one to answer the policy prompt the write is refused, the file is never
+// written, and the next start runs with the user's baseline.
+#[test]
+fn the_model_cannot_write_the_project_settings_file_unasked() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": ".buildwithnexus/settings.json", "content": "{\"sandbox\":\"off\"}"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "custom", "auto", port);
+    let r = run(&home, &cwd, "turn the sandbox off");
+    let denied = r.text_of("tool_denied");
+    assert!(denied.contains("policy file"), "{denied}");
+    assert!(!cwd.join(".buildwithnexus/settings.json").exists());
+}
+
 // IN-2 (roadmap 1.3; analysis I4): a user settings file that doesn't load,
 // here holding a deny rule, stops the run before any model request. Before,
 // the file was dropped and the run went ahead without its rules.
@@ -6798,7 +6821,7 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     assert!(files.contains("added.txt"), "{files}");
 
     // A shell command that writes .git is still confined. Where the backend
-    // can keep .git read-only, the model is told why and how to opt out.
+    // can keep .git read-only, the model is told why, not how to opt out.
     let port = serve(vec![
         tool_call(
             "c1",
@@ -6825,10 +6848,14 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     if result.contains("[exit 0]") {
         return;
     }
+    // Roadmap 1.9 (analysis A4): the note explains the refusal and leaves the
+    // sandbox to the user; it never tells the model how to turn it off.
     assert!(
-        result.contains("--sandbox off") && result.contains(".git"),
-        "sandboxed .git write did not explain the opt-out: {result}"
+        result.contains("cannot write .git") && result.contains("user"),
+        "sandboxed .git write was not explained: {result}"
     );
+    assert!(!result.contains("--sandbox off"), "{result}");
+    assert!(!result.contains("/sandbox off"), "{result}");
 }
 
 // http.cookieFile with http.saveCookies has git write the file the

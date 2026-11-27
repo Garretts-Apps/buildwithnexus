@@ -3372,6 +3372,42 @@ fn is_environ_name(n: &str) -> bool {
         || (n.contains(['*', '?', '[']) && n.contains("env") && component_glob_match(n, "environ"))
 }
 
+/// What a `.buildwithnexus` folder holds that governs bwn: settings, rules,
+/// Python tools, agents, commands, skills, the system prompt and Agents.md.
+/// The knowledge base and artifacts are bwn's own working files, not policy.
+const PROJECT_POLICY_ENTRIES: &[&str] = &[
+    "settings.json",
+    "settings.local.json",
+    "rules",
+    "tools",
+    "agents",
+    "commands",
+    "skills",
+    "system.md",
+    "agents.md",
+];
+
+/// Whether `p` is a policy file of a project (or the `.buildwithnexus`
+/// folder itself), on the lexical path or the symlink-resolved one. Names
+/// compare without case, so a case-insensitive filesystem can't slip a
+/// spelling past it (roadmap 1.4; analysis I1, Integrity invariant).
+pub fn is_project_policy_path(p: &Path) -> bool {
+    let windows = cfg!(windows);
+    let check = |q: &Path| {
+        let names = path_names(q, windows);
+        names
+            .last()
+            .is_some_and(|n| n.eq_ignore_ascii_case(".buildwithnexus"))
+            || names.windows(2).any(|w| {
+                w[0].eq_ignore_ascii_case(".buildwithnexus")
+                    && PROJECT_POLICY_ENTRIES
+                        .iter()
+                        .any(|e| w[1].eq_ignore_ascii_case(e))
+            })
+    };
+    check(&normalize(p)) || check(&canonicalize_lenient(p))
+}
+
 /// Sensitivity of a path inside a project tree, relative to its root: the
 /// same credential names as `is_sensitive`, except that the project's own
 /// `.buildwithnexus` (instructions, skills) is ordinary repo content.

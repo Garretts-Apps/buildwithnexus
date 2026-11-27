@@ -309,6 +309,14 @@ refuse in every mode and which a project's settings cannot remove,
 placed and verified itself), and `BWN_TLS_ROOTS=bundled` (trust only the
 roots built into the binary, not the OS store or `SSL_CERT_FILE`).
 
+A project's policy files (`.buildwithnexus/settings.json` and
+`settings.local.json`, `rules/`, `tools/`, `agents/`, `commands/`, `skills/`,
+`system.md`, `Agents.md`, and the folder itself) are protected from the file
+tools: any change asks a person, in every mode, one change at a time, and no
+saved approval or allow rule covers it. Without a terminal to ask, the change
+is refused. Shell commands under Landlock or with no backend can still write
+them; that gap is roadmap item 2.2.
+
 A broken setting never loosens these. A `sandbox` value bwn can't parse runs
 as `require`, and a `permission` value as `readonly`, each with a warning
 naming the fix. A settings file that exists but doesn't load (bad JSON, a
