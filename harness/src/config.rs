@@ -2785,6 +2785,13 @@ fn positive(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|v| v.as_f64()).filter(|b| *b > 0.0)
 }
 
+// Whether `{key: value}` alone deserializes as settings: every field has a
+// default, so this fails only when the value itself has the wrong type.
+fn loads_alone(key: &str, value: &serde_json::Value) -> bool {
+    let one = serde_json::Value::Object([(key.to_string(), value.clone())].into_iter().collect());
+    serde_json::from_value::<Settings>(one).is_ok()
+}
+
 // Splits an untrusted project file into what it may apply on top of `base`
 // (harmless keys, and permission/sandbox/budget only when they tighten) and
 // the names of the keys that need the user's trust.
@@ -2797,6 +2804,13 @@ fn untrusted_view(
     for (k, v) in proj {
         // An empty hooks block runs nothing, so it isn't worth a prompt.
         if k == "hooks" && v.as_object().is_none_or(|m| m.is_empty()) {
+            continue;
+        }
+        // A key the user's own files set to a value that doesn't load keeps
+        // bwn from starting. A project must not repair it into a running
+        // configuration, so nothing it says about that key applies.
+        if base.get(&k).is_some_and(|b| !loads_alone(&k, b)) {
+            ignored.push(crate::tui::sanitize_terminal(&k).into_owned());
             continue;
         }
         // Rules that only add ask or deny entries apply at once; allow
@@ -2819,21 +2833,21 @@ fn untrusted_view(
             k if HARMLESS_PROJECT_KEYS.contains(&k) => true,
             // A key the user's settings don't name is compared with its
             // default, never with the loosest value.
+            // A value the user's file names but bwn can't rank counts as
+            // the strictest, so a project can't loosen from it.
             "permission" => {
-                let cur = base
-                    .get(&k)
-                    .and_then(permission_rank)
-                    .or_else(|| permission_rank(&default_permission().into()))
-                    .unwrap_or(u8::MAX);
-                permission_rank(&v).is_some_and(|r| r >= cur)
+                let cur = match base.get(&k) {
+                    Some(b) => permission_rank(b),
+                    None => permission_rank(&default_permission().into()),
+                };
+                permission_rank(&v).is_some_and(|r| r >= cur.unwrap_or(u8::MAX))
             }
             "sandbox" => {
-                let cur = base
-                    .get(&k)
-                    .and_then(sandbox_rank)
-                    .or_else(|| sandbox_rank(&default_sandbox().into()))
-                    .unwrap_or(u8::MAX);
-                sandbox_rank(&v).is_some_and(|r| r >= cur)
+                let cur = match base.get(&k) {
+                    Some(b) => sandbox_rank(b),
+                    None => sandbox_rank(&default_sandbox().into()),
+                };
+                sandbox_rank(&v).is_some_and(|r| r >= cur.unwrap_or(u8::MAX))
             }
             "max_budget_usd" => match (positive(Some(&v)), positive(base.get(&k))) {
                 (Some(new), Some(cur)) => new <= cur,
@@ -5907,3 +5921,7 @@ mod settings_cache_tests {
         let _ = fs::remove_dir_all(&h);
     }
 }
+
+#[cfg(test)]
+#[path = "config_authority_tests.rs"]
+mod authority_tests;

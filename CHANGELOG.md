@@ -14,6 +14,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **An untrusted project can no longer repair a broken user setting.** When
+  your own file held a value bwn can't load (say `"permission": 5`), bwn
+  refused to start, but a project file setting the same key to a valid
+  value overwrote it and bwn started anyway. A project's value for such a
+  key is now held for trust. A `sandbox` or `permission` value bwn can't
+  rank counts as the strictest when comparing a project's value.
 - **Credential files are hidden from sandboxed commands.** `~/.ssh`,
   `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.npmrc`, bwn's own folder, the SSH
   agent's socket and the other stores the file tools already treat as
