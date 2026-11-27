@@ -76,6 +76,8 @@ pub mod trace;
 pub mod tui;
 pub mod update;
 pub mod usage;
+#[cfg(target_os = "linux")]
+mod userns;
 pub mod verifier;
 pub mod workdirs;
 pub mod workflow;
@@ -149,6 +151,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--no-auto-commit",
     "--auto-commit",
     "--accept-posture",
+    "--sandbox-network",
     "--no-repo-map",
     "--repo-map",
     "--route-gemini",
@@ -231,6 +234,10 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
         }
         if arg == "--accept-posture" {
             posture::accept_by_flag();
+            continue;
+        }
+        if arg == "--sandbox-network" {
+            sandbox::allow_landlock_network_for_session();
             continue;
         }
         if arg == "--no-auto-commit" {
@@ -2562,6 +2569,9 @@ fn usage_text() -> String {
          \x20                               shell commands; off is the 0.20 default)\n\
          \x20 --accept-posture              accept the posture check (what the session can\n\
          \x20                               reach) without being asked; for headless runs\n\
+         \x20 --sandbox-network             on Landlock alone (no bubblewrap or user\n\
+         \x20                               namespaces), let commands use the network\n\
+         \x20                               through the checker; it is off there otherwise\n\
          \x20 --auto-commit                 git-commit file edits (the default)\n\
          \x20 --no-auto-commit              leave file edits uncommitted\n\
          \x20 --repo-map                    offer the repo_map tool (the default)\n\

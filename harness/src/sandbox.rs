@@ -53,6 +53,11 @@ pub enum Backend {
     SandboxExec,
     /// Linux, when bubblewrap is missing or cannot make a namespace.
     Landlock,
+    /// Linux, when bubblewrap is missing but unprivileged user namespaces
+    /// work: Landlock and seccomp inside bwn's own mount namespace, which
+    /// also confines metadata, hides store names and keeps `.git` read-only
+    /// (roadmap 2.2; `userns.rs`).
+    Userns,
 }
 
 impl Backend {
@@ -61,6 +66,7 @@ impl Backend {
             Backend::Bwrap => "bwrap (bubblewrap)",
             Backend::SandboxExec => "sandbox-exec (Seatbelt)",
             Backend::Landlock => "landlock+seccomp (built-in)",
+            Backend::Userns => "namespace+landlock+seccomp (built-in)",
         }
     }
 }
@@ -136,6 +142,28 @@ pub fn set_network(allowed: bool) {
 
 pub fn network() -> bool {
     NETWORK.load(Ordering::Relaxed)
+}
+
+// Landlock alone holds a command to the checker by port only, so a command
+// could still reach another machine listening on that port. There it gets
+// no network unless the user allows it for this session, with
+// `/sandbox network` or `--sandbox-network`; never from settings, a project
+// or the model (owner decision; roadmap 2.2).
+static LANDLOCK_NETWORK: AtomicBool = AtomicBool::new(false);
+
+/// `/sandbox network` and `--sandbox-network`: on Landlock alone, let
+/// commands use the network through the checker for this session.
+pub fn allow_landlock_network_for_session() {
+    LANDLOCK_NETWORK.store(true, Ordering::Relaxed);
+}
+
+pub fn landlock_network_allowed() -> bool {
+    LANDLOCK_NETWORK.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn forget_landlock_network() {
+    LANDLOCK_NETWORK.store(false, Ordering::Relaxed);
 }
 
 // ── credential stores hidden from commands ───────────────────────────────────
@@ -267,9 +295,11 @@ pub fn can_check_egress(backend: Backend) -> bool {
     match backend {
         Backend::SandboxExec => true,
         #[cfg(target_os = "linux")]
-        Backend::Bwrap | Backend::Landlock => crate::landlock::limits_connections(),
+        Backend::Bwrap | Backend::Landlock | Backend::Userns => {
+            crate::landlock::limits_connections()
+        }
         #[cfg(not(target_os = "linux"))]
-        Backend::Bwrap | Backend::Landlock => false,
+        Backend::Bwrap | Backend::Landlock | Backend::Userns => false,
     }
 }
 
@@ -278,6 +308,9 @@ pub fn can_check_egress(backend: Backend) -> bool {
 /// hold a command to it, no network (the posture check says so).
 pub fn net_for(backend: Backend) -> Net {
     if !network() {
+        return Net::Off;
+    }
+    if backend == Backend::Landlock && !landlock_network_allowed() {
         return Net::Off;
     }
     if !egress_check() {
@@ -376,6 +409,12 @@ fn detect() -> Result<Backend, String> {
             #[cfg(target_os = "linux")]
             "landlock" => return crate::landlock::available().map(|()| Backend::Landlock),
             #[cfg(target_os = "linux")]
+            "userns" => {
+                return crate::landlock::available()
+                    .and_then(|()| crate::userns::available())
+                    .map(|()| Backend::Userns)
+            }
+            #[cfg(target_os = "linux")]
             "bwrap" => return probe_external("bwrap", bwrap_probe_args(), Backend::Bwrap),
             _ => {}
         }
@@ -420,6 +459,9 @@ fn detect_linux() -> Result<Backend, String> {
     match bwrap {
         Ok(b) => Ok(b),
         Err(bwrap_err) => match crate::landlock::available() {
+            // Without bubblewrap, bwn's own mount namespace closes the gaps
+            // Landlock alone leaves, where user namespaces are allowed.
+            Ok(()) if crate::userns::available().is_ok() => Ok(Backend::Userns),
             Ok(()) => Ok(Backend::Landlock),
             Err(land) => Err(format!("{bwrap_err}; Landlock is also unavailable: {land}")),
         },
@@ -615,6 +657,24 @@ const CONFINE_EXE: &str = "/run/bwn-confine";
 
 /// Workspace entries a sandboxed command may read but never write.
 const PROTECTED_IN_WORKSPACE: &[&str] = &[".git", ".buildwithnexus"];
+
+/// The paths inside `roots` a sandboxed command must not write: each root's
+/// `.git` and `.buildwithnexus`, and the nested repositories' `.git` (within
+/// the same bounds bubblewrap uses).
+pub fn protected_paths(roots: &[&Path]) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|r| PROTECTED_IN_WORKSPACE.iter().map(|d| r.join(d)))
+        .collect();
+    for r in roots {
+        for p in nested_git_entries(r) {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+    }
+    v
+}
 
 // How far the search for nested repositories goes: at most this many
 // folders read, and this many `.git` entries kept, per root. Every sandboxed
@@ -934,10 +994,16 @@ fn command_for(backend: Backend, cmd: &str, cwd: &Path) -> Result<Command, Strin
             c.args(["sh", "-c", cmd]);
             c
         }
-        Backend::Landlock => {
+        Backend::Landlock | Backend::Userns => {
             #[cfg(target_os = "linux")]
             {
-                crate::landlock::command(cmd, &cwd, &crate::workdirs::list(), net_for(backend))?
+                crate::landlock::command_in(
+                    cmd,
+                    &cwd,
+                    &crate::workdirs::list(),
+                    net_for(backend),
+                    backend == Backend::Userns,
+                )?
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -1031,7 +1097,7 @@ pub fn git_write_blocked_note(output: &str) -> Option<&'static str> {
 /// carve them out of the writable workspace (roadmap 1.8; analysis M1).
 pub fn protects_policy_files() -> bool {
     match decide(mode(), backend()) {
-        Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
+        Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec | Backend::Userns) => true,
         Decision::Sandboxed(_)
         | Decision::Unsandboxed
         | Decision::Refused
@@ -1052,7 +1118,7 @@ pub fn hides_reads(cwd: &Path) -> bool {
     match decide(mode(), backend()) {
         Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
         #[cfg(target_os = "linux")]
-        Decision::Sandboxed(Backend::Landlock) => {
+        Decision::Sandboxed(Backend::Landlock | Backend::Userns) => {
             let extra = crate::workdirs::list();
             let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
             let roots: Vec<&Path> = std::iter::once(cwd.as_path())
@@ -1155,6 +1221,34 @@ pub fn doctor_summary() -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Owner decision (roadmap 2.2): Landlock alone holds a command to the
+    // checker by port only, so there the network is off until the user
+    // allows it for the session. With the egress check off, the namespace
+    // backend gets an open network and Landlock alone gets none; the old
+    // rule gave both the open network.
+    #[test]
+    fn invariant_landlock_alone_has_no_network_until_allowed() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (net0, egress0) = (network(), egress_check());
+        set_network(true);
+        set_egress_check(false);
+        forget_landlock_network();
+        let before = (net_for(Backend::Landlock), net_for(Backend::Userns));
+        allow_landlock_network_for_session();
+        let after = net_for(Backend::Landlock);
+        forget_landlock_network();
+        set_network(net0);
+        set_egress_check(egress0);
+        assert_eq!(
+            before,
+            (Net::Off, Net::Open),
+            "Landlock alone had a network"
+        );
+        assert_eq!(after, Net::Open, "allowing it for the session did not");
+    }
 
     #[test]
     fn mode_parses_the_three_values_only() {

@@ -278,10 +278,16 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         allowed.sort();
         let allow = allowed.len();
         let checked = format!("checked:{}", allowed.join(","));
+        let landlock_alone = matches!(backend, crate::sandbox::Backend::Landlock);
         let (nv, nl, nk) = match net {
             Net::Off if !crate::sandbox::network() => {
                 ("none (sandbox_network: false)".to_string(), Level::Good, "off")
             }
+            Net::Off if landlock_alone && !crate::sandbox::landlock_network_allowed() => (
+                "none: on Landlock alone commands are held to the checker by port, not address, so the network is off; type /sandbox network (or pass --sandbox-network) to allow it for this session, or install bubblewrap".to_string(),
+                Level::Good,
+                "off-landlock",
+            ),
             Net::Off => (
                 "none: this machine cannot hold commands to the checker (Landlock ABI 4 needed); set sandbox_egress_check: false to let them connect anywhere".to_string(),
                 Level::Unknown,
@@ -1000,6 +1006,9 @@ mod tests {
         let _g = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // On Landlock alone the network is off until allowed for the
+        // session; allow it so the checked row (and its hosts) is tested.
+        crate::sandbox::allow_landlock_network_for_session();
         let home = std::env::temp_dir().join(format!("bwn-posture-in3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("proj")).unwrap();
@@ -1053,6 +1062,7 @@ mod tests {
         forget_accepted();
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
+        crate::sandbox::forget_landlock_network();
     }
 
     // The row keys carry the lists they show, so the fingerprint moves with
@@ -1063,6 +1073,9 @@ mod tests {
         let _g = crate::config::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // On Landlock alone the network is off until allowed for the
+        // session; allow it so the checked row (and its hosts) is tested.
+        crate::sandbox::allow_landlock_network_for_session();
         let home = std::env::temp_dir().join(format!("bwn-posture-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("proj")).unwrap();
@@ -1093,5 +1106,6 @@ mod tests {
         crate::sandbox::set_mode(mode0);
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
+        crate::sandbox::forget_landlock_network();
     }
 }

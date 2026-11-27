@@ -37,7 +37,7 @@ inputs:
     description: For `review`, also review the branch since this git ref (for example `origin/main`). A shallow checkout is deepened and a missing `<remote>/<branch>` fetched first.
     default: ""
   args:
-    description: "More bwn options, separated by spaces (for example `--sandbox auto --effort low`). On a runner where no sandbox backend works (Windows), commands are refused, because nobody is there to allow them to run unconfined; pass `--sandbox off` here to run them unconfined."
+    description: "More bwn options, separated by spaces (for example `--sandbox auto --effort low`). On a runner where no sandbox backend works (Windows), commands are refused, because nobody is there to allow them to run unconfined; pass `--sandbox off` here to run them unconfined. On a Linux runner with neither bubblewrap nor unprivileged user namespaces (GitHub's Ubuntu images restrict them through AppArmor), commands get no network; pass `--sandbox-network` here to let them reach the network through the host checker."
     default: ""
   working-directory:
     description: Folder to run in.

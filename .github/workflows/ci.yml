@@ -97,12 +97,13 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, backend: bwrap, expect: "bwrap (bubblewrap)" }
+          - { os: ubuntu-latest, backend: userns, expect: "namespace+landlock+seccomp" }
           - { os: ubuntu-latest, backend: landlock, expect: "landlock+seccomp" }
           - { os: ubuntu-latest, backend: none, expect: "no backend" }
           - { os: macos-15, backend: seatbelt, expect: "sandbox-exec" }
           - { os: windows-2022, backend: windows-none, expect: "no sandbox backend on Windows" }
     env:
-      BWN_TEST_SANDBOX_BACKEND: ${{ contains(fromJSON('["bwrap","landlock","none"]'), matrix.backend) && matrix.backend || '' }}
+      BWN_TEST_SANDBOX_BACKEND: ${{ contains(fromJSON('["bwrap","userns","landlock","none"]'), matrix.backend) && matrix.backend || '' }}
     steps:
       - name: Keep LF line endings
         if: runner.os == 'Windows'
@@ -120,12 +121,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Ubuntu's AppArmor stops unprivileged user namespaces, which
-      # bubblewrap needs.
+      # bubblewrap and bwn's own namespace backend need. The landlock cell
+      # keeps the restriction, which is how bwn falls back to Landlock alone.
       - name: Install bubblewrap
         if: matrix.backend == 'bwrap'
         run: |
           sudo apt-get install -y bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Allow unprivileged user namespaces
+        if: matrix.backend == 'userns'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Build
         run: cargo build --locked --bin buildwithnexus

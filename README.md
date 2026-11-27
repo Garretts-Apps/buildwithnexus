@@ -749,24 +749,24 @@ An OS-level layer *under* the permission gate for shell commands
 (`run_command`/`bash`, `!cmd`, and `check_work`). On by default since 0.21.
 `"sandbox"` (or `--sandbox`, or `/sandbox`):
 
-- `"auto"` (default) — confine when a backend works; otherwise say so once
-  and run unsandboxed.
+- `"auto"` (default) — confine when a backend works; otherwise ask first.
 - `"off"` — unsandboxed, the default before 0.21.
 - `"require"` — refuse commands when no backend works.
 
-Linux uses `bwrap` when it works, otherwise built-in Landlock and seccomp
-(also in WSL, when the kernel allows it). macOS uses `sandbox-exec`.
-Windows has none. Sandboxed shell commands cannot write `.git`; the tool
-result names `--sandbox off`. Auto-commit of file edits runs outside it.
+Linux uses `bwrap`; without it (and always in WSL), bwn's own
+user-namespace backend, or Landlock and seccomp alone where namespaces are
+blocked. macOS uses `sandbox-exec`; Windows has none. Commands cannot write
+`.git` (on Landlock alone, auto mode asks first). Auto-commit runs outside
+the sandbox.
 
 **Confined:** writes outside the working directory and the temp dirs. With
 bubblewrap, `/tmp` is a private tmpfs (`TMPDIR=/tmp`) discarded on exit.
-With Landlock and on macOS, `/tmp` and `$TMPDIR` are the real directories.
+Elsewhere, `/tmp` and `$TMPDIR` are the real directories.
 `~/.buildwithnexus` and caches such as `~/.cargo` stay read-only.
 
 Credential files (`~/.ssh`, `~/.aws`, `~/.netrc`, …, the SSH agent) are
-hidden, and the network goes only through a host checker. A posture check
-asks before the first model request. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
+hidden, and the network goes only through a host checker (on Landlock alone,
+only after `/sandbox network`). A posture check asks first. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
 
 **Not confined:** other reads, the agent's own file tools, hooks, MCP
 servers, `start_server`. The sandbox never approves anything — the gate is

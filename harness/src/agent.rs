@@ -929,13 +929,14 @@ fn auto_asks(
             ));
         }
     }
-    // Landlock leaves .git and .buildwithnexus writable, so a command could
-    // plant a hook or setting that runs later outside the sandbox (roadmap
-    // 1.8; analysis M1, A2). Until 2.2 closes that, auto mode asks.
+    // Landlock alone leaves .git and .buildwithnexus writable, so a command
+    // could plant a hook or setting that runs later outside the sandbox
+    // (roadmap 1.8; analysis M1, A2): auto mode asks there. bwn's namespace
+    // backend keeps them read-only, like bubblewrap (roadmap 2.2).
     if command
         && matches!(
             crate::sandbox::decide(crate::sandbox::mode(), crate::sandbox::backend()),
-            crate::sandbox::Decision::Sandboxed(b) if !matches!(b, crate::sandbox::Backend::Bwrap | crate::sandbox::Backend::SandboxExec)
+            crate::sandbox::Decision::Sandboxed(crate::sandbox::Backend::Landlock)
         )
     {
         return Some(

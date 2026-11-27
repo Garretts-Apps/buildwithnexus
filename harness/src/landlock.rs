@@ -378,13 +378,56 @@ pub fn engage(ruleset: RawFd, net: Net, deny_truncate: bool) -> io::Result<()> {
 }
 
 /// `cmd` as a child that confines itself with Landlock and seccomp.
+#[cfg(test)]
 pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Command, String> {
+    command_in(cmd, cwd, extra, net, false)
+}
+
+/// Like [`command`]; with `userns`, the child first enters bwn's own user and
+/// mount namespace (`userns.rs`), which confines metadata, hides store names
+/// and keeps `.git` and `.buildwithnexus` read-only, then applies Landlock
+/// and seccomp inside it.
+pub fn command_in(
+    cmd: &str,
+    cwd: &Path,
+    extra: &[PathBuf],
+    net: Net,
+    userns: bool,
+) -> Result<Command, String> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
     let roots: Vec<&Path> = std::iter::once(cwd.as_path())
         .chain(extra.iter().map(PathBuf::as_path))
         .collect();
     let hidden = crate::sandbox::hidden_paths(&roots);
+    build(cmd, &cwd, extra, net, userns, hidden)
+}
+
+/// [`command_in`] with the credential stores given rather than looked up
+/// under the user's home (tests use a fake home).
+#[cfg(test)]
+pub fn command_with_hidden_for_test(
+    cmd: &str,
+    cwd: &Path,
+    hidden: &[PathBuf],
+    net: Net,
+) -> Result<Command, String> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    build(cmd, &cwd, &[], net, true, hidden.to_vec())
+}
+
+fn build(
+    cmd: &str,
+    cwd: &Path,
+    extra: &[PathBuf],
+    net: Net,
+    userns: bool,
+    hidden: Vec<PathBuf>,
+) -> Result<Command, String> {
+    let cwd = cwd.to_path_buf();
+    let tmp = std::env::var_os("TMPDIR").map(PathBuf::from);
+    let roots: Vec<&Path> = std::iter::once(cwd.as_path())
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
     // A root that holds a hidden path cannot have it carved out; the
     // session reports reads as not confined then (sandbox::hides_reads).
     let hidden = if can_hide(&roots, &hidden) {
@@ -401,6 +444,16 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Com
     // ftruncate stays: it needs a file opened for writing, which Landlock
     // does check.
     let deny_truncate = !confines_truncate();
+    let plan = if userns {
+        let protected = crate::sandbox::protected_paths(&roots);
+        let writable = write_roots(&cwd, extra, tmp.as_deref());
+        Some(
+            crate::userns::Plan::new(&cwd, &writable, &protected, &hidden)
+                .ok_or("namespace plan: a path is not representable")?,
+        )
+    } else {
+        None
+    };
     let mut child = Command::new("sh");
     child.args(["-c", cmd]).current_dir(&cwd);
     // The hook owns the parent's copy of the ruleset fd, so it is closed
@@ -411,6 +464,12 @@ pub fn command(cmd: &str, cwd: &Path, extra: &[PathBuf], net: Net) -> Result<Com
     unsafe {
         child.pre_exec(move || {
             let fd = owned.as_raw_fd();
+            if let Some(plan) = &plan {
+                if let Err(e) = plan.enter() {
+                    let _ = libc::close(fd);
+                    return Err(e);
+                }
+            }
             let r = engage(fd, net, deny_truncate);
             let _ = libc::close(fd);
             r
@@ -520,6 +579,16 @@ fn seccomp(net: Net, deny_truncate: bool) -> io::Result<()> {
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,
+        // The mount API, old and new: a command must not unmount, remount
+        // or clone the namespace's mounts (userns.rs), and has no use for
+        // them elsewhere.
+        libc::SYS_open_tree,
+        libc::SYS_move_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
     ];
     if deny_truncate {
         deny.push(libc::SYS_truncate);
