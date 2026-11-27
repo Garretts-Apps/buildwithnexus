@@ -442,6 +442,26 @@ thread_local! {
 }
 
 // `confirm_call` for a call that --permission-mode auto lets through.
+thread_local! {
+    // Set while asking about a change that must be approved by itself: the
+    // session and always answers count as a single yes and save nothing.
+    static ONE_CHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// confirm_call for a change no saved approval may cover (a project policy
+// file): asked each time, and `s` or `a` approve only this change.
+fn confirm_one_change(
+    name: &str,
+    input: &serde_json::Value,
+    label: &str,
+    cwd: &Path,
+) -> Option<String> {
+    ONE_CHANGE.with(|o| o.set(true));
+    let r = confirm_call(name, input, label, &format!("policy {name}"), cwd);
+    ONE_CHANGE.with(|o| o.set(false));
+    r
+}
+
 fn confirm_call_auto_allows(
     name: &str,
     input: &serde_json::Value,
@@ -599,6 +619,7 @@ pub(crate) fn ask_remote_posture(posture: &str) -> Option<crate::posture::Answer
 fn remote_decision(answer: RemoteAnswer, tool_key: &str, cwd: &Path) -> Option<String> {
     match answer {
         RemoteAnswer::Once => None,
+        RemoteAnswer::Always if ONE_CHANGE.with(|o| o.get()) => None,
         RemoteAnswer::Always => {
             add_session_allowed_tool(cwd, tool_key);
             crate::config::add_project_allowed(cwd, tool_key);
@@ -685,14 +706,21 @@ fn confirm_with(
     // Name what `s`/`a` would allow from now on: a binary (`cargo`), a
     // subcommand (`git status`), a host, or one exact command.
     let shown_key = tui::sanitize_terminal(tool_key);
+    let one_change = ONE_CHANGE.with(|o| o.get());
     let scope = if tool_key.is_empty() {
         String::new()
     } else {
         format!(" `{shown_key}`")
     };
-    tui::line(&tui::dim(&format!(
-        "  Y yes   N no   S allow{scope} this session   A always   D deny"
-    )));
+    if one_change {
+        tui::line(&tui::dim(
+            "  Y yes   N no   D deny   (each policy change is approved by itself)",
+        ));
+    } else {
+        tui::line(&tui::dim(&format!(
+            "  Y yes   N no   S allow{scope} this session   A always   D deny"
+        )));
+    }
     let q = format!("  {} ", tui::accent("ASK"));
     let Some(ans) = ask(&q) else {
         // Esc or Ctrl+C: refuse this call and stop the turn, instead of
@@ -702,7 +730,9 @@ fn confirm_with(
     };
     let trimmed = ans.trim();
     let lower = trimmed.to_lowercase();
-    if matches!(lower.as_str(), "y" | "yes") {
+    if matches!(lower.as_str(), "y" | "yes")
+        || (one_change && matches!(lower.as_str(), "s" | "session" | "a" | "always"))
+    {
         None
     } else if matches!(lower.as_str(), "s" | "session") {
         add_session_allowed_tool(cwd, tool_key);
@@ -939,9 +969,22 @@ pub(crate) fn gate(
         return None;
     }
 
+    let paths = tools::touched_paths(name, input, cwd);
+    // A project's policy files decide what bwn lets itself do, so a change
+    // to one asks a person in every mode, one change at a time: no saved
+    // approval or allow rule skips it (roadmap 1.4; analysis I1).
+    if tools::is_mutating_call(name, input) {
+        if let Some(p) = paths.iter().find(|p| tools::is_project_policy_path(p)) {
+            return confirm_one_change(
+                name,
+                input,
+                &format!("change project policy file {}", p.display()),
+                cwd,
+            );
+        }
+    }
     // A sensitive path is approved by itself: `s` and `a` cover that path,
     // not the tool or the command that reached it.
-    let paths = tools::touched_paths(name, input, cwd);
     if let Some(p) = paths.iter().find(|p| tools::is_sensitive(p)) {
         let key = format!("access {}", p.display());
         if !is_pre_approved(None, &key, cwd) {

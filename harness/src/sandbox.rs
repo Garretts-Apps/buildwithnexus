@@ -930,7 +930,7 @@ pub fn wrap_in(mode: Mode, cmd: &str, cwd: &Path) -> Result<Option<Command>, Str
             Ok(None)
         }
         Decision::Refused => Err(format!(
-            "sandbox: refusing to run the command — sandbox mode is `require` but no backend is usable ({}). On Linux, bubblewrap or Landlock is enough; or switch with /sandbox off.",
+            "sandbox: refusing to run the command — sandbox mode is `require` but no backend is usable ({}). On Linux, bubblewrap or Landlock is enough. Changing the sandbox mode is the user's decision.",
             backend_error().unwrap_or("no backend")
         )),
     }
@@ -941,9 +941,9 @@ pub const GIT_WRITE_BLOCKED: &str = "\
 sandboxed commands cannot write .git, so a hook or git config they plant \
 cannot run later outside the sandbox. git fetch, git pull, and git commit \
 from the shell fail for that reason. bwn still commits its own file edits \
-outside the sandbox when auto_commit is on. To let this command update .git, \
-turn the sandbox off: --sandbox off, \"sandbox\": \"off\" in settings.json, \
-or /sandbox off.";
+outside the sandbox when auto_commit is on. Tell the user which git step was \
+refused and leave it to them; changing the sandbox is their decision, so do \
+not suggest switching it off to get around this.";
 
 /// Why a failed sandboxed command could not update `.git`, when the output
 /// says so. `None` when this does not look like that denial.
@@ -1093,8 +1093,14 @@ mod tests {
         let note = git_write_blocked_note(
             "fatal: could not open '.git/FETCH_HEAD': Operation not permitted",
         );
-        assert!(note.unwrap().contains("--sandbox off"));
-        assert!(note.unwrap().contains("auto_commit"));
+        // Roadmap 1.9 (analysis A4, Authority invariant): the note tells the
+        // model what happened, never how to switch the sandbox off.
+        let note = note.unwrap();
+        assert!(note.contains("auto_commit"));
+        assert!(note.contains("user"));
+        for nudge in ["sandbox off", "--sandbox", "\"off\"", "/sandbox"] {
+            assert!(!note.contains(nudge), "{nudge}: {note}");
+        }
         assert!(git_write_blocked_note("Read-only file system: .git/refs/heads/main").is_some());
         assert!(git_write_blocked_note("cargo: permission denied").is_none());
         assert!(git_write_blocked_note("updated .git/refs/heads/main").is_none());

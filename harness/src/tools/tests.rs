@@ -4002,3 +4002,51 @@ fn remove_path_removes_a_symlink_to_a_directory_not_the_directory() {
     );
     assert_eq!(fs::read_to_string(d.join("real/keep.txt")).unwrap(), "kept");
 }
+
+// Roadmap 1.4 (analysis I1, Integrity invariant): what counts as a project
+// policy file, by any spelling, path or link.
+#[test]
+fn project_policy_paths_are_recognized_by_any_spelling() {
+    let root = std::env::temp_dir().join(format!("bwn-policy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dot = root.join(".buildwithnexus");
+    std::fs::create_dir_all(dot.join("rules")).unwrap();
+    std::fs::write(dot.join("settings.json"), "{}").unwrap();
+    for p in [
+        ".buildwithnexus",
+        ".buildwithnexus/settings.json",
+        ".buildwithnexus/settings.local.json",
+        ".buildwithnexus/rules/no-force-push.md",
+        ".buildwithnexus/tools/lint.py",
+        ".buildwithnexus/agents/reviewer.md",
+        ".buildwithnexus/commands/ship.md",
+        ".buildwithnexus/skills/x/SKILL.md",
+        ".buildwithnexus/system.md",
+        ".buildwithnexus/Agents.md",
+        ".buildwithnexus/AGENTS.md",
+        ".BuildWithNexus/Settings.json",
+        "src/../.buildwithnexus/settings.json",
+        ".buildwithnexus/./rules/../settings.json",
+    ] {
+        assert!(is_project_policy_path(&root.join(p)), "{p}");
+    }
+    for p in [
+        ".buildwithnexus/knowledge/entities.json",
+        ".buildwithnexus/artifacts/page.html",
+        "src/settings.json",
+        "buildwithnexus/settings.json",
+        "docs/.buildwithnexus-notes.md",
+    ] {
+        assert!(!is_project_policy_path(&root.join(p)), "{p}");
+    }
+    #[cfg(unix)]
+    {
+        let link = root.join("harmless.json");
+        std::os::unix::fs::symlink(dot.join("settings.json"), &link).unwrap();
+        assert!(is_project_policy_path(&link), "a link to the settings file");
+        let dir_link = root.join("cfg");
+        std::os::unix::fs::symlink(&dot, &dir_link).unwrap();
+        assert!(is_project_policy_path(&dir_link.join("rules/r.md")));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
