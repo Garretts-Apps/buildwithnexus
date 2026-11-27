@@ -3865,7 +3865,7 @@ fn untrusted_tools_are_labelled() {
 // loading mid-session takes its deny rules with it unless the gate refuses.
 // It refuses every call, reads included, until the file loads again.
 #[test]
-fn a_settings_file_broken_mid_session_refuses_every_call() {
+fn invariant_in2_a_settings_file_broken_mid_session_refuses_every_call() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -3923,7 +3923,7 @@ fn a_settings_file_broken_mid_session_refuses_every_call() {
 // before. With no terminal the ask is a refusal. Reads stay allowed, and
 // bwn's own working files under .buildwithnexus are ordinary writes.
 #[test]
-fn file_tools_ask_before_changing_project_policy_files() {
+fn invariant_in1_file_tools_ask_before_changing_project_policy_files() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4035,7 +4035,7 @@ fn file_tools_ask_before_changing_project_policy_files() {
 // in auto mode, and a mixed-case spelling was not sensitive at all outside
 // Windows. Neither may let a policy change through unasked.
 #[test]
-fn a_policy_change_is_never_pre_approved() {
+fn invariant_au2_a_policy_change_is_never_pre_approved() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4060,6 +4060,47 @@ fn a_policy_change_is_never_pre_approved() {
             "{path} went through unasked"
         );
     }
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// AU-5, disclosure half (roadmap 1.8; analysis M1, A2): on Landlock,
+// commands can write .git and .buildwithnexus, so auto mode asks before
+// each command and the startup check says why. On bubblewrap and Seatbelt
+// they are read-only and auto mode doesn't ask for this reason. The
+// invariant suite runs this once per backend.
+#[test]
+fn invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home("landlock-gap", json!({}));
+    let mode0 = crate::sandbox::mode();
+    crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+    let reason = gate(
+        Permission::Auto,
+        "run_command",
+        &json!({"command": "make"}),
+        &proj,
+    )
+    .unwrap_or_default();
+    let rows = crate::posture::gather_session_rows_for_test(Permission::Auto, &proj);
+    let writes = rows
+        .iter()
+        .find(|r| r.item == "writes")
+        .map(|r| r.value.clone());
+    match crate::sandbox::backend() {
+        Some(crate::sandbox::Backend::Landlock) => {
+            assert!(reason.contains("Landlock"), "{reason:?}");
+            assert!(writes.unwrap().contains(".git and .buildwithnexus"));
+        }
+        Some(_) => {
+            assert!(!reason.contains("Landlock"), "{reason:?}");
+            assert!(!writes.unwrap().contains(".git and .buildwithnexus"));
+        }
+        None => eprintln!("skip: no backend, covered by the no-backend rows"),
+    }
+    crate::sandbox::set_mode(mode0);
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }

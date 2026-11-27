@@ -4015,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_diag_reports_broken_files() {
+    fn invariant_in2_settings_diag_reports_broken_files() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let h = unique_home();
         let _ = fs::remove_dir_all(&h);
@@ -4756,7 +4756,7 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_project_keys_only_tighten() {
+    fn invariant_au1_untrusted_project_keys_only_tighten() {
         let base = serde_json::json!({
             "permission": "ask", "sandbox": "auto", "max_budget_usd": 5.0
         });
@@ -4815,7 +4815,7 @@ mod tests {
     // an untrusted project's `sandbox` applies only when it is at least as
     // strict as the user's effective mode.
     #[test]
-    fn untrusted_project_sandbox_never_weakens_any_user_setting() {
+    fn invariant_au1_untrusted_project_sandbox_never_weakens_any_user_setting() {
         let rank = |m: &str| {
             ["off", "auto", "require"]
                 .iter()

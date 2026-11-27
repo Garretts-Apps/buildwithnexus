@@ -479,7 +479,9 @@ an OS sandbox by default since 0.21. Set it with the `"sandbox"` setting,
 - `off` runs them unconfined.
 
 Backends: `bwrap` (bubblewrap) or the built-in Landlock and seccomp backend
-on Linux, and `sandbox-exec` (Seatbelt) on macOS. Windows has none.
+on Linux (always Landlock inside WSL), and `sandbox-exec` (Seatbelt) on
+macOS. Windows has none: commands there are not confined, the posture check
+and `doctor` say so, and auto mode asks before each command.
 
 Inside the sandbox, the command can write only to the working directory,
 the folders added with `--add-dir` and the temp directories; the rest of the
@@ -488,8 +490,12 @@ filesystem, including `~/.buildwithnexus`, is read-only, and so are the
 the `.git` of repositories nested inside them that exist when the command
 starts (on Linux an empty read-only placeholder stands in when they don't
 exist yet, so a command cannot create a `.git/config` that runs later outside
-the sandbox). On Linux with bubblewrap, `/tmp` is a fresh private directory
-that is discarded when the command exits.
+the sandbox). That read-only rule holds on bubblewrap and Seatbelt. Landlock
+cannot carve `.git` and `.buildwithnexus` out of the writable workspace, so on
+Landlock (and so always in WSL) a command can write them; the posture check
+says so, and auto mode asks before every command on that backend. On Linux
+with bubblewrap, `/tmp` is a fresh private directory that is discarded when
+the command exits.
 
 The user's credential stores cannot be read from inside it, whatever path a
 command uses to reach them: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`,
