@@ -30,6 +30,12 @@ Build feature parity and differentiation on that base, never around it.
   *Reproduced* is reproduced in a matching field cell (docker or
   `field-adhoc`) before it is fixed. If it does not reproduce, the item is
   rewritten to match what does.
+- **Every security change is traceable.** Its PR and commit name the
+  analysis finding IDs it closes (for example M12, A1), the invariant it
+  restores (Authority, Integrity, Verification, Inheritance or
+  Accountability), the roadmap item, and the acceptance tests that prove it.
+  Tests carry the same IDs in a comment. A fix with no finding ID either
+  adds one to the analysis or explains why it is outside it.
 - **Acceptance criteria are tests.** Each item's "done" is a set of named
   tests that pass, not a description. The test IDs (AU-1, IN-2, VE-3 and so
   on) are defined in section 5 of the analysis.
@@ -70,7 +76,7 @@ truthful.
 
 | # | Item | Closes | Evidence | Acceptance |
 |---|---|---|---|---|
-| 1.1 | A missing user `sandbox` value is compared as `auto`, not `off`. Ships first, as a patch. | A1, M12 | Reproduced | AU-1 for `sandbox`; `untrusted_project_keys_only_tighten` extended to a base that names nothing |
+| 1.1 | A missing user `sandbox` value is compared as `auto`, not `off`. Ships first, as a patch. Done in #171, which also fixed `doctor` showing the startup check before reading settings. | A1, M12 | Reproduced | AU-1 for `sandbox`; `untrusted_project_keys_only_tighten` extended to a base that names nothing |
 | 1.2 | Every loosening project key is checked against the effective default, not a missing value. | A1, AU-1 class | Code inspection | AU-1 for every loosening key |
 | 1.3 | A bad `sandbox` value falls back to the strictest mode; an unparseable settings file refuses to start or applies the strictest policy, and its deny rules are never dropped. | M13, I4 | Code inspection | IN-2 |
 | 1.4 | Project policy files (`.buildwithnexus/settings.json`, rules, agents, skills, commands, tools) are a protected class for file tools. A change needs a human answer through the trust prompt. | I1 | Code inspection | AU-2; IN-1 for the file-tool surface |
