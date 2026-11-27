@@ -1,0 +1,3 @@
+# cell|url|sha256
+jammy|https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img|77d19e53656f87c95f1f6c6be59c789083b3f77fa08f9d88011ee04085c61f87
+bookworm|https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2|b94ebc662796cbd4fd1f5053ce63b59ebc56e034f8f550689713c0cae493310e

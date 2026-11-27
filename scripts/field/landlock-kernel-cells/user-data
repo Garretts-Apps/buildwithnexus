@@ -1,0 +1,3 @@
+#cloud-config
+runcmd:
+  - mkdir -p /mnt/kit && mount -o ro /dev/disk/by-label/BWNKIT /mnt/kit && sh /mnt/kit/probe.sh
