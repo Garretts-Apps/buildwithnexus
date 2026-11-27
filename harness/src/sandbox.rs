@@ -186,7 +186,7 @@ pub fn hidden_paths(roots: &[&Path]) -> Vec<PathBuf> {
     )
 }
 
-fn hidden_paths_in(
+pub(crate) fn hidden_paths_in(
     home: &Path,
     bwn_home: &Path,
     agent_socket: Option<PathBuf>,

@@ -7,6 +7,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Two Landlock gaps are now disclosed in the guarantee table.** Under
+  Landlock (not bubblewrap or Seatbelt): a file's metadata outside the
+  workspace — `chmod`, `chown`, `utime`, xattrs — is not confined, and
+  `stat` of a guessed name in a hidden credential store confirms the name
+  exists (listing the folder is still refused, so names can't be
+  enumerated, and the contents stay unreadable). The posture check and
+  SECURITY.md say so; roadmap 2.2 closes both. The guarantee table in
+  SECURITY.md is now rendered from code (`harness/src/capabilities.rs`) and
+  a test holds the file to it, so a cell or a cited test can't drift.
 - **x32 syscalls are refused inside the sandbox.** On x86-64, the seccomp
   filter matched syscall numbers only, and an x32 call carries the same
   architecture with a different number, so on a kernel with x32 enabled a

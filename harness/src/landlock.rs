@@ -684,6 +684,194 @@ fn audit_arch() -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn write_roots_include_the_workspace_and_temp_and_not_the_home_dir() {
+        let cwd = Path::new("/work/app");
+        let extra = vec![PathBuf::from("/other")];
+        let roots = write_roots(cwd, &extra, Some(Path::new("/var/tmp/build")));
+        assert!(roots.iter().any(|p| p == Path::new("/work/app")));
+        assert!(roots.iter().any(|p| p == Path::new("/other")));
+        assert!(roots.iter().any(|p| p == Path::new("/tmp")));
+        assert!(roots.iter().any(|p| p == Path::new("/var/tmp/build")));
+        assert!(roots.iter().any(|p| p == Path::new("/dev")));
+        assert!(!roots.iter().any(|p| p == Path::new("/home")));
+    }
+
+    // Each command used to leave its ruleset fd open in bwn. Other tests
+    // open files on other threads meanwhile, so the check allows some
+    // noise, far below one fd per command.
+    #[test]
+    fn a_confined_command_does_not_leak_its_ruleset_fd() {
+        if available().is_err() {
+            return;
+        }
+        let open_fds = || std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+        let dir = std::env::temp_dir();
+        let runs = 64;
+        let before = open_fds();
+        for _ in 0..runs {
+            let mut cmd = command("true", &dir, &[], Net::Off).expect("ruleset");
+            let out = cmd.stdout(Stdio::null()).output().expect("spawn");
+            assert!(out.status.success(), "{:?}", out.status);
+        }
+        let after = open_fds();
+        assert!(
+            after < before + runs / 2,
+            "{} fds open after {runs} confined commands, {before} before",
+            after
+        );
+    }
+
+    #[test]
+    fn a_confined_command_can_write_inside_and_not_outside() {
+        if available().is_err() {
+            return;
+        }
+        // Under the crate's target dir, not /tmp (a writable root) and not
+        // a path that only exists on one machine. A sibling of the workspace
+        // must stay unwritable.
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "bwn-landlock-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let dir = base.join("ws");
+        let outside = base.join("out.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "echo inside > in.txt; echo outside > {} ; echo done",
+            outside.display()
+        );
+        let mut cmd = command(&script, &dir, &[], Net::Open).expect("ruleset");
+        let out = cmd.output().expect("spawn");
+        let inside = std::fs::read_to_string(dir.join("in.txt")).unwrap_or_default();
+        let leaked = std::fs::read_to_string(&outside).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            out.status.success(),
+            "status {:?} stderr {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(inside.contains("inside"), "{inside}");
+        assert!(
+            !leaked.contains("outside"),
+            "landlock allowed a write outside the workspace: {leaked}"
+        );
+    }
+
+    // Characterization (roadmap 2.2): Landlock has no right for a file's
+    // metadata, so `chmod`, `chown`, `utime` and xattrs on a file outside
+    // the workspace are not confined. The capability table marks the write
+    // guarantee Partial for this reason; a confined command can't read a
+    // credential, but it can change one's mode. If this ever starts to be
+    // confined, this test fails and the table should be upgraded.
+    #[test]
+    fn landlock_does_not_confine_file_metadata_outside() {
+        use std::os::unix::fs::PermissionsExt;
+        if available().is_err() {
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bwn-landlock-meta-{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("keep.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(&outside, "k").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut cmd = command(
+            &format!("chmod 600 {}", outside.display()),
+            &ws,
+            &[],
+            Net::Open,
+        )
+        .expect("ruleset");
+        let _ = cmd.output().expect("spawn");
+        let mode = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            mode, 0o600,
+            "landlock now confines chmod outside the workspace: upgrade the capability table"
+        );
+    }
+
+    // Characterization (roadmap 2.2): Landlock blocks listing a hidden
+    // store's folder (so names can't be enumerated: see M5), but it does not
+    // block `stat` of a path, so a guessed standard name (`~/.ssh/id_ed25519`)
+    // can still be confirmed to exist. The table marks the credential
+    // guarantee Partial for this. Contents stay unreadable either way.
+    #[test]
+    fn landlock_credential_names_leak_via_stat() {
+        use std::os::unix::process::CommandExt;
+        if available().is_err() {
+            return;
+        }
+        let hbase = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
+            .unwrap_or_else(|| PathBuf::from("/var/tmp"));
+        let home = hbase.join(format!("bwn-stat-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::write(home.join(".ssh/id_test"), "KEY").unwrap();
+        let home = home.canonicalize().unwrap();
+        let ws = home.join("proj");
+        let hidden = crate::sandbox::hidden_paths_in(
+            &home,
+            &home.join(".buildwithnexus"),
+            None,
+            &[],
+            &[&ws],
+        );
+        let fd = ruleset_with(&ws, &[], None, &hidden, Net::Off).unwrap();
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            &format!(
+                "stat {} >/dev/null 2>&1 && echo FOUND || echo HIDDEN",
+                home.join(".ssh/id_test").display()
+            ),
+        ])
+        .current_dir(&ws);
+        unsafe {
+            c.pre_exec(move || engage(fd, Net::Off, false));
+        }
+        let out = c.output().unwrap();
+        unsafe { libc::close(fd) };
+        // The contents must still be unreadable even though stat succeeds.
+        let mut r = Command::new("sh");
+        r.args([
+            "-c",
+            &format!("cat {} 2>/dev/null", home.join(".ssh/id_test").display()),
+        ])
+        .current_dir(&ws);
+        let fd2 = ruleset_with(&ws, &[], None, &hidden, Net::Off).unwrap();
+        unsafe {
+            r.pre_exec(move || engage(fd2, Net::Off, false));
+        }
+        let read = r.output().unwrap();
+        unsafe { libc::close(fd2) };
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "FOUND",
+            "landlock now hides a guessed store name from stat: upgrade the capability table"
+        );
+        assert!(
+            !String::from_utf8_lossy(&read.stdout).contains("KEY"),
+            "landlock leaked the credential contents, not just its name"
+        );
+    }
+
     // Roadmap 2.2 (analysis M2): the seccomp half, forced on so it runs on
     // any kernel. truncate(2) is refused inside the workspace too (the
     // disclosed cost); opening with O_TRUNC and ftruncate still work there.
