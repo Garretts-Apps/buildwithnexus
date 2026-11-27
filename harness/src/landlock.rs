@@ -666,4 +666,38 @@ mod tests {
             "landlock allowed a write outside the workspace: {leaked}"
         );
     }
+
+    // Roadmap 1.7 (analysis M2): truncate(2) on a file outside the
+    // workspace is a write. Landlock only handles it from ABI 3 (kernel
+    // 6.2); before that, the guarantee has to come from elsewhere or be
+    // disclosed. Run on 5.15 and 6.1 in the field cells.
+    #[test]
+    fn invariant_m2_a_confined_command_cannot_truncate_outside() {
+        if available().is_err() {
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bwn-landlock-trunc-{}", std::process::id()));
+        let dir = base.join("ws");
+        let outside = base.join("keep.txt");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&outside, "keep").unwrap();
+        let script = format!("truncate -s 0 {}; echo rc=$?", outside.display());
+        let Ok(mut cmd) = command(&script, &dir, &[], Net::Open) else {
+            let _ = std::fs::remove_dir_all(&base);
+            panic!("no ruleset on ABI {:?}", abi());
+        };
+        let out = cmd.output().expect("spawn");
+        let after = std::fs::read_to_string(&outside).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            after,
+            "keep",
+            "ABI {:?}: truncated outside the workspace ({})",
+            abi(),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 }
