@@ -114,6 +114,8 @@ Authorized humans keep a trusted control path to change policy and approve excep
 
 The invariants become automated acceptance tests for the harness. Every new feature (background agents, plugins, memory, browser automation, model integrations) must pass them before release.
 
+Enforcement fails closed. When the confinement a guarantee depends on is unavailable (no working sandbox backend, a missing limiter, a backend that lacks a documented right), operations that depend on it are refused unless an authorized human explicitly approves an exception. The exception is recorded, scoped to the session and shown in the posture check. A missing control is never silently treated as permission. (Decided 27 November 2026; see decision D1 in `docs/roadmap.md`.)
+
 Reducing security friction is not a goal in itself. For example, a remembered posture acceptance is tied to a fingerprint of the effective security policy and is asked again when permissions or exposure change materially.
 
 ## Roadmap categories
