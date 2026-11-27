@@ -452,4 +452,33 @@ mod tests {
         );
         assert!(!said.contains("KEY-MATERIAL"), "the key was read: {said}");
     }
+
+    // Under the checker, a command in the namespace reaches only the
+    // checker's port over TCP: no other port, no UDP, and no Unix socket
+    // (so not the SSH agent either).
+    #[test]
+    fn invariant_userns_limits_the_network_to_the_proxy() {
+        let Some(c) = Cell::new("net") else { return };
+        if !crate::landlock::limits_connections() {
+            eprintln!("skip: Landlock ABI 4 is needed to limit connections");
+            return;
+        }
+        let proxy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let (pp, op) = (
+            proxy.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        let out = crate::landlock::command_with_hidden_for_test(
+            &format!("{} {pp} {op}", crate::sandbox::tests::NET_PROBE),
+            &c.ws,
+            &[c.home.join(".ssh")],
+            crate::landlock::Net::Proxy(pp),
+        )
+        .expect("command")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn");
+        crate::sandbox::tests::assert_proxy_only(&out);
+    }
 }
