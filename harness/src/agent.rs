@@ -446,6 +446,8 @@ thread_local! {
     // Set while asking about a change that must be approved by itself: the
     // session and always answers count as a single yes and save nothing.
     static ONE_CHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // The question is the session's unconfined-commands exception (D1).
+    static SESSION_EXCEPTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // confirm_call for a change no saved approval may cover (a project policy
@@ -460,6 +462,46 @@ fn confirm_one_change(
     let r = confirm_call(name, input, label, &format!("policy {name}"), cwd);
     ONE_CHANGE.with(|o| o.set(false));
     r
+}
+
+// D1 (roadmap 1.6): sandbox auto and no working backend. Commands are
+// refused until a person allows them to run unconfined for this session.
+// Asked of the person only: no hook, saved approval or allow rule answers
+// it, and `s` or `a` save nothing. The answer is kept for this process only.
+fn ask_unconfined_exception(perm: Permission, cwd: &Path) -> Option<String> {
+    let why = crate::sandbox::backend_error().unwrap_or("no backend");
+    let label = format!(
+        "run commands unconfined for the rest of this session (no sandbox backend works here: {why})"
+    );
+    ONE_CHANGE.with(|o| o.set(true));
+    SESSION_EXCEPTION.with(|o| o.set(true));
+    let answer = confirm_tool(&label, "unconfined commands", cwd);
+    SESSION_EXCEPTION.with(|o| o.set(false));
+    ONE_CHANGE.with(|o| o.set(false));
+    match answer {
+        None => {
+            crate::sandbox::allow_unconfined_for_session();
+            crate::trace::record_visible(
+                "sandbox",
+                "unconfined commands allowed for this session",
+                serde_json::json!({"reason": why}),
+            );
+            crate::posture::note_unconfined_allowed(perm, cwd);
+            None
+        }
+        Some(r) => {
+            // The person can be told how to opt out; the model is not.
+            static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TOLD.swap(true, Ordering::Relaxed) {
+                report::notice(
+                    "  commands are refused: no sandbox backend works here. To run them unconfined, answer yes when asked, or start with --sandbox off.",
+                );
+            }
+            Some(format!(
+                "refused: no sandbox backend works here, and commands run unconfined only when the user allows it for this session ({r})"
+            ))
+        }
+    }
 }
 
 fn confirm_call_auto_allows(
@@ -712,7 +754,11 @@ fn confirm_with(
     } else {
         format!(" `{shown_key}`")
     };
-    if one_change {
+    if SESSION_EXCEPTION.with(|o| o.get()) {
+        tui::line(&tui::dim(
+            "  Y yes   N no   D deny   (for this session only; not saved)",
+        ));
+    } else if one_change {
         tui::line(&tui::dim(
             "  Y yes   N no   D deny   (each policy change is approved by itself)",
         ));
@@ -974,6 +1020,18 @@ pub(crate) fn gate(
         let delegation = matches!(name, "task" | "spawn_subagent");
         if !readonly_shell && !delegation {
             return Some(READONLY_SKIP.into());
+        }
+    }
+    // D1: no backend under sandbox auto. Before any rule or approval can
+    // allow a command, a person decides whether commands may run unconfined
+    // this session (sandbox::wrap refuses them otherwise, on every path).
+    if matches!(
+        name,
+        "run_command" | "bash" | "check_work" | "start_server" | "python_tool"
+    ) && crate::sandbox::needs_exception()
+    {
+        if let Some(r) = ask_unconfined_exception(perm, cwd) {
+            return Some(r);
         }
     }
     // A write outside the working folders is refused by the tool itself
