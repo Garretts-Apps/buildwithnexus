@@ -322,6 +322,14 @@ fn has_hooks(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How many hooks a project settings file's text defines (tests).
+#[cfg(test)]
+pub(crate) fn project_hook_count(text: &str) -> usize {
+    let mut list = Vec::new();
+    parse_into(text, Source::Project, &mut list);
+    list.len()
+}
+
 #[cfg(test)]
 fn parse_into(text: &str, source: Source, out: &mut Vec<Hook>) {
     parse_checked(text, source, out, &mut Vec::new());
