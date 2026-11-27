@@ -74,6 +74,7 @@ while IFS='|' read -r cell url sha; do
   sed -n '/PROBE START/,/PROBE END/p' "$serial" || true
   if ! grep -q "PROBE END" "$serial"; then echo "$cell: did not reach PROBE END" >&2; rc=1; fi
   if grep -q "panicked" "$serial"; then echo "$cell: a test panicked" >&2; rc=1; fi
+  if grep -q "EMPTY FILTER" "$serial"; then echo "$cell: a test filter matched nothing" >&2; rc=1; fi
 done < "$here/images.txt"
 
 exit $rc

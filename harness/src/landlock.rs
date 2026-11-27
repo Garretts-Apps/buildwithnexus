@@ -587,14 +587,20 @@ fn proxy_filter() -> Vec<SockFilter> {
     let ld = |off| stmt(BPF_LD | BPF_W | BPF_ABS, off);
     let ret = |k| stmt(BPF_RET | BPF_K, k);
     let jeq = |k, jt, jf| jump(BPF_JMP | BPF_JEQ | BPF_K, k, jt, jf);
+    // socket(): IPv4 or IPv6, SOCK_STREAM, and protocol 0 or IPPROTO_TCP.
+    // The protocol check matters: MPTCP is SOCK_STREAM as well, and
+    // Landlock's TCP connect rule does not cover it (SEC-1).
     let mut p = vec![
-        jeq(libc::SYS_socket as u32, 0, 8),
+        jeq(libc::SYS_socket as u32, 0, 11),
         ld(ARG0),
         jeq(libc::AF_INET as u32, 1, 0),
-        jeq(libc::AF_INET6 as u32, 0, 3),
+        jeq(libc::AF_INET6 as u32, 0, 6),
         ld(ARG1),
         stmt(BPF_ALU | BPF_AND | BPF_K, 0xf),
-        jeq(libc::SOCK_STREAM as u32, 1, 0),
+        jeq(libc::SOCK_STREAM as u32, 0, 3),
+        ld(ARG2),
+        jeq(0, 2, 0),
+        jeq(libc::IPPROTO_TCP as u32, 1, 0),
         ret(deny),
         ret(SECCOMP_RET_ALLOW),
     ];
@@ -1053,6 +1059,58 @@ mod tests {
             "ABI {:?}: truncated outside the workspace ({})",
             abi(),
             String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // Roadmap 2.2 (analysis M8c): an x32 syscall carries the x86-64 audit
+    // architecture and the x32 bit (1 << 30) in its number, so a deny list
+    // of x86-64 numbers never matches it. The filter refuses every x32
+    // number. A kernel without x32 answers ENOSYS when nothing refuses it,
+    // so this fails on the old filter on any x86-64 kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn invariant_m8c_x32_syscalls_are_refused() {
+        if available().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        // getpid (39) and socket (41) with the x32 bit.
+        let script =
+            "perl -e 'for my $n (39, 41) { syscall(0x40000000 + $n, 2, 1, 0); print $!+0, \" \" }'";
+        let mut cmd = command(script, &dir, &[], Net::Off).expect("ruleset");
+        let out = cmd.output().expect("spawn");
+        let errnos = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            errnos,
+            format!("{} {}", libc::EPERM, libc::EPERM),
+            "x32 syscalls were not refused (errno per call): {errnos}; stderr {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // SEC-1: with the network limited to the proxy, a socket must be plain
+    // TCP. MPTCP (IPPROTO_MPTCP) is SOCK_STREAM too, but Landlock's TCP
+    // connect rule does not cover it, so the filter used to let a command
+    // open an MPTCP socket and connect anywhere. The filter now allows only
+    // protocol 0 or IPPROTO_TCP; anything else gets EPERM (the old filter
+    // either opened it or the kernel failed it with another errno).
+    #[test]
+    fn invariant_sec1_mptcp_socket_is_refused_under_the_proxy() {
+        if available().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        let script = "python3 -c 'import socket,errno\ntry:\n socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262); print(\"OPENED\")\nexcept OSError as e:\n print(errno.errorcode.get(e.errno, e.errno))'";
+        let Ok(mut cmd) = command(script, &dir, &[], Net::Proxy(9)) else {
+            return; // below ABI 4 there is no proxy mode, only no network
+        };
+        let out = cmd.output().expect("spawn");
+        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            said,
+            "EPERM",
+            "an MPTCP socket was not refused by the filter: {said}; stderr {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }

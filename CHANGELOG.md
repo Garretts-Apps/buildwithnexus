@@ -7,6 +7,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **An MPTCP socket could bypass the host checker.** With the network
+  limited to the checker (bubblewrap's limiter and Landlock ABI 4), the
+  seccomp filter allowed any IPv4 or IPv6 stream socket. MPTCP is a stream
+  socket that Landlock's TCP rule does not cover, so a command could open
+  one and connect to any host. The filter now allows only plain TCP
+  (protocol 0 or `IPPROTO_TCP`); other protocols get EPERM. The x32 test
+  that a refactor had dropped is restored, and the old-kernel field cells
+  now fail when a named test filter matches no test.
 - **Two Landlock gaps are now disclosed in the guarantee table.** Under
   Landlock (not bubblewrap or Seatbelt): a file's metadata outside the
   workspace — `chmod`, `chown`, `utime`, xattrs — is not confined, and
