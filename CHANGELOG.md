@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **x32 syscalls are refused inside the sandbox.** On x86-64, the seccomp
+  filter matched syscall numbers only, and an x32 call carries the same
+  architecture with a different number, so on a kernel with x32 enabled a
+  command could open a socket while the network was off. The filter now
+  refuses every x32 call. SECURITY.md also lists what the automatic checks
+  do not guarantee yet, including that a check round the gate refused does
+  not fail the run.
 - **Under Landlock, commands can no longer list the files in a hidden
   credential store.** `ls ~/.ssh` used to print the key names, though not
   their contents. To hide the names, commands also can't list the folders

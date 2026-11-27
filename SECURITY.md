@@ -570,3 +570,26 @@ request. Text from web pages, search results
 and MCP servers is labelled as untrusted for the model, and after a session
 reads any, auto mode asks before commands, fetches and MCP calls that can
 change things.
+
+### What the automatic checks do not guarantee
+
+When the model finishes after editing files without running `check_work`,
+bwn runs the project's checks once itself, and a top-level run whose checks
+still fail ends with `check_work_failed` (exit 7), not `success`. That is
+the limit of it today; roadmap 3.1 makes the checks mandatory:
+
+- **A check that was refused does not fail the run.** If the permission gate
+  denies the automatic round, or nobody can approve it (no terminal), the
+  checks are not run and the run can still end as `success`. The run prints
+  "checks were not run" and the tool record says the round was skipped.
+- **Edits are committed before any check.** With `auto_commit` on (the
+  default), each file edit is committed when it is made, so a run that ends
+  with failing checks leaves those commits in place.
+- **The model chooses the check.** `check_work` accepts a command, and its
+  exit status is the verdict; a later passing call replaces an earlier
+  failure.
+- **Shell edits do not trigger the round.** Only file-tool edits count as
+  changes, so a run that changes files only through commands is not checked
+  automatically.
+- **Helpers are not checked.** The automatic round and the verifier run only
+  for the top-level agent.

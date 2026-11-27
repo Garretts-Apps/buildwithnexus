@@ -449,6 +449,7 @@ const BPF_W: u16 = 0x00;
 const BPF_ABS: u16 = 0x20;
 const BPF_JMP: u16 = 0x05;
 const BPF_JEQ: u16 = 0x10;
+const BPF_JGE: u16 = 0x30;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
@@ -485,6 +486,8 @@ const ARG1: u32 = 24;
 const ARG2: u32 = 32;
 const ARG3: u32 = 40;
 const MSG_FASTOPEN: u32 = 0x2000_0000;
+#[cfg(target_arch = "x86_64")]
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 fn seccomp(net: Net) -> io::Result<()> {
     let block_network = net == Net::Off;
@@ -528,6 +531,13 @@ fn seccomp(net: Net) -> io::Result<()> {
         stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)),
         stmt(BPF_LD | BPF_W | BPF_ABS, 0),
     ];
+    // x32 syscalls share the x86-64 architecture value and set bit 30 of
+    // the number, so no number below would match them (analysis M8c).
+    #[cfg(target_arch = "x86_64")]
+    prog.extend([
+        jump(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT, 0, 1),
+        stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (libc::EPERM as u32)),
+    ]);
     if let Net::Proxy(_) = net {
         prog.extend(proxy_filter());
     }
@@ -694,6 +704,32 @@ mod tests {
         assert!(
             !leaked.contains("outside"),
             "landlock allowed a write outside the workspace: {leaked}"
+        );
+    }
+
+    // Roadmap 2.2 (analysis M8c): an x32 syscall carries the x86-64 audit
+    // architecture and the x32 bit (1 << 30) in its number, so a deny list
+    // of x86-64 numbers never matches it. The filter refuses every x32
+    // number. A kernel without x32 answers ENOSYS when nothing refuses it,
+    // so this fails on the old filter on any x86-64 kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn invariant_m8c_x32_syscalls_are_refused() {
+        if available().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir();
+        // getpid (39) and socket (41) with the x32 bit.
+        let script =
+            "perl -e 'for my $n (39, 41) { syscall(0x40000000 + $n, 2, 1, 0); print $!+0, \" \" }'";
+        let mut cmd = command(script, &dir, &[], Net::Off).expect("ruleset");
+        let out = cmd.output().expect("spawn");
+        let errnos = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            errnos,
+            format!("{} {}", libc::EPERM, libc::EPERM),
+            "x32 syscalls were not refused (errno per call): {errnos}; stderr {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 

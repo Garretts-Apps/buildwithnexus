@@ -106,6 +106,15 @@ Seatbelt and no backend. The reproductions for M2, M3, M5 and M8(c) are
 recorded, and whatever they turn up is planned. No fail-open condition from
 the analysis remains undisclosed.
 
+Recorded: M2 and M3 in Ubuntu 22.04 (5.15) and Debian 12 (6.1) VMs (#182:
+every ruleset failed with "Invalid argument" on 6.1; truncation outside is
+not confined below ABI 3, now disclosed). M5 on 6.18 (#183: `ls ~/.ssh`
+listed the key names). M8(c) on 6.18 without x32 enabled: x32 `getpid` and
+`socket` calls passed the seccomp filter and reached the kernel (ENOSYS),
+so on a kernel with x32 enabled they would run; fixed in 2.2. The V3 and V6
+fail-opens (a failed or refused check round) are disclosed in SECURITY.md
+and closed by 3.1.
+
 ### Milestone 2: enforcement foundation
 
 **Goal:** one effective security policy, conformance tested on every
@@ -115,7 +124,7 @@ record.
 | # | Item | Closes | Acceptance |
 |---|---|---|---|
 | 2.1 | SO-2: a capability table in code (backend and ABI against each guarantee); SECURITY.md generated from it or tested against it; a conformance suite running the same probes in field cells on kernels 5.15, 6.1, 6.8 and current, WSL and macOS. | M1, M4–M9 | Probes: write outside, truncate outside, write `.git/hooks`, create `.git`, read and list `~/.ssh`, connect to the agent socket, unlisted host, UDP, inbound connection, x32 |
-| 2.2 | Close the backend gaps the suite finds. In progress: listing hidden folders under Landlock (M5) is closed, at the cost of listing the folders a store sits in. Remaining: Landlock: the agent socket without the checker, `.git` and policy files, `/dev` and `/tmp`. Everywhere: nested `.git` past the bounds, inbound listening, a store that contains the workspace. | M1, M4–M9 | 2.1 probes pass, or the capability table says "not guaranteed" and the startup check shows it |
+| 2.2 | Close the backend gaps the suite finds. In progress: listing hidden folders under Landlock (M5) is closed, at the cost of listing the folders a store sits in; x32 syscalls (M8c) are refused by the seccomp filter on x86-64. Remaining: Landlock: the agent socket without the checker, `.git` and policy files, `/dev` and `/tmp`. Everywhere: nested `.git` past the bounds, inbound listening, a store that contains the workspace. | M1, M4–M9 | 2.1 probes pass, or the capability table says "not guaranteed" and the startup check shows it |
 | 2.3 | SO-5: one policy object per session for commands, file tools, fetch, MCP, hooks and helpers. | A3, H5 | IH-2 property test |
 | 2.4 | Stdio MCP servers and hooks start inside the sandbox by default. Any widening is per entry and shown in the startup check. File-tool reads follow the same hidden-store policy as commands. | H1, H2, H3 | IH-1 for MCP stdio, hooks and file tools |
 | 2.5 | SO-7: a decision log of every gate decision, approval, exception, startup-check acceptance and verification result, with the D3 trust anchor chosen and implemented. Trust, startup-check and rules stores get an integrity check. | C1, C2, C3, I3 | AC-1, including detection of a rewritten chain |
