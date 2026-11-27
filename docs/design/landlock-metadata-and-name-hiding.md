@@ -403,14 +403,222 @@ Setuid programs already do not gain privilege because of `no_new_privs`.
 Whether supplementary groups are still honoured for access after `setgroups`
 is denied (expected yes) needs a test.
 
-The network side does not change. No network namespace is created, so
-`Net::Off` (seccomp refuses sockets) and `Net::Proxy` (Landlock's TCP rule plus
-`proxy_filter`) work as they do under Landlock-only, and all of it happens in
-one process, without the `__confine-net` hop bubblewrap needs.
+The network side changes too; see the next section.
+
+## Network isolation
+
+The owner has set five requirements. This backend, and bubblewrap, must meet
+them. The same helper that builds the mount tree is where the network is cut
+off, so they belong in this design.
+
+### What bwn does today
+
+A command with the network checked (`Net::Proxy`) runs in the host's network
+namespace on every Linux backend. Bubblewrap is started with `--share-net`, and
+`bwn __confine-net` then applies the same two layers the Landlock backend uses:
+
+- a Landlock rule that allows `connect` on TCP sockets to one port, the
+  checker's (`create()` in `landlock.rs`; needs ABI 4, kernel 6.7);
+- a seccomp filter (`proxy_filter`) that allows `socket()` only for `AF_INET`
+  and `AF_INET6` with `SOCK_STREAM`, and refuses TCP Fast Open.
+
+The checker (`egress.rs`) listens on `127.0.0.1` on a port the kernel picks.
+Commands find it through `HTTPS_PROXY` and `HTTP_PROXY`. It resolves the name
+itself, checks every address, and connects to the address it checked.
+
+Below ABI 4 there is no network at all for commands. A command may listen
+(capability table: "a command can listen"). With the network off, seccomp
+refuses every socket call.
+
+This is a filter on a shared network, not a private one. What that means,
+from the sources:
+
+- The Landlock rule names a port, not an address. Source, kernel document:
+  "`LANDLOCK_ACCESS_NET_CONNECT_TCP`: Connect TCP sockets to the given remote
+  port."
+- The rule covers TCP only. Source, kernel document, "Erratum 1: TCP socket
+  identification": the fix "ensures that only TCP sockets are subject to TCP
+  access rights, allowing other protocols to operate without unnecessary
+  restrictions", naming SMC, MPTCP and SCTP.
+- A listening socket on the host's network is reachable by whatever can reach
+  the host.
+
+Two findings about the current limiter came out of testing for this section.
+They are reported to the owner directly and are left out of this public note
+until they are fixed.
+
+### What a private network namespace gives
+
+Source, [network_namespaces(7)](https://man7.org/linux/man-pages/man7/network_namespaces.7.html):
+a network namespace isolates "network devices, IPv4 and IPv6 protocol stacks,
+IP routing tables, firewall rules, [...] port numbers (sockets), and so on. In
+addition, network namespaces isolate the UNIX domain abstract socket
+namespace".
+
+Tested on 6.18.44 as uid 1000, after
+`unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)` with an identity id map,
+the loopback interface brought up before `execve`, and probes run after it:
+
+| Attempt from inside | Result |
+|---|---|
+| TCP connect to a listener on the host's `127.0.0.1` | `ECONNREFUSED` |
+| TCP connect to `1.1.1.1:443` | `ENETUNREACH` |
+| UDP `sendto` `8.8.8.8:53` | `ENETUNREACH` |
+| Raw ICMP socket | `EPERM` |
+| `AF_PACKET` socket | `EPERM` |
+| Netlink `RTM_NEWLINK` (create an interface) | `EPERM` |
+| Connect to an abstract Unix socket a host process listens on | `ECONNREFUSED` |
+| Connect to a **pathname** Unix socket a host process listens on, through the read-only tree | **connects** |
+| Listen on `0.0.0.0` inside; host connects to that port | listen works; host gets `ECONNREFUSED` |
+
+Not tested: IPv6 (this machine has none; the expectation is `::1` only), and
+`setns` into a host process's network namespace (expected `EPERM`).
+
+The one row that connects is the important one. A pathname Unix socket lives
+in the file tree, not the network namespace. That is the way to reach the
+checker from inside. It is also a way out if the tree shows other sockets:
+Docker's, the D-Bus session bus, systemd-resolved's, X11's, the SSH agent's.
+
+### The design
+
+One helper process per sandbox does all of this. For bubblewrap it is
+`__confine-net`, which already exists; for the built-in backend it is the new
+`__confine-ns`.
+
+1. **Private namespace.** `CLONE_NEWNET` is added to the `unshare` call, and
+   bubblewrap is run without `--share-net` (its `--unshare-all` then includes
+   `--unshare-net`; source,
+   [bwrap(1)](https://github.com/containers/bubblewrap/blob/main/bwrap.xml)).
+   The helper brings `lo` up while it still holds capabilities. Whether
+   bubblewrap already brings `lo` up needs a test.
+
+2. **The checker listens on a Unix socket too.** `egress::start()` binds a
+   second listener at a path in a folder only the user can enter, outside any
+   write root. The mount plan binds that one socket file into the sandbox,
+   read-only. Connecting through a read-only mount works (tested); it needs
+   write permission on the socket file, which the user has (source,
+   [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)).
+
+3. **A forwarder inside.** Tools speak to an HTTP proxy at a TCP address, not
+   a Unix socket. So the helper listens on `127.0.0.1:<port>` inside the
+   namespace, forks, and the child becomes the command. The parent stays as
+   the forwarder: for each connection it accepts, it connects to the Unix
+   socket and copies bytes both ways. It exits with the command's status.
+   `HTTPS_PROXY=http://127.0.0.1:<port>` is unchanged, so npm, cargo, pip, git
+   and curl need nothing new.
+
+   The forwarder is not the enforcement point. If a command took it over, it
+   would hold one thing: a connection to the checker, which the command is
+   allowed anyway. The namespace stops direct traffic and the checker, outside
+   the sandbox, decides. The forwarder should still be confined: no file
+   writes, and a Landlock domain the command is not inside, so the command
+   cannot trace it (source, kernel document, "Ptrace restrictions").
+
+   Passing descriptors instead of binding a path would also work, but each
+   proxied connection needs a new connection to the checker, so a path that
+   can be connected to repeatedly is simpler than a channel that hands out
+   descriptors. The end-to-end forwarder has not been built: needs a prototype.
+
+4. **Other sockets in the tree.** The command's seccomp filter keeps refusing
+   `AF_UNIX` when the network is checked, as `proxy_filter` does now, and the
+   filter is tightened to accept only protocol 0 or `IPPROTO_TCP` on stream
+   sockets. The mount plan replaces `/run` and `/tmp` as bubblewrap's does.
+   Landlock ABI 9's `FS_RESOLVE_UNIX` is a third layer where the kernel has it.
+   Refusing `AF_UNIX` also refuses tools that use Unix sockets among
+   themselves; that is the case today and can be relaxed later.
+
+5. **DNS.** There is none inside, by design. A resolver reachable from the
+   sandbox is a way to send data out, one query at a time. Tools that use the
+   proxy send it the host name, and the checker resolves it outside and
+   connects to the address it checked, as it does now. A tool that resolves
+   names itself fails. To make it fail at once instead of timing out, bind an
+   `/etc/resolv.conf` that names `127.0.0.1`, where nothing listens. Needs a
+   test with glibc and musl.
+
+6. **Incoming connections.** Nothing outside can connect in (tested). A dev
+   server a command starts is reachable only inside that namespace. This is a
+   behaviour change; see the owner questions.
+
+7. **Loopback at the checker.** `egress::check` allows loopback on any port so
+   a command can reach "this machine's own servers". With a private namespace
+   a command reaches its own servers directly, and loopback at the checker
+   means the host's services. To meet requirement 1 the checker should refuse
+   loopback unless `network.allow` names it. `NO_PROXY` must cover `localhost`
+   and `127.0.0.1` so in-sandbox traffic does not go to the checker; whether
+   `proxy_env` sets it was not checked.
+
+With this, `can_check_egress` no longer depends on Landlock ABI 4 for these
+two backends, so Ubuntu 22.04 and Debian 12 get a checked network instead of
+none. `Net::Off` is the same namespace with no forwarder. `Net::Open` creates
+no network namespace; the user asked for that.
+
+The Landlock-only backend cannot do any of this: it has no namespace. It keeps
+the port rule and the filter, and it does not meet requirement 1. The
+capability table has to say so, or the network has to be off by default there.
+
+### The five requirements
+
+| Requirement | Bubblewrap and the built-in mount backend, after this | Landlock-only |
+|---|---|---|
+| 1. Private network: no direct route to the internet, the local network or host services | Private namespace, loopback only. Host services only through the checker, and only if `network.allow` names them | Not met. Shared namespace, filtered |
+| 2. All authorized traffic through a trusted service outside | The checker, reached over a bound Unix socket by the forwarder | The checker, over host loopback |
+| 3. Default deny for destinations, DNS and incoming | Checker's rules; no resolver inside; nothing can connect in | Destinations by the checker; DNS refused by the filter; incoming not blocked |
+| 4. One policy for commands, MCP servers, plugins, hooks and fetch | See below | See below |
+| 5. Escape attempts in the release suite | See the list below | Same list; expected failures recorded in the capability table |
+
+Requirement 4 is roadmap 2.3 and 2.4, which are open. Today `sandbox::wrap`
+is called for commands (`tools.rs`); the fetch tools apply their own address
+checks (`net_guard`) and do not call `egress::check`; hooks build their own
+`Command` (`hooks.rs`). This was read from call sites, not audited. The design
+that fits this note:
+
+- One function starts every child process: commands, stdio MCP servers, hooks,
+  plugin helpers. It takes the session's policy object (2.3) and returns the
+  process inside the helper. A long-lived MCP server gets a helper that lives
+  as long as it does.
+- Everything bwn connects to itself (fetch tools, HTTP MCP servers) goes
+  through the same decision function as the checker, `egress::check`, so a host
+  a command may not reach is one fetch may not reach either.
+- A widening is per entry and shown in the startup check (2.4).
+
+### Escape tests for the release suite
+
+Each test runs inside the sandbox, on every backend the machine can run
+(`BWN_TEST_SANDBOX_BACKEND`), with a listener on the host that fails the test
+if anything arrives. A backend that cannot pass one says so in the capability
+table, and the table's own check ties the row to the test.
+
+- Direct TCP connect: a public address, the default gateway, a private-range
+  address, the host's loopback listener.
+- The checker's port number on an address that is not the checker.
+- UDP `sendto` port 53; `getaddrinfo` of a name not in the rules; a lookup
+  through systemd-resolved's and nscd's Unix sockets.
+- Raw sockets: `SOCK_RAW` ICMP, the unprivileged ping socket
+  (`SOCK_DGRAM`, `IPPROTO_ICMP`), `AF_PACKET`.
+- IPv6: `::1` on a host listener's port, a public address, a link-local
+  address.
+- Stream sockets that are not TCP: MPTCP, SCTP, SMC.
+- Unix sockets: an abstract name a host process listens on; pathname sockets
+  under `/run` and `/tmp` (Docker, D-Bus, X11, the SSH agent).
+- Netlink: dump routes, create an interface, move one between namespaces.
+- Incoming: the command listens on `0.0.0.0`; the host tries to connect.
+- Around the filter: TCP Fast Open (`sendto` with `MSG_FASTOPEN`), `io_uring`
+  connect, an x32 socket call, `socketcall` on 32-bit.
+- Around the namespace: a nested user and network namespace; `setns` to
+  `/proc/<host pid>/ns/net`; a descriptor inherited from bwn.
+- Against the checker: `CONNECT` to a host not in the rules, to an address
+  literal, to a name that resolves to a private or metadata address, to a name
+  whose address changes between lookups, to port 22; a request line for an
+  allowed host with a different `Host` header; a request with the proxy
+  variables unset.
+- Against the forwarder: signal it, trace it, open `/proc/<its pid>/mem`.
 
 ## Recommendation
 
 Build option D with the corrections. Do not build a supervisor.
+
+The same helper carries the private network namespace and the forwarder the
+network requirements need, on both bubblewrap and the built-in backend.
 
 The stronger argument is that one mechanism closes most of what roadmap 2.2
 still lists for Landlock, not only these two gaps: file metadata, `stat`
@@ -441,7 +649,8 @@ with the store covered by a mount, Landlock no longer has to refuse listing
 
 - `command()` (line 381) gains the plan. The child does, in this order, and
   exits 126 on any failure:
-  1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)`.
+  1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)`, with `CLONE_NEWNET` unless the
+     network is open. Bring `lo` up.
   2. Write `deny` to `/proc/self/setgroups`, then `uid uid 1` and `gid gid 1`
      to the id maps. Not root.
   3. `mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)`.
@@ -451,15 +660,21 @@ with the store covered by a mount, Landlock no longer has to refuse listing
   6. `mount_setattr("/", AT_RECURSIVE, MOUNT_ATTR_RDONLY)`, clear it on the
      write roots, set it again on the covers and protected entries inside them.
   7. `chdir` to the workspace again.
-  8. `engage()` (line 368), unchanged: `no_new_privs`, the Landlock ruleset
-     (write rights and the network rule; no hidden list needed), then seccomp.
-  9. `execve`.
+  8. With the network checked: listen on `127.0.0.1:<port>`, fork; the parent
+     becomes the forwarder to the checker's Unix socket.
+  9. `engage()` (line 368), unchanged: `no_new_privs`, the Landlock ruleset
+     (write rights; no hidden list needed), then seccomp.
+  10. `execve`.
 - `seccomp()` (line 503) adds the seven new mount syscalls to `deny`, for
-  every backend.
+  every backend, and `proxy_filter()` (line 585) checks the protocol argument
+  of `socket()`.
 - Prefer a helper, `bwn __confine-ns`, dispatched in `lib.rs` beside
   `__confine-net`, over doing steps 1 to 7 in `pre_exec`. The steps open and
   write files and may allocate, which is unsafe in a forked child of a threaded
   process. `engage()` alone is why `pre_exec` is acceptable today.
+
+`harness/src/egress.rs`: `start()` (line 272) also binds the Unix socket;
+`check` refuses loopback unless a rule allows it.
 
 `harness/src/capabilities.rs`: a column or note for the new backend, with
 tests named, as the table's own check requires.
@@ -480,6 +695,15 @@ writes in the workspace work; `/tmp` is writable.
    result? It is if "works with nothing installed" is a product requirement.
    If not, a clearer "install bubblewrap" message and leaving Landlock-only as
    it is would be cheaper.
+
+3. A private network namespace means a dev server started by one command is
+   not reachable from the next command or from the user's browser. Two ways
+   to keep that working: one namespace per session that every command joins,
+   and an explicit, shown setting that publishes a port to the host. Which, or
+   neither?
+4. Landlock-only cannot give a private network. Should the network be off by
+   default on that backend, or stay filtered with the capability table saying
+   requirement 1 is not met?
 
 ## Residual risk if nothing is built
 
@@ -506,6 +730,9 @@ read-only on the workspace, changes directory, optionally applies a Landlock
 ruleset that handles `WRITE_FILE`, `MAKE_REG` and `REMOVE_FILE` and allows the
 workspace, `/dev` and `/tmp`, and then executes the second. The second makes
 each call in the results table and prints the error. Both ran as uid 1000 with
-no capabilities, on Linux 6.18.44 x86-64. Nothing was run on a kernel below
+no capabilities, on Linux 6.18.44 x86-64. A third program made the network probes after
+`unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)`, with a host process
+listening on TCP, a pathname Unix socket and an abstract Unix socket. Nothing
+was run on a kernel below
 6.18, on Ubuntu 24.04 with AppArmor, on WSL, or in a Docker container; the
 claims about those are marked as needing a test.
