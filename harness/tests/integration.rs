@@ -6798,7 +6798,7 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     assert!(files.contains("added.txt"), "{files}");
 
     // A shell command that writes .git is still confined. Where the backend
-    // can keep .git read-only, the model is told why and how to opt out.
+    // can keep .git read-only, the model is told why, not how to opt out.
     let port = serve(vec![
         tool_call(
             "c1",
@@ -6825,10 +6825,14 @@ fn auto_commit_succeeds_while_the_sandbox_is_on() {
     if result.contains("[exit 0]") {
         return;
     }
+    // Roadmap 1.9 (analysis A4): the note explains the refusal and leaves the
+    // sandbox to the user; it never tells the model how to turn it off.
     assert!(
-        result.contains("--sandbox off") && result.contains(".git"),
-        "sandboxed .git write did not explain the opt-out: {result}"
+        result.contains("cannot write .git") && result.contains("user"),
+        "sandboxed .git write was not explained: {result}"
     );
+    assert!(!result.contains("--sandbox off"), "{result}");
+    assert!(!result.contains("/sandbox off"), "{result}");
 }
 
 // http.cookieFile with http.saveCookies has git write the file the

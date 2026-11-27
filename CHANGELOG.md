@@ -14,6 +14,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **A blocked `.git` write no longer tells the model how to turn the sandbox
+  off.** The note says what was refused and that changing the sandbox is the
+  user's decision; the `require` refusal says the same.
 - **A broken setting never loosens the policy.** A `sandbox` value bwn
   can't parse runs as `require` (it used to leave the sandbox off), and a
   `permission` value as `readonly` (it used to be `ask`), each with a
