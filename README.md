@@ -754,10 +754,13 @@ An OS-level layer *under* the permission gate for shell commands
 - `"off"` — unsandboxed, the default before 0.21.
 - `"require"` — refuse commands when no backend works.
 
-Linux uses `bwrap` when it works, otherwise built-in Landlock and seccomp
-(also in WSL, when the kernel allows it). macOS uses `sandbox-exec`.
-Windows has none. Sandboxed shell commands cannot write `.git`; the tool
-result names `--sandbox off`. Auto-commit of file edits runs outside it.
+Linux uses `bwrap` when it works. Without it, bwn uses its own namespace
+backend (a user and mount namespace with Landlock and seccomp inside) where
+the kernel allows unprivileged user namespaces, and Landlock and seccomp
+alone otherwise; WSL always skips `bwrap`. macOS uses `sandbox-exec`.
+Windows has none. Sandboxed shell commands cannot write `.git` (except under
+Landlock alone, where auto mode asks before every command). Auto-commit of
+file edits runs outside the sandbox.
 
 **Confined:** writes outside the working directory and the temp dirs. With
 bubblewrap, `/tmp` is a private tmpfs (`TMPDIR=/tmp`) discarded on exit.

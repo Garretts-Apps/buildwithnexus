@@ -76,6 +76,8 @@ pub mod trace;
 pub mod tui;
 pub mod update;
 pub mod usage;
+#[cfg(target_os = "linux")]
+mod userns;
 pub mod verifier;
 pub mod workdirs;
 pub mod workflow;

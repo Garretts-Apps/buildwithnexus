@@ -7,6 +7,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Without bubblewrap, commands run in bwn's own namespace.** Where
+  bubblewrap is missing (and always in WSL) but the kernel allows
+  unprivileged user namespaces, bwn now runs each command in a new user and
+  mount namespace before applying Landlock and seccomp: the tree is
+  read-only, the workspace, added folders, `/tmp` and `/dev` are writable,
+  `.git` and `.buildwithnexus` stay read-only, and each credential store
+  folder is covered by an empty folder. This closes the two gaps Landlock
+  alone leaves: a command can no longer change a file's mode, owner, times
+  or xattrs outside the workspace, and can no longer confirm that a name
+  exists in a hidden store. The command is mapped to its own user and has
+  no capabilities, and the mount system calls are refused, so it cannot
+  undo the mounts. Auto mode no longer asks before every command on this
+  backend. Where user namespaces are blocked (Ubuntu 24.04's AppArmor
+  restriction, for example), bwn uses Landlock alone as before.
 - **An MPTCP socket could bypass the host checker.** With the network
   limited to the checker (bubblewrap's limiter and Landlock ABI 4), the
   seccomp filter allowed any IPv4 or IPv6 stream socket. MPTCP is a stream

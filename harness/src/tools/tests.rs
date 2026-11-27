@@ -2968,7 +2968,7 @@ fn server_and_python_tool_follow_the_sandbox_policy() {
             assert!(server_sandbox(Mode::Require, "npm run dev", &d, &d).is_err());
             assert!(python_tool_command(Mode::Require, &d.join("t.py"), &d).is_err());
         }
-        Some(crate::sandbox::Backend::Landlock) => {
+        Some(crate::sandbox::Backend::Landlock | crate::sandbox::Backend::Userns) => {
             let c = server_sandbox(Mode::Require, "npm run dev", &d, &d)
                 .unwrap()
                 .expect("wrapped");
