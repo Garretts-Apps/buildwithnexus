@@ -1,0 +1,565 @@
+{
+  "when": "2026-11-27T14-17-26Z",
+  "machine": "Linux 6.18.44-fc-v880 x86_64",
+  "backends": [
+    "bwrap",
+    "landlock",
+    "none"
+  ],
+  "score": {
+    "AU2": {
+      "bwrap": {
+        "passed": 2,
+        "total": 2
+      },
+      "landlock": {
+        "passed": 2,
+        "total": 2
+      },
+      "none": {
+        "passed": 2,
+        "total": 2
+      }
+    },
+    "AU5": {
+      "bwrap": {
+        "passed": 1,
+        "total": 1
+      },
+      "landlock": {
+        "passed": 1,
+        "total": 1
+      },
+      "none": {
+        "passed": 1,
+        "total": 1
+      }
+    },
+    "IN1": {
+      "bwrap": {
+        "passed": 2,
+        "total": 2
+      },
+      "landlock": {
+        "passed": 2,
+        "total": 2
+      },
+      "none": {
+        "passed": 2,
+        "total": 2
+      }
+    },
+    "IN2": {
+      "bwrap": {
+        "passed": 9,
+        "total": 9
+      },
+      "landlock": {
+        "passed": 9,
+        "total": 9
+      },
+      "none": {
+        "passed": 9,
+        "total": 9
+      }
+    },
+    "AU1": {
+      "bwrap": {
+        "passed": 7,
+        "total": 7
+      },
+      "landlock": {
+        "passed": 7,
+        "total": 7
+      },
+      "none": {
+        "passed": 7,
+        "total": 7
+      }
+    },
+    "D1": {
+      "bwrap": {
+        "passed": 3,
+        "total": 3
+      },
+      "landlock": {
+        "passed": 3,
+        "total": 3
+      },
+      "none": {
+        "passed": 3,
+        "total": 3
+      }
+    },
+    "IN3": {
+      "bwrap": {
+        "passed": 2,
+        "total": 2
+      },
+      "landlock": {
+        "passed": 2,
+        "total": 2
+      },
+      "none": {
+        "passed": 2,
+        "total": 2
+      }
+    },
+    "G3": {
+      "bwrap": {
+        "passed": 1,
+        "total": 1
+      },
+      "landlock": {
+        "passed": 1,
+        "total": 1
+      },
+      "none": {
+        "passed": 1,
+        "total": 1
+      }
+    },
+    "M8B": {
+      "bwrap": {
+        "passed": 1,
+        "total": 1
+      },
+      "landlock": {
+        "passed": 1,
+        "total": 1
+      },
+      "none": {
+        "passed": 1,
+        "total": 1
+      }
+    }
+  },
+  "tests": {
+    "bwrap": [
+      {
+        "case": "AU2",
+        "test": "a_policy_change_is_never_pre_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU5",
+        "test": "the_landlock_policy_gap_is_disclosed_and_auto_asks",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "file_tools_ask_before_changing_project_policy_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_broken_mid_session_refuses_every_call",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "a_trusted_project_applies_what_the_user_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_never_expands_authority_beyond_the_user_baseline",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "every_settings_field_is_classified",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "hooks_in_an_untrusted_project_wait_for_trust",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "an_unreadable_settings_file_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_keys_only_tighten",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_sandbox_never_weakens_any_user_setting",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "settings_diag_reports_broken_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_broken_settings_file_refuses_every_connection",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "require_with_no_backend_says_commands_are_refused",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "a_session_is_asked_again_when_its_reach_changes",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "the_fingerprint_follows_hidden_stores_and_allowed_hosts",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "wrap_refuses_commands_until_the_person_allows_them",
+        "result": "ok"
+      },
+      {
+        "case": "G3",
+        "test": "no_home_folder_means_nothing_is_claimed_hidden",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_falls_back_to_require",
+        "result": "ok"
+      },
+      {
+        "case": "M8B",
+        "test": "no_network_limiter_means_no_network",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_permission_setting_runs_as_readonly",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "project_policy_paths_are_recognized_by_any_spelling",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_cannot_turn_the_sandbox_off",
+        "result": "ok"
+      },
+      {
+        "case": "AU2",
+        "test": "the_model_cannot_write_the_project_settings_file_unasked",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "no_backend_runs_no_command_without_an_exception",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_runs_as_require",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_the_run",
+        "result": "ok"
+      }
+    ],
+    "landlock": [
+      {
+        "case": "AU2",
+        "test": "a_policy_change_is_never_pre_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU5",
+        "test": "the_landlock_policy_gap_is_disclosed_and_auto_asks",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "file_tools_ask_before_changing_project_policy_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_broken_mid_session_refuses_every_call",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "a_trusted_project_applies_what_the_user_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_never_expands_authority_beyond_the_user_baseline",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "every_settings_field_is_classified",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "hooks_in_an_untrusted_project_wait_for_trust",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "an_unreadable_settings_file_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_keys_only_tighten",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_sandbox_never_weakens_any_user_setting",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "settings_diag_reports_broken_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_broken_settings_file_refuses_every_connection",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "require_with_no_backend_says_commands_are_refused",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "a_session_is_asked_again_when_its_reach_changes",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "the_fingerprint_follows_hidden_stores_and_allowed_hosts",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "wrap_refuses_commands_until_the_person_allows_them",
+        "result": "ok"
+      },
+      {
+        "case": "G3",
+        "test": "no_home_folder_means_nothing_is_claimed_hidden",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_falls_back_to_require",
+        "result": "ok"
+      },
+      {
+        "case": "M8B",
+        "test": "no_network_limiter_means_no_network",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_permission_setting_runs_as_readonly",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "project_policy_paths_are_recognized_by_any_spelling",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_cannot_turn_the_sandbox_off",
+        "result": "ok"
+      },
+      {
+        "case": "AU2",
+        "test": "the_model_cannot_write_the_project_settings_file_unasked",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "no_backend_runs_no_command_without_an_exception",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_runs_as_require",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_the_run",
+        "result": "ok"
+      }
+    ],
+    "none": [
+      {
+        "case": "AU2",
+        "test": "a_policy_change_is_never_pre_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU5",
+        "test": "the_landlock_policy_gap_is_disclosed_and_auto_asks",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "file_tools_ask_before_changing_project_policy_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_broken_mid_session_refuses_every_call",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "a_trusted_project_applies_what_the_user_approved",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_never_expands_authority_beyond_the_user_baseline",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "every_settings_field_is_classified",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "hooks_in_an_untrusted_project_wait_for_trust",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "an_unreadable_settings_file_stops_startup",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_keys_only_tighten",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "untrusted_project_sandbox_never_weakens_any_user_setting",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "settings_diag_reports_broken_files",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_broken_settings_file_refuses_every_connection",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "require_with_no_backend_says_commands_are_refused",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "a_session_is_asked_again_when_its_reach_changes",
+        "result": "ok"
+      },
+      {
+        "case": "IN3",
+        "test": "the_fingerprint_follows_hidden_stores_and_allowed_hosts",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "wrap_refuses_commands_until_the_person_allows_them",
+        "result": "ok"
+      },
+      {
+        "case": "G3",
+        "test": "no_home_folder_means_nothing_is_claimed_hidden",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_falls_back_to_require",
+        "result": "ok"
+      },
+      {
+        "case": "M8B",
+        "test": "no_network_limiter_means_no_network",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_permission_setting_runs_as_readonly",
+        "result": "ok"
+      },
+      {
+        "case": "IN1",
+        "test": "project_policy_paths_are_recognized_by_any_spelling",
+        "result": "ok"
+      },
+      {
+        "case": "AU1",
+        "test": "an_untrusted_project_cannot_turn_the_sandbox_off",
+        "result": "ok"
+      },
+      {
+        "case": "AU2",
+        "test": "the_model_cannot_write_the_project_settings_file_unasked",
+        "result": "ok"
+      },
+      {
+        "case": "D1",
+        "test": "no_backend_runs_no_command_without_an_exception",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_bad_sandbox_setting_runs_as_require",
+        "result": "ok"
+      },
+      {
+        "case": "IN2",
+        "test": "a_settings_file_that_does_not_load_stops_the_run",
+        "result": "ok"
+      }
+    ]
+  }
+}

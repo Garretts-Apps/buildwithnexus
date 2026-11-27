@@ -2110,6 +2110,9 @@ fn run_outcome_case(c: &OutcomeCase, env: &[(&str, &str)]) -> Run {
         "base_url": format!("http://127.0.0.1:{port}/v1"),
         // Large enough that 60 steps never trigger a compaction request.
         "context_tokens": 1_000_000,
+        // These cases are about exit codes, not confinement: on a machine
+        // with no sandbox backend, auto would refuse their commands (D1).
+        "sandbox": "off",
     });
     for (k, v) in c.config.as_object().unwrap() {
         cfg[k] = v.clone();
@@ -3262,6 +3265,51 @@ fn settings_without_a_model_run_on_the_preset_default_and_take_the_model_flag() 
     assert!(r.success, "stderr: {}", r.stderr);
     let body: Value = serde_json::from_str(&posts.lock().unwrap()[0]).unwrap();
     assert_eq!(body["model"], "mock-coder");
+}
+
+// D1 (roadmap 1.6; fail-open list, Authority invariant): with sandbox auto
+// and no working backend, no path runs a command unconfined without a
+// person's exception for the session: not an allow rule in ask mode, not a
+// saved approval in auto mode, not --accept-posture (set for every run
+// here). Headless, nobody can grant it, so nothing runs.
+#[cfg(unix)]
+#[test]
+fn invariant_d1_no_backend_runs_no_command_without_an_exception() {
+    for (perm, allow) in [("ask", true), ("auto", false), ("accept-edits", true)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call("c1", "run_command", json!({"command": "touch ran"})),
+            finish("done"),
+        ]);
+        let mut cfg = json!({
+            "provider": "custom", "model": "test-model", "permission": perm,
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "auto", "auto_commit": false,
+        });
+        if allow {
+            cfg["permissions"] = json!({"allow": ["run_command(*)"]});
+        } else {
+            cfg["allowed_commands"] = json!(["touch"]);
+        }
+        std::fs::write(home.join("config.json"), cfg.to_string()).unwrap();
+        let r = run_env(
+            &home,
+            &cwd,
+            &["--json", "run", "make a file"],
+            &[("BWN_TEST_SANDBOX_BACKEND", "none")],
+        );
+        assert!(
+            !cwd.join("ran").exists(),
+            "{perm}: ran unconfined: {}",
+            r.stderr
+        );
+        let said = format!("{}{}", r.text_of("tool_denied"), r.text_of("tool_result"));
+        assert!(
+            !said.contains("--sandbox off"),
+            "{perm}: told the model how: {said}"
+        );
+    }
 }
 
 // AU-2 (roadmap 1.4; analysis I1, A1): a scripted model in auto mode tries

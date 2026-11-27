@@ -14,6 +14,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **With no sandbox backend, commands are refused until you allow them.**
+  In `auto` sandbox mode with no working backend (Windows, or Linux without
+  bubblewrap or Landlock), bwn used to run commands unconfined. Now it asks
+  once, at the first command, whether to run commands unconfined for this
+  session; nothing else answers that question (not a hook, a saved approval,
+  an allow rule or `--accept-posture`), and the answer isn't saved. Headless
+  runs refuse commands there unless started with `--sandbox off`. Before,
+  ask mode with an allow rule such as `run_command(*)` ran commands
+  unconfined with nobody asked.
 - **Three more fail-closed fixes.** With bubblewrap, a command whose
   network limiter (bwn's own binary) can't be found now gets no network
   instead of the host's. With no home folder (`HOME` unset), the sandbox no
