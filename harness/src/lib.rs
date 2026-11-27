@@ -855,16 +855,18 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
         std::process::exit(2);
     }
     let perm = permission_from(opts.permission_mode.as_deref(), &settings.permission);
-    // A bad --sandbox flag is a hard error; a bad settings value only warns
-    // (and leaves the sandbox off) so a typo can't lock the user out.
-    let sandbox_mode = opts.sandbox.as_deref().unwrap_or(&settings.sandbox);
+    // A bad --sandbox flag is a hard error; a bad settings value warns and
+    // falls back to require, so a typo never leaves commands unconfined.
     sandbox::set_expose(&settings.sandbox_expose);
     sandbox::set_egress_check(settings.sandbox_egress_check);
-    if let Err(e) = sandbox::configure(sandbox_mode, settings.sandbox_network) {
-        if opts.sandbox.is_some() {
-            return Err(e);
+    match &opts.sandbox {
+        Some(flag) => sandbox::configure(flag, settings.sandbox_network)?,
+        None => {
+            if let Err(e) = sandbox::configure_setting(&settings.sandbox, settings.sandbox_network)
+            {
+                eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
+            }
         }
-        eprintln!("{}", tui::yellow(&format!("buildwithnexus: warning: {e}")));
     }
     tools::set_repo_map(opts.repo_map.unwrap_or(settings.repo_map));
     commands::set_auto_commit(opts.auto_commit.unwrap_or(settings.auto_commit));
@@ -925,10 +927,12 @@ fn permission_from(flag: Option<&str>, setting: &str) -> Permission {
             eprintln!(
                 "{}",
                 tui::yellow(&format!(
-                    "buildwithnexus: warning: settings: {e} — using ask"
+                    "buildwithnexus: warning: settings: {e} — using readonly until it is fixed"
                 ))
             );
-            Permission::Ask
+            // The strictest mode, so a typo never runs with more than the
+            // user asked for (roadmap 1.3; analysis M13).
+            Permission::ReadOnly
         }),
     }
 }
@@ -976,9 +980,10 @@ fn no_setup_headless_msg() -> String {
 }
 
 fn broken_settings_msg() -> String {
-    "settings files exist but none could be used (see warnings above).\n  \
-     Fix the file, or delete it and run `buildwithnexus init` to set up again.\n  \
-     `buildwithnexus doctor` lists every settings file and its status."
+    "a settings file exists but does not load (see warnings above), and bwn won't\n  \
+     run without the rules it holds. Fix the file, or delete it and run\n  \
+     `buildwithnexus init` to set up again. `buildwithnexus doctor` lists every\n  \
+     settings file and its status."
         .to_string()
 }
 
@@ -2785,6 +2790,7 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
             format!("{}: {}", i.source, i.error),
         ));
     }
+    let mut unusable_settings = false;
     let mut settings = match load.settings.clone() {
         Some(s) => {
             out.push(DoctorCheck::pass(
@@ -2805,8 +2811,9 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
         None if load.any_present => {
             out.push(DoctorCheck::fail(
                 "settings",
-                "present but unusable — fix the file(s) above",
+                "present but unusable — bwn won't start until the file(s) above load",
             ));
+            unusable_settings = true;
             None
         }
         // As a headless run would: --provider, or the first key set.
@@ -2880,7 +2887,7 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
     // commands would actually be confined on this machine.
     let mut sandbox_err = None;
     if let Some(s) = &settings {
-        if let Err(e) = sandbox::configure(&s.sandbox, s.sandbox_network) {
+        if let Err(e) = sandbox::configure_setting(&s.sandbox, s.sandbox_network) {
             sandbox_err = Some(e);
         }
     }
@@ -2903,8 +2910,18 @@ fn doctor_checks(opts: &CliOptions, live: Option<&Provider>) -> Vec<DoctorCheck>
     if let Some(e) = sandbox_err {
         out.push(DoctorCheck::fail("sandbox", e));
     }
-    let (glyph, text) = sandbox::doctor_summary();
-    out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
+    // With no usable settings bwn doesn't start, so no sandbox mode applies;
+    // the built-in default here would read as "unconfined".
+    if unusable_settings {
+        out.push(DoctorCheck::from_glyph(
+            "sandbox",
+            "·",
+            "not checked: bwn won't start until the settings load",
+        ));
+    } else {
+        let (glyph, text) = sandbox::doctor_summary();
+        out.push(DoctorCheck::from_glyph("sandbox", glyph, text));
+    }
     if let Some(note) = settings
         .as_ref()
         .and_then(|s| agent::max_parallel_helpers_note(s.max_parallel_helpers))

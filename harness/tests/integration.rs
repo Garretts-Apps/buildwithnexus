@@ -3264,6 +3264,65 @@ fn settings_without_a_model_run_on_the_preset_default_and_take_the_model_flag() 
     assert_eq!(body["model"], "mock-coder");
 }
 
+// IN-2 (roadmap 1.3; analysis I4): a user settings file that doesn't load,
+// here holding a deny rule, stops the run before any model request. Before,
+// the file was dropped and the run went ahead without its rules.
+#[test]
+fn a_settings_file_that_does_not_load_stops_the_run() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_recording(vec![
+        tool_call("c1", "run_command", json!({"command": "touch planted"})),
+        finish("done"),
+    ]);
+    write_config(&home, "custom", "auto", port);
+    std::fs::write(
+        home.join("settings.json"),
+        r#"{"permissions": {"deny": ["run_command"]}"#,
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "go");
+    assert!(!r.success, "stderr: {}", r.stderr);
+    assert!(r.stderr.contains("does not load"), "{}", r.stderr);
+    assert!(posts.lock().unwrap().is_empty(), "a model request was made");
+    assert!(!cwd.join("planted").exists());
+}
+
+// IN-2 (roadmap 1.3; analysis M13): a sandbox value bwn can't parse runs as
+// require, never off.
+#[test]
+fn a_bad_sandbox_setting_runs_as_require() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::write(
+        home.join("config.json"),
+        json!({"provider": "custom", "model": "m", "base_url": "http://127.0.0.1:9/v1", "sandbox": "bogus"})
+            .to_string(),
+    )
+    .unwrap();
+    let mut cmd = Command::new(BIN);
+    for var in NET_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .arg("doctor")
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("using require"), "{out}");
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains(" sandbox ")).collect();
+    assert!(rows.iter().any(|r| r.contains("mode=require")), "{out}");
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("mode=off") && !r.contains("off (your setting)")),
+        "{out}"
+    );
+}
+
 #[test]
 fn a_hooks_only_project_file_is_not_a_broken_setup() {
     let home = tmp("home");

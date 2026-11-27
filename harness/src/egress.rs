@@ -144,6 +144,9 @@ pub fn refusal_note(refused: &[(String, String)]) -> Option<String> {
 pub struct Rules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    /// A settings file that doesn't load: its network.deny can't be read,
+    /// so every connection is refused (roadmap 1.3; analysis I4).
+    pub broken: Option<String>,
 }
 
 impl Rules {
@@ -160,7 +163,11 @@ impl Rules {
                 _ => {}
             }
         }
-        Rules { allow, deny }
+        Rules {
+            allow,
+            deny,
+            broken: crate::config::broken_policy_file(cwd),
+        }
     }
 }
 
@@ -199,6 +206,9 @@ pub fn check(
     let loopback = host == "localhost" || literal.is_some_and(|ip| ip.is_loopback());
     // This machine's own servers (a dev server on :3000) on any port; the
     // rest of the world on 443 and 80.
+    if let Some(why) = &rules.broken {
+        return Err(why.clone());
+    }
     if port != 443 && port != 80 && !loopback {
         return Err(format!("port {port}: only 443 and 80 are open to commands"));
     }
@@ -458,6 +468,24 @@ mod tests {
         Rules {
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+            broken: None,
+        }
+    }
+
+    // Roadmap 1.3 (analysis I4): with a settings file that doesn't load,
+    // nothing connects, not even a host the rules or the known list allow.
+    #[test]
+    fn a_broken_settings_file_refuses_every_connection() {
+        let mut r = rules(&["docs.example"], &[]);
+        assert!(check("127.0.0.1", 8080, &r, false).is_ok());
+        r.broken = Some("settings file x does not load".into());
+        for (host, port) in [
+            ("docs.example", 443),
+            ("github.com", 443),
+            ("127.0.0.1", 8080),
+        ] {
+            let err = check(host, port, &r, false).unwrap_err();
+            assert!(err.contains("does not load"), "{host}: {err}");
         }
     }
 

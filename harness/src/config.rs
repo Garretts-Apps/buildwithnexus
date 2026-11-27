@@ -2944,6 +2944,30 @@ pub struct PolicyRule {
 /// separately so a refusal can name the file it came from. Lists add up
 /// across layers (a project cannot drop a user's deny rule), and an
 /// untrusted project file contributes only its ask and deny entries.
+/// The first settings file (the user's, then the project's at `workdir`)
+/// that exists but does not load as a JSON object, with why. Its rules,
+/// deny rules included, can't be read, so callers refuse rather than act
+/// without them (roadmap 1.3; analysis I4, Integrity invariant).
+pub fn broken_policy_file(workdir: &Path) -> Option<String> {
+    let dot = workdir.join(".buildwithnexus");
+    let project = PROJECT_SETTINGS_FILES.iter().map(|n| dot.join(n));
+    user_settings_files()
+        .into_iter()
+        .chain(project)
+        .find_map(|p| {
+            let why = match settings_file(&p)?.json {
+                SettingsJson::Object(_) => return None,
+                SettingsJson::NotObject => "top level is not a JSON object".to_string(),
+                SettingsJson::Invalid(e) => e,
+            };
+            Some(format!(
+                "settings file {} does not load ({})",
+                crate::tui::sanitize_terminal(&p.display().to_string()),
+                crate::tui::sanitize_terminal(&why)
+            ))
+        })
+}
+
 pub fn policy_rules(workdir: &Path) -> Vec<PolicyRule> {
     let mut layers: Vec<(&'static str, serde_json::Map<String, serde_json::Value>)> =
         user_settings_files()
@@ -3094,7 +3118,8 @@ fn forget_settings_file(path: &Path) {
         .retain(|(p, _, _)| p != path);
 }
 
-// The settings file at `path`, parsed; None when it cannot be read.
+// The settings file at `path`, parsed; None when it does not exist. A file
+// that exists but cannot be read comes back as `Invalid`.
 fn settings_file(path: &Path) -> Option<SettingsFile> {
     let mut files = SETTINGS_FILES.lock().unwrap_or_else(|e| e.into_inner());
     let at = files.iter().position(|(p, _, _)| p == path);
@@ -3114,7 +3139,19 @@ fn settings_file(path: &Path) -> Option<SettingsFile> {
     if let Some(i) = at {
         files.swap_remove(i);
     }
-    let text = fs::read_to_string(path).ok()?;
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        // Gone between the stat and the read: absent.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // Present but unreadable (permissions, not UTF-8): never "absent",
+        // which would drop its rules. Not cached, so fixing it takes effect.
+        Err(e) => {
+            return Some(SettingsFile {
+                text: "".into(),
+                json: SettingsJson::Invalid(format!("cannot be read: {e}")),
+            })
+        }
+    };
     SETTINGS_FILE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     SETTINGS_READ_LOG
@@ -3163,6 +3200,7 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
     let mut any_present = false;
     let mut untrusted = Vec::new();
 
+    let mut broken_file = false;
     let mut read = |p: &Path, issues: &mut Vec<SettingsIssue>| {
         let file = settings_file(p)?;
         any_present = true;
@@ -3171,16 +3209,19 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
             SettingsJson::NotObject => {
                 issues.push(SettingsIssue {
                     source: p.display().to_string(),
-                    error: "top level must be a JSON object — file ignored".into(),
+                    error: "top level must be a JSON object — bwn won't start until it loads"
+                        .into(),
                 });
+                broken_file = true;
                 None
             }
             // serde_json's Display includes line and column — keep it verbatim.
             SettingsJson::Invalid(e) => {
                 issues.push(SettingsIssue {
                     source: p.display().to_string(),
-                    error: format!("{e} — file ignored"),
+                    error: format!("{e} — bwn won't start until it loads"),
                 });
+                broken_file = true;
                 None
             }
         }
@@ -3222,7 +3263,10 @@ fn load_layers(workdir: Option<&Path>) -> (SettingsLoad, Vec<UntrustedProjectFil
         }
     }
 
-    if !any_source {
+    // A file that exists but doesn't load holds rules nobody can read, its
+    // deny rules among them. Starting without it would run looser than the
+    // user asked, so nothing loads (roadmap 1.3; analysis I4).
+    if !any_source || broken_file {
         let load = SettingsLoad {
             settings: None,
             issues,
@@ -3986,7 +4030,7 @@ mod tests {
         assert!(l.issues.is_empty());
         assert!(!l.any_present);
 
-        // Syntax error: file is present, ignored, and the issue names it.
+        // Syntax error: file is present, nothing loads, and the issue names it.
         fs::write(h.join("settings.json"), "{ \"provider\": \"openai\", }").unwrap();
         let l = load_settings_from_dir_diag(&work);
         assert!(l.settings.is_none());
@@ -3995,7 +4039,7 @@ mod tests {
         assert!(l.issues[0].source.contains("settings.json"));
         assert!(l.issues[0].error.contains("line"));
 
-        // Valid JSON, wrong shape: array top level is ignored with a clear reason.
+        // Valid JSON, wrong shape: an array top level stops the load with a clear reason.
         fs::write(h.join("settings.json"), "[1,2,3]").unwrap();
         let l = load_settings_from_dir_diag(&work);
         assert!(l.settings.is_none() && l.any_present);
@@ -4026,13 +4070,18 @@ mod tests {
         assert!(l.settings.is_some());
         assert!(l.issues.is_empty());
 
-        // A broken project-local file is reported but doesn't take down the
-        // valid global settings.
+        // A broken project file stops the load too: its deny and ask rules
+        // can't be read, and an agent that corrupts it must not drop them
+        // (roadmap 1.3; analysis I4, IN-2). The issue names the file.
         fs::create_dir_all(work.join(".buildwithnexus")).unwrap();
         fs::write(work.join(".buildwithnexus/settings.json"), "{oops").unwrap();
         let l = load_settings_from_dir_diag(&work);
-        assert!(l.settings.is_some());
+        assert!(l.settings.is_none() && l.any_present);
         assert_eq!(l.issues.len(), 1);
+        assert!(l.issues[0].source.ends_with(&format!(
+            ".buildwithnexus{}settings.json",
+            std::path::MAIN_SEPARATOR
+        )));
 
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);
@@ -5915,7 +5964,9 @@ mod settings_cache_tests {
         for _ in 0..2 {
             let load = load_layers(None).0;
             assert!(load.settings.is_none() && load.any_present);
-            assert!(load.issues[0].error.ends_with("— file ignored"));
+            assert!(load.issues[0]
+                .error
+                .ends_with("— bwn won't start until it loads"));
         }
         std::env::remove_var("NEXUS_HOME");
         let _ = fs::remove_dir_all(&h);

@@ -619,3 +619,75 @@ fn a_trusted_project_applies_what_the_user_approved() {
     }
     assert!(checked > 25, "{checked}");
 }
+
+// IN-2 (roadmap 1.3; analysis I4, Integrity invariant): a settings file that
+// exists but does not load, the user's or the project's, stops bwn from
+// starting. Before, it was dropped with its rules and the rest loaded, so a
+// user's readonly, require and deny rules vanished with one stray comma.
+#[test]
+fn a_settings_file_that_does_not_load_stops_startup() {
+    let env = env();
+    let good = json!({"provider": "ollama", "model": "m"});
+    let strict =
+        r#"{"permission":"readonly","sandbox":"require","permissions":{"deny":["run_command"]}}"#;
+    let broken: &[&[u8]] = &[
+        b"{\"permission\":\"readonly\",\"sandbox\":\"require\"",
+        b"[\"not\", \"an object\"]",
+        b"",
+        b"{\"permission\": \"readonly\"} trailing",
+        b"\xff\xfe{}",
+    ];
+    for (where_, path) in [
+        ("user", env.home.join("settings.json")),
+        (
+            "project",
+            env.proj.join(".buildwithnexus/settings.local.json"),
+        ),
+    ] {
+        fs::write(env.home.join("config.json"), good.to_string()).unwrap();
+        for bytes in broken {
+            fs::write(&path, bytes).unwrap();
+            let load = load_settings_from_dir_diag(&env.proj);
+            assert!(
+                load.settings.is_none(),
+                "{where_} {:?}: loaded without it",
+                String::from_utf8_lossy(bytes)
+            );
+            assert!(load.any_present);
+            let why = broken_policy_file(&env.proj).expect("reported");
+            assert!(why.contains("does not load"), "{why}");
+        }
+        // Fixed, it loads again and nothing is reported.
+        fs::write(&path, strict).unwrap();
+        assert!(
+            load_settings_from_dir_diag(&env.proj).settings.is_some(),
+            "{where_}"
+        );
+        assert_eq!(broken_policy_file(&env.proj), None, "{where_}");
+        let _ = fs::remove_file(&path);
+    }
+}
+
+// A file bwn can't read is not "absent": its rules would be skipped.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_settings_file_stops_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = env();
+    fs::write(env.home.join("config.json"), r#"{"provider":"ollama"}"#).unwrap();
+    let p = env.home.join("settings.json");
+    fs::write(&p, r#"{"permission":"readonly"}"#).unwrap();
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&p).is_ok() {
+        // Running as root: permissions don't stop the read, nothing to test.
+        eprintln!("skip: root can read a mode-000 file");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+    assert!(load_settings_from_dir_diag(&env.proj).settings.is_none());
+    assert!(broken_policy_file(&env.proj)
+        .unwrap()
+        .contains("cannot be read"));
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(load_settings_from_dir_diag(&env.proj).settings.is_some());
+}
