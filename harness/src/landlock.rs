@@ -25,8 +25,10 @@ use std::os::unix::process::CommandExt;
 const CREATE_VERSION: u32 = 1;
 const RULE_PATH_BENEATH: u32 = 1;
 
-// Landlock ABI 1 write-ish rights, plus ABI 2's truncate and refer. A right
-// the running ABI does not know is dropped before the ruleset is created.
+// Landlock ABI 1 write-ish rights, plus ABI 2's refer and ABI 3's truncate.
+// A right the running ABI does not know is left out of the ruleset: the
+// kernel rejects an unknown one (EINVAL), which on Debian 12's 6.1 (ABI 2)
+// refused every confined command (roadmap 1.7; analysis M3).
 const FS_READ_FILE: u64 = 1 << 2;
 const FS_WRITE_FILE: u64 = 1 << 1;
 const FS_REMOVE_DIR: u64 = 1 << 4;
@@ -127,9 +129,19 @@ fn abi() -> io::Result<i32> {
 fn handled_access(version: i32) -> u64 {
     let mut access = ABI1;
     if version >= 2 {
-        access |= FS_REFER | FS_TRUNCATE;
+        access |= FS_REFER;
+    }
+    if version >= 3 {
+        access |= FS_TRUNCATE;
     }
     access
+}
+
+/// Whether this kernel's Landlock confines truncate(2) by path (ABI 3,
+/// kernel 6.2). Before that, a confined command can truncate a file it can
+/// name outside the workspace (roadmap 1.7; analysis M2).
+pub fn confines_truncate() -> bool {
+    abi().is_ok_and(|v| v >= 3)
 }
 
 /// A ruleset fd that allows writes only under `write_roots`. The caller
@@ -684,7 +696,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&outside, "keep").unwrap();
-        let script = format!("truncate -s 0 {}; echo rc=$?", outside.display());
+        // truncate(2) on the path, which coreutils' truncate does not use
+        // (it opens the file for writing first, which every ABI refuses).
+        let script = format!(
+            "perl -e 'truncate($ARGV[0], 0)' {0} || python3 -c 'import os,sys; os.truncate(sys.argv[1], 0)' {0}; echo done",
+            outside.display()
+        );
         let Ok(mut cmd) = command(&script, &dir, &[], Net::Open) else {
             let _ = std::fs::remove_dir_all(&base);
             panic!("no ruleset on ABI {:?}", abi());
@@ -692,6 +709,16 @@ mod tests {
         let out = cmd.output().expect("spawn");
         let after = std::fs::read_to_string(&outside).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&base);
+        if !confines_truncate() {
+            // Documented: on ABI 1 and 2 this is a known gap, shown in the
+            // posture check. Record what happened instead of failing.
+            eprintln!(
+                "ABI {:?}: truncation outside confined: {}",
+                abi(),
+                after == "keep"
+            );
+            return;
+        }
         assert_eq!(
             after,
             "keep",

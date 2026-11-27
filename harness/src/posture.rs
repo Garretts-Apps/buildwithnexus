@@ -220,12 +220,24 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 &format!("confined:{}", added.join(",")),
             ));
         } else {
+            // Landlock below ABI 3 (kernel 6.2) can't confine truncate(2)
+            // by path either (roadmap 1.7; M2).
+            #[cfg(target_os = "linux")]
+            let truncate_gap = matches!(backend, crate::sandbox::Backend::Landlock)
+                && !crate::landlock::confines_truncate();
+            #[cfg(not(target_os = "linux"))]
+            let truncate_gap = false;
+            let also = if truncate_gap {
+                "; on this kernel (Landlock below ABI 3) files outside can still be truncated"
+            } else {
+                ""
+            };
             v.push(row(
                 "session",
                 "writes",
-                format!("{where_}, including .git and .buildwithnexus on this backend (a planted hook or setting runs later outside the sandbox; auto mode asks before commands)"),
+                format!("{where_}, including .git and .buildwithnexus on this backend (a planted hook or setting runs later outside the sandbox; auto mode asks before commands){also}"),
                 Level::Warn,
-                &format!("confined-policy-writable:{}", added.join(",")),
+                &format!("confined-policy-writable{}:{}", if truncate_gap { "-truncate" } else { "" }, added.join(",")),
             ));
         }
         let hidden = crate::sandbox::hidden_paths(&[cwd]);
