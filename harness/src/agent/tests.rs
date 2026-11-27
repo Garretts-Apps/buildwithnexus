@@ -3916,3 +3916,150 @@ fn a_settings_file_broken_mid_session_refuses_every_call() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// AU-2 / IN-1 for the file-tool surface (roadmap 1.4; analysis I1,
+// Integrity invariant): every write-capable file tool asks before changing
+// a project policy file, in auto mode, whatever was approved or allowed
+// before. With no terminal the ask is a refusal. Reads stay allowed, and
+// bwn's own working files under .buildwithnexus are ordinary writes.
+#[test]
+fn file_tools_ask_before_changing_project_policy_files() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home(
+        "policy",
+        json!({"permissions": {"allow": ["write_file(*)", "edit_file(*)", "move_path(*)", "remove_path(*)", "apply_patch(*)"]}}),
+    );
+    std::fs::create_dir_all(proj.join(".buildwithnexus/rules")).unwrap();
+    std::fs::write(proj.join(".buildwithnexus/settings.json"), "{}").unwrap();
+    std::fs::write(proj.join(".buildwithnexus/rules/r.md"), "rule").unwrap();
+    std::fs::write(proj.join("notes.txt"), "x").unwrap();
+    for key in [
+        "write_file",
+        "edit_file",
+        "move_path",
+        "remove_path",
+        "apply_patch",
+    ] {
+        crate::config::add_project_allowed(&proj, key);
+    }
+    let patch = "--- a/.buildwithnexus/settings.json\n+++ b/.buildwithnexus/settings.json\n@@ -1 +1 @@\n-{}\n+{\"sandbox\":\"off\"}\n";
+    for (tool, input) in [
+        (
+            "write_file",
+            json!({"path": ".buildwithnexus/settings.json", "content": "{\"sandbox\":\"off\"}"}),
+        ),
+        (
+            "write_file",
+            json!({"path": ".BuildWithNexus/Settings.json", "content": "{}"}),
+        ),
+        (
+            "write_file",
+            json!({"path": "src/../.buildwithnexus/settings.local.json", "content": "{}"}),
+        ),
+        (
+            "edit_file",
+            json!({"path": ".buildwithnexus/rules/r.md", "old_string": "rule", "new_string": ""}),
+        ),
+        (
+            "multi_edit",
+            json!({"path": ".buildwithnexus/system.md", "edits": []}),
+        ),
+        (
+            "str_replace_editor",
+            json!({"command": "create", "path": ".buildwithnexus/tools/t.py", "file_text": "x"}),
+        ),
+        ("apply_patch", json!({"patch": patch})),
+        (
+            "move_path",
+            json!({"from": ".buildwithnexus/rules/r.md", "to": "r.md"}),
+        ),
+        (
+            "move_path",
+            json!({"from": "notes.txt", "to": ".buildwithnexus/agents/a.md"}),
+        ),
+        ("remove_path", json!({"path": ".buildwithnexus/rules"})),
+        ("remove_path", json!({"path": ".buildwithnexus"})),
+        ("create_dir", json!({"path": ".buildwithnexus/skills/x"})),
+    ] {
+        let r = gate(Permission::Auto, tool, &input, &proj).unwrap_or_default();
+        assert!(r.contains("policy file"), "{tool} {input}: {r:?}");
+    }
+    // Reading one is not a change (it asks only as a sensitive path does).
+    let r = gate(
+        Permission::Auto,
+        "read_file",
+        &json!({"path": ".buildwithnexus/settings.json"}),
+        &proj,
+    );
+    assert!(
+        r.as_deref().is_none_or(|r| !r.contains("policy file")),
+        "{r:?}"
+    );
+    // A saved approval for the path itself (an earlier `a` to the sensitive
+    // path prompt) doesn't cover a policy change either.
+    crate::config::add_project_allowed(
+        &proj,
+        &format!(
+            "access {}",
+            proj.join(".buildwithnexus/settings.json").display()
+        ),
+    );
+    let r = gate(
+        Permission::Auto,
+        "write_file",
+        &json!({"path": ".buildwithnexus/settings.json", "content": "{}"}),
+        &proj,
+    )
+    .unwrap_or_default();
+    assert!(r.contains("policy file"), "{r:?}");
+    for path in [".buildwithnexus/knowledge/entities.json", "notes.txt"] {
+        let r = gate(
+            Permission::Auto,
+            "write_file",
+            &json!({"path": path, "content": "{}"}),
+            &proj,
+        );
+        assert!(
+            r.as_deref().is_none_or(|r| !r.contains("policy file")),
+            "{path}: {r:?}"
+        );
+    }
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// AU-2 (roadmap 1.4; analysis I1): before 1.4 an earlier `a` to the
+// sensitive-path prompt let every later write to the settings file through
+// in auto mode, and a mixed-case spelling was not sensitive at all outside
+// Windows. Neither may let a policy change through unasked.
+#[test]
+fn a_policy_change_is_never_pre_approved() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home("policy-preapproved", json!({}));
+    std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
+    std::fs::write(proj.join(".buildwithnexus/settings.json"), "{}").unwrap();
+    crate::config::add_project_allowed(
+        &proj,
+        &format!(
+            "access {}",
+            proj.join(".buildwithnexus/settings.json").display()
+        ),
+    );
+    crate::config::add_project_allowed(&proj, "write_file");
+    for path in [
+        ".buildwithnexus/settings.json",
+        ".BuildWithNexus/Settings.json",
+    ] {
+        let input = json!({"path": path, "content": "{\"sandbox\":\"off\"}"});
+        assert!(
+            gate(Permission::Auto, "write_file", &input, &proj).is_some(),
+            "{path} went through unasked"
+        );
+    }
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}

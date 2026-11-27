@@ -14,6 +14,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sandbox` and `permission` are now compared with their defaults.
   `doctor`'s startup-check panel also showed the sandbox as off before it
   had read your settings; it now shows the real mode.
+- **Changing a project's policy files asks you, every time.** A file-tool
+  write, edit, move or delete of `.buildwithnexus/settings*.json`, `rules/`,
+  `tools/`, `agents/`, `commands/`, `skills/`, `system.md` or `Agents.md`
+  asks in every mode, one change at a time; an earlier "always" for the
+  path, an allow rule, or a different spelling (`.BuildWithNexus/...`, a
+  symlink, `..`) no longer lets it through. Headless runs refuse it.
 - **A blocked `.git` write no longer tells the model how to turn the sandbox
   off.** The note says what was refused and that changing the sandbox is the
   user's decision; the `require` refusal says the same.
