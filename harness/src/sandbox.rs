@@ -1851,6 +1851,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // Analysis M5 (roadmap 2.2): under Landlock a command could list the
+    // names in a hidden store (`ls ~/.ssh`), though not read them. Listing
+    // is confined too now; folders beside a store, system folders and the
+    // workspace still list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invariant_m5_landlock_does_not_list_hidden_store_names() {
+        use std::os::unix::process::CommandExt;
+        if crate::landlock::available().is_err() {
+            return;
+        }
+        let (home, ws, hidden) = fake_home("landlock-ls");
+        std::fs::write(ws.join("in-ws.txt"), "x").unwrap();
+        std::fs::create_dir_all(home.join(".config/app")).unwrap();
+        std::fs::write(home.join(".config/app/app.toml"), "x").unwrap();
+        let fd = crate::landlock::ruleset_with(&ws, &[], None, &hidden, Net::Off).unwrap();
+        let ls = |dir: &Path| {
+            let mut c = Command::new("ls");
+            c.arg(dir).current_dir(&ws).stdin(Stdio::null());
+            unsafe {
+                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off));
+            }
+            let o = c.output().unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+            )
+        };
+        let store = ls(&home.join(".ssh"));
+        let gh = ls(&home.join(".config/gh"));
+        let sibling = ls(&home.join(".config/app"));
+        let usr = ls(Path::new("/usr"));
+        let inside = ls(&ws);
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            !store.0 && !store.1.contains("id_test"),
+            "listed ~/.ssh: {store:?}"
+        );
+        assert!(
+            !gh.0 && !gh.1.contains("hosts.yml"),
+            "listed ~/.config/gh: {gh:?}"
+        );
+        assert!(
+            sibling.0 && sibling.1.contains("app.toml"),
+            "~/.config/app: {sibling:?}"
+        );
+        assert!(usr.0 && usr.1.contains("bin"), "/usr: {usr:?}");
+        assert!(
+            inside.0 && inside.1.contains("in-ws.txt"),
+            "workspace: {inside:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn seatbelt_profile_denies_reads_of_hidden_paths() {

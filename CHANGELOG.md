@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Under Landlock, commands can no longer list the files in a hidden
+  credential store.** `ls ~/.ssh` used to print the key names, though not
+  their contents. To hide the names, commands also can't list the folders
+  a store sits in (`/`, `/home`, your home folder, `~/.config`); files in
+  those folders stay readable by name, and everything else lists as before.
+  bubblewrap and Seatbelt are unchanged.
 - **An untrusted project can no longer turn the sandbox off.** When your own
   settings didn't name `sandbox`, a project's `.buildwithnexus/settings.json`
   with `"sandbox": "off"` was applied without asking for trust, because the

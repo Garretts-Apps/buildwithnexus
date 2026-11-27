@@ -30,6 +30,10 @@ const RULE_PATH_BENEATH: u32 = 1;
 // kernel rejects an unknown one (EINVAL), which on Debian 12's 6.1 (ABI 2)
 // refused every confined command (roadmap 1.7; analysis M3).
 const FS_READ_FILE: u64 = 1 << 2;
+const FS_READ_DIR: u64 = 1 << 3;
+// The rights a rule on a file (not a directory) may carry; the kernel
+// rejects a directory-only right on a file.
+const FILE_RIGHTS: u64 = FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE;
 const FS_WRITE_FILE: u64 = 1 << 1;
 const FS_REMOVE_DIR: u64 = 1 << 4;
 const FS_REMOVE_FILE: u64 = 1 << 5;
@@ -162,7 +166,14 @@ pub fn ruleset_with(
 ) -> io::Result<RawFd> {
     let version = abi()?;
     let write = handled_access(version);
-    let read = if hidden.is_empty() { 0 } else { FS_READ_FILE };
+    // With stores to hide, reading files and listing folders are handled:
+    // allowed everywhere except in (and, for listing, above) a hidden store
+    // (roadmap 2.2; analysis M5: names in ~/.ssh were listable).
+    let read = if hidden.is_empty() {
+        0
+    } else {
+        FS_READ_FILE | FS_READ_DIR
+    };
     let access = write | read;
     let fd = create(access, net, version)?;
     let roots = write_roots(cwd, extra, tmpdir);
@@ -252,6 +263,8 @@ pub fn can_hide(roots: &[&Path], hidden: &[PathBuf]) -> bool {
 // a hidden path); what they point to is readable through its own rule.
 // Entries created later in those few folders are not readable, which is
 // fine: a command cannot create them, since it cannot write there.
+// Listing is granted the same way, so the folders on the way (`/`, `/home`,
+// the home folder) cannot be listed: listing them would name the store.
 fn allow_reads_except(ruleset: RawFd, hidden: &[PathBuf]) {
     use std::collections::{HashMap, HashSet};
     let mut on_path: HashMap<PathBuf, HashSet<std::ffi::OsString>> = HashMap::new();
@@ -285,7 +298,7 @@ fn allow_reads_except(ruleset: RawFd, hidden: &[PathBuf]) {
             match e.file_type() {
                 Ok(t) if t.is_symlink() => {}
                 Ok(_) => {
-                    let _ = add_path(ruleset, &path, FS_READ_FILE);
+                    let _ = add_path(ruleset, &path, FS_READ_FILE | FS_READ_DIR);
                 }
                 Err(_) => {}
             }
@@ -294,6 +307,11 @@ fn allow_reads_except(ruleset: RawFd, hidden: &[PathBuf]) {
 }
 
 fn add_path(ruleset: RawFd, path: &Path, access: u64) -> io::Result<()> {
+    let access = if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+        access
+    } else {
+        access & FILE_RIGHTS
+    };
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
     // SAFETY: O_PATH opens the node without using it; closed before return.
