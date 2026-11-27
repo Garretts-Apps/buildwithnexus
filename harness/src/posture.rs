@@ -56,7 +56,51 @@ fn row(section: &'static str, item: &str, value: String, level: Level, key: &str
 }
 
 static ACCEPT_FLAG: AtomicBool = AtomicBool::new(false);
-static ACCEPTED: Mutex<Option<String>> = Mutex::new(None);
+static ACCEPTED: Mutex<Option<Accepted>> = Mutex::new(None);
+
+/// What a session accepted: its id, the inputs to its posture as they were
+/// then (cheap to compare on every request), and the fingerprint of the
+/// session rows they produced.
+struct Accepted {
+    sid: String,
+    state: PolicyState,
+    session_fp: String,
+}
+
+/// The settings and switches the session rows are built from. Comparing
+/// these is cheap; only when they differ are the rows built again, and only
+/// when the rows differ is the person asked again (roadmap 1.5; M11).
+#[derive(Clone, PartialEq, Debug)]
+struct PolicyState {
+    sandbox: &'static str,
+    network: bool,
+    egress_check: bool,
+    exposed: Vec<PathBuf>,
+    permission: &'static str,
+    added: Vec<PathBuf>,
+    settings_reads: usize,
+}
+
+fn policy_state(perm: crate::agent::Permission) -> PolicyState {
+    PolicyState {
+        sandbox: crate::sandbox::mode().as_str(),
+        network: crate::sandbox::network(),
+        egress_check: crate::sandbox::egress_check(),
+        exposed: crate::sandbox::exposed(),
+        permission: crate::agent::permission_name(perm),
+        added: crate::workdirs::list(),
+        settings_reads: crate::config::settings_file_reads(),
+    }
+}
+
+fn session_fingerprint(rows: &[Row]) -> String {
+    let session: Vec<Row> = rows
+        .iter()
+        .filter(|r| r.section == "session")
+        .cloned()
+        .collect();
+    fingerprint(&session)
+}
 
 /// `--accept-posture`: the headless answer.
 pub fn accept_by_flag() {
@@ -123,12 +167,19 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
     v.push(row("session", "sandbox", sb, sl, skey));
 
     if let Some(backend) = backend {
+        // Keys carry what the row allows, so a change to it changes the
+        // fingerprint (roadmap 1.5; analysis M11).
+        let added: Vec<String> = crate::workdirs::list().iter().map(|p| tilde(p)).collect();
         v.push(row(
             "session",
             "writes",
-            "only the workspace and temp folders".into(),
+            if added.is_empty() {
+                "only the workspace and temp folders".into()
+            } else {
+                format!("only the workspace, temp folders and {}", added.join(", "))
+            },
             Level::Good,
-            "confined",
+            &format!("confined:{}", added.join(",")),
         ));
         let hidden = crate::sandbox::hidden_paths(&[cwd]);
         let (cv, cl, ck) = if crate::sandbox::hides_reads(cwd) {
@@ -138,17 +189,20 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             } else {
                 format!("hidden from commands: {}", names.join(", "))
             };
-            (shown, Level::Good, "hidden")
+            (shown, Level::Good, format!("hidden:{}", names.join(",")))
         } else {
             (
                 "readable by commands (the workspace holds a credential store, which this sandbox cannot carve out)".into(),
                 Level::Warn,
-                "readable",
+                "readable".to_string(),
             )
         };
-        v.push(row("session", "credential files", cv, cl, ck));
+        v.push(row("session", "credential files", cv, cl, &ck));
         let net = crate::sandbox::net_for(backend);
-        let allow = crate::egress::Rules::load(cwd).allow.len();
+        let mut allowed = crate::egress::Rules::load(cwd).allow;
+        allowed.sort();
+        let allow = allowed.len();
+        let checked = format!("checked:{}", allowed.join(","));
         let (nv, nl, nk) = match net {
             Net::Off if !crate::sandbox::network() => {
                 ("none (sandbox_network: false)".to_string(), Level::Good, "off")
@@ -164,7 +218,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                     crate::egress::KNOWN_HOSTS.len()
                 ),
                 Level::Good,
-                "checked",
+                checked.as_str(),
             ),
             Net::Open => (
                 "any host (sandbox_egress_check: false)".to_string(),
@@ -556,23 +610,41 @@ pub fn ensure(
     cwd: &Path,
     base_url: &str,
 ) -> Result<(), String> {
-    if ACCEPTED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_deref()
-        == Some(sid)
+    let state = policy_state(perm);
+    let mut changed = false;
     {
-        return Ok(());
+        let mut acc = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = acc.as_mut().filter(|a| a.sid == sid) {
+            if a.state == state {
+                return Ok(());
+            }
+            // Something the session rows are built from changed (/sandbox,
+            // /permissions, /add-dir, a typed switch, a settings file): ask
+            // again only if what the session can reach changed with it.
+            if session_fingerprint(&session_rows(perm, cwd)) == a.session_fp {
+                a.state = state;
+                return Ok(());
+            }
+            changed = true;
+        }
     }
     let rows = gather(perm, cwd, base_url);
     let fp = fingerprint(&rows);
+    let session_fp = session_fingerprint(&rows);
     let lines = render(&rows);
     let accept = |why: &str| {
         store(sid, &fp);
-        *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
+        *ACCEPTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Accepted {
+            sid: sid.to_string(),
+            state: state.clone(),
+            session_fp: session_fp.clone(),
+        });
         crate::report::info(&format!("  posture accepted {why}"));
         Ok(())
     };
+    if changed {
+        crate::report::notice("  what this session can reach changed since you accepted it:");
+    }
     let editor = crate::agent::has_remote_approver();
     let show = || {
         // The heading lines, then one per row: warnings stand out. In an
@@ -649,14 +721,6 @@ pub fn before_request(base_url: &str) -> Result<(), String> {
     #[cfg(not(test))]
     {
         let sid = crate::session::current().unwrap_or_default();
-        if ACCEPTED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_deref()
-            == Some(sid.as_str())
-        {
-            return Ok(());
-        }
         let perm = crate::agent::parse_permission(&crate::hooks::permission_mode())
             .unwrap_or(crate::agent::Permission::Ask);
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -767,6 +831,111 @@ mod tests {
         // Another session is asked afresh.
         forget_accepted();
         assert!(ensure("s2", p, &cwd, base).is_err());
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // IN-3 (roadmap 1.5; analysis M11, Integrity invariant): once accepted,
+    // a session is asked again when what it can reach changes in the same
+    // process: the permission mode, the sandbox mode, an added folder, an
+    // exposed credential store, a network.allow entry. Before, the first
+    // acceptance held for the rest of the process whatever changed.
+    #[test]
+    fn a_session_is_asked_again_when_its_reach_changes() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-posture-in3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let cwd = home.join("proj");
+        let base = "http://127.0.0.1:9/v1";
+        let (mode0, net0) = (crate::sandbox::mode(), crate::sandbox::network());
+        crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+        crate::workdirs::clear();
+        forget_accepted();
+        let accept = |perm| {
+            std::env::set_var("BWN_ACCEPT_POSTURE", "1");
+            assert!(ensure("in3", perm, &cwd, base).is_ok());
+            std::env::remove_var("BWN_ACCEPT_POSTURE");
+        };
+        let asks = |perm| ensure("in3", perm, &cwd, base).is_err();
+        use crate::agent::Permission as P;
+
+        accept(P::Ask);
+        assert!(!asks(P::Ask), "nothing changed");
+        assert!(asks(P::Auto), "permission ask -> auto");
+        accept(P::Auto);
+        crate::sandbox::set_mode(crate::sandbox::Mode::Off);
+        assert!(asks(P::Auto), "sandbox auto -> off");
+        crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+        accept(P::Auto);
+        if crate::sandbox::backend().is_some() {
+            let extra =
+                std::env::temp_dir().join(format!("bwn-posture-in3-extra-{}", std::process::id()));
+            std::fs::create_dir_all(&extra).unwrap();
+            crate::workdirs::add(extra.to_str().unwrap(), &cwd).unwrap();
+            assert!(asks(P::Auto), "/add-dir");
+            accept(P::Auto);
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"network": {"allow": ["exfil.example"]}}"#,
+            )
+            .unwrap();
+            crate::config::invalidate_settings_cache();
+            let _ = crate::config::load_settings();
+            assert!(asks(P::Auto), "network.allow gained a host");
+        } else {
+            eprintln!("skip: no sandbox backend, so no writes or network rows to change");
+        }
+        crate::workdirs::clear();
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("bwn-posture-in3-extra-{}", std::process::id())),
+        );
+        crate::sandbox::set_mode(mode0);
+        crate::sandbox::set_network(net0);
+        forget_accepted();
+        std::env::remove_var("NEXUS_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The row keys carry the lists they show, so the fingerprint moves with
+    // them (roadmap 1.5; M11: the keys were the constants "hidden" and
+    // "checked").
+    #[test]
+    fn the_fingerprint_follows_hidden_stores_and_allowed_hosts() {
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!("bwn-posture-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::env::set_var("NEXUS_HOME", &home);
+        let cwd = home.join("proj");
+        let mode0 = crate::sandbox::mode();
+        crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+        if crate::sandbox::backend().is_none() {
+            eprintln!("skip: no sandbox backend");
+        } else {
+            let fp = || fingerprint(&session_rows(crate::agent::Permission::Ask, &cwd));
+            let before = fp();
+            std::fs::write(
+                home.join("settings.json"),
+                r#"{"network": {"allow": ["a.example"]}}"#,
+            )
+            .unwrap();
+            crate::config::invalidate_settings_cache();
+            let allowed = fp();
+            assert_ne!(before, allowed, "network.allow");
+            let hidden = crate::sandbox::hidden_paths(&[&cwd]);
+            if let Some(first) = hidden.first() {
+                crate::sandbox::set_expose(&[first.display().to_string()]);
+                assert_ne!(allowed, fp(), "sandbox_expose");
+                crate::sandbox::set_expose(&[]);
+            }
+        }
+        crate::sandbox::set_mode(mode0);
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
