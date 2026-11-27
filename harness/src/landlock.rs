@@ -766,6 +766,49 @@ mod tests {
         );
     }
 
+    // Conformance (roadmap 2.1): the write guarantee is more than "a write
+    // to a new path is refused" — renaming, linking, creating, removing and
+    // making a directory outside the workspace are all refused too. Only a
+    // file's metadata leaks (the test below) and, below ABI 3, truncation
+    // (the seccomp tests). Probing each path, not just one, is what caught
+    // the O_TRUNC gap.
+    #[test]
+    fn invariant_landlock_confines_write_syscall_paths_outside() {
+        if available().is_err() {
+            return;
+        }
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("bwn-landlock-paths-{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), "v").unwrap();
+        let o = outside.display();
+        // Each line prints WORKED only if the operation outside succeeded.
+        let script = format!(
+            "cd {o}; \
+             mv victim.txt moved.txt 2>/dev/null && echo rename-WORKED; \
+             ln moved.txt hard.txt 2>/dev/null && echo hardlink-WORKED; \
+             ln -s moved.txt sym.txt 2>/dev/null && echo symlink-WORKED; \
+             touch newfile.txt 2>/dev/null && echo create-WORKED; \
+             mkdir newdir 2>/dev/null && echo mkdir-WORKED; \
+             rm moved.txt 2>/dev/null && echo unlink-WORKED; \
+             echo end"
+        );
+        let mut cmd = command(&script, &ws, &[], Net::Open).expect("ruleset");
+        let out = cmd.output().expect("spawn");
+        let said = String::from_utf8_lossy(&out.stdout);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(said.contains("end"), "the probe did not run: {said}");
+        assert!(
+            !said.contains("WORKED"),
+            "landlock let a write-path syscall touch outside the workspace: {said}"
+        );
+    }
+
     // Characterization (roadmap 2.2): Landlock has no right for a file's
     // metadata, so `chmod`, `chown`, `utime` and xattrs on a file outside
     // the workspace are not confined. The capability table marks the write
