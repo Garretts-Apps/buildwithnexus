@@ -117,3 +117,19 @@ machine, named in its `hardware.json`.
 
 Pinned versions change only by editing `pins.json` and rerunning. The runner
 exits if a binary's `--version` text does not contain its pin.
+
+## Security and engineering benchmarks
+
+These follow `docs/roadmap.md` (items 1.13 and 6.1) and the design in
+section 9 of `docs/competitor-analysis.md`.
+
+- `python3 bench/invariants.py` runs every `invariant_*` test once per
+  sandbox backend this machine has and writes `invariants.json` and
+  `invariants.md`: passed/total per acceptance case (AU-1, IN-2, ...) and
+  backend. That is the "unauthorised actions blocked" metric, for bwn.
+- `python3 bench/longitudinal/select_tasks.py <repo>` scans a repository's
+  first-parent history for 20-change windows that suit the longitudinal
+  benchmark: every change carries tests, at least half build on files an
+  earlier change in the window touched, and none is a release-sized merge.
+  It ranks the windows; writing the requirements and running the harnesses
+  are later steps (roadmap 6.1).
