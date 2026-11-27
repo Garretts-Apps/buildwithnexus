@@ -4748,6 +4748,43 @@ mod tests {
         assert_eq!(keep.len(), 2, "restating a default is not a loosening");
     }
 
+    // AU-1 (analysis M12/A1): for every user setting, omitted or explicit,
+    // an untrusted project's `sandbox` applies only when it is at least as
+    // strict as the user's effective mode.
+    #[test]
+    fn untrusted_project_sandbox_never_weakens_any_user_setting() {
+        let rank = |m: &str| {
+            ["off", "auto", "require"]
+                .iter()
+                .position(|x| *x == m)
+                .unwrap()
+        };
+        // (user's setting, effective mode it gives)
+        let users = [
+            (None, "auto"),
+            (Some("off"), "off"),
+            (Some("auto"), "auto"),
+            (Some("require"), "require"),
+        ];
+        for (user, effective) in users {
+            let mut base = serde_json::Map::new();
+            if let Some(u) = user {
+                base.insert("sandbox".into(), u.into());
+            }
+            for proj in ["off", "auto", "require"] {
+                let p = serde_json::json!({ "sandbox": proj });
+                let (keep, ignored) = untrusted_view(&base, p.as_object().unwrap().clone());
+                let applied = keep.contains_key("sandbox");
+                assert_eq!(
+                    applied,
+                    rank(proj) >= rank(effective),
+                    "user {user:?}, project {proj}"
+                );
+                assert_eq!(ignored.is_empty(), applied, "user {user:?}, project {proj}");
+            }
+        }
+    }
+
     #[test]
     fn trusted_project_never_edits_home_mcp_servers() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
