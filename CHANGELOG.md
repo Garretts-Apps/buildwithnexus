@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **x32 syscalls are refused inside the sandbox.** On x86-64, the seccomp
+  filter matched syscall numbers only, and an x32 call carries the same
+  architecture with a different number, so on a kernel with x32 enabled a
+  command could open a socket while the network was off. The filter now
+  refuses every x32 call. SECURITY.md also lists what the automatic checks
+  do not guarantee yet, including that a check round the gate refused does
+  not fail the run.
 - **Under Landlock, commands can no longer list the files in a hidden
   credential store.** `ls ~/.ssh` used to print the key names, though not
   their contents. To hide the names, commands also can't list the folders
@@ -25,9 +32,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (kernel 6.2), and the kernel rejects an unknown right: on Debian 12 every
   sandboxed command was refused with "Invalid argument". bwn now asks only
   for rights the running kernel has. Below ABI 3 (Ubuntu 22.04, Debian 12)
-  Landlock can't stop a command truncating a file outside the workspace;
-  the posture check says so, and auto mode already asks before commands on
-  Landlock.
+  Landlock can't stop a command truncating a file outside the workspace, so
+  on those kernels the seccomp filter now refuses `truncate(2)` and an
+  `open` with `O_TRUNC` in read-only mode (which also truncates and which
+  Landlock there does not catch), inside the workspace too. A normal
+  write-mode truncate — `: > file`, `ftruncate`, opening for writing with
+  `O_TRUNC` — still works inside, because Landlock confines those. `perl`'s
+  and Python's `truncate` on a path name do not. The posture check says so.
 - **With no sandbox backend, commands are refused until you allow them.**
   In `auto` sandbox mode with no working backend (Windows, or Linux without
   bubblewrap or Landlock), bwn used to run commands unconfined. Now it asks

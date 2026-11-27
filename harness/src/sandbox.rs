@@ -1841,7 +1841,7 @@ mod tests {
             let mut c = Command::new("sh");
             c.args(["-c", cmd]).current_dir(&ws).stdin(Stdio::null());
             unsafe {
-                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off));
+                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off, false));
             }
             let o = c.output().unwrap();
             unsafe { libc::close(fd) };
@@ -1871,7 +1871,7 @@ mod tests {
             let mut c = Command::new("ls");
             c.arg(dir).current_dir(&ws).stdin(Stdio::null());
             unsafe {
-                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off));
+                c.pre_exec(move || crate::landlock::engage(fd, crate::landlock::Net::Off, false));
             }
             let o = c.output().unwrap();
             (
@@ -2037,7 +2037,7 @@ print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
         c.args(["-c", &format!("{NET_PROBE} {pp} {op}")])
             .stdin(Stdio::null());
         unsafe {
-            c.pre_exec(move || crate::landlock::engage(fd, net));
+            c.pre_exec(move || crate::landlock::engage(fd, net, false));
         }
         let out = c.output().unwrap();
         unsafe { libc::close(fd) };

@@ -221,14 +221,14 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             ));
         } else {
             // Landlock below ABI 3 (kernel 6.2) can't confine truncate(2)
-            // by path either (roadmap 1.7; M2).
+            // by path, so seccomp refuses it everywhere (roadmap 2.2; M2).
             #[cfg(target_os = "linux")]
             let truncate_gap = matches!(backend, crate::sandbox::Backend::Landlock)
                 && !crate::landlock::confines_truncate();
             #[cfg(not(target_os = "linux"))]
             let truncate_gap = false;
             let also = if truncate_gap {
-                "; on this kernel (Landlock below ABI 3) files outside can still be truncated"
+                "; on this kernel (Landlock below ABI 3) commands can't truncate a file by path, even inside"
             } else {
                 ""
             };

@@ -506,7 +506,7 @@ this table applies.
 | Network only through the host checker | Yes; no network if bwn's own binary can't be found | Needs Landlock ABI 4 (kernel 6.7); otherwise no network | Yes | `bwrap_limits_the_network_to_the_proxy`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network` |
 | No inbound connections | No: a command can listen | No | No | Not guaranteed |
 | Provider keys and tokens stripped from the environment | Yes | Yes | Yes (and with no backend) | `sandboxed_children_lose_sockets_and_provider_keys` |
-| Older kernels | n/a | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold, but a command can truncate a file outside the workspace with `truncate(2)`; the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside` (asserts from ABI 3), run in 5.15 and 6.1 VMs |
+| Older kernels | n/a | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold. Landlock can't confine truncation there, so seccomp refuses `truncate(2)` and a read-only `open` with `O_TRUNC`, inside the workspace too (write-mode truncation — `: > file`, `ftruncate`, opening for writing with `O_TRUNC` — still works, because Landlock confines it); the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, run in 5.15 and 6.1 VMs |
 
 The invariant suite (`cargo test -- invariant_`) runs once per backend in CI
 and gates every release.
@@ -570,3 +570,26 @@ request. Text from web pages, search results
 and MCP servers is labelled as untrusted for the model, and after a session
 reads any, auto mode asks before commands, fetches and MCP calls that can
 change things.
+
+### What the automatic checks do not guarantee
+
+When the model finishes after editing files without running `check_work`,
+bwn runs the project's checks once itself, and a top-level run whose checks
+still fail ends with `check_work_failed` (exit 7), not `success`. That is
+the limit of it today; roadmap 3.1 makes the checks mandatory:
+
+- **A check that was refused does not fail the run.** If the permission gate
+  denies the automatic round, or nobody can approve it (no terminal), the
+  checks are not run and the run can still end as `success`. The run prints
+  "checks were not run" and the tool record says the round was skipped.
+- **Edits are committed before any check.** With `auto_commit` on (the
+  default), each file edit is committed when it is made, so a run that ends
+  with failing checks leaves those commits in place.
+- **The model chooses the check.** `check_work` accepts a command, and its
+  exit status is the verdict; a later passing call replaces an earlier
+  failure.
+- **Shell edits do not trigger the round.** Only file-tool edits count as
+  changes, so a run that changes files only through commands is not checked
+  automatically.
+- **Helpers are not checked.** The automatic round and the verifier run only
+  for the top-level agent.
