@@ -12389,7 +12389,7 @@ fn reports_decide_checks_that_name_a_format() {
         let mut spec = spec;
         let cmd = spec["command"].as_str().unwrap().replace(
             "STUB",
-            &format!("node '{}'", home.join("stub.js").display()),
+            &format!("node \"{}\"", home.join("stub.js").display()),
         );
         spec["command"] = json!(cmd);
         add_user_setting(&home, "checks", json!([spec.clone()]));
