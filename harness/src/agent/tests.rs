@@ -4104,3 +4104,86 @@ fn invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// Roadmap 2.2: the nested-repository scan has bounds (64 found, 10,000
+// folders). A workspace past them leaves a nested .git writable, so on a
+// backend that otherwise keeps nested .git read-only the posture check says
+// so and auto mode asks before commands.
+#[test]
+fn invariant_nested_git_past_the_bounds_is_disclosed_and_auto_asks() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home("nested-bounds", json!({}));
+    for i in 0..70 {
+        std::fs::create_dir_all(proj.join(format!("vendor/r{i}/.git"))).unwrap();
+    }
+    assert!(!crate::sandbox::nested_git_complete(&[&proj]));
+    let mode0 = crate::sandbox::mode();
+    crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+    let reason = gate(
+        Permission::Auto,
+        "run_command",
+        &json!({"command": "make"}),
+        &proj,
+    )
+    .unwrap_or_default();
+    let rows = crate::posture::gather_session_rows_for_test(Permission::Auto, &proj);
+    let writes = rows
+        .iter()
+        .find(|r| r.item == "writes")
+        .map(|r| r.value.clone())
+        .unwrap_or_default();
+    crate::sandbox::set_mode(mode0);
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+    if crate::sandbox::protects_policy_files() {
+        assert!(reason.contains("nested repositor"), "{reason:?}");
+        assert!(writes.contains("nested repository's .git"), "{writes}");
+    } else {
+        eprintln!("skip: this backend doesn't keep nested .git read-only at all");
+    }
+}
+
+// A credential store that holds the workspace (a session run from inside
+// ~/.aws) can't be hidden without hiding the workspace. No backend may claim
+// it hidden: the posture check says readable, and auto mode asks.
+#[test]
+fn invariant_a_store_holding_the_workspace_is_never_claimed_hidden() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|h| h.is_dir() && !h.starts_with("/tmp"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/tmp"));
+    let fake = base.join(format!("bwn-store-ws-{}", std::process::id()));
+    let ws = fake.join(".aws/proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(fake.join(".aws/credentials"), "KEY\n").unwrap();
+    let (home0, profile0) = (std::env::var_os("HOME"), std::env::var_os("USERPROFILE"));
+    std::env::set_var("HOME", &fake);
+    std::env::set_var("USERPROFILE", &fake);
+    let mode0 = crate::sandbox::mode();
+    crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
+    let hides = crate::sandbox::hides_reads(&ws);
+    let reason = gate(
+        Permission::Auto,
+        "run_command",
+        &json!({"command": "make"}),
+        &ws,
+    )
+    .unwrap_or_default();
+    crate::sandbox::set_mode(mode0);
+    for (k, v) in [("HOME", home0), ("USERPROFILE", profile0)] {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&fake);
+    assert!(!hides, "claimed to hide a store that holds the workspace");
+    if crate::sandbox::would_confine() {
+        assert!(!reason.is_empty(), "auto mode did not ask");
+    }
+}

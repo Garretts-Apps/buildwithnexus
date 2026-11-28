@@ -212,13 +212,29 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
         // Landlock can't keep .git and .buildwithnexus read-only inside the
         // workspace; say so, and auto mode asks (roadmap 1.8; M1).
         if crate::sandbox::protects_policy_files() {
-            v.push(row(
-                "session",
-                "writes",
-                where_,
-                Level::Good,
-                &format!("confined:{}", added.join(",")),
-            ));
+            // Nested repositories' .git are kept read-only only as far as
+            // the scan reaches (roadmap 2.2).
+            let extra = crate::workdirs::list();
+            let roots: Vec<&Path> = std::iter::once(cwd)
+                .chain(extra.iter().map(PathBuf::as_path))
+                .collect();
+            if crate::sandbox::nested_git_complete(&roots) {
+                v.push(row(
+                    "session",
+                    "writes",
+                    where_,
+                    Level::Good,
+                    &format!("confined:{}", added.join(",")),
+                ));
+            } else {
+                v.push(row(
+                    "session",
+                    "writes",
+                    format!("{where_}; this workspace has more folders or nested repositories than bwn checks, so a nested repository's .git past them stays writable (auto mode asks before commands)"),
+                    Level::Warn,
+                    &format!("confined-nested-unbounded:{}", added.join(",")),
+                ));
+            }
         } else {
             // Landlock below ABI 3 (kernel 6.2) can't confine truncate(2)
             // by path, so seccomp refuses it everywhere (roadmap 2.2; M2).
@@ -254,6 +270,13 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                     "contents hidden from commands: {} (a guessed name can still be confirmed with `stat`, and the file's metadata is writable — roadmap 2.2)",
                     names.join(", ")
                 )
+            } else if hidden.iter().any(|p| !p.is_dir()) {
+                // A file is covered by an empty one: its contents are hidden,
+                // not whether it exists (M-1).
+                format!(
+                    "hidden from commands: {} (for a file, its contents; whether it exists still shows)",
+                    names.join(", ")
+                )
             } else {
                 format!("hidden from commands: {}", names.join(", "))
             };
@@ -267,7 +290,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             )
         } else {
             (
-                "readable by commands (the workspace holds a credential store, which this sandbox cannot carve out)".into(),
+                "readable by commands (the workspace holds a credential store or sits inside one, which this sandbox cannot carve out; auto mode asks before commands)".into(),
                 Level::Warn,
                 "readable".to_string(),
             )
@@ -304,7 +327,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             ),
             Net::Proxy(_) => (
                 format!(
-                    "only through the checker: {} package and source hosts, hosts you name, {allow} in network.allow; this machine's own servers on any port",
+                    "only through the checker: {} package and source hosts, hosts you name, {allow} in network.allow; this machine's own servers on any port. A server a command starts listens on this machine's network, where other machines may reach it",
                     crate::egress::KNOWN_HOSTS.len()
                 ),
                 Level::Good,
@@ -1103,9 +1126,12 @@ mod tests {
         crate::sandbox::allow_landlock_network_for_session();
         let home = std::env::temp_dir().join(format!("bwn-posture-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("NEXUS_HOME", &home);
-        let cwd = home.join("proj");
+        // Outside bwn's own folder, which is a store: a workspace inside it
+        // would leave it readable (and the row would not list stores).
+        let cwd = std::env::temp_dir().join(format!("bwn-posture-keys-proj-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
         let mode0 = crate::sandbox::mode();
         crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
         if crate::sandbox::backend().is_none() {
@@ -1131,6 +1157,7 @@ mod tests {
         crate::sandbox::set_mode(mode0);
         std::env::remove_var("NEXUS_HOME");
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cwd);
         crate::sandbox::forget_landlock_network();
     }
 }
