@@ -69,7 +69,7 @@ class Script(unittest.TestCase):
 
     def test_without_tools_the_command_comes_in_a_fenced_block(self) -> None:
         r = post(self.srv.url + "/chat/completions", {"messages": [{"role": "user", "content": "go"}]})
-        self.assertIn("```bash\necho one\n```", r["choices"][0]["message"]["content"])
+        self.assertIn("```bash\necho one\necho two\n```", r["choices"][0]["message"]["content"])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DONE_TEXT = "SCRIPT_DONE"
+FENCE_LEAD = "Scripted step, run this:"
 
 # Shell-running tool names, most specific first. Matched case-insensitively
 # against the tool names a harness offers.
@@ -183,13 +184,21 @@ class Handler(BaseHTTPRequestHandler):
         if tool is None and not payload.get("tools"):
             # A harness that offers no tools (Aider) runs shell commands it
             # finds in a fenced block, when its unattended flag says yes.
-            # Steps are counted by the assistant turns already taken.
-            done = sum(1 for m in payload.get("messages") or [] if isinstance(m, dict) and m.get("role") == "assistant")
+            # Steps are counted by this model's own earlier replies; a
+            # harness's prompt can hold example assistant turns of its own.
+            done = sum(
+                1
+                for m in payload.get("messages") or []
+                if isinstance(m, dict) and m.get("role") == "assistant" and FENCE_LEAD in str(m.get("content"))
+            )
+            # Such a harness runs one reply's block and doesn't send the
+            # output back, so the whole script goes in one block, a line per step.
             with srv.lock:
-                step = srv.script[done] if done < len(srv.script) else None
-                if step is not None:
-                    srv.calls.append({"step": done, "tool": "fenced-block", "command": step})
-            text = f"Running this:\n\n```bash\n{step}\n```\n" if step is not None else DONE_TEXT
+                steps = srv.script if done == 0 else []
+                for i, st in enumerate(steps):
+                    srv.calls.append({"step": i, "tool": "fenced-block", "command": st})
+            block = "\n".join(steps)
+            text = f"{FENCE_LEAD}\n\n```bash\n{block}\n```\n" if steps else DONE_TEXT
             self._text(responses, stream, text)
             return
         if step is None or tool is None:
