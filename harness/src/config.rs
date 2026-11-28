@@ -275,6 +275,11 @@ pub enum CheckSpec {
         /// output. Removed before the command runs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// The files this check is for (roadmap 4.3): it runs only when a
+        /// changed file matches one of these globs (`*.css`, `web/*`),
+        /// matched against its path or its name. Left out: every change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paths: Option<Vec<String>>,
     },
 }
 
@@ -298,6 +303,14 @@ impl CheckSpec {
 }
 
 impl CheckSpec {
+    /// The globs naming the files this check is for; empty for every change.
+    pub fn paths(&self) -> Vec<String> {
+        match self {
+            CheckSpec::Named { paths: Some(p), .. } => p.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The report a check produces: (format, fail_on, output file), when
     /// its result is read from a report rather than its exit status.
     pub fn report(&self) -> Option<(String, String, Option<String>)> {

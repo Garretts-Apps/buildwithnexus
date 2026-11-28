@@ -7,6 +7,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Checks per kind of file (roadmap 4.3).** A `checks` entry's `paths`
+  globs (`["*.css"]`) run it only when a matching file changed; its verdict
+  counts like any check's.
 - **The model's questions reach the person in the editor and in chat
   turns.** Under ACP the question tool was always refused for want of a
   terminal; now the editor answers it as a choice between the model's

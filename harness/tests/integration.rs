@@ -12922,3 +12922,49 @@ fn acp_the_startup_check_is_answered_in_the_editor() {
         let _ = acp.close();
     }
 }
+
+// Roadmap 4.3 (CP-2): checks for kinds of files, picked by the changed
+// paths. A seeded failure in each artifact type blocks; a change to a file
+// no check is for runs none of them.
+#[test]
+fn per_artifact_checks_run_for_their_files_and_block() {
+    if !npm_available() {
+        eprintln!("skipping: node not installed");
+        return;
+    }
+    let fails_if_bad = |file: &str| {
+        format!(
+            "node -e \"process.exit(require('fs').readFileSync('{file}','utf8').includes('bad')?1:0)\""
+        )
+    };
+    let checks = json!([
+        {"name": "styles", "command": fails_if_bad("style.css"), "paths": ["*.css"]},
+        {"name": "scripts", "command": fails_if_bad("app.js"), "paths": ["*.js"]},
+    ]);
+    let go = |file: &str, content: &str| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        add_user_setting(&home, "checks", checks.clone());
+        run(&home, &cwd, "edit")
+    };
+    let r = go("style.css", "body { color: bad }");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("styles FAILED"));
+    assert!(!r.text_of("tool_result").contains("scripts"));
+    let r = go("app.js", "bad()");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    assert!(r.text_of("tool_result").contains("scripts FAILED"));
+    let r = go("README.md", "notes");
+    assert!(r.success, "{}", r.text_of("tool_result"));
+    assert!(r
+        .text_of("tool_result")
+        .contains("no checks configured for the changed files"));
+}

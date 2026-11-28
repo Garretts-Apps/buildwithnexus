@@ -23,6 +23,11 @@ rewrites the `package.json` script they run fails them. A project's `checks` run
 code, so like its hooks they wait until you trust the file; until then bwn
 runs the checks it detects.
 
+A check can be for some files only: `"paths": ["*.css", "web/*"]` runs it
+when a changed file's path or name matches one of the globs, so styles,
+scripts or templates each get their own checks. A check without `paths`
+runs for every change.
+
 A check can be read from a scanner's report instead of its exit status:
 `"format": "sarif"` (SARIF 2.1.0) or `"json"` (a list of findings), with
 `"fail_on"` the lowest SARIF level that fails (`error` by default) and

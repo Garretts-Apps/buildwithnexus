@@ -4375,6 +4375,8 @@ struct WorkCheck {
     cmd: String,
     /// Read from a report, not the exit status (roadmap 3.4).
     report: Option<Report>,
+    /// Globs of the files it is for; empty for every change (roadmap 4.3).
+    paths: Vec<String>,
 }
 
 /// How a check's report is read: SARIF 2.1.0 or JSON findings, the lowest
@@ -4514,6 +4516,7 @@ fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
                     WorkCheck {
                         label: "secrets (gitleaks)".into(),
                         kind: "security",
+                        paths: Vec::new(),
                         cmd: format!(
                             "gitleaks detect --no-git --no-banner --source . --report-format json --report-path '{}' --exit-code 0",
                             r.display()
@@ -4527,6 +4530,7 @@ fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
                 WorkCheck {
                     label: "SAST (semgrep)".into(),
                     kind: "security",
+                    paths: Vec::new(),
                     // The changed files go on the end (run_check_plan).
                     cmd: "semgrep scan --sarif --quiet --metrics=off --config auto".into(),
                     report: Some(Report {
@@ -4541,6 +4545,7 @@ fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
                 WorkCheck {
                     label: "configuration (trivy config)".into(),
                     kind: "security",
+                    paths: Vec::new(),
                     cmd: "trivy config --format sarif --quiet .".into(),
                     report: Some(Report {
                         sarif: true,
@@ -4557,6 +4562,7 @@ fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
                 WorkCheck {
                     label: "SBOM (syft)".into(),
                     kind: "security",
+                    paths: Vec::new(),
                     cmd: "syft scan dir:. -q -o cyclonedx-json -o cyclonedx-json=bom.json".into(),
                     report: Some(Report {
                         sarif: false,
@@ -4570,6 +4576,7 @@ fn gate_checks(gates: &[String]) -> Vec<(WorkCheck, bool)> {
                 WorkCheck {
                     label: "dependencies (osv-scanner)".into(),
                     kind: "security",
+                    paths: Vec::new(),
                     cmd: "osv-scanner scan source --format json -r .".into(),
                     report: Some(Report {
                         sarif: false,
@@ -4620,9 +4627,10 @@ pub fn check_plan(cwd: &Path) -> CheckPlan {
         Some(list) => CheckPlan {
             checks: list
                 .iter()
-                .map(|c| (c.parts(), c.report()))
-                .filter(|((_, _, cmd), _)| !cmd.trim().is_empty())
-                .map(|((label, kind, cmd), report)| WorkCheck {
+                .map(|c| (c.parts(), c.report(), c.paths()))
+                .filter(|((_, _, cmd), _, _)| !cmd.trim().is_empty())
+                .map(|((label, kind, cmd), report, paths)| WorkCheck {
+                    paths,
                     report: report.map(|(f, fail_on, output)| Report {
                         sarif: f != "json",
                         fail_on: sarif_rank(&fail_on).max(1),
@@ -4758,9 +4766,38 @@ pub fn run_check_plan(pinned: &CheckPlan, cwd: &Path, changed: &[String]) -> Out
     if pinned.configured && pinned.checks.is_empty() && gates.is_empty() {
         return ok("check_work: no checks configured (the `checks` setting is empty).");
     }
+    // A check for some files only runs when one of them changed (roadmap
+    // 4.3): matched against each changed file's path and name.
+    let rels: Vec<String> = changed
+        .iter()
+        .map(|f| {
+            Path::new(f)
+                .strip_prefix(cwd)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| f.replace('\\', "/"))
+        })
+        .collect();
+    let applies = |c: &WorkCheck| {
+        c.paths.is_empty()
+            || rels.iter().any(|r| {
+                let name = r.rsplit('/').next().unwrap_or(r);
+                c.paths
+                    .iter()
+                    .any(|g| crate::hooks::glob_match(g, r) || crate::hooks::glob_match(g, name))
+            })
+    };
     // The gates are checks read from a report: one that can't run leaves
     // no report and fails.
-    let all: Vec<WorkCheck> = pinned.checks.iter().cloned().chain(gates).collect();
+    let all: Vec<WorkCheck> = pinned
+        .checks
+        .iter()
+        .filter(|c| applies(c))
+        .cloned()
+        .chain(gates)
+        .collect();
+    if pinned.configured && all.is_empty() {
+        return ok("check_work: no checks configured for the changed files.");
+    }
     run_checks(&all, cwd, pinned.configured)
 }
 
@@ -4825,18 +4862,21 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "build",
                 cmd: owned("cargo build --quiet"),
                 report: None,
+                paths: Vec::new(),
             },
             WorkCheck {
                 label: owned("cargo test"),
                 kind: "test",
                 cmd: owned("cargo test --quiet"),
                 report: None,
+                paths: Vec::new(),
             },
             WorkCheck {
                 label: owned("cargo clippy"),
                 kind: "lint",
                 cmd: owned("cargo clippy --quiet -- -D warnings"),
                 report: None,
+                paths: Vec::new(),
             },
         ];
     }
@@ -4857,6 +4897,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "build",
                 cmd: format!("{pm} run typecheck"),
                 report: None,
+                paths: Vec::new(),
             });
         }
         if has_script("build") {
@@ -4865,6 +4906,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "build",
                 cmd: format!("{pm} run build"),
                 report: None,
+                paths: Vec::new(),
             });
         }
         if has_script("test") {
@@ -4873,6 +4915,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "test",
                 cmd: format!("{pm} test"),
                 report: None,
+                paths: Vec::new(),
             });
         }
         if has_script("lint") {
@@ -4881,6 +4924,7 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "lint",
                 cmd: format!("{pm} run lint"),
                 report: None,
+                paths: Vec::new(),
             });
         }
         return checks;
@@ -4892,18 +4936,21 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "build",
                 cmd: owned("go build ./..."),
                 report: None,
+                paths: Vec::new(),
             },
             WorkCheck {
                 label: owned("go test"),
                 kind: "test",
                 cmd: owned("go test ./..."),
                 report: None,
+                paths: Vec::new(),
             },
             WorkCheck {
                 label: owned("go vet"),
                 kind: "lint",
                 cmd: owned("go vet ./..."),
                 report: None,
+                paths: Vec::new(),
             },
         ];
     }
@@ -4919,12 +4966,14 @@ fn detect_checks(cwd: &Path) -> Vec<WorkCheck> {
                 kind: "test",
                 cmd: owned("python -m pytest -q"),
                 report: None,
+                paths: Vec::new(),
             },
             WorkCheck {
                 label: owned("ruff"),
                 kind: "lint",
                 cmd: owned("ruff check ."),
                 report: None,
+                paths: Vec::new(),
             },
         ];
     }
@@ -4954,6 +5003,7 @@ fn run_check_work(input: &Value, cwd: &Path) -> Outcome {
             kind: "custom",
             cmd: cmd.to_string(),
             report: None,
+            paths: Vec::new(),
         };
         return run_checks(&[one], cwd, false);
     }
