@@ -988,10 +988,22 @@ fn dir_names(dir: &Path) -> HashSet<String> {
 /// only the second). An empty value counts as unset. Every `~` in bwn goes
 /// through here, so one platform rule covers them all.
 pub(crate) fn user_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(h) = TEST_USER_HOME.with(|h| h.borrow().clone()) {
+        return Some(h);
+    }
     let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
     set("HOME")
         .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+// A fake home folder for one test thread, so a test that needs one doesn't
+// change HOME under the tests running beside it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_USER_HOME: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn tilde(path: &Path) -> String {

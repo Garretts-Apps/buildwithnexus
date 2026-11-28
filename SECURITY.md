@@ -536,6 +536,8 @@ this table applies.
 | SSH agent socket unreachable | Yes | Yes while the network is checked or off: only TCP sockets, in the session's private network namespace | Only while the network is checked or off | Yes | `invariant_bwrap_agent_socket_is_unreachable`, `invariant_userns_limits_the_network_to_the_proxy`, `invariant_netns_command_reaches_only_the_checker`, `landlock_limits_the_network_to_the_proxy`, `seatbelt_profile_denies_reads_of_hidden_paths` |
 | Network only through the host checker | Yes where bwn can make the session's private network namespace: bubblewrap starts in it, as on the namespace backend. Where it can't (a setuid bubblewrap with unprivileged namespaces off), through the checker held by port, so the checker's port on another address also connects. Only plain TCP sockets. No network if bwn's own binary can't be found | Yes: each command joins the session's private network namespace, which holds only loopback and the checker, on any Landlock ABI. Only plain TCP sockets; no DNS. Through the checker, `localhost` is the namespace, not this machine. Servers a command starts reach later commands and bwn's own tools (fetch, `wait_for_url`, `screenshot_url`), not model providers | No network, unless the user allows it for the session (`/sandbox network`, `--sandbox-network`): Landlock alone holds a command by port only, and no private network namespace is possible here. Once allowed, with Landlock ABI 4 (kernel 6.7), as bubblewrap | Yes | `bwrap_limits_the_network_to_the_proxy`, `invariant_bwrap_netns_command_reaches_only_the_checker`, `invariant_bwrap_netns_screenshot_reaches_a_server_a_command_started`, `landlock_limits_the_network_to_the_proxy`, `invariant_userns_limits_the_network_to_the_proxy`, `seatbelt_limits_the_network_to_the_proxy`, `invariant_m8b_no_network_limiter_means_no_network`, `invariant_sec1_mptcp_socket_is_refused_under_the_proxy`, `invariant_m8c_x32_syscalls_are_refused`, `invariant_landlock_alone_has_no_network_until_allowed`, `invariant_netns_command_reaches_only_the_checker`, `invariant_netns_checker_does_not_reach_host_loopback`, `invariant_netns_holds_when_its_holder_dies`, `invariant_netns_command_cannot_join_the_host_or_read_the_holder`, `invariant_netns_tools_reach_session_servers_and_providers_do_not`, `invariant_netns_screenshot_reaches_a_server_a_command_started` |
 | No inbound connections | Yes in the session's private network namespace. Where bwn can't make one, no: a command can listen on this machine's network, and the posture check says so | Yes: nothing outside the session's namespace can connect in; a server there answers later commands and bwn's own tools only | No: a command can listen on this machine's network; the posture check says so | No | `invariant_netns_servers_persist_and_only_the_session_reaches_them`, `invariant_bwrap_netns_listener_is_not_reachable_from_the_host`; not guaranteed elsewhere |
+| Stdio MCP servers and hooks confined like commands | Yes, unless the entry sets `"sandbox": false` (the posture check names it). Hook scripts in bwn's own folder and compiled Rust hooks run outside: the sandbox hides that folder | Yes, as bubblewrap | Yes, as bubblewrap | Yes, as bubblewrap | `invariant_ih1_an_extension_starts_inside_the_sandbox`, `invariant_ih1_a_stdio_server_starts_inside_the_sandbox`, `invariant_ih1_a_hook_runs_inside_the_sandbox` |
+| File tools refuse hidden credential stores | Yes, whatever a person answers; bwn's own skills, agents and commands stay readable | Yes, as bubblewrap | Yes, as bubblewrap | Yes, as bubblewrap | `invariant_ih1_file_tools_follow_the_hidden_store_policy` |
 | Provider keys and tokens stripped from the environment | Yes | Yes | Yes | Yes (and with no backend) | `sandboxed_children_lose_sockets_and_provider_keys` |
 | Older kernels | n/a | As Landlock alone, except the network: the private namespace holds it on every ABI, so commands get the checker below ABI 4 too. The namespace needs `mount_setattr` (kernel 5.12), which every Landlock kernel has | ABI 1 (5.13 to 5.18, Ubuntu 22.04) and ABI 2 (5.19 to 6.1, Debian 12): writes, credential stores and no-network hold. Landlock can't confine truncation there, so seccomp refuses `truncate(2)` and a read-only `open` with `O_TRUNC`, inside the workspace too (write-mode truncation — `: > file`, `ftruncate`, opening for writing with `O_TRUNC` — still works, because Landlock confines it); the posture check says so. Confirmed on 5.15 and 6.1 | n/a | `a_confined_command_can_write_inside_and_not_outside`, `invariant_m2_a_confined_command_cannot_truncate_outside`, `invariant_m2_seccomp_refuses_truncate_below_abi_3`, `invariant_m2_seccomp_refuses_otrunc_open_below_abi3`, `invariant_userns_confines_metadata_outside`, run in 5.15 and 6.1 VMs |
 
@@ -606,9 +608,25 @@ entirely; `"sandbox_egress_check": false` removes the checker.
 Data can still leave through an allowed host (publishing a package, for
 example), which is why the credential files are hidden as well.
 
-The sandbox does not confine: other reads (including a project's `.env`),
-the agent's own file tools (which are fenced to the working directory and the
-added folders by the permission gate instead), hooks and MCP servers.
+The sandbox does not confine other reads, including a project's `.env`. It
+does not confine the agent's own file tools either: the permission gate
+fences them to the working directory and the added folders instead. With the
+sandbox on, though, the file tools refuse a hidden credential store, as
+commands do, whatever a person answers. Reads under bwn's own `skills`,
+`agents` and `commands` folders stay allowed.
+
+Stdio MCP servers and command and script hooks start inside the sandbox,
+like a command. An entry with `"sandbox": false` runs outside it, and the
+posture check names that entry. So does a hook script in bwn's own folder
+(`~/.buildwithnexus/hooks/`) and a compiled Rust hook: the sandbox hides
+that folder from what it runs. HTTP hooks and HTTP MCP servers are bwn's own
+requests, not processes. With the sandbox off, or with no backend under
+`auto`, they run as before. Under `require` with no backend they are
+refused.
+
+A server or hook that needs more than a command gets — writing its own cache
+under your home folder, or reaching a host the checker doesn't allow — needs
+`"sandbox": false` on its entry.
 `start_server` runs inside it when it is on (directly, not in tmux, since a
 tmux server would run the command outside it). It never approves anything; it
 only limits what an already-approved command can touch. For untrusted work,

@@ -768,9 +768,9 @@ Credential files (`~/.ssh`, `~/.aws`, `~/.netrc`, …, the SSH agent) are
 hidden, and the network goes only through a host checker (on Landlock alone,
 only after `/sandbox network`). A posture check asks first. [Details](https://github.com/Garretts-Apps/buildwithnexus/blob/main/SECURITY.md#permission-gates-and-the-optional-sandbox).
 
-**Not confined:** other reads, the agent's own file tools, hooks, MCP
-servers, `start_server`. The sandbox never approves anything — the gate is
-unchanged; it only limits what an approved command can touch. Sandboxed
+**Not confined:** other reads and file tools (they refuse hidden stores).
+Hooks and stdio MCP servers run inside unless set `"sandbox": false`. The
+sandbox approves nothing. Sandboxed
 commands are marked `[sandboxed]`; `/sandbox status` and `buildwithnexus
 doctor` show the backend. To escape for one command, use `/sandbox off`.
 

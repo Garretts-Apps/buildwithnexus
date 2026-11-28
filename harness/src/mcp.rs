@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -68,6 +68,10 @@ pub struct ServerConfig {
     pub exclude_tools: Vec<String>,
     /// `oauth`: a pre-registered client for `mcp login` (http only).
     pub oauth: crate::mcp_auth::OAuthSettings,
+    /// `"sandbox": false`: a stdio server runs outside the sandbox. It runs
+    /// inside by default (roadmap 2.4), and the posture check names any
+    /// that doesn't.
+    pub unconfined: bool,
 }
 
 impl ServerConfig {
@@ -212,6 +216,11 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
     }
     let oauth = crate::mcp_auth::parse_settings(name, obj.get("oauth"))?;
     let enabled = obj.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let unconfined = match obj.get("sandbox") {
+        None | Some(Value::Null) | Some(Value::Bool(true)) => false,
+        Some(Value::Bool(false)) => true,
+        Some(_) => return Err(format!("mcp_servers.{name}: sandbox must be true or false")),
+    };
     let trust_read_only_hints = obj
         .get("trust_read_only_hints")
         .and_then(Value::as_bool)
@@ -229,6 +238,7 @@ pub fn parse_server(name: &str, v: &Value) -> Result<ServerConfig, String> {
         include_tools,
         exclude_tools,
         oauth,
+        unconfined,
     })
 }
 
@@ -505,17 +515,19 @@ impl StdioConn {
         args: &[String],
         env: &[(String, String)],
         timeout: Duration,
+        unconfined: bool,
+        cwd: &std::path::Path,
     ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
-        // A stdio server no longer inherits the provider keys and other
-        // credential-shaped variables (the same set run_command strips):
-        // a server is third-party code and gets only the secrets meant for
-        // it. Those come from the entry's own `env` map, applied after the
-        // scrub so a declared variable always reaches it, or from
+        // Inside the sandbox, like a command, unless the entry says
+        // `"sandbox": false` (roadmap 2.4). Either way a stdio server no
+        // longer inherits the provider keys and other credential-shaped
+        // variables (the same set run_command strips): a server is
+        // third-party code and gets only the secrets meant for it. Those
+        // come from the entry's own `env` map, applied after the scrub so a
+        // declared variable always reaches it, or from
         // `shell_env_passthrough` for a variable to inherit from the shell.
-        crate::sandbox::scrub_credentials(&mut cmd);
+        let mut cmd = crate::sandbox::extension_command(command, args, cwd, unconfined, true)?;
         let mut child = cmd
-            .args(args)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1339,9 +1351,17 @@ fn list_optional<T>(
 // `mcp login` opens a browser.
 fn connect(cfg: &ServerConfig) -> Result<Connected, Status> {
     let mut conn: Box<dyn Rpc> = match &cfg.transport {
-        Transport::Stdio { command, args, env } => {
-            Box::new(StdioConn::spawn(command, args, env, cfg.timeout).map_err(Status::Failed)?)
-        }
+        Transport::Stdio { command, args, env } => Box::new(
+            StdioConn::spawn(
+                command,
+                args,
+                env,
+                cfg.timeout,
+                cfg.unconfined,
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            )
+            .map_err(Status::Failed)?,
+        ),
         Transport::Http { url, headers } => {
             Box::new(HttpConn::new(url, headers, cfg.timeout).with_oauth(&cfg.name))
         }
@@ -2500,6 +2520,60 @@ fn manage_lines(
 
 #[cfg(test)]
 mod tests {
+    // IH-1 for stdio MCP servers (roadmap 2.4): the server's process starts
+    // inside the sandbox by default; `"sandbox": false` runs it as before.
+    #[cfg(unix)]
+    #[test]
+    fn invariant_ih1_a_stdio_server_starts_inside_the_sandbox() {
+        crate::sandbox::tests::with_confined_home("mcp", |home, ws, outside| {
+            let script = format!(
+                "cat '{}/.ssh/id_test' > '{}/leak.txt' 2>/dev/null; echo x > '{}/w.txt' 2>/dev/null; cat >/dev/null",
+                home.display(),
+                ws.display(),
+                outside.display()
+            );
+            let spawn = |unconfined: bool| {
+                let c = super::StdioConn::spawn(
+                    "sh",
+                    &["-c".to_string(), script.clone()],
+                    &[],
+                    std::time::Duration::from_secs(5),
+                    unconfined,
+                    ws,
+                )
+                .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                drop(c);
+            };
+            spawn(false);
+            let leaked = std::fs::read_to_string(ws.join("leak.txt")).unwrap_or_default();
+            let wrote = outside.join("w.txt").exists();
+            spawn(true);
+            let open = std::fs::read_to_string(ws.join("leak.txt")).unwrap_or_default();
+            assert!(
+                !leaked.contains("KEY-MATERIAL"),
+                "the server read the store"
+            );
+            assert!(!wrote, "the server wrote outside");
+            assert!(
+                open.contains("KEY-MATERIAL"),
+                "sandbox: false still confined"
+            );
+        });
+    }
+
+    #[test]
+    fn a_servers_sandbox_key_is_read() {
+        let off = super::parse_server("a", &serde_json::json!({"command": "x", "sandbox": false}))
+            .unwrap();
+        assert!(off.unconfined);
+        let on = super::parse_server("a", &serde_json::json!({"command": "x"})).unwrap();
+        assert!(!on.unconfined);
+        assert!(
+            super::parse_server("a", &serde_json::json!({"command": "x", "sandbox": "no"}))
+                .is_err()
+        );
+    }
     use super::*;
     use std::io::Cursor;
 
@@ -2511,7 +2585,7 @@ mod tests {
     // The Store `python3` stub spawns and exits non-zero. These fixtures need
     // a real interpreter; without one the test is skipped rather than failed.
     fn python3_runs() -> bool {
-        Command::new("python3")
+        std::process::Command::new("python3")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2521,7 +2595,15 @@ mod tests {
     }
 
     fn fixture_conn(timeout: Duration) -> StdioConn {
-        StdioConn::spawn("python3", &[FIXTURE.to_string()], &[], timeout).expect("spawn fixture")
+        StdioConn::spawn(
+            "python3",
+            &[FIXTURE.to_string()],
+            &[],
+            timeout,
+            false,
+            &std::env::temp_dir(),
+        )
+        .expect("spawn fixture")
     }
 
     // ── config ──────────────────────────────────────────────────────────
@@ -3114,6 +3196,8 @@ mod tests {
             &[],
             &[],
             Duration::from_secs(1),
+            false,
+            &std::env::temp_dir(),
         )
         .err()
         .unwrap();
@@ -3144,6 +3228,8 @@ mod tests {
             &["-c".to_string(), script.to_string()],
             env,
             Duration::from_secs(10),
+            false,
+            &std::env::temp_dir(),
         )
         .expect("spawn sh")
     }

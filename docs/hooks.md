@@ -49,7 +49,15 @@ interpreter, not executable, a `.rs` hook that does not compile) or is killed by
 a signal. Any other non-zero exit is shown with the end of its stderr and
 does not block, unless the hook sets `"on_error": "deny"`, which makes a
 crashing guard block the call. Other events never block on a failed hook, but
-the failure is shown. Matchers are `*`, an exact tool name, or a
+the failure is shown.
+
+Command and script hooks run inside the sandbox, like a command. A hook that
+needs more than a command gets sets `"sandbox": false` to run outside it:
+for example, one that writes under your home folder or posts to a chat
+service the checker doesn't allow. The posture check names every hook that
+runs outside, including scripts in `~/.buildwithnexus/hooks/` and compiled
+`.rs` hooks. Those always run outside, because the sandbox hides bwn's own
+folder. Matchers are `*`, an exact tool name, or a
 `|`-separated list; each segment may use `*` and `?` wildcards (`"*_file"`,
 `"mcp__*"`, or Claude Code's `"mcp__.*"`). Claude Code tool names stand for
 the bwn tools that do the same thing: `Bash` (`run_command`, `bash`,
