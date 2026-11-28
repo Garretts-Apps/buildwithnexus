@@ -2324,7 +2324,20 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(proj.join(".buildwithnexus")).unwrap();
     std::env::set_var("NEXUS_HOME", &home);
-    let old_cwd = std::env::current_dir().unwrap();
+    // Other tests set the process-wide sandbox mode; on a machine with no
+    // backend (Windows) that would put this thread in restricted mode, where
+    // every command asks. This test is about trust, not the sandbox.
+    crate::sandbox::TEST_MODE.with(|m| m.set(Some(crate::sandbox::Mode::Off)));
+    // Put the cwd back even if an assertion fails, so no later test runs in
+    // this project.
+    struct Back(std::path::PathBuf);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+            crate::sandbox::TEST_MODE.with(|m| m.set(None));
+        }
+    }
+    let _back = Back(std::env::current_dir().unwrap());
     std::env::set_current_dir(&proj).unwrap();
     let script = proj.join(".buildwithnexus/check.sh");
     std::fs::write(&script, "#!/bin/sh\necho ok-1\n").unwrap();
@@ -2362,7 +2375,7 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     // Trust withdrawn by removing the store: refused again at once.
     std::fs::remove_file(home.join("trusted.json")).unwrap();
     assert!(gated(&make).0.is_some());
-    std::env::set_current_dir(old_cwd).unwrap();
+    drop(_back);
     std::env::remove_var("NEXUS_HOME");
     if base != real {
         let _ = std::fs::remove_file(&base);
