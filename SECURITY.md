@@ -480,6 +480,26 @@ A property test checks that every child policy is within its parent for
 random policies. The policy does not change what happens with no sandbox
 backend, which is still covered by the gate and the posture check.
 
+## Decision Log
+
+Every gate decision, approval, session exception, startup-check acceptance
+and verification result goes into a per-session log,
+`~/.buildwithnexus/audit/<session>.jsonl`. Each line records the time, the
+actor (`user`, `hook`, `gate`, `policy`, `flag`, `check`), the decision, the
+tool or subject, and the reason or what the call acted on. Text is redacted
+for key-like tokens and capped.
+
+Each line also carries the SHA-256 of the line before it. `bwn-audit-verify
+<log>` is a separate program that shares no code with the writer. It lists
+the decisions and reports a deleted, edited, inserted or reordered line.
+Given `--head`, a head recorded elsewhere, it also reports a log cut short
+or rewritten with a consistent chain.
+
+Sandboxed commands can't read or write the log: it is in bwn's own folder.
+A process outside the sandbox, running as you, can rewrite the whole file.
+Anchoring the head outside that reach is the next step: the OS keyring, and
+a commit trailer when bwn commits.
+
 ## Permission Gates and the Optional Sandbox
 
 `ask` / `accept-edits` / `auto` / `readonly` modes, allow, ask and deny

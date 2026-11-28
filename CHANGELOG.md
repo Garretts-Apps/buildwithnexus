@@ -7,6 +7,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **A decision log for every session.** Gate decisions, approvals, session
+  exceptions, startup-check acceptances and verification results go to
+  `~/.buildwithnexus/audit/<session>.jsonl`, one hash-chained line each.
+  Text in it is redacted and capped. The new `bwn-audit-verify` program
+  lists the decisions and finds a deleted, edited or reordered line.
 - **Stdio MCP servers and hooks start inside the sandbox.** They used to
   run outside every control. Now a server's or hook's process gets what a
   command gets: writes only in the workspace and temp folders, credential

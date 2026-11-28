@@ -478,6 +478,13 @@ fn ask_unconfined_exception(perm: Permission, cwd: &Path) -> Option<String> {
     let answer = confirm_tool(&label, "unconfined commands", cwd);
     SESSION_EXCEPTION.with(|o| o.set(false));
     ONE_CHANGE.with(|o| o.set(false));
+    crate::audit::record(crate::audit::Entry {
+        kind: crate::audit::Kind::Exception,
+        actor: "user",
+        decision: if answer.is_some() { "deny" } else { "allow" },
+        subject: "unconfined commands",
+        detail: &label,
+    });
     match answer {
         None => {
             crate::sandbox::allow_unconfined_for_session();
@@ -598,12 +605,24 @@ fn confirm_call(
     // trust is worked out afresh from here on.
     hooks::suspend_trust_memo();
     let watching = crate::debug_panel::enter_permission(label);
-    let decided = match hooks::permission_request(name, input, label, cwd) {
-        PreDecision::Allow => None,
-        PreDecision::Deny(r) => Some(r),
-        PreDecision::Continue => confirm_tool(label, tool_key, cwd),
+    let (decided, actor) = match hooks::permission_request(name, input, label, cwd) {
+        PreDecision::Allow => (None, "hook"),
+        PreDecision::Deny(r) => (Some(r), "hook"),
+        PreDecision::Continue => (confirm_tool(label, tool_key, cwd), "user"),
     };
     crate::debug_panel::leave_permission(watching);
+    // No one there to ask: the refusal is the policy's, not a person's.
+    let actor = match &decided {
+        Some(r) if actor == "user" && r.starts_with("blocked (no interactive terminal") => "policy",
+        _ => actor,
+    };
+    crate::audit::record(crate::audit::Entry {
+        kind: crate::audit::Kind::Approval,
+        actor,
+        decision: if decided.is_some() { "deny" } else { "allow" },
+        subject: name,
+        detail: label,
+    });
     decided
 }
 
@@ -1749,6 +1768,11 @@ fn gate_after_hook(
     input: &serde_json::Value,
     cwd: &Path,
 ) -> Option<String> {
+    // Who answered, for the decision log (roadmap 2.5).
+    let actor = match &decision {
+        PreDecision::Deny(_) | PreDecision::Allow => "hook",
+        PreDecision::Continue => "gate",
+    };
     // The project's trust is worked out once for the whole decision (see
     // hooks::with_trust_memo).
     let reason = hooks::with_trust_memo(|| match decision {
@@ -1774,7 +1798,23 @@ fn gate_after_hook(
     if crate::debug_panel::armed() {
         crate::debug_panel::permission(name, reason.as_deref());
     }
+    crate::audit::record(crate::audit::Entry {
+        kind: crate::audit::Kind::Gate,
+        actor,
+        decision: if reason.is_some() { "deny" } else { "allow" },
+        subject: name,
+        detail: reason
+            .as_deref()
+            .unwrap_or_else(|| call_summary(name, input).unwrap_or("")),
+    });
     reason
+}
+
+// What a call acts on, for the decision log: its command, path or host.
+fn call_summary<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    tools::command_arg_for(name, input)
+        .or_else(|| input["path"].as_str())
+        .or_else(|| input["url"].as_str())
 }
 
 // Public compact helper for the /compact REPL command.
