@@ -70,11 +70,15 @@ fn key() -> Option<(Vec<u8>, bool)> {
     if let Some(k) = existing.as_deref().and_then(decode) {
         return Some((k, false));
     }
-    // A key file that's there but doesn't read as a key is not replaced:
-    // nothing can be checked against it, and making a new one would make
-    // every sealed store read as rewritten.
+    // A key file that's there (perhaps made since the read above) is read
+    // again, and one that doesn't read as a key is not replaced: making a
+    // new one would make every sealed store read as rewritten.
     if ring.is_none() && key_file().exists() {
-        return None;
+        return std::fs::read_to_string(key_file())
+            .ok()
+            .as_deref()
+            .and_then(decode)
+            .map(|k| (k, false));
     }
     let mut fresh = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut fresh).ok()?;
@@ -88,7 +92,7 @@ fn key() -> Option<(Vec<u8>, bool)> {
             // catching a half-written file) must not each make a key, or
             // the stores the first sealed read as rewritten. The one that
             // loses uses the key that won.
-            let tmp = key_file().with_extension(format!("key.{}", std::process::id()));
+            let tmp = key_file().with_extension(format!("key.{}.{}", std::process::id(), &hex[..8]));
             let linked = write_private(&tmp, &hex) && std::fs::hard_link(&tmp, key_file()).is_ok();
             let _ = std::fs::remove_file(&tmp);
             if !linked {
