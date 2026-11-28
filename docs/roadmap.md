@@ -172,38 +172,71 @@ suite before release.
 
 | # | Item | Acceptance |
 |---|---|---|
-| 4.1 | A parity audit against the backlog below, scoring each row against the current releases of the leading harnesses. It turns *To verify* rows into shipped, partial or gap. | Backlog table updated with sources |
+| 4.1 | A parity audit against the backlog below, scoring each row against the current releases of the leading harnesses. It turns *To verify* rows into shipped, partial or gap. Done 2026-11-28: every row has a status and sources; the new rows are ranked for 4.6. | Backlog table updated with sources |
 | 4.2 | CP-1: editor, ACP and headless parity. One suite of gate decisions gives the same answers through the terminal, ACP and `--json`. The question tool and the startup check are answerable in all three.  In progress. Done: `gate_decisions_are_the_same_in_json_and_acp` runs one table (read, edit, command, a dangerous command, read-only, a deny rule, across ask, auto and readonly) through `--json` and ACP and gets the same allow, ask or deny in both; the terminal shares the gate function. The question tool is answered in the editor as a choice between its options (`acp_the_question_tool_is_answered_in_the_editor`; it was refused for want of a terminal, and a chat turn reported it unknown in every interface). The startup check is asked in the editor before the first model request, and a refusal keeps the turn from the model (`acp_the_startup_check_is_answered_in_the_editor`). Complete when this row's PR passes CI. | Cross-interface decision suite |
 | 4.3 | CP-2: per-artifact verification. A project file maps artifact types to checks, the harness picks them by changed paths, and the verdicts feed 3.1.  Done: a `checks` entry takes `paths` globs, matched against each changed file's path and name; the matching checks run in the mandatory round and their verdicts are the 3.1 verdict. `per_artifact_checks_run_for_their_files_and_block` seeds a failure in a stylesheet and a script and changes a README. Complete when this row's PR passes CI. | Each artifact type has a seeded failure that blocks |
 | 4.4 | CP-3: Bedrock, Vertex and Azure credential flows, signed in-tree (no vendor SDKs), with keys bound to their endpoints. Subscription sign-in only after the providers' terms for third-party clients are read. | Credentials never reach commands (IH-1); the endpoint is shown in the startup check |
 | 4.5 | Context management: compaction controls and policy (thresholds, what is kept, untrusted labels kept through compaction). Done: the summary of turns that read untrusted text carries the label a resumed session looks for (`invariant_ih3_the_untrusted_mark_survives_compaction_and_resume`, which fails without it); the `compaction` setting sets the threshold (`threshold_percent`, held to 20–95, default 80) and what stays verbatim (`keep_recent`, at least 2) (`the_compaction_setting_moves_the_threshold_and_the_kept_tail`). Complete when this row's PR passes CI. | The untrusted mark survives compaction and resume |
-| 4.6 | Backlog items the audit ranks highest, each as its own item with tests. | Per item |
+| 4.6 | Backlog items the audit ranks highest, each as its own item with tests. In progress. Done: `/voice` reads only the transcript whisper writes in this run, never a file beside the audio (`invariant_in1_a_planted_transcript_is_never_the_voice_input`). Model routing per role: an agent file's `model:` runs that helper on its own model at the session's endpoint (`an_agent_files_model_runs_that_helper`). Next, in the audit's order: LSP diagnostics, plugins as one unit, a fallback model. | Per item |
 
 **Dependencies:** needs Milestone 3 for 4.3. 4.2 can start after
 Milestone 2.
 
 #### Parity backlog
 
-"Today" is from the README and the analysis; *To verify* rows are confirmed
-in 4.1.
+Audited in 4.1 (2026-11-28) against bwn's code and the other harnesses'
+current documentation. Numbers in brackets are the sources listed below.
 
-| Capability | Today | Note |
+| Capability | bwn today | Others | Note |
+|---|---|---|---|
+| Manual compaction | Shipped (`/compact`) | Copilot CLI, also automatic [3]; Codex (unverified) [9] | |
+| Compaction controls | Shipped (4.5: the `compaction` setting; untrusted labels survive it) | OpenCode `compaction.auto/keep/buffer` [6]; Claude Code summarizes from a checkpoint [11] | |
+| Model routing per role (helpers, compaction, review) | Partial: an agent file's `model:` routes its helper (4.6); compaction and review use the session model | Claude Code subagent `model:` [2]; Aider `--weak-model`, `--editor-model` [5]; OpenCode per-agent model [6] | Each route's endpoint in the startup check |
+| Session branching | Partial: `/fork`, `/rewind`; no parent link or tree | Claude Code `/branch`, `--fork-session` [11]; Codex `codex fork` (unverified) [9] | A browsable tree is the gap |
+| Checkpoints and undo | Shipped | Claude Code `/rewind` [11]; Gemini CLI `/restore`, off by default [12] | Shell changes aren't checkpointed, as in Claude Code [11] |
+| Plugins: skills, hooks, MCP servers and agents as one unit | Gap: `plugins` is parsed and trust-classified but nothing loads it | Claude Code plugins [1]; Gemini CLI extensions [4]; Codex plugins [10] | Local and trust-gated; no marketplace |
+| Images | Shipped (paste, `read_file`) | Codex `--image` [10] | |
+| PDFs, audio, video | Partial: PDFs as text (pdftotext), video as ffmpeg frames, audio through a local whisper in `/voice` | Gemini CLI `read_file` reads images, audio and PDFs [7] | `/voice` sent a transcript file a checkout could plant; fixed in 4.6 |
+| Browser automation beyond `screenshot_url` | Partial: `screenshot_url` is loopback-only; `headless_browser` fetches text | Claude Code Chrome integration [8] | Needs the browser surface in the invariant suite |
+| Editor integration | Shipped (4.2: ACP; questions and the startup check answered in the editor) | Copilot CLI ACP [3] | |
+| Bedrock, Vertex, Azure; subscription sign-in | Gap | Claude Code Bedrock, Vertex, Foundry [13]; Crush Bedrock, Vertex, Azure [14]; Gemini CLI Vertex and Google sign-in [15] | 4.4 |
+| Cross-session memory | Partial: hand-written `memory.md`, AGENTS.md, a project knowledge base | Claude Code auto memory [16]; Copilot Memory [3] | Milestone 5: treated as untrusted content |
+| Background agents | Partial: timed workflows while bwn is open | Claude Code background subagents [2]; Codex `codex cloud` [10]; Copilot `--cloud` [3] | Milestone 5 |
+| Reasoning effort control | Shipped (`/effort`) | Claude Code `/effort` [17] | |
+| Headless JSON contract | Shipped | | |
+
+Found by the audit and not in the backlog before, ranked for 4.6 by how
+many of the leading harnesses ship them and how much they matter for
+professional use:
+
+| Capability | bwn today | Others |
 |---|---|---|
-| Manual compaction | Shipped (`/compact`) | |
-| Compaction controls (thresholds, retention rules, per-session policy) | To verify | Untrusted labels must survive it (4.5) |
-| Model routing (a different model per role: helpers, compaction, review, planning) | To verify | Each route's endpoint shown in the startup check |
-| Session branching | Partial: `/fork`, `/rewind` | A browsable session tree is the gap |
-| Checkpoints and undo | Shipped | Shell changes are not checkpointed |
-| Plugins: skills, hooks, MCP servers and agents installed as one unit | To verify | Local and trust-gated; a marketplace is deprioritized by the mandate |
-| Images | Shipped (paste, `read_file`) | |
-| Other multimodal input (PDFs, audio, video frames) | To verify | Video through ffmpeg exists for attachments |
-| Browser automation beyond `screenshot_url` | Partial | Needs the fetch and browser surface in the invariant suite |
-| Editor integration | Partial (ACP; the question tool gets no answer) | 4.2 |
-| Bedrock, Vertex, Azure; subscription sign-in | Gap | 4.4 |
-| Cross-session memory | Partial (`/memory`, AGENTS.md) | Milestone 5: treated as untrusted content |
-| Background agents | Partial (timed workflows) | Milestone 5 |
-| Reasoning effort control | Shipped (`/effort`) | |
-| Headless JSON contract | Shipped | |
+| LSP diagnostics fed back to the model | Gap | OpenCode [18], Crush [14] |
+| Model routing per role (above) | Gap | Claude Code [2], Aider [5], OpenCode [6] |
+| Plugins as one unit (above) | Gap | Claude Code [1], Gemini CLI [4], Codex [10] |
+| A fallback model on outages and rate limits | Gap | Claude Code `fallbackModel` [17] |
+| Cloud or remote delegation | Gap | Codex `codex cloud` [10], Copilot `--cloud` [3] |
+| A browser with the user's signed-in session | Gap | Claude Code Chrome [8] |
+| Hooks, custom subagents, custom commands and skills, web search | Shipped | Claude Code [1][2], Copilot [3], Gemini CLI [4], Codex [10] |
+
+Sources: [1] https://code.claude.com/docs/en/plugins [2]
+https://code.claude.com/docs/en/sub-agents [3]
+https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli [4]
+https://geminicli.com/docs/extensions/ [5]
+https://aider.chat/docs/config/options.html [6]
+https://opencode.ai/docs/config/ [7]
+https://geminicli.com/docs/tools/file-system/ [8]
+https://code.claude.com/docs/en/chrome [9]
+https://developers.openai.com/codex/glossary (search results only,
+unverified) [10] https://developers.openai.com/codex/cli/features [11]
+https://code.claude.com/docs/en/checkpointing [12]
+https://geminicli.com/docs/cli/checkpointing/ [13]
+https://code.claude.com/docs/en/third-party-integrations [14]
+https://github.com/charmbracelet/crush [15]
+https://geminicli.com/docs/get-started/authentication/ [16]
+https://code.claude.com/docs/en/memory [17]
+https://code.claude.com/docs/en/settings [18]
+https://opencode.ai/docs/lsp/
 
 ### Milestone 5: secure autonomous engineering
 

@@ -12968,3 +12968,37 @@ fn per_artifact_checks_run_for_their_files_and_block() {
         .text_of("tool_result")
         .contains("no checks configured for the changed files"));
 }
+
+// Roadmap 4.6 (model routing per role): an agent file's `model:` runs that
+// helper on its own model at the session's endpoint; the parent keeps its.
+#[test]
+fn an_agent_files_model_runs_that_helper() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    std::fs::write(
+        home.join("agents/scout.md"),
+        "---\nname: scout\ndescription: Looks around\nmodel: small-model\n---\nLook around.\n",
+    )
+    .unwrap();
+    let (port, posts) = serve_recording(vec![
+        tool_call("c1", "task", json!({"task": "look", "role": "scout"})),
+        finish("scouted"),
+        finish("done"),
+    ]);
+    write_big_context_config(&home, port);
+    let r = run(&home, &cwd, "send the scout");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let models: Vec<String> = posts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|b| serde_json::from_str::<Value>(b).ok())
+        .filter_map(|v| v["model"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        models,
+        ["test-model", "small-model", "test-model"],
+        "{models:?}"
+    );
+}

@@ -2310,6 +2310,9 @@ pub struct AgentDef {
     /// `read_only: true`: it may read and search but never change anything.
     /// Read-only helpers started from the same reply run side by side.
     pub read_only: bool,
+    /// `model:` the helper runs on, on the session's endpoint; None (or
+    /// `inherit`) is the session's model (roadmap 4.6).
+    pub model: Option<String>,
     pub prompt: String,
     pub path: PathBuf,
 }
@@ -2366,6 +2369,10 @@ fn parse_agent_file(path: &Path, text: &str) -> Option<AgentDef> {
         name,
         tools,
         read_only,
+        model: fm
+            .get("model")
+            .map(|m| m.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+            .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("inherit")),
         prompt: body.trim().to_string(),
         path: path.to_path_buf(),
     })

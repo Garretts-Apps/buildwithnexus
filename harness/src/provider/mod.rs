@@ -38,6 +38,25 @@ pub struct Provider {
     pub ollama_ctx: std::sync::OnceLock<Option<u32>>,
 }
 
+impl Provider {
+    /// The same endpoint, key and settings with another model (an agent
+    /// file's `model:`, roadmap 4.6). The endpoint is unchanged, so what
+    /// the startup check showed still holds.
+    pub fn with_model(&self, model: &str) -> Provider {
+        Provider {
+            protocol: self.protocol,
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: model.to_string(),
+            context_tokens: self.context_tokens,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            effort: self.effort,
+            ollama_ctx: std::sync::OnceLock::new(),
+        }
+    }
+}
+
 // Neutral conversation. The provider translates this into each vendor's shape;
 // the rest of the program never sees vendor JSON. Serializable + cloneable so a
 // transcript can be persisted to a session file and restored on resume.

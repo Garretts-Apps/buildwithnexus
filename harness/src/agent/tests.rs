@@ -273,6 +273,7 @@ fn a_helper_reads_only_when_the_call_its_agent_file_or_the_session_says_so() {
         description: String::new(),
         tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
         read_only,
+        model: None,
         prompt: String::new(),
         path: PathBuf::new(),
     };
