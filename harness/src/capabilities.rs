@@ -83,6 +83,16 @@ pub const CAPABILITIES: &[Cap] = &[
         tests: &[(UN, "invariant_userns_hides_store_names"), (UN, "invariant_userns_command_cannot_undo_the_mounts"), (BW, "bwrap_hides_credential_stores"), (LL, "landlock_hides_credential_stores"), (LL, "invariant_m5_landlock_does_not_list_hidden_store_names"), (LL, "landlock_credential_names_leak_via_stat"), (SB, "seatbelt_hides_credential_stores")],
     },
     Cap {
+        id: "keychain_unreachable",
+        guarantee: "The OS keychain unreachable",
+        bwrap: "Not claimed: the Secret Service on the session bus is not tested here (bubblewrap's `/run` is empty and the bus address is stripped)",
+        userns: "Not claimed: as bubblewrap, and the bus socket may be reachable with the network open",
+        landlock: "Not claimed: as the namespace backend",
+        seatbelt: "Yes: the keychain daemon's services are refused, so a command can't read an item, git's stored GitHub token included",
+        proven_by: "`invariant_seatbelt_keychain_is_unreachable` (it read the item back before the fix)",
+        tests: &[(SB, "invariant_seatbelt_keychain_is_unreachable")],
+    },
+    Cap {
         id: "store_contains_workspace",
         guarantee: "A store that contains the workspace hidden",
         bwrap: "No: the posture check says the stores are readable and auto mode asks before commands",

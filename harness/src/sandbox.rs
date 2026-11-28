@@ -1032,6 +1032,9 @@ fn sbpl_quote(p: &Path) -> String {
 /// workspace and the temp dirs. Callers pass realpath'd paths so `/var/…`
 /// and `/private/var/…` agree.
 /// Folders added with --add-dir (`extra`) are writable like the workspace.
+/// The keychain daemon's services, refused to commands (see seatbelt_profile).
+const KEYCHAIN_DENY: &str = "(deny mach-lookup\n  (global-name \"com.apple.SecurityServer\")\n  (global-name \"com.apple.securityd.xpc\")\n  (global-name \"com.apple.security.agent\")\n  (global-name \"com.apple.security.authhost\"))\n";
+
 pub fn seatbelt_profile(
     cwd: &Path,
     extra: &[PathBuf],
@@ -1063,6 +1066,11 @@ pub fn seatbelt_profile(
         }
     }
     p.push_str(")\n(deny appleevent-send)\n");
+    // The keychain: an item trusts the program that made it, so a command
+    // running that program (`security`, git's credential-osxkeychain) would
+    // read it back. Certificate trust for TLS goes through trustd, which
+    // stays reachable.
+    p.push_str(KEYCHAIN_DENY);
     match net {
         Net::Off | Net::Private(_) => p.push_str("(deny network*)\n"),
         // Out only to the proxy on loopback; listening and accepting stay
@@ -1851,6 +1859,10 @@ pub(crate) mod tests {
         );
         assert!(p.contains("(subpath \"/private/var/w/my \\\"proj\\\"/.buildwithnexus\")"));
         assert!(p.contains("(deny appleevent-send)"));
+        assert!(
+            p.contains("(global-name \"com.apple.SecurityServer\")"),
+            "{p}"
+        );
         assert!(!p.contains("network"));
         let no_net = seatbelt_profile(Path::new("/w"), &[], None, Net::Off, &[]);
         assert!(no_net.ends_with("(deny network*)\n"));
@@ -2354,6 +2366,69 @@ pub(crate) mod tests {
 
     // Real Seatbelt (macOS runners): a hidden folder and file cannot be
     // read, a hidden socket cannot be connected to, and the rest reads.
+    // Real Seatbelt (macOS runners): the keychain holds credentials too
+    // (git's GitHub token through credential-osxkeychain, and bwn's own
+    // decision-log key, roadmap 2.5). An item's access list trusts the
+    // program that made it, so a sandboxed command running that program
+    // would read it back unless the profile cuts off the keychain service.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invariant_seatbelt_keychain_is_unreachable() {
+        let svc = format!("bwn-test-keychain-{}", std::process::id());
+        let made = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-s",
+                &svc,
+                "-a",
+                "bwn",
+                "-w",
+                "KEYCHAIN-SECRET",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("skip: no writable keychain here");
+            return;
+        }
+        // Readable outside the sandbox, so a refusal inside means something.
+        let outside = Command::new("security")
+            .args(["find-generic-password", "-s", &svc, "-w"])
+            .output()
+            .unwrap();
+        let ws = std::env::temp_dir().join(format!("bwn-sb-kc-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let inside = Command::new("sandbox-exec")
+            .args([
+                "-p",
+                &seatbelt_profile(&ws, &[], None, Net::Off, &[]),
+                "security",
+                "find-generic-password",
+                "-s",
+                &svc,
+                "-w",
+            ])
+            .current_dir(&ws)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let _ = Command::new("security")
+            .args(["delete-generic-password", "-s", &svc])
+            .output();
+        let _ = std::fs::remove_dir_all(&ws);
+        assert!(
+            String::from_utf8_lossy(&outside.stdout).contains("KEYCHAIN-SECRET"),
+            "{outside:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&inside.stdout).contains("KEYCHAIN-SECRET"),
+            "a sandboxed command read the keychain: {inside:?}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_hides_credential_stores() {
