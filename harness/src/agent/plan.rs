@@ -102,7 +102,9 @@ pub fn plan_turn(
     } else if let Some(ask) = REMOTE_APPROVER.get() {
         match ask(RemoteAsk::Plan { steps: &steps }) {
             RemoteAnswer::Once | RemoteAnswer::Always => {}
-            RemoteAnswer::Reject | RemoteAnswer::Cancelled => return Ok(PlanEnd::Cancelled),
+            RemoteAnswer::Reject | RemoteAnswer::Cancelled | RemoteAnswer::Chose(_) => {
+                return Ok(PlanEnd::Cancelled)
+            }
         }
     } else {
         let items = vec![

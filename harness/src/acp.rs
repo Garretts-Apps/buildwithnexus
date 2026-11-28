@@ -1405,6 +1405,25 @@ fn on_question(q: RemoteAsk) -> RemoteAnswer {
                 None => RemoteAnswer::Cancelled,
             }
         }
+        RemoteAsk::Question { question, options } => {
+            let choices: Vec<Value> = options
+                .iter()
+                .enumerate()
+                .map(|(i, o)| option(&format!("answer_{i}"), o, "allow_once"))
+                .collect();
+            let asked = ask_editor(json!({"title": question, "kind": "other"}), choices);
+            let picked = asked
+                .option
+                .as_deref()
+                .and_then(|o| o.strip_prefix("answer_"))
+                .and_then(|i| i.parse::<usize>().ok());
+            close_question(asked.made, picked.is_some());
+            match picked {
+                Some(i) => RemoteAnswer::Chose(i),
+                None if asked.option.is_some() => RemoteAnswer::Reject,
+                None => RemoteAnswer::Cancelled,
+            }
+        }
         RemoteAsk::Plan { steps } => {
             let plan: String = steps
                 .iter()

@@ -12848,3 +12848,42 @@ fn gate_decisions_are_the_same_in_json_and_acp() {
         assert_eq!(acp_d, want, "ACP {label}");
     }
 }
+
+// Roadmap 4.2: under ACP the model's question tool is answered in the
+// editor, as a choice between its options; the model gets the pick.
+#[test]
+fn acp_the_question_tool_is_answered_in_the_editor() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let (port, posts) = serve_sse(vec![
+        tool_call(
+            "q1",
+            "question",
+            json!({"question": "Which file?", "options": ["A.txt", "B.txt"]}),
+        ),
+        text("ok"),
+    ]);
+    write_config(&home, "llamacpp", "ask", port);
+    // A window large enough that the question tool is offered.
+    add_user_setting(&home, "context_tokens", json!(200_000));
+    let mut acp = Acp::start(&home, &cwd, &[]);
+    acp_init(&mut acp, json!({}));
+    let sid = acp_new_session(&mut acp, &cwd);
+    let mut pick_second = |req: &Value| {
+        assert_eq!(req["method"], "session/request_permission", "{req}");
+        let opts = req["params"]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2, "{req}");
+        assert_eq!(opts[1]["name"], "B.txt");
+        json!({"outcome": {"outcome": "selected", "optionId": opts[1]["optionId"]}})
+    };
+    let done = acp.call("session/prompt", prompt(&sid, "ask me"), &mut pick_second);
+    assert_eq!(
+        done["result"]["stopReason"],
+        "end_turn",
+        "{done}; {}",
+        acp.stderr()
+    );
+    let second = posts.lock().unwrap()[1].clone();
+    assert!(second.contains("The user answered: B.txt"), "{second}");
+    let _ = acp.close();
+}

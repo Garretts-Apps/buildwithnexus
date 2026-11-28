@@ -1591,6 +1591,30 @@ pub(super) fn answer_question(input: &serde_json::Value) -> (String, bool) {
     }
 
     let full_prompt = format!("{}{}", question, options_str);
+    // Under ACP the editor answers (roadmap 4.2): one of the options, or
+    // yes or no when the model gave none.
+    let mut opts: Vec<String> = input["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            o.as_str()
+                .or_else(|| o["label"].as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    if opts.is_empty() {
+        opts = vec!["Yes".into(), "No".into()];
+    }
+    if let Some(answer) = super::ask_remote_question(question, &opts) {
+        return match answer {
+            Some(a) => (format!("The user answered: {a}"), false),
+            None => {
+                stop_turn();
+                (STOPPED_BY_USER.into(), true)
+            }
+        };
+    }
     if report::is_json() || !std::io::stdin().is_terminal() {
         return (
             format!("blocked (no interactive terminal to answer question: {full_prompt})"),

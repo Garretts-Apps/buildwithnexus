@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **The model's questions reach the person in the editor and in chat
+  turns.** Under ACP the question tool was always refused for want of a
+  terminal; now the editor answers it as a choice between the model's
+  options (yes or no when it gave none). In a conversational turn the tool
+  was reported as unknown in every interface; it now asks, as in the
+  others.
 - **`compaction` setting (roadmap 4.5).** `{"threshold_percent": 60,
   "keep_recent": 10}` compacts at 60% of the model's context and keeps the
   last 10 messages verbatim (defaults 80 and 6).
