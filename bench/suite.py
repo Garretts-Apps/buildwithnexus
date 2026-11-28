@@ -708,39 +708,6 @@ def measure_prompt(cmd: dict, installs: dict) -> dict:
         env["BWN_NO_AUTO_UPDATE"] = "1"
     extra = (PINS.get("prompts") or {}).get(cmd["id"]) or {}
     argv = argv + list(extra.get("args") or [])
-    if cmd["id"] == "copilot":
-        # Copilot CLI's own BYOK variables (`copilot help environment`):
-        # an OpenAI-compatible provider, offline, so it needs no GitHub
-        # sign-in and reaches nothing but the mock.
-        env.update({
-            "COPILOT_OFFLINE": "true",
-            "COPILOT_PROVIDER_BASE_URL": base_url,
-            "COPILOT_PROVIDER_TYPE": "openai",
-            "COPILOT_PROVIDER_API_KEY": "sk-bench",
-            "COPILOT_MODEL": "bench",
-        })
-        return {
-            "argv": argv + ["-p", TASK_TEXT, "--allow-all"],
-            "env": env,
-            "cwd": str(cwd),
-            "methodology": methodology
-            + " Copilot CLI is pointed at the mock with COPILOT_PROVIDER_BASE_URL and COPILOT_OFFLINE.",
-        }
-    if cmd["id"] == "crush":
-        # A crushrc in the tool's own HOME adds the mock as a provider.
-        rc = home / ".config" / "crush" / "crushrc"
-        rc.parent.mkdir(parents=True, exist_ok=True)
-        rc.write_text(
-            f'provider add bench --type completions --base-url "{base_url}" --api-key "sk-bench"\n'
-            "model add bench/bench --name bench --context-window 8000 --default-max-tokens 100\n"
-        )
-        return {
-            "argv": argv + ["run", "-q", "-m", "bench/bench", TASK_TEXT],
-            "env": env,
-            "cwd": str(cwd),
-            "methodology": methodology
-            + " Crush is pointed at the mock with a crushrc that adds it as an OpenAI-compatible provider.",
-        }
     if cmd["id"] == "aider":
         env["OPENAI_API_KEY"] = "sk-bench"
     if cmd["id"] == "codex":
@@ -951,6 +918,39 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
             "cwd": str(cwd),
             "methodology": methodology
             + " Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1.",
+        }
+    if cmd["id"] == "copilot":
+        # Copilot CLI's own BYOK variables (`copilot help environment`):
+        # an OpenAI-compatible provider, offline, so it needs no GitHub
+        # sign-in and reaches nothing but the mock.
+        env.update({
+            "COPILOT_OFFLINE": "true",
+            "COPILOT_PROVIDER_BASE_URL": base_url,
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_API_KEY": "sk-bench",
+            "COPILOT_MODEL": "bench",
+        })
+        return {
+            "argv": argv + ["-p", TASK_TEXT, "--allow-all"],
+            "env": env,
+            "cwd": str(cwd),
+            "methodology": methodology
+            + " Copilot CLI is pointed at the mock with COPILOT_PROVIDER_BASE_URL and COPILOT_OFFLINE.",
+        }
+    if cmd["id"] == "crush":
+        # A crushrc in the tool's own HOME adds the mock as a provider.
+        rc = home / ".config" / "crush" / "crushrc"
+        rc.parent.mkdir(parents=True, exist_ok=True)
+        rc.write_text(
+            f'provider add bench --type completions --base-url "{base_url}" --api-key "sk-bench"\n'
+            "model add bench/bench --name bench --context-window 8000 --default-max-tokens 100\n"
+        )
+        return {
+            "argv": argv + ["run", "-q", "-m", "bench/bench", TASK_TEXT],
+            "env": env,
+            "cwd": str(cwd),
+            "methodology": methodology
+            + " Crush is pointed at the mock with a crushrc that adds it as an OpenAI-compatible provider.",
         }
     if cmd["id"] == "aider":
         env["OPENAI_API_KEY"] = "sk-bench"
