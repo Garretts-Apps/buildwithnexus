@@ -74,10 +74,13 @@ jobs:
           [[ "$BRANCH" =~ ^bwn/cloud-[A-Za-z0-9._-]+$ ]] || { echo "::error::not a cloud branch: $BRANCH"; exit 1; }
           echo "NEXUS_HOME=$RUNNER_TEMP/bwn-home" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v4
+      # No token is left in .git/config: the agent and its model can read
+      # that file. Only the publish step gets one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.base }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Start the branch
         env:
@@ -87,7 +90,7 @@ jobs:
           git config user.name "bwn cloud agent"
           git config user.email "bwn-cloud@users.noreply.github.com"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
 
@@ -108,9 +111,13 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CUSTOM_API_KEY: ${{ secrets.CUSTOM_API_KEY }}
 
+      # What passed its checks is committed, so it is published whatever the
+      # run's outcome. The token reaches git through its environment only.
       - name: Push the branch and its evidence
+        if: ${{ !cancelled() }}
         env:
           BRANCH: ${{ inputs.branch }}
+          GH_TOKEN: ${{ github.token }}
         run: bwn bg publish "$BRANCH"
 "#;
 
@@ -202,11 +209,38 @@ pub fn dispatch(cwd: &Path, task: &str) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    remember(&branch, &head)?;
     Ok(format!(
         "cloud agent dispatched on {} from {}: when its run finishes (`gh run list --workflow bwn-cloud.yml`), `buildwithnexus bg fetch {branch}` brings it back and `bg merge {branch}` merges what verifies",
         branch,
         &head[..12.min(head.len())]
     ))
+}
+
+// Cloud branches this home dispatched, and the commit each started from:
+// `fetch` takes only these, so a branch someone else pushed under the
+// cloud prefix (with records that hash to their names, as anyone's can)
+// isn't brought in.
+fn dispatched_dir() -> std::path::PathBuf {
+    crate::config::home().join("cloud")
+}
+
+fn record_name(branch: &str) -> String {
+    branch.replace('/', "%")
+}
+
+fn remember(branch: &str, base: &str) -> Result<(), String> {
+    crate::config::ensure_home();
+    std::fs::create_dir_all(dispatched_dir()).map_err(|e| e.to_string())?;
+    let rec = serde_json::json!({"branch": branch, "base": base});
+    std::fs::write(dispatched_dir().join(record_name(branch)), rec.to_string())
+        .map_err(|e| e.to_string())
+}
+
+fn dispatched_base(branch: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dispatched_dir().join(record_name(branch))).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (v["branch"] == branch).then(|| v["base"].as_str().map(str::to_string))?
 }
 
 // The records the commits of HEAD not on any remote name.
@@ -253,16 +287,28 @@ pub fn publish(cwd: &Path, branch: &str) -> Result<String, String> {
     )?
     .trim()
     .to_string();
-    git(
-        cwd,
-        &[
-            "push",
-            "--force",
-            "origin",
-            &format!("HEAD:refs/heads/{branch}"),
-            &format!("{commit}:refs/heads/{EVIDENCE_PREFIX}{branch}"),
-        ],
-    )?;
+    let mut push = Command::new("git");
+    push.args(["-c", "core.fsmonitor=false", "push", "--force", "origin"])
+        .arg(format!("HEAD:refs/heads/{branch}"))
+        .arg(format!("{commit}:refs/heads/{EVIDENCE_PREFIX}{branch}"))
+        .current_dir(cwd)
+        .stdin(Stdio::null());
+    // On the runner the checkout keeps no credentials; the workflow hands
+    // this step its token, which goes to git as configuration in the
+    // environment, never on a command line or in .git/config.
+    if let Some(token) = std::env::var("GH_TOKEN").ok().filter(|t| !t.is_empty()) {
+        let auth = crate::net::base64(format!("x-access-token:{token}").as_bytes());
+        push.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+            .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {auth}"));
+    }
+    let o = push.output().map_err(|e| format!("cannot run git: {e}"))?;
+    if !o.status.success() {
+        return Err(format!(
+            "push failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ));
+    }
     Ok(format!(
         "pushed {branch} and {} evidence record(s) on {EVIDENCE_PREFIX}{branch}",
         hashes.len()
@@ -304,6 +350,9 @@ fn mktree(cwd: &Path, entries: &str) -> Result<String, String> {
 /// record only when its content hashes to its name.
 pub fn fetch(cwd: &Path, branch: &str) -> Result<String, String> {
     valid_branch(branch)?;
+    let base = dispatched_base(branch).ok_or_else(|| {
+        format!("`{branch}` wasn't dispatched from here (`bg run --cloud`); nothing fetched")
+    })?;
     let ev_ref = format!("refs/bwn-evidence/{branch}");
     git(
         cwd,
@@ -315,6 +364,24 @@ pub fn fetch(cwd: &Path, branch: &str) -> Result<String, String> {
             &format!("+refs/heads/{EVIDENCE_PREFIX}{branch}:{ev_ref}"),
         ],
     )?;
+    // The work must start from the commit it was dispatched on.
+    if git(
+        cwd,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &base,
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_err()
+    {
+        let _ = git(cwd, &["update-ref", "-d", &format!("refs/heads/{branch}")]);
+        return Err(format!(
+            "`{branch}` doesn't start from {}, the commit it was dispatched on; not kept",
+            &base[..12.min(base.len())]
+        ));
+    }
     let names = git(cwd, &["ls-tree", "--name-only", &ev_ref])?;
     let (mut kept, mut refused) = (0, Vec::new());
     for name in names.lines().filter(|l| !l.is_empty()) {
@@ -371,6 +438,29 @@ mod tests {
             }
         }
         assert!(wf.contains("^bwn/cloud-[A-Za-z0-9._-]+$"));
+        // The checkout keeps no credentials, and the token appears only in
+        // the publish step, after the agent has run.
+        assert!(wf.contains("persist-credentials: false"));
+        let publish = wf.find("- name: Push the branch and its evidence").unwrap();
+        assert!(
+            !wf[..publish].contains("github.token"),
+            "a token before the publish step"
+        );
+        assert_eq!(wf.matches("github.token").count(), 1);
+        // Actions are pinned by commit, as in the repository's own CI.
+        for line in wf.lines().filter(|l| l.contains("uses: actions/")) {
+            let sha = line
+                .split('@')
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert!(
+                sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{line}"
+            );
+        }
         assert!(wf.contains(&format!("buildwithnexus@v{}", env!("CARGO_PKG_VERSION"))));
     }
 

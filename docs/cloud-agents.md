@@ -1,5 +1,9 @@
 # Cloud background agents
 
+Needs bwn 0.22.0 or later on the runner: the workflow pins bwn's GitHub
+Action at the version that wrote it, and earlier versions have no
+`bg publish` and make no evidence records. 0.22.0 is not released yet.
+
 A cloud background agent runs on your repository's GitHub Actions runners
 instead of your machine. It works like `/bg`: it gets a branch of its own,
 it can't answer approvals, and its work comes back only through
@@ -62,9 +66,27 @@ the record's content hashes to its name, and says which ones it refused.
 merges only if all of them match. If records are missing, nothing is
 merged.
 
+`bg fetch` takes only a branch that `bg run --cloud` dispatched from this
+bwn home, and only when its history starts from the commit it was
+dispatched on. Anyone else's branch under `bwn/cloud-`, with records made
+to match it, isn't fetched.
+
 ## What a cloud record shows
 
 A record says what bwn saw on the runner, under the workflow's settings:
 the checks that ran there and their results. The merge still refuses a
-commit whose files don't match the record it names. The runner, its
-settings and its secrets are your repository's.
+commit whose files don't match the record it names.
+
+The hash check proves a record wasn't changed after it was made, not who
+made it. A record from your own machine was made by your bwn. A cloud
+record was made by whatever pushed the evidence branch. Normally that's
+the workflow, but anyone who can push to the repository could replace the
+branch and records of a dispatched run before you fetch them. Treat a
+cloud branch the way you treat a pull request from someone with push
+access.
+
+The checkout keeps no credentials while the agent runs. Only the publish
+step gets the job's token, and it passes the token to git through the
+environment.
+
+The runner, its settings and its secrets are your repository's.

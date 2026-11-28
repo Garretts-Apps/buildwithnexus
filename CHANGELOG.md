@@ -30,6 +30,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     keeping a record only when its content hashes to its name.
   - **Merging:** `bg merge` merges only when every commit verifies against
     its record, as for a local agent.
+  - **Only your own runs:** `bg fetch` takes only a branch this bwn home
+    dispatched, starting from the commit it was dispatched on.
+  - **Credentials:** the checkout keeps none while the agent runs; only the
+    publish step gets the job's token.
+  - **What the hash check proves:** it proves integrity, not who made the
+    record. Anyone with push access could replace a dispatched run's
+    branch and records before you fetch them.
   - **Setup:** see `docs/cloud-agents.md`.
 - **A browser with your signed-in session (roadmap 5.9).**
   `"signed_in_browser": {"profile": ..., "hosts": [...]}` adds a tool that

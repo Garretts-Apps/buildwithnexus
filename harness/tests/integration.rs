@@ -13753,6 +13753,68 @@ fn a_cloud_agents_branch_merges_only_with_its_fetched_evidence() {
         std::fs::read_to_string(user.join("new.txt")).unwrap(),
         "from the cloud\n"
     );
+    // A branch anyone with push access made under the cloud prefix, with a
+    // commit and a record that match each other, isn't fetched: this home
+    // didn't dispatch it.
+    let run_on = |b: &str, from: &[&str]| {
+        g(&runner, from);
+        g(&runner, &["switch", "-q", "-c", b]);
+        let port = serve(vec![
+            tool_call(
+                "c1",
+                "write_file",
+                json!({"path": "evil.txt", "content": "x\n"}),
+            ),
+            finish("done"),
+            finish("done"),
+        ]);
+        std::fs::write(
+            rhome.join("config.json"),
+            json!({
+                "provider": "ollama", "model": "test-model", "permission": "auto",
+                "base_url": format!("http://127.0.0.1:{port}/v1"), "sandbox": "off",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (code, said) = bwn(
+            &runner,
+            &rhome,
+            &["--json", "--accept-posture", "--auto-commit", "run", "x"],
+        );
+        assert_eq!(code, Some(0), "{said}");
+        let (code, said) = bwn(&runner, &rhome, &["bg", "publish", b]);
+        assert_eq!(code, Some(0), "{said}");
+    };
+    run_on("bwn/cloud-unasked", &["checkout", "-q", &base]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "fetch", "bwn/cloud-unasked"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("wasn't dispatched from here"), "{said}");
+    let (code, _) = bwn(&user, &uhome, &["bg", "merge", "bwn/cloud-unasked"]);
+    assert_eq!(code, Some(1));
+
+    // A dispatched branch whose history doesn't start from its base isn't kept.
+    g(&user, &["push", "-q", "origin", "main"]);
+    g(&user, &["fetch", "-q", "origin"]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "run", "--cloud", "another task"]);
+    assert_eq!(code, Some(0), "{said}");
+    let args = std::fs::read_to_string(uhome.join("gh-args")).unwrap();
+    let branch2 = args
+        .lines()
+        .find_map(|l| l.strip_prefix("branch="))
+        .unwrap()
+        .to_string();
+    g(&runner, &["checkout", "-q", "--orphan", "unrelated"]);
+    g(
+        &runner,
+        &["commit", "-q", "--allow-empty", "-m", "an unrelated root"],
+    );
+    run_on(&branch2, &["checkout", "-q", "unrelated"]);
+    let (code, said) = bwn(&user, &uhome, &["bg", "fetch", &branch2]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("doesn't start from"), "{said}");
+    let (code, _) = bwn(&user, &uhome, &["bg", "merge", &branch2]);
+    assert_eq!(code, Some(1));
 }
 
 // Roadmap 5.8 (SD-8): an experiment runs a task as several background
