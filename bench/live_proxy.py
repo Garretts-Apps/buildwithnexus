@@ -20,16 +20,22 @@ import json
 import os
 import ssl
 import threading
+import time
 import urllib.request
 
 
 class LiveProxy(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, upstream: str, model: str) -> None:
+    def __init__(self, upstream: str, model: str, retry_429: int = 0) -> None:
         super().__init__(("127.0.0.1", 0), Handler)
         self.upstream = upstream.rstrip("/")
         self.model = model
+        # Times to retry an upstream 429 before passing it on, with backoff.
+        # Off for the efficiency bench, where a harness's own retries are part
+        # of what is measured; on for task benchmarks, where a free model's
+        # burst limit would otherwise end a run before it starts.
+        self.retry_429 = retry_429
         self.requests: list[dict] = []
         self.lock = threading.Lock()
 
@@ -114,13 +120,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         ctx = ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or None)
         status, headers, body = 502, {}, b""
-        try:
-            with urllib.request.urlopen(req, timeout=300, context=ctx) as r:
-                status, headers, body = r.status, dict(r.headers), r.read()
-        except urllib.error.HTTPError as e:
-            status, headers, body = e.code, dict(e.headers), e.read()
-        except OSError as e:
-            body = json.dumps({"error": {"message": str(e)}}).encode()
+        retries = 0
+        for attempt in range(self.server.retry_429 + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=300, context=ctx) as r:
+                    status, headers, body = r.status, dict(r.headers), r.read()
+            except urllib.error.HTTPError as e:
+                status, headers, body = e.code, dict(e.headers), e.read()
+            except OSError as e:
+                status, body = 502, json.dumps({"error": {"message": str(e)}}).encode()
+            if status != 429 or attempt == self.server.retry_429:
+                break
+            retries += 1
+            time.sleep(min(60, 5 * 2**attempt))
         with self.server.lock:
             self.server.requests.append({
                 "path": self.path,
@@ -128,6 +140,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "request_bytes": len(raw),
                 "stream": streamed,
                 "usage": _usage_from(body, streamed),
+                "retried_429": retries,
             })
         self.send_response(status)
         self.send_header("content-type", headers.get("Content-Type", "application/json"))
@@ -136,7 +149,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def start(upstream: str, model: str) -> LiveProxy:
-    srv = LiveProxy(upstream, model)
+def start(upstream: str, model: str, retry_429: int = 0) -> LiveProxy:
+    srv = LiveProxy(upstream, model, retry_429)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
