@@ -128,6 +128,47 @@ machine, named in its `hardware.json`.
 Pinned versions change only by editing `pins.json` and rerunning. The runner
 exits if a binary's `--version` text does not contain its pin.
 
+## The fixed task against a live model
+
+`bench/live_task.py` runs the same one-line task once per harness against a
+real model. Every harness is pointed at `bench/live_proxy.py`, a local
+OpenAI-compatible endpoint. The proxy forwards each request to the upstream
+with the model replaced by the pinned one, so every harness talks to the
+same model whatever it was told. It keeps the token usage the upstream
+reports for each request. That way, tokens are counted the same way for
+every harness, not taken from each harness's own accounting.
+
+```bash
+python3 bench/live_task.py --model baidu/ernie-5.5-flash-preview:free
+```
+
+The upstream key never reaches the harnesses or the proxy process: the
+request carries a placeholder that this machine's egress proxy replaces,
+or `LIVE_API_KEY` names the key.
+
+- **Run order:** each harness runs once, with a pause between harnesses.
+- **Rate limits:** free models are rate-limited (OpenRouter: about 20
+  requests a minute and 50 a day).
+  - A row the upstream refused with 429 reads "rate-limited" and is retried
+    once after a longer pause.
+  - Requests the upstream refused are counted apart from the ones it
+    answered.
+- **Outcome labels:** an endpoint the upstream doesn't serve reads as that,
+  not as a harness failure.
+- **Wall time:** it includes the upstream's latency and each harness's own
+  retries, so it is not the startup or overhead figure of the mock bench.
+
+`bench/results/2026-11-28T15-10-23Z-live/` is the first run, against
+`baidu/ernie-5.5-flash-preview:free`.
+- **Every harness the bench can point at the endpoint finished the task.**
+  Claude Code and Gemini CLI can't be pointed at an OpenAI-compatible
+  endpoint.
+- **Prompt tokens:** Aider 717, bwn 4413, OpenCode 7181 (two requests),
+  Codex 8644, Copilot CLI 13483, Crush 15609 (four requests).
+- **Codex and OpenCode** were rerun with `--merge` after the proxy learned
+  to read Responses API usage.
+- **Aider's and Crush's byte totals** include requests the upstream refused.
+
 ## Security and engineering benchmarks
 
 These follow `docs/roadmap.md` (items 1.13 and 6.1) and the design in

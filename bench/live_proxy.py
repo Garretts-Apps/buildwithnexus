@@ -38,17 +38,33 @@ class LiveProxy(http.server.ThreadingHTTPServer):
         return f"http://127.0.0.1:{self.server_address[1]}/v1"
 
 
+def _usage_of(obj: object) -> dict | None:
+    """Usage from a chat completion or chunk (`usage`) or a Responses API
+    object or event (`usage`, or `response.usage`), as prompt and completion
+    tokens."""
+    if not isinstance(obj, dict):
+        return None
+    u = obj.get("usage")
+    if not u and isinstance(obj.get("response"), dict):
+        u = obj["response"].get("usage")
+    if not isinstance(u, dict):
+        return None
+    if "prompt_tokens" not in u and "input_tokens" in u:
+        u = {**u, "prompt_tokens": u.get("input_tokens", 0), "completion_tokens": u.get("output_tokens", 0)}
+    return u
+
+
 def _usage_from(body: bytes, streamed: bool) -> dict | None:
     if not streamed:
         try:
-            return json.loads(body).get("usage")
-        except (json.JSONDecodeError, AttributeError):
+            return _usage_of(json.loads(body))
+        except json.JSONDecodeError:
             return None
     usage = None
     for line in body.decode("utf-8", "replace").splitlines():
         if line.startswith("data:") and '"usage"' in line:
             try:
-                u = json.loads(line[5:].strip()).get("usage")
+                u = _usage_of(json.loads(line[5:].strip()))
             except json.JSONDecodeError:
                 continue
             if u:

@@ -1,0 +1,16 @@
+{
+  "timestamp_utc": "2026-11-28T15:01:36Z",
+  "date_utc": "2026-11-28",
+  "os": "Ubuntu 24.04.5 LTS",
+  "kernel": "6.18.44-fc-v880",
+  "arch": "x86_64",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+  "cpu_count": 4,
+  "bogomips": 4200.0,
+  "hypervisor": "KVM",
+  "mem_total_bytes": 16868675584,
+  "hyperfine": "hyperfine 1.18.0",
+  "gnu_time": "time (GNU Time) UNKNOWN",
+  "node": "v22.23.5",
+  "python": "3.13.18"
+}
