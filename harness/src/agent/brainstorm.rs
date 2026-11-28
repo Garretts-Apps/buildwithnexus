@@ -263,7 +263,7 @@ pub(super) fn brainstorm_reply(
             }
             if call.name == "save_memory" {
                 if let Some(note) = call_input["note"].as_str() {
-                    config::append_memory(note);
+                    config::append_model_memory(note, crate::agent::untrusted_read().is_some());
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
                     trace_tool_result(&call.name, &msg, false, "brainstorm", 0);

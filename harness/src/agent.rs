@@ -985,8 +985,15 @@ pub fn sync_untrusted(sid: &str, msgs: &[Msg]) {
             return;
         }
         u.sid = sid.to_string();
-        u.tool = untrusted_tool_in(msgs);
-        u.local = local_tool_in(msgs);
+        // The memory a session starts with is in its prompt: notes the
+        // model saved are text it may have taken from anywhere (roadmap
+        // 5.3).
+        let memory = crate::config::memory_provenance();
+        u.tool = untrusted_tool_in(msgs).or_else(|| {
+            (memory == Some(true))
+                .then(|| "memory (a note saved after reading untrusted text)".to_string())
+        });
+        u.local = local_tool_in(msgs).or_else(|| memory.is_some().then(|| "memory".to_string()));
     });
 }
 
@@ -2983,7 +2990,7 @@ fn build_turn(
             // Memory-save tool: the model can call save_memory to persist facts.
             if call.name == "save_memory" {
                 if let Some(note) = call_input["note"].as_str() {
-                    config::append_memory(note);
+                    config::append_model_memory(note, crate::agent::untrusted_read().is_some());
                     let msg = "memory saved".to_string();
                     report::tool_result(&call.name, &msg, false);
                     trace_tool_result(&call.name, &msg, false, "build", depth);

@@ -19,6 +19,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Memory the model saves is treated as its text (roadmap 5.3).**
+  - **When saved:** `save_memory` notes are tagged as the model's and
+    shown as they are saved. If the session had read someone else's text,
+    the tag says so. A note can't add an untagged line.
+  - **In a later session:** loaded memory gives the session the matching
+    mark from roadmap 5.1. Notes saved after reading untrusted text make
+    commands, fetches and MCP calls ask. The model's other notes make
+    fetches, MCP writes and CI edits ask.
+  - **Your own notes:** `/memory` entries mark nothing.
 - **Every tool result names its source, and auto mode acts on it (roadmap
   5.1).** Each result is labelled with where its text came from, and the
   label survives resume and compaction.

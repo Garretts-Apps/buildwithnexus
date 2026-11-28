@@ -752,6 +752,18 @@ file and through compaction, so a resumed session knows what it read:
   too. After a session reads any, auto mode asks before a fetch to a host
   you didn't name (this machine's own servers excepted) and before MCP
   calls that can change things. Sandboxed commands carry on.
+- **Memory:** a note the model saves with `save_memory` is tagged as the
+  model's when it is saved, and shown to you then. If the session had
+  read someone else's text, the tag says so too. Line breaks in a note
+  become spaces, so the model can't add an untagged line that reads as
+  yours. `memory.md` is in bwn's folder, which commands and file tools
+  can't reach.
+
+  A later session that loads the memory starts marked by it: notes saved
+  after reading untrusted text count as someone else's text, and the
+  model's other notes count as the project's own. The prompt tells the
+  model that tagged entries are data. Notes you add with `/memory` count
+  as yours.
 - **CI, hook and policy files:** after either kind of read, auto mode asks
   before an edit of one, whether through a file tool or a command that
   names it. The files are `.github`, `.gitlab-ci.yml`, `.circleci`,
