@@ -303,6 +303,18 @@ const KEYS: &[Key] = &[
         user: &[r#"["TERM"]"#, r#""x""#],
         project: &[r#"["AWS_SECRET_ACCESS_KEY"]"#, "5"],
     },
+    // A project's checks run code, and `[]` would switch checking off.
+    Key {
+        name: "checks",
+        class: Class::Trust,
+        user: &[
+            r#"["npm test"]"#,
+            r#"[{"name":"unit","command":"make test"}]"#,
+            "[]",
+            "5",
+        ],
+        project: &["[]", r#"["true"]"#, r#"[{"command":"./evil.sh"}]"#, "5"],
+    },
     Key {
         name: "sandbox_expose",
         class: Class::Trust,

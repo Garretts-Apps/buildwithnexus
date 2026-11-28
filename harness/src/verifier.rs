@@ -252,8 +252,11 @@ impl Verifier {
             _ => "blocked".to_string(),
         };
 
-        // 6. Determine overall status
-        if rule_violations
+        // 6. Determine overall status. Failing checks are a failure, not a
+        // warning (roadmap 3.1; analysis V7).
+        if ctx.tests_passed == Some(false) {
+            report.status = VerificationStatus::Failed;
+        } else if rule_violations
             .iter()
             .any(|v| v.severity == Severity::Critical || v.severity == Severity::High)
         {
@@ -462,7 +465,7 @@ mod tests {
             ..Default::default()
         });
         assert!(failed.tests_status.tests_run);
-        assert_eq!(failed.status, VerificationStatus::PassedWithWarnings);
+        assert_eq!(failed.status, VerificationStatus::Failed);
         assert!(failed
             .missing_evidence
             .iter()

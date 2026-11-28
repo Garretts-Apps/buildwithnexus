@@ -238,6 +238,39 @@ impl std::fmt::Display for Effort {
     }
 }
 
+/// One entry of `checks`: a command, or a command with a name and a kind
+/// (`build`, `test` or `lint`, for `check_work`'s `only`; default `test`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CheckSpec {
+    Command(String),
+    Named {
+        #[serde(default)]
+        name: Option<String>,
+        command: String,
+        #[serde(default)]
+        kind: Option<String>,
+    },
+}
+
+impl CheckSpec {
+    /// (label, kind, command).
+    pub fn parts(&self) -> (String, String, String) {
+        match self {
+            CheckSpec::Command(c) => (c.clone(), "test".into(), c.clone()),
+            CheckSpec::Named {
+                name,
+                command,
+                kind,
+            } => (
+                name.clone().unwrap_or_else(|| command.clone()),
+                kind.clone().unwrap_or_else(|| "test".into()),
+                command.clone(),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Preset id; empty means setup has not run (a hooks-only project file).
@@ -386,6 +419,11 @@ pub struct Settings {
     /// removed before a command runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shell_env_passthrough: Vec<String>,
+    /// The checks that must pass on a turn's changes (roadmap 3.1). Left
+    /// out, bwn detects them from the project's files; `[]` means none. A
+    /// project file's list waits for trust, like its hooks: it runs code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<CheckSpec>>,
     /// Credential stores sandboxed commands may read after all (`~/.ssh`,
     /// `~/.config/gh`, …). By default every store tools::credential_stores
     /// lists, bwn's own folder and the SSH agent's socket are hidden from
@@ -522,6 +560,7 @@ impl Default for Settings {
             permissions: PermissionRules::default(),
             network: NetworkRules::default(),
             shell_env_passthrough: Vec::new(),
+            checks: None,
             sandbox_expose: Vec::new(),
             endpoints: BTreeMap::new(),
             prices: BTreeMap::new(),

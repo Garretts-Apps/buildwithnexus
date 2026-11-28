@@ -2357,9 +2357,19 @@ fn a_gated_call_checks_project_trust_once_and_sees_every_change() {
     // refused with nobody to ask).
     assert!(gated(&make).0.is_some());
     crate::hooks::store_trust(&proj, &crate::config::untrusted_project_files(&proj));
+    // Nothing is left waiting for trust; if something is, say what.
+    let pending: Vec<(String, Vec<String>)> = crate::config::untrusted_project_files(&proj)
+        .into_iter()
+        .map(|f| (f.name.to_string(), f.keys))
+        .collect();
+    assert!(
+        pending.is_empty(),
+        "still untrusted after store_trust: {pending:?}; store: {:?}",
+        std::fs::read_to_string(home.join("trusted.json"))
+    );
     // Trusted: allowed by the project's rule on the very next call.
     let (r, digests) = gated(&make);
-    assert_eq!(r, None);
+    assert_eq!(r, None, "sandbox mode {:?}", crate::sandbox::mode());
     // One digest for the whole decision, though the rules and the saved
     // approvals each consult the project's settings.
     let (r, ls_digests) = gated(&json!({"command": "ls src"}));

@@ -2304,6 +2304,9 @@ struct TurnState {
     /// differs, whichever tool made it.
     tree_base: Option<crate::tree::Snapshot>,
     mandatory_pass: Option<crate::tree::Snapshot>,
+    /// The checks this turn's changes must pass, as they were when it
+    /// began: the turn can't rewrite them into passing.
+    check_plan: Option<tools::CheckPlan>,
     // The project's checks were refused for want of a terminal: asking
     // again at finish would only be refused again.
     checks_unapprovable: bool,
@@ -2401,6 +2404,7 @@ fn build_turn(
     let mut st = TurnState::default();
     if depth == 0 {
         st.tree_base = Some(crate::tree::take(cwd));
+        st.check_plan = Some(tools::check_plan(cwd));
     }
     // From here the loop only appends to the transcript, except where it
     // compacts, which resets the count.
@@ -2901,10 +2905,8 @@ fn build_turn(
                 _ => false,
             };
             if let (Some(base), Some(now)) = (&st.tree_base, &now) {
-                let top = crate::config::find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-                for k in now.changed_since(base) {
-                    let rel = k.split_once(':').map_or(k.as_str(), |(_, r)| r);
-                    let path = top.join(rel).display().to_string();
+                for p in crate::tree::changed_paths(base, now, cwd) {
+                    let path = p.display().to_string();
                     if !st.changed_files.contains(&path) {
                         st.changed_files.push(path);
                     }
@@ -2925,6 +2927,18 @@ fn build_turn(
                     Some((reason, no_terminal)) => {
                         report::tool_denied(&reason);
                         st.checks_unapprovable |= no_terminal;
+                        // A rule or hook that refuses the project's checks
+                        // leaves the change unverified: not a success
+                        // (analysis V6). Nobody to approve them is not a
+                        // refusal; the run says the checks were not run.
+                        if !no_terminal {
+                            report::note_denial(
+                                "check_work",
+                                "the project's checks",
+                                &reason,
+                                true,
+                            );
+                        }
                         report::notice(&if no_terminal {
                             format!("  {CHECKS_NOT_RUN}")
                         } else {
@@ -2933,9 +2947,15 @@ fn build_turn(
                         trace_tool_result("check_work", &reason, true, "build", depth);
                         None
                     }
-                    None => Some(tools::run("check_work", &input, cwd)),
+                    None => Some(match &st.check_plan {
+                        Some(plan) => tools::run_check_plan(plan, cwd),
+                        None => tools::run("check_work", &input, cwd),
+                    }),
                 };
                 if let Some(out) = &mut out {
+                    if out.content.contains("nothing ran") {
+                        report::notice("  checks were not run (every checker was missing)");
+                    }
                     post_tool_hooks("check_work", &input, out, cwd);
                     report::tool_result("check_work", &out.content, out.is_error);
                     trace_tool_result("check_work", &out.content, out.is_error, "build", depth);
@@ -2992,8 +3012,9 @@ fn build_turn(
                     &crate::verifier::Verifier::format_report_json(&rep),
                 );
                 match rep.status {
+                    // Failing checks had their own rounds above; more from
+                    // the verifier would only repeat them.
                     crate::verifier::VerificationStatus::Blocked
-                    | crate::verifier::VerificationStatus::Failed
                         if st.verifier_fix_rounds < MAX_VERIFIER_FIX_ROUNDS =>
                     {
                         // Give the model a chance to address the violations
@@ -3122,7 +3143,9 @@ const MAX_AUTO_CHECK_ROUNDS: usize = 2;
 // check_work had nothing to run (no recognised project, or every checker is
 // missing) — nothing to enforce, and no verdict to record.
 fn check_work_found_no_project(report: &str) -> bool {
-    report.contains("no build/test/lint commands detected") || report.contains("nothing ran")
+    report.contains("no build/test/lint commands detected")
+        || report.contains("no checks configured")
+        || report.contains("nothing ran")
 }
 
 // Feedback for a tool call whose arguments failed to parse: name the tool,
@@ -3319,7 +3342,13 @@ fn record_outcome(
             .as_str()
             .is_some_and(|c| !c.trim().is_empty())
             || input["only"].as_str().is_some_and(|o| !o.trim().is_empty());
-        if !advisory && !check_work_found_no_project(&out.content) {
+        // Only the checks the turn began with count: a call after the turn
+        // rewrote them ran something else.
+        let as_pinned = st
+            .check_plan
+            .as_ref()
+            .is_none_or(|p| *p == tools::check_plan(ctx.cwd));
+        if !advisory && as_pinned && !check_work_found_no_project(&out.content) {
             st.check_work_passed = Some(!out.is_error);
             st.mandatory_pass = (!out.is_error).then(|| crate::tree::take(ctx.cwd));
         }

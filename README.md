@@ -787,6 +787,11 @@ are refused. `"vision": false` keeps pictures out. `notify` is `"auto"`,
 `"always"` or `"off"`. Terminals, sizes and the screenshot rules are in
 [Inline images](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/images.md).
 
+## Checks
+
+A turn that changes files must pass the project's checks, detected or named
+with `checks`, or the run exits 7: [Checks](https://github.com/Garretts-Apps/buildwithnexus/blob/main/docs/checks.md).
+
 ## Hooks
 
 bwn runs your own commands at the same lifecycle points as Claude Code, from
@@ -1052,9 +1057,6 @@ certificate; a TLS-inspecting proxy needs its root in `NODE_EXTRA_CA_CERTS`.
   (`*_API_KEY`, `*_API_TOKEN`, `*_TOKEN`, `*_SECRET`, `*_SECRETS`,
   `*_PASSWORD`, `AWS_*`, `HF_TOKEN`); `shell_env_passthrough` opts a variable
   back in. See [Permissions](#permissions).
-- `repo_map` lists source files and top-level symbols (ranked by an optional
-  `focus`). It is on by default and is not pasted into the prompt.
-  `"repo_map": false` or `--no-repo-map` hides it.
 - The file tools (`grep_files`, `find_files`, `find_paths`, `list_tree`) and
   `@` completion skip what `.gitignore` ignores and Python virtualenvs, and
   never list `.env` and other sensitive files, even when a `.gitignore` line

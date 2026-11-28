@@ -713,26 +713,41 @@ change things.
 ### What the automatic checks do not guarantee
 
 When a top-level turn changed the working tree, bwn runs the project's
-detected checks at finish unless they already passed on the tree as it is.
+checks at finish unless they already passed on the tree as it is.
 A change is whatever the tree shows: a file-tool edit, a `sed` through
-`run_command`, a deletion, or a helper's edit. In a git work tree bwn
-compares `git status` with a hash of each changed file; outside one, every
-file's size and modification time (a tree too large to take counts as
-changed). A `check_work` with the model's own `command` or `only` is
-advisory: it never stands in for the project's checks. If they fail, the
-model gets the report and another round, at most twice a turn, and a run
-whose checks still fail ends with `check_work_failed` (exit 7), not
-`success`. The limits today (roadmap 3.1 PR 2 and 3.8 close the first two):
+`run_command`, a deletion, or a helper's edit, in the working folder's git
+work tree or any folder added to the session. In a git work tree bwn
+compares `git status` with a hash of each changed file; outside one, each
+file's size, modification time and change time (which `touch` can't set
+back). A tree too large to take counts as changed.
 
-- **Which checks run is detected, not configured.** bwn picks them from
-  `Cargo.toml`, `package.json`, `go.mod` or Python project files. A project
-  with none of those has no checks, and a change there finishes unchecked.
+The checks are pinned when the turn starts: the `checks` setting, or what
+bwn detects then. A turn that rewrites a `package.json` script its checks
+run, or deletes the manifest, fails them; a `check_work` the model runs
+after such a rewrite doesn't count. A `check_work` with the model's own
+`command` or `only` is advisory and never stands in for them. If they
+fail, the model gets the report and another round, at most twice a turn,
+and the run ends with `check_work_failed` (exit 7) and the verifier's
+status `failed`. A rule or hook that refuses them makes the run
+`approval_blocked` (exit 3), with the checks among its denials. The limits
+today (roadmap 3.8 closes the second):
+
+- **A project with no checks finishes unchecked.** bwn runs the `checks`
+  setting, or, without one, what it detects from `Cargo.toml`,
+  `package.json`, `go.mod` or Python project files. A project's own
+  `checks` wait for trust, so a cloned repository can't set `[]` or
+  `["true"]` to switch them off. With none of those, or every detected
+  checker missing, a change finishes unchecked; a check the setting names
+  that can't run fails.
 - **Edits are committed before any check.** With `auto_commit` on (the
   default), each file edit is committed when it is made, so a run that ends
   with failing checks leaves those commits in place.
-- **A check that was refused does not fail the run.** If the permission gate
-  denies the checks, or nobody can approve them (no terminal), they are not
-  run and the run can still end as `success`. The run prints "checks were
-  not run" and the tool record says the round was skipped.
+- **Checks nobody can approve are not run.** Under `ask` or `accept-edits`
+  with no terminal, the run prints "checks were not run" and can still end
+  as `success`; `--permission-mode auto` runs them unattended.
+- **The model can still weaken the tests themselves.** bwn pins which
+  checks run, not what the project's test files contain.
+- **ACP has no failure stop reason.** A turn over failing checks ends with
+  `end_turn` there; the failure is in the turn's text.
 - **Only the top-level agent runs them.** A helper's changes are checked at
   its parent's finish, not at the helper's own.

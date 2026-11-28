@@ -11830,6 +11830,8 @@ fn invariant_ve3_repeated_finish_over_failing_checks_is_a_failure() {
     let r = run(&home, &cwd, "break it");
     assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
     assert!(check_work_calls(&r) <= 2);
+    // Every report says failed: the verifier too (analysis V7).
+    assert_eq!(r.find("verify").expect("verify event")["status"], "failed");
 
     let Some((home, cwd)) = ve_project() else {
         return;
@@ -11884,4 +11886,206 @@ fn invariant_ve5_a_helpers_edit_is_checked_at_the_parents_finish() {
     );
     assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
     assert_eq!(check_work_calls(&r), 2);
+}
+
+// ── SO-3: the checks come from policy, not from the model (roadmap 3.1) ─────
+
+fn add_user_setting(home: &Path, key: &str, value: Value) {
+    let p = home.join("config.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    cfg[key] = value;
+    std::fs::write(p, cfg.to_string()).unwrap();
+}
+
+fn break_state() -> Vec<String> {
+    vec![
+        tool_call("c0", "read_file", json!({"path": "state.txt"})),
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "state.txt", "content": "bad\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ]
+}
+
+// The user's `checks` replace the detected ones and are what must pass;
+// `[]` means no checks at all.
+#[test]
+fn invariant_so3_the_checks_setting_names_the_mandatory_checks() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    // Detection would run the failing state check; the setting runs its own.
+    let port = serve(break_state());
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(
+        &home,
+        "checks",
+        json!([{"name": "always", "command": "node -e \"\""}]),
+    );
+    let r = run(&home, &cwd, "break it");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(
+        r.text_of("tool_result").contains("always passed"),
+        "{}",
+        r.text_of("tool_result")
+    );
+
+    // A failing configured check fails the run, in a folder bwn would
+    // detect nothing in.
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(&home, "checks", json!(["node -e \"process.exit(3)\""]));
+    let r = run(&home, &cwd, "add notes");
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+
+    // None configured: nothing to run, and the run says so.
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(break_state());
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(&home, "checks", json!([]));
+    let r = run(&home, &cwd, "break it");
+    assert!(r.success, "stderr: {}", r.stderr);
+    assert!(r.text_of("tool_result").contains("no checks configured"));
+}
+
+// An untrusted project's `checks` wait for trust: `["true"]` or `[]` in a
+// cloned repository does not switch off the checks bwn detects.
+#[test]
+fn invariant_so3_an_untrusted_projects_checks_do_not_replace_the_detected_ones() {
+    for planted in [json!(["true"]), json!([])] {
+        let Some((home, cwd)) = ve_project() else {
+            return;
+        };
+        std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+        std::fs::write(
+            cwd.join(".buildwithnexus/settings.json"),
+            json!({ "checks": planted }).to_string(),
+        )
+        .unwrap();
+        let port = serve(break_state());
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "break it");
+        assert_eq!(r.code, Some(7), "{planted}: stderr: {}", r.stderr);
+        assert!(
+            r.stderr.contains("checks"),
+            "{planted}: the ignored key is named: {}",
+            r.stderr
+        );
+    }
+}
+
+// SO-3: the checks are the ones the turn began with. Rewriting the test
+// script to pass, or deleting the manifest, doesn't make a bad change pass.
+#[test]
+fn invariant_so3_a_turn_cannot_rewrite_or_remove_its_own_checks() {
+    let rewrite = r#"{"name":"p","version":"1.0.0","scripts":{"test":"node -e \"\""}}"#;
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "script rewritten",
+            vec![
+                tool_call("c0", "read_file", json!({"path": "state.txt"})),
+                tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"path": "state.txt", "content": "bad\n"}),
+                ),
+                tool_call("c2", "read_file", json!({"path": "package.json"})),
+                tool_call(
+                    "c3",
+                    "write_file",
+                    json!({"path": "package.json", "content": rewrite}),
+                ),
+                tool_call("c4", "check_work", json!({})),
+                finish("done"),
+                finish("done"),
+                finish("done"),
+            ],
+        ),
+        (
+            "manifest deleted",
+            vec![
+                tool_call("c0", "read_file", json!({"path": "state.txt"})),
+                tool_call(
+                    "c1",
+                    "write_file",
+                    json!({"path": "state.txt", "content": "bad\n"}),
+                ),
+                tool_call("c2", "read_file", json!({"path": "package.json"})),
+                tool_call("c3", "remove_path", json!({"path": "package.json"})),
+                finish("done"),
+                finish("done"),
+                finish("done"),
+            ],
+        ),
+    ];
+    for (what, script) in cases {
+        let Some((home, cwd)) = ve_project() else {
+            return;
+        };
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        let r = run(&home, &cwd, "break it");
+        assert_eq!(r.code, Some(7), "{what}: stderr: {}", r.stderr);
+    }
+}
+
+// A check the user named that can't run fails; it isn't skipped as a
+// missing checker.
+#[test]
+fn invariant_so3_a_named_check_that_cannot_run_fails() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "x"}),
+        ),
+        finish("done"),
+        finish("done"),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(&home, "checks", json!(["bwn-no-such-checker-xyz"]));
+    let r = run(&home, &cwd, "add notes");
+    assert_eq!(r.code, Some(7), "stderr: {}", r.stderr);
+}
+
+// V6: a deny rule that refuses the project's checks leaves the change
+// unverified: the run doesn't end as a success, and its result lists the
+// refused checks among its denials.
+#[test]
+fn invariant_ve3_checks_a_rule_refuses_do_not_end_in_success() {
+    let Some((home, cwd)) = ve_project() else {
+        return;
+    };
+    let port = serve(break_state());
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(&home, "permissions", json!({"deny": ["check_work"]}));
+    let r = run(&home, &cwd, "break it");
+    assert!(!r.success, "stderr: {}", r.stderr);
+    assert_eq!(r.code, Some(3), "stderr: {}", r.stderr);
+    // The result names what was refused, so nobody reads it as checked.
+    let result = r.find("result").expect("result event");
+    assert!(
+        result["denials"].to_string().contains("check_work"),
+        "{result}"
+    );
 }
