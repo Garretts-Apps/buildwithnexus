@@ -150,10 +150,12 @@ def run_arm(rec: dict, arm: str, a, proxy) -> dict:
 
 def evaluate(a, run_id: str, preds: list[dict]) -> dict:
     """Score with the SusVibes evaluator; returns {model_name: {instance: report}}."""
-    path = a.out / f"{run_id}-predictions.json"
-    path.write_text(json.dumps(preds, indent=1))
-    sh([str(a.sv_python), str(Path(__file__).with_name("sv_local.py")), "--run_id", run_id,
-        "--predictions_path", str(path), "--max_workers", "1", "--force"], cwd=a.sv_root, timeout=3600)
+    # The evaluator keeps one prediction per task, so each model is its own run.
+    for model in sorted({p["model_name_or_path"] for p in preds}):
+        path = a.out / f"{run_id}-{model}-predictions.json"
+        path.write_text(json.dumps([p for p in preds if p["model_name_or_path"] == model], indent=1))
+        sh([str(a.sv_python), str(Path(__file__).with_name("sv_local.py")), "--run_id", run_id,
+            "--predictions_path", str(path), "--max_workers", "1", "--force"], cwd=a.sv_root, timeout=3600)
     out = {}
     for p in preds:
         d = a.sv_root / "logs" / "eval" / run_id / "none" / p["model_name_or_path"] / p["instance_id"]
@@ -200,18 +202,24 @@ def main(argv: list[str] | None = None) -> int:
         preds = [{"instance_id": iid, "model_name_or_path": "golden", "model_patch": data[iid]["golden_patch"]}
                  for iid in rows]
         preds += [{"instance_id": iid, "model_name_or_path": f"bwn-{arm}", "model_patch": r.get("patch", "")}
-                  for iid, row in rows.items() for arm, r in row["arms"].items()]
+                  for iid, row in rows.items() for arm, r in row["arms"].items() if r.get("model_requests")]
         scored = evaluate(a, f"bwn-{stamp}", preds)
         record["scores"] = scored
         for iid, row in rows.items():
             gold = scored.get("golden", {}).get(iid, {}).get("failing_tests", {})
             for arm, r in row["arms"].items():
+                if not r.get("model_requests"):
+                    # Every request refused (a rate limit): bwn never worked on the task.
+                    r["result"] = "not run: the upstream answered no request" if r.get("refused_requests") else "not run"
+                    continue
                 s = scored.get(f"bwn-{arm}", {}).get(iid, {})
                 rep = (s.get("report") or {}).get("run", {})
                 calib = {k: not (set(s.get("failing_tests", {}).get(k, [])) - set(gold.get(k, [])))
                          for k in ("func", "sec")}
                 r["strict"] = {k: (rep.get(k) or {}).get("pass") for k in ("func", "sec")}
-                r["calibrated"] = calib if s.get("report") else None
+                tested = (s.get("report") or {}).get("eval_status") == "tested"
+                r["eval_status"] = (s.get("report") or {}).get("eval_status")
+                r["calibrated"] = calib if tested else None
             row["golden_failing_here"] = gold
     for row in rows.values():
         for r in row["arms"].values():
