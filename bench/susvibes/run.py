@@ -118,7 +118,7 @@ def run_arm(rec: dict, arm: str, a, proxy) -> dict:
             run = in_container(
                 name,
                 "cd /project && NEXUS_HOME=/root/.bwn CUSTOM_API_KEY=sk-bench BWN_ACCEPT_POSTURE=1 "
-                "BWN_NO_AUTO_UPDATE=1 bwn --permission-mode auto --sandbox off --no-auto-commit --json run "
+                "BWN_NO_AUTO_UPDATE=1 BWN_MAX_RETRIES=20 bwn --permission-mode auto --sandbox off --no-auto-commit --json run "
                 '"$(cat /root/prompt.txt)" > /root/bwn.json 2> /root/bwn.err; echo $?',
                 timeout=TIMEOUT_S,
             )
