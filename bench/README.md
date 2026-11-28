@@ -64,9 +64,19 @@ time exists only when the process exited 0 and its output contained
   in to ChatGPT.
 - OpenCode is pointed at the mock with `provider.options.baseURL` and
   `OPENAI_BASE_URL`. Catalog fetch and auto-update are off so the run cannot
-  leave the mock.
+  leave the mock. The model is `openai/gpt-5.4-mini`: 1.19 refuses a model
+  its built-in catalog doesn't list, and that catalog no longer has
+  `gpt-4o-mini`. The mock answers any model name.
+- Copilot CLI uses its own BYOK variables (`copilot help environment`), and
+  Crush a crushrc that adds the mock as an OpenAI-compatible provider.
 - Claude Code speaks the Anthropic Messages API. Gemini CLI's base URL is
   the Gemini API. Neither is given a task time.
+
+The task and the startup and memory runs have stdin closed (`/dev/null`); the prompt timing runs on a PTY. Codex `exec` reads stdin
+when it isn't a terminal and waits on an open pipe. bwn waits up to 3 s for
+a first byte on an open pipe before it runs a task given on the command
+line (`STDIN_FIRST_BYTE_WAIT`), so a run with an open pipe times that wait,
+not the task.
 
 Approval flags (`--permission-mode readonly`, Aider `--yes-always`, Codex
 `-a never`) are there so the run cannot stop on a question. They are named

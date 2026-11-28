@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         before = len(proxy.requests)
         t0 = time.perf_counter()
         try:
-            proc = subprocess.run(spec["argv"], env=spec["env"], cwd=run_dir, capture_output=True, text=True, timeout=600)
+            proc = subprocess.run(spec["argv"], env=spec["env"], cwd=run_dir, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
             timed_out = False
         except subprocess.TimeoutExpired as e:
             proc = subprocess.CompletedProcess(spec["argv"], 124, e.stdout or "", e.stderr or "")

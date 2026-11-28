@@ -31,6 +31,9 @@ def log(msg: str) -> None:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     kw.setdefault("text", True)
+    # No tool waits on a terminal it was never given (codex exec reads stdin when it isn't one).
+    if "input" not in kw:
+        kw.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.run(cmd, **kw)
 
 
@@ -1026,7 +1029,7 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
         cfg.write_text(
             json.dumps(
                 {
-                    "model": "openai/gpt-4o-mini",
+                    "model": "openai/gpt-5.4-mini",
                     "provider": {
                         "openai": {
                             "options": {
@@ -1045,11 +1048,11 @@ def task_command(cmd: dict, installs: dict, base_url: str, work: Path) -> dict:
         env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
         env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
         return {
-            "argv": argv + ["run", "--pure", "--model", "openai/gpt-4o-mini", TASK_TEXT],
+            "argv": argv + ["run", "--pure", "--model", "openai/gpt-5.4-mini", TASK_TEXT],
             "env": env,
             "cwd": str(cwd),
             "methodology": methodology
-            + " OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock.",
+            + " OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock. The model is one from OpenCode's built-in catalog, which no longer lists gpt-4o-mini; the mock answers any model name.",
         }
     return {"ok": False, "status": "skipped", "reason": f"No mock invocation is defined for {cmd['id']}."}
 
