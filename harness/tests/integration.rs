@@ -226,6 +226,9 @@ fn run_env(home: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Run 
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .args(args)
         .envs(env.iter().copied())
@@ -1146,6 +1149,9 @@ fn commands_get_no_descriptor_bwn_inherited() {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     // SAFETY: dup2 between fork and exec, onto a descriptor without
     // close-on-exec, as a runner passes its pipe.
     unsafe {
@@ -1809,6 +1815,9 @@ fn a_tilde_attachment_uses_userprofile_when_home_is_unset() {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .args([
             "--json",
@@ -3111,6 +3120,9 @@ fn run_stdin(home: &Path, cwd: &Path, args: &[&str], input: &str) -> Run {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let mut child = cmd
         .args(args)
         .current_dir(cwd)
@@ -3375,6 +3387,9 @@ fn invariant_in2_a_bad_sandbox_setting_runs_as_require() {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .arg("doctor")
         .current_dir(&cwd)
@@ -4159,6 +4174,9 @@ fn an_image_refusal_names_who_said_the_model_takes_no_images() {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .args(["run", "what is in shot.png"])
         .current_dir(&cwd)
@@ -5027,6 +5045,9 @@ fn doctor(home: &Path, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, Str
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     for (k, _) in [
         ("ANTHROPIC_API_KEY", ""),
         ("OPENAI_API_KEY", ""),
@@ -5728,6 +5749,9 @@ fn oauth_cli(
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .args(args)
         .current_dir(home)
@@ -6045,6 +6069,9 @@ fn mcp_oauth_login_without_a_browser_waits_for_the_printed_url() {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let mut child = cmd
         .args(["mcp", "login", "remote"])
         .current_dir(&home)
@@ -6148,6 +6175,9 @@ fn update_cmd(
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     if let Some(dir) = path {
         let old = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{old}", dir.display()));
@@ -6658,6 +6688,9 @@ fn run_human(home: &Path, cwd: &Path, task: &str) -> (Option<i32>, String) {
     for var in NET_VARS {
         cmd.env_remove(var);
     }
+    // No test touches a real keychain: an empty stand-in means none, unless
+    // a test passes its own.
+    cmd.env("BWN_TEST_KEYRING", "");
     let out = cmd
         .args(["run", task])
         .current_dir(cwd)

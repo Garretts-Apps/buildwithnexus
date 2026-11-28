@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **The trust, posture-check and rules stores are sealed.** Something
+  outside the sandbox could rewrite `trusted.json` to trust a repo's hooks,
+  or a posture file to skip the startup question. Each store now carries an
+  HMAC seal, keyed in the OS keyring. bwn reads a store rewritten behind its
+  back as empty and asks again. The rules folder stays yours to edit: the
+  posture check names it when it changed since you last accepted the check.
 - **The decision log's head is anchored outside the log.** At the end of
   each turn and session it goes to the OS keyring (the macOS keychain, or
   the Secret Service on Linux), and each commit bwn makes carries it as a

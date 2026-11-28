@@ -266,6 +266,10 @@ pub fn keyring() -> Option<Keyring> {
     if let Some(d) = std::env::var_os("BWN_TEST_KEYRING") {
         return (!d.is_empty()).then(|| Keyring::TestDir(PathBuf::from(d)));
     }
+    // Unit tests never touch a real keychain.
+    if cfg!(test) {
+        return None;
+    }
     if cfg!(target_os = "macos") && crate::tools::find_on_path("security").is_some() {
         return Some(Keyring::MacKeychain);
     }
@@ -318,7 +322,7 @@ fn run_limited(program: &str, args: &[&str], stdin: Option<&str>) -> Option<Stri
     }
 }
 
-fn keyring_set(k: &Keyring, account: &str, value: &str) -> bool {
+pub(crate) fn keyring_set(k: &Keyring, account: &str, value: &str) -> bool {
     match k {
         Keyring::MacKeychain => run_limited(
             "security",
@@ -355,7 +359,7 @@ fn keyring_set(k: &Keyring, account: &str, value: &str) -> bool {
     }
 }
 
-fn keyring_get(k: &Keyring, account: &str) -> Option<String> {
+pub(crate) fn keyring_get(k: &Keyring, account: &str) -> Option<String> {
     let v = match k {
         Keyring::MacKeychain => run_limited(
             "security",
