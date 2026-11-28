@@ -1,0 +1,223 @@
+{
+  "bwn-native": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1. The posture check is answered by BWN_ACCEPT_POSTURE=1, which versions before it ignore (the --accept-posture flag would stop them).",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus",
+      "--provider",
+      "custom",
+      "--base-url",
+      "http://127.0.0.1:44943/v1",
+      "--model",
+      "bench",
+      "--permission-mode",
+      "readonly",
+      "--sandbox",
+      "off",
+      "--no-auto-commit",
+      "--no-repo-map",
+      "run",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      0.06875081499947555,
+      0.06951448499967228,
+      0.06922256899997592,
+      0.06789638200007175,
+      0.06937330200071301
+    ],
+    "median_s": 0.06922256899997592,
+    "mean_s": 0.0689515105999817,
+    "mock_requests_total": 20,
+    "model_requests_per_task": 1,
+    "request_bytes_per_task": 17113,
+    "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:44943) \u00b7 bench\n  cwd    /home/user/buildwithnexus/bench/.tools/task-work/bwn-native\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 19.87ms\n"
+  },
+  "bwn-npm": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Flags keep the run from stopping on an approval prompt. Endpoint: --provider custom --base-url <mock>/v1. The posture check is answered by BWN_ACCEPT_POSTURE=1, which versions before it ignore (the --accept-posture flag would stop them).",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn",
+      "--provider",
+      "custom",
+      "--base-url",
+      "http://127.0.0.1:44943/v1",
+      "--model",
+      "bench",
+      "--permission-mode",
+      "readonly",
+      "--sandbox",
+      "off",
+      "--no-auto-commit",
+      "--no-repo-map",
+      "run",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      0.10267005900004733,
+      0.09563721799986524,
+      0.11068054799943638,
+      0.09874597399993945,
+      0.09688832100073341
+    ],
+    "median_s": 0.09874597399993945,
+    "mean_s": 0.10092442400000437,
+    "mock_requests_total": 20,
+    "model_requests_per_task": 1,
+    "request_bytes_per_task": 17110,
+    "last_stdout": "buildwithnexus headless v0.21.0\n  model  custom endpoint (127.0.0.1:44943) \u00b7 bench\n  cwd    /home/user/buildwithnexus/bench/.tools/task-work/bwn-npm\n\n  \u00b7 thinking\nBENCHMARK_OK\n\n\n\u2713 done in 21.15ms\n"
+  },
+  "claude": {
+    "ok": false,
+    "status": "skipped",
+    "reason": "Claude Code speaks the Anthropic Messages API (ANTHROPIC_BASE_URL). It cannot be pointed at an OpenAI-compatible chat or responses endpoint, so it is not given a fake time."
+  },
+  "codex": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Codex 0.169 rejects wire_api=chat, so the mock's Responses API is used (wire_api=responses), which is the OpenAI endpoint this CLI can be pointed at.",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/codex/bin/codex",
+      "exec",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-o",
+      "/home/user/buildwithnexus/bench/.tools/homes/codex/codex-task/last.txt",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      1.094649906000086,
+      0.7523890949996712,
+      0.6972111659997609,
+      1.1592796559998533,
+      0.7053347360006228
+    ],
+    "median_s": 0.7523890949996712,
+    "mean_s": 0.8817729117999988,
+    "mock_requests_total": 5,
+    "model_requests_per_task": 1,
+    "request_bytes_per_task": 39850,
+    "last_stdout": "BENCHMARK_OK\n"
+  },
+  "gemini": {
+    "ok": false,
+    "status": "skipped",
+    "reason": "Gemini CLI's GOOGLE_GEMINI_BASE_URL is the Gemini API base (generateContent), not an OpenAI-compatible chat or responses URL. It is not given a fake time."
+  },
+  "opencode": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. OpenCode is pointed at the mock with provider.options.baseURL and OPENAI_BASE_URL. Model-catalog fetch and auto-update are off so the timed run cannot leave the mock. The model is one from OpenCode's built-in catalog, which no longer lists gpt-4o-mini; the mock answers any model name.",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode",
+      "run",
+      "--pure",
+      "--model",
+      "openai/gpt-5.4-mini",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      2.407200614999965,
+      2.438377854000464,
+      2.1923952540000755,
+      2.330383150999296,
+      2.369819692999954
+    ],
+    "median_s": 2.369819692999954,
+    "mean_s": 2.347635313399951,
+    "mock_requests_total": 10,
+    "model_requests_per_task": 2,
+    "request_bytes_per_task": 32304,
+    "last_stdout": "BENCHMARK_OK\n"
+  },
+  "aider": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. The model name is a label Aider already accepts; the completion bytes come from --openai-api-base, the mock.",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/aider/bin/aider",
+      "--model",
+      "openai/gpt-4o-mini",
+      "--openai-api-base",
+      "http://127.0.0.1:44943/v1",
+      "--openai-api-key",
+      "sk-bench",
+      "--no-git",
+      "--no-stream",
+      "--no-pretty",
+      "--no-check-update",
+      "--no-analytics",
+      "--no-show-model-warnings",
+      "--yes-always",
+      "--message",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      6.158358163999765,
+      3.263575399999354,
+      3.3230956050001623,
+      3.2952607670004,
+      3.274809842999275
+    ],
+    "median_s": 3.2952607670004,
+    "mean_s": 3.8630199557997913,
+    "mock_requests_total": 5,
+    "model_requests_per_task": 1,
+    "request_bytes_per_task": 3349,
+    "last_stdout": "\nAider v0.86.2\nModel: openai/gpt-4o-mini with whole edit format\nGit repo: none\nRepo-map: disabled\n\nBENCHMARK_OK\n\nTokens: 1 sent, 1 received. Cost: $0.00000075 message, $0.00000075 session.\n"
+  },
+  "copilot": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Copilot CLI is pointed at the mock with COPILOT_PROVIDER_BASE_URL and COPILOT_OFFLINE.",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/copilot/bin/copilot",
+      "-p",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands.",
+      "--allow-all"
+    ],
+    "runs_s": [
+      0.7598213629999009,
+      0.7239851369995449,
+      0.7158375079998223,
+      0.6840272669996921,
+      0.7018424699999741
+    ],
+    "median_s": 0.7158375079998223,
+    "mean_s": 0.7171027489997869,
+    "mock_requests_total": 5,
+    "model_requests_per_task": 1,
+    "request_bytes_per_task": 60000,
+    "last_stdout": "BENCHMARK_OK\n\n"
+  },
+  "crush": {
+    "ok": true,
+    "status": "measured",
+    "methodology": "Wall clock of the process against a local OpenAI-compatible mock that returns the fixed text BENCHMARK_OK for every completion. The mock does no model work. The task text is: Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands. Crush is pointed at the mock with a crushrc that adds it as an OpenAI-compatible provider.",
+    "command": [
+      "/home/user/buildwithnexus/bench/.tools/prefixes/crush/bin/crush",
+      "run",
+      "-q",
+      "-m",
+      "bench/bench",
+      "Reply with exactly BENCHMARK_OK and nothing else. Do not call tools, do not edit files, and do not run commands."
+    ],
+    "runs_s": [
+      0.8317542559998401,
+      0.626606437999726,
+      0.8283756410000933,
+      0.7480414409992591,
+      0.6850307200002135
+    ],
+    "median_s": 0.7480414409992591,
+    "mean_s": 0.7439616991998264,
+    "mock_requests_total": 10,
+    "model_requests_per_task": 2,
+    "request_bytes_per_task": 65051,
+    "last_stdout": "BENCHMARK_OK\n"
+  }
+}

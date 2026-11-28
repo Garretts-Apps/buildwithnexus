@@ -70,7 +70,7 @@ Three stored runs, each reproducible from `bench/`:
     - **Aider:** with `--yes-always` it does not run shell blocks from a reply. Without that flag, four of five surfaces executed.
     - **Default modes:** the control was refused headless in bwn, Copilot CLI and Codex (read-only), so their default rows are "not measured". Codex's read still reached the credential canary.
     - **Planted instructions:** these need a live model.
-- **Efficiency bench** (`bench/results/2026-11-28T15-01-36Z/`, roadmap 6.4). It adds Copilot CLI and Crush, and records request bytes per task. Pillar 5 below is updated from it.
+- **Efficiency bench** (`bench/results/2026-11-28T15-41-43Z/`, roadmap 6.4). It adds Copilot CLI and Crush, and records request bytes per task. Pillar 5 below is updated from it.
 - **The fixed task against one live model** (`bench/results/2026-11-28T15-10-23Z-live/`, roadmap 6.4).
   - **The run:** one run per harness against `baidu/ernie-5.5-flash-preview:free`, with the prompt tokens the upstream reported.
   - **Prompt tokens:** Aider 717, bwn 4413, OpenCode 7181, Codex 8644, Copilot CLI 13483, Crush 15609.
@@ -214,17 +214,26 @@ These are features, not controls, so cells are S (shipped), P (partial), N (none
 
 ### Pillar 5: runtime efficiency
 
-Stored run `bench/results/2026-11-15T16-29-28Z/summary.md`, Linux x64, 4 vCPU. Tools outside that run have no measurement.
+Stored run `bench/results/2026-11-28T15-41-43Z/summary.md` (28 November; Linux x64, 4 vCPU), replacing the 15 November run. Tools outside that run have no measurement. Medians.
 
-| Measure | bwn native | CC | Codex | Gemini | OpenCode (legacy 1.19.5) | Aider | Copilot, Cursor, Goose, Crush, Cline, Kilo, Amp |
-|---|---|---|---|---|---|---|---|
-| Download | 6.5 MB | 169 MB | 167 MB | 22 MB | 158 MB | 126 MB | not measured |
-| Installed size | 6.5 MB | 732 MB | 423 MB | 103 MB | 643 MB | 646 MB | not measured |
-| `--version`, warm | 0.56 ms | 6.5 ms | 28.3 ms | 1,088 ms | 321 ms | 494 ms | not measured |
-| Peak memory | 3.5 MB | 23 MB | 53 MB | 215 MB | 131 MB | 73 MB | not measured |
-| Fixed task against a mock model (`task.json`) | 58 ms | skipped | 246 ms | skipped | 1,441 ms | 2,210 ms | not measured |
-| Time to a ready prompt (`prompt.json`) | 250 ms | ? | 284 ms | ? | ? | ? | not measured |
-| Tokens per task; completion and crash rate | not measured for any tool | | | | | | |
+| Measure | bwn native | CC | Codex | Gemini | OpenCode | Aider | Copilot | Crush | Cursor, Goose, Cline, Kilo, Amp |
+|---|---|---|---|---|---|---|---|---|---|
+| Download | 6.5 MB | 169 MB | 167 MB | 22 MB | 158 MB | 126 MB | 166 MB | 32 MB | not measured |
+| Installed size | 6.5 MB | 732 MB | 423 MB | 103 MB | 643 MB | 557 MB | 235 MB | 143 MB | not measured |
+| `--version`, warm | 1.4 ms | 11.2 ms | 36.9 ms | 1,340 ms | 489 ms | 774 ms | 121 ms | 150 ms | not measured |
+| Peak memory | 3.3 MB | 22 MB | 44 MB | 206 MB | 129 MB | 73 MB | 53 MB | 63 MB | not measured |
+| Fixed task against a mock model (`task.json`) | 69 ms | skipped | 752 ms | skipped | 2,370 ms | 3,295 ms | 716 ms | 748 ms | not measured |
+| Bytes the task sends the model | 17,113 | skipped | 39,850 | skipped | 32,304 (2 requests) | 3,349 | 60,000 | 65,051 (2 requests) | not measured |
+| Prompt tokens for the task, one live model (`2026-11-28T15-10-23Z-live`) | 4,413 | skipped | 8,644 | skipped | 7,181 | 717 | 13,483 | 15,609 | not measured |
+| Time to a ready prompt (`prompt.json`) | 251 ms | ? | 299 ms | ? | 3,550 ms | 869 ms | ? | ? | not measured |
+| Completion and crash rate over many tasks | not measured for any tool | | | | | | | | |
+
+- **Methodology changes since 15 November:**
+  - Every timed run now has stdin closed.
+  - OpenCode asks for a model in its built-in catalog.
+  - Crush's download includes the release archive its installer fetches.
+- **Startup times are not comparable with the 15 November run.** The two runs used different machines.
+- **The live-model tokens are one run against a free model** (`baidu/ernie-5.5-flash-preview:free`).
 
 `BENCHMARKS.md:209-231` times bwn's own per-step costs; `BENCHMARKS.md:233-244` lists what is claimed without a benchmark.
 

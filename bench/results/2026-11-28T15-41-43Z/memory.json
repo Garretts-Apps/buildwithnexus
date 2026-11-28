@@ -1,0 +1,146 @@
+{
+  "bwn-native": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/homes/bwn/bin/0.21.0/buildwithnexus --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      3232,
+      3412,
+      3264,
+      3272,
+      3272
+    ],
+    "median_kib": 3272.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "bwn-npm": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/bwn/bin/bwn --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      38780,
+      38720,
+      38764,
+      38712,
+      38728
+    ],
+    "median_kib": 38728.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "claude": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/claude/bin/claude --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      21776,
+      22256,
+      22260,
+      21996,
+      22252
+    ],
+    "median_kib": 22252.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "codex": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/codex/bin/codex --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      43736,
+      43748,
+      43564,
+      43576,
+      43848
+    ],
+    "median_kib": 43736.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "gemini": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/gemini/bin/gemini --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      206044,
+      197556,
+      206920,
+      198252,
+      206548
+    ],
+    "median_kib": 206044.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "opencode": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/opencode/bin/opencode --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      128620,
+      128504,
+      129220,
+      129108,
+      129456
+    ],
+    "median_kib": 129108.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "aider": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/aider/bin/aider --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      73020,
+      73212,
+      73168,
+      73076,
+      73164
+    ],
+    "median_kib": 73164.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "copilot": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/copilot/bin/copilot --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      52032,
+      52980,
+      53100,
+      52876,
+      53104
+    ],
+    "median_kib": 52980.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  },
+  "crush": {
+    "ok": true,
+    "command": "/home/user/buildwithnexus/bench/.tools/prefixes/crush/bin/crush --version",
+    "tool": "/usr/bin/time -v",
+    "field": "Maximum resident set size (kbytes)",
+    "unit": "GNU time kbytes (1024-byte kibibytes), top-level process only",
+    "samples_kib": [
+      62464,
+      62800,
+      62744,
+      63548,
+      64308
+    ],
+    "median_kib": 62800.0,
+    "note": "GNU time reports the top-level process. A Node launcher's figure is that Node process, not a child native binary."
+  }
+}
