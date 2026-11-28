@@ -13117,3 +13117,70 @@ fn a_plugin_loads_its_agents_and_hooks_as_one_unit() {
         );
     }
 }
+
+// Roadmap 4.6 (LSP diagnostics): after an edit, the language server's
+// errors for that file come back in the edit's result; a clean edit adds
+// none. A stub server stands in for a real one.
+#[cfg(unix)]
+#[test]
+fn an_edits_result_carries_the_language_servers_diagnostics() {
+    let stub = r#"
+import sys, json
+def read():
+    n = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        line = line.strip()
+        if not line: break
+        if line.lower().startswith(b"content-length:"): n = int(line.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(n))
+def send(m):
+    b = json.dumps(m).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); sys.stdout.buffer.flush()
+while True:
+    m = read()
+    if m.get("method") == "initialize": send({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {}}})
+    elif m.get("method") in ("textDocument/didOpen", "textDocument/didChange"):
+        p = m["params"]; doc = p["textDocument"]
+        text = doc.get("text") if "text" in doc else p["contentChanges"][-1]["text"]
+        diags = [{"range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}}, "severity": 1, "message": "undefined name BUG"}] if "BUG" in text else []
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": doc["uri"], "diagnostics": diags}})
+"#;
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let server = home.join("stub_lsp.py");
+    std::fs::write(&server, stub).unwrap();
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "app.py", "content": "x = BUG\n"}),
+        ),
+        tool_call(
+            "c2",
+            "write_file",
+            json!({"path": "ok.py", "content": "x = 1\n"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    add_user_setting(
+        &home,
+        "lsp",
+        json!({"stub": {"command": "python3", "args": [server.display().to_string()], "extensions": ["py"], "wait_ms": 5000}}),
+    );
+    let r = run(&home, &cwd, "write two files");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let results = r.text_of("tool_result");
+    assert!(results.contains("[stub diagnostics]"), "{results}");
+    assert!(
+        results.contains("app.py:1:5 error: undefined name BUG"),
+        "{results}"
+    );
+    assert_eq!(
+        results.matches("[stub diagnostics]").count(),
+        1,
+        "the clean file adds none: {results}"
+    );
+}

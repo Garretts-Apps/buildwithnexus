@@ -5669,6 +5669,14 @@ pub fn run(name: &str, input: &Value, cwd: &Path) -> Outcome {
     }
     if !outcome.is_error {
         maybe_auto_commit(name, input, cwd);
+        // What the language servers now say about the edited files.
+        let edits = table::lookup(name).is_some_and(|s| s.file_edit);
+        if let Some(d) = edits
+            .then(|| crate::lsp::diagnostics_after(name, input, cwd))
+            .flatten()
+        {
+            outcome.content.push_str(&d);
+        }
     }
     outcome
 }
