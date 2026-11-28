@@ -48,6 +48,7 @@ import datetime as dt
 import hashlib
 import json
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -107,6 +108,72 @@ def bwn_report(stdout: str) -> dict:
 TEST_ENV = {**__import__("os").environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 
+def change_size(tree: Path, exclude: set[str]) -> dict:
+    """Lines the task's commit added and removed, outside its hidden tests."""
+    added = removed = files = 0
+    for row in sh(["git", "diff", "--numstat", "HEAD~1", "HEAD"], tree).stdout.splitlines():
+        a, r, path = (row.split("\t") + ["", "", ""])[:3]
+        if path in exclude or not a.isdigit():
+            continue
+        added, removed, files = added + int(a), removed + int(r), files + 1
+    return {"lines_added": added, "lines_removed": removed, "files_changed": files}
+
+
+def rework(tree: Path, recent: list[str]) -> int:
+    """Lines this task removed or rewrote that one of the `recent` task
+    commits (the previous three) wrote."""
+    if not recent:
+        return 0
+    count = 0
+    diff = sh(["git", "diff", "-U0", "HEAD~1", "HEAD"], tree).stdout
+    path = None
+    for line in diff.splitlines():
+        if line.startswith("--- a/"):
+            path = line[6:]
+        elif line.startswith("--- "):
+            path = None
+        elif line.startswith("@@") and path:
+            old = line.split()[1].lstrip("-")
+            start, _, n = old.partition(",")
+            n = int(n) if n else 1
+            if n == 0:
+                continue
+            blame = sh(["git", "blame", "--porcelain", "-L", f"{start},{int(start) + n - 1}", "HEAD~1", "--", path], tree).stdout
+            count += sum(1 for b in blame.splitlines() if b.split(" ")[0] in recent)
+    return count
+
+
+# Scanners at the benchmark's own versions, never the harness's: each runs
+# when installed, and the record says when one isn't.
+SCANNERS = {
+    "gitleaks": ["gitleaks", "detect", "--no-banner", "--no-git", "--report-format", "json", "--report-path", "/dev/stdout", "--source", "."],
+    "semgrep": ["semgrep", "scan", "--config", "auto", "--json", "--quiet", "."],
+    "osv-scanner": ["osv-scanner", "--format", "json", "-r", "."],
+}
+
+
+def scan(tree: Path) -> dict:
+    out = {}
+    for name, cmd in SCANNERS.items():
+        if not shutil.which(cmd[0]):
+            out[name] = "not installed"
+            continue
+        try:
+            text = sh(cmd, tree, timeout=900).stdout
+            data = json.loads(text or "null")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
+            out[name] = "no report"
+            continue
+        if isinstance(data, list):
+            out[name] = len(data)
+        elif isinstance(data, dict) and "results" in data:
+            res = data["results"]
+            out[name] = sum(len(r.get("packages", [])) for r in res) if name == "osv-scanner" else len(res)
+        else:
+            out[name] = 0
+    return out
+
+
 def run_tests(tree: Path, command: str, files: list[str], timeout: int) -> bool | None:
     if not files:
         return None
@@ -160,6 +227,10 @@ def run_sequence(manifest: dict, harness: dict, run_no: int, out: Path) -> list[
             earlier.extend(hidden)
         sh(["git", "add", "-A"], tree)
         sh(["git", "commit", "-q", "-m", f"after {task['id']}", "--allow-empty"], tree)
+        size = change_size(tree, set(hidden))
+        commits = sh(["git", "log", "--format=%H", "-n", "4"], tree).stdout.split()
+        reworked = rework(tree, commits[1:4] if n > 1 else [])
+        findings = scan(tree)
         bundle = out / f"{task['id']}.bundle"
         sh(["git", "bundle", "create", str(bundle), "HEAD"], tree)
         rec = {
@@ -173,6 +244,9 @@ def run_sequence(manifest: dict, harness: dict, run_no: int, out: Path) -> list[
             "tests_passed": this_task,
             "regressions": regressions,
             "suite_passed": suite,
+            **size,
+            "rework_lines": reworked,
+            "scanner_findings": findings,
             **bwn_report(stdout),
         }
         (out / f"{task['id']}.json").write_text(json.dumps(rec, indent=2))
@@ -188,8 +262,8 @@ def summarize(manifest: dict, all_records: dict[str, list[list[dict]]]) -> str:
         f"{len(manifest['tasks'])} tasks, {manifest.get('runs', 3)} runs per harness. "
         "Model output is not deterministic: medians and ranges over runs.",
         "",
-        "| Harness | Tasks passed (visible) | Tasks passed (held out) | Regressions | Zero-regression runs | Tokens in |",
-        "|---|---|---|---|---|---|",
+        "| Harness | Tasks passed (visible) | Tasks passed (held out) | Regressions | Zero-regression runs | Rework lines | Tokens in |",
+        "|---|---|---|---|---|---|---|",
     ]
 
     def med_range(xs: list[float]) -> str:
@@ -207,8 +281,9 @@ def summarize(manifest: dict, all_records: dict[str, list[list[dict]]]) -> str:
             sum(r["tokens_in"] or 0 for r in run) if any(r["tokens_in"] is not None for r in run) else None
             for run in runs
         ]
+        rework = [sum(r.get("rework_lines", 0) for r in run) for run in runs]
         lines.append(
-            f"| {name} | {med_range(vis)} | {med_range(held)} | {med_range(regs)} | {clean}/{len(runs)} | {med_range(toks)} |"
+            f"| {name} | {med_range(vis)} | {med_range(held)} | {med_range(regs)} | {clean}/{len(runs)} | {med_range(rework)} | {med_range(toks)} |"
         )
     return "\n".join(lines) + "\n"
 

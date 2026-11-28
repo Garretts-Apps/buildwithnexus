@@ -115,12 +115,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(breaker[0]["tests_passed"], True)
         self.assertEqual(breaker[1]["tests_passed"], True)
         self.assertEqual(breaker[1]["regressions"], ["tests/test_mul.py"])
+        # Size of each change, rework of the previous tasks' lines, and the
+        # scanners (reported as not installed where they aren't).
+        self.assertGreater(oracle[0]["lines_added"], 0)
+        self.assertEqual(oracle[0]["rework_lines"], 0)
+        self.assertGreater(breaker[1]["rework_lines"], 0, breaker[1])
+        self.assertIn("gitleaks", oracle[0]["scanner_findings"])
         # Each task's tree is kept, and the manifest with its hash.
         self.assertTrue((root / "oracle" / "run1" / "t2.bundle").is_file())
         self.assertEqual(json.loads((root / "manifest.json").read_text())["base"], self.base)
         self.assertEqual(len((root / "manifest.sha256").read_text().strip()), 64)
         summary = (root / "summary.md").read_text()
-        self.assertIn("| oracle | 1 (1–1) | 1 (1–1) | 0 (0–0) | 2/2 |", summary)
+        self.assertIn("| oracle | 1 (1–1) | 1 (1–1) | 0 (0–0) | 2/2 | 0 (0–0) |", summary)
         self.assertIn("| breaker | 1 (1–1) | 1 (1–1) | 1 (1–1) | 0/2 |", summary)
         self.assertIn("| idle | 0 (0–0) | 0 (0–0) | 0 (0–0) | 2/2 |", summary)
 
