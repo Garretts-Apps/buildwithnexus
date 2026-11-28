@@ -26,6 +26,9 @@ pub struct Facts {
     pub checks_report: String,
     /// The verifier's status.
     pub verifier: String,
+    /// The quality policy that applied (roadmap 5.6;
+    /// `tools::applied_policy`).
+    pub policy: Value,
 }
 
 static FACTS: std::sync::Mutex<Option<Facts>> = std::sync::Mutex::new(None);
@@ -64,6 +67,7 @@ pub fn record(files: &[(String, String)]) -> Option<String> {
             "report": facts.checks_report.chars().take(4000).collect::<String>(),
         },
         "verifier": facts.verifier,
+        "policy": facts.policy,
         "decision_log": crate::audit::head().map(|(a, b, n)| json!([a, b, n])),
         // The SBOM as committed, when the change carries one.
         "sbom": files.iter().find(|(p, _)| p == "bom.json").map(|(_, b)| b),
@@ -132,8 +136,27 @@ pub fn verify(cwd: &Path, commit: &str) -> Result<String, String> {
         Some(true) => "checks passed",
         _ => "no checks ran",
     };
+    let policy = match rec["policy"]["digest"].as_str() {
+        Some(d) => format!(
+            ", policy {} ({}: {})",
+            &d[..12.min(d.len())],
+            rec["policy"]["source"].as_str().unwrap_or("?"),
+            rec["policy"]["checks"]
+                .as_array()
+                .map(|a| {
+                    let names: Vec<&str> = a.iter().filter_map(|c| c["name"].as_str()).collect();
+                    if names.is_empty() {
+                        "no checks".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                })
+                .unwrap_or_else(|| "no checks".into())
+        ),
+        None => String::new(),
+    };
     Ok(format!(
-        "ok: {commit} matches evidence {} ({} file{}, {checks}, verifier {})",
+        "ok: {commit} matches evidence {} ({} file{}, {checks}, verifier {}{policy})",
         &hash[..12],
         files.len(),
         if files.len() == 1 { "" } else { "s" },

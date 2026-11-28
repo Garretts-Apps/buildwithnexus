@@ -26,7 +26,9 @@ runs the checks it detects.
 A check can be for some files only: `"paths": ["*.css", "web/*"]` runs it
 when a changed file's path or name matches one of the globs, so styles,
 scripts or templates each get their own checks. A check without `paths`
-runs for every change.
+runs for every change. The commit's evidence record names the checks that
+applied and a digest of the policy they came from (`buildwithnexus evidence
+verify <commit>` shows it).
 
 A check can be read from a scanner's report instead of its exit status:
 `"format": "sarif"` (SARIF 2.1.0) or `"json"` (a list of findings), with
@@ -47,3 +49,32 @@ when a Dockerfile, Terraform, Kubernetes or CI file changed) and `"sbom"`
 changed; the commit's evidence record names it). A
 gate whose scanner isn't installed blocks. semgrep's `--config auto`
 downloads its rules, so its host must be allowed in `network.allow`.
+
+## Architectural boundaries
+
+`boundaries` records decisions about what may depend on what, and checks
+them on every round (roadmap 5.7):
+
+```json
+{
+  "boundaries": [
+    {
+      "name": "ui-no-db",
+      "from": ["src/ui/**"],
+      "forbid": ["crate::db", "../db/"],
+      "why": "ADR 7: the UI reads through the service layer"
+    }
+  ]
+}
+```
+
+- **What breaks a boundary:** a changed file matching a `from` glob that
+  has a line containing one of the `forbid` texts.
+- **What happens then:** the break fails the round like a failing check,
+  even when the project has no other checks. The model gets each break as
+  `file:line uses `text` (name: why)`, and a run that still breaks one
+  exits 7.
+- **When the rules are read:** they are pinned when the turn starts, so a
+  turn that edits them doesn't change the round it is checked by.
+- **In a project file:** a boundary only adds a check and runs no program,
+  so it applies without trust.

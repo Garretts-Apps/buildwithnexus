@@ -13236,3 +13236,130 @@ fn invariant_so8_a_hook_made_under_a_built_name_is_caught_at_turn_end() {
     }
     assert!(!r.success, "the run reported success: {:?}", r.events);
 }
+
+// Roadmap 5.7 (SD-7): an architectural boundary is a check. A project's
+// `boundaries` (it adds a check and runs nothing, so it applies untrusted)
+// fails the mandatory round when a changed file under `from` uses a
+// forbidden module, with no other check in the project; a file outside it
+// passes.
+#[test]
+fn a_seeded_boundary_break_blocks() {
+    let go = |file: &str, content: &str| {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        std::fs::create_dir_all(cwd.join(".buildwithnexus")).unwrap();
+        std::fs::write(
+            cwd.join(".buildwithnexus/settings.json"),
+            json!({"boundaries": [{
+                "name": "ui-no-db",
+                "from": ["src/ui/**"],
+                "forbid": ["crate::db"],
+                "why": "ADR 7: the UI reads through the service layer"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut script = vec![tool_call(
+            "w",
+            "write_file",
+            json!({"path": file, "content": content}),
+        )];
+        script.extend((0..3).map(|_| finish("done")));
+        let port = serve(script);
+        write_config(&home, "ollama", "auto", port);
+        run(&home, &cwd, "edit")
+    };
+    let r = go("src/ui/view.rs", "use crate::db::Pool;\nfn view() {}\n");
+    assert_eq!(r.code, Some(7), "{}", r.text_of("tool_result"));
+    let out = r.text_of("tool_result");
+    assert!(out.contains("boundary break"), "{out}");
+    assert!(
+        out.contains("src/ui/view.rs:1 uses `crate::db` (ui-no-db: ADR 7"),
+        "{out}"
+    );
+    let r = go("src/db/pool.rs", "use crate::db::Pool;\n");
+    assert!(r.success, "{}", r.text_of("tool_result"));
+}
+
+// Roadmap 5.6 (SD-5): the commit records which quality policy applied. The
+// evidence record names the checks that applied to the changed files (a
+// stylesheet change: the styles check, not the scripts one), where they
+// came from and a digest of the whole pinned policy; `evidence verify`
+// shows it.
+#[test]
+fn the_commit_records_which_policy_applied() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let g = |args: &[&str]| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    g(&["init", "-q"]);
+    g(&["config", "user.name", "t"]);
+    g(&["config", "user.email", "t@t"]);
+    std::fs::write(cwd.join("base.txt"), "b").unwrap();
+    g(&["add", "."]);
+    g(&["commit", "-q", "-m", "base"]);
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "style.css", "content": "body { color: red }\n"}),
+        ),
+        finish("done"),
+        finish("done"),
+    ]);
+    let pass = if cfg!(windows) { "exit 0" } else { "true" };
+    std::fs::write(
+        home.join("config.json"),
+        json!({
+            "provider": "ollama", "model": "test-model", "permission": "auto",
+            "base_url": format!("http://127.0.0.1:{port}/v1"),
+            "sandbox": "off", "auto_commit": true,
+            "checks": [
+                {"name": "styles", "command": pass, "paths": ["*.css"]},
+                {"name": "scripts", "command": pass, "paths": ["*.js"]},
+            ],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let r = run(&home, &cwd, "restyle");
+    assert!(r.success, "stderr: {}", r.stderr);
+    let out = Command::new(BIN)
+        .args(["evidence", "verify", "HEAD"])
+        .current_dir(&cwd)
+        .env("NEXUS_HOME", &home)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("policy ") && said.contains("(settings: styles)"),
+        "{said}"
+    );
+    let body = g(&["log", "-1", "--format=%B"]);
+    let hash = body
+        .lines()
+        .find_map(|l| l.strip_prefix("Bwn-Evidence:"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let rec: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join("evidence").join(format!("{hash}.json"))).unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = rec["policy"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(names, ["styles"], "{rec}");
+    assert_eq!(rec["policy"]["source"], "settings");
+    assert_eq!(rec["policy"]["digest"].as_str().map(str::len), Some(64));
+}

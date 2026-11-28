@@ -131,6 +131,13 @@ const KEYS: &[Key] = &[
         ],
     },
     // ── harmless ───────────────────────────────────────────────────────────
+    // A boundary only adds a check and runs nothing (roadmap 5.7).
+    Key {
+        name: "boundaries",
+        class: Class::Harmless,
+        user: &[r#"[{"from":["src/ui/**"],"forbid":["db::"]}]"#, "[]", "5"],
+        project: &[r#"[{"from":["**"],"forbid":["unsafe"]}]"#, "5"],
+    },
     Key {
         name: "reasoning_effort",
         class: Class::Harmless,

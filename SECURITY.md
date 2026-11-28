@@ -508,8 +508,10 @@ so the chain's head is also kept in two places outside the log:
 
 Each commit bwn makes for a turn's change also names an evidence record in
 a `Bwn-Evidence:` trailer (roadmap 3.7): the files as committed, the
-project's checks and their verdict, the verifier's status and the log's
-head, kept in `~/.buildwithnexus/evidence/` under the record's SHA-256.
+project's checks and their verdict, the verifier's status, the quality
+policy that applied (where the checks came from, each check and boundary
+that applied to the changed files, the gates, and a digest of the whole
+pinned policy) and the log's head, kept in `~/.buildwithnexus/evidence/` under the record's SHA-256.
 `buildwithnexus evidence verify <commit>` exits 0 when the record is there,
 unchanged, and describes exactly the files in that commit, and 1 when it
 was edited, the commit was amended with other content, or the commit names
