@@ -454,6 +454,32 @@ never auto-updated.
   command it starts, a tool call quoted inside an answer never runs, and an
   isolated helper's worktree runs no repository hooks.
 
+## One Policy per Session
+
+Everything that limits what a session's surfaces may do is one policy value:
+- the permission mode;
+- the sandbox mode and its network switches;
+- the added folders;
+- the credential stores you exposed;
+- the hosts you named;
+- whether the session has read text someone else wrote;
+- read-only.
+
+Helpers get their policy from it through one derivation, which can only
+narrow. A helper in the session shares its state, so a helper started under
+`ask` can't act as `auto`. A background workflow is its own process. It gets
+the session's policy as `--inherit-policy` and runs with the stricter of
+that and its own settings in every field.
+
+So a workflow started after the session read untrusted text keeps asking in
+auto mode, and one started from `--sandbox require` keeps `require`. Its
+task, which the model wrote, adds no host the checker would let a command
+reach. A value that doesn't parse means the strictest policy.
+
+A property test checks that every child policy is within its parent for
+random policies. The policy does not change what happens with no sandbox
+backend, which is still covered by the gate and the posture check.
+
 ## Permission Gates and the Optional Sandbox
 
 `ask` / `accept-edits` / `auto` / `readonly` modes, allow, ask and deny

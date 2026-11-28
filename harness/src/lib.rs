@@ -64,6 +64,7 @@ pub mod net;
 #[cfg(target_os = "linux")]
 mod netns;
 pub mod onboarding;
+pub mod policy;
 pub mod posture;
 pub mod provider;
 pub mod report;
@@ -140,6 +141,9 @@ struct CliOptions {
     auto_commit: Option<bool>,
     /// `--route-gemini native|openrouter`.
     route_gemini: Option<String>,
+    /// `--inherit-policy <json>`: the parent session's policy, for a
+    /// background workflow (policy.rs). The child only ever narrows to it.
+    inherit_policy: Option<String>,
 }
 
 /// Every option `parse_cli_options` knows, for "did you mean" hints.
@@ -154,6 +158,7 @@ const CLI_OPTIONS: &[&str] = &[
     "--auto-commit",
     "--accept-posture",
     "--sandbox-network",
+    "--inherit-policy",
     "--no-repo-map",
     "--repo-map",
     "--route-gemini",
@@ -275,6 +280,7 @@ fn parse_cli_options(args: Vec<String>) -> Result<(CliOptions, Vec<String>), Str
             "--trust-project-allow" => &mut opts.trust_project_allow,
             "--base-url" => &mut opts.base_url,
             "--worktree" => &mut opts.worktree,
+            "--inherit-policy" => &mut opts.inherit_policy,
             _ => {
                 let named = !looks_like_option(&arg);
                 rest.push(arg);
@@ -914,6 +920,24 @@ fn provider_or_onboard(opts: &CliOptions) -> Result<(Provider, Permission), Stri
     if let Some(note) = agent::max_parallel_helpers_note(settings.max_parallel_helpers) {
         eprintln!("{}", tui::yellow(&format!("buildwithnexus: {note}")));
     }
+    // A background workflow: the meet of this process's own settings and
+    // the policy its parent session handed down, so it can only be
+    // stricter. One that doesn't parse means the strictest (roadmap 2.3).
+    let perm = match &opts.inherit_policy {
+        Some(raw) => {
+            let inherited = policy::Policy::decode(raw).unwrap_or_else(|e| {
+                eprintln!(
+                    "{}",
+                    tui::yellow(&format!(
+                        "buildwithnexus: warning: --inherit-policy: {e}; running with the strictest policy"
+                    ))
+                );
+                policy::Policy::strictest()
+            });
+            policy::Policy::current(perm).meet(&inherited).apply()
+        }
+        None => perm,
+    };
     workflow::set_launch(
         &settings.provider,
         &provider.model,
@@ -2574,6 +2598,8 @@ fn usage_text() -> String {
          \x20 --sandbox-network             on Landlock alone (no bubblewrap or user\n\
          \x20                               namespaces), let commands use the network\n\
          \x20                               through the checker; it is off there otherwise\n\
+         \x20 --inherit-policy <json>       (set by bwn for background workflows) run no\n\
+         \x20                               looser than the session that started this one\n\
          \x20 --auto-commit                 git-commit file edits (the default)\n\
          \x20 --no-auto-commit              leave file edits uncommitted\n\
          \x20 --repo-map                    offer the repo_map tool (the default)\n\

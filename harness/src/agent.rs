@@ -875,8 +875,27 @@ pub fn mark_untrusted_read(tool: &str) {
 }
 
 /// The tool through which this session first read untrusted text, if any.
+/// A background workflow started after its parent read untrusted text
+/// carries the parent's mark for its whole run.
 pub fn untrusted_read() -> Option<String> {
-    with_untrusted(|u| u.tool.clone())
+    with_untrusted(|u| u.tool.clone()).or_else(|| {
+        INHERITED_UNTRUSTED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    })
+}
+
+static INHERITED_UNTRUSTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The parent session had read untrusted text through `tool` (policy.rs):
+/// this session counts as having read it too, whatever its own messages
+/// hold.
+pub fn inherit_untrusted(tool: &str) {
+    *INHERITED_UNTRUSTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) =
+        Some(format!("{tool} (in the session that started this one)"));
 }
 
 /// Called as a turn starts: a different session than the last one (a new

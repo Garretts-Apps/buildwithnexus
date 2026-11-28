@@ -38,6 +38,12 @@ pub fn list() -> Vec<PathBuf> {
     with_dirs(|d| d.clone())
 }
 
+/// Keep only the added folders `keep` accepts (a child session narrowed to
+/// its parent's policy).
+pub fn retain(keep: impl Fn(&PathBuf) -> bool) {
+    with_dirs(|d| d.retain(|p| keep(p)));
+}
+
 pub fn count() -> usize {
     with_dirs(|d| d.len())
 }

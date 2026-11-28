@@ -152,6 +152,15 @@ pub(crate) fn child_args(ctx: Option<&SessionContext>, task: &str) -> Vec<String
         }
     }
     args.extend(crate::workdirs::child_args());
+    // Everything else that limits the session (sandbox, network, exposed
+    // stores, the hosts the user named, the untrusted mark), as one value
+    // the child can only narrow to (roadmap 2.3).
+    let perm = ctx
+        .and_then(|c| crate::agent::parse_permission(&c.permission).ok())
+        .unwrap_or(crate::agent::Permission::ReadOnly);
+    let policy =
+        crate::policy::Policy::current(perm).child(&crate::policy::ChildRequest::default());
+    args.push(format!("--inherit-policy={}", policy.encode()));
     args.push("--".to_string());
     args.push(task.to_string());
     args
@@ -1072,6 +1081,13 @@ mod tests {
         assert_eq!(highest_logged_id(), 0);
     }
 
+    // child_args without the policy value (tested on its own).
+    fn without_policy(args: Vec<String>) -> Vec<String> {
+        args.into_iter()
+            .filter(|a| !a.starts_with("--inherit-policy="))
+            .collect()
+    }
+
     #[test]
     fn background_runs_carry_the_session_permission_and_model() {
         let ctx = SessionContext {
@@ -1080,8 +1096,23 @@ mod tests {
             model: "mock-coder".into(),
             base_url: "http://127.0.0.1:9/v1".into(),
         };
+        let args = child_args(Some(&ctx), "--permission auto: create notes.txt");
+        // The session's policy rides along as one value (roadmap 2.3).
+        let inherited: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("--inherit-policy="))
+            .collect();
+        assert_eq!(inherited.len(), 1, "{args:?}");
+        let policy =
+            crate::policy::Policy::decode(inherited[0].trim_start_matches("--inherit-policy="))
+                .unwrap();
+        assert_eq!(policy.permission, crate::agent::Permission::ReadOnly);
+        let args: Vec<&String> = args
+            .iter()
+            .filter(|a| !a.starts_with("--inherit-policy="))
+            .collect();
         assert_eq!(
-            child_args(Some(&ctx), "--permission auto: create notes.txt"),
+            args,
             [
                 "run",
                 "--json",
@@ -1094,7 +1125,10 @@ mod tests {
             ]
         );
         // Before a session exists (tests, headless) nothing is added.
-        assert_eq!(child_args(None, "t"), ["run", "--json", "--", "t"]);
+        assert_eq!(
+            without_policy(child_args(None, "t")),
+            ["run", "--json", "--", "t"]
+        );
     }
 
     #[test]
@@ -1107,7 +1141,7 @@ mod tests {
         crate::workdirs::add(&other.display().to_string(), &cwd).unwrap();
         let other = other.canonicalize().unwrap();
         assert_eq!(
-            child_args(None, "t"),
+            without_policy(child_args(None, "t")),
             [
                 "run".to_string(),
                 "--json".into(),
