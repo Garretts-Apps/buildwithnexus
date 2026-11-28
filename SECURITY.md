@@ -471,6 +471,19 @@ narrow. A helper in the session shares its state, so a helper started under
 the session's policy as `--inherit-policy` and runs with the stricter of
 that and its own settings in every field.
 
+A background agent (`/bg <task>`, or `buildwithnexus bg run <task>`;
+roadmap 5.2) is such a child, never a daemon:
+- **Where it runs:** in a git worktree of its own, on a new branch made
+  without running the repository's hooks.
+- **Approvals:** it has no terminal, so a call that would ask is refused.
+  It can't answer its own approvals.
+- **Commits:** its edits are committed only once its checks pass, and each
+  commit names its evidence record.
+- **Merging:** the work comes back only through
+  `buildwithnexus bg merge <branch>`, a command you run. It merges only
+  when every commit the branch adds verifies against its record, and
+  otherwise names each commit that doesn't.
+
 So a workflow started after the session read untrusted text keeps asking in
 auto mode, and one started from `--sandbox require` keeps `require`. Its
 task, which the model wrote, adds no host the checker would let a command

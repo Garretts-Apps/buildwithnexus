@@ -3946,6 +3946,13 @@ mod unrun_call_tests {
 }
 
 mod review;
+
+/// A worktree on a new branch from HEAD for work done apart from this
+/// checkout (roadmap 5.2): its path, branch and base commit. Made without
+/// running the repository's hooks or fsmonitor.
+pub(crate) fn make_isolated_worktree(cwd: &Path) -> Result<(PathBuf, String, String), String> {
+    review::make_worktree(cwd).map(|w| (w.path, w.branch, w.base))
+}
 use review::*;
 mod parallel_tools;
 use parallel_tools::*;

@@ -19,6 +19,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tool or host (`"permissions": {"allow": ["fetch_url(docs.rs)"]}`).
 
 ### Security
+- **Background agents in worktrees of their own (roadmap 5.2).**
+  - **Starting:** `/bg <task>` (or `buildwithnexus bg run <task>`) runs the
+    task as a child of the session, on a new branch in its own worktree,
+    with the session's policy.
+  - **Approvals:** it can't answer its own approvals.
+  - **Commits:** its work is committed once its checks pass, with
+    evidence.
+  - **Merging:** `buildwithnexus bg merge <branch>` merges only when every
+    commit verifies against its evidence record.
 - **Refusals you keep making become proposed rules (roadmap 5.4).** After
   the third refusal of the same command, host or tool, bwn proposes the
   deny rule. It joins your settings only when you run
