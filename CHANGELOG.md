@@ -14,8 +14,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   says the store is readable, and auto mode asks before commands.
 - **The startup check names what the sandbox can't do in your setup:**
   - Nested repositories past the scan's bounds (64 repositories or 10,000
-    folders): their `.git` stays writable. The check says so, and auto mode
-    asks before commands.
+    folders): their `.git` stays writable, and the check says so.
   - A hidden file's existence (not its contents) still shows.
   - Commands that hold the network by port can still listen on this
     machine's network. That is Landlock alone, or a bubblewrap that can't

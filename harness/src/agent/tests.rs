@@ -4108,9 +4108,10 @@ fn invariant_au5_the_landlock_policy_gap_is_disclosed_and_auto_asks() {
 // Roadmap 2.2: the nested-repository scan has bounds (64 found, 10,000
 // folders). A workspace past them leaves a nested .git writable, so on a
 // backend that otherwise keeps nested .git read-only the posture check says
-// so and auto mode asks before commands.
+// so. Auto mode does not ask for it: a Python project's .venv alone can pass
+// 10,000 folders, and asking before every command there would be noise.
 #[test]
-fn invariant_nested_git_past_the_bounds_is_disclosed_and_auto_asks() {
+fn invariant_nested_git_past_the_bounds_is_disclosed() {
     let _g = crate::config::TEST_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -4138,7 +4139,7 @@ fn invariant_nested_git_past_the_bounds_is_disclosed_and_auto_asks() {
     std::env::remove_var("NEXUS_HOME");
     let _ = std::fs::remove_dir_all(&home);
     if crate::sandbox::protects_policy_files() {
-        assert!(reason.contains("nested repositor"), "{reason:?}");
+        assert!(!reason.contains("nested repositor"), "{reason:?}");
         assert!(writes.contains("nested repository's .git"), "{writes}");
     } else {
         eprintln!("skip: this backend doesn't keep nested .git read-only at all");

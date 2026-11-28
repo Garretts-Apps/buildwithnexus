@@ -65,12 +65,12 @@ pub const CAPABILITIES: &[Cap] = &[
     Cap {
         id: "nested_git_readonly",
         guarantee: "Nested repositories' `.git` read-only",
-        bwrap: "Up to 64 found in 10,000 folders, skipping `node_modules` and `target`. Past those bounds the posture check says so and auto mode asks before commands",
+        bwrap: "Up to 64 found in 10,000 folders, skipping `node_modules` and `target`. Past those bounds the posture check says so",
         userns: "Same bounds as bubblewrap",
         landlock: "No",
         seatbelt: "Same bounds as bubblewrap",
-        proven_by: "`nested_repositories_stay_read_only_too`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_nested_git_past_the_bounds_is_disclosed_and_auto_asks`",
-        tests: &[(BW | SB, "nested_repositories_stay_read_only_too"), (UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only"), (BW | UN | SB, "invariant_nested_git_past_the_bounds_is_disclosed_and_auto_asks")],
+        proven_by: "`nested_repositories_stay_read_only_too`, `invariant_userns_keeps_the_workspace_writable_and_git_read_only`, `invariant_nested_git_past_the_bounds_is_disclosed`",
+        tests: &[(BW | SB, "nested_repositories_stay_read_only_too"), (UN, "invariant_userns_keeps_the_workspace_writable_and_git_read_only"), (BW | UN | SB, "invariant_nested_git_past_the_bounds_is_disclosed")],
     },
     Cap {
         id: "credential_stores_hidden",

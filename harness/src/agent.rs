@@ -944,18 +944,6 @@ fn auto_asks(
                 .to_string(),
         );
     }
-    // A nested repository's .git past the scan's bounds is not kept
-    // read-only (roadmap 2.2), so a hook could be planted there.
-    if command
-        && crate::sandbox::protects_policy_files()
-        && crate::sandbox::would_confine()
-        && !crate::sandbox::nested_git_complete(&[cwd])
-    {
-        return Some(
-            "auto mode asks: this workspace has more folders or nested repositories than bwn checks, so a nested repository's .git past them is writable by commands"
-                .to_string(),
-        );
-    }
     if command
         && crate::sandbox::mode() != crate::sandbox::Mode::Off
         && !crate::sandbox::hides_reads(cwd)

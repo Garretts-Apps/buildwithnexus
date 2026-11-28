@@ -230,7 +230,7 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
                 v.push(row(
                     "session",
                     "writes",
-                    format!("{where_}; this workspace has more folders or nested repositories than bwn checks, so a nested repository's .git past them stays writable (auto mode asks before commands)"),
+                    format!("{where_}; this workspace has more folders or nested repositories than bwn checks, so a nested repository's .git past them stays writable"),
                     Level::Warn,
                     &format!("confined-nested-unbounded:{}", added.join(",")),
                 ));
@@ -1130,7 +1130,8 @@ mod tests {
         std::env::set_var("NEXUS_HOME", &home);
         // Outside bwn's own folder, which is a store: a workspace inside it
         // would leave it readable (and the row would not list stores).
-        let cwd = std::env::temp_dir().join(format!("bwn-posture-keys-proj-{}", std::process::id()));
+        let cwd =
+            std::env::temp_dir().join(format!("bwn-posture-keys-proj-{}", std::process::id()));
         std::fs::create_dir_all(&cwd).unwrap();
         let mode0 = crate::sandbox::mode();
         crate::sandbox::set_mode(crate::sandbox::Mode::Auto);
