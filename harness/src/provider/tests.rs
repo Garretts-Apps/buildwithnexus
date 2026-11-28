@@ -587,6 +587,7 @@ fn anthropic_effort_body(
         effort,
         stream: false,
         vertex: false,
+        bedrock: false,
     };
     parsed(anthropic_bytes(msgs, tools, &shape))
 }
@@ -3050,6 +3051,7 @@ fn a_vertex_body_names_the_api_version_and_not_the_model() {
         effort: Effort::Off,
         stream: true,
         vertex,
+        bedrock: false,
     };
     let v: Value = serde_json::from_slice(&anthropic_bytes(&msgs, &[], &shape(true))).unwrap();
     let a: Value = serde_json::from_slice(&anthropic_bytes(&msgs, &[], &shape(false))).unwrap();
@@ -3075,6 +3077,9 @@ fn cloud_model_names_resolve_to_the_model() {
         ),
         ("claude-opus-4-8", "claude-opus-4-8"),
         ("vendor/anthropic.x", "vendor/anthropic.x"),
+        ("deepseek-v3", "deepseek-v3"),
+        ("my-ft-v2", "my-ft-v2"),
+        ("anthropic.claude-x-v", "claude-x-v"),
     ] {
         assert_eq!(crate::usage::bare_model(cloud), bare, "{cloud}");
     }
@@ -3087,4 +3092,139 @@ fn cloud_model_names_resolve_to_the_model() {
         crate::usage::price_for("us.anthropic.claude-sonnet-4-6").is_some(),
         crate::usage::price_for("claude-sonnet-4-6").is_some()
     );
+}
+
+fn bedrock(base: &str, model: &str, auth: Auth) -> Provider {
+    Provider {
+        protocol: Protocol::Anthropic,
+        base_url: base.into(),
+        api_key: (auth == Auth::AwsBearer).then(|| "bedrock-test-key".into()),
+        model: model.into(),
+        context_tokens: 200_000,
+        temperature: None,
+        max_tokens: None,
+        effort: Effort::Off,
+        ollama_ctx: std::sync::OnceLock::new(),
+        auth,
+    }
+}
+
+// Roadmap 4.4, IH-1: a Bedrock key or signature goes only to a Bedrock
+// runtime endpoint, decided before any credential is read; a model id
+// can't move the request to another path.
+#[test]
+fn invariant_ih1_bedrock_credentials_go_only_to_a_bedrock_endpoint() {
+    for auth in [Auth::AwsBearer, Auth::AwsSigV4] {
+        for base in [
+            "https://evil.example",
+            "https://bedrock-runtime.us-east-1.amazonaws.com.evil.example",
+            "https://bedrock-runtime.a.b.amazonaws.com",
+            "https://bedrock.us-east-1.amazonaws.com",
+            "http://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://u:p@bedrock-runtime.us-east-1.amazonaws.com",
+            "http://127.0.0.1:9",
+        ] {
+            let e = bedrock_request(
+                &bedrock(base, "us.anthropic.claude-sonnet-4-6", auth),
+                true,
+                b"{}",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{base}: request built"));
+            assert!(
+                e.starts_with("refusing to send AWS credentials"),
+                "{base}: {e}"
+            );
+        }
+        let ok = "https://bedrock-runtime.us-west-2.amazonaws.com";
+        for model in ["../x", "a?b", "a#b", " "] {
+            let e = bedrock_request(&bedrock(ok, model, auth), true, b"{}")
+                .err()
+                .unwrap();
+            assert!(e.contains("isn't a Bedrock model id"), "{model}: {e}");
+        }
+    }
+    let ok = "https://bedrock-runtime.us-west-2.amazonaws.com";
+    let req = bedrock_request(
+        &bedrock(
+            ok,
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            Auth::AwsBearer,
+        ),
+        true,
+        b"{}",
+    )
+    .unwrap();
+    assert_eq!(
+        req.url(),
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-haiku-4-5-20251001-v1%3A0/invoke-with-response-stream"
+    );
+    assert!(req.has("authorization"));
+    let p = bedrock(ok, "m", Auth::AwsBearer);
+    assert_eq!(openai_key_header(&p, ok), None);
+}
+
+#[test]
+fn a_bedrock_body_names_its_version_and_no_model_or_stream_field() {
+    let msgs = [Msg::User("hi".into())];
+    let shape = AnthropicBody {
+        model: "us.anthropic.claude-sonnet-4-6",
+        max_tokens: None,
+        effort: Effort::Off,
+        stream: true,
+        vertex: false,
+        bedrock: true,
+    };
+    let v: Value = serde_json::from_slice(&anthropic_bytes(&msgs, &[], &shape)).unwrap();
+    assert_eq!(v["anthropic_version"], "bedrock-2023-05-31");
+    assert!(v.get("model").is_none() && v.get("stream").is_none(), "{v}");
+    assert!(v["messages"].is_array());
+}
+
+// A whole streamed reply through Bedrock's framing, and a throttled one
+// that reads as busy, so `fallback_model` takes over as it does elsewhere.
+#[test]
+fn a_bedrock_stream_reads_as_an_anthropic_reply_and_throttling_as_busy() {
+    let chunk = |json: Value| {
+        let payload = json!({"bytes": crate::media::b64_encode(json.to_string().as_bytes())});
+        crate::aws::encode_message(
+            &[(":message-type", "event"), (":event-type", "chunk")],
+            payload.to_string().as_bytes(),
+        )
+    };
+    let mut wire = Vec::new();
+    for e in [
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 5, "output_tokens": 0}}}),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+        json!({"type": "message_stop"}),
+    ] {
+        wire.extend(chunk(e));
+    }
+    let mut text = String::new();
+    let reply = anthropic_stream(
+        crate::aws::BedrockSse::new(&wire[..]),
+        &mut |t| text.push_str(t),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(text, "hello");
+    assert_eq!(reply.text, "hello");
+
+    let throttled = crate::aws::encode_message(
+        &[
+            (":message-type", "exception"),
+            (":exception-type", "throttlingException"),
+        ],
+        br#"{"message":"Too many requests, please wait"}"#,
+    );
+    let e = anthropic_stream(
+        crate::aws::BedrockSse::new(&throttled[..]),
+        &mut |_| {},
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert!(busy_error(&e), "{e}");
 }

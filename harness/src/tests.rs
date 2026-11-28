@@ -2116,3 +2116,41 @@ fn a_vertex_base_url_off_googles_hosts_is_refused() {
     s.base_url = None;
     assert!(build_provider(&s).err().unwrap().contains("needs base_url"));
 }
+
+#[test]
+fn a_bedrock_base_url_off_amazons_hosts_is_refused() {
+    let s = Settings {
+        provider: "bedrock".into(),
+        permission: "ask".into(),
+        base_url: Some("https://bedrock-runtime.us-east-1.amazonaws.com.evil.example".into()),
+        ..Default::default()
+    };
+    let e = build_provider_with_key(&s, Some("k")).err().unwrap();
+    assert!(e.contains("refusing"), "{e}");
+    let mut s = s;
+    s.base_url = Some("https://bedrock-runtime.us-east-1.amazonaws.com".into());
+    let p = build_provider_with_key(&s, Some("k")).unwrap();
+    assert_eq!(p.auth, provider::Auth::AwsBearer);
+    assert_eq!(p.context_tokens, 200_000);
+}
+
+// Roadmap 4.4 acceptance, IH-1: the cloud credentials' variables are
+// stripped from every command the agent runs.
+#[test]
+fn invariant_ih1_cloud_credential_variables_never_reach_commands() {
+    let names = [
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AZURE_OPENAI_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ];
+    let stripped = sandbox::credential_env(names.iter().map(|n| n.to_string()), &[]);
+    for n in names {
+        assert!(stripped.iter().any(|s| s == n), "{n} reaches commands");
+    }
+    assert!(sandbox::credential_env(["PATH".to_string()], &[]).is_empty());
+}

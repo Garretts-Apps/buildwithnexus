@@ -182,7 +182,10 @@ fn configure(pick: &'static Preset, ollama_found: &[String]) -> Result<Settings,
     }
     // A gateway that wants a key says so before the model is chosen.
     // Vertex signs in with Google's credentials file, not a key.
-    let mut wants_key = !pick.local && pick.id != "vertex";
+    // Bedrock signs with an AWS access key when there is one.
+    let mut wants_key = !pick.local
+        && pick.id != "vertex"
+        && !(pick.id == "bedrock" && crate::aws::creds().is_some());
     let detected = if pick.local {
         detect_models(pick, &mut base_url, ollama_found, &mut wants_key)?
     } else {
@@ -708,6 +711,7 @@ fn key_page(provider: &str) -> Option<&'static str> {
         "deepseek" => "https://platform.deepseek.com/api_keys",
         "azure" => "https://ai.azure.com (your resource's Keys and Endpoint)",
         "vertex" => "https://cloud.google.com/docs/authentication/provide-credentials-adc",
+        "bedrock" => "https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html",
         _ => return None,
     })
 }

@@ -20,6 +20,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `https://oauth2.googleapis.com/token`: a key file's `token_uri` is
   ignored. The token goes only to an `aiplatform.googleapis.com` endpoint.
   The key file is hidden from commands.
+- **Claude on Amazon Bedrock (roadmap 4.4).** `"provider": "bedrock"`
+  sends `AWS_BEARER_TOKEN_BEDROCK` as a Bearer token, or signs each
+  request with an AWS access key (SigV4, in-tree). The access key comes
+  from the environment or `~/.aws/credentials`. Requests go only to a
+  `bedrock-runtime.REGION.amazonaws.com` endpoint. Streamed replies are
+  read from AWS event-stream frames, and each frame's checksums are
+  checked. Throttling triggers `fallback_model`.
 - **Language-server diagnostics after an edit.** `"lsp": {"rust":
   {"command": "rust-analyzer", "extensions": ["rs"]}}` starts the server
   (inside the sandbox) the first time a file it serves is edited, and adds
