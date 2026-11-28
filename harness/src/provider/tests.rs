@@ -3077,6 +3077,9 @@ fn cloud_model_names_resolve_to_the_model() {
         ),
         ("claude-opus-4-8", "claude-opus-4-8"),
         ("vendor/anthropic.x", "vendor/anthropic.x"),
+        ("deepseek-v3", "deepseek-v3"),
+        ("my-ft-v2", "my-ft-v2"),
+        ("anthropic.claude-x-v", "claude-x-v"),
     ] {
         assert_eq!(crate::usage::bare_model(cloud), bare, "{cloud}");
     }

@@ -98,16 +98,18 @@ const PRICES: &[(&str, Price)] = &[
 pub fn bare_model(model: &str) -> String {
     let m = model.trim().to_ascii_lowercase();
     let m = m.split('@').next().unwrap_or(&m);
-    let m = match m.find("anthropic.") {
-        Some(i) if !m[..i].contains('/') => &m[i + "anthropic.".len()..],
-        _ => m,
+    // Only Bedrock's form (`…anthropic.<model>-v1:0`) has a version suffix
+    // to drop; `deepseek-v3` and the like keep theirs.
+    let Some(i) = m.find("anthropic.").filter(|i| !m[..*i].contains('/')) else {
+        return m.to_string();
     };
+    let m = &m[i + "anthropic.".len()..];
     let m = match m.rfind("-v") {
         Some(i)
-            if m[i + 2..]
-                .split(':')
-                .all(|p| p.chars().all(|c| c.is_ascii_digit()))
-                && !m[i + 2..].is_empty() =>
+            if !m[i + 2..].is_empty()
+                && m[i + 2..]
+                    .split(':')
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) =>
         {
             &m[..i]
         }
@@ -119,9 +121,12 @@ pub fn bare_model(model: &str) -> String {
 /// List price for a model, matched by the longest known prefix (case-insensitive).
 /// Prices from settings (`prices`) come before the built-in table.
 pub fn price_for(model: &str) -> Option<Price> {
+    let raw = model.trim().to_ascii_lowercase();
     let m = bare_model(model);
     let user = user_prices();
-    longest_prefix(&m, user.iter().map(|(k, p)| (k.as_str(), *p)))
+    // A user's price may name the model as written or as the model it is.
+    longest_prefix(&raw, user.iter().map(|(k, p)| (k.as_str(), *p)))
+        .or_else(|| longest_prefix(&m, user.iter().map(|(k, p)| (k.as_str(), *p))))
         .or_else(|| longest_prefix(&m, PRICES.iter().map(|(k, p)| (*k, *p))))
 }
 
