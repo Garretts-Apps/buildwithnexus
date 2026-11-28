@@ -246,6 +246,38 @@ pub(crate) fn hidden_paths_in(
     out
 }
 
+/// Credential stores that hold one of `roots` (a session run from inside
+/// `~/.aws`, say). No backend can hide such a store without hiding the
+/// workspace, so it stays readable; the posture check says so and auto mode
+/// asks before commands.
+pub(crate) fn stores_holding_a_root_in(
+    home: &Path,
+    bwn_home: &Path,
+    expose: &[PathBuf],
+    roots: &[&Path],
+) -> Vec<PathBuf> {
+    let roots: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| r.canonicalize().unwrap_or_else(|_| r.to_path_buf()))
+        .collect();
+    crate::tools::credential_stores(home)
+        .into_iter()
+        .chain([bwn_home.to_path_buf()])
+        .filter(|c| c.symlink_metadata().is_ok())
+        .map(|c| c.canonicalize().unwrap_or(c))
+        .filter(|c| c != Path::new("/") && !expose.iter().any(|e| c.starts_with(e)))
+        .filter(|c| roots.iter().any(|r| r.starts_with(c)))
+        .collect()
+}
+
+fn store_holds_a_root(roots: &[&Path]) -> bool {
+    let Some(home) = crate::config::user_home() else {
+        return false;
+    };
+    let expose = EXPOSE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    !stores_holding_a_root_in(&home, &crate::config::home(), &expose, roots).is_empty()
+}
+
 /// Appended to a sandboxed command's output when it failed on a hidden path.
 pub fn hidden_note(output: &str, hidden: &[PathBuf]) -> Option<String> {
     let l = output.to_ascii_lowercase();
@@ -756,12 +788,25 @@ const NESTED_GIT_DIRS: usize = 10_000;
 /// followed, and `node_modules` and `target` (dependency and build output)
 /// are not searched.
 pub fn nested_git_entries(root: &Path) -> Vec<PathBuf> {
+    nested_git_scan(root).0
+}
+
+/// Whether the nested-repository scan covered every folder under each of
+/// `roots`. When it stopped at its bounds, a `.git` past them stays
+/// writable: the posture check says so and auto mode asks before commands.
+pub fn nested_git_complete(roots: &[&Path]) -> bool {
+    roots.iter().all(|r| nested_git_scan(r).1)
+}
+
+// The nested `.git` entries under `root`, and whether the scan finished
+// within its bounds (NESTED_GIT_DIRS folders, NESTED_GIT_MAX found).
+fn nested_git_scan(root: &Path) -> (Vec<PathBuf>, bool) {
     let mut found = Vec::new();
     let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
     let mut read = 0;
     while let Some(dir) = queue.pop_front() {
         if read >= NESTED_GIT_DIRS {
-            break;
+            return (found, false);
         }
         read += 1;
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -779,7 +824,7 @@ pub fn nested_git_entries(root: &Path) -> Vec<PathBuf> {
                 if dir != root {
                     found.push(e.path());
                     if found.len() >= NESTED_GIT_MAX {
-                        return found;
+                        return (found, false);
                     }
                 }
                 continue; // a repository's own store holds no repositories
@@ -789,7 +834,7 @@ pub fn nested_git_entries(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    found
+    (found, true)
 }
 
 /// Environment a sandboxed child never inherits: session buses and agent
@@ -1184,15 +1229,20 @@ pub fn hides_reads(cwd: &Path) -> bool {
     if mode() == Mode::Off || crate::config::user_home().is_none() {
         return false;
     }
+    let extra = crate::workdirs::list();
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let roots: Vec<&Path> = std::iter::once(cwd.as_path())
+        .chain(extra.iter().map(PathBuf::as_path))
+        .collect();
+    // A store that holds the workspace is left visible on every backend
+    // (hidden_paths drops it, so Landlock's check below would not see it).
+    if store_holds_a_root(&roots) {
+        return false;
+    }
     match decide(mode(), backend()) {
         Decision::Sandboxed(Backend::Bwrap | Backend::SandboxExec) => true,
         #[cfg(target_os = "linux")]
         Decision::Sandboxed(Backend::Landlock | Backend::Userns) => {
-            let extra = crate::workdirs::list();
-            let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-            let roots: Vec<&Path> = std::iter::once(cwd.as_path())
-                .chain(extra.iter().map(PathBuf::as_path))
-                .collect();
             crate::landlock::can_hide(&roots, &hidden_paths(&roots))
         }
         _ => false,
@@ -2379,6 +2429,77 @@ print("unix", kind(socket.AF_UNIX, socket.SOCK_STREAM))
         for k in ["host_loopback", "public_v4", "udp", "unix", "dns"] {
             assert!(got.contains_key(k), "probe line {k} missing: {text}");
         }
+    }
+
+    // No inbound: a server a bubblewrap command starts in the session's
+    // namespace is not reachable from this machine, on loopback or on its
+    // own address, while it listens on every address.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn invariant_bwrap_netns_listener_is_not_reachable_from_the_host() {
+        use std::io::BufRead;
+        let _g = crate::config::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let usable = Command::new("bwrap")
+            .args(bwrap_probe_args())
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success());
+        let exe = std::env::current_exe().ok().and_then(|t| {
+            t.ancestors()
+                .map(|a| a.join("buildwithnexus"))
+                .find(|p| p.is_file())
+        });
+        if !usable || exe.is_none() {
+            eprintln!("skip: bwrap or the built binary missing");
+            return;
+        }
+        let Ok(s) = crate::netns::session() else {
+            return;
+        };
+        std::env::set_var("BWN_TEST_CONFINE_EXE", exe.unwrap());
+        let ws = std::env::temp_dir().join(format!("bwn-bwrap-inbound-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let script = "python3 -c 'import socket, time\ns = socket.socket(); s.bind((\"0.0.0.0\", 0)); s.listen(4)\nprint(s.getsockname()[1], flush=True)\ns.settimeout(4)\ntry:\n    s.accept(); print(\"ACCEPTED\", flush=True)\nexcept OSError:\n    print(\"NONE\", flush=True)'";
+        let mut c = Command::new("bwrap");
+        c.args(bwrap_argv(
+            script,
+            &ws,
+            &[],
+            Net::Private(s.port),
+            false,
+            &[],
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+        join_session_net(&mut c).unwrap();
+        let mut child = c.spawn().unwrap();
+        std::env::remove_var("BWN_TEST_CONFINE_EXE");
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        let port: u16 = line.trim().parse().expect(&line);
+        let mut reached = Vec::new();
+        let mut targets: Vec<std::net::IpAddr> = vec![[127, 0, 0, 1].into()];
+        targets.extend(crate::userns::tests::outer_ip());
+        for ip in targets {
+            let a = std::net::SocketAddr::new(ip, port);
+            if std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(1)).is_ok() {
+                reached.push(a);
+            }
+        }
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut out, &mut rest);
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&ws);
+        // Another process on the host may hold that port number; what
+        // matters is that the command's listener accepted nothing.
+        assert!(
+            !rest.contains("ACCEPTED"),
+            "the host reached the listener: {reached:?}"
+        );
+        assert!(rest.contains("NONE"), "{rest}");
     }
 
     // Real Seatbelt (macOS runners): out only to the proxy's port on
