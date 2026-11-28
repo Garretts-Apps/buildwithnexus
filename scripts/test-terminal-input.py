@@ -2285,9 +2285,17 @@ class FileMentionTests(TerminalHarness):
         self.wait_for(lambda: b"@src/" in self.output, "a visible folder completes")
 
     def test_an_unknown_at_file_is_flagged_before_sending(self):
+        # The first turn prints the startup check's twenty-odd lines right
+        # after the notice. Frames paint only what is on screen, so when no
+        # frame falls between them the notice scrolls past unpainted (it is
+        # still in the transcript) and never reaches the PTY. A first turn
+        # takes that burst out of the way.
+        self.send("hello\r")
+        self.wait_for(lambda: b"Looked." in self.output, "the first answer")
+        start = len(self.output)
         self.send("explain @nosuchfile.py\r")
-        self.wait_for(lambda: b"@nosuchfile.py not found" in self.output, "the notice")
-        self.wait_for(lambda: b"Looked." in self.output, "the answer")
+        self.wait_for(lambda: b"@nosuchfile.py not found" in self.output[start:], "the notice")
+        self.wait_for(lambda: self.output[start:].count(b"Looked.") >= 1, "the answer")
 
     def test_help_lists_custom_commands(self):
         self.send("/help\r")
