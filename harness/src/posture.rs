@@ -370,13 +370,13 @@ fn session_rows(perm: crate::agent::Permission, cwd: &Path) -> Vec<Row> {
             row(
             "session",
             "commands",
-            if perm == P::Auto && smode != Mode::Off {
-                "can write and read anywhere you can and reach any host; auto mode asks before each one".into()
+            if smode != Mode::Off {
+                "can write and read anywhere you can and reach any host, so each one asks, in every mode (restricted mode: no saved approval or allow rule skips it)".into()
             } else {
                 "can write and read anywhere you can, and reach any host".into()
             },
             Level::Warn,
-            "unconfined",
+            if smode != Mode::Off { "restricted" } else { "unconfined" },
         )
         });
     }

@@ -576,6 +576,13 @@ Landlock and seccomp alone. WSL skips bubblewrap and starts at the namespace
 backend. `sandbox-exec` (Seatbelt) on macOS. Windows has none: commands there are refused until you allow them to
 run unconfined for the session, and the posture check and `doctor` say so.
 
+After that, wherever no backend confines commands (Windows, or a machine with
+none working), bwn runs in restricted mode. Every command asks, in every
+mode, auto included, one at a time. No allow rule, saved approval or "always"
+answer skips the question, and with no terminal to ask, the command is
+refused. `"sandbox": "off"` is your choice to run unconfined, and it keeps
+the usual gate.
+
 What each backend guarantees, and the test that proves it. "No" is a
 documented gap, not a bug report: each one has a roadmap item. With no backend,
 commands are refused until allowed (see above), and once allowed nothing in

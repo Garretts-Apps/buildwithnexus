@@ -7,6 +7,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Restricted mode where no sandbox confines commands.** On Windows, or a
+  machine with no working backend, every command now asks, in every mode
+  and one at a time, after the session's "run unconfined" answer. An allow
+  rule, a saved approval or auto mode used to let one run unasked; none of
+  them can now. With no terminal to ask, the command is refused. The posture
+  check says so. `"sandbox": "off"` keeps the usual gate.
 - **The trust, posture-check and rules stores are sealed.** Something
   outside the sandbox could rewrite `trusted.json` to trust a repo's hooks,
   or a posture file to skip the startup question. Each store now carries an

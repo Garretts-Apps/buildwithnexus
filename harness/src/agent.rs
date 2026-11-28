@@ -1243,6 +1243,21 @@ pub(crate) fn gate(
             cwd,
         );
     }
+    // D4 restricted mode (roadmap 2.6): where no sandbox confines commands
+    // (Windows, or a machine with no working backend) and the sandbox isn't
+    // off by the user's choice, every command asks, in every mode, one at a
+    // time: no allow rule, saved approval or auto mode runs one unasked.
+    if shell.is_some() && crate::sandbox::restricted_execution() {
+        return confirm_one_change(
+            name,
+            input,
+            &format!(
+                "{} — no sandbox confines commands here, so each one asks (restricted mode)",
+                tools::approval_label(name, input)
+            ),
+            cwd,
+        );
+    }
     let allowed_by_rule = rule_for(
         &rules,
         config::RuleEffect::Allow,

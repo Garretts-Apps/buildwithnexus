@@ -1325,6 +1325,17 @@ pub fn hides_reads(cwd: &Path) -> bool {
     }
 }
 
+/// Restricted execution (roadmap 2.6, D4): the sandbox is on but no backend
+/// confines commands (Windows; a machine with none working), so every
+/// command asks, in every mode, and nothing saved skips the question.
+pub fn restricted_execution() -> bool {
+    mode() != Mode::Off
+        && matches!(
+            decide(mode(), backend()),
+            Decision::NeedsException | Decision::Unsandboxed
+        )
+}
+
 /// True when the next shell command would run confined — drives the
 /// `[sandboxed]` marker on the tool header.
 pub fn would_confine() -> bool {

@@ -4236,3 +4236,43 @@ fn the_posture_check_names_an_mcp_server_run_outside_the_sandbox() {
         assert!(inside.0.contains("outside any sandbox"), "{inside:?}");
     }
 }
+
+// D4 restricted mode (roadmap 2.6): where no sandbox confines commands
+// (Windows; the "none" cells), every command asks in every mode, even with
+// the session's unconfined exception granted, an allow rule naming it and
+// auto mode. With no terminal to ask, it is refused, never run unasked.
+#[test]
+fn invariant_d4_restricted_mode_asks_before_every_command() {
+    let _g = crate::config::TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (home, proj) = rules_home(
+        "restricted",
+        json!({"permissions": {"allow": ["Bash(echo *)"]}}),
+    );
+    crate::config::invalidate_settings_cache();
+    crate::sandbox::TEST_MODE.with(|m| m.set(Some(crate::sandbox::Mode::Auto)));
+    crate::sandbox::allow_unconfined_for_session();
+    let input = json!({"command": "echo hi"});
+    let auto = gate(Permission::Auto, "run_command", &input, &proj);
+    let accept = gate(Permission::AcceptEdits, "run_command", &input, &proj);
+    let restricted = crate::sandbox::restricted_execution();
+    crate::sandbox::forget_unconfined();
+    crate::sandbox::TEST_MODE.with(|m| m.set(None));
+    std::env::remove_var("NEXUS_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+    crate::config::invalidate_settings_cache();
+    if crate::sandbox::backend().is_some() {
+        assert!(!restricted, "a working backend is not restricted mode");
+        eprintln!("skip: a backend confines commands here; the none and Windows cells test this");
+        return;
+    }
+    assert!(restricted);
+    for (mode, reason) in [("auto", &auto), ("accept-edits", &accept)] {
+        let r = reason.as_deref().unwrap_or("");
+        assert!(
+            r.contains("restricted mode"),
+            "{mode}: ran unasked or other reason: {r:?}"
+        );
+    }
+}
