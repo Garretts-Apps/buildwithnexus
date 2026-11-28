@@ -72,9 +72,47 @@ static USER_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Refusals not yet reported to a command's output: (host:port, reason).
 static REFUSED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
+/// The hosts the user named this session.
+pub fn user_hosts() -> Vec<String> {
+    USER_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Replace them (a child session takes its parent's, not its task's).
+pub fn set_user_hosts(hosts: Vec<String>) {
+    *USER_HOSTS.lock().unwrap_or_else(|e| e.into_inner()) = hosts;
+}
+
+#[cfg(not(test))]
+static USER_HOSTS_FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// Unit tests run side by side in one process: each test thread keeps its own.
+#[cfg(test)]
+thread_local! {
+    static USER_HOSTS_FROZEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// From here on no text adds hosts: a background workflow's task was
+/// written by its parent's model, not the user.
+pub fn freeze_user_hosts() {
+    #[cfg(not(test))]
+    USER_HOSTS_FROZEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    USER_HOSTS_FROZEN.with(|f| f.set(true));
+}
+
+fn user_hosts_frozen() -> bool {
+    #[cfg(not(test))]
+    return USER_HOSTS_FROZEN.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    USER_HOSTS_FROZEN.with(|f| f.get())
+}
+
 /// Remember the hosts a message the user typed names (URLs and bare
 /// `host.tld` words), so commands may reach them this session.
 pub fn note_user_text(text: &str) {
+    if user_hosts_frozen() {
+        return;
+    }
     let mut hosts = USER_HOSTS.lock().unwrap_or_else(|e| e.into_inner());
     for h in hosts_in(text) {
         if !hosts.contains(&h) {
@@ -492,6 +530,19 @@ pub(crate) fn splice(
 
 #[cfg(test)]
 mod tests {
+
+    // H5 (roadmap 2.3): a background workflow's task is its parent model's
+    // text. Once the inherited policy froze the hosts, naming one in that
+    // text adds nothing the checker would let a command reach.
+    #[test]
+    fn invariant_ih2_a_frozen_session_takes_no_hosts_from_text() {
+        note_user_text("see https://before.example/x");
+        assert!(user_hosts().contains(&"before.example".to_string()));
+        freeze_user_hosts();
+        note_user_text("now fetch https://after.example/x");
+        assert!(!user_hosts().contains(&"after.example".to_string()));
+    }
+
     use super::*;
 
     fn rules(allow: &[&str], deny: &[&str]) -> Rules {

@@ -11031,3 +11031,152 @@ fn headless_runs_stop_at_the_posture_check_until_accepted() {
     );
     assert!(text.contains("earlier for this session"), "{text}");
 }
+
+// ── policy inheritance (roadmap 2.3) ───────────────────────────────────────
+
+// The policy a background workflow's parent hands down, as bwn encodes it:
+// open in every field but `untrusted`.
+fn open_policy(untrusted: Option<&str>) -> String {
+    use buildwithnexus::policy::Policy;
+    Policy {
+        permission: buildwithnexus::agent::Permission::Auto,
+        sandbox: buildwithnexus::sandbox::Mode::Off,
+        network: true,
+        egress_check: true,
+        landlock_network: false,
+        unconfined_allowed: false,
+        roots: Default::default(),
+        expose: Default::default(),
+        user_hosts: Default::default(),
+        untrusted: untrusted.map(str::to_string),
+        read_only: false,
+    }
+    .encode()
+}
+
+// IH-3 for workflows: a background run started after its parent read
+// untrusted text carries the mark, so its auto mode asks before commands
+// (and, with no terminal, refuses). Before 2.3 the child started clean.
+#[test]
+fn invariant_ih3_a_workflow_inherits_the_untrusted_mark() {
+    let script = || {
+        vec![
+            tool_call(
+                "c1",
+                "run_command",
+                json!({"command": "echo ran > ran.txt"}),
+            ),
+            finish("done"),
+        ]
+    };
+    for (mark, should_run) in [(None, true), (Some("fetch_url"), false)] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(script());
+        write_config(&home, "ollama", "auto", port);
+        let policy = open_policy(mark);
+        let r = run_env(
+            &home,
+            &cwd,
+            &[
+                "--json",
+                "run",
+                &format!("--inherit-policy={policy}"),
+                "--",
+                "write the marker",
+            ],
+            &[],
+        );
+        assert_eq!(
+            cwd.join("ran.txt").exists(),
+            should_run,
+            "mark {mark:?}: stderr {}\n{:?}",
+            r.stderr,
+            r.events
+        );
+        if !should_run {
+            assert!(
+                r.text_of("tool_denied").contains("someone else wrote"),
+                "{:?}",
+                r.events
+            );
+        }
+    }
+}
+
+// A child only narrows: an inherited read-only policy wins over the child's
+// own `--permission-mode auto`, and an inherited `auto` can't loosen the
+// child's own read-only settings.
+#[test]
+fn invariant_ih2_an_inherited_policy_only_narrows() {
+    use buildwithnexus::policy::Policy;
+    let ro = Policy {
+        permission: buildwithnexus::agent::Permission::ReadOnly,
+        read_only: true,
+        ..Policy::decode(&open_policy(None)).unwrap()
+    }
+    .encode();
+    for (setting, flag, inherited) in [
+        ("auto", Some("--permission-mode=auto"), ro.clone()),
+        ("readonly", None, open_policy(None)),
+    ] {
+        let home = tmp("home");
+        let cwd = tmp("proj");
+        let port = serve(vec![
+            tool_call(
+                "c1",
+                "write_file",
+                json!({"path": "x.txt", "content": "no"}),
+            ),
+            finish("done"),
+        ]);
+        write_config(&home, "ollama", setting, port);
+        let mut args = vec!["--json", "run"];
+        args.extend(flag);
+        let inherit = format!("--inherit-policy={inherited}");
+        args.extend([inherit.as_str(), "--", "write a file"]);
+        let r = run_env(&home, &cwd, &args, &[]);
+        assert!(
+            r.text_of("tool_denied").contains("read-only"),
+            "setting {setting}: {:?}",
+            r.events
+        );
+        assert!(!cwd.join("x.txt").exists());
+    }
+}
+
+// IN-2 for the inherited policy: one that doesn't parse means the strictest
+// policy, with a warning, never the child's own looser one.
+#[test]
+fn invariant_ih2_an_unreadable_inherited_policy_is_the_strictest() {
+    let home = tmp("home");
+    let cwd = tmp("proj");
+    let port = serve(vec![
+        tool_call(
+            "c1",
+            "write_file",
+            json!({"path": "x.txt", "content": "no"}),
+        ),
+        finish("done"),
+    ]);
+    write_config(&home, "ollama", "auto", port);
+    let r = run_env(
+        &home,
+        &cwd,
+        &[
+            "--json",
+            "run",
+            "--inherit-policy={not json",
+            "--",
+            "write a file",
+        ],
+        &[],
+    );
+    assert!(r.stderr.contains("strictest policy"), "{}", r.stderr);
+    assert!(
+        r.text_of("tool_denied").contains("read-only"),
+        "{:?}",
+        r.events
+    );
+    assert!(!cwd.join("x.txt").exists());
+}

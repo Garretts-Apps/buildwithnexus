@@ -7,6 +7,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Background workflows can no longer run looser than the session that
+  started them.** A workflow is a separate process, and it used to get only
+  the permission mode and the added folders. It re-read the settings for
+  everything else. Now it gets the session's whole policy and runs with the
+  stricter of that and its own settings, so:
+  - a workflow started after the session read untrusted text still asks in
+    auto mode;
+  - one started from `--sandbox require` keeps `require`, and the
+    network, exposed stores and allowances can only narrow;
+  - its task, which the model wrote, no longer adds hosts that commands may
+    reach;
+  - an unreadable inherited policy means the strictest one.
+
+  Helpers inside the session take their permission and read-only setting
+  from the same derivation. A property test checks every child policy is
+  within its parent's.
 - **A credential store that contains the workspace is no longer claimed
   hidden.** When you run bwn from inside a store, for example `~/.aws/proj`,
   no backend can hide that store without hiding the workspace, so it stays

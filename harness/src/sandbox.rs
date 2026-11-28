@@ -104,6 +104,12 @@ pub fn allow_unconfined_for_session() {
     UNCONFINED_ALLOWED.store(true, Ordering::Relaxed);
 }
 
+/// Take back that allowance (a child session whose inherited policy
+/// doesn't have it).
+pub fn forget_unconfined() {
+    UNCONFINED_ALLOWED.store(false, Ordering::Relaxed);
+}
+
 /// Whether a person allowed unconfined commands for this session.
 pub fn unconfined_allowed() -> bool {
     UNCONFINED_ALLOWED.load(Ordering::Relaxed)
@@ -161,7 +167,8 @@ pub fn landlock_network_allowed() -> bool {
     LANDLOCK_NETWORK.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
+/// Take back the Landlock-alone network allowance (a child session whose
+/// inherited policy doesn't have it; tests).
 pub fn forget_landlock_network() {
     LANDLOCK_NETWORK.store(false, Ordering::Relaxed);
 }

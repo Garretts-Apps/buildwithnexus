@@ -426,14 +426,22 @@ pub(super) fn run_helper(
     );
     let mut child: Vec<Msg> = Vec::new();
     take_helper_refusals(depth + 1);
+    // The helper's policy comes from the session's through the one
+    // derivation every helper uses (roadmap 2.3): it can only narrow. It
+    // shares the session's other state (sandbox, hosts, untrusted mark).
+    let policy = crate::policy::Policy::current(perm).child(&crate::policy::ChildRequest {
+        read_only: *read_only,
+        permission: None,
+    });
     set_helper_ctx(
         depth + 1,
         Some(HelperCtx {
             agent: agent.clone(),
-            read_only: *read_only,
+            read_only: policy.read_only,
             label: format!("{role} · {}", trace::preview(task, 60)),
         }),
     );
+    let perm = policy.permission;
     let outcome = build_inner(p, perm, role, task, &h.run_cwd, depth + 1, &mut child, None);
     // SubagentStop carries the call and what the helper answered; a hook
     // may send the helper on, as Stop does for the turn.
